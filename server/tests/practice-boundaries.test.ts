@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { buildFinalFeedback, MAX_FINAL_FEEDBACK_LENGTH } from '../src/practice';
 
 afterAll(async () => {
   await pool.end();
@@ -43,6 +44,7 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     expect(third.body).toMatchObject({ passed: false, attemptNo: 3, attemptsLeft: 0 });
     expect(third.body.finalFeedback).toContain('final feedback');
     expect(third.body.nextQuestion).toBeDefined();
+    expect(third.body.nextQuestion.id).not.toBe(questionId);
 
     // attempt_no 3 is NOT < MAX_ATTEMPTS: the next attempt restarts at 1.
     const fourth = await attempt();
@@ -62,11 +64,21 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     const passed = await attempt();
     expect(passed.body).toMatchObject({ passed: true, attemptNo: 2 });
     expect(passed.body.nextQuestion).toBeDefined();
+    expect(passed.body.nextQuestion.id).not.toBe(questionId);
     expect(passed.body.attemptsLeft).toBeUndefined();
     expect(passed.body.finalFeedback).toBeUndefined();
 
     // A passed last attempt restarts numbering at 1.
     const afterPass = await attempt();
     expect(afterPass.body).toMatchObject({ attemptNo: 1 });
+  });
+});
+
+describe('practice feedback response bounds', () => {
+  it('caps unexpectedly large authored examples to the mobile contract', () => {
+    const feedback = buildFinalFeedback('Keep practicing.', 'x'.repeat(10_000));
+    expect(feedback).toHaveLength(MAX_FINAL_FEEDBACK_LENGTH);
+    expect(feedback).toContain('Keep practicing.');
+    expect(feedback.endsWith(". Let's move on!")).toBe(true);
   });
 });

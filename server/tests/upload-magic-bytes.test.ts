@@ -32,12 +32,10 @@ async function exists(filePath: string): Promise<boolean> {
 describe('verifyAudioMagicBytes', () => {
   const valid: Array<[string, Buffer]> = [
     ['a.m4a', FTYP],
-    ['a.m4b', FTYP],
     ['a.mp4', FTYP],
     ['a.wav', WAV],
     ['a.mp3', ID3],
     ['a.mp3', MP3_FRAME],
-    ['a.aac', ADTS],
     ['a.ogg', OGG],
     ['a.oga', OGG],
     ['a.webm', WEBM],
@@ -62,6 +60,8 @@ describe('verifyAudioMagicBytes', () => {
     ['a.m4a', Buffer.concat([Buffer.alloc(4), Buffer.from('ftYp'), Buffer.alloc(4)]), 'wrong box name'],
     ['a.wav', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVX')]), 'not a WAVE form type'],
     ['a.mp3', Buffer.from([0xff, 0x1f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 'frame sync without the 0xe0 mask'],
+    ['a.m4b', FTYP, 'unsupported audiobook extension'],
+    ['a.aac', ADTS, 'unsupported raw AAC extension'],
     ['a.webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa4, 0, 0, 0, 0]), 'wrong EBML fourth byte'],
     ['a.flac', Buffer.from('flac-is-lowercase'), 'lowercase fLaC'],
     // Extension/signature mismatches: a valid signature for the WRONG container.
@@ -116,6 +116,8 @@ describe('upload fileFilter extension/MIME matrix', () => {
     ['answer.txt', 'audio/mp4'], // extension not allowlisted
     ['answer', 'audio/mp4'], // no extension
     ['answer.wav.exe', 'audio/wav'], // final extension wins
+    ['answer.m4b', 'audio/mp4'], // not accepted by the transcription provider
+    ['answer.aac', 'audio/aac'], // raw AAC is not accepted by the transcription provider
   ];
 
   it.each(rejected)('rejects %s as %s with 415', async (filename, contentType) => {

@@ -24,7 +24,10 @@ describe('diagnostic adaptive binary search', () => {
   }
 
   async function answer(token: string, questionId: string) {
-    const r = await answerForm(request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`), questionId);
+    const r = await answerForm(
+      request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+      questionId,
+    );
     expect(r.status).toBe(200);
     return r.body;
   }

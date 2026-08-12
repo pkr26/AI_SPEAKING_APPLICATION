@@ -19,7 +19,7 @@ import {
   MAX_PASSWORD_UTF8_BYTES,
   useAuth,
 } from '../../lib/auth';
-import { colors } from '../../lib/theme';
+import { colors, layout } from '../../lib/theme';
 
 export default function LoginScreen() {
   const { login } = useAuth();
@@ -28,8 +28,7 @@ export default function LoginScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const passwordError =
-    password.length > 0 ? comparablePasswordError(password) : null;
+  const passwordError = password.length > 0 ? comparablePasswordError(password) : null;
   const canSubmit =
     email.trim().length > 0 &&
     email.trim().length <= MAX_EMAIL_LENGTH &&
@@ -50,9 +49,7 @@ export default function LoginScreen() {
       } else if (err instanceof ApiError && err.status === 429) {
         setError('Too many attempts, please try again later.');
       } else {
-        setError(
-          userMessageForError(err, 'Could not sign in. Please try again.'),
-        );
+        setError(userMessageForError(err, 'Could not sign in. Please try again.'));
       }
     } finally {
       setBusy(false);
@@ -65,80 +62,73 @@ export default function LoginScreen() {
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <ScrollView
-          contentContainerStyle={styles.container}
-          keyboardShouldPersistTaps="handled"
-        >
-        <Text accessibilityRole="header" style={styles.brand}>
-          AI English Coach
-        </Text>
-        <Text style={styles.subtitle}>
-          Practice speaking English with instant AI feedback.
-        </Text>
+        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <Text accessibilityRole="header" style={styles.brand}>
+            AI English Coach
+          </Text>
+          <Text style={styles.subtitle}>Practice speaking English with instant AI feedback.</Text>
 
-        <View style={styles.form}>
-          <Text style={styles.label}>Email</Text>
-          <TextInput
-            accessibilityLabel="Email"
-            style={styles.input}
-            value={email}
-            onChangeText={setEmail}
-            placeholder="you@example.com"
-            placeholderTextColor={colors.muted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="email-address"
-            textContentType="emailAddress"
-            maxLength={MAX_EMAIL_LENGTH}
-          />
+          <View style={styles.form}>
+            <Text style={styles.label}>Email</Text>
+            <TextInput
+              accessibilityLabel="Email"
+              style={styles.input}
+              value={email}
+              onChangeText={setEmail}
+              placeholder="you@example.com"
+              placeholderTextColor={colors.muted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              textContentType="emailAddress"
+              maxLength={MAX_EMAIL_LENGTH}
+            />
 
-          <Text style={styles.label}>Password</Text>
-          <TextInput
-            accessibilityLabel="Password"
-            style={styles.input}
-            value={password}
-            onChangeText={setPassword}
-            placeholder="Your password"
-            placeholderTextColor={colors.muted}
-            secureTextEntry
-            textContentType="password"
-            maxLength={MAX_PASSWORD_UTF8_BYTES}
-          />
-          {passwordError && (
-            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
-              {passwordError}
-            </Text>
-          )}
+            <Text style={styles.label}>Password</Text>
+            <TextInput
+              accessibilityLabel="Password"
+              style={styles.input}
+              value={password}
+              onChangeText={setPassword}
+              placeholder="Your password"
+              placeholderTextColor={colors.muted}
+              secureTextEntry
+              textContentType="password"
+              maxLength={MAX_PASSWORD_UTF8_BYTES}
+            />
+            {passwordError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {passwordError}
+              </Text>
+            )}
 
-          {error && (
-            <Text accessibilityRole="alert" style={styles.error}>
-              {error}
-            </Text>
-          )}
+            {error && (
+              <Text accessibilityRole="alert" style={styles.error}>
+                {error}
+              </Text>
+            )}
 
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ disabled: !canSubmit, busy }}
-            disabled={!canSubmit}
-            onPress={handleLogin}
-            style={({ pressed }) => [
-              styles.button,
-              !canSubmit && styles.buttonDisabled,
-              pressed && canSubmit && styles.buttonPressed,
-            ]}
-          >
-            <Text style={styles.buttonText}>
-              {busy ? 'Signing in…' : 'Sign In'}
-            </Text>
-          </Pressable>
-        </View>
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ disabled: !canSubmit, busy }}
+              disabled={!canSubmit}
+              onPress={handleLogin}
+              style={({ pressed }) => [
+                styles.button,
+                !canSubmit && styles.buttonDisabled,
+                pressed && canSubmit && styles.buttonPressed,
+              ]}
+            >
+              <Text style={styles.buttonText}>{busy ? 'Signing in…' : 'Sign In'}</Text>
+            </Pressable>
+          </View>
 
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>New here? </Text>
-          <Link href="/signup" style={styles.footerLink}>
-            Create an account
-          </Link>
-        </View>
+          <View style={styles.footer}>
+            <Text style={styles.footerText}>New here? </Text>
+            <Link href="/signup" style={styles.footerLink}>
+              Create an account
+            </Link>
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -154,6 +144,9 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     justifyContent: 'center',
     padding: 24,
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
   },
   brand: {
     fontSize: 32,
@@ -223,7 +216,9 @@ const styles = StyleSheet.create({
   },
   footer: {
     marginTop: 24,
+    minHeight: layout.minimumTarget,
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'center',
   },
   footerText: {
@@ -231,6 +226,7 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
   footerLink: {
+    paddingVertical: 12,
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',

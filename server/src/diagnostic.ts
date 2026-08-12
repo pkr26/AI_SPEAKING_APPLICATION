@@ -4,10 +4,23 @@ import fs from 'fs/promises';
 import { PoolClient } from 'pg';
 import { z } from 'zod';
 import { assessSpeaking } from './assess';
-import { resolvePresignedAudio } from './audio-upload';
+import { verifyAudioDuration } from './audio-inspection';
+import {
+  completeSubmittedPresignedAudioReplay,
+  discardSubmittedPresignedAudio,
+  finalizeSubmittedPresignedAudio,
+  ownSubmittedPresignedAudio,
+  preserveSubmittedPresignedAudio,
+  resolvePresignedAudio,
+} from './audio-upload';
 import { config } from './config';
 import { pool } from './db';
-import { abandonAssessmentRequest, claimAssessmentRequest, completeAssessmentRequest } from './idempotency';
+import {
+  abandonAssessmentRequest,
+  AssessmentRequestInFlightError,
+  claimAssessmentRequest,
+  completeAssessmentRequest,
+} from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
@@ -233,6 +246,9 @@ export function createDiagnosticRouter(limiters: Limiters) {
     next();
   });
   router.use(requireAuth);
+  // Register transient-object cleanup before per-route rate limiting and body
+  // validation so every authenticated submission path discards its owned key.
+  if (config.s3.bucket) router.use(discardSubmittedPresignedAudio);
 
   router.get(
     '/next',
@@ -275,25 +291,30 @@ export function createDiagnosticRouter(limiters: Limiters) {
     '/answer',
     limiters.assess,
     ...(config.s3.bucket
-      ? [validate({ body: answerJsonBodySchema }), resolvePresignedAudio]
+      ? [validate({ body: answerJsonBodySchema })]
       : [uploadAudio, validate({ body: answerBodySchema })]),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       try {
-        if (!req.file) {
-          throw new HttpError(400, 'audio file is required');
-        }
-        await verifyAudioMagicBytes(req.file.path);
-
         const { questionId, requestId } = req.body as z.infer<typeof answerBodySchema>;
         const knownQuestion = await pool.query('SELECT 1 FROM questions WHERE id = $1', [questionId]);
         if (knownQuestion.rowCount !== 1) {
           throw new HttpError(409, 'Question mismatch');
         }
-        const requestClaim = await claimAssessmentRequest(user.id, requestId, 'diagnostic', questionId);
+        let requestClaim;
+        try {
+          requestClaim = await claimAssessmentRequest(user.id, requestId, 'diagnostic', questionId);
+        } catch (err) {
+          if (err instanceof AssessmentRequestInFlightError) {
+            preserveSubmittedPresignedAudio(res);
+          }
+          throw err;
+        }
         if (requestClaim.kind === 'completed') {
+          completeSubmittedPresignedAudioReplay(res);
           return res.json(requestClaim.response);
         }
+        ownSubmittedPresignedAudio(res);
 
         if (user.diagnostic_completed) {
           await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
@@ -303,6 +324,12 @@ export function createDiagnosticRouter(limiters: Limiters) {
         let claimId: string | undefined;
         let completed = false;
         try {
+          if (config.s3.bucket) await resolvePresignedAudio(req, res);
+          if (!req.file) {
+            throw new HttpError(400, 'audio file is required');
+          }
+          await verifyAudioMagicBytes(req.file.path);
+          if (!config.mockAi) await verifyAudioDuration(req.file.path);
           const claim = await claimDiagnosticAnswer(user.id, questionId);
           claimId = claim.claimId;
           const result = await assessSpeaking(
@@ -330,6 +357,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
         }
       } finally {
         if (req.file) await fs.unlink(req.file.path).catch(() => {});
+        if (config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
       }
     }),
   );

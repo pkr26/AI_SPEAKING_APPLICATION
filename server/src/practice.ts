@@ -3,16 +3,30 @@ import { Router } from 'express';
 import fs from 'fs/promises';
 import { z } from 'zod';
 import { assessSpeaking } from './assess';
-import { resolvePresignedAudio } from './audio-upload';
+import { verifyAudioDuration } from './audio-inspection';
+import {
+  completeSubmittedPresignedAudioReplay,
+  discardSubmittedPresignedAudio,
+  finalizeSubmittedPresignedAudio,
+  ownSubmittedPresignedAudio,
+  preserveSubmittedPresignedAudio,
+  resolvePresignedAudio,
+} from './audio-upload';
 import { config } from './config';
 import { pool } from './db';
 import { logger } from './logger';
-import { abandonAssessmentRequest, claimAssessmentRequest, completeAssessmentRequest } from './idempotency';
+import {
+  abandonAssessmentRequest,
+  AssessmentRequestInFlightError,
+  claimAssessmentRequest,
+  completeAssessmentRequest,
+} from './idempotency';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
 import { uploadAudio, verifyAudioMagicBytes } from './upload';
 
 const MAX_ATTEMPTS = 3;
+export const MAX_FINAL_FEEDBACK_LENGTH = 4000;
 
 interface QuestionJson {
   id: string;
@@ -26,19 +40,29 @@ interface QuestionJson {
  * practice attempt by this user, then the least-recently attempted ones,
  * with a random tiebreak.
  */
-async function pickPracticeQuestion(userId: string, level: string): Promise<QuestionJson | undefined> {
-  const { rows } = await pool.query<QuestionJson>(
+interface Queryable {
+  query<T>(text: string, values?: unknown[]): Promise<{ rows: T[] }>;
+}
+
+async function pickPracticeQuestion(
+  userId: string,
+  level: string,
+  db: Queryable = pool,
+  excludeQuestionId?: string,
+): Promise<QuestionJson | undefined> {
+  const { rows } = await db.query<QuestionJson>(
     `SELECT q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"
      FROM questions q
      LEFT JOIN attempts a
        ON a.question_id = q.id AND a.user_id = $1 AND a.context = 'practice'
      WHERE q.cefr_level = $2
+       AND ($3::uuid IS NULL OR q.id <> $3)
      GROUP BY q.id
      ORDER BY COALESCE(BOOL_OR(a.passed), FALSE) ASC,
               MAX(a.created_at) ASC NULLS FIRST,
               random()
      LIMIT 1`,
-    [userId, level],
+    [userId, level, excludeQuestionId ?? null],
   );
   return rows[0];
 }
@@ -121,8 +145,11 @@ async function storePracticeResult(
   result: Awaited<ReturnType<typeof assessSpeaking>>,
   requestId: string,
   requestClaimId: string,
-  response: Record<string, unknown>,
-): Promise<void> {
+  body: Record<string, unknown>,
+  responseKind: 'passed' | 'retry' | 'final-failed',
+  level: string,
+  finalFeedback?: string,
+): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -140,6 +167,18 @@ async function storePracticeResult(
        VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7)`,
       [userId, questionId, claim.attemptNo, result.transcript, result.score, result.passed, result.feedback],
     );
+    let response: Record<string, unknown>;
+    if (responseKind === 'retry') {
+      response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
+    } else {
+      // Select after the current attempt is visible in this transaction and
+      // explicitly exclude it. A pass/final failure must always advance.
+      const nextQuestion = await pickPracticeQuestion(userId, level, client, questionId);
+      response =
+        responseKind === 'passed'
+          ? { ...body, nextQuestion }
+          : { ...body, attemptsLeft: 0, finalFeedback, nextQuestion };
+    }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
       userId,
       questionId,
@@ -147,6 +186,7 @@ async function storePracticeResult(
     ]);
     await completeAssessmentRequest(client, userId, requestId, requestClaimId, response);
     await client.query('COMMIT');
+    return response;
   } catch (err) {
     await client.query('ROLLBACK');
     throw err;
@@ -162,6 +202,13 @@ function authoredAnswerHint(question: Record<string, unknown>, language: string)
   return example || `a few clear, on-topic sentences about "${String(question.prompt_word)}"`;
 }
 
+export function buildFinalFeedback(providerFeedback: string, hint: string): string {
+  const prefix = `Don't worry — here's the final feedback for this question: ${providerFeedback} A good answer could be: `;
+  const suffix = ". Let's move on!";
+  const availableHintLength = Math.max(0, MAX_FINAL_FEEDBACK_LENGTH - prefix.length - suffix.length);
+  return `${prefix}${hint.slice(0, availableHintLength)}${suffix}`.slice(0, MAX_FINAL_FEEDBACK_LENGTH);
+}
+
 export function createPracticeRouter(limiters: Limiters) {
   const router = Router();
   router.use((_req, res, next) => {
@@ -169,6 +216,9 @@ export function createPracticeRouter(limiters: Limiters) {
     next();
   });
   router.use(requireAuth);
+  // Register transient-object cleanup before eligibility checks, per-route rate
+  // limiting, and validation so every authenticated submission path is covered.
+  if (config.s3.bucket) router.use(discardSubmittedPresignedAudio);
   router.use((req: AuthedRequest, _res, next) => {
     if (!req.user!.diagnostic_completed || !req.user!.cefr_level) {
       return next(new HttpError(403, 'Diagnostic not completed'));
@@ -223,16 +273,11 @@ export function createPracticeRouter(limiters: Limiters) {
     '/attempt',
     limiters.assess,
     ...(config.s3.bucket
-      ? [validate({ body: attemptJsonBodySchema }), resolvePresignedAudio]
+      ? [validate({ body: attemptJsonBodySchema })]
       : [uploadAudio, validate({ body: attemptBodySchema })]),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       try {
-        if (!req.file) {
-          throw new HttpError(400, 'audio file is required');
-        }
-        await verifyAudioMagicBytes(req.file.path);
-
         const { questionId, requestId } = req.body as z.infer<typeof attemptBodySchema>;
         const { rows: qRows } = await pool.query('SELECT * FROM questions WHERE id = $1', [questionId]);
         const q = qRows[0];
@@ -241,14 +286,30 @@ export function createPracticeRouter(limiters: Limiters) {
           throw new HttpError(403, 'Question is not available at your level');
         }
 
-        const requestClaim = await claimAssessmentRequest(user.id, requestId, 'practice', questionId);
+        let requestClaim;
+        try {
+          requestClaim = await claimAssessmentRequest(user.id, requestId, 'practice', questionId);
+        } catch (err) {
+          if (err instanceof AssessmentRequestInFlightError) {
+            preserveSubmittedPresignedAudio(res);
+          }
+          throw err;
+        }
         if (requestClaim.kind === 'completed') {
+          completeSubmittedPresignedAudioReplay(res);
           return res.json(requestClaim.response);
         }
+        ownSubmittedPresignedAudio(res);
 
         let claim: PracticeClaim | undefined;
         let completed = false;
         try {
+          if (config.s3.bucket) await resolvePresignedAudio(req, res);
+          if (!req.file) {
+            throw new HttpError(400, 'audio file is required');
+          }
+          await verifyAudioMagicBytes(req.file.path);
+          if (!config.mockAi) await verifyAudioDuration(req.file.path);
           claim = await claimPracticeAttempt(user.id, q.id);
           const result = await assessSpeaking(
             req.file.path,
@@ -267,21 +328,31 @@ export function createPracticeRouter(limiters: Limiters) {
             feedback: result.feedback,
           };
 
-          let response: Record<string, unknown>;
+          let responseKind: 'passed' | 'retry' | 'final-failed';
+          let finalFeedback: string | undefined;
           if (result.passed) {
-            const nextQuestion = await pickPracticeQuestion(user.id, user.cefr_level!);
-            response = { ...body, nextQuestion };
+            responseKind = 'passed';
           } else if (claim.attemptNo < MAX_ATTEMPTS) {
-            response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
+            responseKind = 'retry';
           } else {
             // Use reviewed, authored examples instead of making a second,
             // unmetered provider call after the assessment has already succeeded.
             const hint = authoredAnswerHint(q, user.native_language);
-            const finalFeedback = `Don't worry — here's the final feedback for this question: ${result.feedback} A good answer could be: ${hint}. Let's move on!`;
-            const nextQuestion = await pickPracticeQuestion(user.id, user.cefr_level!);
-            response = { ...body, attemptsLeft: 0, finalFeedback, nextQuestion };
+            finalFeedback = buildFinalFeedback(result.feedback, hint);
+            responseKind = 'final-failed';
           }
-          await storePracticeResult(user.id, q.id, claim, result, requestId, requestClaim.claimId, response);
+          const response = await storePracticeResult(
+            user.id,
+            q.id,
+            claim,
+            result,
+            requestId,
+            requestClaim.claimId,
+            body,
+            responseKind,
+            user.cefr_level!,
+            finalFeedback,
+          );
           completed = true;
           return res.json(response);
         } finally {
@@ -290,6 +361,7 @@ export function createPracticeRouter(limiters: Limiters) {
         }
       } finally {
         if (req.file) await fs.unlink(req.file.path).catch(() => {});
+        if (config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
       }
     }),
   );

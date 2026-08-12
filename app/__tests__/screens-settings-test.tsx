@@ -1,11 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { Alert } from 'react-native';
 
@@ -49,6 +43,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     user: USER,
     sessionVersion: 1,
     isRestoring: false,
+    restoreError: null,
+    retrySessionRestore: jest.fn(),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -85,9 +81,7 @@ function makeQueryClient(): QueryClient {
 
 function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
   const client = queryClient ?? makeQueryClient();
-  return render(
-    <QueryClientProvider client={client}>{ui}</QueryClientProvider>,
-  );
+  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
 function alertButtons(): { text?: string; onPress?: () => void }[] {
@@ -119,25 +113,13 @@ afterEach(() => {
 
 // ----- change password -----
 
-async function fillChangePassword(
-  current: string,
-  next: string,
-  confirm: string,
-) {
+async function fillChangePassword(current: string, next: string, confirm: string) {
+  await fireEvent.changeText(screen.getByPlaceholderText('Your current password'), current);
   await fireEvent.changeText(
-    screen.getByPlaceholderText('Your current password'),
-    current,
-  );
-  await fireEvent.changeText(
-    screen.getByPlaceholderText(
-      'At least 8 characters, with a letter and a number',
-    ),
+    screen.getByPlaceholderText('At least 8 characters, with a letter and a number'),
     next,
   );
-  await fireEvent.changeText(
-    screen.getByPlaceholderText('Repeat the new password'),
-    confirm,
-  );
+  await fireEvent.changeText(screen.getByPlaceholderText('Repeat the new password'), confirm);
 }
 
 function updateButton() {
@@ -163,16 +145,12 @@ describe('change password screen', () => {
   it('enforces the password policy on the new password', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'short', 'short');
-    expect(
-      screen.getByText('Password must be at least 8 characters.'),
-    ).toBeTruthy();
+    expect(screen.getByText('Password must be at least 8 characters.')).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'abcdefgh', 'abcdefgh');
     expect(
-      screen.getByText(
-        'Password must include at least one letter and one number.',
-      ),
+      screen.getByText('Password must include at least one letter and one number.'),
     ).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
@@ -180,9 +158,7 @@ describe('change password screen', () => {
   it('rejects current passwords over the UTF-8 byte limit', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('a'.repeat(73), 'newpass1', 'newpass1');
-    expect(
-      screen.getByText('Password must be at most 72 UTF-8 bytes.'),
-    ).toBeTruthy();
+    expect(screen.getByText('Password must be at most 72 UTF-8 bytes.')).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -192,10 +168,7 @@ describe('change password screen', () => {
     await fireEvent.press(updateButton());
 
     await waitFor(() =>
-      expect(mockAuthValue.changePassword).toHaveBeenCalledWith(
-        'oldpass1',
-        'newpass1',
-      ),
+      expect(mockAuthValue.changePassword).toHaveBeenCalledWith('oldpass1', 'newpass1'),
     );
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
@@ -233,59 +206,43 @@ describe('change password screen', () => {
   });
 
   it('shows a credential error on 401', async () => {
-    mockAuthValue.changePassword = jest
-      .fn()
-      .mockRejectedValue(new ApiError(401, 'unauthorized'));
+    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new ApiError(401, 'unauthorized'));
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(
-      await screen.findByText('Current password is incorrect.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Current password is incorrect.')).toBeTruthy();
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
   it('shows a rate-limit error on 429', async () => {
-    mockAuthValue.changePassword = jest
-      .fn()
-      .mockRejectedValue(new ApiError(429, 'slow down'));
+    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new ApiError(429, 'slow down'));
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(
-      await screen.findByText('Too many attempts, please try again later.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
   });
 
   it('maps other API errors through userMessageForError', async () => {
-    mockAuthValue.changePassword = jest
-      .fn()
-      .mockRejectedValue(new ApiError(500, 'boom'));
+    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
     expect(
-      await screen.findByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      await screen.findByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
   });
 
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.changePassword = jest
-      .fn()
-      .mockRejectedValue(new Error('storage full'));
+    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new Error('storage full'));
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
     expect(
-      await screen.findByText(
-        'Could not change your password. Please try again.',
-      ),
+      await screen.findByText('Could not change your password. Please try again.'),
     ).toBeTruthy();
   });
 });
@@ -293,10 +250,7 @@ describe('change password screen', () => {
 // ----- delete account -----
 
 async function typePassword(password: string) {
-  await fireEvent.changeText(
-    screen.getByPlaceholderText('Your password'),
-    password,
-  );
+  await fireEvent.changeText(screen.getByPlaceholderText('Your password'), password);
 }
 
 function deleteButton() {
@@ -313,9 +267,7 @@ describe('delete account screen', () => {
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('a'.repeat(73));
-    expect(
-      screen.getByText('Password must be at most 72 UTF-8 bytes.'),
-    ).toBeTruthy();
+    expect(screen.getByText('Password must be at most 72 UTF-8 bytes.')).toBeTruthy();
     expect(deleteButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -340,9 +292,7 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
     await pressAlertButton('Delete');
 
-    await waitFor(() =>
-      expect(mockAuthValue.deleteAccount).toHaveBeenCalledWith('password1'),
-    );
+    await waitFor(() => expect(mockAuthValue.deleteAccount).toHaveBeenCalledWith('password1'));
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
         'Account deleted',
@@ -378,9 +328,7 @@ describe('delete account screen', () => {
   });
 
   it('shows a credential error on 401', async () => {
-    mockAuthValue.deleteAccount = jest
-      .fn()
-      .mockRejectedValue(new ApiError(401, 'unauthorized'));
+    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new ApiError(401, 'unauthorized'));
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
@@ -391,23 +339,17 @@ describe('delete account screen', () => {
   });
 
   it('shows a rate-limit error on 429', async () => {
-    mockAuthValue.deleteAccount = jest
-      .fn()
-      .mockRejectedValue(new ApiError(429, 'slow down'));
+    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new ApiError(429, 'slow down'));
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
     await pressAlertButton('Delete');
 
-    expect(
-      await screen.findByText('Too many attempts, please try again later.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
   });
 
   it('surfaces local cleanup failures after deletion', async () => {
-    mockAuthValue.deleteAccount = jest
-      .fn()
-      .mockRejectedValue(new AccountDeletedCleanupError());
+    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new AccountDeletedCleanupError());
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
@@ -422,18 +364,14 @@ describe('delete account screen', () => {
   });
 
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.deleteAccount = jest
-      .fn()
-      .mockRejectedValue(new Error('network down'));
+    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new Error('network down'));
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
     await pressAlertButton('Delete');
 
     expect(
-      await screen.findByText(
-        'Could not delete your account. Please try again.',
-      ),
+      await screen.findByText('Could not delete your account. Please try again.'),
     ).toBeTruthy();
   });
 });

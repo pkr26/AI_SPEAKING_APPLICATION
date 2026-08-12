@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -7,21 +7,21 @@ import {
   StyleSheet,
   Text,
   View,
-} from "react-native";
-import { router } from "expo-router";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+} from 'react-native';
+import { router } from 'expo-router';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 
-import Recorder from "../components/Recorder";
-import { apiFetch, userMessageForError } from "../lib/api";
-import { useAuth } from "../lib/auth";
-import { colors } from "../lib/theme";
+import Recorder from '../components/Recorder';
+import { apiFetch, userMessageForError } from '../lib/api';
+import { useAuth } from '../lib/auth';
+import { colors, layout } from '../lib/theme';
 import {
   parseDiagnosticAnswerResult,
   parseDiagnosticNext,
   type CefrLevel,
   type DiagnosticAnswerResult,
   type Question,
-} from "../lib/types";
+} from '../lib/types';
 
 export default function DiagnosticScreen() {
   const { user, setUser, logout } = useAuth();
@@ -36,11 +36,9 @@ export default function DiagnosticScreen() {
   const [level, setLevel] = useState<CefrLevel | null>(null);
 
   const nextQuery = useQuery({
-    queryKey: ["diagnostic-next", user?.id],
+    queryKey: ['diagnostic-next', user?.id],
     queryFn: async ({ signal }) =>
-      parseDiagnosticNext(
-        await apiFetch<unknown>("/diagnostic/next", { signal }),
-      ),
+      parseDiagnosticNext(await apiFetch<unknown>('/diagnostic/next', { signal })),
     enabled: !!user,
     retry: false,
   });
@@ -60,35 +58,30 @@ export default function DiagnosticScreen() {
   };
 
   const handleError = (message: string) => {
-    Alert.alert("Could not assess your answer", message);
+    Alert.alert('Could not assess your answer', message);
   };
 
   const handleLogout = async () => {
     try {
       await logout();
-      router.replace("/");
+      router.replace('/');
     } catch {
-      Alert.alert("Could not log out", "Check your connection and try again.");
+      Alert.alert('Could not log out', 'Check your connection and try again.');
     }
   };
 
   const openAccountMenu = () => {
-    Alert.alert("Account & privacy", undefined, [
+    Alert.alert('Account & privacy', undefined, [
       {
-        text: "Change Password",
-        onPress: () => router.push("/settings/change-password"),
+        text: 'Change Password',
+        onPress: () => router.push('/settings/change-password'),
       },
       {
-        text: "Delete Account",
-        style: "destructive",
-        onPress: () => router.push("/settings/delete-account"),
+        text: 'Delete Account',
+        style: 'destructive',
+        onPress: () => router.push('/settings/delete-account'),
       },
-      {
-        text: "Log Out",
-        style: "destructive",
-        onPress: () => void handleLogout(),
-      },
-      { text: "Cancel", style: "cancel" },
+      { text: 'Cancel', style: 'cancel' },
     ]);
   };
 
@@ -114,8 +107,8 @@ export default function DiagnosticScreen() {
       diagnosticCompleted: true,
       cefrLevel: level,
     });
-    void queryClient.invalidateQueries({ queryKey: ["me"] });
-    router.replace("/");
+    void queryClient.invalidateQueries({ queryKey: ['me'] });
+    router.replace('/');
   };
 
   // ----- Loading / error states -----
@@ -137,15 +130,12 @@ export default function DiagnosticScreen() {
           <Text accessibilityLiveRegion="assertive" style={styles.muted}>
             {userMessageForError(
               nextQuery.error,
-              "Could not load the diagnostic test. Please try again.",
+              'Could not load the diagnostic test. Please try again.',
             )}
           </Text>
           <Pressable
             accessibilityRole="button"
-            style={({ pressed }) => [
-              styles.primaryButton,
-              pressed && styles.primaryButtonPressed,
-            ]}
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
             onPress={() => void nextQuery.refetch()}
           >
             <Text style={styles.primaryButtonText}>Try Again</Text>
@@ -172,10 +162,7 @@ export default function DiagnosticScreen() {
         </Text>
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [
-            styles.primaryButton,
-            pressed && styles.primaryButtonPressed,
-          ]}
+          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
           onPress={startPracticing}
         >
           <Text style={styles.primaryButtonText}>Start Practicing</Text>
@@ -190,27 +177,30 @@ export default function DiagnosticScreen() {
 
   // ----- Question view -----
   return (
-    <ScrollView
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={styles.container}
-    >
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
       <Text accessibilityRole="header" style={styles.heading}>
         Diagnostic Test
       </Text>
-      <Pressable
-        accessibilityRole="button"
-        style={({ pressed }) => [
-          styles.accountButton,
-          pressed && styles.accountButtonPressed,
-        ]}
-        onPress={openAccountMenu}
-      >
-        <Text style={styles.accountButtonText}>Account & privacy</Text>
-      </Pressable>
+      <View style={styles.accountActions}>
+        <Pressable
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.accountButton, pressed && styles.accountButtonPressed]}
+          onPress={openAccountMenu}
+        >
+          <Text style={styles.accountButtonText}>Account & privacy</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.accountButton, pressed && styles.accountButtonPressed]}
+          onPress={() => void handleLogout()}
+        >
+          <Text style={styles.accountButtonText}>Log out</Text>
+        </Pressable>
+      </View>
       {progress && (
         <Text style={styles.progressText}>
-          Question {Math.min(progress.asked + 1, progress.maxQuestions)} of up
-          to {progress.maxQuestions}
+          Question {Math.min(progress.asked + 1, progress.maxQuestions)} of up to{' '}
+          {progress.maxQuestions}
         </Text>
       )}
 
@@ -225,19 +215,15 @@ export default function DiagnosticScreen() {
         <View accessibilityLiveRegion="polite" style={styles.resultCard}>
           <Text style={styles.resultTitle}>Answer received</Text>
           <Text style={styles.resultText}>
-            Your answer was saved. Your score and level are revealed at the end
-            of the test.
+            Your answer was saved. Your score and level are revealed at the end of the test.
           </Text>
           <Pressable
             accessibilityRole="button"
-            style={({ pressed }) => [
-              styles.primaryButton,
-              pressed && styles.primaryButtonPressed,
-            ]}
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
             onPress={advance}
           >
             <Text style={styles.primaryButtonText}>
-              {result.done ? "See My Level" : "Next Question"}
+              {result.done ? 'See My Level' : 'Next Question'}
             </Text>
           </Pressable>
         </View>
@@ -259,19 +245,22 @@ export default function DiagnosticScreen() {
 const styles = StyleSheet.create({
   center: {
     flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
+    alignItems: 'center',
+    justifyContent: 'center',
     padding: 24,
     backgroundColor: colors.background,
   },
   container: {
     flexGrow: 1,
     padding: 20,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   heading: {
     fontSize: 26,
-    fontWeight: "800",
+    fontWeight: '800',
     color: colors.text,
   },
   progressText: {
@@ -280,9 +269,9 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
   accountButton: {
-    alignSelf: "flex-start",
-    marginTop: 12,
-    paddingVertical: 8,
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    paddingVertical: 10,
     paddingHorizontal: 12,
     borderWidth: 1,
     borderColor: colors.border,
@@ -291,9 +280,16 @@ const styles = StyleSheet.create({
   accountButtonPressed: {
     backgroundColor: colors.card,
   },
+  accountActions: {
+    alignSelf: 'flex-start',
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+    marginTop: 12,
+  },
   accountButtonText: {
     color: colors.primary,
-    fontWeight: "700",
+    fontWeight: '700',
   },
   card: {
     marginTop: 20,
@@ -305,16 +301,16 @@ const styles = StyleSheet.create({
   },
   cardLabel: {
     fontSize: 12,
-    fontWeight: "700",
+    fontWeight: '700',
     color: colors.muted,
-    textTransform: "uppercase",
+    textTransform: 'uppercase',
     letterSpacing: 0.8,
     marginTop: 12,
   },
   promptWord: {
     marginTop: 4,
     fontSize: 30,
-    fontWeight: "800",
+    fontWeight: '800',
     color: colors.primary,
   },
   questionText: {
@@ -327,11 +323,11 @@ const styles = StyleSheet.create({
     marginTop: 12,
     fontSize: 15,
     color: colors.muted,
-    textAlign: "center",
+    textAlign: 'center',
   },
   errorTitle: {
     fontSize: 20,
-    fontWeight: "700",
+    fontWeight: '700',
     color: colors.text,
   },
   resultCard: {
@@ -344,7 +340,7 @@ const styles = StyleSheet.create({
   },
   resultTitle: {
     fontSize: 20,
-    fontWeight: "800",
+    fontWeight: '800',
     color: colors.text,
   },
   resultText: {
@@ -359,9 +355,9 @@ const styles = StyleSheet.create({
   congratsTitle: {
     marginTop: 12,
     fontSize: 26,
-    fontWeight: "800",
+    fontWeight: '800',
     color: colors.text,
-    textAlign: "center",
+    textAlign: 'center',
   },
   congratsText: {
     marginTop: 16,
@@ -377,15 +373,15 @@ const styles = StyleSheet.create({
   },
   levelBadgeText: {
     fontSize: 34,
-    fontWeight: "800",
-    color: "#FFFFFF",
+    fontWeight: '800',
+    color: '#FFFFFF',
   },
   congratsHint: {
     marginTop: 16,
     marginBottom: 8,
     fontSize: 15,
     color: colors.muted,
-    textAlign: "center",
+    textAlign: 'center',
   },
   primaryButton: {
     marginTop: 20,
@@ -393,16 +389,16 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     paddingVertical: 15,
     paddingHorizontal: 28,
-    alignItems: "center",
-    alignSelf: "stretch",
+    alignItems: 'center',
+    alignSelf: 'stretch',
   },
   primaryButtonPressed: {
     backgroundColor: colors.primaryDark,
   },
   primaryButtonText: {
-    color: "#FFFFFF",
+    color: '#FFFFFF',
     fontSize: 17,
-    fontWeight: "600",
-    textAlign: "center",
+    fontWeight: '600',
+    textAlign: 'center',
   },
 });

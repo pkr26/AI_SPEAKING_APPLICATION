@@ -28,15 +28,11 @@ describe('UTF-8 password policy', () => {
     const password = `a1${'é'.repeat(35)}b`;
     expect(password.length).toBeLessThan(MAX_PASSWORD_UTF8_BYTES);
     expect(utf8ByteLength(password)).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
-    expect(passwordPolicyError(password)).toBe(
-      'Password must be at most 72 UTF-8 bytes.',
-    );
+    expect(passwordPolicyError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
   });
 
   it('rejects short passwords and passwords missing a required character class', () => {
-    expect(passwordPolicyError('abc123')).toBe(
-      'Password must be at least 8 characters.',
-    );
+    expect(passwordPolicyError('abc123')).toBe('Password must be at least 8 characters.');
     expect(passwordPolicyError('abcdefgh')).toBe(
       'Password must include at least one letter and one number.',
     );
@@ -45,12 +41,9 @@ describe('UTF-8 password policy', () => {
     );
   });
 
-  it.each(['भाषा1234', 'భాషా1234', 'Español1']) (
-    'accepts Unicode letters in %p',
-    (password) => {
-      expect(passwordPolicyError(password)).toBeNull();
-    },
-  );
+  it.each(['भाषा1234', 'భాషా1234', 'Español1'])('accepts Unicode letters in %p', (password) => {
+    expect(passwordPolicyError(password)).toBeNull();
+  });
 
   it.each([
     ['\x7F', 1],

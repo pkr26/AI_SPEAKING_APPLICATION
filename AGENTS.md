@@ -9,22 +9,25 @@ Monorepo, two packages:
 - `server/` — Node + Express + TypeScript API (port 4000). PostgreSQL via `pg`, JWT auth, S3 presigned audio uploads (multer multipart fallback in dev/test), OpenAI Whisper transcription plus GPT transcript-based feedback. Entry: `server/src/index.ts`; app wiring in `server/src/app.ts`.
 - `app/` — Expo React Native (SDK 57, expo-router, TanStack Query, expo-secure-store, expo-audio). All source lives under `app/src/` (routes in `app/src/app/`, shared code in `app/src/lib/` and `app/src/components/`); all tests live in `app/__tests__/`.
 
-Contract between them: camelCase JSON everywhere; auth = `Authorization: Bearer <jwt>`. Audio upload is two-step: the app calls `POST /uploads/audio-url` with the recording's content type and either gets `{mode:'s3', uploadUrl, audioKey}` — it PUTs bytes straight to S3, then POSTs JSON `{questionId, requestId, audioKey}` to the assessment endpoint — or `{mode:'direct'}` (dev/test without `S3_BUCKET`), where it posts multipart with file field `audio` + UUID text fields `questionId` and `requestId`. In both modes `requestId` must be reused when retrying one logical submission, and the assessment-endpoint response contract is identical. The app derives its base URL from `EXPO_PUBLIC_API_URL` (fallback: LAN IP from Expo hostUri, then platform-specific emulator URLs).
+Contract between them: camelCase JSON everywhere; auth = `Authorization: Bearer <jwt>`. Audio upload is two-step: the app calls `POST /uploads/audio-url` with the recording's content type and either gets a size-constrained `{mode:'s3', uploadUrl, uploadFields, audioKey, contentType, expiresIn, maxBytes}` grant — it submits the signed multipart form straight to S3, then POSTs JSON `{questionId, requestId, audioKey}` to the assessment endpoint — or `{mode:'direct'}` (dev/test without `S3_BUCKET`), where it posts multipart with file field `audio` + UUID text fields `questionId` and `requestId`. In both modes `requestId` must be reused when retrying one logical submission, and the assessment-endpoint response contract is identical. The app persists the upload stage and S3 key in secure storage so an interrupted handoff can reconcile the same logical request. The app derives its base URL from `EXPO_PUBLIC_API_URL` (fallback: LAN IP from Expo hostUri, then platform-specific emulator URLs).
 
 ## Commands
 
 Server (`cd server`):
+
 - `npm run db:setup` — local/initial setup: create DB if missing, run checksummed migrations, idempotently seed 36 questions
 - `npm run db:migrate` / `npm run db:migrate:prod` — migration-only development / compiled production commands; deploys must not run `db:setup`
 - `npm run dev` — tsx watch; needs `.env` (see `.env.example`); `MOCK_AI=true` avoids OpenAI calls
 - `npm test` — vitest + supertest with enforced coverage thresholds against auto-created `ai_english_test` DB
-- `npm run lint` · `npm run typecheck` · `npm run format`
+- `npm run format:check` · `npm run lint` · `npm run typecheck` · `npm run build` · `npm test`
 - `RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 npm run dev` then `npm run smoke` — full e2e journey smoke test (needs relaxed limits)
 
 App (`cd app`):
+
 - `npx expo start` — run in Expo Go / simulator
-- `npm run lint` · `npm run typecheck` · `npm test` · `npm run doctor`
+- `npm run format:check` · `npm run lint` · `npm run typecheck` · `npm test` (with enforced coverage floors) · `npm run doctor`
 - `npm run audit:ci` — reject new dependency advisories while the reviewed Expo/Metro upstream baseline remains
+- `NODE_ENV=production EXPO_PUBLIC_API_URL=https://api.example.invalid npx expo export --platform ios` (and `android`) — production bundle validation
 
 ## Conventions
 
@@ -33,18 +36,21 @@ App (`cd app`):
 - **Validation** — every route validates body + params with zod via `validate()`; malformed UUIDs must 400, not 500.
 - **Logging** — use the pino logger (`server/src/logger.ts`), never `console.*`; never log tokens, passwords, or secrets.
 - **Errors** — throw `HttpError(status, message)`; the central handler shapes the response. Don't leak internals.
-- **Rate limits** — new expensive endpoints must get a limiter in `server/src/rate-limit.ts`.
-- **Audio ingress** — production stores learner audio in S3 via presigned PUT URLs (`server/src/audio-upload.ts`; `S3_BUCKET` required in production). Keys are `audio-uploads/{userId}/{uuid}.{ext}`, validated per-user before the API downloads them, and objects are deleted after assessment. Local dev/test keeps the multer multipart flow (`server/src/upload.ts`); never make tests depend on real AWS.
+- **Rate limits** — new expensive endpoints must get a limiter in `server/src/rate-limit.ts`. Security-sensitive global/auth/login-account/assessment/upload-grant counters use the shared PostgreSQL store in `server/src/postgres-rate-limit-store.ts`; keep namespaces stable across replicas and add migrations for store schema changes. The login-account limiter runs after JSON parsing, HMACs normalized email keys, and refunds successful responses. S3 grants have a separate budget so grant issuance does not consume the paid assessment limiter.
+- **Audio ingress** — production stores learner audio in S3 via size-constrained presigned POST forms (`server/src/audio-upload.ts`; `S3_BUCKET` required in production). Keys are `audio-uploads/{userId}/{uuid}.{ext}`, validated per-user before the API downloads them, and submitted objects are deleted after assessment. Production buckets also need a short lifecycle expiration for uploads abandoned before assessment submission. Local dev/test keeps the multer multipart flow (`server/src/upload.ts`); never make tests depend on real AWS.
 - **Money endpoints** — anything that calls OpenAI must go through the assess pipeline (daily cap + concurrency semaphore) — never call OpenAI directly from a route.
-- **Password policy** — min 8, letter + number; mirrored client-side via `passwordPolicyError()` in `app/src/lib/auth.tsx`. Keep both in sync.
+- **Native media work** — every FFmpeg decode must acquire the fail-fast `AUDIO_INSPECTION_MAX_CONCURRENCY` slot before spawning and release it on every outcome; do not queue unbounded decoder work.
+- **Password policy** — min 8, letter + number; mirrored client-side via `passwordPolicyError()` in `app/src/lib/password-policy.ts`. Keep both in sync.
 - **Recorder** — `app/src/components/Recorder.tsx` is the single shared recording component (spec requirement); do not fork it per screen.
 - **TypeScript strict** in both packages; zero type errors is the bar for any change.
 - Tests: add vitest coverage for any new endpoint; keep coverage thresholds and `scripts/smoke.mjs` passing. App component/hook tests use `@testing-library/react-native` v14 (devDependency) — its `render`/`fireEvent`/`act` APIs are fully async and must be awaited.
-- **Mutation testing** — both packages carry a `stryker.config.json` (jest runner for app, vitest runner for server, concurrency 1 since tests share `ai_english_test`). Run with `npx stryker run` in either package; reports land in `reports/mutation/` (gitignored, as is `.stryker-tmp/`). Stryker packages are installed with `npm install --no-save` so manifests stay clean.
+- **Mutation testing** — both packages carry a `stryker.config.json` (jest runner and concurrency 2 for app; vitest runner and concurrency 1 for server because server tests share `ai_english_test`). Run with `npx stryker run` in either package; reports land in `reports/mutation/` (gitignored, as is `.stryker-tmp/`). Stryker packages are currently installed with `npm install --no-save`, so a clean `npm ci` does not install them; treat reproducible CI mutation testing as follow-up work.
 
 ## Verification before calling work done
 
-1. `cd server && npm run lint && npm run typecheck && npm test`
+1. `cd server && npm run format:check && npm run lint && npm run typecheck && npm run build && npm test`
 2. Smoke: server running with relaxed limits + `MOCK_AI=true` → `npm run smoke` exit 0
-3. `cd app && npm run lint && npm run typecheck && npm test && npm run doctor && npm run audit:ci`
-4. `npm audit` in both packages — no new vulnerabilities introduced beyond the explicitly reviewed mobile upstream baseline
+3. `cd app && npm run format:check && npm run lint && npm run typecheck && npm test && npm run doctor && npm run audit:ci`
+4. In `app`, production-mode `expo export` for both `ios` and `android` with an explicit HTTPS `EXPO_PUBLIC_API_URL`
+5. `npm audit` in both packages — no new vulnerabilities introduced beyond the explicitly reviewed mobile upstream baseline
+6. When container files change, build and scan `server/Dockerfile` and exercise its healthcheck before release

@@ -15,6 +15,18 @@ export type AssessmentRequestClaim =
   { kind: 'claimed'; claimId: string } | { kind: 'completed'; response: Record<string, unknown> };
 
 /**
+ * Internal signal that another worker still owns this request UUID. Routes use
+ * it to preserve a possibly shared S3 object until that owner finishes. The
+ * public status/message remain the normal HttpError contract.
+ */
+export class AssessmentRequestInFlightError extends HttpError {
+  constructor(message: string, extra?: Record<string, unknown>) {
+    super(409, message, extra);
+    this.name = 'AssessmentRequestInFlightError';
+  }
+}
+
+/**
  * Claim a client request UUID before any quota/provider work. Completed rows
  * replay their exact response; concurrent processing returns 409 with a short
  * retry hint. The same UUID can never be reused for another question/context.
@@ -53,14 +65,20 @@ export async function claimAssessmentRequest(
       [userId, requestId],
     );
     const row = existing.rows[0];
-    if (!row || row.context !== context || row.question_id !== questionId) {
+    if (!row) {
+      throw new HttpError(409, 'Assessment request identifier was already used');
+    }
+    if (row.context !== context || row.question_id !== questionId) {
+      if (row.status === 'processing') {
+        throw new AssessmentRequestInFlightError('Assessment request identifier was already used');
+      }
       throw new HttpError(409, 'Assessment request identifier was already used');
     }
     if (row.status === 'completed' && row.response_body) {
       await client.query('COMMIT');
       return { kind: 'completed', response: row.response_body };
     }
-    throw new HttpError(409, 'Assessment is still processing', { retryAfterSeconds: 2 });
+    throw new AssessmentRequestInFlightError('Assessment is still processing', { retryAfterSeconds: 2 });
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
@@ -137,4 +155,22 @@ export async function getAssessmentRequestStatus(
     return { status: 'completed', context: row.context, questionId: row.question_id, response: row.response_body };
   }
   return { status: 'processing', context: row.context, questionId: row.question_id };
+}
+
+/**
+ * Cleanup guard used by pre-route S3 middleware. A live processing row means
+ * some worker may still need the request's shared audio object, even if this
+ * duplicate was rejected by validation, eligibility, or a limiter before it
+ * reached claimAssessmentRequest.
+ */
+export async function isAssessmentRequestProcessing(userId: string, requestId: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1
+     FROM assessment_requests
+     WHERE user_id = $1 AND request_id = $2
+       AND status = 'processing'
+       AND started_at >= now() - interval '5 minutes'`,
+    [userId, requestId],
+  );
+  return rows.length > 0;
 }

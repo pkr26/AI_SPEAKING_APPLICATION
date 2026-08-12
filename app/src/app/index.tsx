@@ -1,27 +1,17 @@
 import React, { useEffect } from 'react';
-import {
-  ActivityIndicator,
-  Pressable,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
 import { Redirect } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 
 import { ApiError, apiFetch, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
-import { colors } from '../lib/theme';
+import { colors, layout } from '../lib/theme';
 import { parseUserResponse } from '../lib/types';
 
 function LoadingView({ label }: { label: string }) {
   return (
     <View style={styles.center}>
-      <ActivityIndicator
-        accessibilityLabel={label}
-        size="large"
-        color={colors.primary}
-      />
+      <ActivityIndicator accessibilityLabel={label} size="large" color={colors.primary} />
       <Text accessibilityLiveRegion="polite" style={styles.muted}>
         {label}
       </Text>
@@ -37,7 +27,8 @@ function LoadingView({ label }: { label: string }) {
  * An expired/invalid token (401) is cleared and the user lands on login.
  */
 export default function Gate() {
-  const { token, user, sessionVersion, isRestoring, setUser } = useAuth();
+  const { token, user, sessionVersion, isRestoring, restoreError, retrySessionRestore, setUser } =
+    useAuth();
 
   const meQuery = useQuery({
     queryKey: ['me', sessionVersion],
@@ -55,6 +46,26 @@ export default function Gate() {
 
   if (isRestoring) {
     return <LoadingView label="Restoring your session…" />;
+  }
+
+  if (restoreError) {
+    return (
+      <View style={styles.center}>
+        <Text accessibilityRole="header" style={styles.title}>
+          Can&apos;t access your secure session
+        </Text>
+        <Text accessibilityRole="alert" style={styles.muted}>
+          {restoreError}
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+          onPress={retrySessionRestore}
+        >
+          <Text style={styles.buttonText}>Try Again</Text>
+        </Pressable>
+      </View>
+    );
   }
 
   if (!token) {
@@ -75,10 +86,7 @@ export default function Gate() {
       <View style={styles.center}>
         <Text style={styles.title}>Can&apos;t reach the server</Text>
         <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-          {userMessageForError(
-            meQuery.error,
-            'Could not load your profile. Please try again.',
-          )}
+          {userMessageForError(meQuery.error, 'Could not load your profile. Please try again.')}
         </Text>
         <Pressable
           accessibilityRole="button"
@@ -96,9 +104,7 @@ export default function Gate() {
     return <LoadingView label="Loading your profile…" />;
   }
 
-  return (
-    <Redirect href={profile.diagnosticCompleted ? '/practice' : '/diagnostic'} />
-  );
+  return <Redirect href={profile.diagnosticCompleted ? '/practice' : '/diagnostic'} />;
 }
 
 const styles = StyleSheet.create({
@@ -124,6 +130,7 @@ const styles = StyleSheet.create({
   },
   button: {
     marginTop: 24,
+    minHeight: layout.minimumTarget,
     backgroundColor: colors.primary,
     borderRadius: 12,
     paddingVertical: 14,

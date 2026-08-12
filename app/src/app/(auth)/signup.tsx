@@ -20,7 +20,7 @@ import {
   passwordPolicyError,
   useAuth,
 } from '../../lib/auth';
-import { colors } from '../../lib/theme';
+import { colors, layout } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
 
 const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
@@ -35,14 +35,11 @@ export default function SignupScreen() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(
-    null,
-  );
+  const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const passwordError =
-    password.length > 0 ? passwordPolicyError(password) : null;
+  const passwordError = password.length > 0 ? passwordPolicyError(password) : null;
 
   const canSubmit =
     name.trim().length > 0 &&
@@ -84,130 +81,112 @@ export default function SignupScreen() {
         style={styles.flex}
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
-        <ScrollView
-          contentContainerStyle={styles.container}
-          keyboardShouldPersistTaps="handled"
-        >
-        <Text accessibilityRole="header" style={styles.brand}>
-          Create your account
-        </Text>
-        <Text style={styles.subtitle}>
-          We&apos;ll tailor your practice to your native language.
-        </Text>
+        <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <Text accessibilityRole="header" style={styles.brand}>
+            Create your account
+          </Text>
+          <Text style={styles.subtitle}>
+            We&apos;ll tailor your practice to your native language.
+          </Text>
 
-        <View style={styles.form}>
-          <Text style={styles.label}>Name</Text>
-          <TextInput
-            accessibilityLabel="Name"
-            style={styles.input}
-            value={name}
-            onChangeText={setName}
-            placeholder="Your name"
-            placeholderTextColor={colors.muted}
-            autoCapitalize="words"
-            textContentType="name"
-            maxLength={MAX_NAME_LENGTH}
-          />
+          <View style={styles.form}>
+            <Text style={styles.label}>Name</Text>
+            <TextInput
+              accessibilityLabel="Name"
+              style={styles.input}
+              value={name}
+              onChangeText={setName}
+              placeholder="Your name"
+              placeholderTextColor={colors.muted}
+              autoCapitalize="words"
+              textContentType="name"
+              maxLength={MAX_NAME_LENGTH}
+            />
 
-          <Text style={styles.label}>Email</Text>
-          <TextInput
-            accessibilityLabel="Email"
-            style={styles.input}
-            value={email}
-            onChangeText={setEmail}
-            placeholder="you@example.com"
-            placeholderTextColor={colors.muted}
-            autoCapitalize="none"
-            autoCorrect={false}
-            keyboardType="email-address"
-            textContentType="emailAddress"
-            maxLength={MAX_EMAIL_LENGTH}
-          />
+            <Text style={styles.label}>Email</Text>
+            <TextInput
+              accessibilityLabel="Email"
+              style={styles.input}
+              value={email}
+              onChangeText={setEmail}
+              placeholder="you@example.com"
+              placeholderTextColor={colors.muted}
+              autoCapitalize="none"
+              autoCorrect={false}
+              keyboardType="email-address"
+              textContentType="emailAddress"
+              maxLength={MAX_EMAIL_LENGTH}
+            />
 
-          <Text style={styles.label}>Password</Text>
-          <TextInput
-            accessibilityLabel="Password"
-            style={styles.input}
-            value={password}
-            onChangeText={setPassword}
-            placeholder="At least 8 characters, with a letter and a number"
-            placeholderTextColor={colors.muted}
-            secureTextEntry
-            textContentType="newPassword"
-            maxLength={MAX_PASSWORD_UTF8_BYTES}
-          />
-          {passwordError && (
-            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
-              {passwordError}
-            </Text>
-          )}
+            <Text style={styles.label}>Password</Text>
+            <TextInput
+              accessibilityLabel="Password"
+              style={styles.input}
+              value={password}
+              onChangeText={setPassword}
+              placeholder="At least 8 characters, with a letter and a number"
+              placeholderTextColor={colors.muted}
+              secureTextEntry
+              textContentType="newPassword"
+              maxLength={MAX_PASSWORD_UTF8_BYTES}
+            />
+            {passwordError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {passwordError}
+              </Text>
+            )}
 
-          <Text style={styles.label}>Native language</Text>
-          <View style={styles.languageGrid}>
-            {LANGUAGES.map((lang) => {
-              const selected = nativeLanguage === lang.code;
-              return (
-                <Pressable
-                  key={lang.code}
-                  accessibilityRole="button"
-                  accessibilityLabel={`${lang.english}, ${lang.native}`}
-                  accessibilityState={{ selected }}
-                  onPress={() => setNativeLanguage(lang.code)}
-                  style={[
-                    styles.languageChip,
-                    selected && styles.languageChipSelected,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.languageNative,
-                      selected && styles.languageTextSelected,
-                    ]}
+            <Text style={styles.label}>Native language</Text>
+            <View style={styles.languageGrid}>
+              {LANGUAGES.map((lang) => {
+                const selected = nativeLanguage === lang.code;
+                return (
+                  <Pressable
+                    key={lang.code}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${lang.english}, ${lang.native}`}
+                    accessibilityState={{ selected }}
+                    onPress={() => setNativeLanguage(lang.code)}
+                    style={[styles.languageChip, selected && styles.languageChipSelected]}
                   >
-                    {lang.native}
-                  </Text>
-                  <Text
-                    style={[
-                      styles.languageEnglish,
-                      selected && styles.languageTextSelected,
-                    ]}
-                  >
-                    {lang.english}
-                  </Text>
-                </Pressable>
-              );
-            })}
+                    <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
+                      {lang.native}
+                    </Text>
+                    <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
+                      {lang.english}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            {error && (
+              <Text accessibilityRole="alert" style={styles.error}>
+                {error}
+              </Text>
+            )}
+
+            <Pressable
+              accessibilityRole="button"
+              accessibilityState={{ disabled: !canSubmit, busy }}
+              disabled={!canSubmit}
+              onPress={handleSignup}
+              style={({ pressed }) => [
+                styles.button,
+                !canSubmit && styles.buttonDisabled,
+                pressed && canSubmit && styles.buttonPressed,
+              ]}
+            >
+              <Text style={styles.buttonText}>{busy ? 'Creating account…' : 'Sign Up'}</Text>
+            </Pressable>
           </View>
 
-          {error && (
-            <Text accessibilityRole="alert" style={styles.error}>
-              {error}
-            </Text>
-          )}
-
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ disabled: !canSubmit, busy }}
-            disabled={!canSubmit}
-            onPress={handleSignup}
-            style={({ pressed }) => [
-              styles.button,
-              !canSubmit && styles.buttonDisabled,
-              pressed && canSubmit && styles.buttonPressed,
-            ]}
-          >
-            <Text style={styles.buttonText}>
-              {busy ? 'Creating account…' : 'Sign Up'}
-            </Text>
-          </Pressable>
-        </View>
-
-        <View style={styles.footer}>
-          <Text style={styles.footerText}>Already have an account? </Text>
-          <Link href="/login" style={styles.footerLink}>
-            Sign in
-          </Link>
-        </View>
+          <View style={styles.footer}>
+            <Text style={styles.footerText}>Already have an account? </Text>
+            <Link href="/login" style={styles.footerLink}>
+              Sign in
+            </Link>
+          </View>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -223,6 +202,9 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     justifyContent: 'center',
     padding: 24,
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
   },
   brand: {
     fontSize: 28,
@@ -324,7 +306,9 @@ const styles = StyleSheet.create({
   },
   footer: {
     marginTop: 24,
+    minHeight: layout.minimumTarget,
     flexDirection: 'row',
+    alignItems: 'center',
     justifyContent: 'center',
   },
   footerText: {
@@ -332,6 +316,7 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
   footerLink: {
+    paddingVertical: 12,
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',

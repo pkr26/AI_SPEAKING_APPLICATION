@@ -1,7 +1,7 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, render, screen, waitFor } from "@testing-library/react-native";
-import { useEffect } from "react";
-import { Text } from "react-native";
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { act, render, screen, waitFor } from '@testing-library/react-native';
+import { useEffect } from 'react';
+import { Text } from 'react-native';
 
 import {
   ApiError,
@@ -10,21 +10,20 @@ import {
   getToken,
   saveToken,
   setUnauthorizedHandler,
-} from "../src/lib/api";
+} from '../src/lib/api';
 import {
   AccountDeletedCleanupError,
   AuthProvider,
   LogoutCleanupError,
   useAuth,
-} from "../src/lib/auth";
-import { clearPendingAssessment } from "../src/lib/pending-assessment";
-import type { User } from "../src/lib/types";
+} from '../src/lib/auth';
+import { clearPendingAssessment } from '../src/lib/pending-assessment';
+import type { User } from '../src/lib/types';
 
 // React 19 requires this opt-in before act() can track async updates.
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean })
-  .IS_REACT_ACT_ENVIRONMENT = true;
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-jest.mock("../src/lib/api", () => {
+jest.mock('../src/lib/api', () => {
   // A local class keeps `error instanceof ApiError` working inside auth.tsx,
   // which imports the mocked module, without executing the real api module.
   class MockApiError extends Error {
@@ -32,7 +31,7 @@ jest.mock("../src/lib/api", () => {
 
     constructor(status: number, message: string) {
       super(message);
-      this.name = "ApiError";
+      this.name = 'ApiError';
       this.status = status;
     }
   }
@@ -47,7 +46,7 @@ jest.mock("../src/lib/api", () => {
   };
 });
 
-jest.mock("../src/lib/pending-assessment", () => ({
+jest.mock('../src/lib/pending-assessment', () => ({
   clearPendingAssessment: jest.fn(),
 }));
 
@@ -59,10 +58,10 @@ const mockedSetUnauthorizedHandler = jest.mocked(setUnauthorizedHandler);
 const mockedClearPendingAssessment = jest.mocked(clearPendingAssessment);
 
 const USER: User = {
-  id: "550e8400-e29b-41d4-a716-446655440000",
-  name: "Test User",
-  email: "test@example.com",
-  nativeLanguage: "te",
+  id: '550e8400-e29b-41d4-a716-446655440000',
+  name: 'Test User',
+  email: 'test@example.com',
+  nativeLanguage: 'te',
   cefrLevel: null,
   diagnosticCompleted: false,
 };
@@ -92,13 +91,14 @@ function Capture() {
 }
 
 function SessionDisplay() {
-  const { token, user, sessionVersion, isRestoring } = useAuth();
+  const { token, user, sessionVersion, isRestoring, restoreError } = useAuth();
   return (
     <>
-      <Text testID="token">{token ?? "null"}</Text>
-      <Text testID="userEmail">{user?.email ?? "null"}</Text>
+      <Text testID="token">{token ?? 'null'}</Text>
+      <Text testID="userEmail">{user?.email ?? 'null'}</Text>
       <Text testID="sessionVersion">{String(sessionVersion)}</Text>
       <Text testID="isRestoring">{String(isRestoring)}</Text>
+      <Text testID="restoreError">{restoreError ?? 'null'}</Text>
     </>
   );
 }
@@ -121,17 +121,17 @@ function renderTree(queryClient: QueryClient) {
 async function renderAuth(storedToken: string | null = null) {
   mockedGetToken.mockResolvedValue(storedToken);
   const queryClient = new QueryClient();
-  const clearSpy = jest.spyOn(queryClient, "clear");
+  const clearSpy = jest.spyOn(queryClient, 'clear');
   const rendered = await renderTree(queryClient);
-  await waitFor(() => expect(text("isRestoring")).toBe("false"));
+  await waitFor(() => expect(text('isRestoring')).toBe('false'));
   return { ...rendered, queryClient, clearSpy };
 }
 
-async function renderLoggedIn(token = "tok-1") {
+async function renderLoggedIn(token = 'tok-1') {
   const rendered = await renderAuth(null);
   mockedApiFetch.mockResolvedValueOnce(authResponse(token));
   await act(async () => {
-    await auth!.login("a@example.com", "secret1");
+    await auth!.login('a@example.com', 'secret1');
   });
   return rendered;
 }
@@ -141,7 +141,7 @@ function registeredUnauthorizedHandler(): (rejectedToken: string) => void {
     .reverse()
     .map(([handler]) => handler)
     .find((handler) => handler !== null);
-  if (!registered) throw new Error("no unauthorized handler was registered");
+  if (!registered) throw new Error('no unauthorized handler was registered');
   return registered;
 }
 
@@ -150,43 +150,60 @@ beforeEach(() => {
   auth = null;
   mockedGetToken.mockResolvedValue(null);
   mockedSaveToken.mockResolvedValue(undefined);
-  mockedClearToken.mockResolvedValue(undefined);
+  mockedClearToken.mockResolvedValue(true);
   mockedClearPendingAssessment.mockResolvedValue(undefined);
 });
 
-describe("AuthProvider session restore", () => {
-  it("restores a persisted token and bumps sessionVersion", async () => {
-    const { clearSpy } = await renderAuth("tok-stored");
+describe('AuthProvider session restore', () => {
+  it('restores a persisted token and bumps sessionVersion', async () => {
+    const { clearSpy } = await renderAuth('tok-stored');
 
-    expect(text("token")).toBe("tok-stored");
-    expect(text("userEmail")).toBe("null");
-    expect(text("isRestoring")).toBe("false");
-    expect(text("sessionVersion")).toBe("1");
+    expect(text('token')).toBe('tok-stored');
+    expect(text('userEmail')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+    expect(text('sessionVersion')).toBe('1');
     expect(clearSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("completes the restore with no session when nothing is persisted", async () => {
+  it('completes the restore with no session when nothing is persisted', async () => {
     await renderAuth(null);
 
     expect(mockedGetToken).toHaveBeenCalledTimes(1);
-    expect(text("token")).toBe("null");
-    expect(text("isRestoring")).toBe("false");
-    expect(text("sessionVersion")).toBe("1");
+    expect(text('token')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+    expect(text('sessionVersion')).toBe('1');
   });
 
-  it("ignores a restore that resolves after unmount", async () => {
+  it('exposes a retryable error when secure session storage cannot be read', async () => {
+    mockedGetToken.mockRejectedValueOnce(new Error('keychain locked'));
+    await renderTree(new QueryClient());
+
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('token')).toBe('null');
+    expect(text('restoreError')).toBe(
+      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+    );
+
+    mockedGetToken.mockResolvedValueOnce('tok-recovered');
+    await act(async () => {
+      auth!.retrySessionRestore();
+    });
+    await waitFor(() => expect(text('token')).toBe('tok-recovered'));
+    expect(text('restoreError')).toBe('null');
+    expect(text('sessionVersion')).toBe('1');
+  });
+
+  it('ignores a restore that resolves after unmount', async () => {
     const stored = deferred<string | null>();
     mockedGetToken.mockReturnValue(stored.promise);
-    const consoleSpy = jest
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 
     const rendered = await renderTree(new QueryClient());
     await rendered.unmount();
     expect(mockedSetUnauthorizedHandler).toHaveBeenLastCalledWith(null);
 
     await act(async () => {
-      stored.resolve("tok-late");
+      stored.resolve('tok-late');
       await stored.promise;
     });
 
@@ -195,108 +212,103 @@ describe("AuthProvider session restore", () => {
   });
 });
 
-describe("login", () => {
-  it("posts credentials, persists the token, and establishes the session", async () => {
+describe('login', () => {
+  it('posts credentials, persists the token, and establishes the session', async () => {
     const { clearSpy } = await renderAuth(null);
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-login"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
 
     let loggedIn: User | undefined;
     await act(async () => {
-      loggedIn = await auth!.login("a@example.com", "secret1");
+      loggedIn = await auth!.login('a@example.com', 'secret1');
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/login", {
-      method: "POST",
-      body: { email: "a@example.com", password: "secret1" },
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/login', {
+      method: 'POST',
+      body: { email: 'a@example.com', password: 'secret1' },
       auth: false,
       expireSessionOn401: false,
     });
-    expect(mockedSaveToken).toHaveBeenCalledWith("tok-login");
+    expect(mockedSaveToken).toHaveBeenCalledWith('tok-login');
     expect(loggedIn).toEqual(USER);
-    expect(text("token")).toBe("tok-login");
-    expect(text("userEmail")).toBe(USER.email);
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('tok-login');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('2');
     expect(clearSpy).toHaveBeenCalledTimes(2);
     expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
   });
 
-  it("rejects a concurrent account operation", async () => {
+  it('rejects a concurrent account operation', async () => {
     await renderAuth(null);
     const pending = deferred<unknown>();
     mockedApiFetch.mockReturnValueOnce(pending.promise);
 
     await act(async () => {
-      const first = auth!.login("a@example.com", "secret1");
-      await expect(auth!.login("b@example.com", "secret1")).rejects.toThrow(
-        "An account operation is already in progress.",
+      const first = auth!.login('a@example.com', 'secret1');
+      await expect(auth!.login('b@example.com', 'secret1')).rejects.toThrow(
+        'An account operation is already in progress.',
       );
-      pending.resolve(authResponse("tok-login"));
+      pending.resolve(authResponse('tok-login'));
       await first;
     });
 
-    expect(text("token")).toBe("tok-login");
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('tok-login');
+    expect(text('sessionVersion')).toBe('2');
   });
 
-  it("propagates a contract failure without establishing a session", async () => {
+  it('propagates a contract failure without establishing a session', async () => {
     await renderAuth(null);
     mockedApiFetch.mockResolvedValueOnce({ unexpected: true });
 
     await act(async () => {
-      await expect(auth!.login("a@example.com", "secret1")).rejects.toThrow(
-        "The server returned an invalid response. Please try again.",
+      await expect(auth!.login('a@example.com', 'secret1')).rejects.toThrow(
+        'The server returned an invalid response. Please try again.',
       );
     });
 
     expect(mockedSaveToken).not.toHaveBeenCalled();
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("1");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('1');
 
     // The failed attempt must release the transition guard.
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-retry"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-retry'));
     await act(async () => {
-      await auth!.login("a@example.com", "secret1");
+      await auth!.login('a@example.com', 'secret1');
     });
-    expect(text("token")).toBe("tok-retry");
+    expect(text('token')).toBe('tok-retry');
   });
 });
 
-describe("register", () => {
-  it("posts the profile and establishes the session", async () => {
+describe('register', () => {
+  it('posts the profile and establishes the session', async () => {
     await renderAuth(null);
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-registered"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-registered'));
 
     let registered: User | undefined;
     await act(async () => {
-      registered = await auth!.register(
-        "Test User",
-        "a@example.com",
-        "secret1",
-        "hi",
-      );
+      registered = await auth!.register('Test User', 'a@example.com', 'secret1', 'hi');
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/register", {
-      method: "POST",
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/register', {
+      method: 'POST',
       body: {
-        name: "Test User",
-        email: "a@example.com",
-        password: "secret1",
-        nativeLanguage: "hi",
+        name: 'Test User',
+        email: 'a@example.com',
+        password: 'secret1',
+        nativeLanguage: 'hi',
       },
       auth: false,
       expireSessionOn401: false,
     });
-    expect(mockedSaveToken).toHaveBeenCalledWith("tok-registered");
+    expect(mockedSaveToken).toHaveBeenCalledWith('tok-registered');
     expect(registered).toEqual(USER);
-    expect(text("token")).toBe("tok-registered");
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('tok-registered');
+    expect(text('sessionVersion')).toBe('2');
   });
 });
 
-describe("logout", () => {
-  it("revokes the token and resets the session", async () => {
+describe('logout', () => {
+  it('revokes the token and resets the session', async () => {
     const { clearSpy } = await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
 
@@ -304,36 +316,35 @@ describe("logout", () => {
       await auth!.logout();
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/logout", {
-      method: "POST",
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/logout', {
+      method: 'POST',
       expireSessionOn401: false,
     });
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3); // mount + login + logout
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
   });
 
-  it("tolerates a 401 from the logout endpoint", async () => {
+  it('tolerates a 401 from the logout endpoint', async () => {
     await renderLoggedIn();
-    mockedApiFetch.mockRejectedValueOnce(
-      new ApiError(401, "Request failed with status 401"),
-    );
+    mockedApiFetch.mockRejectedValueOnce(new ApiError(401, 'Request failed with status 401'));
 
     await act(async () => {
       await auth!.logout();
     });
 
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
-    expect(text("token")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
   });
 
-  it("aborts the logout when the server call fails for another reason", async () => {
+  it('aborts the logout when the server call fails for another reason', async () => {
     await renderLoggedIn();
-    const failure = new ApiError(500, "Request failed with status 500");
+    const failure = new ApiError(500, 'Request failed with status 500');
     mockedApiFetch.mockRejectedValueOnce(failure);
 
     await act(async () => {
@@ -341,27 +352,41 @@ describe("logout", () => {
     });
 
     expect(mockedClearToken).not.toHaveBeenCalled();
-    expect(text("token")).toBe("tok-1");
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('tok-1');
+    expect(text('sessionVersion')).toBe('2');
   });
 
-  it("still resets the session when clearing the persisted token fails", async () => {
+  it('still resets the session when clearing the persisted token fails', async () => {
     await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
-    mockedClearToken.mockRejectedValueOnce(new Error("keychain unavailable"));
+    mockedClearToken.mockRejectedValueOnce(new Error('keychain unavailable'));
 
     await act(async () => {
       await expect(auth!.logout()).rejects.toBeInstanceOf(LogoutCleanupError);
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('reports pending-assessment cleanup failure after revoking the session', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearPendingAssessment.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await act(async () => {
+      await expect(auth!.logout()).rejects.toBeInstanceOf(LogoutCleanupError);
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
   });
 });
 
-describe("expireSession via the unauthorized handler", () => {
-  it("registers the handler on mount and removes it on unmount", async () => {
+describe('expireSession via the unauthorized handler', () => {
+  it('registers the handler on mount and removes it on unmount', async () => {
     const { unmount } = await renderAuth(null);
 
     expect(registeredUnauthorizedHandler()).toBeInstanceOf(Function);
@@ -370,264 +395,370 @@ describe("expireSession via the unauthorized handler", () => {
     expect(mockedSetUnauthorizedHandler).toHaveBeenLastCalledWith(null);
   });
 
-  it("resets the session when the active token is rejected", async () => {
+  it('resets the session when the active token is rejected', async () => {
     const { clearSpy } = await renderLoggedIn();
 
     await act(async () => {
-      registeredUnauthorizedHandler()("tok-1");
+      registeredUnauthorizedHandler()('tok-1');
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3);
   });
 
-  it("expires a session restored from storage", async () => {
-    await renderAuth("tok-stored");
+  it('expires a session restored from storage', async () => {
+    await renderAuth('tok-stored');
 
     await act(async () => {
-      registeredUnauthorizedHandler()("tok-stored");
+      registeredUnauthorizedHandler()('tok-stored');
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('null');
+    expect(text('sessionVersion')).toBe('2');
   });
 
-  it("ignores a rejection for a stale token", async () => {
+  it('ignores a rejection for a stale token', async () => {
     await renderLoggedIn();
 
     await act(async () => {
-      registeredUnauthorizedHandler()("tok-stale");
+      registeredUnauthorizedHandler()('tok-stale');
     });
 
-    expect(text("token")).toBe("tok-1");
-    expect(text("userEmail")).toBe(USER.email);
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
   });
 
-  it("ignores a rejection that arrives during an account transition", async () => {
+  it('ignores a rejection that arrives during an account transition', async () => {
     await renderLoggedIn();
     const pending = deferred<unknown>();
     mockedApiFetch.mockReturnValueOnce(pending.promise);
 
     await act(async () => {
-      const rotation = auth!.changePassword("secret1", "secret2");
+      const rotation = auth!.changePassword('secret1', 'secret2');
       // Let the change-password request start before the late 401 arrives.
       await Promise.resolve();
-      registeredUnauthorizedHandler()("tok-1");
+      registeredUnauthorizedHandler()('tok-1');
       expect(mockedClearToken).not.toHaveBeenCalled();
-      pending.resolve(authResponse("tok-rotated"));
+      pending.resolve(authResponse('tok-rotated'));
       await rotation;
     });
 
-    expect(text("token")).toBe("tok-rotated");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('tok-rotated');
+    expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('finishes old pending cleanup before establishing a new session', async () => {
+    await renderLoggedIn();
+    mockedSaveToken.mockClear();
+    const cleanup = deferred<void>();
+    mockedClearPendingAssessment.mockReturnValueOnce(cleanup.promise);
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1));
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-new'));
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+
+    await act(async () => {
+      cleanup.resolve();
+      await login;
+    });
+    expect(mockedSaveToken).toHaveBeenCalledWith('tok-new');
+    expect(text('token')).toBe('tok-new');
+  });
+
+  it('retries a failed old-account cleanup before saving a new session', async () => {
+    await renderLoggedIn();
+    mockedSaveToken.mockClear();
+    mockedClearPendingAssessment.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1));
+
+    const retry = deferred<void>();
+    mockedClearPendingAssessment.mockReturnValueOnce(retry.promise);
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-new'));
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(2));
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+
+    await act(async () => {
+      retry.resolve();
+      await login;
+    });
+    expect(mockedSaveToken).toHaveBeenCalledWith('tok-new');
+    expect(text('token')).toBe('tok-new');
+  });
+
+  it('fails closed when the old-account cleanup retry also fails', async () => {
+    await renderLoggedIn();
+    mockedSaveToken.mockClear();
+    mockedClearPendingAssessment
+      .mockRejectedValueOnce(new Error('first cleanup failure'))
+      .mockRejectedValueOnce(new Error('retry cleanup failure'));
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1));
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-new'));
+    await act(async () => {
+      await expect(auth!.login('a@example.com', 'secret1')).rejects.toThrow(
+        'retry cleanup failure',
+      );
+    });
+
+    expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(2);
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
   });
 });
 
-describe("changePassword", () => {
-  it("rotates the token on success", async () => {
+describe('changePassword', () => {
+  it('rotates the token on success', async () => {
     await renderLoggedIn();
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-rotated"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-rotated'));
 
     await act(async () => {
-      await auth!.changePassword("secret1", "secret2");
+      await auth!.changePassword('secret1', 'secret2');
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/change-password", {
-      method: "POST",
-      body: { currentPassword: "secret1", newPassword: "secret2" },
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/change-password', {
+      method: 'POST',
+      body: { currentPassword: 'secret1', newPassword: 'secret2' },
       expireSessionOn401: false,
     });
-    expect(mockedSaveToken).toHaveBeenCalledWith("tok-rotated");
-    expect(text("token")).toBe("tok-rotated");
-    expect(text("sessionVersion")).toBe("3");
+    expect(mockedSaveToken).toHaveBeenCalledWith('tok-rotated');
+    expect(text('token')).toBe('tok-rotated');
+    expect(text('sessionVersion')).toBe('3');
   });
 
-  it("verifies the session after a 401 and rethrows the original error", async () => {
+  it('verifies the session after a 401 and rethrows the original error', async () => {
     await renderLoggedIn();
-    const failure = new ApiError(401, "Request failed with status 401");
+    const failure = new ApiError(401, 'Request failed with status 401');
     mockedApiFetch.mockImplementation((async (path: string) => {
-      if (path === "/auth/change-password") throw failure;
-      if (path === "/auth/me") return { user: USER };
+      if (path === '/auth/change-password') throw failure;
+      if (path === '/auth/me') return { user: USER };
       throw new Error(`unexpected apiFetch call: ${path}`);
     }) as unknown as typeof apiFetch);
 
     await act(async () => {
-      await expect(auth!.changePassword("secret1", "secret2")).rejects.toBe(
-        failure,
-      );
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(failure);
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/me");
-    expect(text("token")).toBe("tok-1");
-    expect(text("sessionVersion")).toBe("2");
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
+    expect(text('token')).toBe('tok-1');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
-  it("expires the session when the post-401 verification also fails with 401", async () => {
+  it('expires the session when the post-401 verification also fails with 401', async () => {
     await renderLoggedIn();
-    const failure = new ApiError(401, "Request failed with status 401");
+    const failure = new ApiError(401, 'Request failed with status 401');
     mockedApiFetch.mockImplementation((async () => {
       throw failure;
     }) as unknown as typeof apiFetch);
 
     await act(async () => {
-      await expect(auth!.changePassword("secret1", "secret2")).rejects.toBe(
-        failure,
-      );
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(failure);
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).toHaveBeenCalled();
   });
 
-  it("fails closed when the rotated token cannot be persisted", async () => {
+  it('fails closed when the rotated token cannot be persisted', async () => {
     await renderLoggedIn();
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-rotated"));
-    const keychain = new Error("keychain unavailable");
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-rotated'));
+    const keychain = new Error('keychain unavailable');
     mockedSaveToken.mockRejectedValueOnce(keychain);
 
     await act(async () => {
-      await expect(auth!.changePassword("secret1", "secret2")).rejects.toBe(
-        keychain,
-      );
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(keychain);
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).toHaveBeenCalled();
   });
 });
 
-describe("deleteAccount", () => {
-  it("deletes the account and resets the session", async () => {
+describe('deleteAccount', () => {
+  it('deletes the account and resets the session', async () => {
     const { clearSpy } = await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
 
     await act(async () => {
-      await auth!.deleteAccount("secret1");
+      await auth!.deleteAccount('secret1');
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/account", {
-      method: "DELETE",
-      body: { password: "secret1" },
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/account', {
+      method: 'DELETE',
+      body: { password: 'secret1' },
       expireSessionOn401: false,
     });
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3);
-    expect(text("token")).toBe("null");
-    expect(text("userEmail")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
   });
 
-  it("still resets the session when clearing the persisted token fails", async () => {
+  it('still resets the session when clearing the persisted token fails', async () => {
     await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
-    mockedClearToken.mockRejectedValueOnce(new Error("keychain unavailable"));
+    mockedClearToken.mockRejectedValueOnce(new Error('keychain unavailable'));
 
     await act(async () => {
-      await expect(auth!.deleteAccount("secret1")).rejects.toBeInstanceOf(
+      await expect(auth!.deleteAccount('secret1')).rejects.toBeInstanceOf(
         AccountDeletedCleanupError,
       );
     });
 
-    expect(text("token")).toBe("null");
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('token')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
   });
 
-  it("verifies the session after a 401 and rethrows the original error", async () => {
+  it('reports pending-assessment cleanup failure after deleting the account', async () => {
     await renderLoggedIn();
-    const failure = new ApiError(401, "Request failed with status 401");
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearPendingAssessment.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBeInstanceOf(
+        AccountDeletedCleanupError,
+      );
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('verifies the session after a 401 and rethrows the original error', async () => {
+    await renderLoggedIn();
+    const failure = new ApiError(401, 'Request failed with status 401');
     mockedApiFetch.mockImplementation((async (path: string) => {
-      if (path === "/auth/account") throw failure;
-      if (path === "/auth/me") return { user: USER };
+      if (path === '/auth/account') throw failure;
+      if (path === '/auth/me') return { user: USER };
       throw new Error(`unexpected apiFetch call: ${path}`);
     }) as unknown as typeof apiFetch);
 
     await act(async () => {
-      await expect(auth!.deleteAccount("secret1")).rejects.toBe(failure);
+      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith("/auth/me");
-    expect(text("token")).toBe("tok-1");
-    expect(text("sessionVersion")).toBe("2");
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
+    expect(text('token')).toBe('tok-1');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 });
 
-describe("epoch race guards", () => {
-  it("does not let a late restore overwrite a freshly established session", async () => {
+describe('epoch race guards', () => {
+  it('does not let a late restore overwrite a freshly established session', async () => {
     const stored = deferred<string | null>();
     mockedGetToken.mockReturnValue(stored.promise);
     await renderTree(new QueryClient());
 
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-login"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
     await act(async () => {
-      await auth!.login("a@example.com", "secret1");
+      await auth!.login('a@example.com', 'secret1');
     });
 
     await act(async () => {
-      stored.resolve("tok-stored");
+      stored.resolve('tok-stored');
       await stored.promise;
     });
     await act(async () => {
       await Promise.resolve();
     });
 
-    expect(text("token")).toBe("tok-login");
-    expect(text("userEmail")).toBe(USER.email);
+    expect(text('token')).toBe('tok-login');
+    expect(text('userEmail')).toBe(USER.email);
+  });
+
+  it('conditionally removes a token whose save finishes after unmount', async () => {
+    const rendered = await renderAuth(null);
+    const write = deferred<void>();
+    mockedSaveToken.mockReturnValueOnce(write.promise);
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-late'));
+
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockedSaveToken).toHaveBeenCalledWith('tok-late'));
+
+    await rendered.unmount();
+    write.resolve();
+    await expect(login).rejects.toThrow('The account operation was cancelled.');
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-late');
   });
 });
 
-describe("sessionVersion", () => {
-  it("increments on every identity change", async () => {
+describe('sessionVersion', () => {
+  it('increments on every identity change', async () => {
     await renderAuth(null);
-    expect(text("sessionVersion")).toBe("1");
+    expect(text('sessionVersion')).toBe('1');
 
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-1"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-1'));
     await act(async () => {
-      await auth!.login("a@example.com", "secret1");
+      await auth!.login('a@example.com', 'secret1');
     });
-    expect(text("sessionVersion")).toBe("2");
+    expect(text('sessionVersion')).toBe('2');
 
-    mockedApiFetch.mockResolvedValueOnce(authResponse("tok-2"));
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-2'));
     await act(async () => {
-      await auth!.changePassword("secret1", "secret2");
+      await auth!.changePassword('secret1', 'secret2');
     });
-    expect(text("sessionVersion")).toBe("3");
+    expect(text('sessionVersion')).toBe('3');
 
     mockedApiFetch.mockResolvedValueOnce(undefined);
     await act(async () => {
       await auth!.logout();
     });
-    expect(text("sessionVersion")).toBe("4");
+    expect(text('sessionVersion')).toBe('4');
   });
 });
 
-describe("useAuth", () => {
-  it("throws outside an AuthProvider", async () => {
-    const consoleSpy = jest
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
+describe('useAuth', () => {
+  it('throws outside an AuthProvider', async () => {
+    const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 
     function Bare() {
       useAuth();
       return null;
     }
 
-    await expect(render(<Bare />)).rejects.toThrow(
-      "useAuth must be used within an AuthProvider",
-    );
+    await expect(render(<Bare />)).rejects.toThrow('useAuth must be used within an AuthProvider');
     consoleSpy.mockRestore();
   });
 });

@@ -108,9 +108,7 @@ describe('question and diagnostic contract parsers', () => {
         progress: { asked: 6, maxQuestions: 6 },
       }),
     );
-    expectContractError(() =>
-      parseDiagnosticNext({ done: true, level: 'B9' }),
-    );
+    expectContractError(() => parseDiagnosticNext({ done: true, level: 'B9' }));
     expectContractError(() =>
       parseDiagnosticNext({
         done: false,
@@ -130,18 +128,10 @@ describe('question and diagnostic contract parsers', () => {
       nextQuestion: question,
     };
     expect(parseDiagnosticAnswerResult(answer)).toEqual(answer);
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...answer, score: Number.NaN }),
-    );
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...answer, score: 101 }),
-    );
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...answer, feedback: '  ' }),
-    );
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...answer, nextQuestion: null }),
-    );
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, score: Number.NaN }));
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, score: 101 }));
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, feedback: '  ' }));
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, nextQuestion: null }));
     expectContractError(() =>
       parseDiagnosticAnswerResult({ ...answer, done: false, nextQuestion: undefined }),
     );
@@ -158,14 +148,18 @@ describe('practice contract parsers', () => {
       promptWordNative: 'ప్రయాణం',
       questionText: question.questionText,
       questionTextNative: 'మీరు ఎక్కడికి వెళ్లాలనుకుంటున్నారు?',
-      examples: [{ en: 'I want to travel.', native: 'నేను ప్రయాణించాలనుకుంటున్నాను.' }],
+      examples: [
+        { en: 'I want to travel.', native: 'నేను ప్రయాణించాలనుకుంటున్నాను.' },
+        { en: 'I travel by train.', native: 'నేను రైలులో ప్రయాణిస్తాను.' },
+        { en: 'Travel teaches me.', native: 'ప్రయాణం నాకు నేర్పుతుంది.' },
+      ],
     };
     expect(parseHelpContent(help)).toEqual(help);
 
     const attempt = {
       passed: false,
-      attemptNo: 2,
-      attemptsLeft: 1,
+      attemptNo: 3,
+      attemptsLeft: 0,
       score: 60,
       transcript: 'Spain.',
       feedback: 'Add more detail.',
@@ -242,19 +236,13 @@ describe('field validators', () => {
     });
   });
 
-  it.each(['fr', 'TE', '', 't e', 'english'])(
-    'rejects native language %p',
-    (nativeLanguage) => {
-      expectContractError(() => parseUser({ ...user, nativeLanguage }));
-    },
-  );
+  it.each(['fr', 'TE', '', 't e', 'english'])('rejects native language %p', (nativeLanguage) => {
+    expectContractError(() => parseUser({ ...user, nativeLanguage }));
+  });
 
-  it.each(['A1', 'A2', 'B2', 'C1', 'C2'])(
-    'accepts CEFR level %s',
-    (cefrLevel) => {
-      expect(parseUser({ ...user, cefrLevel })).toMatchObject({ cefrLevel });
-    },
-  );
+  it.each(['A1', 'A2', 'B2', 'C1', 'C2'])('accepts CEFR level %s', (cefrLevel) => {
+    expect(parseUser({ ...user, cefrLevel })).toMatchObject({ cefrLevel });
+  });
 
   it('accepts a null CEFR level before the diagnostic', () => {
     expect(parseUser({ ...user, cefrLevel: null })).toMatchObject({
@@ -294,15 +282,11 @@ describe('score and progress boundaries', () => {
   } as const;
 
   it.each([0, 100])('accepts boundary score %i', (score) => {
-    expect(
-      parseDiagnosticAnswerResult({ ...doneAnswer, score }),
-    ).toMatchObject({ score });
+    expect(parseDiagnosticAnswerResult({ ...doneAnswer, score })).toMatchObject({ score });
   });
 
-  it.each([-1])('rejects out-of-range score %i', (score) => {
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...doneAnswer, score }),
-    );
+  it.each([-1, 50.5])('rejects out-of-contract score %s', (score) => {
+    expectContractError(() => parseDiagnosticAnswerResult({ ...doneAnswer, score }));
   });
 
   it('accepts the final-question progress boundary', () => {
@@ -341,12 +325,8 @@ describe('score and progress boundaries', () => {
   });
 
   it('rejects non-boolean diagnostic answer flags', () => {
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...doneAnswer, passed: 'yes' }),
-    );
-    expectContractError(() =>
-      parseDiagnosticAnswerResult({ ...doneAnswer, done: 1 }),
-    );
+    expectContractError(() => parseDiagnosticAnswerResult({ ...doneAnswer, passed: 'yes' }));
+    expectContractError(() => parseDiagnosticAnswerResult({ ...doneAnswer, done: 1 }));
   });
 });
 
@@ -356,83 +336,153 @@ describe('help and attempt detail boundaries', () => {
     promptWordNative: 'ప్రయాణం',
     questionText: question.questionText,
     questionTextNative: 'ప్రశ్న',
-    examples: [{ en: 'I travel often.', native: 'నేను తరచుగా ప్రయాణిస్తాను.' }],
+    examples: [
+      { en: 'I travel often.', native: 'నేను తరచుగా ప్రయాణిస్తాను.' },
+      { en: 'I travel by train.', native: 'నేను రైలులో ప్రయాణిస్తాను.' },
+      { en: 'Travel teaches me.', native: 'ప్రయాణం నాకు నేర్పుతుంది.' },
+    ],
   } as const;
 
   it('rejects blank help example fields', () => {
     expect(parseHelpContent(help)).toEqual(help);
     expectContractError(() =>
-      parseHelpContent({ ...help, examples: [{ en: '', native: 'x' }] }),
+      parseHelpContent({
+        ...help,
+        examples: [{ en: '', native: 'x' }, ...help.examples.slice(1)],
+      }),
     );
     expectContractError(() =>
-      parseHelpContent({ ...help, examples: [{ en: '   ', native: 'x' }] }),
+      parseHelpContent({
+        ...help,
+        examples: [{ en: '   ', native: 'x' }, ...help.examples.slice(1)],
+      }),
     );
     expectContractError(() =>
-      parseHelpContent({ ...help, examples: [{ en: 'x', native: '' }] }),
+      parseHelpContent({
+        ...help,
+        examples: [{ en: 'x', native: '' }, ...help.examples.slice(1)],
+      }),
     );
     expectContractError(() =>
-      parseHelpContent({ ...help, examples: [{ en: 'x', native: '  ' }] }),
+      parseHelpContent({
+        ...help,
+        examples: [{ en: 'x', native: '  ' }, ...help.examples.slice(1)],
+      }),
     );
   });
 
   it('enforces attempt number and attempts-left bounds', () => {
-    const base = {
+    const final = {
       passed: false,
       attemptNo: 3,
+      attemptsLeft: 0,
+      score: 50,
+      transcript: '',
+      feedback: 'Try again.',
+      finalFeedback: 'Use a complete sentence next time.',
+      nextQuestion: question,
+    };
+    const firstRetry = {
+      passed: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
       score: 50,
       transcript: '',
       feedback: 'Try again.',
     };
-    expect(parseAttemptResult(base)).toEqual(base);
-    expect(parseAttemptResult({ ...base, attemptNo: 1, attemptsLeft: 2 })).toEqual({
-      ...base,
-      attemptNo: 1,
-      attemptsLeft: 2,
-    });
-    expect(parseAttemptResult({ ...base, attemptsLeft: 0 })).toEqual({
-      ...base,
-      attemptsLeft: 0,
-    });
-    expectContractError(() => parseAttemptResult({ ...base, attemptNo: 4 }));
-    expectContractError(() => parseAttemptResult({ ...base, attemptsLeft: -1 }));
-    expectContractError(() => parseAttemptResult({ ...base, attemptsLeft: 3 }));
-    expectContractError(() =>
-      parseAttemptResult({ ...base, attemptsLeft: 0.5 }),
-    );
+    expect(parseAttemptResult(final)).toEqual(final);
+    expect(parseAttemptResult(firstRetry)).toEqual(firstRetry);
+    expectContractError(() => parseAttemptResult({ ...final, attemptNo: 4 }));
+    expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: -1 }));
+    expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: 3 }));
+    expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: 0.5 }));
   });
 
-  it('validates optional final feedback and follow-up questions', () => {
-    const base = {
+  it('enforces passed, retry, and final response shapes', () => {
+    const passed = {
       passed: true,
       attemptNo: 1,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
-    };
-    expect(
-      parseAttemptResult({ ...base, finalFeedback: 'Solid progress.' }),
-    ).toEqual({ ...base, finalFeedback: 'Solid progress.' });
-    expectContractError(() =>
-      parseAttemptResult({ ...base, finalFeedback: '   ' }),
-    );
-    expect(parseAttemptResult({ ...base, nextQuestion: question })).toEqual({
-      ...base,
       nextQuestion: question,
-    });
+    };
+    expect(parseAttemptResult(passed)).toEqual(passed);
+    expectContractError(() => parseAttemptResult({ ...passed, finalFeedback: 'Solid progress.' }));
+    expectContractError(() => parseAttemptResult({ ...passed, attemptsLeft: 2 }));
+    expectContractError(() => parseAttemptResult({ ...passed, nextQuestion: undefined }));
+
+    const retry = {
+      passed: false,
+      attemptNo: 2,
+      attemptsLeft: 1,
+      score: 45,
+      transcript: 'An answer.',
+      feedback: 'Add detail.',
+    };
+    expect(parseAttemptResult(retry)).toEqual(retry);
+    expectContractError(() => parseAttemptResult({ ...retry, attemptsLeft: 2 }));
+    expectContractError(() => parseAttemptResult({ ...retry, nextQuestion: question }));
+
+    const final = {
+      ...retry,
+      attemptNo: 3,
+      attemptsLeft: 0,
+      finalFeedback: 'Review the example and continue.',
+      nextQuestion: question,
+    };
+    expect(parseAttemptResult(final)).toEqual(final);
+    expectContractError(() => parseAttemptResult({ ...final, finalFeedback: '   ' }));
+    expectContractError(() => parseAttemptResult({ ...final, nextQuestion: undefined }));
+  });
+
+  it('rejects response strings and collections beyond server contract bounds', () => {
+    expectContractError(() => parseUser({ ...user, name: 'x'.repeat(101) }));
+    expectContractError(() =>
+      parseQuestionResponse({
+        question: { ...question, questionText: 'x'.repeat(1_001) },
+      }),
+    );
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        passed: true,
+        score: 80,
+        transcript: 'x'.repeat(12_001),
+        feedback: 'Good.',
+        done: true,
+        level: 'B1',
+      }),
+    );
+    expectContractError(() =>
+      parseHelpContent({
+        ...help,
+        examples: Array.from({ length: 11 }, () => ({ en: 'x', native: 'y' })),
+      }),
+    );
   });
 });
 
 describe('audio upload grant parser', () => {
+  const audioKey =
+    'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.m4a';
+  const s3 = {
+    mode: 's3',
+    uploadUrl: 'https://bucket.s3.amazonaws.com/',
+    uploadFields: {
+      key: audioKey,
+      'Content-Type': 'audio/mp4',
+      Policy: 'signed-policy',
+    },
+    audioKey,
+    contentType: 'audio/mp4',
+    expiresIn: 900,
+    maxBytes: 25 * 1024 * 1024,
+  } as const;
+
   it('accepts direct and s3 grants', () => {
     expect(parseAudioUploadGrant({ mode: 'direct' })).toEqual({
       mode: 'direct',
     });
-    const s3 = {
-      mode: 's3',
-      uploadUrl: 'https://bucket.s3.amazonaws.com/key?sig=1',
-      audioKey: 'audio-uploads/user/1.m4a',
-      expiresIn: 900,
-    };
     expect(parseAudioUploadGrant(s3)).toEqual(s3);
   });
 
@@ -449,21 +499,29 @@ describe('audio upload grant parser', () => {
     42,
     [],
     { mode: 'bogus' },
-    { mode: 1, uploadUrl: 'https://x', audioKey: 'k', expiresIn: 10 },
+    { ...s3, mode: 1 },
     { mode: 's3' },
-    { mode: 's3', uploadUrl: '', audioKey: 'k', expiresIn: 10 },
-    { mode: 's3', uploadUrl: '   ', audioKey: 'k', expiresIn: 10 },
-    { mode: 's3', uploadUrl: 'https://x', audioKey: '', expiresIn: 10 },
-    { mode: 's3', uploadUrl: 'https://x', audioKey: '   ', expiresIn: 10 },
-    { mode: 's3', uploadUrl: 'https://x', audioKey: 'k' },
-    { mode: 's3', uploadUrl: 'https://x', audioKey: 'k', expiresIn: '10' },
-    { mode: 's3', uploadUrl: 'https://x', audioKey: 'k', expiresIn: Number.NaN },
+    { ...s3, uploadUrl: '' },
+    { ...s3, uploadUrl: 'http://bucket.s3.amazonaws.com/' },
+    { ...s3, uploadUrl: 'https://user:secret@bucket.example/' },
+    { ...s3, uploadUrl: 'https://bucket.example/?signature=secret' },
+    { ...s3, uploadUrl: 'https://bucket.example/#fragment' },
+    { ...s3, audioKey: '' },
+    { ...s3, audioKey: '../another-user/audio.m4a' },
+    { ...s3, uploadFields: {} },
+    { ...s3, uploadFields: { ...s3.uploadFields, file: 'reserved' } },
+    { ...s3, uploadFields: { ...s3.uploadFields, key: 'wrong-key' } },
     {
-      mode: 's3',
-      uploadUrl: 'https://x',
-      audioKey: 'k',
-      expiresIn: Number.POSITIVE_INFINITY,
+      ...s3,
+      uploadFields: { ...s3.uploadFields, 'Content-Type': 'audio/wav' },
     },
+    { ...s3, contentType: 'application/octet-stream' },
+    { ...s3, expiresIn: 59 },
+    { ...s3, expiresIn: 3601 },
+    { ...s3, expiresIn: '900' },
+    { ...s3, expiresIn: Number.NaN },
+    { ...s3, maxBytes: 0 },
+    { ...s3, maxBytes: 25 * 1024 * 1024 + 1 },
   ])('rejects malformed grant %#', (value) => {
     expectContractError(() => parseAudioUploadGrant(value));
   });

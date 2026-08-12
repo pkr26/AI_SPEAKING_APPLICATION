@@ -20,7 +20,7 @@ import {
   MAX_PASSWORD_UTF8_BYTES,
   useAuth,
 } from '../../lib/auth';
-import { colors } from '../../lib/theme';
+import { colors, layout } from '../../lib/theme';
 
 export default function DeleteAccountScreen() {
   const { deleteAccount } = useAuth();
@@ -29,8 +29,7 @@ export default function DeleteAccountScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const passwordError =
-    password.length > 0 ? comparablePasswordError(password) : null;
+  const passwordError = password.length > 0 ? comparablePasswordError(password) : null;
   const canSubmit = password.length > 0 && passwordError === null && !busy;
 
   const performDelete = async () => {
@@ -39,11 +38,9 @@ export default function DeleteAccountScreen() {
     try {
       await deleteAccount(password);
       queryClient.clear();
-      Alert.alert(
-        'Account deleted',
-        'Your account and all its data have been deleted.',
-        [{ text: 'OK', onPress: () => router.replace('/') }],
-      );
+      Alert.alert('Account deleted', 'Your account and all its data have been deleted.', [
+        { text: 'OK', onPress: () => router.replace('/') },
+      ]);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setError('Incorrect password.');
@@ -54,12 +51,7 @@ export default function DeleteAccountScreen() {
           'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
         );
       } else {
-        setError(
-          userMessageForError(
-            err,
-            'Could not delete your account. Please try again.',
-          ),
-        );
+        setError(userMessageForError(err, 'Could not delete your account. Please try again.'));
       }
     } finally {
       setBusy(false);
@@ -97,8 +89,8 @@ export default function DeleteAccountScreen() {
             This action is permanent
           </Text>
           <Text style={styles.warningText}>
-            Deleting your account removes your profile, diagnostic results, and
-            practice history. This cannot be undone.
+            Deleting your account removes your profile, diagnostic results, and practice history.
+            This cannot be undone.
           </Text>
         </View>
 
@@ -138,9 +130,7 @@ export default function DeleteAccountScreen() {
               pressed && canSubmit && styles.deleteButtonPressed,
             ]}
           >
-            <Text style={styles.deleteButtonText}>
-              {busy ? 'Deleting…' : 'Delete My Account'}
-            </Text>
+            <Text style={styles.deleteButtonText}>{busy ? 'Deleting…' : 'Delete My Account'}</Text>
           </Pressable>
         </View>
       </ScrollView>
@@ -161,6 +151,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.dangerLight,
     borderRadius: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
     borderWidth: 1,
     borderColor: colors.danger,
     marginBottom: 16,
@@ -180,6 +173,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card,
     borderRadius: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -213,6 +209,7 @@ const styles = StyleSheet.create({
   },
   deleteButton: {
     marginTop: 20,
+    minHeight: layout.minimumTarget,
     backgroundColor: colors.danger,
     borderRadius: 12,
     paddingVertical: 15,

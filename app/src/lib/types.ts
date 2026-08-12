@@ -73,6 +73,14 @@ function isNonEmptyString(value: unknown): value is string {
   return isString(value) && value.trim().length > 0;
 }
 
+function isBoundedString(value: unknown, maxLength: number): value is string {
+  return isString(value) && value.length <= maxLength;
+}
+
+function isBoundedNonEmptyString(value: unknown, maxLength: number): value is string {
+  return isNonEmptyString(value) && value.length <= maxLength;
+}
+
 function isNumber(value: unknown): value is number {
   return typeof value === 'number' && Number.isFinite(value);
 }
@@ -95,14 +103,12 @@ function isCefrLevel(value: unknown): value is CefrLevel {
 function isUuid(value: unknown): value is string {
   return (
     isString(value) &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
-      value,
-    )
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
   );
 }
 
 function isScore(value: unknown): value is number {
-  return isNumber(value) && value >= 0 && value <= 100;
+  return isNumber(value) && Number.isInteger(value) && value >= 0 && value <= 100;
 }
 
 function isQuestion(value: unknown): value is Question {
@@ -110,15 +116,12 @@ function isQuestion(value: unknown): value is Question {
     isRecord(value) &&
     isUuid(value.id) &&
     isCefrLevel(value.cefrLevel) &&
-    isNonEmptyString(value.promptWord) &&
-    isNonEmptyString(value.questionText)
+    isBoundedNonEmptyString(value.promptWord, 100) &&
+    isBoundedNonEmptyString(value.questionText, 1_000)
   );
 }
 
-function parseWith<T>(
-  value: unknown,
-  predicate: (value: unknown) => value is T,
-): T {
+function parseWith<T>(value: unknown, predicate: (value: unknown) => value is T): T {
   if (!predicate(value)) throw new ContractError();
   return value;
 }
@@ -128,8 +131,8 @@ export function parseUser(value: unknown): User {
     if (!isRecord(candidate)) return false;
     return (
       isUuid(candidate.id) &&
-      isNonEmptyString(candidate.name) &&
-      isNonEmptyString(candidate.email) &&
+      isBoundedNonEmptyString(candidate.name, 100) &&
+      isBoundedNonEmptyString(candidate.email, 254) &&
       isNativeLanguage(candidate.nativeLanguage) &&
       (candidate.cefrLevel === null || isCefrLevel(candidate.cefrLevel)) &&
       typeof candidate.diagnosticCompleted === 'boolean'
@@ -137,10 +140,8 @@ export function parseUser(value: unknown): User {
   });
 }
 
-export function parseAuthResponse(
-  value: unknown,
-): { token: string; user: User } {
-  if (!isRecord(value) || !isNonEmptyString(value.token)) {
+export function parseAuthResponse(value: unknown): { token: string; user: User } {
+  if (!isRecord(value) || !isBoundedNonEmptyString(value.token, 16_384)) {
     throw new ContractError();
   }
   return { token: value.token, user: parseUser(value.user) };
@@ -161,7 +162,9 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
     throw new ContractError();
   }
   if (value.done) {
-    if (!isCefrLevel(value.level)) throw new ContractError();
+    if (!isCefrLevel(value.level) || value.question !== undefined || value.progress !== undefined) {
+      throw new ContractError();
+    }
     return { done: true, level: value.level };
   }
   if (
@@ -172,6 +175,7 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
     !isNumber(value.progress.maxQuestions) ||
     !Number.isInteger(value.progress.maxQuestions) ||
     value.progress.maxQuestions < 1 ||
+    value.progress.maxQuestions > 100 ||
     value.progress.asked >= value.progress.maxQuestions
   ) {
     throw new ContractError();
@@ -186,15 +190,13 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
   };
 }
 
-export function parseDiagnosticAnswerResult(
-  value: unknown,
-): DiagnosticAnswerResult {
+export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerResult {
   if (
     !isRecord(value) ||
     typeof value.passed !== 'boolean' ||
     !isScore(value.score) ||
-    !isString(value.transcript) ||
-    !isNonEmptyString(value.feedback) ||
+    !isBoundedString(value.transcript, 12_000) ||
+    !isBoundedNonEmptyString(value.feedback, 800) ||
     typeof value.done !== 'boolean'
   ) {
     throw new ContractError();
@@ -207,10 +209,14 @@ export function parseDiagnosticAnswerResult(
     done: value.done,
   };
   if (value.done) {
-    if (!isCefrLevel(value.level)) throw new ContractError();
+    if (!isCefrLevel(value.level) || value.nextQuestion !== undefined) {
+      throw new ContractError();
+    }
     result.level = value.level;
   } else {
-    if (value.nextQuestion === undefined) throw new ContractError();
+    if (value.level !== undefined || value.nextQuestion === undefined) {
+      throw new ContractError();
+    }
     result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
   }
   return result;
@@ -219,20 +225,20 @@ export function parseDiagnosticAnswerResult(
 export function parseHelpContent(value: unknown): HelpContent {
   if (
     !isRecord(value) ||
-    !isNonEmptyString(value.promptWord) ||
-    !isNonEmptyString(value.promptWordNative) ||
-    !isNonEmptyString(value.questionText) ||
-    !isNonEmptyString(value.questionTextNative) ||
+    !isBoundedNonEmptyString(value.promptWord, 100) ||
+    !isBoundedNonEmptyString(value.promptWordNative, 500) ||
+    !isBoundedNonEmptyString(value.questionText, 1_000) ||
+    !isBoundedNonEmptyString(value.questionTextNative, 4_000) ||
     !Array.isArray(value.examples) ||
-    value.examples.length === 0
+    value.examples.length !== 3
   ) {
     throw new ContractError();
   }
   const examples = value.examples.map((example) => {
     if (
       !isRecord(example) ||
-      !isNonEmptyString(example.en) ||
-      !isNonEmptyString(example.native)
+      !isBoundedNonEmptyString(example.en, 4_000) ||
+      !isBoundedNonEmptyString(example.native, 4_000)
     ) {
       throw new ContractError();
     }
@@ -256,8 +262,8 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     value.attemptNo < 1 ||
     value.attemptNo > 3 ||
     !isScore(value.score) ||
-    !isString(value.transcript) ||
-    !isNonEmptyString(value.feedback)
+    !isBoundedString(value.transcript, 12_000) ||
+    !isBoundedNonEmptyString(value.feedback, 800)
   ) {
     throw new ContractError();
   }
@@ -268,45 +274,146 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     transcript: value.transcript,
     feedback: value.feedback,
   };
-  if (value.attemptsLeft !== undefined) {
+  if (value.passed) {
     if (
-      !isNumber(value.attemptsLeft) ||
-      !Number.isInteger(value.attemptsLeft) ||
-      value.attemptsLeft < 0 ||
-      value.attemptsLeft > 2
+      value.attemptsLeft !== undefined ||
+      value.finalFeedback !== undefined ||
+      value.nextQuestion === undefined
     ) {
       throw new ContractError();
     }
-    result.attemptsLeft = value.attemptsLeft;
-  }
-  if (value.finalFeedback !== undefined) {
-    if (!isNonEmptyString(value.finalFeedback)) throw new ContractError();
-    result.finalFeedback = value.finalFeedback;
-  }
-  if (value.nextQuestion !== undefined) {
     result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
+    return result;
   }
+
+  if (value.attemptNo < 3) {
+    const expectedAttemptsLeft = 3 - value.attemptNo;
+    if (
+      value.attemptsLeft !== expectedAttemptsLeft ||
+      value.finalFeedback !== undefined ||
+      value.nextQuestion !== undefined
+    ) {
+      throw new ContractError();
+    }
+    result.attemptsLeft = expectedAttemptsLeft;
+    return result;
+  }
+
+  if (
+    value.attemptsLeft !== 0 ||
+    !isBoundedNonEmptyString(value.finalFeedback, 4_000) ||
+    value.nextQuestion === undefined
+  ) {
+    throw new ContractError();
+  }
+  result.attemptsLeft = 0;
+  result.finalFeedback = value.finalFeedback;
+  result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
   return result;
 }
 
 export type AudioUploadGrant =
-  | { mode: "direct" }
-  | { mode: "s3"; uploadUrl: string; audioKey: string; expiresIn: number };
+  | { mode: 'direct' }
+  | {
+      mode: 's3';
+      uploadUrl: string;
+      uploadFields: Record<string, string>;
+      audioKey: string;
+      contentType: string;
+      expiresIn: number;
+      maxBytes: number;
+    };
+
+const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+const AUDIO_CONTENT_TYPES = new Set([
+  'audio/mp4',
+  'audio/m4a',
+  'audio/x-m4a',
+  'audio/webm',
+  'audio/wav',
+  'audio/x-wav',
+]);
+
+function safeUploadUrl(value: string): boolean {
+  if (value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return (
+      url.protocol === 'https:' &&
+      !!url.hostname &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
+}
+
+function safeAudioKey(value: string): boolean {
+  return /^audio-uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp4|webm|wav)$/i.test(
+    value,
+  );
+}
+
+function parseUploadFields(value: unknown): Record<string, string> | null {
+  if (!isRecord(value)) return null;
+  const entries = Object.entries(value);
+  if (entries.length < 2 || entries.length > 32) return null;
+  let totalLength = 0;
+  const parsed: Record<string, string> = {};
+  for (const [key, fieldValue] of entries) {
+    if (
+      !/^[A-Za-z0-9_.-]{1,128}$/.test(key) ||
+      key.toLowerCase() === 'file' ||
+      key === '__proto__' ||
+      key === 'constructor' ||
+      key === 'prototype' ||
+      !isNonEmptyString(fieldValue) ||
+      fieldValue.length > 8192
+    ) {
+      return null;
+    }
+    totalLength += key.length + fieldValue.length;
+    if (totalLength > 32_768) return null;
+    parsed[key] = fieldValue;
+  }
+  return parsed;
+}
 
 export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
   if (!isRecord(value)) throw new ContractError();
-  if (value.mode === "direct") return { mode: "direct" };
+  if (value.mode === 'direct') return { mode: 'direct' };
+  const uploadFields = parseUploadFields(value.uploadFields);
   if (
-    value.mode === "s3" &&
+    value.mode === 's3' &&
     isNonEmptyString(value.uploadUrl) &&
+    safeUploadUrl(value.uploadUrl) &&
     isNonEmptyString(value.audioKey) &&
-    isNumber(value.expiresIn)
+    safeAudioKey(value.audioKey) &&
+    uploadFields !== null &&
+    uploadFields.key === value.audioKey &&
+    isNonEmptyString(value.contentType) &&
+    AUDIO_CONTENT_TYPES.has(value.contentType) &&
+    uploadFields['Content-Type'] === value.contentType &&
+    isNumber(value.expiresIn) &&
+    Number.isInteger(value.expiresIn) &&
+    value.expiresIn >= 60 &&
+    value.expiresIn <= 3600 &&
+    isNumber(value.maxBytes) &&
+    Number.isInteger(value.maxBytes) &&
+    value.maxBytes > 0 &&
+    value.maxBytes <= MAX_AUDIO_BYTES
   ) {
     return {
-      mode: "s3",
+      mode: 's3',
       uploadUrl: value.uploadUrl,
+      uploadFields,
       audioKey: value.audioKey,
+      contentType: value.contentType,
       expiresIn: value.expiresIn,
+      maxBytes: value.maxBytes,
     };
   }
   throw new ContractError();

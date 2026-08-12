@@ -1,9 +1,19 @@
 node_modules/
 dist/
 coverage/
-.env
+.npmrc
+.env*
+!.env.example
 uploads/
 *.log
+*.jks
+*.key
+*.keystore
+*.mobileprovision
+*.p12
+*.p8
+*.pem
+*.pfx
 .DS_Store
 .expo/
 # Mutation testing (Stryker) scratch + reports

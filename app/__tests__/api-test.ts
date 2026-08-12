@@ -15,6 +15,15 @@ const mockSecureData = new Map<string, string>();
 const mockArrayBuffer = jest.fn(
   async () => new TextEncoder().encode('audio').buffer as ArrayBuffer,
 );
+const mockFileState: { exists: boolean; size: number } = {
+  exists: true,
+  size: 5,
+};
+const mockFileUpload = jest.fn(async (_url: string, _options: { signal?: AbortSignal }) => ({
+  status: 204,
+  headers: {},
+  body: '',
+}));
 
 jest.mock('expo-constants', () => ({
   get expoConfig() {
@@ -24,9 +33,7 @@ jest.mock('expo-constants', () => ({
 
 jest.mock('expo-secure-store', () => ({
   WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'when-unlocked-this-device-only',
-  getItemAsync: jest.fn(
-    async (key: string) => mockSecureData.get(key) ?? null,
-  ),
+  getItemAsync: jest.fn(async (key: string) => mockSecureData.get(key) ?? null),
   setItemAsync: jest.fn(async (key: string, value: string) => {
     mockSecureData.set(key, value);
   }),
@@ -36,7 +43,17 @@ jest.mock('expo-secure-store', () => ({
 }));
 
 jest.mock('expo-file-system', () => ({
-  File: jest.fn(() => ({ arrayBuffer: mockArrayBuffer })),
+  File: jest.fn(() => ({
+    arrayBuffer: mockArrayBuffer,
+    get exists() {
+      return mockFileState.exists;
+    },
+    get size() {
+      return mockFileState.size;
+    },
+    upload: mockFileUpload,
+  })),
+  UploadType: { MULTIPART: 'multipart' },
 }));
 
 jest.mock('react-native', () => ({
@@ -137,13 +154,25 @@ function catchSync(run: () => unknown): unknown {
   }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeAll(() => {
   setEnv(undefined);
   setDev(true);
   api = require('../src/lib/api') as ApiModule;
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Reset the module-level request snapshot as well as the mocked keychain.
+  await api.clearToken().catch(() => undefined);
   setEnv(undefined);
   setDev(true);
   mockHostUri.value = undefined;
@@ -151,6 +180,14 @@ afterEach(() => {
   mockSecureData.clear();
   fetchMock.mockReset();
   mockArrayBuffer.mockClear();
+  mockFileState.exists = true;
+  mockFileState.size = 5;
+  mockFileUpload.mockReset();
+  mockFileUpload.mockImplementation(async (_url: string, _options: { signal?: AbortSignal }) => ({
+    status: 204,
+    headers: {},
+    body: '',
+  }));
   api.setUnauthorizedHandler(null);
 });
 
@@ -164,33 +201,83 @@ describe('token storage', () => {
     jest.mocked(SecureStore.getItemAsync).mockClear();
 
     await expect(api.getToken()).resolves.toBe('jwt-123');
-    expect(SecureStore.getItemAsync).toHaveBeenCalledWith(
-      'auth_token',
-      KEYCHAIN_OPTIONS,
-    );
+    expect(SecureStore.getItemAsync).toHaveBeenCalledWith('auth_token', KEYCHAIN_OPTIONS);
   });
 
-  it('returns null when the keychain read fails', async () => {
-    jest
-      .mocked(SecureStore.getItemAsync)
-      .mockRejectedValueOnce(new Error('keychain locked'));
+  it('rejects distinctly when the keychain read fails', async () => {
+    const cause = new Error('keychain locked');
+    jest.mocked(SecureStore.getItemAsync).mockRejectedValueOnce(cause);
 
-    await expect(api.getToken()).resolves.toBeNull();
+    const error = await catchAsync(api.getToken());
+
+    expect(error).toBeInstanceOf(api.TokenStorageReadError);
+    expect(error).toMatchObject({
+      name: 'TokenStorageReadError',
+      message: 'Secure session storage is unavailable.',
+      cause,
+    });
   });
 
   it('saves and clears the token with the keychain options', async () => {
     await api.saveToken('jwt-9');
-    expect(SecureStore.setItemAsync).toHaveBeenCalledWith(
-      'auth_token',
-      'jwt-9',
-      KEYCHAIN_OPTIONS,
-    );
+    expect(SecureStore.setItemAsync).toHaveBeenCalledWith('auth_token', 'jwt-9', KEYCHAIN_OPTIONS);
 
     await api.clearToken();
-    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith(
-      'auth_token',
-      KEYCHAIN_OPTIONS,
-    );
+    expect(SecureStore.deleteItemAsync).toHaveBeenCalledWith('auth_token', KEYCHAIN_OPTIONS);
+  });
+
+  it('serializes a new save ahead of stale conditional cleanup', async () => {
+    await api.saveToken('jwt-old');
+    jest.mocked(SecureStore.setItemAsync).mockClear();
+    jest.mocked(SecureStore.deleteItemAsync).mockClear();
+
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    jest
+      .mocked(SecureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        writeStarted.resolve();
+        await allowWrite.promise;
+        mockSecureData.set(key, value);
+      });
+
+    const saving = api.saveToken('jwt-new');
+    await writeStarted.promise;
+    const staleCleanup = api.clearToken('jwt-old');
+
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+    allowWrite.resolve();
+    await saving;
+    await expect(staleCleanup).resolves.toBe(false);
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+    expect(mockSecureData.get('auth_token')).toBe('jwt-new');
+  });
+
+  it('does not delete a newer persisted token when the snapshot is stale', async () => {
+    await api.saveToken('jwt-old');
+    mockSecureData.set('auth_token', 'jwt-new');
+    jest.mocked(SecureStore.deleteItemAsync).mockClear();
+
+    await expect(api.clearToken('jwt-old')).resolves.toBe(false);
+
+    expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
+    expect(mockSecureData.get('auth_token')).toBe('jwt-new');
+  });
+
+  it('serves API calls from the snapshot established by restore', async () => {
+    mockSecureData.set('auth_token', 'jwt-restored');
+    await api.getToken();
+    jest.mocked(SecureStore.getItemAsync).mockClear();
+    mockSecureData.set('auth_token', 'unexpected-external-value');
+    fetchMock.mockResolvedValue(fakeResponse());
+
+    await api.apiFetch('/me');
+
+    expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer jwt-restored',
+    });
   });
 });
 
@@ -199,10 +286,7 @@ describe('userMessageForError', () => {
     [0, 'Could not connect to the server. Check your connection and try again.'],
     [408, 'The request timed out. Check your connection and try again.'],
     [413, 'The recording is too large. Please record a shorter answer.'],
-    [
-      415,
-      'This recording format is not supported. Please record your answer again.',
-    ],
+    [415, 'This recording format is not supported. Please record your answer again.'],
     [
       409,
       'An assessment is already in progress or the question changed. Wait a moment and try again.',
@@ -211,21 +295,19 @@ describe('userMessageForError', () => {
     [500, 'The service is temporarily unavailable. Please try again later.'],
     [503, 'The service is temporarily unavailable. Please try again later.'],
   ])('maps status %i to safe copy', (status, expected) => {
-    expect(
-      api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback'),
-    ).toBe(expected);
+    expect(api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback')).toBe(
+      expected,
+    );
   });
 
   it.each([400, 401, 404, 499])('falls back for status %i', (status) => {
-    expect(
-      api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback'),
-    ).toBe('Fallback');
+    expect(api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback')).toBe(
+      'Fallback',
+    );
   });
 
   it('falls back for non-ApiError values', () => {
-    expect(api.userMessageForError(new Error('boom'), 'Fallback')).toBe(
-      'Fallback',
-    );
+    expect(api.userMessageForError(new Error('boom'), 'Fallback')).toBe('Fallback');
     expect(api.userMessageForError('nope', 'Fallback')).toBe('Fallback');
     expect(api.userMessageForError(null, 'Fallback')).toBe('Fallback');
   });
@@ -233,9 +315,7 @@ describe('userMessageForError', () => {
 
 describe('apiFetch', () => {
   it('performs an authenticated JSON GET by default', async () => {
-    fetchMock.mockResolvedValue(
-      fakeResponse({ json: async () => ({ hello: 'world' }) }),
-    );
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ hello: 'world' }) }));
 
     const result = await api.apiFetch<{ hello: string }>('/health');
 
@@ -262,6 +342,7 @@ describe('apiFetch', () => {
 
   it('attaches the bearer token when one is stored', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
+    await api.getToken();
     fetchMock.mockResolvedValue(fakeResponse());
 
     await api.apiFetch('/me');
@@ -287,6 +368,7 @@ describe('apiFetch', () => {
 
   it('invokes the unauthorized handler on 401 when a token was used', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
+    await api.getToken();
     const handler = jest.fn();
     api.setUnauthorizedHandler(handler);
     fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 401 }));
@@ -300,6 +382,7 @@ describe('apiFetch', () => {
 
   it('suppresses the unauthorized handler when expireSessionOn401 is false', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
+    await api.getToken();
     const handler = jest.fn();
     api.setUnauthorizedHandler(handler);
     fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 401 }));
@@ -386,9 +469,7 @@ describe('apiFetch', () => {
     controller.abort();
     fetchMock.mockRejectedValue(new Error('aborted by platform'));
 
-    const error = await catchAsync(
-      api.apiFetch('/pre-aborted', { signal: controller.signal }),
-    );
+    const error = await catchAsync(api.apiFetch('/pre-aborted', { signal: controller.signal }));
 
     expect(error).not.toBeInstanceOf(api.ApiError);
     expect((error as Error).message).toBe('aborted by platform');
@@ -402,8 +483,7 @@ describe('apiFetch', () => {
     expect(error).toBeInstanceOf(api.ApiError);
     expect(error).toMatchObject({
       status: 0,
-      message:
-        'Could not connect to the server. Check your connection and try again.',
+      message: 'Could not connect to the server. Check your connection and try again.',
     });
   });
 
@@ -423,21 +503,24 @@ describe('audioFileDescriptor', () => {
   it.each([
     ['file:///rec/a.webm', { name: 'audio.webm', type: 'audio/webm' }],
     ['file:///rec/a.wav', { name: 'audio.wav', type: 'audio/wav' }],
-    ['file:///rec/a.aac', { name: 'audio.aac', type: 'audio/aac' }],
     ['file:///rec/a.m4a', { name: 'audio.m4a', type: 'audio/mp4' }],
     ['file:///rec/a.bin', { name: 'audio.m4a', type: 'audio/mp4' }],
     ['file:///rec/no-extension', { name: 'audio.m4a', type: 'audio/mp4' }],
     ['file:///REC/A.WEBM', { name: 'audio.webm', type: 'audio/webm' }],
     ['file:///REC/A.WAV', { name: 'audio.wav', type: 'audio/wav' }],
     ['file:///rec/a.wav?duration=10', { name: 'audio.wav', type: 'audio/wav' }],
-    ['file:///rec/a.aac#clip', { name: 'audio.aac', type: 'audio/aac' }],
     ['file:///rec/a.webm?next=.m4a', { name: 'audio.webm', type: 'audio/webm' }],
   ])('maps %s to %o', (uri, expected) => {
     expect(api.audioFileDescriptor(uri)).toEqual(expected);
   });
 
-  it('rejects 3GP recordings with a 415 ApiError', () => {
-    for (const uri of ['file:///rec/a.3gp', 'file:///REC/A.3GP?x=1']) {
+  it('rejects undocumented recording formats with a 415 ApiError', () => {
+    for (const uri of [
+      'file:///rec/a.3gp',
+      'file:///REC/A.3GP?x=1',
+      'file:///rec/a.aac',
+      'file:///REC/A.AAC#clip',
+    ]) {
       const error = catchSync(() => api.audioFileDescriptor(uri));
       expect(error).toBeInstanceOf(api.ApiError);
       expect(error).toMatchObject({
@@ -459,9 +542,8 @@ describe('audioFileDescriptor', () => {
 describe('apiUploadAudio', () => {
   it('builds multipart form data with the React Native file descriptor', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
-    fetchMock.mockResolvedValue(
-      fakeResponse({ json: async () => ({ result: 'ok' }) }),
-    );
+    await api.getToken();
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ result: 'ok' }) }));
 
     const result = await api.apiUploadAudio<{ result: string }>(
       '/practice/attempt',
@@ -507,11 +589,9 @@ describe('apiUploadAudio', () => {
       } as unknown as Response)
       .mockResolvedValueOnce(fakeResponse({ json: async () => ({ ok: true }) }));
 
-    await api.apiUploadAudio(
-      '/practice/attempt',
-      'blob:https://app/audio-1',
-      { questionId: 'q-1' },
-    );
+    await api.apiUploadAudio('/practice/attempt', 'blob:https://app/audio-1', {
+      questionId: 'q-1',
+    });
 
     expect(fetchMock.mock.calls[0]).toEqual(['blob:https://app/audio-1']);
     const form = fetchMock.mock.calls[1][1].body as unknown as MockFormData;
@@ -524,6 +604,7 @@ describe('apiUploadAudio', () => {
 
   it('reports 401 uploads to the unauthorized handler', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
+    await api.getToken();
     const handler = jest.fn();
     api.setUnauthorizedHandler(handler);
     fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 401 }));
@@ -569,9 +650,14 @@ describe('apiUploadAudio', () => {
     fetchUntilAborted();
 
     const error = await catchAsync(
-      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}, {
-        timeoutMs: 10,
-      }),
+      api.apiUploadAudio(
+        '/practice/attempt',
+        'file:///rec/a.m4a',
+        {},
+        {
+          timeoutMs: 10,
+        },
+      ),
     );
 
     expect(error).toMatchObject({ status: 408 });
@@ -579,12 +665,23 @@ describe('apiUploadAudio', () => {
 });
 
 describe('apiRequestAudioUpload', () => {
+  const audioKey =
+    'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.m4a';
+  const uploadFields = {
+    key: audioKey,
+    'Content-Type': 'audio/mp4',
+    Policy: 'signed-policy',
+  };
+
   it('posts the content type and parses the grant', async () => {
     const grant = {
       mode: 's3',
-      uploadUrl: 'https://bucket.s3.amazonaws.com/key?sig=1',
-      audioKey: 'audio-uploads/user/1.m4a',
+      uploadUrl: 'https://bucket.s3.amazonaws.com/',
+      uploadFields,
+      audioKey,
+      contentType: 'audio/mp4',
       expiresIn: 900,
+      maxBytes: 25 * 1024 * 1024,
     };
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => grant }));
 
@@ -598,68 +695,119 @@ describe('apiRequestAudioUpload', () => {
   });
 
   it('rejects a malformed grant as a contract error', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ mode: 'carrier-pigeon' }) }));
+
+    await expect(api.apiRequestAudioUpload('audio/mp4')).rejects.toThrow(ContractError);
+  });
+
+  it('rejects a signed content type that differs from the requested recording', async () => {
     fetchMock.mockResolvedValue(
-      fakeResponse({ json: async () => ({ mode: 'carrier-pigeon' }) }),
+      fakeResponse({
+        json: async () => ({
+          mode: 's3',
+          uploadUrl: 'https://bucket.s3.amazonaws.com/',
+          uploadFields: {
+            ...uploadFields,
+            'Content-Type': 'audio/wav',
+          },
+          audioKey,
+          contentType: 'audio/wav',
+          expiresIn: 900,
+          maxBytes: 25 * 1024 * 1024,
+        }),
+      }),
     );
 
-    await expect(api.apiRequestAudioUpload('audio/mp4')).rejects.toThrow(
-      ContractError,
-    );
+    await expect(api.apiRequestAudioUpload('audio/mp4')).rejects.toThrow(ContractError);
   });
 });
 
-describe('apiPutPresignedAudio', () => {
-  it('PUTs the file bytes with the signed content type and no auth header', async () => {
+describe('apiPostPresignedAudio', () => {
+  const uploadUrl = 'https://bucket.s3.amazonaws.com/';
+  const uploadFields = {
+    key: 'audio-uploads/user/key.m4a',
+    'Content-Type': 'audio/mp4',
+    Policy: 'signed-policy',
+  };
+  const maxBytes = 25 * 1024 * 1024;
+
+  it('streams a native file with the signed multipart fields and no auth header', async () => {
     const FileMock = jest.mocked(File);
     FileMock.mockClear();
-    fetchMock.mockResolvedValue(fakeResponse());
 
-    await api.apiPutPresignedAudio(
-      'https://bucket.s3.amazonaws.com/key?sig=1',
+    await api.apiPostPresignedAudio(
+      uploadUrl,
+      uploadFields,
       'file:///recordings/answer.m4a',
       'audio/mp4',
+      maxBytes,
     );
 
     expect(FileMock).toHaveBeenCalledWith('file:///recordings/answer.m4a');
-    expect(mockArrayBuffer).toHaveBeenCalledTimes(1);
-    const [input, init] = fetchMock.mock.calls[0];
-    expect(input).toBe('https://bucket.s3.amazonaws.com/key?sig=1');
-    expect(init.method).toBe('PUT');
-    expect(init.headers).toEqual({ 'Content-Type': 'audio/mp4' });
-    expect(init.body).toBeInstanceOf(Blob);
-    expect((init.body as Blob).type).toBe('audio/mp4');
-    expect((init.body as Blob).size).toBe(5);
+    expect(mockArrayBuffer).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(mockFileUpload).toHaveBeenCalledWith(
+      uploadUrl,
+      expect.objectContaining({
+        httpMethod: 'POST',
+        uploadType: 'multipart',
+        fieldName: 'file',
+        mimeType: 'audio/mp4',
+        parameters: uploadFields,
+        sessionType: 'foreground',
+        signal: expect.any(AbortSignal),
+      }),
+    );
   });
 
-  it('PUTs a fetched blob on web', async () => {
+  it('POSTs signed fields before a fetched blob on web', async () => {
     mockPlatform.OS = 'web';
     const blob = new Blob(['web-audio'], { type: 'audio/webm' });
+    const webFields = {
+      ...uploadFields,
+      'Content-Type': 'audio/webm',
+    };
     fetchMock
       .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
         blob: async () => blob,
       } as unknown as Response)
       .mockResolvedValueOnce(fakeResponse());
 
-    await api.apiPutPresignedAudio(
-      'https://bucket.s3.amazonaws.com/key?sig=1',
+    await api.apiPostPresignedAudio(
+      uploadUrl,
+      webFields,
       'blob:https://app/audio-1',
       'audio/webm',
+      maxBytes,
     );
 
     const [, init] = fetchMock.mock.calls[1];
-    expect(init.method).toBe('PUT');
-    expect(init.headers).toEqual({ 'Content-Type': 'audio/webm' });
-    expect(init.body).toBe(blob);
+    expect(init.method).toBe('POST');
+    const form = init.body as unknown as MockFormData;
+    expect(form.entries).toEqual([
+      { name: 'key', value: uploadFields.key },
+      { name: 'Content-Type', value: 'audio/webm' },
+      { name: 'Policy', value: 'signed-policy' },
+      { name: 'file', value: blob, filename: 'audio.webm' },
+    ]);
   });
 
   it('throws an ApiError when S3 rejects the upload', async () => {
-    fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 403 }));
+    mockFileUpload.mockResolvedValueOnce({
+      status: 403,
+      headers: {},
+      body: 'sensitive provider response',
+    });
 
     const error = await catchAsync(
-      api.apiPutPresignedAudio(
-        'https://bucket.s3.amazonaws.com/key?sig=1',
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
         'file:///rec/a.m4a',
         'audio/mp4',
+        maxBytes,
       ),
     );
 
@@ -668,18 +816,52 @@ describe('apiPutPresignedAudio', () => {
   });
 
   it('times out slow presigned uploads with a 408 ApiError', async () => {
-    fetchUntilAborted();
+    mockFileUpload.mockImplementationOnce(
+      async (_url: string, options: { signal?: AbortSignal }) =>
+        await new Promise((_, reject) => {
+          const fail = () => reject(new DOMException('aborted', 'AbortError'));
+          if (options.signal?.aborted) fail();
+          else options.signal?.addEventListener('abort', fail, { once: true });
+        }),
+    );
 
     const error = await catchAsync(
-      api.apiPutPresignedAudio(
-        'https://bucket.s3.amazonaws.com/key?sig=1',
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
         'file:///rec/a.m4a',
         'audio/mp4',
+        maxBytes,
         { timeoutMs: 10 },
       ),
     );
 
     expect(error).toMatchObject({ status: 408 });
+  });
+
+  it('fails closed when native file metadata is unavailable or oversized', async () => {
+    mockFileState.size = Number.NaN;
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
+        'file:///rec/a.m4a',
+        'audio/mp4',
+        maxBytes,
+      ),
+    ).rejects.toMatchObject({ status: 400 });
+
+    mockFileState.size = maxBytes + 1;
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
+        'file:///rec/a.m4a',
+        'audio/mp4',
+        maxBytes,
+      ),
+    ).rejects.toMatchObject({ status: 413 });
+    expect(mockFileUpload).not.toHaveBeenCalled();
   });
 });
 
@@ -706,9 +888,7 @@ describe('resolveBaseUrl', () => {
     setDev(false);
     setEnv('not-a-url');
 
-    expect(() => importFreshApi()).toThrow(
-      'EXPO_PUBLIC_API_URL must be a valid absolute URL.',
-    );
+    expect(() => importFreshApi()).toThrow('EXPO_PUBLIC_API_URL must be a valid absolute URL.');
   });
 
   it('rejects plain HTTP outside development', async () => {

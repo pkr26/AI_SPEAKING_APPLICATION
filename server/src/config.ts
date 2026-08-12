@@ -33,7 +33,22 @@ const trustProxyHops = z
 
 const envSchema = z
   .object({
-    DATABASE_URL: z.string({ required_error: 'DATABASE_URL is required' }).min(1, 'DATABASE_URL is required'),
+    DATABASE_URL: z
+      .string({ required_error: 'DATABASE_URL is required' })
+      .trim()
+      .min(1, 'DATABASE_URL is required')
+      .refine((value) => {
+        try {
+          const url = new URL(value);
+          return (
+            (url.protocol === 'postgres:' || url.protocol === 'postgresql:') &&
+            !!url.hostname &&
+            url.pathname.length > 1
+          );
+        } catch {
+          return false;
+        }
+      }, 'must be a PostgreSQL URL with a host and database name'),
     JWT_SECRET: z
       .string({ required_error: 'JWT_SECRET is required (no default — set a real secret)' })
       .min(32, 'JWT_SECRET must be at least 32 characters'),
@@ -48,7 +63,9 @@ const envSchema = z
     ASSESS_DAILY_CAP: z.coerce.number().int().min(1).default(150),
     ASSESS_GLOBAL_DAILY_CAP: z.coerce.number().int().min(1).default(5000),
     AI_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(10),
+    AUDIO_INSPECTION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(4),
     OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).max(70_000).default(60_000),
+    FFMPEG_PATH: z.string().trim().min(1).max(1024).default('ffmpeg'),
     RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -61,25 +78,55 @@ const envSchema = z
       .min(1000)
       .default(15 * 60 * 1000),
     RATE_LIMIT_AUTH_MAX: z.coerce.number().int().min(1).default(20),
+    RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(15 * 60 * 1000),
+    RATE_LIMIT_LOGIN_ACCOUNT_MAX: z.coerce.number().int().min(1).max(100_000).default(10),
     RATE_LIMIT_ASSESS_WINDOW_MS: z.coerce
       .number()
       .int()
       .min(1000)
       .default(60 * 60 * 1000),
     RATE_LIMIT_ASSESS_MAX: z.coerce.number().int().min(1).default(20),
+    RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(60 * 60 * 1000),
+    RATE_LIMIT_UPLOAD_GRANT_MAX: z.coerce.number().int().min(1).max(100_000).default(40),
     MOCK_AI: bool(false),
     OPENAI_API_KEY: z.string().default(''),
     // Audio ingress: empty S3_BUCKET keeps the local multipart-to-disk flow for
-    // dev/test; production must store uploads in S3 via presigned PUT URLs.
-    S3_BUCKET: z.string().default(''),
-    S3_REGION: z.string().min(1).default('us-east-1'),
+    // dev/test; production must store uploads in S3 via presigned POST grants.
+    S3_BUCKET: z.string().trim().default(''),
+    S3_REGION: z.string().trim().min(1).default('us-east-1'),
     // Optional static credentials; when empty the AWS default provider chain
     // (instance/task IAM role, shared config) is used instead.
-    S3_ACCESS_KEY_ID: z.string().default(''),
-    S3_SECRET_ACCESS_KEY: z.string().default(''),
+    S3_ACCESS_KEY_ID: z.string().trim().max(256).default(''),
+    S3_SECRET_ACCESS_KEY: z.string().trim().max(4096).default(''),
+    S3_SESSION_TOKEN: z.string().trim().max(8192).default(''),
     S3_UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(300),
+    S3_OPERATION_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(30_000),
   })
   .superRefine((env, ctx) => {
+    if (env.NODE_ENV === 'production') {
+      try {
+        const databaseUrl = new URL(env.DATABASE_URL);
+        if (databaseUrl.searchParams.get('sslmode') !== 'verify-full') {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['DATABASE_URL'],
+            message: 'must set sslmode=verify-full in production',
+          });
+        }
+      } catch {
+        // The field-level URL issue is more specific.
+      }
+    }
     if (!env.MOCK_AI && !env.OPENAI_API_KEY) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -105,7 +152,30 @@ const envSchema = z
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['S3_BUCKET'],
-        message: 'is required in production; learner audio must be uploaded to S3 via presigned URLs',
+        message: 'is required in production; learner audio must use size-constrained S3 presigned POST grants',
+      });
+    }
+    const hasS3AccessKey = env.S3_ACCESS_KEY_ID.length > 0;
+    const hasS3SecretKey = env.S3_SECRET_ACCESS_KEY.length > 0;
+    if (hasS3AccessKey !== hasS3SecretKey) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['S3_ACCESS_KEY_ID'],
+        message: 'and S3_SECRET_ACCESS_KEY must either both be set or both be empty',
+      });
+    }
+    if (env.S3_SESSION_TOKEN && !(hasS3AccessKey && hasS3SecretKey)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['S3_SESSION_TOKEN'],
+        message: 'requires both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY',
+      });
+    }
+    if (!env.S3_BUCKET && (hasS3AccessKey || hasS3SecretKey || env.S3_SESSION_TOKEN)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['S3_BUCKET'],
+        message: 'is required when static S3 credentials are configured',
       });
     }
     if (env.ASSESS_GLOBAL_DAILY_CAP < env.ASSESS_DAILY_CAP) {
@@ -143,14 +213,20 @@ export const config = {
   assessDailyCap: env.ASSESS_DAILY_CAP,
   assessGlobalDailyCap: env.ASSESS_GLOBAL_DAILY_CAP,
   aiMaxConcurrency: env.AI_MAX_CONCURRENCY,
+  audioInspectionMaxConcurrency: env.AUDIO_INSPECTION_MAX_CONCURRENCY,
   openaiTimeoutMs: env.OPENAI_TIMEOUT_MS,
+  ffmpegPath: env.FFMPEG_PATH,
   rateLimit: {
     globalWindowMs: env.RATE_LIMIT_GLOBAL_WINDOW_MS,
     globalMax: env.RATE_LIMIT_GLOBAL_MAX,
     authWindowMs: env.RATE_LIMIT_AUTH_WINDOW_MS,
     authMax: env.RATE_LIMIT_AUTH_MAX,
+    loginAccountWindowMs: env.RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS,
+    loginAccountMax: env.RATE_LIMIT_LOGIN_ACCOUNT_MAX,
     assessWindowMs: env.RATE_LIMIT_ASSESS_WINDOW_MS,
     assessMax: env.RATE_LIMIT_ASSESS_MAX,
+    uploadGrantWindowMs: env.RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS,
+    uploadGrantMax: env.RATE_LIMIT_UPLOAD_GRANT_MAX,
   },
   mockAi: env.MOCK_AI,
   openaiApiKey: env.OPENAI_API_KEY,
@@ -159,6 +235,8 @@ export const config = {
     region: env.S3_REGION,
     accessKeyId: env.S3_ACCESS_KEY_ID,
     secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+    sessionToken: env.S3_SESSION_TOKEN,
     uploadUrlTtlSeconds: env.S3_UPLOAD_URL_TTL_SECONDS,
+    operationTimeoutMs: env.S3_OPERATION_TIMEOUT_MS,
   },
 };

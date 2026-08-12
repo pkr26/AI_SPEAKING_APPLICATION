@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawnSync } from 'node:child_process';
 
 // Expo SDK 57 currently resolves three upstream advisories through its
 // build/Metro toolchain. Keep CI strict without applying npm's incompatible
@@ -11,33 +11,29 @@ import { spawnSync } from "node:child_process";
 const reviewedAdvisories = new Set([1119441, 1138808, 1138809]);
 const reviewedMaximums = { moderate: 7, high: 15, total: 22 };
 
-const result = spawnSync("npm", ["audit", "--omit=dev", "--json"], {
-  encoding: "utf8",
-  shell: process.platform === "win32",
+const result = spawnSync('npm', ['audit', '--omit=dev', '--json'], {
+  encoding: 'utf8',
+  shell: process.platform === 'win32',
 });
 
 let report;
 try {
   report = JSON.parse(result.stdout);
 } catch {
-  console.error(result.stderr || "npm audit did not return valid JSON.");
+  console.error(result.stderr || 'npm audit did not return valid JSON.');
   process.exit(1);
 }
 
 const counts = report.metadata?.vulnerabilities;
 if (!counts) {
-  console.error("npm audit response did not include vulnerability totals.");
+  console.error('npm audit response did not include vulnerability totals.');
   process.exit(1);
 }
 
 const observedAdvisories = new Set();
 for (const vulnerability of Object.values(report.vulnerabilities ?? {})) {
   for (const cause of vulnerability.via ?? []) {
-    if (
-      typeof cause === "object" &&
-      cause !== null &&
-      Number.isInteger(cause.source)
-    ) {
+    if (typeof cause === 'object' && cause !== null && Number.isInteger(cause.source)) {
       observedAdvisories.add(cause.source);
     }
   }

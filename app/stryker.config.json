@@ -8,10 +8,7 @@
     },
     "enableFindRelatedTests": true
   },
-  "mutate": [
-    "src/**/*.ts",
-    "src/**/*.tsx"
-  ],
+  "mutate": ["src/**/*.ts", "src/**/*.tsx"],
   "ignoreStatic": true,
   "coverageAnalysis": "perTest",
   "timeoutMS": 60000,
@@ -20,5 +17,5 @@
   "tempDirName": ".stryker-tmp",
   "cleanTempDir": true,
   "reporters": ["clear-text", "progress", "html"],
-  "thresholds": { "high": 80, "low": 60, "break": 0 }
+  "thresholds": { "high": 80, "low": 60, "break": 60 }
 }

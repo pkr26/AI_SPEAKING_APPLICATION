@@ -1,11 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { Alert } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -79,6 +73,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     user: USER,
     sessionVersion: 1,
     isRestoring: false,
+    restoreError: null,
+    retrySessionRestore: jest.fn(),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn().mockResolvedValue(undefined),
@@ -100,9 +96,7 @@ type PracticeFlowValue = ReturnType<typeof usePracticeFlow>;
 
 let mockPracticeFlow: PracticeFlowValue;
 
-function makePracticeFlow(
-  overrides: Partial<PracticeFlowValue> = {},
-): PracticeFlowValue {
+function makePracticeFlow(overrides: Partial<PracticeFlowValue> = {}): PracticeFlowValue {
   return {
     feedback: null,
     showFeedback: jest.fn(),
@@ -157,6 +151,10 @@ const HELP_CONTENT = {
       en: 'It takes courage to speak up.',
       native: 'మాట్లాడటానికి ధైర్యం కావాలి.',
     },
+    {
+      en: 'Courage grows with practice.',
+      native: 'అభ్యాసంతో ధైర్యం పెరుగుతుంది.',
+    },
   ],
 };
 
@@ -205,8 +203,7 @@ function recorderProps(): CapturedRecorderProps {
 async function pressAlertButton(text: string) {
   const calls = alertSpy.mock.calls;
   const buttons = calls[calls.length - 1][2] as
-    | { text?: string; onPress?: () => void }[]
-    | undefined;
+    { text?: string; onPress?: () => void }[] | undefined;
   const button = buttons?.find((candidate) => candidate.text === text);
   if (!button?.onPress) throw new Error(`Alert button "${text}" not found`);
   await act(async () => button.onPress?.());
@@ -245,9 +242,7 @@ describe('practice home screen', () => {
     mockApiFetch.mockResolvedValue({ question: QUESTION });
     await renderScreen(<PracticeScreen />);
 
-    expect(
-      await screen.findByText('Describe a time you showed courage.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText('B1')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
@@ -267,10 +262,7 @@ describe('practice home screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await act(async () => recorderProps().onResult(PASSED_RESULT));
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      PASSED_RESULT,
-    );
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
@@ -280,10 +272,7 @@ describe('practice home screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await act(async () => recorderProps().onError('upload failed'));
-    expect(alertSpy).toHaveBeenCalledWith(
-      'Could not assess your answer',
-      'upload failed',
-    );
+    expect(alertSpy).toHaveBeenCalledWith('Could not assess your answer', 'upload failed');
   });
 
   it('refetches the question when recorder recovery is unresolved', async () => {
@@ -317,9 +306,7 @@ describe('practice home screen', () => {
 
     expect(await screen.findByText("Couldn't load a question")).toBeTruthy();
     expect(
-      screen.getByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
 
     await act(async () => {
@@ -336,11 +323,7 @@ describe('practice home screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await fireEvent.press(screen.getByRole('button', { name: 'Settings' }));
-    expect(alertSpy).toHaveBeenCalledWith(
-      'Settings',
-      undefined,
-      expect.any(Array),
-    );
+    expect(alertSpy).toHaveBeenCalledWith('Settings', undefined, expect.any(Array));
 
     await pressAlertButton('Change Password');
     expect(mockRouter.push).toHaveBeenCalledWith('/settings/change-password');
@@ -369,10 +352,7 @@ describe('practice home screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: 'Log out' }));
     await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(
-        'Logged out',
-        expect.stringContaining('logged out'),
-      ),
+      expect(alertSpy).toHaveBeenCalledWith('Logged out', expect.stringContaining('logged out')),
     );
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
@@ -401,9 +381,7 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />);
 
     expect(screen.getByText('Invalid question link')).toBeTruthy();
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Back to Practice' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -420,9 +398,7 @@ describe('practice attempt screen', () => {
     mockApiFetch.mockResolvedValue(HELP_CONTENT);
     await renderScreen(<AttemptScreen />);
 
-    expect(
-      await screen.findByText('Describe a time you showed courage.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
       `/practice/question/${QUESTION.id}/help`,
@@ -444,10 +420,7 @@ describe('practice attempt screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await act(async () => recorderProps().onResult(PASSED_RESULT));
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      PASSED_RESULT,
-    );
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
@@ -471,13 +444,9 @@ describe('practice attempt screen', () => {
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen(<AttemptScreen />);
 
+    expect(await screen.findByText("Couldn't load the question")).toBeTruthy();
     expect(
-      await screen.findByText("Couldn't load the question"),
-    ).toBeTruthy();
-    expect(
-      screen.getByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
 
     await act(async () => {
@@ -494,9 +463,7 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText('No result to show')).toBeTruthy();
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Back to Practice' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
   });
 
@@ -515,12 +482,10 @@ describe('practice feedback screen', () => {
     expect(screen.getByText('Feedback')).toBeTruthy();
     expect(screen.getByText('Nice work.')).toBeTruthy();
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Next Question' }),
-    );
-    expect(
-      queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel]),
-    ).toEqual({ question: NEXT_QUESTION });
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
+      question: NEXT_QUESTION,
+    });
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
   });
@@ -534,9 +499,7 @@ describe('practice feedback screen', () => {
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
     await renderScreen(<FeedbackScreen />, queryClient);
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Next Question' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ['practice-question', USER.id, USER.cefrLevel],
     });
@@ -560,9 +523,7 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText('Not quite — attempt 2 of 3')).toBeTruthy();
-    expect(
-      screen.getByText(/1 attempt left\. Review the feedback and try again\./),
-    ).toBeTruthy();
+    expect(screen.getByText(/1 attempt left\. Review the feedback and try again\./)).toBeTruthy();
     expect(screen.getByText('40')).toBeTruthy();
     // Empty transcripts are hidden.
     expect(screen.queryByText('We heard')).toBeNull();
@@ -612,15 +573,11 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText('Out of attempts')).toBeTruthy();
-    expect(
-      screen.getByText("Here's what to work on before the next question."),
-    ).toBeTruthy();
+    expect(screen.getByText("Here's what to work on before the next question.")).toBeTruthy();
     expect(screen.getByText('Final feedback')).toBeTruthy();
     expect(screen.getByText('Final words.')).toBeTruthy();
     expect(screen.queryByText('Regular feedback.')).toBeNull();
-    expect(
-      screen.getByRole('button', { name: 'Next Question' }),
-    ).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Next Question' })).toBeTruthy();
   });
 
   it('does not navigate when the user is missing', async () => {
@@ -630,9 +587,7 @@ describe('practice feedback screen', () => {
     });
     await renderScreen(<FeedbackScreen />);
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Next Question' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
     expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
   });
@@ -644,9 +599,7 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
 
     expect(screen.getByText('Invalid question link')).toBeTruthy();
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Back to Practice' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -667,12 +620,8 @@ describe('practice help screen', () => {
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText('ధైర్యం')).toBeTruthy();
     expect(screen.getByText('Question')).toBeTruthy();
-    expect(
-      screen.getByText('Describe a time you showed courage.'),
-    ).toBeTruthy();
-    expect(
-      screen.getByText('మీరు ధైర్యం చూపిన సమయాన్ని వివరించండి.'),
-    ).toBeTruthy();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(screen.getByText('మీరు ధైర్యం చూపిన సమయాన్ని వివరించండి.')).toBeTruthy();
     expect(screen.getByText('Example sentences')).toBeTruthy();
     expect(screen.getByText('Example 1')).toBeTruthy();
     expect(screen.getByText('She showed courage at work.')).toBeTruthy();
@@ -683,6 +632,25 @@ describe('practice help screen', () => {
       `/practice/question/${QUESTION.id}/help`,
       expect.objectContaining({ signal: expect.anything() }),
     );
+    expect(screen.getByText('ధైర్యం').props.accessibilityLanguage).toBe('te-IN');
+    expect(
+      screen.getByText('మీరు ధైర్యం చూపిన సమయాన్ని వివరించండి.').props.accessibilityLanguage,
+    ).toBe('te-IN');
+    expect(screen.getByText('ఆమె పనిలో ధైర్యం చూపింది.').props.accessibilityLanguage).toBe('te-IN');
+  });
+
+  it.each([
+    ['hi', 'hi-IN'],
+    ['es', 'es-ES'],
+    ['zh', 'zh-Hans'],
+  ] as const)('uses the %s learner language for native help text', async (language, tag) => {
+    mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: language } });
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<HelpScreen />);
+
+    expect((await screen.findByText('ధైర్యం')).props.accessibilityLanguage).toBe(tag);
+    expect(screen.getByText('ఆమె పనిలో ధైర్యం చూపింది.').props.accessibilityLanguage).toBe(tag);
   });
 
   it('navigates to practice mode for the same question', async () => {
@@ -691,9 +659,7 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
     await screen.findByText('Word');
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Start Practice' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Start Practice' }));
     expect(mockRouter.push).toHaveBeenCalledWith({
       pathname: '/practice/attempt',
       params: { questionId: QUESTION.id },
@@ -707,9 +673,7 @@ describe('practice help screen', () => {
 
     expect(await screen.findByText("Couldn't load help")).toBeTruthy();
     expect(
-      screen.getByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
 
     await act(async () => {

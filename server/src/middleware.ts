@@ -120,10 +120,20 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     }
     return res.status(400).json({ error: err.message });
   }
-  // Body-parser rejections carry a 4xx status — they are client errors, not 500s.
+  // Map body-parser protocol errors to stable, non-sensitive API responses.
+  // Never reflect parser messages because they can include request fragments.
   const bodyParserError = err as { type?: string; status?: number };
+  if (bodyParserError.type === 'entity.too.large') {
+    return res.status(413).json({ error: 'Request body is too large' });
+  }
+  if (bodyParserError.type === 'encoding.unsupported' || bodyParserError.type === 'charset.unsupported') {
+    return res.status(415).json({ error: 'Unsupported request body encoding' });
+  }
   if (bodyParserError.type === 'entity.parse.failed') {
     return res.status(400).json({ error: 'Request body is not valid JSON' });
+  }
+  if (bodyParserError.type === 'request.aborted' || bodyParserError.type === 'request.size.invalid') {
+    return res.status(400).json({ error: 'Invalid request body' });
   }
   logger.error({ err, requestId: req.id }, 'unhandled error');
   return res.status(500).json({ error: 'Internal server error' });

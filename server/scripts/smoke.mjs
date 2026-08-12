@@ -309,7 +309,7 @@ ok(`observed the attemptNo=3 final-feedback path (after ${attempts} attempts)`, 
 r = await req('POST', '/practice/attempt', { token, form: audioForm(practiceQ.id) });
 ok(
   'attemptNo resets to 1 after a pass or a 3rd failure',
-  r.status === 200 && (r.body.passed || r.body.attemptNo === 1 || r.body.attemptNo <= 3),
+  r.status === 200 && r.body.attemptNo === 1,
   JSON.stringify(r.body),
 );
 

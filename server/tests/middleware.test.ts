@@ -153,12 +153,35 @@ describe('errorHandler', () => {
   });
 
   it('maps malformed JSON bodies to 400 instead of a misleading 500', async () => {
+    const res = await request(buildApp()).post('/anything').set('Content-Type', 'application/json').send('{ not json');
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('Request body is not valid JSON');
+  });
+
+  it('maps an oversized JSON body to 413 without exposing parser details', async () => {
     const res = await request(buildApp())
       .post('/anything')
       .set('Content-Type', 'application/json')
-      .send('{ not json');
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('Request body is not valid JSON');
+      .send(JSON.stringify({ value: 'x'.repeat(110 * 1024) }));
+    expect(res.status).toBe(413);
+    expect(res.body).toEqual({ error: 'Request body is too large' });
+  });
+
+  it('maps unsupported JSON encodings and charsets to 415', async () => {
+    const encoding = await request(buildApp())
+      .post('/anything')
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', 'made-up')
+      .send('{"ok":true}');
+    expect(encoding.status).toBe(415);
+    expect(encoding.body).toEqual({ error: 'Unsupported request body encoding' });
+
+    const charset = await request(buildApp())
+      .post('/anything')
+      .set('Content-Type', 'application/json; charset=iso-8859-1')
+      .send('{"ok":true}');
+    expect(charset.status).toBe(415);
+    expect(charset.body).toEqual({ error: 'Unsupported request body encoding' });
   });
 
   it('maps unexpected errors to a generic 500', async () => {

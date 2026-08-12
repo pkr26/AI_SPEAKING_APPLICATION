@@ -1,18 +1,12 @@
 import React from 'react';
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { useAuth } from '../../lib/auth';
 import { usePracticeFlow } from '../../lib/practice-flow';
-import { colors } from '../../lib/theme';
+import { colors, layout } from '../../lib/theme';
 
 type Variant = 'passed' | 'retry' | 'final';
 
@@ -35,15 +29,10 @@ export default function FeedbackScreen() {
         <Text accessibilityRole="header" style={styles.title}>
           No result to show
         </Text>
-        <Text style={styles.body}>
-          Something went wrong displaying this feedback.
-        </Text>
+        <Text style={styles.body}>Something went wrong displaying this feedback.</Text>
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [
-            styles.primaryButton,
-            pressed && styles.primaryButtonPressed,
-          ]}
+          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
           onPress={() => router.replace('/practice')}
         >
           <Text style={styles.primaryButtonText}>Back to Practice</Text>
@@ -53,19 +42,14 @@ export default function FeedbackScreen() {
   }
 
   const attemptsLeft = result.attemptsLeft ?? 0;
-  const variant: Variant = result.passed
-    ? 'passed'
-    : attemptsLeft > 0
-      ? 'retry'
-      : 'final';
+  const variant: Variant = result.passed ? 'passed' : attemptsLeft > 0 ? 'retry' : 'final';
 
   const goToNextQuestion = () => {
     if (!user) return;
     if (result.nextQuestion) {
-      queryClient.setQueryData(
-        ['practice-question', user.id, user.cefrLevel],
-        { question: result.nextQuestion },
-      );
+      queryClient.setQueryData(['practice-question', user.id, user.cefrLevel], {
+        question: result.nextQuestion,
+      });
     } else {
       void queryClient.invalidateQueries({
         queryKey: ['practice-question', user.id, user.cefrLevel],
@@ -85,10 +69,7 @@ export default function FeedbackScreen() {
         {variant === 'passed' && (
           <>
             <Text style={styles.emoji}>🎉</Text>
-            <Text
-              accessibilityRole="header"
-              style={[styles.title, { color: colors.success }]}
-            >
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
               Great job!
             </Text>
             <Text style={styles.subtitle}>You passed this question.</Text>
@@ -98,15 +79,12 @@ export default function FeedbackScreen() {
         {variant === 'retry' && (
           <>
             <Text style={styles.emoji}>💪</Text>
-            <Text
-              accessibilityRole="header"
-              style={[styles.title, { color: colors.warning }]}
-            >
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
               Not quite — attempt {result.attemptNo} of 3
             </Text>
             <Text style={styles.subtitle}>
-              {attemptsLeft} {attemptsLeft === 1 ? 'attempt' : 'attempts'}{' '}
-              left. Review the feedback and try again.
+              {attemptsLeft} {attemptsLeft === 1 ? 'attempt' : 'attempts'} left. Review the feedback
+              and try again.
             </Text>
           </>
         )}
@@ -114,10 +92,7 @@ export default function FeedbackScreen() {
         {variant === 'final' && (
           <>
             <Text style={styles.emoji}>📘</Text>
-            <Text
-              accessibilityRole="header"
-              style={[styles.title, { color: colors.danger }]}
-            >
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.danger }]}>
               Out of attempts
             </Text>
             <Text style={styles.subtitle}>
@@ -143,23 +118,16 @@ export default function FeedbackScreen() {
             {variant === 'final' ? 'Final feedback' : 'Feedback'}
           </Text>
           <Text style={styles.body}>
-            {variant === 'final' && result.finalFeedback
-              ? result.finalFeedback
-              : result.feedback}
+            {variant === 'final' && result.finalFeedback ? result.finalFeedback : result.feedback}
           </Text>
         </View>
       </ScrollView>
 
-      <View
-        style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}
-      >
+      <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         {variant === 'retry' ? (
           <Pressable
             accessibilityRole="button"
-            style={({ pressed }) => [
-              styles.primaryButton,
-              pressed && styles.primaryButtonPressed,
-            ]}
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
             onPress={() => router.back()}
           >
             <Text style={styles.primaryButtonText}>Try Again</Text>
@@ -167,10 +135,7 @@ export default function FeedbackScreen() {
         ) : (
           <Pressable
             accessibilityRole="button"
-            style={({ pressed }) => [
-              styles.primaryButton,
-              pressed && styles.primaryButtonPressed,
-            ]}
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
             onPress={goToNextQuestion}
           >
             <Text style={styles.primaryButtonText}>Next Question</Text>
@@ -196,6 +161,9 @@ const styles = StyleSheet.create({
   content: {
     padding: 24,
     alignItems: 'center',
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
   },
   emoji: {
     fontSize: 52,

@@ -1,17 +1,13 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { Text } from 'react-native';
+import { router } from 'expo-router';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import AuthLayout from '../src/app/(auth)/_layout';
-import RootLayout from '../src/app/_layout';
+import NotFoundScreen from '../src/app/+not-found';
+import RootLayout, { ErrorBoundary } from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
@@ -20,14 +16,10 @@ import type { User } from '../src/lib/types';
 // ----- expo-router mock (captures Stack structure and redirects) -----
 
 const capturedStackProps: { screenOptions?: unknown }[] = [];
-const capturedScreenProps: ({ name?: string; options?: unknown } | undefined)[] =
-  [];
+const capturedScreenProps: ({ name?: string; options?: unknown } | undefined)[] = [];
 const capturedProtectedProps: { guard: boolean }[] = [];
 
-function MockStack(props: {
-  children?: React.ReactNode;
-  screenOptions?: unknown;
-}) {
+function MockStack(props: { children?: React.ReactNode; screenOptions?: unknown }) {
   capturedStackProps.push(props);
   return <>{props.children}</>;
 }
@@ -35,10 +27,7 @@ function MockStackScreen(props: { name?: string; options?: unknown }) {
   capturedScreenProps.push(props);
   return null;
 }
-function MockStackProtected(props: {
-  guard: boolean;
-  children?: React.ReactNode;
-}) {
+function MockStackProtected(props: { guard: boolean; children?: React.ReactNode }) {
   capturedProtectedProps.push(props);
   return <>{props.children}</>;
 }
@@ -96,6 +85,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     user: USER,
     sessionVersion: 1,
     isRestoring: false,
+    restoreError: null,
+    retrySessionRestore: jest.fn(),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -218,6 +209,16 @@ describe('root layout route guards', () => {
     expect(guards()).toEqual([true, false, false, false]);
   });
 
+  it('keeps every protected group closed after a secure-store restore error', async () => {
+    mockAuthValue = makeAuth({
+      token: null,
+      user: null,
+      restoreError: 'Secure session storage is unavailable.',
+    });
+    await render(<RootLayout />);
+    expect(guards()).toEqual([false, false, false, false]);
+  });
+
   it('closes everything while the profile is still loading', async () => {
     mockAuthValue = makeAuth({ user: null });
     await render(<RootLayout />);
@@ -239,6 +240,26 @@ describe('root layout route guards', () => {
   });
 });
 
+describe('root fallback screens', () => {
+  it('retries a route crash without exposing the error body', async () => {
+    const retry = jest.fn();
+    await render(<ErrorBoundary error={new Error('sensitive stack details')} retry={retry} />);
+
+    expect(screen.getByText('Something went wrong')).toBeTruthy();
+    expect(screen.queryByText(/sensitive stack details/)).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    expect(retry).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns an invalid deep link to the protected entry gate', async () => {
+    await render(<NotFoundScreen />);
+
+    expect(screen.getByText('Page not found')).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: 'Return Home' }));
+    expect(router.replace).toHaveBeenCalledWith('/');
+  });
+});
+
 describe('(auth) layout', () => {
   it('hides headers for the auth stack', async () => {
     await render(<AuthLayout />);
@@ -254,6 +275,23 @@ describe('index gate', () => {
     mockAuthValue = makeAuth({ isRestoring: true, token: null, user: null });
     await renderGate();
     expect(screen.getByText('Restoring your session…')).toBeTruthy();
+  });
+
+  it('shows secure-storage recovery instead of redirecting to login', async () => {
+    const retrySessionRestore = jest.fn();
+    mockAuthValue = makeAuth({
+      token: null,
+      user: null,
+      restoreError:
+        'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+      retrySessionRestore,
+    });
+    await renderGate();
+
+    expect(screen.queryByTestId('redirect')).toBeNull();
+    expect(screen.getByText("Can't access your secure session")).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    expect(retrySessionRestore).toHaveBeenCalledTimes(1);
   });
 
   it('redirects to login when there is no token', async () => {
@@ -292,9 +330,7 @@ describe('index gate', () => {
     const fetched = { ...USER, diagnosticCompleted: false, cefrLevel: null };
     mockApiFetch.mockResolvedValue({ user: fetched });
     await renderGate();
-    await waitFor(() =>
-      expect(mockAuthValue.setUser).toHaveBeenCalledWith(fetched),
-    );
+    await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(fetched));
     expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
   });
 
@@ -311,9 +347,7 @@ describe('index gate', () => {
     await renderGate();
     expect(await screen.findByText("Can't reach the server")).toBeTruthy();
     expect(
-      screen.getByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
 
     await act(async () => {
@@ -328,8 +362,6 @@ describe('index gate', () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockRejectedValue(new Error('parse failure'));
     await renderGate();
-    expect(
-      await screen.findByText('Could not load your profile. Please try again.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Could not load your profile. Please try again.')).toBeTruthy();
   });
 });

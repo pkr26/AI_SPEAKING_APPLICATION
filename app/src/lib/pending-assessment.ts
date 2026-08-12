@@ -1,10 +1,8 @@
-import * as SecureStore from "expo-secure-store";
+import * as SecureStore from 'expo-secure-store';
 
-import { isUuid } from "./params";
+import { isUuid } from './params';
 
-export type AssessmentEndpoint =
-  | "/diagnostic/answer"
-  | "/practice/attempt";
+export type AssessmentEndpoint = '/diagnostic/answer' | '/practice/attempt';
 
 export interface PendingAssessment {
   ownerId: string;
@@ -12,39 +10,78 @@ export interface PendingAssessment {
   questionId: string;
   requestId: string;
   createdAt: number;
-  delivery: "pending" | "reconcile";
+  stage: 'prepared' | 'direct-posting' | 's3-granted' | 'reconcile';
+  audioKey?: string;
 }
 
-const STORAGE_KEY = "pending_assessment_v1";
+const STORAGE_KEY = 'pending_assessment_v1';
 const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
-  keychainService: "ai-english-coach.pending-assessment",
+  keychainService: 'ai-english-coach.pending-assessment',
 };
 
 let memoryValue: PendingAssessment | null = null;
 let memoryLoaded = false;
+let storageQueue: Promise<void> = Promise.resolve();
 
-export function parsePendingAssessment(
-  value: unknown,
-): PendingAssessment | null {
-  if (!value || typeof value !== "object") return null;
+function isOwnedAudioKey(ownerId: string, audioKey: string): boolean {
+  const [prefix, keyOwnerId, filename, extra] = audioKey.split('/');
+  return (
+    extra === undefined &&
+    prefix === 'audio-uploads' &&
+    keyOwnerId === ownerId &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp4|webm|wav)$/i.test(
+      filename ?? '',
+    )
+  );
+}
+
+function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
+  const result = storageQueue.then(operation, operation);
+  storageQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
+export function parsePendingAssessment(value: unknown): PendingAssessment | null {
+  if (!value || typeof value !== 'object') return null;
   const candidate = value as Partial<PendingAssessment>;
   if (
     !isUuid(candidate.ownerId) ||
     !isUuid(candidate.questionId) ||
     !isUuid(candidate.requestId) ||
-    (candidate.endpoint !== "/diagnostic/answer" &&
-      candidate.endpoint !== "/practice/attempt") ||
-    typeof candidate.createdAt !== "number" ||
+    (candidate.endpoint !== '/diagnostic/answer' && candidate.endpoint !== '/practice/attempt') ||
+    typeof candidate.createdAt !== 'number' ||
     !Number.isFinite(candidate.createdAt) ||
     candidate.createdAt <= 0
   ) {
     return null;
   }
   if (
-    candidate.delivery !== undefined &&
-    candidate.delivery !== "pending" &&
-    candidate.delivery !== "reconcile"
+    candidate.stage !== undefined &&
+    candidate.stage !== 'prepared' &&
+    candidate.stage !== 'direct-posting' &&
+    candidate.stage !== 's3-granted' &&
+    candidate.stage !== 'reconcile'
+  ) {
+    return null;
+  }
+  const legacyDelivery = (candidate as Partial<PendingAssessment> & { delivery?: string }).delivery;
+  if (
+    legacyDelivery !== undefined &&
+    legacyDelivery !== 'pending' &&
+    legacyDelivery !== 'reconcile'
+  ) {
+    return null;
+  }
+  const stage =
+    candidate.stage ?? (legacyDelivery === 'reconcile' ? 'reconcile' : 'direct-posting');
+  if (
+    stage === 's3-granted' &&
+    (typeof candidate.audioKey !== 'string' ||
+      !isOwnedAudioKey(candidate.ownerId, candidate.audioKey))
   ) {
     return null;
   }
@@ -54,33 +91,18 @@ export function parsePendingAssessment(
     questionId: candidate.questionId,
     requestId: candidate.requestId,
     createdAt: candidate.createdAt,
-    // Backward-compatible with a pending record written by the immediately
-    // preceding app build before the delivery marker was introduced.
-    delivery: candidate.delivery ?? "pending",
+    stage,
+    ...(stage === 's3-granted' ? { audioKey: candidate.audioKey } : {}),
   };
 }
 
-export async function savePendingAssessment(
-  pending: PendingAssessment,
-): Promise<void> {
-  const parsed = parsePendingAssessment(pending);
-  if (!parsed) throw new Error("Invalid pending assessment metadata");
-  await SecureStore.setItemAsync(
-    STORAGE_KEY,
-    JSON.stringify(parsed),
-    STORAGE_OPTIONS,
-  );
-  memoryValue = parsed;
-  memoryLoaded = true;
-}
-
-export async function loadPendingAssessment(): Promise<PendingAssessment | null> {
+async function loadPendingUnsafe(): Promise<PendingAssessment | null> {
   if (memoryLoaded) return memoryValue;
   let stored: string | null;
   try {
     stored = await SecureStore.getItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
   } catch (error) {
-    throw new Error("Secure pending-assessment storage is unavailable", {
+    throw new Error('Secure pending-assessment storage is unavailable', {
       cause: error,
     });
   }
@@ -95,20 +117,37 @@ export async function loadPendingAssessment(): Promise<PendingAssessment | null>
   } catch {
     // Invalid local metadata is deleted below and never sent to the API.
   }
-  await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(
-    () => undefined,
-  );
+  await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
+  memoryValue = null;
   return null;
 }
 
-export async function clearPendingAssessment(
-  expectedRequestId?: string,
-): Promise<void> {
-  const current = memoryValue ?? (await loadPendingAssessment());
-  if (expectedRequestId && current?.requestId !== expectedRequestId) return;
-  await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
-  memoryValue = null;
+async function savePendingUnsafe(pending: PendingAssessment): Promise<void> {
+  await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(pending), STORAGE_OPTIONS);
+  memoryValue = pending;
   memoryLoaded = true;
+}
+
+export async function savePendingAssessment(pending: PendingAssessment): Promise<void> {
+  const parsed = parsePendingAssessment(pending);
+  if (!parsed) throw new Error('Invalid pending assessment metadata');
+  await serializeStorage(async () => {
+    await savePendingUnsafe(parsed);
+  });
+}
+
+export async function loadPendingAssessment(): Promise<PendingAssessment | null> {
+  return serializeStorage(loadPendingUnsafe);
+}
+
+export async function clearPendingAssessment(expectedRequestId?: string): Promise<void> {
+  await serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (expectedRequestId && current?.requestId !== expectedRequestId) return;
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
+    memoryValue = null;
+    memoryLoaded = true;
+  });
 }
 
 /**
@@ -116,11 +155,35 @@ export async function clearPendingAssessment(
  * or process death races delivery, the next focused screen refreshes canonical
  * state rather than polling/replaying or enabling another paid submission.
  */
-export async function markPendingAssessmentForReconciliation(
+export async function markPendingAssessmentForReconciliation(requestId: string): Promise<boolean> {
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (!current || current.requestId !== requestId) return false;
+    await savePendingUnsafe({
+      ...current,
+      stage: 'reconcile',
+      audioKey: undefined,
+    });
+    return true;
+  });
+}
+
+/** Advance the durable upload handoff before starting the corresponding I/O. */
+export async function markPendingAssessmentStage(
   requestId: string,
+  stage: 'direct-posting' | 's3-granted',
+  audioKey?: string,
 ): Promise<boolean> {
-  const current = await loadPendingAssessment();
-  if (!current || current.requestId !== requestId) return false;
-  await savePendingAssessment({ ...current, delivery: "reconcile" });
-  return true;
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (!current || current.requestId !== requestId) return false;
+    const next = parsePendingAssessment({
+      ...current,
+      stage,
+      ...(stage === 's3-granted' ? { audioKey } : { audioKey: undefined }),
+    });
+    if (!next) throw new Error('Invalid pending assessment metadata');
+    await savePendingUnsafe(next);
+    return true;
+  });
 }

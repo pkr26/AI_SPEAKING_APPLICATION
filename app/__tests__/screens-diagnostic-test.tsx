@@ -1,11 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import {
-  act,
-  fireEvent,
-  render,
-  screen,
-  waitFor,
-} from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { Alert } from 'react-native';
 
@@ -72,6 +66,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     user: USER,
     sessionVersion: 1,
     isRestoring: false,
+    restoreError: null,
+    retrySessionRestore: jest.fn(),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn().mockResolvedValue(undefined),
@@ -150,8 +146,7 @@ function recorderProps(): CapturedRecorderProps {
 async function pressAlertButton(text: string) {
   const calls = alertSpy.mock.calls;
   const buttons = calls[calls.length - 1][2] as
-    | { text?: string; onPress?: () => void }[]
-    | undefined;
+    { text?: string; onPress?: () => void }[] | undefined;
   const button = buttons?.find((candidate) => candidate.text === text);
   if (!button?.onPress) throw new Error(`Alert button "${text}" not found`);
   await act(async () => button.onPress?.());
@@ -187,9 +182,7 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
 
-    expect(
-      await screen.findByText('Describe a time you showed courage.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText(/Question 1 of up to 5/)).toBeTruthy();
     expect(screen.getByText('Diagnostic Test')).toBeTruthy();
@@ -221,13 +214,9 @@ describe('diagnostic screen', () => {
     await act(async () => recorderProps().onResult(result));
 
     expect(screen.getByText('Answer received')).toBeTruthy();
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Next Question' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
 
-    expect(
-      await screen.findByText('Tell me about a memorable journey.'),
-    ).toBeTruthy();
+    expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
     expect(screen.getByText('journey')).toBeTruthy();
     expect(screen.getByText(/Question 2 of up to 5/)).toBeTruthy();
     expect(recorderProps().questionId).toBe(QUESTION_2.id);
@@ -247,17 +236,13 @@ describe('diagnostic screen', () => {
       level: 'B2',
     };
     await act(async () => recorderProps().onResult(result));
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'See My Level' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'See My Level' }));
 
     expect(await screen.findByText('Diagnostic complete!')).toBeTruthy();
     expect(screen.getByText('Your English level is')).toBeTruthy();
     expect(screen.getByText('B2')).toBeTruthy();
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Start Practicing' }),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Start Practicing' }));
     expect(mockAuthValue.setUser).toHaveBeenCalledWith({
       ...USER,
       diagnosticCompleted: true,
@@ -280,9 +265,7 @@ describe('diagnostic screen', () => {
 
     expect(await screen.findByText("Couldn't load the test")).toBeTruthy();
     expect(
-      screen.getByText(
-        'The service is temporarily unavailable. Please try again later.',
-      ),
+      screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
 
     await act(async () => {
@@ -298,9 +281,7 @@ describe('diagnostic screen', () => {
     await renderScreen();
 
     expect(
-      await screen.findByText(
-        'Could not load the diagnostic test. Please try again.',
-      ),
+      await screen.findByText('Could not load the diagnostic test. Please try again.'),
     ).toBeTruthy();
   });
 
@@ -310,10 +291,7 @@ describe('diagnostic screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await act(async () => recorderProps().onError('upload failed'));
-    expect(alertSpy).toHaveBeenCalledWith(
-      'Could not assess your answer',
-      'upload failed',
-    );
+    expect(alertSpy).toHaveBeenCalledWith('Could not assess your answer', 'upload failed');
   });
 
   it('refetches server state when recorder recovery is unresolved', async () => {
@@ -334,14 +312,11 @@ describe('diagnostic screen', () => {
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Account & privacy' }),
-    );
-    expect(alertSpy).toHaveBeenCalledWith(
-      'Account & privacy',
-      undefined,
-      expect.any(Array),
-    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Account & privacy' }));
+    expect(alertSpy).toHaveBeenCalledWith('Account & privacy', undefined, expect.any(Array));
+    const buttons = alertSpy.mock.calls.at(-1)?.[2] as { text?: string }[];
+    expect(buttons).toHaveLength(3);
+    expect(buttons).toEqual(expect.arrayContaining([expect.objectContaining({ text: 'Cancel' })]));
 
     await pressAlertButton('Change Password');
     expect(mockRouter.push).toHaveBeenCalledWith('/settings/change-password');
@@ -350,15 +325,12 @@ describe('diagnostic screen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/settings/delete-account');
   });
 
-  it('logs out from the account menu and returns to the gate', async () => {
+  it('logs out from the dedicated account action and returns to the gate', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Account & privacy' }),
-    );
-    await pressAlertButton('Log Out');
+    await fireEvent.press(screen.getByRole('button', { name: 'Log out' }));
 
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalled();
@@ -372,10 +344,7 @@ describe('diagnostic screen', () => {
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
 
-    await fireEvent.press(
-      screen.getByRole('button', { name: 'Account & privacy' }),
-    );
-    await pressAlertButton('Log Out');
+    await fireEvent.press(screen.getByRole('button', { name: 'Log out' }));
 
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(

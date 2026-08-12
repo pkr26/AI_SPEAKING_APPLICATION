@@ -22,17 +22,19 @@ storage; browser persistence is not an accepted security fallback.
 ## Run
 
 ```bash
-npm install
+npm ci
 npx expo start
 ```
 
 Useful checks:
 
 ```bash
-npm run typecheck
-npm run doctor
+npm run format:check
 npm run lint
+npm run typecheck
 npm test
+npm run doctor
+npm run audit:ci
 ```
 
 The backend must be running on port 4000.
@@ -59,33 +61,38 @@ dev machine's LAN IP from `expoConfig.hostUri` as a fallback.)
 ## Project structure
 
 ```
-app/                  expo-router routes
-  _layout.tsx         providers (React Query, auth) + root Stack
-  index.tsx           gate: routes to login / diagnostic / practice
-  (auth)/             login + signup (native-language picker)
-  diagnostic.tsx      CEFR diagnostic test flow
-  practice/
-    index.tsx         practice question + Recorder + help (?) + log out
-    help.tsx          translations + example sentences for a question
-    attempt.tsx       minimal practice mode (word + question + Recorder)
-    feedback.tsx      pass / retry / final-fail variants
-components/
-  Recorder.tsx        shared recorder used by diagnostic + practice
-lib/
-  api.ts              fetch wrapper (base URL, Bearer token, multipart upload)
-  auth.tsx            auth context (SecureStore token, user, login/register/revoking logout)
-  types.ts            API contract types
-  params.ts           route-param helpers
-  theme.ts            colors
+src/
+  app/                  expo-router routes
+    _layout.tsx         providers (React Query, auth) + root Stack
+    index.tsx           gate: routes to login / diagnostic / practice
+    (auth)/             login + signup (native-language picker)
+    diagnostic.tsx      CEFR diagnostic test flow
+    practice/
+      index.tsx         practice question + Recorder + help (?) + log out
+      help.tsx          translations + example sentences for a question
+      attempt.tsx       minimal practice mode (word + question + Recorder)
+      feedback.tsx      pass / retry / final-fail variants
+  components/
+    Recorder.tsx        shared recorder used by diagnostic + practice
+  lib/
+    api.ts              API URL, Bearer requests, direct/S3 audio upload
+    auth.tsx            SecureStore-backed auth context and cache isolation
+    pending-assessment.ts durable interrupted-upload state machine
+    types.ts            strict runtime parsers for API contracts
+    params.ts           route-param helpers
+    theme.ts            colors
 ```
 
 ## Backend contract
 
-JSON, camelCase; `Authorization: Bearer <token>`. Audio answers are uploaded
-as `multipart/form-data` (file field `audio`; its extension and audio MIME type
-are derived from the platform recording URI; UUID text fields `questionId` and
-`requestId`, reused for safe retries of one logical submission). API and
-upstream-provider error bodies are never shown directly to users. If an upload
-is interrupted, the app stores only its owner/question/request UUID metadata in
-device-only secure storage and polls authenticated `GET /assessments/:requestId`
-before enabling another recording; the server replay expires after 24 hours.
+JSON, camelCase; `Authorization: Bearer <token>`. Before sending audio, the app
+calls `POST /uploads/audio-url`. Production receives a short-lived,
+size-constrained S3 multipart-POST grant, uploads the native file directly, then
+POSTs `{questionId, requestId, audioKey}` to the assessment endpoint. Local
+development receives `mode: direct` and sends multipart form data with file
+field `audio`. The same UUID `requestId` identifies every retry of one logical
+submission. API and upstream-provider error bodies are never shown directly to
+users. Device-only secure storage records the owner, question, request, upload
+stage, and user-scoped S3 key when applicable, allowing the app to reconcile an
+interrupted handoff through authenticated `GET /assessments/:requestId`; the
+server replay expires after 24 hours.

@@ -19,7 +19,7 @@ import {
   passwordPolicyError,
   useAuth,
 } from '../../lib/auth';
-import { colors } from '../../lib/theme';
+import { colors, layout } from '../../lib/theme';
 
 export default function ChangePasswordScreen() {
   const { changePassword } = useAuth();
@@ -29,12 +29,9 @@ export default function ChangePasswordScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const newPasswordError =
-    newPassword.length > 0 ? passwordPolicyError(newPassword) : null;
+  const newPasswordError = newPassword.length > 0 ? passwordPolicyError(newPassword) : null;
   const currentPasswordError =
-    currentPassword.length > 0
-      ? comparablePasswordError(currentPassword)
-      : null;
+    currentPassword.length > 0 ? comparablePasswordError(currentPassword) : null;
   const confirmError =
     confirmPassword.length > 0 && confirmPassword !== newPassword
       ? 'Passwords do not match.'
@@ -62,12 +59,7 @@ export default function ChangePasswordScreen() {
       } else if (err instanceof ApiError && err.status === 429) {
         setError('Too many attempts, please try again later.');
       } else {
-        setError(
-          userMessageForError(
-            err,
-            'Could not change your password. Please try again.',
-          ),
-        );
+        setError(userMessageForError(err, 'Could not change your password. Please try again.'));
       }
     } finally {
       setBusy(false);
@@ -115,9 +107,7 @@ export default function ChangePasswordScreen() {
             textContentType="newPassword"
             maxLength={MAX_PASSWORD_UTF8_BYTES}
           />
-          {newPasswordError && (
-            <Text style={styles.fieldError}>{newPasswordError}</Text>
-          )}
+          {newPasswordError && <Text style={styles.fieldError}>{newPasswordError}</Text>}
 
           <Text style={styles.label}>Confirm new password</Text>
           <TextInput
@@ -150,9 +140,7 @@ export default function ChangePasswordScreen() {
               pressed && canSubmit && styles.buttonPressed,
             ]}
           >
-            <Text style={styles.buttonText}>
-              {busy ? 'Updating…' : 'Update Password'}
-            </Text>
+            <Text style={styles.buttonText}>{busy ? 'Updating…' : 'Update Password'}</Text>
           </Pressable>
         </View>
       </ScrollView>
@@ -173,6 +161,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card,
     borderRadius: 16,
     padding: 20,
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -206,6 +197,7 @@ const styles = StyleSheet.create({
   },
   button: {
     marginTop: 20,
+    minHeight: layout.minimumTarget,
     backgroundColor: colors.primary,
     borderRadius: 12,
     paddingVertical: 15,

@@ -24,7 +24,13 @@ import { config } from '../src/config';
 import { app, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
+let userId: string;
+let audioPath: string;
+
 afterAll(async () => {
+  if (audioPath) {
+    await fs.rm(audioPath, { force: true });
+  }
   await pool.end();
 });
 
@@ -34,14 +40,11 @@ const QUESTION: AssessQuestion = {
   questionText: 'Describe your hometown.',
 };
 
-let userId: string;
-let audioPath: string;
-
 beforeAll(async () => {
   const { res } = await registerUser(app());
   userId = res.body.user.id;
   audioPath = path.join(uploadsDir, `assess-test-${randomUUID()}.m4a`);
-  await fs.writeFile(audioPath, Buffer.from('00000018667479704d34412000000000', 'hex'));
+  await fs.writeFile(audioPath, Buffer.from('00000018667479704d34412000000000', 'hex'), { mode: 0o600 });
 });
 
 afterEach(() => {
@@ -118,10 +121,9 @@ describe('assertDailyAssessmentCapacity', () => {
       await assertDailyAssessmentCapacity(userId);
       // Second reservation at now-12h-equivalent spacing is the caller's job;
       // seed an older row directly to control the retry math.
-      await pool.query(
-        `INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '12 hours')`,
-        [userId],
-      );
+      await pool.query(`INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '12 hours')`, [
+        userId,
+      ]);
       await expect(assertDailyAssessmentCapacity(userId)).rejects.toMatchObject({
         status: 429,
         message: 'Daily assessment limit reached',
@@ -173,10 +175,9 @@ describe('assertDailyAssessmentCapacity', () => {
     try {
       config.assessGlobalDailyCap = 1;
       config.assessDailyCap = 1000000;
-      await pool.query(
-        `INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '6 hours')`,
-        [userId],
-      );
+      await pool.query(`INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '6 hours')`, [
+        userId,
+      ]);
       await expect(assertDailyAssessmentCapacity(userId)).rejects.toMatchObject({
         status: 429,
         message: 'Service daily assessment capacity reached',
@@ -192,10 +193,9 @@ describe('assertDailyAssessmentCapacity', () => {
     await pool.query('DELETE FROM assessment_usage');
     try {
       config.assessDailyCap = 1;
-      await pool.query(
-        `INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '25 hours')`,
-        [userId],
-      );
+      await pool.query(`INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '25 hours')`, [
+        userId,
+      ]);
       await assertDailyAssessmentCapacity(userId); // stale row must not count
       const { rows } = await pool.query<{ n: number }>(
         'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
@@ -317,7 +317,9 @@ describe('assessSpeaking (OpenAI path)', () => {
   });
 
   it('maps provider timeouts to 504 and other failures to 502', async () => {
-    openaiMocks.transcribe.mockRejectedValue(Object.assign(new Error('timed out'), { name: 'APIConnectionTimeoutError' }));
+    openaiMocks.transcribe.mockRejectedValue(
+      Object.assign(new Error('timed out'), { name: 'APIConnectionTimeoutError' }),
+    );
     await expect(assessSpeaking(audioPath, QUESTION, userId)).rejects.toMatchObject({
       status: 504,
       message: 'Assessment timed out; please try again',

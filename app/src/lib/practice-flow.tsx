@@ -1,10 +1,4 @@
-import React, {
-  createContext,
-  useCallback,
-  useContext,
-  useMemo,
-  useState,
-} from 'react';
+import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import { useAuth } from './auth';
 import type { AttemptResult } from './types';
@@ -20,39 +14,22 @@ interface PracticeFlowValue {
   clearFeedback: () => void;
 }
 
-const PracticeFlowContext = createContext<PracticeFlowValue | undefined>(
-  undefined,
-);
+const PracticeFlowContext = createContext<PracticeFlowValue | undefined>(undefined);
 
-export function PracticeFlowProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export function PracticeFlowProvider({ children }: { children: React.ReactNode }) {
   const { sessionVersion } = useAuth();
 
   // Remounting the state owner destroys transcripts and feedback immediately
   // on every authentication transition, including same-user token rotation.
-  return (
-    <PracticeFlowStateProvider key={sessionVersion}>
-      {children}
-    </PracticeFlowStateProvider>
-  );
+  return <PracticeFlowStateProvider key={sessionVersion}>{children}</PracticeFlowStateProvider>;
 }
 
-function PracticeFlowStateProvider({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) {
   const [feedback, setFeedback] = useState<PracticeFeedback | null>(null);
 
-  const showFeedback = useCallback(
-    (questionId: string, result: AttemptResult) => {
-      setFeedback({ questionId, result });
-    },
-    [],
-  );
+  const showFeedback = useCallback((questionId: string, result: AttemptResult) => {
+    setFeedback({ questionId, result });
+  }, []);
   const clearFeedback = useCallback(() => setFeedback(null), []);
 
   const value = useMemo(
@@ -60,11 +37,7 @@ function PracticeFlowStateProvider({
     [feedback, showFeedback, clearFeedback],
   );
 
-  return (
-    <PracticeFlowContext.Provider value={value}>
-      {children}
-    </PracticeFlowContext.Provider>
-  );
+  return <PracticeFlowContext.Provider value={value}>{children}</PracticeFlowContext.Provider>;
 }
 
 export function usePracticeFlow(): PracticeFlowValue {

@@ -24,12 +24,12 @@
     "format:check": "prettier --check ."
   },
   "engines": {
-    "node": "^22.13.0 || >=24.3.0",
+    "node": "^22.13.0 || ^24.3.0",
     "npm": ">=10"
   },
   "dependencies": {
-    "@aws-sdk/client-s3": "^3.1108.0",
-    "@aws-sdk/s3-request-presigner": "^3.1108.0",
+    "@aws-sdk/client-s3": "^3.1109.0",
+    "@aws-sdk/s3-presigned-post": "^3.1109.0",
     "bcrypt": "^6.0.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",

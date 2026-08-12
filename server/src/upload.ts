@@ -12,11 +12,9 @@ fs.chmodSync(uploadsDir, 0o700);
 
 export const AUDIO_TYPES: Readonly<Record<string, readonly string[]>> = {
   '.m4a': ['audio/m4a', 'audio/mp4', 'audio/x-m4a', 'video/mp4'],
-  '.m4b': ['audio/m4b', 'audio/mp4', 'audio/x-m4b'],
   '.mp4': ['audio/mp4', 'video/mp4'],
   '.mp3': ['audio/mpeg', 'audio/mp3'],
   '.wav': ['audio/wav', 'audio/x-wav', 'audio/wave'],
-  '.aac': ['audio/aac', 'audio/x-aac'],
   '.ogg': ['audio/ogg', 'application/ogg'],
   '.oga': ['audio/ogg', 'application/ogg'],
   '.webm': ['audio/webm', 'video/webm'],
@@ -145,10 +143,9 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
   // The container signature must match the already allowlisted extension and
   // MIME pair. Merely finding *some* supported signature is not sufficient.
   const is =
-    (['.m4a', '.m4b', '.mp4'].includes(ext) && isoBmff) ||
+    (['.m4a', '.mp4'].includes(ext) && isoBmff) ||
     (ext === '.wav' && wav) ||
     (ext === '.mp3' && (id3 || mpegOrAdts)) ||
-    (ext === '.aac' && mpegOrAdts) ||
     (['.ogg', '.oga'].includes(ext) && ogg) ||
     (ext === '.webm' && webm) ||
     (ext === '.flac' && flac);

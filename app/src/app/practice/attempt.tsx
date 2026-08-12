@@ -16,12 +16,8 @@ import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { firstParam, isUuid } from '../../lib/params';
 import { usePracticeFlow } from '../../lib/practice-flow';
-import { colors } from '../../lib/theme';
-import {
-  parseAttemptResult,
-  parseHelpContent,
-  type AttemptResult,
-} from '../../lib/types';
+import { colors, layout } from '../../lib/theme';
+import { parseAttemptResult, parseHelpContent, type AttemptResult } from '../../lib/types';
 
 /**
  * Practice Mode: deliberately minimal — only the prompt word, the question,
@@ -36,18 +32,12 @@ export default function AttemptScreen() {
   const validQuestionId = isUuid(questionId) ? questionId : null;
 
   const helpQuery = useQuery({
-    queryKey: [
-      'question-help',
-      user?.id,
-      user?.nativeLanguage,
-      validQuestionId,
-    ],
+    queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
     queryFn: async ({ signal }) =>
       parseHelpContent(
-        await apiFetch<unknown>(
-          `/practice/question/${encodeURIComponent(validQuestionId!)}/help`,
-          { signal },
-        ),
+        await apiFetch<unknown>(`/practice/question/${encodeURIComponent(validQuestionId!)}/help`, {
+          signal,
+        }),
       ),
     enabled: !!user && !!validQuestionId,
     retry: false,
@@ -77,10 +67,7 @@ export default function AttemptScreen() {
         </Text>
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [
-            styles.retryButton,
-            pressed && styles.retryButtonPressed,
-          ]}
+          style={({ pressed }) => [styles.retryButton, pressed && styles.retryButtonPressed]}
           onPress={() => router.replace('/practice')}
         >
           <Text style={styles.retryButtonText}>Back to Practice</Text>
@@ -118,10 +105,7 @@ export default function AttemptScreen() {
           </Text>
           <Pressable
             accessibilityRole="button"
-            style={({ pressed }) => [
-              styles.retryButton,
-              pressed && styles.retryButtonPressed,
-            ]}
+            style={({ pressed }) => [styles.retryButton, pressed && styles.retryButtonPressed]}
             onPress={() => void helpQuery.refetch()}
           >
             <Text style={styles.retryButtonText}>Try Again</Text>
@@ -137,10 +121,7 @@ export default function AttemptScreen() {
   }
 
   return (
-    <ScrollView
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={styles.container}
-    >
+    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
       <View style={styles.card}>
         <Text accessibilityRole="header" style={styles.promptWord}>
           {promptWord}
@@ -172,6 +153,9 @@ const styles = StyleSheet.create({
   container: {
     flexGrow: 1,
     padding: 20,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   center: {

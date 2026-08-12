@@ -1,15 +1,16 @@
+import { createServer } from 'http';
 import { config } from './config';
 import { createApp } from './app';
 import { pool } from './db';
 import { logger } from './logger';
 import { cleanupAssessmentRequests } from './idempotency';
 import { cleanupOldUploads } from './upload';
+import { cleanupRateLimitWindows } from './postgres-rate-limit-store';
+import { assertDatabaseSchemaCurrent } from './schema-readiness';
+import { assertAudioInspectorAvailable } from './audio-inspection';
 
 const app = createApp();
-
-const server = app.listen(config.port, () => {
-  logger.info({ port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv }, 'AI English API listening');
-});
+const server = createServer(app);
 
 server.requestTimeout = 75_000;
 server.headersTimeout = 30_000;
@@ -26,6 +27,12 @@ cleanupAssessmentRequests()
     if (removed > 0) logger.info({ removed }, 'janitor removed expired assessment replays');
   })
   .catch((err) => logger.warn({ err }, 'assessment replay janitor failed'));
+
+cleanupRateLimitWindows()
+  .then((removed) => {
+    if (removed > 0) logger.info({ removed }, 'janitor removed expired rate-limit counters');
+  })
+  .catch((err) => logger.warn({ err }, 'rate-limit janitor failed'));
 
 // Keep cleaning orphaned files in long-running processes; boot-only cleanup
 // leaves aborted/crashed requests on disk indefinitely until the next deploy.
@@ -51,6 +58,17 @@ const assessmentReplayJanitor = setInterval(
 );
 assessmentReplayJanitor.unref();
 
+const rateLimitJanitor = setInterval(
+  () =>
+    cleanupRateLimitWindows()
+      .then((removed) => {
+        if (removed > 0) logger.info({ removed }, 'janitor removed expired rate-limit counters');
+      })
+      .catch((err) => logger.warn({ err }, 'rate-limit janitor failed')),
+  60 * 60 * 1000,
+);
+rateLimitJanitor.unref();
+
 let shuttingDown = false;
 
 function shutdown(signal: string) {
@@ -58,6 +76,7 @@ function shutdown(signal: string) {
   shuttingDown = true;
   clearInterval(uploadJanitor);
   clearInterval(assessmentReplayJanitor);
+  clearInterval(rateLimitJanitor);
   logger.info({ signal }, 'shutting down');
 
   // Hard stop if graceful shutdown takes too long.
@@ -86,3 +105,20 @@ function shutdown(signal: string) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Refuse traffic until the release schema and required media inspector are
+// ready. The same dependency checks back /ready for post-start drift/failure.
+Promise.all([assertDatabaseSchemaCurrent(), assertAudioInspectorAvailable({ force: true })])
+  .then(() => {
+    if (shuttingDown) return;
+    server.listen(config.port, () => {
+      logger.info({ port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv }, 'AI English API listening');
+    });
+  })
+  .catch((err) => {
+    logger.fatal({ err }, 'required service dependency is unavailable; refusing to start');
+    pool
+      .end()
+      .catch((poolErr) => logger.error({ err: poolErr }, 'error closing pg pool after dependency startup failure'))
+      .finally(() => process.exit(1));
+  });

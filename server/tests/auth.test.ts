@@ -128,6 +128,61 @@ describe('auth: login', () => {
       config.rateLimit.authMax = prev;
     }
   });
+
+  it('limits failed logins for one normalized account across IPs/replicas and refunds successes', async () => {
+    const setup = app();
+    const { body } = await registerUser(setup);
+    const savedTrustProxy = config.trustProxy;
+    const savedWindow = config.rateLimit.loginAccountWindowMs;
+    const savedMax = config.rateLimit.loginAccountMax;
+    const windowMs = 73_000;
+    const max = 2;
+    const namespace = `login-account:${windowMs}:${max}`;
+
+    config.trustProxy = 1;
+    config.rateLimit.loginAccountWindowMs = windowMs;
+    config.rateLimit.loginAccountMax = max;
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+
+    try {
+      const firstReplica = app();
+      const secondReplica = app();
+      const login = (target: ReturnType<typeof app>, ip: string, email: string, password: string) =>
+        request(target).post('/auth/login').set('X-Forwarded-For', ip).send({ email, password });
+
+      // Successes briefly increment and are then refunded, so normal account
+      // use cannot consume the failed-login budget.
+      expect((await login(firstReplica, '203.0.113.1', `  ${body.email.toUpperCase()} `, STRONG_PASSWORD)).status).toBe(
+        200,
+      );
+      expect((await login(secondReplica, '203.0.113.2', body.email, STRONG_PASSWORD)).status).toBe(200);
+      await vi.waitFor(async () => {
+        const result = await pool.query<{ hits: number }>('SELECT hits FROM rate_limit_windows WHERE namespace = $1', [
+          namespace,
+        ]);
+        expect(Number(result.rows[0]?.hits)).toBe(0);
+      });
+
+      expect((await login(firstReplica, '203.0.113.11', body.email.toUpperCase(), 'wrong-1')).status).toBe(401);
+      expect((await login(secondReplica, '203.0.113.12', ` ${body.email} `, 'wrong-2')).status).toBe(401);
+      const blocked = await login(firstReplica, '203.0.113.13', body.email, 'wrong-3');
+      expect(blocked.status).toBe(429);
+      expect(blocked.body).toEqual({ error: 'Too many login attempts, please try again later' });
+
+      const stored = await pool.query<{ key_hash: string }>(
+        'SELECT key_hash FROM rate_limit_windows WHERE namespace = $1',
+        [namespace],
+      );
+      expect(stored.rows).toHaveLength(1);
+      expect(stored.rows[0].key_hash).toMatch(/^[0-9a-f]{64}$/);
+      expect(stored.rows[0].key_hash).not.toContain(body.email);
+    } finally {
+      config.trustProxy = savedTrustProxy;
+      config.rateLimit.loginAccountWindowMs = savedWindow;
+      config.rateLimit.loginAccountMax = savedMax;
+      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+    }
+  });
 });
 
 describe('auth: infrastructure failures', () => {

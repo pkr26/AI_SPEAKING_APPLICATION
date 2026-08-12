@@ -1,10 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { randomUUID } from 'crypto';
-import {
-  claimAssessmentRequest,
-  completeAssessmentRequest,
-  getAssessmentRequestStatus,
-} from '../src/idempotency';
+import { claimAssessmentRequest, completeAssessmentRequest, getAssessmentRequestStatus } from '../src/idempotency';
 import { app, pool, registerUser } from './helpers';
 
 afterAll(async () => {

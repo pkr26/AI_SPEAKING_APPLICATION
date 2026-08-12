@@ -3,9 +3,9 @@ import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
 import { authRouter } from './auth';
+import { assertAudioInspectorAvailable } from './audio-inspection';
 import { createAudioUploadRouter } from './audio-upload';
 import { config } from './config';
-import { pool } from './db';
 import { createDiagnosticRouter } from './diagnostic';
 import { httpLogger, logger } from './logger';
 import { getAssessmentRequestStatus } from './idempotency';
@@ -13,8 +13,17 @@ import { AuthedRequest, errorHandler, h, HttpError, requireAuth, validate } from
 import { z } from 'zod';
 import { createPracticeRouter } from './practice';
 import { buildLimiters } from './rate-limit';
+import { assertDatabaseSchemaCurrent } from './schema-readiness';
 
-export function createApp() {
+interface AppDependencies {
+  schemaCheck?: () => Promise<unknown>;
+  audioInspectorCheck?: () => Promise<unknown>;
+}
+
+export function createApp({
+  schemaCheck = assertDatabaseSchemaCurrent,
+  audioInspectorCheck = assertAudioInspectorAvailable,
+}: AppDependencies = {}) {
   const app = express();
 
   // Use the exact configured hop count. Express warns against `true`, which
@@ -43,11 +52,11 @@ export function createApp() {
   app.get('/health', (_req, res) => res.json({ ok: true }));
   app.get('/ready', limiters.readiness, async (_req, res) => {
     try {
-      await pool.query('SELECT 1');
+      await Promise.all([schemaCheck(), audioInspectorCheck()]);
       res.json({ ok: true });
     } catch (err) {
-      logger.error({ err }, 'readiness check failed');
-      res.status(503).json({ ok: false, error: 'database unreachable' });
+      logger.error({ err }, 'readiness dependency check failed');
+      res.status(503).json({ ok: false, error: 'required service dependency unavailable' });
     }
   });
 
@@ -64,6 +73,11 @@ export function createApp() {
 
   app.use(compression());
   app.use(express.json({ limit: '1mb' }));
+
+  // The account-targeted login limiter needs the parsed/normalized-able email.
+  // The independent IP limiter above still rejects abusive bodies before JSON
+  // parsing, while this shared budget prevents distributed credential attacks.
+  app.use('/auth/login', limiters.loginAccount);
 
   app.use('/auth', authRouter);
   app.get(

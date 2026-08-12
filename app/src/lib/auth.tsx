@@ -1,4 +1,4 @@
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from '@tanstack/react-query';
 import React, {
   createContext,
   useCallback,
@@ -7,23 +7,11 @@ import React, {
   useMemo,
   useRef,
   useState,
-} from "react";
+} from 'react';
 
-import {
-  ApiError,
-  apiFetch,
-  clearToken,
-  getToken,
-  saveToken,
-  setUnauthorizedHandler,
-} from "./api";
-import {
-  parseAuthResponse,
-  parseUserResponse,
-  type NativeLanguage,
-  type User,
-} from "./types";
-import { clearPendingAssessment } from "./pending-assessment";
+import { ApiError, apiFetch, clearToken, getToken, saveToken, setUnauthorizedHandler } from './api';
+import { parseAuthResponse, parseUserResponse, type NativeLanguage, type User } from './types';
+import { clearPendingAssessment } from './pending-assessment';
 export {
   comparablePasswordError,
   MAX_EMAIL_LENGTH,
@@ -31,7 +19,7 @@ export {
   MAX_PASSWORD_UTF8_BYTES,
   passwordPolicyError,
   utf8ByteLength,
-} from "./password-policy";
+} from './password-policy';
 
 interface AuthContextValue {
   token: string | null;
@@ -40,6 +28,9 @@ interface AuthContextValue {
   sessionVersion: number;
   /** True while the persisted token is being read from SecureStore. */
   isRestoring: boolean;
+  /** Safe user-facing error when the OS credential store could not be read. */
+  restoreError: string | null;
+  retrySessionRestore: () => void;
   login: (email: string, password: string) => Promise<User>;
   register: (
     name: string,
@@ -48,10 +39,7 @@ interface AuthContextValue {
     nativeLanguage: NativeLanguage,
   ) => Promise<User>;
   logout: () => Promise<void>;
-  changePassword: (
-    currentPassword: string,
-    newPassword: string,
-  ) => Promise<void>;
+  changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   deleteAccount: (password: string) => Promise<void>;
   setUser: (user: User | null) => void;
 }
@@ -59,22 +47,24 @@ interface AuthContextValue {
 export class AccountDeletedCleanupError extends Error {
   constructor() {
     super(
-      "Your account was deleted, but local session cleanup failed. Restart the app before signing in again.",
+      'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
     );
-    this.name = "AccountDeletedCleanupError";
+    this.name = 'AccountDeletedCleanupError';
   }
 }
 
 export class LogoutCleanupError extends Error {
   constructor() {
     super(
-      "You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.",
+      'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
     );
-    this.name = "LogoutCleanupError";
+    this.name = 'LogoutCleanupError';
   }
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
+const SESSION_RESTORE_ERROR =
+  'Secure session storage is temporarily unavailable. Unlock your device and try again.';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
@@ -82,16 +72,52 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
   const [isRestoring, setIsRestoring] = useState(true);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
   const transitionRef = useRef(false);
   const epochRef = useRef(0);
   const tokenRef = useRef<string | null>(null);
+  const pendingCleanupTailRef = useRef<Promise<void>>(Promise.resolve());
+  const pendingCleanupFailedRef = useRef(false);
+
+  const schedulePendingCleanup = useCallback(() => {
+    const cleanup = pendingCleanupTailRef.current.then(async () => {
+      try {
+        await clearPendingAssessment();
+        pendingCleanupFailedRef.current = false;
+      } catch (error) {
+        pendingCleanupFailedRef.current = true;
+        throw error;
+      }
+    });
+    // The tail always settles successfully so one OS-storage failure cannot
+    // poison later cleanup. Callers may still observe `cleanup` itself.
+    pendingCleanupTailRef.current = cleanup.then(
+      () => undefined,
+      () => undefined,
+    );
+    return cleanup;
+  }, []);
+
+  const waitForPendingCleanup = useCallback(async () => {
+    // Include cleanup appended while an earlier operation is settling. If the
+    // last OS-storage cleanup failed, append and await one real retry before a
+    // new bearer token can be persisted.
+    for (;;) {
+      const pending = pendingCleanupTailRef.current;
+      await pending;
+      if (pending !== pendingCleanupTailRef.current) continue;
+      if (!pendingCleanupFailedRef.current) return;
+      await schedulePendingCleanup();
+    }
+  }, [schedulePendingCleanup]);
 
   const resetMemorySession = useCallback(() => {
     queryClient.clear();
-    void clearPendingAssessment().catch(() => undefined);
     tokenRef.current = null;
     setToken(null);
     setUser(null);
+    setRestoreError(null);
     setSessionVersion((version) => version + 1);
   }, [queryClient]);
 
@@ -102,13 +128,18 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // A password rotation/account deletion owns its transition and will
       // explicitly fail closed if it cannot establish or remove the session.
       if (rejectedToken && transitionRef.current) return;
+      const tokenToClear = rejectedToken ?? tokenRef.current;
       epochRef.current += 1;
+      void schedulePendingCleanup().catch(() => undefined);
       resetMemorySession();
       // The server has already rejected this token. Clear persistence
-      // best-effort so protected UI closes even if the keychain is unavailable.
-      void clearToken().catch(() => undefined);
+      // best-effort and conditionally: a newer login must never be deleted by
+      // this older 401's cleanup.
+      if (tokenToClear) {
+        void clearToken(tokenToClear).catch(() => undefined);
+      }
     },
-    [resetMemorySession],
+    [resetMemorySession, schedulePendingCleanup],
   );
 
   useEffect(() => {
@@ -121,22 +152,48 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const epoch = ++epochRef.current;
     queryClient.clear();
     (async () => {
-      const stored = await getToken();
-      if (!cancelled && epoch === epochRef.current) {
-        tokenRef.current = stored;
-        setToken(stored);
-        setSessionVersion((version) => version + 1);
-        setIsRestoring(false);
+      try {
+        const stored = await getToken();
+        if (!cancelled && epoch === epochRef.current) {
+          tokenRef.current = stored;
+          setToken(stored);
+          setRestoreError(null);
+          setSessionVersion((version) => version + 1);
+          setIsRestoring(false);
+        }
+      } catch {
+        if (!cancelled && epoch === epochRef.current) {
+          tokenRef.current = null;
+          setToken(null);
+          setUser(null);
+          setRestoreError(SESSION_RESTORE_ERROR);
+          setIsRestoring(false);
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [queryClient]);
+  }, [queryClient, restoreAttempt]);
+
+  useEffect(
+    () => () => {
+      // A token write that completes after the provider disappears must be
+      // conditionally rolled back by establishSession.
+      epochRef.current += 1;
+    },
+    [],
+  );
+
+  const retrySessionRestore = useCallback(() => {
+    setRestoreError(null);
+    setIsRestoring(true);
+    setRestoreAttempt((attempt) => attempt + 1);
+  }, []);
 
   const beginTransition = () => {
     if (transitionRef.current) {
-      throw new Error("An account operation is already in progress.");
+      throw new Error('An account operation is already in progress.');
     }
     transitionRef.current = true;
     return ++epochRef.current;
@@ -145,12 +202,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const establishSession = useCallback(
     async (response: unknown, epoch: number): Promise<User> => {
       const parsed = parseAuthResponse(response);
+      await waitForPendingCleanup();
       if (epoch !== epochRef.current) {
-        throw new Error("The account operation was cancelled.");
+        throw new Error('The account operation was cancelled.');
       }
       await saveToken(parsed.token);
       if (epoch !== epochRef.current) {
-        throw new Error("The account operation was cancelled.");
+        // Only remove the token written by this cancelled transition. If a
+        // newer transition already saved another token, conditional cleanup
+        // leaves it untouched.
+        await clearToken(parsed.token);
+        throw new Error('The account operation was cancelled.');
       }
       queryClient.clear();
       tokenRef.current = parsed.token;
@@ -159,15 +221,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSessionVersion((version) => version + 1);
       return parsed.user;
     },
-    [queryClient],
+    [queryClient, waitForPendingCleanup],
   );
 
   const login = useCallback(
     async (email: string, password: string) => {
       const epoch = beginTransition();
       try {
-        const response = await apiFetch<unknown>("/auth/login", {
-          method: "POST",
+        const response = await apiFetch<unknown>('/auth/login', {
+          method: 'POST',
           body: { email, password },
           auth: false,
           expireSessionOn401: false,
@@ -181,16 +243,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const register = useCallback(
-    async (
-      name: string,
-      email: string,
-      password: string,
-      nativeLanguage: NativeLanguage,
-    ) => {
+    async (name: string, email: string, password: string, nativeLanguage: NativeLanguage) => {
       const epoch = beginTransition();
       try {
-        const response = await apiFetch<unknown>("/auth/register", {
-          method: "POST",
+        const response = await apiFetch<unknown>('/auth/register', {
+          method: 'POST',
           body: { name, email, password, nativeLanguage },
           auth: false,
           expireSessionOn401: false,
@@ -205,12 +262,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     const epoch = beginTransition();
+    const sessionToken = tokenRef.current;
     try {
       // Revoke the bearer token before removing the local copy. Logout applies
       // to all devices until refresh-token families are introduced server-side.
       try {
-        await apiFetch<void>("/auth/logout", {
-          method: "POST",
+        await apiFetch<void>('/auth/logout', {
+          method: 'POST',
           expireSessionOn401: false,
         });
       } catch (error) {
@@ -218,12 +276,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // let that 401 keep protected data or the stale token on this device.
         if (!(error instanceof ApiError && error.status === 401)) throw error;
       }
-      let cleanupError: unknown;
-      try {
-        await clearToken();
-      } catch (error) {
-        cleanupError = error;
-      }
+      const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
+        sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
+        schedulePendingCleanup(),
+      ]);
+      const cleanupError =
+        tokenCleanup.status === 'rejected' ||
+        tokenCleanup.value === false ||
+        pendingCleanup.status === 'rejected';
       if (epoch !== epochRef.current) return;
       // The server token is already revoked, so the protected UI must close
       // even if the OS keychain could not remove its now-useless local copy.
@@ -234,11 +294,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } finally {
       transitionRef.current = false;
     }
-  }, [resetMemorySession]);
+  }, [resetMemorySession, schedulePendingCleanup]);
 
   const verifySessionAfterCredentialError = useCallback(async () => {
     try {
-      const response = await apiFetch<unknown>("/auth/me");
+      const response = await apiFetch<unknown>('/auth/me');
       parseUserResponse(response);
     } catch (error) {
       if (error instanceof ApiError && error.status === 401) {
@@ -255,8 +315,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       try {
         let response: unknown;
         try {
-          response = await apiFetch<unknown>("/auth/change-password", {
-            method: "POST",
+          response = await apiFetch<unknown>('/auth/change-password', {
+            method: 'POST',
             body: { currentPassword, newPassword },
             expireSessionOn401: false,
           });
@@ -272,10 +332,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // Once the server rotates the token, failing to persist its replacement
         // leaves the old session invalid. Fail closed and require a fresh login.
         if (epoch !== epochRef.current) throw error;
-        if (
-          responseReceived &&
-          !(error instanceof ApiError && error.status === 401)
-        ) {
+        if (responseReceived && !(error instanceof ApiError && error.status === 401)) {
           expireSession();
         }
         throw error;
@@ -289,10 +346,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const deleteAccount = useCallback(
     async (password: string) => {
       beginTransition();
+      const sessionToken = tokenRef.current;
       try {
         try {
-          await apiFetch<void>("/auth/account", {
-            method: "DELETE",
+          await apiFetch<void>('/auth/account', {
+            method: 'DELETE',
             body: { password },
             expireSessionOn401: false,
           });
@@ -303,12 +361,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           throw error;
         }
 
-        let cleanupError: unknown;
-        try {
-          await clearToken();
-        } catch (error) {
-          cleanupError = error;
-        }
+        const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
+          sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
+          schedulePendingCleanup(),
+        ]);
+        const cleanupError =
+          tokenCleanup.status === 'rejected' ||
+          tokenCleanup.value === false ||
+          pendingCleanup.status === 'rejected';
         epochRef.current += 1;
         resetMemorySession();
         if (cleanupError) {
@@ -318,7 +378,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         transitionRef.current = false;
       }
     },
-    [resetMemorySession, verifySessionAfterCredentialError],
+    [resetMemorySession, schedulePendingCleanup, verifySessionAfterCredentialError],
   );
 
   const value = useMemo(
@@ -327,6 +387,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       sessionVersion,
       isRestoring,
+      restoreError,
+      retrySessionRestore,
       login,
       register,
       logout,
@@ -339,6 +401,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       user,
       sessionVersion,
       isRestoring,
+      restoreError,
+      retrySessionRestore,
       login,
       register,
       logout,
@@ -353,7 +417,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 export function useAuth(): AuthContextValue {
   const ctx = useContext(AuthContext);
   if (!ctx) {
-    throw new Error("useAuth must be used within an AuthProvider");
+    throw new Error('useAuth must be used within an AuthProvider');
   }
   return ctx;
 }

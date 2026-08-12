@@ -39,19 +39,38 @@ describe('pending assessment metadata', () => {
     questionId: '550e8400-e29b-41d4-a716-446655440001',
     requestId: '550e8400-e29b-41d4-a716-446655440002',
     createdAt: Date.now(),
-    delivery: 'pending',
+    stage: 'direct-posting',
   } as const;
 
   it('accepts bounded recovery metadata for either assessment endpoint', () => {
     expect(parsePendingAssessment(valid)).toEqual(valid);
-    expect(
-      parsePendingAssessment({ ...valid, endpoint: '/practice/attempt' }),
-    ).toEqual({ ...valid, endpoint: '/practice/attempt' });
+    expect(parsePendingAssessment({ ...valid, endpoint: '/practice/attempt' })).toEqual({
+      ...valid,
+      endpoint: '/practice/attempt',
+    });
   });
 
-  it('upgrades metadata from the previous app build to pending delivery', () => {
-    const { delivery: _delivery, ...legacy } = valid;
-    expect(parsePendingAssessment(legacy)).toEqual(valid);
+  it('upgrades metadata from the previous app build to direct posting', () => {
+    const { stage: _stage, ...legacy } = valid;
+    expect(parsePendingAssessment({ ...legacy, delivery: 'pending' })).toEqual(valid);
+  });
+
+  it('accepts only an owner-bound S3 object key', () => {
+    const audioKey =
+      'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
+    expect(parsePendingAssessment({ ...valid, stage: 's3-granted', audioKey })).toEqual({
+      ...valid,
+      stage: 's3-granted',
+      audioKey,
+    });
+    expect(
+      parsePendingAssessment({
+        ...valid,
+        stage: 's3-granted',
+        audioKey:
+          'audio-uploads/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440003.m4a',
+      }),
+    ).toBeNull();
   });
 
   it.each([

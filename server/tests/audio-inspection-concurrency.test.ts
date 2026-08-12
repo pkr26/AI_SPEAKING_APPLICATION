@@ -35,7 +35,8 @@ function startInspection(child = new FakeChild()) {
 }
 
 function completeSuccessfully(child: FakeChild): void {
-  child.stdout.emit('data', Buffer.from('out_time_us=1000000\n'));
+  // One second of mono 8 kHz signed 16-bit PCM.
+  child.stdout.emit('data', Buffer.alloc(8_000 * 2));
   child.emit('close', 0);
 }
 

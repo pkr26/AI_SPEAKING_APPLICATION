@@ -15,6 +15,10 @@ const AVAILABILITY_SUCCESS_TTL_MS = 30_000;
 const AVAILABILITY_FAILURE_TTL_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
 const MAX_VERSION_BYTES = 16 * 1024;
+const DECODED_SAMPLE_RATE = 8_000;
+const DECODED_BYTES_PER_SAMPLE = 2;
+const DECODED_BYTES_PER_SECOND = DECODED_SAMPLE_RATE * DECODED_BYTES_PER_SAMPLE;
+const MAX_DECODED_BYTES = Math.floor(MAX_AUDIO_DURATION_SECONDS * DECODED_BYTES_PER_SECOND);
 
 // Native decoding is independently bounded before spawn. Requests fail fast
 // rather than queueing and retaining uploaded files/assessment claims while a
@@ -72,11 +76,13 @@ class InspectionError extends Error {
 }
 
 /**
- * Decode the first audio stream with regenerated sample-count timestamps.
- * Container duration headers are attacker controlled; `asetpts=N/SR/TB`
- * makes progress depend on decoded samples instead. A wall-clock deadline,
- * one decoder thread, bounded probe/allocation sizes, disabled network
- * protocols, and bounded child output contain malformed-media resource use.
+ * Decode the first audio stream to mono 8 kHz signed 16-bit PCM and count the
+ * streamed bytes. Container duration headers are attacker controlled, while
+ * FFmpeg progress timestamps vary across versions for very short/final
+ * packets. Counting decoded samples is both version-independent and resistant
+ * to forged metadata. A wall-clock deadline, one decoder thread, bounded
+ * probe/allocation/diagnostic sizes, disabled network protocols, and a hard
+ * decoded-byte cutoff contain malformed-media resource use.
  */
 function inspectDecodedDuration(filePath: string): Promise<number> {
   const inputFormat = INPUT_FORMAT_BY_EXTENSION[path.extname(filePath).toLowerCase()];
@@ -146,20 +152,15 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
           '-vn',
           '-sn',
           '-dn',
-          '-af',
-          'aresample=8000,asetpts=N/SR/TB',
           '-ac',
           '1',
           '-ar',
-          '8000',
+          String(DECODED_SAMPLE_RATE),
+          '-c:a',
+          'pcm_s16le',
           '-f',
-          'null',
-          '-',
-          '-stats_period',
-          '0.1',
-          '-progress',
+          's16le',
           'pipe:1',
-          '-nostats',
         ],
         {
           env: INSPECTOR_ENV,
@@ -178,9 +179,8 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
 
     let settled = false;
     let overlong = false;
-    let outputBytes = 0;
-    let durationSeconds = 0;
-    let progressBuffer = '';
+    let diagnosticBytes = 0;
+    let decodedBytes = 0;
 
     const stop = () => {
       if (!child.killed) child.kill('SIGKILL');
@@ -193,38 +193,23 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
       if (duration instanceof InspectionError) reject(duration);
       else resolve(duration);
     };
-    const parseProgress = (chunk: Buffer) => {
-      outputBytes += chunk.length;
-      if (outputBytes > MAX_DIAGNOSTIC_BYTES) {
-        finish(new InspectionError('invalid'));
-        return;
-      }
-      progressBuffer += chunk.toString('utf8');
-      const lines = progressBuffer.split(/\r?\n/);
-      progressBuffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.startsWith('out_time_us=')) continue;
-        const microseconds = Number(line.slice('out_time_us='.length));
-        if (!Number.isFinite(microseconds) || microseconds < 0) {
-          finish(new InspectionError('invalid'));
-          return;
-        }
-        durationSeconds = Math.max(durationSeconds, microseconds / 1_000_000);
-        if (durationSeconds > MAX_AUDIO_DURATION_SECONDS) {
-          overlong = true;
-          stop();
-          return;
-        }
+    const countDecodedBytes = (chunk: Buffer) => {
+      decodedBytes += chunk.length;
+      if (decodedBytes > MAX_DECODED_BYTES) {
+        overlong = true;
+        stop();
       }
     };
 
     const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
     timeout.unref();
 
-    child.stdout!.on('data', parseProgress);
+    // Data is counted and immediately discarded; learner audio is never
+    // accumulated in application memory.
+    child.stdout!.on('data', countDecodedBytes);
     child.stderr!.on('data', (chunk: Buffer) => {
-      outputBytes += chunk.length;
-      if (outputBytes > MAX_DIAGNOSTIC_BYTES) finish(new InspectionError('invalid'));
+      diagnosticBytes += chunk.length;
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InspectionError('invalid'));
     });
     child.once('error', () => {
       // A ChildProcess error here is an inability to start/control the
@@ -235,10 +220,10 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
       if (settled) return;
       if (overlong) {
         finish(MAX_AUDIO_DURATION_SECONDS + 1);
-      } else if (code !== 0 || durationSeconds <= 0) {
+      } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
         finish(new InspectionError('invalid'));
       } else {
-        finish(durationSeconds);
+        finish(decodedBytes / DECODED_BYTES_PER_SECOND);
       }
     });
   });

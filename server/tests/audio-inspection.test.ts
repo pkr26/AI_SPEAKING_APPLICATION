@@ -125,10 +125,13 @@ describe('verifyAudioDuration', () => {
     await expect(verifyAudioDuration(await fixture('short.wav', pcmWav(0.25)))).rejects.toMatchObject({
       status: 422,
     });
+    await expect(
+      verifyAudioDuration(await generatedAudio('generated-short.wav', { codec: 'pcm_s16le', durationSeconds: 0.25 })),
+    ).rejects.toMatchObject({ status: 422 });
   });
 
-  it('rejects media whose decoded timeline exceeds the recorder limit', async () => {
-    const overLimit = pcmWav(MAX_AUDIO_DURATION_SECONDS + 1);
+  it('rejects media whose decoded samples exceed the recorder limit by one input sample', async () => {
+    const overLimit = pcmWav(MAX_AUDIO_DURATION_SECONDS + 1 / 8_000);
     await expect(verifyAudioDuration(await fixture('long.wav', overLimit))).rejects.toMatchObject({
       status: 413,
     });

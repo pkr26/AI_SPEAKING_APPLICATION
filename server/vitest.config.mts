@@ -9,6 +9,8 @@ export default defineConfig({
     // One worker: all files share the single test database.
     pool: 'forks',
     maxWorkers: 1,
+    // Stryker sandboxes contain copies of the tests; never pick them up.
+    exclude: ['**/node_modules/**', '**/dist/**', '.stryker-tmp/**'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],

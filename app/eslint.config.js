@@ -6,7 +6,7 @@ module.exports = defineConfig([
   globalIgnores(['dist/*', 'coverage/*']),
   expoConfig,
   {
-    files: ['app/diagnostic.tsx'],
+    files: ['src/app/diagnostic.tsx'],
     rules: {
       // TanStack Query results are intentionally copied into the multi-step
       // diagnostic state machine when a network response arrives.

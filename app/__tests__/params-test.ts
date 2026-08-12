@@ -1,5 +1,5 @@
-import { firstParam, isUuid } from '../lib/params';
-import { parsePendingAssessment } from '../lib/pending-assessment';
+import { firstParam, isUuid } from '../src/lib/params';
+import { parsePendingAssessment } from '../src/lib/pending-assessment';
 
 describe('route parameter helpers', () => {
   it('uses the first repeated route parameter and preserves scalar values', () => {

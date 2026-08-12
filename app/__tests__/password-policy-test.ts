@@ -3,7 +3,7 @@ import {
   MAX_PASSWORD_UTF8_BYTES,
   passwordPolicyError,
   utf8ByteLength,
-} from '../lib/password-policy';
+} from '../src/lib/password-policy';
 
 describe('UTF-8 password policy', () => {
   test.each([
@@ -51,4 +51,19 @@ describe('UTF-8 password policy', () => {
       expect(passwordPolicyError(password)).toBeNull();
     },
   );
+
+  it.each([
+    ['\x7F', 1],
+    ['\u0080', 2],
+    ['\u07FF', 2],
+    ['\u0800', 3],
+    ['\uD800', 3],
+    ['\uDC00', 3],
+    ['ab\uD800', 5],
+    ['\uD800A', 4],
+    ['\uD800\uD800', 6],
+    ['\uD800\uDC00', 4],
+  ])('counts boundary string %p as %i UTF-8 bytes', (value, expected) => {
+    expect(utf8ByteLength(value)).toBe(expected);
+  });
 });

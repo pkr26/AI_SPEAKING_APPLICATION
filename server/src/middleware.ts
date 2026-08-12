@@ -120,6 +120,11 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     }
     return res.status(400).json({ error: err.message });
   }
+  // Body-parser rejections carry a 4xx status — they are client errors, not 500s.
+  const bodyParserError = err as { type?: string; status?: number };
+  if (bodyParserError.type === 'entity.parse.failed') {
+    return res.status(400).json({ error: 'Request body is not valid JSON' });
+  }
   logger.error({ err, requestId: req.id }, 'unhandled error');
   return res.status(500).json({ error: 'Internal server error' });
 }

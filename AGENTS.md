@@ -7,7 +7,7 @@ Guidance for anyone (human or AI) working in this repo. Keep this file current w
 Monorepo, two packages:
 
 - `server/` — Node + Express + TypeScript API (port 4000). PostgreSQL via `pg`, JWT auth, S3 presigned audio uploads (multer multipart fallback in dev/test), OpenAI Whisper transcription plus GPT transcript-based feedback. Entry: `server/src/index.ts`; app wiring in `server/src/app.ts`.
-- `app/` — Expo React Native (SDK 57, expo-router, TanStack Query, expo-secure-store, expo-audio). Routes in `app/app/`, shared code in `app/lib/` and `app/components/`.
+- `app/` — Expo React Native (SDK 57, expo-router, TanStack Query, expo-secure-store, expo-audio). All source lives under `app/src/` (routes in `app/src/app/`, shared code in `app/src/lib/` and `app/src/components/`); all tests live in `app/__tests__/`.
 
 Contract between them: camelCase JSON everywhere; auth = `Authorization: Bearer <jwt>`. Audio upload is two-step: the app calls `POST /uploads/audio-url` with the recording's content type and either gets `{mode:'s3', uploadUrl, audioKey}` — it PUTs bytes straight to S3, then POSTs JSON `{questionId, requestId, audioKey}` to the assessment endpoint — or `{mode:'direct'}` (dev/test without `S3_BUCKET`), where it posts multipart with file field `audio` + UUID text fields `questionId` and `requestId`. In both modes `requestId` must be reused when retrying one logical submission, and the assessment-endpoint response contract is identical. The app derives its base URL from `EXPO_PUBLIC_API_URL` (fallback: LAN IP from Expo hostUri, then platform-specific emulator URLs).
 
@@ -36,10 +36,11 @@ App (`cd app`):
 - **Rate limits** — new expensive endpoints must get a limiter in `server/src/rate-limit.ts`.
 - **Audio ingress** — production stores learner audio in S3 via presigned PUT URLs (`server/src/audio-upload.ts`; `S3_BUCKET` required in production). Keys are `audio-uploads/{userId}/{uuid}.{ext}`, validated per-user before the API downloads them, and objects are deleted after assessment. Local dev/test keeps the multer multipart flow (`server/src/upload.ts`); never make tests depend on real AWS.
 - **Money endpoints** — anything that calls OpenAI must go through the assess pipeline (daily cap + concurrency semaphore) — never call OpenAI directly from a route.
-- **Password policy** — min 8, letter + number; mirrored client-side via `passwordPolicyError()` in `app/lib/auth.tsx`. Keep both in sync.
-- **Recorder** — `app/components/Recorder.tsx` is the single shared recording component (spec requirement); do not fork it per screen.
+- **Password policy** — min 8, letter + number; mirrored client-side via `passwordPolicyError()` in `app/src/lib/auth.tsx`. Keep both in sync.
+- **Recorder** — `app/src/components/Recorder.tsx` is the single shared recording component (spec requirement); do not fork it per screen.
 - **TypeScript strict** in both packages; zero type errors is the bar for any change.
-- Tests: add vitest coverage for any new endpoint; keep coverage thresholds and `scripts/smoke.mjs` passing.
+- Tests: add vitest coverage for any new endpoint; keep coverage thresholds and `scripts/smoke.mjs` passing. App component/hook tests use `@testing-library/react-native` v14 (devDependency) — its `render`/`fireEvent`/`act` APIs are fully async and must be awaited.
+- **Mutation testing** — both packages carry a `stryker.config.json` (jest runner for app, vitest runner for server, concurrency 1 since tests share `ai_english_test`). Run with `npx stryker run` in either package; reports land in `reports/mutation/` (gitignored, as is `.stryker-tmp/`). Stryker packages are installed with `npm install --no-save` so manifests stay clean.
 
 ## Verification before calling work done
 

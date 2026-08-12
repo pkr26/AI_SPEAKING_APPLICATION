@@ -4,8 +4,12 @@ import { spawnSync } from "node:child_process";
 // build/Metro toolchain. Keep CI strict without applying npm's incompatible
 // Expo 53 / React Native 0.72 downgrade: any new advisory ID, critical issue,
 // or increase over this reviewed transitive graph fails the build.
+// @testing-library/react-native is a devDependency but is marked devOptional
+// (an optional peer elsewhere in the graph), so npm audit --omit=dev still
+// counts it as one extra node affected by the same reviewed react-native
+// advisories — no new advisory IDs.
 const reviewedAdvisories = new Set([1119441, 1138808, 1138809]);
-const reviewedMaximums = { moderate: 7, high: 14, total: 21 };
+const reviewedMaximums = { moderate: 7, high: 15, total: 22 };
 
 const result = spawnSync("npm", ["audit", "--omit=dev", "--json"], {
   encoding: "utf8",

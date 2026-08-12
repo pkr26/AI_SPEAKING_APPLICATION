@@ -20,6 +20,7 @@
     "react-native-screens": "~4.26.0"
   },
   "devDependencies": {
+    "@testing-library/react-native": "^14.0.1",
     "@types/jest": "29.5.14",
     "@types/react": "~19.2.2",
     "eslint": "^9.0.0",
@@ -33,14 +34,18 @@
     "start": "expo start",
     "android": "expo start --android",
     "ios": "expo start --ios",
-    "lint": "expo lint app components lib __tests__ --max-warnings 0",
+    "lint": "expo lint src __tests__ --max-warnings 0",
     "test": "jest --runInBand",
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "audit:ci": "node scripts/check-audit.mjs"
   },
   "jest": {
-    "preset": "jest-expo"
+    "preset": "jest-expo",
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/.stryker-tmp/"
+    ]
   },
   "private": true
 }

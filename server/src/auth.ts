@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { config } from './config';
 import { pool } from './db';
 import { AuthedRequest, h, HttpError, JWT_AUDIENCE, JWT_ISSUER, requireAuth, UserRow, validate } from './middleware';
+import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 const BCRYPT_COST = 12;
 const BCRYPT_MAX_BYTES = 72;
@@ -127,13 +128,11 @@ authRouter.post(
       );
       await client.query('COMMIT');
     } catch (e) {
-      await client.query('ROLLBACK');
-      if ((e as { code?: string }).code === '23505') {
-        throw new HttpError(409, 'Email already registered');
-      }
-      throw e;
+      const primaryError =
+        (e as { code?: string }).code === '23505' ? new HttpError(409, 'Email already registered') : e;
+      return await rollbackTransaction(client, { value: primaryError });
     } finally {
-      client.release();
+      releaseTransactionClient(client);
     }
     res.status(201).json({ token: signToken(user), user: toUserJson(user) });
   }),

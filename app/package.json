@@ -20,6 +20,8 @@
     "react-native-screens": "~4.26.0"
   },
   "devDependencies": {
+    "@stryker-mutator/core": "9.6.1",
+    "@stryker-mutator/jest-runner": "9.6.1",
     "@testing-library/react-native": "^14.0.1",
     "@types/jest": "29.5.14",
     "@types/react": "~19.2.2",
@@ -40,6 +42,7 @@
     "format:check": "prettier --check .",
     "test": "jest --runInBand --coverage",
     "test:quick": "jest --runInBand",
+    "mutation": "stryker run",
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "audit:ci": "node scripts/check-audit.mjs"
@@ -70,6 +73,9 @@
   "engines": {
     "node": "^22.13.0 || ^24.3.0",
     "npm": ">=10"
+  },
+  "overrides": {
+    "qs": "6.15.3"
   },
   "private": true
 }

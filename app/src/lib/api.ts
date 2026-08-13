@@ -427,29 +427,27 @@ export async function apiPostPresignedAudio(
     return;
   }
 
-  if (Platform.OS === 'web') {
-    const audioResponse = await fetchWithTimeout(
-      audioUri,
-      {},
-      options.timeoutMs ?? AUDIO_TIMEOUT_MS,
-      options.signal,
-    );
-    if (!audioResponse.ok) throwForStatus(audioResponse);
-    const body = await audioResponse.blob();
-    if (body.size === 0 || body.size > maxBytes) {
-      throw new ApiError(413, 'The recording is too large');
-    }
-    const form = new FormData();
-    for (const [key, value] of Object.entries(uploadFields)) {
-      form.append(key, value);
-    }
-    form.append('file', body, audioFileDescriptor(audioUri).name);
-    const res = await fetchWithTimeout(
-      uploadUrl,
-      { method: 'POST', body: form },
-      options.timeoutMs ?? AUDIO_TIMEOUT_MS,
-      options.signal,
-    );
-    if (!res.ok) throwForStatus(res);
+  const audioResponse = await fetchWithTimeout(
+    audioUri,
+    {},
+    options.timeoutMs ?? AUDIO_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!audioResponse.ok) throwForStatus(audioResponse);
+  const body = await audioResponse.blob();
+  if (body.size === 0 || body.size > maxBytes) {
+    throw new ApiError(413, 'The recording is too large');
   }
+  const form = new FormData();
+  for (const [key, value] of Object.entries(uploadFields)) {
+    form.append(key, value);
+  }
+  form.append('file', body, audioFileDescriptor(audioUri).name);
+  const res = await fetchWithTimeout(
+    uploadUrl,
+    { method: 'POST', body: form },
+    options.timeoutMs ?? AUDIO_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) throwForStatus(res);
 }

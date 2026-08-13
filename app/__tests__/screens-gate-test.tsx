@@ -1,7 +1,7 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { Text } from 'react-native';
+import { AppState, type AppStateStatus, Text } from 'react-native';
 import { router } from 'expo-router';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -141,19 +141,25 @@ function makeQueryClient(): QueryClient {
   return client;
 }
 
-function renderGate() {
-  return render(
+async function renderGate(queryClient = makeQueryClient()) {
+  const tree = () => (
     <SafeAreaProvider
       initialMetrics={{
         frame: { x: 0, y: 0, width: 390, height: 844 },
         insets: { top: 0, left: 0, right: 0, bottom: 0 },
       }}
     >
-      <QueryClientProvider client={makeQueryClient()}>
+      <QueryClientProvider client={queryClient}>
         <Gate />
       </QueryClientProvider>
-    </SafeAreaProvider>,
+    </SafeAreaProvider>
   );
+  const rendered = await render(tree());
+  return {
+    ...rendered,
+    queryClient,
+    rerenderGate: () => rendered.rerender(tree()),
+  };
 }
 
 afterEach(async () => {
@@ -203,6 +209,12 @@ describe('root layout route guards', () => {
     expect(guards()).toEqual([false, false, false, false]);
   });
 
+  it('closes every protected group while a populated session is still restoring', async () => {
+    mockAuthValue = makeAuth({ isRestoring: true });
+    await render(<RootLayout />);
+    expect(guards()).toEqual([false, false, false, false]);
+  });
+
   it('opens only the (auth) group when there is no token', async () => {
     mockAuthValue = makeAuth({ token: null, user: null });
     await render(<RootLayout />);
@@ -215,6 +227,12 @@ describe('root layout route guards', () => {
       user: null,
       restoreError: 'Secure session storage is unavailable.',
     });
+    await render(<RootLayout />);
+    expect(guards()).toEqual([false, false, false, false]);
+  });
+
+  it('does not trust a populated profile after secure-store restoration fails', async () => {
+    mockAuthValue = makeAuth({ restoreError: 'Secure session storage is unavailable.' });
     await render(<RootLayout />);
     expect(guards()).toEqual([false, false, false, false]);
   });
@@ -238,6 +256,60 @@ describe('root layout route guards', () => {
     await render(<RootLayout />);
     expect(guards()).toEqual([false, false, true, true]);
   });
+
+  it('locks assessment routes against header-back and swipe-back bypasses', async () => {
+    await render(<RootLayout />);
+    const optionsFor = (name: string) =>
+      capturedScreenProps.find((props) => props?.name === name)?.options;
+
+    expect(optionsFor('index')).toEqual(expect.objectContaining({ headerShown: false }));
+    expect(optionsFor('(auth)')).toEqual(expect.objectContaining({ headerShown: false }));
+    for (const name of ['diagnostic', 'practice/index', 'practice/feedback']) {
+      expect(optionsFor(name)).toEqual(
+        expect.objectContaining({ headerBackVisible: false, gestureEnabled: false }),
+      );
+    }
+  });
+
+  it('tracks native foreground state and removes the focus bridge on unmount', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      value: 'background',
+    });
+    const remove = jest.fn();
+    let onChange: ((state: AppStateStatus) => void) | undefined;
+    const addListenerSpy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_event, listener) => {
+        onChange = listener;
+        return { remove } as ReturnType<typeof AppState.addEventListener>;
+      });
+    const setFocusedSpy = jest.spyOn(focusManager, 'setFocused');
+
+    try {
+      const rendered = await render(<RootLayout />);
+      expect(addListenerSpy).toHaveBeenCalledWith('change', expect.any(Function));
+      expect(setFocusedSpy).toHaveBeenCalledWith(false);
+
+      await act(async () => onChange?.('active'));
+      expect(setFocusedSpy).toHaveBeenLastCalledWith(true);
+      await act(async () => onChange?.('inactive'));
+      expect(setFocusedSpy).toHaveBeenLastCalledWith(false);
+
+      await rendered.unmount();
+      expect(remove).toHaveBeenCalledTimes(1);
+      expect(setFocusedSpy).toHaveBeenLastCalledWith(undefined);
+    } finally {
+      addListenerSpy.mockRestore();
+      setFocusedSpy.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
+  });
 });
 
 describe('root fallback screens', () => {
@@ -245,7 +317,10 @@ describe('root fallback screens', () => {
     const retry = jest.fn();
     await render(<ErrorBoundary error={new Error('sensitive stack details')} retry={retry} />);
 
-    expect(screen.getByText('Something went wrong')).toBeTruthy();
+    expect(screen.getByRole('header', { name: 'Something went wrong' })).toBeTruthy();
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Your learning data is safe. Try this screen again.',
+    );
     expect(screen.queryByText(/sensitive stack details/)).toBeNull();
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(retry).toHaveBeenCalledTimes(1);
@@ -254,7 +329,7 @@ describe('root fallback screens', () => {
   it('returns an invalid deep link to the protected entry gate', async () => {
     await render(<NotFoundScreen />);
 
-    expect(screen.getByText('Page not found')).toBeTruthy();
+    expect(screen.getByRole('header', { name: 'Page not found' })).toBeTruthy();
     await fireEvent.press(screen.getByRole('button', { name: 'Return Home' }));
     expect(router.replace).toHaveBeenCalledWith('/');
   });
@@ -272,16 +347,16 @@ describe('(auth) layout', () => {
 
 describe('index gate', () => {
   it('shows a restoring message while the session is being read', async () => {
-    mockAuthValue = makeAuth({ isRestoring: true, token: null, user: null });
+    mockAuthValue = makeAuth({ isRestoring: true });
     await renderGate();
     expect(screen.getByText('Restoring your session…')).toBeTruthy();
+    expect(screen.queryByTestId('redirect')).toBeNull();
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it('shows secure-storage recovery instead of redirecting to login', async () => {
     const retrySessionRestore = jest.fn();
     mockAuthValue = makeAuth({
-      token: null,
-      user: null,
       restoreError:
         'Secure session storage is temporarily unavailable. Unlock your device and try again.',
       retrySessionRestore,
@@ -290,6 +365,8 @@ describe('index gate', () => {
 
     expect(screen.queryByTestId('redirect')).toBeNull();
     expect(screen.getByText("Can't access your secure session")).toBeTruthy();
+    expect(screen.getByRole('alert')).toHaveTextContent(mockAuthValue.restoreError!);
+    expect(mockApiFetch).not.toHaveBeenCalled();
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(retrySessionRestore).toHaveBeenCalledTimes(1);
   });
@@ -298,12 +375,14 @@ describe('index gate', () => {
     mockAuthValue = makeAuth({ token: null, user: null });
     await renderGate();
     expect(screen.getByTestId('redirect')).toHaveTextContent('/login');
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it('redirects to practice when the diagnostic is complete', async () => {
     mockAuthValue = makeAuth();
     await renderGate();
     expect(screen.getByTestId('redirect')).toHaveTextContent('/practice');
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it('redirects to the diagnostic when it is not complete', async () => {
@@ -312,17 +391,20 @@ describe('index gate', () => {
     });
     await renderGate();
     expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
+    expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
   it('loads the profile when a token exists without a user', async () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
-    await renderGate();
+    const queryClient = makeQueryClient();
+    await renderGate(queryClient);
     expect(screen.getByText('Loading your profile…')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/auth/me',
       expect.objectContaining({ signal: expect.anything() }),
     );
+    expect(queryClient.getQueryCache().find({ queryKey: ['me', 1], exact: true })).toBeDefined();
   });
 
   it('stores the fetched profile and redirects based on it', async () => {
@@ -334,6 +416,37 @@ describe('index gate', () => {
     expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
   });
 
+  it('does not apply a profile response from a superseded auth session', async () => {
+    let resolveFirst!: (value: unknown) => void;
+    let resolveSecond!: (value: unknown) => void;
+    const firstResponse = new Promise<unknown>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const secondResponse = new Promise<unknown>((resolve) => {
+      resolveSecond = resolve;
+    });
+    const firstSetUser = jest.fn();
+    mockAuthValue = makeAuth({ user: null, sessionVersion: 1, setUser: firstSetUser });
+    mockApiFetch.mockReturnValueOnce(firstResponse).mockReturnValueOnce(secondResponse);
+    const rendered = await renderGate();
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+
+    const secondSetUser = jest.fn();
+    mockAuthValue = makeAuth({ user: null, sessionVersion: 2, setUser: secondSetUser });
+    await rendered.rerenderGate();
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
+
+    await act(async () => resolveFirst({ user: { ...USER, name: 'Stale User' } }));
+    expect(firstSetUser).not.toHaveBeenCalled();
+    expect(secondSetUser).not.toHaveBeenCalled();
+    expect(screen.getByText('Loading your profile…')).toBeTruthy();
+
+    const currentProfile = { ...USER, name: 'Current User' };
+    await act(async () => resolveSecond({ user: currentProfile }));
+    await waitFor(() => expect(secondSetUser).toHaveBeenCalledWith(currentProfile));
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/practice');
+  });
+
   it('shows a signing-out spinner when the stored token is rejected', async () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockRejectedValue(new ApiError(401, 'unauthorized'));
@@ -341,9 +454,21 @@ describe('index gate', () => {
     expect(await screen.findByText('Signing you out…')).toBeTruthy();
   });
 
+  it('does not treat a non-ApiError status property as an authenticated rejection', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    mockApiFetch.mockRejectedValue({ status: 401, message: 'not an ApiError' });
+    await renderGate();
+
+    expect(await screen.findByText("Can't reach the server")).toBeTruthy();
+    expect(screen.queryByText('Signing you out…')).toBeNull();
+  });
+
   it('shows a retryable error when the profile fetch fails', async () => {
     mockAuthValue = makeAuth({ user: null });
-    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    const fetched = { ...USER, diagnosticCompleted: false, cefrLevel: null };
+    mockApiFetch
+      .mockRejectedValueOnce(new ApiError(500, 'boom'))
+      .mockResolvedValueOnce({ user: fetched });
     await renderGate();
     expect(await screen.findByText("Can't reach the server")).toBeTruthy();
     expect(
@@ -355,6 +480,8 @@ describe('index gate', () => {
       // Let the refetch settle and the batched query notification fire.
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
+    await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(fetched));
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 

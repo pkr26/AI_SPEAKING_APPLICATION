@@ -4,11 +4,14 @@ import fsPromises from 'fs/promises';
 import { RequestHandler } from 'express';
 import multer from 'multer';
 import path from 'path';
+import { pipeline } from 'stream';
 import { HttpError } from './middleware';
 
 export const uploadsDir = path.join(__dirname, '..', 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
 fs.chmodSync(uploadsDir, 0o700);
+
+export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 
 export const AUDIO_TYPES: Readonly<Record<string, readonly string[]>> = {
   '.m4a': ['audio/m4a', 'audio/mp4', 'audio/x-m4a', 'video/mp4'],
@@ -31,11 +34,14 @@ const privateDiskStorage: multer.StorageEngine = {
     const filePath = path.join(uploadsDir, filename);
     const out = fs.createWriteStream(filePath, { flags: 'wx', mode: 0o600 });
 
-    file.stream.pipe(out);
-    out.once('error', (err) => {
-      fs.unlink(filePath, () => cb(err));
-    });
-    out.once('finish', () => {
+    // pipeline propagates failures from both the multipart input and private
+    // output and invokes its callback exactly once, avoiding a partially
+    // written file or competing error/finish callbacks.
+    pipeline(file.stream, out, (error) => {
+      if (error) {
+        fs.unlink(filePath, () => cb(error));
+        return;
+      }
       cb(null, { destination: uploadsDir, filename, path: filePath, size: out.bytesWritten });
     });
   },
@@ -47,7 +53,10 @@ const privateDiskStorage: multer.StorageEngine = {
 export const upload = multer({
   storage: privateDiskStorage,
   limits: {
-    fileSize: 25 * 1024 * 1024,
+    // Busboy emits LIMIT_FILE_SIZE upon reaching (not exceeding) this value.
+    // Set its stream threshold one byte above the public 25 MiB maximum so an
+    // exact-cap upload is accepted while the first byte beyond it is rejected.
+    fileSize: MAX_AUDIO_BYTES + 1,
     files: 1,
     fields: 2,
     parts: 4,
@@ -132,13 +141,16 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
   }
 
   const ext = path.extname(filePath).toLowerCase();
-  const isoBmff = head.length >= 8 && head.toString('ascii', 4, 8) === 'ftyp';
-  const wav = head.length >= 12 && head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WAVE';
-  const id3 = head.length >= 3 && head.toString('ascii', 0, 3) === 'ID3';
-  const mpegOrAdts = head.length >= 2 && head[0] === 0xff && (head[1] & 0xe0) === 0xe0;
-  const ogg = head.length >= 4 && head.toString('ascii', 0, 4) === 'OggS';
-  const webm = head.length >= 4 && head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
-  const flac = head.length >= 4 && head.toString('ascii', 0, 4) === 'fLaC';
+  // Buffer string slices and indexed reads already fail closed when bytes are
+  // absent, so separate length predicates add no security and create two
+  // representations of each signature boundary that can drift apart.
+  const isoBmff = head.toString('ascii', 4, 8) === 'ftyp';
+  const wav = head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WAVE';
+  const id3 = head.toString('ascii', 0, 3) === 'ID3';
+  const mpegOrAdts = head[0] === 0xff && (head[1] & 0xe0) === 0xe0;
+  const ogg = head.toString('ascii', 0, 4) === 'OggS';
+  const webm = head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
+  const flac = head.toString('ascii', 0, 4) === 'fLaC';
 
   // The container signature must match the already allowlisted extension and
   // MIME pair. Merely finding *some* supported signature is not sufficient.
@@ -157,18 +169,39 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
   return true;
 }
 
-/** Boot-time janitor: drop orphaned uploads older than maxAgeMs (fire-and-forget). */
-export async function cleanupOldUploads(maxAgeMs = 60 * 60 * 1000): Promise<number> {
-  const cutoff = Date.now() - maxAgeMs;
+/**
+ * Deterministic janitor core. Callers must supply a trusted directory; normal
+ * application code should use cleanupOldUploads(), whose target is fixed.
+ */
+export async function cleanupOldUploadsInDirectory(directory: string, maxAgeMs: number, now: number): Promise<number> {
+  const cutoff = now - maxAgeMs;
   let removed = 0;
-  const entries = await fsPromises.readdir(uploadsDir).catch(() => [] as string[]);
+  let entries: string[];
+  try {
+    entries = await fsPromises.readdir(directory);
+  } catch (error) {
+    // A missing directory is equivalent to having no orphaned uploads. Other
+    // I/O failures must reach the caller so operations can alert on a janitor
+    // that is unable to inspect its storage directory.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
   for (const name of entries) {
-    const full = path.join(uploadsDir, name);
+    const full = path.join(directory, name);
     const stat = await fsPromises.stat(full).catch(() => null);
     if (stat && stat.isFile() && stat.mtimeMs < cutoff) {
-      await fsPromises.unlink(full).catch(() => {});
-      removed++;
+      try {
+        await fsPromises.unlink(full);
+        removed++;
+      } catch {
+        // Best effort: a future janitor pass can retry transient failures.
+      }
     }
   }
   return removed;
+}
+
+/** Boot-time janitor: drop orphaned uploads older than maxAgeMs (fire-and-forget). */
+export async function cleanupOldUploads(maxAgeMs = 60 * 60 * 1000): Promise<number> {
+  return cleanupOldUploadsInDirectory(uploadsDir, maxAgeMs, Date.now());
 }

@@ -152,7 +152,7 @@ export default function Recorder<T>({
   });
   const identityRef = useRef({ ownerId, endpoint, questionId });
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     callbacksRef.current = {
       onError,
       onRecoveryUnresolved,
@@ -243,6 +243,10 @@ export default function Recorder<T>({
 
   const recoverPending = useCallback(async () => {
     const instanceId = instanceIdRef.current;
+    const identityIsCurrent = () =>
+      identityRef.current.ownerId === ownerId &&
+      identityRef.current.endpoint === endpoint &&
+      identityRef.current.questionId === questionId;
     if (
       recoveringRef.current ||
       operationRef.current ||
@@ -250,6 +254,8 @@ export default function Recorder<T>({
       !mountedRef.current ||
       !focusedRef.current ||
       AppState.currentState !== 'active' ||
+      !identityIsCurrent() ||
+      (phaseRef.current !== 'idle' && phaseRef.current !== 'recovering') ||
       (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId)
     ) {
       return;
@@ -259,7 +265,13 @@ export default function Recorder<T>({
     try {
       pending = await loadPendingAssessment();
     } catch {
-      if (mountedRef.current && focusedRef.current && AppState.currentState === 'active') {
+      if (
+        mountedRef.current &&
+        focusedRef.current &&
+        AppState.currentState === 'active' &&
+        identityIsCurrent() &&
+        (phaseRef.current === 'idle' || phaseRef.current === 'recovering')
+      ) {
         updatePhase('recovering');
         callbacksRef.current.onError(
           'Secure retry information is temporarily unavailable. Restart the app before recording another answer.',
@@ -273,7 +285,10 @@ export default function Recorder<T>({
       uploadControllerRef.current !== null ||
       !mountedRef.current ||
       !focusedRef.current ||
-      AppState.currentState !== 'active'
+      AppState.currentState !== 'active' ||
+      !identityIsCurrent() ||
+      (phaseRef.current !== 'idle' && phaseRef.current !== 'recovering') ||
+      (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId)
     ) {
       return;
     }
@@ -286,9 +301,7 @@ export default function Recorder<T>({
       recoveryGenerationRef.current === generation &&
       recoveringRef.current &&
       activeRecoveryOwner === instanceId &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
+      identityIsCurrent() &&
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
@@ -517,23 +530,34 @@ export default function Recorder<T>({
                 });
                 if (!isCurrent()) return;
                 if (!routeMatches) {
+                  await finishUnresolved(
+                    'Your interrupted assessment was saved. Your current learning state has been refreshed.',
+                    false,
+                  );
+                  return;
+                }
+                let data: T;
+                try {
+                  data = callbacksRef.current.parseResult(raw);
+                } catch {
+                  await finishUnresolved(
+                    'The assessment was saved, but this app version could not display it. Your learning state has been refreshed.',
+                    false,
+                  );
+                  return;
+                }
+                try {
                   if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
                     throw new Error('Pending assessment disappeared');
                   }
-                  if (!isCurrent()) return;
-                  callbacksRef.current.onRecoveryUnresolved();
-                  if (!isCurrent()) return;
-                  discardRecording();
-                  updatePhase('idle');
-                  callbacksRef.current.onError(
-                    'Your interrupted assessment was saved. Your current learning state has been refreshed.',
-                  );
-                  void clearRequestTracking(pending.requestId);
+                } catch {
+                  if (isCurrent()) {
+                    updatePhase('recovering');
+                    callbacksRef.current.onError(
+                      'The result is safe, but secure retry information could not be updated. Restart the app to finish recovery.',
+                    );
+                  }
                   return;
-                }
-                const data = callbacksRef.current.parseResult(raw);
-                if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-                  throw new Error('Pending assessment disappeared');
                 }
                 if (!isCurrent()) return;
                 discardRecording();
@@ -748,6 +772,9 @@ export default function Recorder<T>({
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentLifecycle = () =>
       lifecycleEpoch === lifecycleEpochRef.current &&
+      identityRef.current.ownerId === ownerId &&
+      identityRef.current.endpoint === endpoint &&
+      identityRef.current.questionId === questionId &&
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
@@ -759,6 +786,7 @@ export default function Recorder<T>({
         : current.canAskAgain === false
           ? current
           : await AudioModule.requestRecordingPermissionsAsync();
+      if (!isCurrentLifecycle()) return;
       if (!response.granted) {
         if (mountedRef.current) {
           setPermissionDenied(true);
@@ -766,18 +794,18 @@ export default function Recorder<T>({
         }
         return;
       }
-      if (!isCurrentLifecycle()) return;
 
       const previousRequestId = requestIdRef.current;
       if (previousRequestId) {
-        if (!(await clearRequestTracking(previousRequestId))) {
+        const cleared = await clearRequestTracking(previousRequestId);
+        if (!isCurrentLifecycle()) return;
+        if (!cleared) {
           updatePhase('recovering');
           callbacksRef.current.onError(
             'Secure retry information could not be cleared. Restart the app before recording another answer.',
           );
           return;
         }
-        if (!isCurrentLifecycle()) return;
       }
       discardRecording();
       setRecordedDurationMillis(0);
@@ -806,12 +834,14 @@ export default function Recorder<T>({
       discardRecording(recorder.uri);
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
-      setRecordedDurationMillis(0);
+      if (mountedRef.current) setRecordedDurationMillis(0);
       updatePhase('idle');
       await restoreAudioMode().catch(() => undefined);
-      callbacksRef.current.onError(
-        'Could not start recording. Check microphone access and try again.',
-      );
+      if (isCurrentLifecycle()) {
+        callbacksRef.current.onError(
+          'Could not start recording. Check microphone access and try again.',
+        );
+      }
     } finally {
       operationRef.current = false;
     }
@@ -821,6 +851,14 @@ export default function Recorder<T>({
     if (operationRef.current || phaseRef.current !== 'recording') return;
     operationRef.current = true;
     const lifecycleEpoch = lifecycleEpochRef.current;
+    const isCurrentLifecycle = () =>
+      lifecycleEpoch === lifecycleEpochRef.current &&
+      identityRef.current.ownerId === ownerId &&
+      identityRef.current.endpoint === endpoint &&
+      identityRef.current.questionId === questionId &&
+      mountedRef.current &&
+      focusedRef.current &&
+      AppState.currentState === 'active';
     try {
       const durationBeforeStop = Math.max(
         recorderState.durationMillis ?? 0,
@@ -828,7 +866,7 @@ export default function Recorder<T>({
       );
       await stopNativeRecording();
       const uri = recorder.uri;
-      if (lifecycleEpoch !== lifecycleEpochRef.current) {
+      if (!isCurrentLifecycle()) {
         discardRecording(uri);
         return;
       }
@@ -850,9 +888,11 @@ export default function Recorder<T>({
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
       updatePhase('idle');
-      callbacksRef.current.onError(
-        'Could not save the recording. Please record your answer again.',
-      );
+      if (isCurrentLifecycle()) {
+        callbacksRef.current.onError(
+          'Could not save the recording. Please record your answer again.',
+        );
+      }
     } finally {
       await restoreAudioMode().catch(() => undefined);
       operationRef.current = false;
@@ -886,6 +926,7 @@ export default function Recorder<T>({
       const requestId = requestIdRef.current ?? Crypto.randomUUID();
       requestIdRef.current = requestId;
       const existing = await loadPendingAssessment();
+      if (!isCurrentSubmission()) return;
       if (
         existing &&
         (existing.requestId !== requestId ||
@@ -894,6 +935,7 @@ export default function Recorder<T>({
           existing.questionId !== questionId)
       ) {
         recoverAfterUpload = true;
+        updatePhase('recovering');
         return;
       }
       if (!existing) {
@@ -907,7 +949,9 @@ export default function Recorder<T>({
         };
         try {
           await savePendingAssessment(pending);
+          if (!isCurrentSubmission()) return;
         } catch {
+          if (!isCurrentSubmission()) return;
           requestIdRef.current = null;
           updatePhase('recorded');
           callbacksRef.current.onError(
@@ -922,11 +966,13 @@ export default function Recorder<T>({
       // recovery flow below is identical for both paths.
       const descriptor = audioFileDescriptor(uri);
       const grant = await apiRequestAudioUpload(descriptor.type);
+      if (!isCurrentSubmission()) return;
       let raw: unknown;
       if (grant.mode === 's3') {
         if (!(await markPendingAssessmentStage(requestId, 's3-granted', grant.audioKey))) {
           throw new Error('Pending assessment disappeared');
         }
+        if (!isCurrentSubmission()) return;
         await apiPostPresignedAudio(
           grant.uploadUrl,
           grant.uploadFields,
@@ -935,6 +981,7 @@ export default function Recorder<T>({
           grant.maxBytes,
           { signal: controller.signal },
         );
+        if (!isCurrentSubmission()) return;
         raw = await apiFetch<unknown>(endpoint, {
           method: 'POST',
           body: { questionId, requestId, audioKey: grant.audioKey },
@@ -945,6 +992,7 @@ export default function Recorder<T>({
         if (!(await markPendingAssessmentStage(requestId, 'direct-posting'))) {
           throw new Error('Pending assessment disappeared');
         }
+        if (!isCurrentSubmission()) return;
         raw = await apiUploadAudio<unknown>(
           endpoint,
           uri,
@@ -969,6 +1017,7 @@ export default function Recorder<T>({
             throw new Error('Pending assessment disappeared');
           }
         } catch {
+          if (!isCurrentSubmission()) return;
           updatePhase('recovering');
           callbacksRef.current.onError(
             'The assessment was saved, but secure retry information could not be updated. Restart the app to finish recovery.',
@@ -990,6 +1039,7 @@ export default function Recorder<T>({
           throw new Error('Pending assessment disappeared');
         }
       } catch {
+        if (!isCurrentSubmission()) return;
         updatePhase('recovering');
         callbacksRef.current.onError(
           'The result is safe, but secure retry information could not be updated. Restart the app to finish recovery.',
@@ -1002,18 +1052,20 @@ export default function Recorder<T>({
       void clearRequestTracking(requestId);
     } catch (error) {
       if (controller.signal.aborted) return;
+      if (!isCurrentSubmission()) return;
       const definitelyRejected =
         error instanceof ApiError && [400, 403, 404, 413, 415, 422, 429].includes(error.status);
       if (definitelyRejected) {
         const requestId = requestIdRef.current;
-        if (requestId && !(await clearRequestTracking(requestId))) {
+        const cleared = requestId ? await clearRequestTracking(requestId) : true;
+        if (!isCurrentSubmission()) return;
+        if (!cleared) {
           updatePhase('recovering');
           callbacksRef.current.onError(
             'Secure retry information could not be cleared. Restart the app before recording another answer.',
           );
           return;
         }
-        if (!isCurrentSubmission()) return;
         updatePhase('recorded');
         callbacksRef.current.onError(
           userMessageForError(

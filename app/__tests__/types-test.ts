@@ -59,6 +59,15 @@ describe('identity contract parsers', () => {
     expectContractError(() => parseAuthResponse({ token: '', user }));
     expectContractError(() => parseAuthResponse({ token: 'jwt', user: null }));
   });
+
+  it('rejects null and array auth, user, and question envelopes', () => {
+    expectContractError(() => parseAuthResponse(null));
+    expectContractError(() => parseAuthResponse(Object.assign([], { token: 'jwt', user })));
+    expectContractError(() => parseUserResponse(null));
+    expectContractError(() => parseUserResponse(Object.assign([], { user })));
+    expectContractError(() => parseQuestionResponse(null));
+    expectContractError(() => parseQuestionResponse(Object.assign([], { question })));
+  });
 });
 
 describe('question and diagnostic contract parsers', () => {
@@ -110,6 +119,24 @@ describe('question and diagnostic contract parsers', () => {
     );
     expectContractError(() => parseDiagnosticNext({ done: true, level: 'B9' }));
     expectContractError(() =>
+      parseDiagnosticNext(
+        Object.assign([], {
+          done: false,
+          question,
+          progress: { asked: 0, maxQuestions: 6 },
+        }),
+      ),
+    );
+    for (const progress of [null, Object.assign([], { asked: 0, maxQuestions: 6 })]) {
+      expectContractError(() =>
+        parseDiagnosticNext({
+          done: false,
+          question,
+          progress,
+        }),
+      );
+    }
+    expectContractError(() =>
       parseDiagnosticNext({
         done: false,
         question,
@@ -139,21 +166,70 @@ describe('question and diagnostic contract parsers', () => {
       parseDiagnosticAnswerResult({ ...answer, done: true, level: undefined }),
     );
   });
+
+  it('enforces diagnostic-next discriminants one forbidden field at a time', () => {
+    const pending = {
+      done: false,
+      question,
+      progress: { asked: 0, maxQuestions: 6 },
+    } as const;
+    const complete = { done: true, level: 'B1' } as const;
+
+    expectContractError(() => parseDiagnosticNext({ ...pending, level: 'B1' }));
+    expectContractError(() => parseDiagnosticNext({ ...complete, question }));
+    expectContractError(() =>
+      parseDiagnosticNext({ ...complete, progress: { asked: 0, maxQuestions: 6 } }),
+    );
+    expectContractError(() => parseDiagnosticNext({ ...pending, done: 0 }));
+    expectContractError(() => parseDiagnosticNext({ ...pending, done: null }));
+  });
+
+  it('enforces diagnostic-answer discriminants one forbidden field at a time', () => {
+    const pending = {
+      passed: true,
+      score: 82,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: false,
+      nextQuestion: question,
+    } as const;
+    const complete = {
+      passed: true,
+      score: 82,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: true,
+      level: 'B1',
+    } as const;
+
+    expectContractError(() => parseDiagnosticAnswerResult({ ...pending, level: 'B1' }));
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        passed: complete.passed,
+        score: complete.score,
+        transcript: complete.transcript,
+        feedback: complete.feedback,
+        done: true,
+      }),
+    );
+    expectContractError(() => parseDiagnosticAnswerResult({ ...complete, nextQuestion: question }));
+  });
 });
 
 describe('practice contract parsers', () => {
+  const help = {
+    promptWord: 'travel',
+    promptWordNative: 'ప్రయాణం',
+    questionText: question.questionText,
+    questionTextNative: 'మీరు ఎక్కడికి వెళ్లాలనుకుంటున్నారు?',
+    examples: [
+      { en: 'I want to travel.', native: 'నేను ప్రయాణించాలనుకుంటున్నాను.' },
+      { en: 'I travel by train.', native: 'నేను రైలులో ప్రయాణిస్తాను.' },
+      { en: 'Travel teaches me.', native: 'ప్రయాణం నాకు నేర్పుతుంది.' },
+    ],
+  } as const;
+
   it('accepts complete help and attempt responses', () => {
-    const help = {
-      promptWord: 'travel',
-      promptWordNative: 'ప్రయాణం',
-      questionText: question.questionText,
-      questionTextNative: 'మీరు ఎక్కడికి వెళ్లాలనుకుంటున్నారు?',
-      examples: [
-        { en: 'I want to travel.', native: 'నేను ప్రయాణించాలనుకుంటున్నాను.' },
-        { en: 'I travel by train.', native: 'నేను రైలులో ప్రయాణిస్తాను.' },
-        { en: 'Travel teaches me.', native: 'ప్రయాణం నాకు నేర్పుతుంది.' },
-      ],
-    };
     expect(parseHelpContent(help)).toEqual(help);
 
     const attempt = {
@@ -167,6 +243,45 @@ describe('practice contract parsers', () => {
       nextQuestion: question,
     };
     expect(parseAttemptResult(attempt)).toEqual(attempt);
+  });
+
+  it.each([
+    ['an array envelope', Object.assign([], help)],
+    ['a missing prompt word', { ...help, promptWord: undefined }],
+    ['a non-string prompt word', { ...help, promptWord: 42 }],
+    ['a blank prompt word', { ...help, promptWord: '   ' }],
+    ['an oversized prompt word', { ...help, promptWord: 'x'.repeat(101) }],
+    ['a missing native prompt word', { ...help, promptWordNative: undefined }],
+    ['a non-string native prompt word', { ...help, promptWordNative: 42 }],
+    ['a blank native prompt word', { ...help, promptWordNative: '   ' }],
+    ['an oversized native prompt word', { ...help, promptWordNative: 'x'.repeat(501) }],
+    ['a missing question', { ...help, questionText: undefined }],
+    ['a non-string question', { ...help, questionText: 42 }],
+    ['a blank question', { ...help, questionText: '   ' }],
+    ['an oversized question', { ...help, questionText: 'x'.repeat(1_001) }],
+    ['a missing native question', { ...help, questionTextNative: undefined }],
+    ['a non-string native question', { ...help, questionTextNative: 42 }],
+    ['a blank native question', { ...help, questionTextNative: '   ' }],
+    ['an oversized native question', { ...help, questionTextNative: 'x'.repeat(4_001) }],
+    ['non-array examples', { ...help, examples: 'not-an-array' }],
+    ['too few examples', { ...help, examples: help.examples.slice(0, 2) }],
+    ['too many examples', { ...help, examples: [...help.examples, help.examples[0]] }],
+  ])('rejects help content with %s', (_label, value) => {
+    expectContractError(() => parseHelpContent(value));
+  });
+
+  it('rejects array and wrong-boolean attempt envelopes that otherwise satisfy the contract', () => {
+    const passedAttempt = {
+      passed: true,
+      attemptNo: 1,
+      score: 90,
+      transcript: 'An answer.',
+      feedback: 'Great.',
+      nextQuestion: question,
+    } as const;
+
+    expectContractError(() => parseAttemptResult(Object.assign([], passedAttempt)));
+    expectContractError(() => parseAttemptResult({ ...passedAttempt, passed: 'yes' }));
   });
 
   it('rejects malformed nested help examples and practice edge values', () => {
@@ -296,6 +411,12 @@ describe('score and progress boundaries', () => {
       progress: { asked: 0, maxQuestions: 1 },
     } as const;
     expect(parseDiagnosticNext(value)).toEqual(value);
+    const upper = {
+      done: false,
+      question,
+      progress: { asked: 99, maxQuestions: 100 },
+    } as const;
+    expect(parseDiagnosticNext(upper)).toEqual(upper);
   });
 
   it('rejects non-integer and out-of-range progress values', () => {
@@ -322,11 +443,26 @@ describe('score and progress boundaries', () => {
         progress: { asked: 0, maxQuestions: 0 },
       }),
     );
+    expectContractError(() =>
+      parseDiagnosticNext({
+        done: false,
+        question,
+        progress: { asked: 0, maxQuestions: 101 },
+      }),
+    );
   });
 
   it('rejects non-boolean diagnostic answer flags', () => {
     expectContractError(() => parseDiagnosticAnswerResult({ ...doneAnswer, passed: 'yes' }));
     expectContractError(() => parseDiagnosticAnswerResult({ ...doneAnswer, done: 1 }));
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        ...doneAnswer,
+        done: 0,
+        level: undefined,
+        nextQuestion: question,
+      }),
+    );
   });
 });
 
@@ -371,6 +507,21 @@ describe('help and attempt detail boundaries', () => {
     );
   });
 
+  it.each([
+    ['a null example', null],
+    ['an array example', Object.assign([], { en: 'English', native: 'Native' })],
+    ['a missing native translation', { en: 'English only' }],
+    ['a non-string English value', { en: 42, native: 'Native' }],
+    ['a non-string native value', { en: 'English', native: 42 }],
+  ])('rejects exactly three help examples when one is %s', (_label, malformedExample) => {
+    expectContractError(() =>
+      parseHelpContent({
+        ...help,
+        examples: [help.examples[0], malformedExample, help.examples[2]],
+      }),
+    );
+  });
+
   it('enforces attempt number and attempts-left bounds', () => {
     const final = {
       passed: false,
@@ -392,6 +543,9 @@ describe('help and attempt detail boundaries', () => {
     };
     expect(parseAttemptResult(final)).toEqual(final);
     expect(parseAttemptResult(firstRetry)).toEqual(firstRetry);
+    expectContractError(() =>
+      parseAttemptResult({ ...firstRetry, attemptNo: 1.5, attemptsLeft: 1.5 }),
+    );
     expectContractError(() => parseAttemptResult({ ...final, attemptNo: 4 }));
     expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: -1 }));
     expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: 3 }));
@@ -408,6 +562,7 @@ describe('help and attempt detail boundaries', () => {
       nextQuestion: question,
     };
     expect(parseAttemptResult(passed)).toEqual(passed);
+    expectContractError(() => parseAttemptResult({ ...passed, attemptNo: 0 }));
     expectContractError(() => parseAttemptResult({ ...passed, finalFeedback: 'Solid progress.' }));
     expectContractError(() => parseAttemptResult({ ...passed, attemptsLeft: 2 }));
     expectContractError(() => parseAttemptResult({ ...passed, nextQuestion: undefined }));
@@ -422,6 +577,9 @@ describe('help and attempt detail boundaries', () => {
     };
     expect(parseAttemptResult(retry)).toEqual(retry);
     expectContractError(() => parseAttemptResult({ ...retry, attemptsLeft: 2 }));
+    expectContractError(() =>
+      parseAttemptResult({ ...retry, finalFeedback: 'Only final failures include this.' }),
+    );
     expectContractError(() => parseAttemptResult({ ...retry, nextQuestion: question }));
 
     const final = {
@@ -437,6 +595,42 @@ describe('help and attempt detail boundaries', () => {
   });
 
   it('rejects response strings and collections beyond server contract bounds', () => {
+    expect(
+      parseUser({ ...user, name: 'x'.repeat(100), email: `${'e'.repeat(242)}@example.com` }),
+    ).toMatchObject({
+      name: 'x'.repeat(100),
+      email: `${'e'.repeat(242)}@example.com`,
+    });
+    expect(
+      parseQuestionResponse({
+        question: {
+          ...question,
+          promptWord: 'x'.repeat(100),
+          questionText: 'x'.repeat(1_000),
+        },
+      }),
+    ).toMatchObject({ question: { promptWord: 'x'.repeat(100), questionText: 'x'.repeat(1_000) } });
+    expect(
+      parseDiagnosticAnswerResult({
+        passed: true,
+        score: 80,
+        transcript: 'x'.repeat(12_000),
+        feedback: 'x'.repeat(800),
+        done: true,
+        level: 'B1',
+      }),
+    ).toMatchObject({ transcript: 'x'.repeat(12_000), feedback: 'x'.repeat(800) });
+    expect(
+      parseHelpContent({
+        ...help,
+        promptWord: 'x'.repeat(100),
+        promptWordNative: 'x'.repeat(500),
+        questionText: 'x'.repeat(1_000),
+        questionTextNative: 'x'.repeat(4_000),
+        examples: help.examples.map(() => ({ en: 'x'.repeat(4_000), native: 'x'.repeat(4_000) })),
+      }),
+    ).toMatchObject({ promptWordNative: 'x'.repeat(500), questionTextNative: 'x'.repeat(4_000) });
+
     expectContractError(() => parseUser({ ...user, name: 'x'.repeat(101) }));
     expectContractError(() =>
       parseQuestionResponse({
@@ -459,6 +653,18 @@ describe('help and attempt detail boundaries', () => {
         examples: Array.from({ length: 11 }, () => ({ en: 'x', native: 'y' })),
       }),
     );
+    expectContractError(() =>
+      parseAttemptResult({
+        passed: false,
+        attemptNo: 3,
+        attemptsLeft: 0,
+        score: 50,
+        transcript: '',
+        feedback: 'Try again.',
+        finalFeedback: 'x'.repeat(4_001),
+        nextQuestion: question,
+      }),
+    );
   });
 });
 
@@ -478,6 +684,11 @@ describe('audio upload grant parser', () => {
     expiresIn: 900,
     maxBytes: 25 * 1024 * 1024,
   } as const;
+  const withAudioKey = (nextAudioKey: string) => ({
+    ...s3,
+    audioKey: nextAudioKey,
+    uploadFields: { ...s3.uploadFields, key: nextAudioKey },
+  });
 
   it('accepts direct and s3 grants', () => {
     expect(parseAudioUploadGrant({ mode: 'direct' })).toEqual({
@@ -490,6 +701,159 @@ describe('audio upload grant parser', () => {
     expect(parseAudioUploadGrant({ mode: 'direct', extra: 'x' })).toEqual({
       mode: 'direct',
     });
+  });
+
+  it.each(['audio/mp4', 'audio/m4a', 'audio/x-m4a', 'audio/webm', 'audio/wav', 'audio/x-wav'])(
+    'accepts the supported signed content type %s',
+    (contentType) => {
+      const value = {
+        ...s3,
+        contentType,
+        uploadFields: { ...s3.uploadFields, 'Content-Type': contentType },
+      };
+      expect(parseAudioUploadGrant(value)).toEqual(value);
+    },
+  );
+
+  it.each([
+    ['mp4', 'audio/mp4'],
+    ['webm', 'audio/webm'],
+    ['wav', 'audio/wav'],
+  ])('accepts a valid .%s object key', (extension, contentType) => {
+    const nextAudioKey = audioKey.replace(/\.m4a$/, `.${extension}`);
+    const value = {
+      ...s3,
+      audioKey: nextAudioKey,
+      contentType,
+      uploadFields: {
+        ...s3.uploadFields,
+        key: nextAudioKey,
+        'Content-Type': contentType,
+      },
+    };
+    expect(parseAudioUploadGrant(value)).toEqual(value);
+  });
+
+  it.each([60, 3_600])('accepts the upload-grant lifetime boundary %i', (expiresIn) => {
+    expect(parseAudioUploadGrant({ ...s3, expiresIn })).toMatchObject({ expiresIn });
+  });
+
+  it.each([1, 25 * 1024 * 1024])('accepts the upload byte boundary %i', (maxBytes) => {
+    expect(parseAudioUploadGrant({ ...s3, maxBytes })).toMatchObject({ maxBytes });
+  });
+
+  it('enforces URL length without accepting credentials, query strings, fragments, or junk', () => {
+    const prefix = 'https://bucket.example/';
+    const exact = prefix + 'a'.repeat(2_048 - prefix.length);
+    expect(parseAudioUploadGrant({ ...s3, uploadUrl: exact })).toMatchObject({ uploadUrl: exact });
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl: `${exact}a` }));
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl: `junk${s3.uploadUrl}` }));
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl: 'https://[' }));
+  });
+
+  it.each(['https://user@bucket.example/', 'https://:secret@bucket.example/'])(
+    'rejects an HTTPS upload URL with one credential component: %s',
+    (uploadUrl) => {
+      expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl }));
+    },
+  );
+
+  it('requires the complete, anchored per-user S3 key shape', () => {
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(`junk/${audioKey}`)));
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(`${audioKey}/junk`)));
+    const invalidVersion = audioKey.replace('550e8400-e29b-41d4-a716', '550e8400-e29b-01d4-a716');
+    const invalidVariant = audioKey.replace('550e8400-e29b-41d4-a716', '550e8400-e29b-41d4-c716');
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(invalidVersion)));
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(invalidVariant)));
+  });
+
+  it('bounds and sanitizes every signed multipart field', () => {
+    const exactKey = 'a'.repeat(128);
+    const exactValue = 'v'.repeat(8_192);
+    expect(
+      parseAudioUploadGrant({
+        ...s3,
+        uploadFields: { ...s3.uploadFields, [exactKey]: exactValue },
+      }),
+    ).toMatchObject({ mode: 's3' });
+
+    for (const uploadFields of [
+      { ...s3.uploadFields, [`${exactKey}a`]: 'value' },
+      { ...s3.uploadFields, [`invalid key`]: 'value' },
+      { ...s3.uploadFields, valid: `${exactValue}v` },
+      { ...s3.uploadFields, FILE: 'reserved' },
+    ]) {
+      expectContractError(() => parseAudioUploadGrant({ ...s3, uploadFields }));
+    }
+
+    for (const reserved of ['__proto__', 'constructor', 'prototype']) {
+      const uploadFields = Object.create(null) as Record<string, string>;
+      Object.assign(uploadFields, s3.uploadFields);
+      Object.defineProperty(uploadFields, reserved, {
+        value: 'reserved',
+        enumerable: true,
+      });
+      expectContractError(() => parseAudioUploadGrant({ ...s3, uploadFields }));
+    }
+  });
+
+  it('rejects array, whitespace-only, and non-string multipart fields independently', () => {
+    expectContractError(() =>
+      parseAudioUploadGrant({
+        ...s3,
+        uploadFields: Object.assign([], s3.uploadFields),
+      }),
+    );
+    expectContractError(() =>
+      parseAudioUploadGrant({
+        ...s3,
+        uploadFields: { ...s3.uploadFields, Policy: '   ' },
+      }),
+    );
+    expectContractError(() =>
+      parseAudioUploadGrant({
+        ...s3,
+        uploadFields: { ...s3.uploadFields, Policy: 42 },
+      }),
+    );
+  });
+
+  it('enforces signed-field count and aggregate-size limits', () => {
+    const twoFields = { key: audioKey, 'Content-Type': 'audio/mp4' };
+    expect(parseAudioUploadGrant({ ...s3, uploadFields: twoFields })).toMatchObject({ mode: 's3' });
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadFields: { key: audioKey } }));
+
+    const thirtyTwoFields: Record<string, string> = {
+      key: audioKey,
+      'Content-Type': 'audio/mp4',
+    };
+    for (let index = 0; index < 30; index += 1) thirtyTwoFields[`x${index}`] = 'v';
+    expect(parseAudioUploadGrant({ ...s3, uploadFields: thirtyTwoFields })).toMatchObject({
+      mode: 's3',
+    });
+    expectContractError(() =>
+      parseAudioUploadGrant({ ...s3, uploadFields: { ...thirtyTwoFields, overflow: 'v' } }),
+    );
+
+    const fixedLength = 'key'.length + audioKey.length + 'Content-Type'.length + 'audio/mp4'.length;
+    const paddingKeys = ['p0', 'p1', 'p2', 'p3'] as const;
+    const finalPaddingLength = 32_768 - fixedLength - paddingKeys.join('').length - 3 * 8_192;
+    const aggregateBoundaryFields: Record<string, string> = {
+      key: audioKey,
+      'Content-Type': 'audio/mp4',
+    };
+    for (const [index, key] of paddingKeys.entries()) {
+      aggregateBoundaryFields[key] = 'x'.repeat(index < 3 ? 8_192 : finalPaddingLength);
+    }
+    expect(parseAudioUploadGrant({ ...s3, uploadFields: aggregateBoundaryFields })).toMatchObject({
+      mode: 's3',
+    });
+    expectContractError(() =>
+      parseAudioUploadGrant({
+        ...s3,
+        uploadFields: { ...aggregateBoundaryFields, p3: `${aggregateBoundaryFields.p3}x` },
+      }),
+    );
   });
 
   it.each([
@@ -520,7 +884,9 @@ describe('audio upload grant parser', () => {
     { ...s3, expiresIn: 3601 },
     { ...s3, expiresIn: '900' },
     { ...s3, expiresIn: Number.NaN },
+    { ...s3, expiresIn: 60.5 },
     { ...s3, maxBytes: 0 },
+    { ...s3, maxBytes: 1.5 },
     { ...s3, maxBytes: 25 * 1024 * 1024 + 1 },
   ])('rejects malformed grant %#', (value) => {
     expectContractError(() => parseAudioUploadGrant(value));

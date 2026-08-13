@@ -18,6 +18,9 @@
     "smoke": "node scripts/smoke.mjs",
     "test": "vitest run --coverage",
     "test:quick": "vitest run",
+    "mutation": "npm run mutation:code && npm run mutation:catalog",
+    "mutation:code": "tsx db/mutation-db-guard.ts && stryker run",
+    "mutation:catalog": "stryker run stryker.catalog.config.json",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write .",
@@ -47,6 +50,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@stryker-mutator/core": "9.6.1",
+    "@stryker-mutator/vitest-runner": "9.6.1",
     "@types/bcrypt": "^6.0.0",
     "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.17",
@@ -67,5 +72,8 @@
     "typescript": "^5.7.2",
     "typescript-eslint": "^8.67.0",
     "vitest": "^4.1.10"
+  },
+  "overrides": {
+    "qs": "6.15.3"
   }
 }

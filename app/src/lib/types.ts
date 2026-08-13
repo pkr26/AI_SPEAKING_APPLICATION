@@ -168,6 +168,7 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
     return { done: true, level: value.level };
   }
   if (
+    value.level !== undefined ||
     !isRecord(value.progress) ||
     !isNumber(value.progress.asked) ||
     !Number.isInteger(value.progress.asked) ||

@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
+import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
 import { assertSafeTestDatabase } from './global-setup';
 import { pool } from './helpers';
@@ -11,6 +12,10 @@ afterAll(async () => {
 });
 
 describe('database content seeding', () => {
+  it('executes every production preflight query against the healthy migrated catalog', async () => {
+    await expect(preflight(process.env.DATABASE_URL!)).resolves.toBeUndefined();
+  });
+
   it('is idempotent and preserves question IDs, attempts, and diagnostic state', async () => {
     const email = `seed_${randomUUID()}@example.com`;
     const user = await pool.query<{ id: string }>(
@@ -150,7 +155,7 @@ describe('migration integrity', () => {
 
 describe('destructive test database guard', () => {
   it('rejects a database without the _test suffix', () => {
-    expect(() => assertSafeTestDatabase('postgres://localhost/production', undefined)).toThrow(
+    expect(() => assertSafeTestDatabase('postgres://localhost:5432/production', undefined)).toThrow(
       'must name a database ending in _test',
     );
   });
@@ -158,7 +163,7 @@ describe('destructive test database guard', () => {
   it('rejects the application database even when connection URLs differ', () => {
     expect(() =>
       assertSafeTestDatabase(
-        'postgres://tester@localhost/example_test',
+        'postgres://tester@localhost:5432/example_test',
         'postgresql://app@localhost:5432/example_test',
       ),
     ).toThrow('matches DATABASE_URL');
@@ -167,15 +172,84 @@ describe('destructive test database guard', () => {
   it('treats localhost and 127.0.0.1 as the same destructive target', () => {
     expect(() =>
       assertSafeTestDatabase(
-        'postgres://tester@localhost/example_test',
+        'postgres://tester@localhost:5432/example_test',
         'postgresql://app@127.0.0.1:5432/example_test',
       ),
     ).toThrow('matches DATABASE_URL');
   });
 
   it('rejects remote databases even when their name ends in _test', () => {
-    expect(() => assertSafeTestDatabase('postgres://db.production.internal/customer_test', undefined)).toThrow(
+    expect(() => assertSafeTestDatabase('postgres://db.production.internal:5432/customer_test', undefined)).toThrow(
       'non-loopback',
     );
+  });
+
+  it.each([
+    'postgres://localhost:5432/customer_test?host=db.production.internal',
+    'postgres://localhost:5432/customer_test?port=6543',
+    'postgres://localhost:5432/customer_test#override',
+  ])('rejects an ambiguous destructive target: %s', (url) => {
+    expect(() => assertSafeTestDatabase(url, undefined)).toThrow('must not contain query parameters');
+  });
+
+  it('rejects connection-target overrides in DATABASE_URL before comparing targets', () => {
+    expect(() =>
+      assertSafeTestDatabase(
+        'postgres://localhost:5432/customer_test',
+        'postgres://db.production.internal/customer_test?host=localhost',
+      ),
+    ).toThrow('DATABASE_URL must not contain query parameters');
+  });
+
+  it.each([
+    ['https://localhost:5432/customer_test', 'postgres or postgresql'],
+    ['postgres://localhost:5432/customer%2Fother_test', 'exactly one database name'],
+    ['postgres://localhost:5432/customer%ZZ_test', 'invalid encoded database name'],
+    ['postgres:///customer_test', 'must include a hostname'],
+    ['postgres://localhost/customer_test', 'explicit port'],
+    ['postgres://localhost:0/customer_test', 'invalid effective PostgreSQL port'],
+  ])('rejects malformed destructive connection URLs', (url, message) => {
+    expect(() => assertSafeTestDatabase(url, undefined)).toThrow(message);
+  });
+
+  it('uses PGPORT when comparing an application URL without an explicit port', () => {
+    const previous = process.env.PGPORT;
+    process.env.PGPORT = '6543';
+    try {
+      expect(() =>
+        assertSafeTestDatabase('postgres://localhost:6543/customer_test', 'postgres://127.0.0.1/customer_test'),
+      ).toThrow('matches DATABASE_URL');
+    } finally {
+      if (previous === undefined) delete process.env.PGPORT;
+      else process.env.PGPORT = previous;
+    }
+  });
+
+  it.each(['LOCALHOST', 'localhost.'])(
+    'normalizes the application loopback spelling %s before comparing targets',
+    (host) => {
+      expect(() =>
+        assertSafeTestDatabase('postgres://localhost:5432/customer_test', `postgres://${host}:5432/customer_test`),
+      ).toThrow('matches DATABASE_URL');
+    },
+  );
+
+  it.each(['05432', ' 5432', '5432suffix'])('normalizes PGPORT=%j exactly as node-postgres does', (port) => {
+    const previous = process.env.PGPORT;
+    process.env.PGPORT = port;
+    try {
+      expect(() =>
+        assertSafeTestDatabase('postgres://localhost:5432/customer_test', 'postgres://127.0.0.1/customer_test'),
+      ).toThrow('matches DATABASE_URL');
+    } finally {
+      if (previous === undefined) delete process.env.PGPORT;
+      else process.env.PGPORT = previous;
+    }
+  });
+
+  it('rejects an application URL without a hostname instead of using ambient PGHOST', () => {
+    expect(() =>
+      assertSafeTestDatabase('postgres://localhost:5432/customer_test', 'postgres:///customer_test'),
+    ).toThrow('DATABASE_URL must include a hostname');
   });
 });

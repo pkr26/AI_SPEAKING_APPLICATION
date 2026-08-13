@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { Alert } from 'react-native';
+import { Alert, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import AttemptScreen from '../src/app/practice/attempt';
@@ -181,13 +181,13 @@ function makeQueryClient() {
   return client;
 }
 
-function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
+function renderScreen(ui: React.ReactElement, queryClient?: QueryClient, bottomInset = 0) {
   const client = queryClient ?? makeQueryClient();
   return render(
     <SafeAreaProvider
       initialMetrics={{
         frame: { x: 0, y: 0, width: 390, height: 844 },
-        insets: { top: 0, left: 0, right: 0, bottom: 0 },
+        insets: { top: 0, left: 0, right: 0, bottom: bottomInset },
       }}
     >
       <QueryClientProvider client={client}>{ui}</QueryClientProvider>
@@ -198,6 +198,12 @@ function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
 function recorderProps(): CapturedRecorderProps {
   if (!mockRecorderProps) throw new Error('Recorder was not rendered');
   return mockRecorderProps;
+}
+
+function buttonContainerPaddingBottom(name: string): unknown {
+  const parent = screen.getByRole('button', { name }).parent;
+  if (!parent) throw new Error(`Button "${name}" has no container`);
+  return StyleSheet.flatten(parent.props.style)?.paddingBottom;
 }
 
 async function pressAlertButton(text: string) {
@@ -238,9 +244,17 @@ describe('practice home screen', () => {
     expect(screen.getByText(`Hi, ${USER.name}`)).toBeTruthy();
   });
 
+  it('keeps footer actions above a larger device safe-area inset', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<PracticeScreen />, undefined, 34);
+
+    expect(buttonContainerPaddingBottom('Settings')).toBe(34);
+  });
+
   it('renders the question and wires the recorder', async () => {
     mockApiFetch.mockResolvedValue({ question: QUESTION });
-    await renderScreen(<PracticeScreen />);
+    const queryClient = makeQueryClient();
+    await renderScreen(<PracticeScreen />, queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
@@ -254,6 +268,28 @@ describe('practice home screen', () => {
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
     });
+    expect(
+      queryClient.getQueryCache().find({
+        queryKey: ['practice-question', USER.id, USER.cefrLevel],
+        exact: true,
+      }),
+    ).toBeDefined();
+    expect(
+      queryClient.getQueryCache().find({
+        queryKey: ['practice-question', USER.id, USER.cefrLevel],
+        exact: true,
+      })?.options,
+    ).toEqual(expect.objectContaining({ enabled: true, retry: false, staleTime: Infinity }));
+  });
+
+  it('does not load or mount a recorder without an authenticated user', async () => {
+    mockAuthValue = makeAuth({ user: null });
+
+    await renderScreen(<PracticeScreen />);
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockRecorderProps).toBeNull();
+    expect(screen.queryByText('Loading your question…')).toBeNull();
   });
 
   it('forwards recorder results to the practice flow and feedback route', async () => {
@@ -323,7 +359,11 @@ describe('practice home screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await fireEvent.press(screen.getByRole('button', { name: 'Settings' }));
-    expect(alertSpy).toHaveBeenCalledWith('Settings', undefined, expect.any(Array));
+    expect(alertSpy).toHaveBeenCalledWith('Settings', undefined, [
+      { text: 'Change Password', onPress: expect.any(Function) },
+      { text: 'Delete Account', style: 'destructive', onPress: expect.any(Function) },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
 
     await pressAlertButton('Change Password');
     expect(mockRouter.push).toHaveBeenCalledWith('/settings/change-password');
@@ -396,7 +436,8 @@ describe('practice attempt screen', () => {
   it('renders the question and wires the recorder for the attempt endpoint', async () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
+    const queryClient = makeQueryClient();
+    await renderScreen(<AttemptScreen />, queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
@@ -409,8 +450,50 @@ describe('practice attempt screen', () => {
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
     });
+    expect(
+      queryClient.getQueryCache().find({
+        queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+        exact: true,
+      }),
+    ).toBeDefined();
+    expect(
+      queryClient.getQueryCache().find({
+        queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+        exact: true,
+      })?.options,
+    ).toEqual(expect.objectContaining({ enabled: true, retry: false }));
     // Practice Mode deliberately hides translations and examples.
     expect(screen.queryByText('ధైర్యం')).toBeNull();
+  });
+
+  it('does not load help or mount a recorder without an authenticated user', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    mockSearchParams = { questionId: QUESTION.id };
+
+    await renderScreen(<AttemptScreen />);
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockRecorderProps).toBeNull();
+    expect(screen.queryByText('Loading question…')).toBeNull();
+  });
+
+  it.each([
+    ['the prompt word', { ...HELP_CONTENT, promptWord: '' }],
+    ['the question text', { ...HELP_CONTENT, questionText: '' }],
+  ])('does not mount the recorder when help omits %s', async (_label, content) => {
+    mockSearchParams = { questionId: QUESTION.id };
+    const queryClient = makeQueryClient();
+    const queryKey = ['question-help', USER.id, USER.nativeLanguage, QUESTION.id] as const;
+    // Exercise the screen's defense against corrupt cached data independently
+    // of the API parser, which rejects these shapes before caching them.
+    queryClient.setQueryDefaults(queryKey, { staleTime: Infinity });
+    queryClient.setQueryData(queryKey, content);
+
+    await renderScreen(<AttemptScreen />, queryClient);
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockRecorderProps).toBeNull();
+    expect(screen.queryByText('courage')).toBeNull();
   });
 
   it('forwards results to the practice flow and feedback route', async () => {
@@ -422,6 +505,36 @@ describe('practice attempt screen', () => {
     await act(async () => recorderProps().onResult(PASSED_RESULT));
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('surfaces attempt recorder errors through an alert', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => recorderProps().onError('microphone upload failed'));
+
+    expect(alertSpy).toHaveBeenCalledWith(
+      'Could not assess your answer',
+      'microphone upload failed',
+    );
+  });
+
+  it('keeps cached attempt content visible during a background refresh', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(
+      ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+      HELP_CONTENT,
+    );
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+
+    await renderScreen(<AttemptScreen />, queryClient);
+
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(screen.queryByText('Loading question…')).toBeNull();
+    expect(recorderProps().questionId).toBe(QUESTION.id);
   });
 
   it('invalidates the practice question and exits when recovery is unresolved', async () => {
@@ -481,6 +594,9 @@ describe('practice feedback screen', () => {
     expect(screen.getByText('“I enjoy reading.”')).toBeTruthy();
     expect(screen.getByText('Feedback')).toBeTruthy();
     expect(screen.getByText('Nice work.')).toBeTruthy();
+    expect(screen.queryByText(/Not quite/)).toBeNull();
+    expect(screen.queryByText('Out of attempts')).toBeNull();
+    expect(screen.queryByText('Try Again')).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
     expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
@@ -488,6 +604,15 @@ describe('practice feedback screen', () => {
     });
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('keeps feedback actions above a larger device safe-area inset', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />, undefined, 34);
+
+    expect(buttonContainerPaddingBottom('Next Question')).toBe(34);
   });
 
   it('invalidates the practice question when no next question is provided', async () => {
@@ -528,6 +653,9 @@ describe('practice feedback screen', () => {
     // Empty transcripts are hidden.
     expect(screen.queryByText('We heard')).toBeNull();
     expect(screen.getByText('Keep practicing.')).toBeTruthy();
+    expect(screen.queryByText('Great job!')).toBeNull();
+    expect(screen.queryByText('Out of attempts')).toBeNull();
+    expect(screen.queryByText('Next Question')).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(mockRouter.back).toHaveBeenCalled();
@@ -578,6 +706,28 @@ describe('practice feedback screen', () => {
     expect(screen.getByText('Final words.')).toBeTruthy();
     expect(screen.queryByText('Regular feedback.')).toBeNull();
     expect(screen.getByRole('button', { name: 'Next Question' })).toBeTruthy();
+    expect(screen.queryByText('Great job!')).toBeNull();
+    expect(screen.queryByText(/Not quite/)).toBeNull();
+    expect(screen.queryByText('Try Again')).toBeNull();
+  });
+
+  it('ignores unexpected final feedback outside the final variant', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          ...PASSED_RESULT,
+          feedback: 'Normal passed feedback.',
+          finalFeedback: 'Must not be displayed.',
+        },
+      },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText('Feedback')).toBeTruthy();
+    expect(screen.getByText('Normal passed feedback.')).toBeTruthy();
+    expect(screen.queryByText('Final feedback')).toBeNull();
+    expect(screen.queryByText('Must not be displayed.')).toBeNull();
   });
 
   it('does not navigate when the user is missing', async () => {
@@ -614,7 +764,8 @@ describe('practice help screen', () => {
   it('renders the word, question, and bilingual examples', async () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<HelpScreen />);
+    const queryClient = makeQueryClient();
+    await renderScreen(<HelpScreen />, queryClient);
 
     expect(await screen.findByText('Word')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
@@ -637,6 +788,32 @@ describe('practice help screen', () => {
       screen.getByText('మీరు ధైర్యం చూపిన సమయాన్ని వివరించండి.').props.accessibilityLanguage,
     ).toBe('te-IN');
     expect(screen.getByText('ఆమె పనిలో ధైర్యం చూపింది.').props.accessibilityLanguage).toBe('te-IN');
+    const helpQuery = queryClient.getQueryCache().find({
+      queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+      exact: true,
+    });
+    expect(helpQuery).toBeDefined();
+    expect(helpQuery?.options).toEqual(expect.objectContaining({ staleTime: 60 * 60_000 }));
+  });
+
+  it('keeps the practice action above a larger device safe-area inset', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<HelpScreen />, undefined, 34);
+    await screen.findByText('Word');
+
+    expect(buttonContainerPaddingBottom('Start Practice')).toBe(34);
+  });
+
+  it('does not load help without an authenticated user', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    mockSearchParams = { questionId: QUESTION.id };
+
+    await renderScreen(<HelpScreen />);
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(screen.queryByText('Word')).toBeNull();
+    expect(screen.queryByText('Loading help…')).toBeNull();
   });
 
   it.each([

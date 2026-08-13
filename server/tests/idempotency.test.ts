@@ -1,7 +1,13 @@
 import { randomUUID } from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { abandonAssessmentRequest, claimAssessmentRequest, completeAssessmentRequest } from '../src/idempotency';
+import {
+  abandonAssessmentRequest,
+  claimAssessmentRequest,
+  cleanupAssessmentRequests,
+  completeAssessmentRequest,
+  isAssessmentRequestProcessing,
+} from '../src/idempotency';
 import { app, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -182,5 +188,39 @@ describe('assessment request recovery', () => {
     expect(completed.rows).toEqual([
       { claim_id: replacement.claimId, status: 'completed', response_body: storedResponse },
     ]);
+  });
+
+  it('identifies only live processing ownership and removes exactly expired requests', async () => {
+    await pool.query('DELETE FROM assessment_requests');
+    const liveProcessingId = randomUUID();
+    const staleProcessingId = randomUUID();
+    const recentCompletedId = randomUUID();
+    const expiredCompletedId = randomUUID();
+
+    await insertRequest(liveProcessingId);
+    await insertRequest(staleProcessingId, {
+      startedAt: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+    });
+    await insertRequest(recentCompletedId, {
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      response: { passed: true, score: 80 },
+    });
+    await insertRequest(expiredCompletedId, {
+      status: 'completed',
+      completedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      response: { passed: false, score: 40 },
+    });
+
+    await expect(isAssessmentRequestProcessing(ownerId, liveProcessingId)).resolves.toBe(true);
+    await expect(isAssessmentRequestProcessing(ownerId, staleProcessingId)).resolves.toBe(false);
+    await expect(isAssessmentRequestProcessing(ownerId, recentCompletedId)).resolves.toBe(false);
+    await expect(isAssessmentRequestProcessing(randomUUID(), liveProcessingId)).resolves.toBe(false);
+
+    await expect(cleanupAssessmentRequests()).resolves.toBe(2);
+    const remaining = await pool.query<{ request_id: string }>(
+      'SELECT request_id FROM assessment_requests ORDER BY request_id',
+    );
+    expect(remaining.rows.map((row) => row.request_id).sort()).toEqual([liveProcessingId, recentCompletedId].sort());
   });
 });

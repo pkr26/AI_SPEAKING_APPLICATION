@@ -22,6 +22,7 @@ Dockerfile
 .dockerignore
 .github
 .stryker-tmp
+.stryker-catalog-tmp
 reports
 tests
 vitest.config.*

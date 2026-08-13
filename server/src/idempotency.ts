@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { pool } from './db';
 import { HttpError } from './middleware';
+import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice';
 
@@ -80,10 +81,9 @@ export async function claimAssessmentRequest(
     }
     throw new AssessmentRequestInFlightError('Assessment is still processing', { retryAfterSeconds: 2 });
   } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
+    return await rollbackTransaction(client, { value: error });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 

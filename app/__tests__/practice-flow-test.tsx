@@ -117,6 +117,33 @@ describe('PracticeFlowProvider', () => {
     expect(feedbackText()).toBe('none');
   });
 
+  it('does not let a callback retained from a previous session repopulate feedback', async () => {
+    const { rerender } = await render(tree());
+    const previousSessionFlow = flow!;
+
+    await act(async () => {
+      previousSessionFlow.showFeedback('old-question', RESULT);
+    });
+    expect(feedbackText()).toBe('old-question');
+
+    setSessionVersion(1);
+    await rerender(tree());
+    const currentSessionFlow = flow!;
+    expect(currentSessionFlow).not.toBe(previousSessionFlow);
+    expect(feedbackText()).toBe('none');
+
+    await act(async () => {
+      previousSessionFlow.showFeedback('stale-question', RESULT);
+    });
+    expect(currentSessionFlow.feedback).toBeNull();
+    expect(feedbackText()).toBe('none');
+
+    await act(async () => {
+      currentSessionFlow.showFeedback('current-question', RESULT);
+    });
+    expect(feedbackText()).toBe('current-question');
+  });
+
   it('throws when usePracticeFlow runs outside the provider', async () => {
     const consoleSpy = jest.spyOn(console, 'error').mockImplementation(() => undefined);
 

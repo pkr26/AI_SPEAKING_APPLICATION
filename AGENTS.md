@@ -44,7 +44,7 @@ App (`cd app`):
 - **Recorder** — `app/src/components/Recorder.tsx` is the single shared recording component (spec requirement); do not fork it per screen.
 - **TypeScript strict** in both packages; zero type errors is the bar for any change.
 - Tests: add vitest coverage for any new endpoint; keep coverage thresholds and `scripts/smoke.mjs` passing. App component/hook tests use `@testing-library/react-native` v14 (devDependency) — its `render`/`fireEvent`/`act` APIs are fully async and must be awaited.
-- **Mutation testing** — both packages carry a `stryker.config.json` (jest runner and concurrency 2 for app; vitest runner and concurrency 1 for server because server tests share `ai_english_test`). Run with `npx stryker run` in either package; reports land in `reports/mutation/` (gitignored, as is `.stryker-tmp/`). Stryker packages are currently installed with `npm install --no-save`, so a clean `npm ci` does not install them; treat reproducible CI mutation testing as follow-up work.
+- **Mutation testing** — both packages pin Stryker in `devDependencies` (jest runner and concurrency 2 for app; vitest runner and concurrency 1 for server because server tests share one database). The server mutation run must set an explicit-port loopback `TEST_DATABASE_URL` whose database name contains `mutation`, ends in `_test`, and differs from both the ordinary `ai_english_test` suite database and the configured application database (including `server/.env`); the guard rejects unsafe targets before destructive setup. `npm run mutation` covers every production TypeScript file in either package. The server command has two explicit lanes: executable API/database code uses the full suite, then all authored `db/seed-data.ts` literals use `stryker.catalog.config.json` and a byte-for-byte catalog artifact test so static content mutants do not each rerun the integration suite. HTML and machine-readable JSON reports land in `reports/mutation/` (gitignored, as are `.stryker-tmp/` and `.stryker-catalog-tmp/`).
 
 ## Verification before calling work done
 
@@ -52,5 +52,6 @@ App (`cd app`):
 2. Smoke: server running with relaxed limits + `MOCK_AI=true` → `npm run smoke` exit 0
 3. `cd app && npm run format:check && npm run lint && npm run typecheck && npm test && npm run doctor && npm run audit:ci`
 4. In `app`, production-mode `expo export` for both `ios` and `android` with an explicit HTTPS `EXPO_PUBLIC_API_URL`
-5. `npm audit` in both packages — no new vulnerabilities introduced beyond the explicitly reviewed mobile upstream baseline
+5. The server's full `npm audit --audit-level=high` must pass. In the app, `npm run audit:ci` is the authoritative reviewed-baseline gate; also record the raw `npm audit` result transparently.
 6. When container files change, build and scan `server/Dockerfile` and exercise its healthcheck before release
+7. For a full mutation campaign, run `cd app && npm run mutation`; then run `cd server && TEST_DATABASE_URL=postgres://localhost:5432/ai_english_mutation_test npm run mutation`. Record the executable-code and catalog results separately.

@@ -24,6 +24,7 @@ import {
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
+import { releaseTransactionClient, rollbackTransaction } from './transaction';
 import { uploadAudio, verifyAudioMagicBytes } from './upload';
 
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
@@ -135,10 +136,9 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
     await client.query('COMMIT');
     return { claimId, question };
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
+    return await rollbackTransaction(client, { value: err });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 
@@ -232,10 +232,9 @@ async function finalizeDiagnosticAnswer(
     await client.query('COMMIT');
     return body;
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
+    return await rollbackTransaction(client, { value: err });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 
@@ -279,10 +278,9 @@ export function createDiagnosticRouter(limiters: Limiters) {
         await client.query('COMMIT');
         res.json({ done: false, question, progress: { asked: state.questions_asked, maxQuestions: MAX_QUESTIONS } });
       } catch (err) {
-        await client.query('ROLLBACK');
-        throw err;
+        return await rollbackTransaction(client, { value: err });
       } finally {
-        client.release();
+        releaseTransactionClient(client);
       }
     }),
   );

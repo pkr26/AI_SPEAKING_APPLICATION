@@ -56,6 +56,10 @@ export default function AttemptScreen() {
     Alert.alert('Could not assess your answer', message);
   };
 
+  // The protected-route gate owns navigation when the session disappears.
+  // A disabled query must not look like an indefinitely loading question.
+  if (!user) return null;
+
   if (!validQuestionId) {
     return (
       <View style={styles.center}>
@@ -131,7 +135,7 @@ export default function AttemptScreen() {
 
       <View style={styles.recorderArea}>
         <Recorder
-          ownerId={user!.id}
+          ownerId={user.id}
           questionId={validQuestionId}
           endpoint="/practice/attempt"
           parseResult={parseAttemptResult}

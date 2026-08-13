@@ -6,6 +6,7 @@ import { config } from './config';
 import { pool } from './db';
 import { logger } from './logger';
 import { HttpError } from './middleware';
+import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export interface AssessQuestion {
   cefrLevel: string;
@@ -46,7 +47,7 @@ const MAX_TRANSCRIPT_CHARS = 12_000;
 
 const gradingSchema = z.object({
   score: z.number().min(0).max(100),
-  feedback: z.string().min(1).max(800),
+  feedback: z.string().trim().min(1).max(800),
 });
 
 function getOpenAI(): OpenAI {
@@ -109,10 +110,9 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
     await client.query('INSERT INTO assessment_usage (user_id) VALUES ($1)', [userId]);
     await client.query('COMMIT');
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
+    return await rollbackTransaction(client, { value: err });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 
@@ -195,18 +195,18 @@ export async function assessSpeaking(audioPath: string, q: AssessQuestion, userI
         { signal: controller.signal },
       );
 
-      const parsed = completion.choices[0]?.message?.parsed;
-      if (!parsed) {
+      const parsed = gradingSchema.safeParse(completion.choices[0]?.message?.parsed);
+      if (!parsed.success) {
         // A provider refusal or malformed response is not evidence that the
         // learner failed. Return a retryable upstream error instead of score 0.
         throw new HttpError(502, 'Assessment provider returned an unusable response; please try again');
       }
-      const score = Math.round(parsed.score);
+      const score = Math.round(parsed.data.score);
       return {
         transcript,
         score,
         passed: score >= 60, // enforced in code regardless of model output
-        feedback: parsed.feedback.trim(),
+        feedback: parsed.data.feedback,
       };
     } catch (err) {
       if (err instanceof HttpError) throw err;

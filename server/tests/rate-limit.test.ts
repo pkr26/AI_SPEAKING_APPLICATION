@@ -43,6 +43,7 @@ function userApp(userId: string, middleware: Parameters<express.Express['use']>[
 describe('rate limiters', () => {
   it('normalizes bounded login account identifiers and skips unusable values', () => {
     expect(normalizeLoginEmail('  Learner@Example.COM ')).toBe('learner@example.com');
+    expect(normalizeLoginEmail('X'.repeat(254))).toBe('x'.repeat(254));
     expect(normalizeLoginEmail('')).toBeUndefined();
     expect(normalizeLoginEmail(123)).toBeUndefined();
     expect(normalizeLoginEmail('x'.repeat(255))).toBeUndefined();
@@ -129,6 +130,11 @@ describe('rate limiters', () => {
       error: 'Audio upload grant rate limit reached, please try again later',
     });
 
+    // Authenticated learners behind the same test-agent IP retain independent
+    // grant budgets; falling back to IP for either user would throttle this.
+    const otherUser = userApp('grant-user-2', buildLimiters().uploadGrant);
+    expect((await request(otherUser).get('/x')).status).toBe(200);
+
     // A grant and a paid assessment use different stable namespaces, so one
     // logical assessment consumes exactly one assessment-limit unit.
     const assessment = userApp(userId, buildLimiters().assess);
@@ -159,5 +165,34 @@ describe('rate limiters', () => {
 
     await pool.query("UPDATE rate_limit_windows SET reset_at = now() - interval '2 hours'");
     await expect(cleanupRateLimitWindows()).resolves.toBe(1);
+  });
+
+  it('increments, refunds, resets, and renews an expired shared counter', async () => {
+    const store = new PostgresRateLimitStore('store-contract', 60_000);
+
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 2, resetTime: expect.any(Date) });
+    await store.decrement('learner');
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 2, resetTime: expect.any(Date) });
+
+    await pool.query("UPDATE rate_limit_windows SET reset_at = now() - interval '1 second'");
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
+
+    await store.resetKey('learner');
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
+  });
+
+  it('isolates identical client keys between limiter namespaces', async () => {
+    const first = new PostgresRateLimitStore('namespace-one', 60_000);
+    const second = new PostgresRateLimitStore('namespace-two', 60_000);
+
+    await first.increment('same-client');
+    await second.increment('same-client');
+    const { rows } = await pool.query<{ namespace: string; key_hash: string }>(
+      `SELECT namespace, key_hash FROM rate_limit_windows
+       WHERE namespace IN ('namespace-one', 'namespace-two') ORDER BY namespace`,
+    );
+    expect(rows).toHaveLength(2);
+    expect(rows[0].key_hash).not.toBe(rows[1].key_hash);
   });
 });

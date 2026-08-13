@@ -12,9 +12,9 @@ import { isAssessmentRequestProcessing } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
-import { AUDIO_TYPES, uploadsDir } from './upload';
+import { AUDIO_TYPES, MAX_AUDIO_BYTES, uploadsDir } from './upload';
 
-export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
+export { MAX_AUDIO_BYTES } from './upload';
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
@@ -59,6 +59,41 @@ export function isOwnedAudioKey(userId: string, key: string): boolean {
     `^${KEY_PREFIX}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
     'i',
   ).test(key);
+}
+
+/** Stream guard used after S3 metadata validation so a lying/missing length cannot bypass the cap. */
+export function createAudioSizeCap(maxBytes = MAX_AUDIO_BYTES): Transform {
+  let received = 0;
+  return new Transform({
+    transform(chunk: Buffer, _encoding, callback) {
+      received += chunk.length;
+      if (received > maxBytes) {
+        callback(new HttpError(413, 'Audio file is too large'));
+      } else {
+        callback(null, chunk);
+      }
+    },
+  });
+}
+
+/** Release an S3 response body that is rejected before the download pipeline consumes it. */
+function releaseUnreadObjectBody(body: unknown): void {
+  const discardable = body as {
+    destroy?: () => void;
+    cancel?: () => void | Promise<void>;
+  };
+  try {
+    if (typeof discardable.destroy === 'function') {
+      discardable.destroy();
+    } else if (typeof discardable.cancel === 'function') {
+      // Do not let a transport's cleanup promise delay the stable 413. The S3
+      // operation is already rejected, and cleanup remains best effort.
+      void Promise.resolve(discardable.cancel()).catch(() => undefined);
+    }
+  } catch {
+    // Releasing the transport is best effort and must not mask the stable 413
+    // response that explains why the uploaded object was rejected.
+  }
 }
 
 // --- S3 client (module singleton, created on first real use) ----------------
@@ -189,8 +224,9 @@ export function completeSubmittedPresignedAudioReplay(res: Response): void {
 /** Idempotently discard after the owning route no longer needs the object. */
 export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
   const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
-  if (!cleanup || cleanup.discarded || cleanup.preserve) return Promise.resolve();
+  if (!cleanup) return Promise.resolve();
   if (cleanup.finalizing) return cleanup.finalizing;
+  if (cleanup.discarded || cleanup.preserve) return Promise.resolve();
 
   cleanup.finalizing = (async () => {
     // A pre-route conflict is not definitive: an owner may be processing even
@@ -290,20 +326,11 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     });
     if (!object.Body) throw new HttpError(400, 'audio upload not found or expired');
     if (typeof object.ContentLength === 'number' && object.ContentLength > MAX_AUDIO_BYTES) {
+      releaseUnreadObjectBody(object.Body);
       throw new HttpError(413, 'Audio file is too large');
     }
 
-    let received = 0;
-    const sizeCap = new Transform({
-      transform(chunk: Buffer, _encoding, callback) {
-        received += chunk.length;
-        if (received > MAX_AUDIO_BYTES) {
-          callback(new HttpError(413, 'Audio file is too large'));
-        } else {
-          callback(null, chunk);
-        }
-      },
-    });
+    const sizeCap = createAudioSizeCap();
     const out = fs.createWriteStream(tempPath, { flags: 'wx', mode: 0o600 });
     await pipeline(object.Body as NodeJS.ReadableStream, sizeCap, out, { signal: controller.signal });
     fs.chmodSync(tempPath, 0o600);

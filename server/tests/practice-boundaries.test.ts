@@ -1,7 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
-import { buildFinalFeedback, MAX_FINAL_FEEDBACK_LENGTH } from '../src/practice';
+import { authoredAnswerHint, buildFinalFeedback, MAX_FINAL_FEEDBACK_LENGTH } from '../src/practice';
 
 afterAll(async () => {
   await pool.end();
@@ -72,9 +72,52 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     const afterPass = await attempt();
     expect(afterPass.body).toMatchObject({ attemptNo: 1 });
   });
+
+  it('excludes the completed question even when ranking would otherwise select it again', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(FAIL_SCORE);
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const questions = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id', [
+      level,
+    ]);
+    const [current, ...alternatives] = questions.rows;
+    for (const alternative of alternatives) {
+      await pool.query(
+        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
+         VALUES ($1, $2, 'practice', 1, 'prior answer', 90, true, 'passed')`,
+        [userId, alternative.id],
+      );
+    }
+    const attempt = () =>
+      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), current.id);
+
+    expect((await attempt()).body).toMatchObject({ attemptNo: 1, attemptsLeft: 2 });
+    expect((await attempt()).body).toMatchObject({ attemptNo: 2, attemptsLeft: 1 });
+    const final = await attempt();
+
+    expect(final.status).toBe(200);
+    expect(final.body).toMatchObject({ attemptNo: 3, attemptsLeft: 0 });
+    expect(final.body.nextQuestion.id).not.toBe(current.id);
+  });
 });
 
 describe('practice feedback response bounds', () => {
+  it('uses a trimmed authored example and safely falls back when translations are incomplete', () => {
+    const question = {
+      prompt_word: 'hometown',
+      translations: { te: { examples: [{ en: '  My hometown is peaceful.  ' }] } },
+    };
+    expect(authoredAnswerHint(question, 'te')).toBe('My hometown is peaceful.');
+    expect(authoredAnswerHint({ prompt_word: 'hometown' }, 'te')).toBe(
+      'a few clear, on-topic sentences about "hometown"',
+    );
+    expect(authoredAnswerHint({ prompt_word: 'hometown', translations: { te: {} } }, 'te')).toBe(
+      'a few clear, on-topic sentences about "hometown"',
+    );
+  });
+
   it('caps unexpectedly large authored examples to the mobile contract', () => {
     const feedback = buildFinalFeedback('Keep practicing.', 'x'.repeat(10_000));
     expect(feedback).toHaveLength(MAX_FINAL_FEEDBACK_LENGTH);

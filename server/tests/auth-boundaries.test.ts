@@ -14,12 +14,18 @@ describe('auth: bcrypt 72-byte password boundary', () => {
     expect(Buffer.byteLength(ascii, 'utf8')).toBe(72);
     const { res } = await registerUser(a, { password: ascii });
     expect(res.status).toBe(201);
+    const login = await request(a).post('/auth/login').send({ email: res.body.user.email, password: ascii });
+    expect(login.status).toBe(200);
 
     // The same boundary is enforced with multi-byte characters.
     const multibyte = `${'a'.repeat(69)}1é`; // 69 + 1 + 2 bytes
     expect(Buffer.byteLength(multibyte, 'utf8')).toBe(72);
     const second = await registerUser(a, { password: multibyte });
     expect(second.res.status).toBe(201);
+    const secondLogin = await request(a)
+      .post('/auth/login')
+      .send({ email: second.res.body.user.email, password: multibyte });
+    expect(secondLogin.status).toBe(200);
   });
 
   it('rejects a password of 73 UTF-8 bytes', async () => {

@@ -118,6 +118,13 @@ describe('verifyAudioDuration', () => {
     await expect(verifyAudioDuration(await fixture('valid.wav', pcmWav(1)))).resolves.toBe(true);
   });
 
+  it('accepts the exact minimum and maximum decoded-duration boundaries', async () => {
+    await expect(verifyAudioDuration(await fixture('exact-minimum.wav', pcmWav(0.5)))).resolves.toBe(true);
+    await expect(
+      verifyAudioDuration(await fixture('exact-maximum.wav', pcmWav(MAX_AUDIO_DURATION_SECONDS))),
+    ).resolves.toBe(true);
+  });
+
   it('rejects malformed media and recordings that are too short', async () => {
     await expect(verifyAudioDuration(await fixture('invalid.wav', Buffer.from('not audio')))).rejects.toMatchObject({
       status: 415,

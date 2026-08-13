@@ -100,4 +100,58 @@ describe('httpLogger', () => {
     expect(res.status).toBe(200);
     expect(entries().some((e) => e.req?.url === '/health')).toBe(false);
   });
+
+  it('redacts credentials from direct application logs as well as HTTP logs', () => {
+    logger.info(
+      {
+        password: 'root-password-secret',
+        currentPassword: 'root-current-secret',
+        newPassword: 'root-new-secret',
+        token: 'root-token-secret',
+        accessToken: 'root-access-secret',
+        refreshToken: 'root-refresh-secret',
+        req: {
+          headers: {
+            authorization: 'Bearer header-secret',
+            cookie: 'session=header-cookie-secret',
+            'x-api-key': 'header-api-key-secret',
+          },
+          body: {
+            password: 'body-password-secret',
+            currentPassword: 'body-current-secret',
+            newPassword: 'body-new-secret',
+            token: 'body-token-secret',
+            accessToken: 'body-access-secret',
+            refreshToken: 'body-refresh-secret',
+          },
+        },
+        res: { headers: { 'set-cookie': 'session=response-cookie-secret' } },
+      },
+      'sensitive-redaction-check',
+    );
+
+    const line = lines.find((candidate) => candidate.includes('sensitive-redaction-check'));
+    expect(line).toBeDefined();
+    for (const secret of [
+      'root-password-secret',
+      'root-current-secret',
+      'root-new-secret',
+      'root-token-secret',
+      'root-access-secret',
+      'root-refresh-secret',
+      'header-secret',
+      'header-cookie-secret',
+      'header-api-key-secret',
+      'body-password-secret',
+      'body-current-secret',
+      'body-new-secret',
+      'body-token-secret',
+      'body-access-secret',
+      'body-refresh-secret',
+      'response-cookie-secret',
+    ]) {
+      expect(line).not.toContain(secret);
+    }
+    expect(line).toContain('[redacted]');
+  });
 });

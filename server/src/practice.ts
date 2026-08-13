@@ -23,6 +23,7 @@ import {
 } from './idempotency';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
+import { releaseTransactionClient, rollbackTransaction } from './transaction';
 import { uploadAudio, verifyAudioMagicBytes } from './upload';
 
 const MAX_ATTEMPTS = 3;
@@ -119,10 +120,9 @@ async function claimPracticeAttempt(userId: string, questionId: string): Promise
     await client.query('COMMIT');
     return { attemptNo, claimId };
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
+    return await rollbackTransaction(client, { value: err });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 
@@ -188,14 +188,13 @@ async function storePracticeResult(
     await client.query('COMMIT');
     return response;
   } catch (err) {
-    await client.query('ROLLBACK');
-    throw err;
+    return await rollbackTransaction(client, { value: err });
   } finally {
-    client.release();
+    releaseTransactionClient(client);
   }
 }
 
-function authoredAnswerHint(question: Record<string, unknown>, language: string): string {
+export function authoredAnswerHint(question: Record<string, unknown>, language: string): string {
   const translations = question.translations as
     Record<string, { examples?: Array<{ en?: string }> } | undefined> | undefined;
   const example = translations?.[language]?.examples?.[0]?.en?.trim();

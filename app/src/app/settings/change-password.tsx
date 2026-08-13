@@ -107,7 +107,11 @@ export default function ChangePasswordScreen() {
             textContentType="newPassword"
             maxLength={MAX_PASSWORD_UTF8_BYTES}
           />
-          {newPasswordError && <Text style={styles.fieldError}>{newPasswordError}</Text>}
+          {newPasswordError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {newPasswordError}
+            </Text>
+          )}
 
           <Text style={styles.label}>Confirm new password</Text>
           <TextInput
@@ -121,7 +125,11 @@ export default function ChangePasswordScreen() {
             textContentType="newPassword"
             maxLength={MAX_PASSWORD_UTF8_BYTES}
           />
-          {confirmError && <Text style={styles.fieldError}>{confirmError}</Text>}
+          {confirmError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {confirmError}
+            </Text>
+          )}
 
           {error && (
             <Text accessibilityRole="alert" style={styles.error}>

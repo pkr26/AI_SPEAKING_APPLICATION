@@ -199,6 +199,8 @@ describe('config env validation', () => {
     await expectInvalid(baseEnv({ TRUST_PROXY: 'true' }), "not 'true'");
     await expectInvalid(baseEnv({ TRUST_PROXY: '11' }), 'proxy hop count from 0 to 10');
     await expectInvalid(baseEnv({ TRUST_PROXY: '01' }), 'proxy hop count from 0 to 10');
+    await expectInvalid(baseEnv({ TRUST_PROXY: '1junk' }), 'proxy hop count from 0 to 10');
+    await expectInvalid(baseEnv({ TRUST_PROXY: '10x' }), 'proxy hop count from 0 to 10');
     await expectInvalid(baseEnv({ TRUST_PROXY: '-1' }), 'proxy hop count from 0 to 10');
   });
 
@@ -224,6 +226,16 @@ describe('config env validation', () => {
       baseEnv({ NODE_ENV: 'production', MOCK_AI: 'false', OPENAI_API_KEY: 'sk-real', S3_BUCKET: '' }),
       'S3_BUCKET',
     );
+    await expectInvalid(
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        JWT_SECRET: 'this is a test secret with enough length',
+        S3_BUCKET: 'audio-bucket',
+      }),
+      'looks like a placeholder',
+    );
     const prod = await loadConfig(
       baseEnv({
         NODE_ENV: 'production',
@@ -241,6 +253,9 @@ describe('config env validation', () => {
     await expectInvalid(baseEnv({ DATABASE_URL: 'not-a-database' }), 'must be a PostgreSQL URL');
     await expectInvalid(baseEnv({ DATABASE_URL: 'https://db.example/ai_english' }), 'must be a PostgreSQL URL');
     await expectInvalid(baseEnv({ DATABASE_URL: 'postgres://db.example' }), 'must be a PostgreSQL URL');
+    expect(
+      (await loadConfig(baseEnv({ DATABASE_URL: 'postgresql://localhost:5432/ai_english_test' }))).databaseUrl,
+    ).toBe('postgresql://localhost:5432/ai_english_test');
     await expectInvalid(
       baseEnv({
         NODE_ENV: 'production',
@@ -250,6 +265,21 @@ describe('config env validation', () => {
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=require',
       }),
       'sslmode=verify-full',
+    );
+  });
+
+  it('supports silent logging and rejects an unseparated testsecret placeholder in production', async () => {
+    expect((await loadConfig(baseEnv({ LOG_LEVEL: 'silent' }))).logLevel).toBe('silent');
+    await expectInvalid(
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        JWT_SECRET: 'prefix-testsecret-suffix-with-enough-length',
+        S3_BUCKET: 'audio-bucket',
+        DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+      }),
+      'looks like a placeholder',
     );
   });
 

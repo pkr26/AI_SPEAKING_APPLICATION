@@ -1,3 +1,4 @@
+import dotenv from 'dotenv';
 import { Client } from 'pg';
 
 interface IntegrityCheck {
@@ -26,17 +27,41 @@ const checks: IntegrityCheck[] = [
     sql: `SELECT count(*)::int AS n FROM questions
           WHERE created_at IS NULL
              OR char_length(prompt_word) NOT BETWEEN 1 AND 100
+             OR btrim(prompt_word) = ''
              OR char_length(question_text) NOT BETWEEN 1 AND 1000
+             OR btrim(question_text) = ''
              OR jsonb_typeof(translations) IS DISTINCT FROM 'object'
              OR NOT (translations ?& ARRAY['te', 'hi', 'es', 'zh'])
-             OR jsonb_typeof(translations->'te'->'examples') IS DISTINCT FROM 'array'
-             OR jsonb_array_length(translations->'te'->'examples') <> 3
-             OR jsonb_typeof(translations->'hi'->'examples') IS DISTINCT FROM 'array'
-             OR jsonb_array_length(translations->'hi'->'examples') <> 3
-             OR jsonb_typeof(translations->'es'->'examples') IS DISTINCT FROM 'array'
-             OR jsonb_array_length(translations->'es'->'examples') <> 3
-             OR jsonb_typeof(translations->'zh'->'examples') IS DISTINCT FROM 'array'
-             OR jsonb_array_length(translations->'zh'->'examples') <> 3`,
+             OR EXISTS (
+               SELECT 1
+               FROM unnest(ARRAY['te', 'hi', 'es', 'zh']) AS supported_language(code)
+               CROSS JOIN LATERAL (
+                 SELECT translations->supported_language.code
+               ) AS payload(translation)
+               WHERE jsonb_typeof(payload.translation) IS DISTINCT FROM 'object'
+                  OR jsonb_typeof(payload.translation->'word') IS DISTINCT FROM 'string'
+                  OR btrim(payload.translation->>'word') = ''
+                  OR char_length(payload.translation->>'word') > 500
+                  OR jsonb_typeof(payload.translation->'question') IS DISTINCT FROM 'string'
+                  OR btrim(payload.translation->>'question') = ''
+                  OR char_length(payload.translation->>'question') > 4000
+                  OR CASE
+                       WHEN jsonb_typeof(payload.translation->'examples') IS DISTINCT FROM 'array'
+                         THEN true
+                       ELSE jsonb_array_length(payload.translation->'examples') <> 3
+                         OR EXISTS (
+                           SELECT 1
+                           FROM jsonb_array_elements(payload.translation->'examples') AS example(item)
+                           WHERE jsonb_typeof(example.item) IS DISTINCT FROM 'object'
+                              OR jsonb_typeof(example.item->'en') IS DISTINCT FROM 'string'
+                              OR btrim(example.item->>'en') = ''
+                              OR char_length(example.item->>'en') > 4000
+                              OR jsonb_typeof(example.item->'native') IS DISTINCT FROM 'string'
+                              OR btrim(example.item->>'native') = ''
+                              OR char_length(example.item->>'native') > 4000
+                         )
+                     END
+             )`,
   },
   {
     name: 'invalid attempts',
@@ -59,6 +84,7 @@ const checks: IntegrityCheck[] = [
 export async function preflight(dbUrl: string): Promise<void> {
   const client = new Client({ connectionString: dbUrl, connectionTimeoutMillis: 10_000 });
   await client.connect();
+  let operationError: { value: unknown } | undefined;
   try {
     await client.query("SET statement_timeout = '60s'");
     const failures: string[] = [];
@@ -71,23 +97,42 @@ export async function preflight(dbUrl: string): Promise<void> {
         `database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - ${failures.join('\n  - ')}`,
       );
     }
-  } finally {
-    await client.end();
+  } catch (error) {
+    operationError = { value: error };
   }
+
+  let disconnectError: { value: unknown } | undefined;
+  try {
+    await client.end();
+  } catch (error) {
+    disconnectError = { value: error };
+  }
+
+  // Preserve the integrity/query failure that operators need to diagnose; a
+  // secondary disconnect error must not replace it. A disconnect failure
+  // remains observable when it is the only failure.
+  if (operationError) throw operationError.value;
+  if (disconnectError) throw disconnectError.value;
 }
 
-async function main() {
-  const { default: dotenv } = await import('dotenv');
-  dotenv.config();
-  const databaseUrl = process.env.DATABASE_URL;
+export async function runPreflightCommand(
+  databaseUrl: string | undefined,
+  check: (url: string) => Promise<void> = preflight,
+  log: (message: string) => void = console.log,
+): Promise<void> {
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
-  await preflight(databaseUrl);
-  console.log('database integrity preflight passed');
+  await check(databaseUrl);
+  log('database integrity preflight passed');
 }
 
+// Stryker disable all: exported command wiring is unit-tested and this
+// direct-execution/exit boundary is subprocess-tested. Mutating require.main
+// inside the Vitest host only creates a runner bootstrap RuntimeError.
 if (require.main === module) {
-  main().catch((error) => {
+  dotenv.config();
+  runPreflightCommand(process.env.DATABASE_URL).catch((error) => {
     console.error(error);
     process.exit(1);
   });
 }
+// Stryker restore all

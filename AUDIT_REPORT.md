@@ -1,11 +1,18 @@
-# Security and Release Audit — 12 August 2026
+# Security and Release Audit — 13 August 2026
 
 ## Decision
 
 The audited working tree is materially stronger than the repository baseline,
-and every local automated gate listed below passes. It is **not approved for a
-public production or app-store release yet**. The remaining blockers require
-owner choices, production infrastructure, legal and educational review, GitHub
+and every completed pre-commit automated gate listed below passes. Preliminary
+exact-source mutation campaigns completed and their material survivors were
+reviewed. Five material app survivors now have regression tests whose exact
+mutants were manually confirmed as detected. Because those tests changed after
+the broad app report—and the requested release order requires commit, push, and
+green GitHub Actions before full mutation testing—the post-push exact-commit
+campaigns remain required. This is therefore a verification checkpoint rather
+than a release approval. The application is **not approved for a public
+production or app-store release yet**. The remaining blockers require owner
+choices, production infrastructure, legal and educational review, GitHub
 configuration, or real-device/release-artifact validation; they cannot be
 truthfully completed in source code alone.
 
@@ -15,11 +22,18 @@ changes made, evidence collected, and risks still open.
 
 ## Audit boundary
 
-- Repository baseline: commit
-  `6c56e82ad62426ba77c673f85488d59db942fad7` on local and `origin/main`.
-- Hardened state: the **uncommitted working tree on top of that commit**. The
-  corrections described here are not part of the baseline commit and are not
-  active remotely until they are reviewed, committed, and pushed.
+- Audit starting point: commit
+  `6c56e82ad62426ba77c673f85488d59db942fad7`.
+- Landed hardening: commits
+  [`163e607371b6c9b1279f0aecdb5481abd016e61a`](https://github.com/pkr26/AI_SPEAKING_APPLICATION/commit/163e607371b6c9b1279f0aecdb5481abd016e61a)
+  and
+  [`415968751f7ff58c970cfa8a34ff62776828e010`](https://github.com/pkr26/AI_SPEAKING_APPLICATION/commit/415968751f7ff58c970cfa8a34ff62776828e010)
+  are on `origin/main`. The latter is the current committed baseline.
+- Current candidate: the **uncommitted mutation- and test-hardening working tree
+  on top of `4159687`**. Its pre-commit gates and preliminary mutation evidence
+  are recorded below. The final commit, push, resulting GitHub checks, and full
+  post-push exact-commit mutation rerun are pending; green checks for the landed
+  commits do not certify these uncommitted changes.
 - Local toolchain: Node.js 24.6.0, npm 11.5.1, and PostgreSQL client/server
   compatibility exercised against local PostgreSQL 14.19. Production should
   use a currently supported PostgreSQL release.
@@ -66,9 +80,21 @@ changes made, evidence collected, and risks still open.
 - Made pass/final-failure practice advancement select a different next question
   inside the same transaction that records the attempt and idempotent response.
   This removes stale reads and immediate same-question repeats.
+- Rejects malformed provider grading objects—including blank feedback and
+  out-of-range scores—before state or database updates, so an unusable paid
+  response produces a retryable 502 instead of a misleading learner result.
+- Unified the direct- and S3-upload byte ceiling, fixed the direct-upload exact
+  25 MiB boundary, released unread oversized S3 bodies, and made local orphan
+  cleanup deterministic and accurately reported.
+- Added strict authored-catalog validation and deterministic seed generation,
+  expanded production preflight validation for every translation/example, and
+  preserved primary deploy errors when rollback, unlock, or connection cleanup
+  also fails.
+- Hardened startup/shutdown handling for signals received before the HTTP server
+  begins listening, and added regression coverage for these lifecycle paths.
 - Added regression coverage for the S3 cleanup lifecycle, the distributed
-  rate-limit store, cross-replica behavior, and transactional practice
-  boundaries.
+  rate-limit store, cross-replica behavior, transactional practice boundaries,
+  database tooling, seed integrity, and exact input boundaries.
 
 ### Mobile reliability and trust boundaries
 
@@ -89,6 +115,14 @@ changes made, evidence collected, and risks still open.
   contrast, microphone-settings recovery, app-focus/query coordination, an
   invalid-route screen, and a last-resort route error boundary that does not
   expose stack/provider details.
+- Clears diagnostic-local state at every authenticated-session boundary and
+  rejects stale callbacks from a previous identity. Recorder ownership now also
+  prevents a second mounted instance from starting while another instance owns
+  interrupted-submission recovery.
+- Added five focused app regressions for material survivors found during
+  independent mutation-result review. Targeted reruns manually confirmed that
+  each exact mutant is now detected; the complete app campaign must still be
+  rerun against the final pushed commit.
 - Expanded API, parser, auth-race, recorder, navigation-gate, recovery, and
   screen tests around these paths.
 
@@ -100,14 +134,19 @@ changes made, evidence collected, and risks still open.
 - Added app-wide coverage collection and enforced global floors, plus
   production-mode iOS and Android Expo exports in CI.
 - Added a weekly/manual dependency-audit workflow: zero-tolerance high-severity
-  production audit for the server and the explicit reviewed-advisory gate for
-  the Expo tree.
+  full dependency audit for the server and the explicit reviewed-advisory gate
+  for the Expo tree.
 - Hardened Git/Docker ignores for environment variants, package-manager config,
   signing keys, certificates, mutation scratch, and reports. The committed
   `.env.example` exception remains available.
 - Fixed the assessment-test audio fixture to use mode 0600 and remove itself,
   tightened a previously vacuous smoke assertion, and raised both mutation
   configurations' break threshold from 0 to 60.
+- Pinned Stryker 9.6.1 in both package manifests so `npm ci` reproduces mutation
+  tooling. The mobile lane mutates all production TypeScript/TSX. The server
+  runs executable API/database code against the full suite, then mutates the
+  authored `db/seed-data.ts` catalog in a dedicated lane with its byte-for-byte
+  artifact test; both lanes emit HTML and JSON reports.
 - Updated the architecture, S3 POST contract, deployment requirements,
   security-reporting status, and verification commands in repository docs.
 
@@ -117,47 +156,70 @@ changes made, evidence collected, and risks still open.
 
 - `npm run format:check`, `npm run lint`, `npm run typecheck`, and
   `npm run build`: passed.
-- `npm audit --omit=dev --audit-level=high`: passed with 0 vulnerabilities.
-- `npm test`: 23/23 files and 239/239 tests passed. The suite includes
-  dedicated FFmpeg process-cap/readiness-coalescing regressions in addition to
-  the decoded-media integration tests.
-- Coverage: 86.42% statements, 81.23% branches, 83.48% functions, and 88.25%
-  lines. The `server/src` subset measured 91.02%, 84.60%, 85.93%, and 93.09%
-  respectively.
-- Fresh compiled-server smoke run: created an isolated database, applied
-  migrations 001–007, verified six questions at each CEFR level, exercised the
-  complete auth/diagnostic/help/practice/retry/final-feedback/export/password/
-  revocation/deletion journey, and exited 0. The final randomized run emitted
-  88 successful assertions across 16 practice-loop attempts and verified that
-  the next logical question reset to attempt 1. The server was stopped and the
-  isolated database was dropped.
+- Both the full `npm audit --audit-level=high` and production-only
+  `npm audit --omit=dev --audit-level=high` passed with 0 vulnerabilities.
+- Registry verification covered 523 package signatures and 125 attestations.
+- `npm test`: 37/37 files and 574/574 tests passed.
+- Coverage: 97.32% statements, 93.51% branches, 97.02% functions, and 98.08%
+  lines.
+- The latest completed compiled-server smoke run created an isolated database,
+  applied migrations 001–007, seeded and verified all 36 questions—six at each
+  CEFR level—passed production preflight and readiness, exercised the complete
+  auth/diagnostic/help/practice/retry/final-feedback/export/password/revocation/
+  deletion journey, emitted 90 successful assertions, and exited 0. The server
+  was stopped and the isolated database was dropped.
 
 ### Mobile
 
-- `npm run lint` and `npm run typecheck`: passed.
-- `npm test`: 14/14 suites and 417/417 tests passed.
-- Coverage: 90.54% statements, 85.32% branches, 95.52% functions, and 94.02%
+- `npm run format:check`, `npm run lint`, and `npm run typecheck`: passed.
+- `npm test`: 14/14 suites and 727/727 tests passed.
+- Coverage: 95.38% statements, 90.99% branches, 97.06% functions, and 98.57%
   lines, above the new global floors of 80%, 75%, 85%, and 85%.
 - `npm run doctor`: 20/20 Expo checks passed.
 - `npm run audit:ci`: passed the reviewed upstream baseline gate. This is not a
-  clean audit: `npm audit --omit=dev` still reports 22 affected dependency
-  nodes—15 high, 7 moderate, and 0 critical—under advisory IDs 1119441,
-  1138808, and 1138809.
-- Production-mode `expo export` completed for both iOS and Android with an
-  explicit HTTPS API URL.
+  clean audit: raw `npm audit` still reports 22 affected dependency nodes—15
+  high, 7 moderate, and 0 critical—under advisory IDs 1119441, 1138808, and 1138809.
+- Registry verification covered 1,123 package signatures and 215 attestations.
+- Production-mode `expo export` passed for both iOS and Android with an explicit
+  HTTPS API URL.
 
 ### Repository and operational evidence
 
-- `git diff --check` passed, touched server files pass Prettier, and both GitHub
-  workflow files parse as YAML.
+- `git diff --check`, the configured server/app format checks, and this report's
+  Prettier check passed; both GitHub workflow files parse as YAML.
+- GitHub Actions passed for the landed hardened state: the
+  [server/mobile CI run](https://github.com/pkr26/AI_SPEAKING_APPLICATION/actions/runs/31650626921)
+  and the
+  [dependency security-audit run](https://github.com/pkr26/AI_SPEAKING_APPLICATION/actions/runs/31650788665)
+  are green. A new run is required after the current candidate is committed and
+  pushed.
 - A high-confidence tracked-file pattern scan found no private-key block, AWS
   access-key ID, GitHub token, or long OpenAI-style token. The local
   `server/.env` is ignored and mode 0600. This is narrower than GitHub secret
   scanning or a dedicated history scanner and is not a substitute for either.
-- Mutation reports exist but predate the current source changes. Mutation
-  packages are intentionally installed with `--no-save`, so clean `npm ci`
-  environments cannot reproduce those reports yet; current unit/integration
-  results must not be presented as a fresh mutation run.
+- Stryker is reproducible from the lockfiles. Preliminary exact-source reports
+  completed before the final five app regression tests were added:
+  - The server executable-code lane generated 2,973 mutants: 2,719 killed, 198
+    survived, 39 had no coverage, 17 were explicitly ignored, and none timed out
+    or produced a runtime error. Its standard mutation score was 91.9824%. The
+    ignored mutants are deliberate CommonJS CLI entry-identity boundaries that
+    are exercised by real subprocess tests; this classification is not an
+    execution failure.
+  - The independent server catalog lane killed 2,053/2,053 mutants (100%).
+  - The app lane generated 4,342 mutants: 3,188 killed, 1,040 survived, 32 had no
+    coverage, 64 timed out, and 18 produced runtime errors. Its standard score
+    was 75.2081%. Manual inspection found that the timeout classifications came
+    from mutant-induced permanent locks or loops in recorder/auth/password
+    paths, while runtime classifications came from fail-fast API URL and
+    `ContractError` construction mutants; the Stryker worker remained stable.
+    These are detected mutant behaviors, not evidence that the ordinary test
+    suite crashed.
+- Independent review identified all material survivors requiring action. Five
+  app regression tests were subsequently added, and focused runs manually
+  confirmed detection of each exact mutant. Because the test tree changed, the
+  preliminary app report is not terminal evidence. Full app and both server
+  lanes must be rerun after the exact candidate is committed, pushed, and passes
+  GitHub Actions.
 - The Docker CLI was unavailable, so `server/Dockerfile` was not built,
   health-tested as a container, SBOM-generated, or image-scanned.
 
@@ -165,11 +227,13 @@ changes made, evidence collected, and risks still open.
 
 ### P0 — before any public data collection
 
-1. **Land and independently review this working tree.** Commit the migration,
-   source, lockfile, tests, workflows, and docs together; run the new workflows
-   on the resulting commit. The remote `main` CI run for baseline commit
-   `6c56e82` is currently failed. Local success does not make that remote check
-   green.
+1. **Finish the requested release sequence for the current candidate.** The
+   pre-commit gates pass and preliminary mutation campaigns have been reviewed.
+   Commit and push the exact tree, require green CI and dependency-security
+   checks for the resulting SHA, then run the complete app and two server
+   mutation lanes against that exact pushed commit. Address every fixable
+   material finding and repeat affected gates before treating the campaign as
+   terminal evidence. No final SHA or post-push run is claimed in this report.
 2. **Put enforceable repository controls in place.** The repository is private.
    GitHub's API reports branch protection/rulesets unavailable on the current
    plan, vulnerability alerts disabled, secret scanning disabled, and code

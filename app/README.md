@@ -33,9 +33,14 @@ npm run format:check
 npm run lint
 npm run typecheck
 npm test
+npm run mutation
 npm run doctor
 npm run audit:ci
 ```
+
+`npm ci` installs the pinned Stryker 9.6.1 toolchain. `npm run mutation`
+mutates every production `.ts` and `.tsx` file and writes HTML plus JSON reports
+to `reports/mutation/`.
 
 The backend must be running on port 4000.
 
@@ -63,7 +68,8 @@ dev machine's LAN IP from `expoConfig.hostUri` as a fallback.)
 ```
 src/
   app/                  expo-router routes
-    _layout.tsx         providers (React Query, auth) + root Stack
+    _layout.tsx         providers, protected Stack, focus bridge + error boundary
+    +not-found.tsx      safe fallback for invalid or stale deep links
     index.tsx           gate: routes to login / diagnostic / practice
     (auth)/             login + signup (native-language picker)
     diagnostic.tsx      CEFR diagnostic test flow
@@ -72,12 +78,17 @@ src/
       help.tsx          translations + example sentences for a question
       attempt.tsx       minimal practice mode (word + question + Recorder)
       feedback.tsx      pass / retry / final-fail variants
+    settings/
+      change-password.tsx password rotation
+      delete-account.tsx  destructive account-deletion confirmation
   components/
     Recorder.tsx        shared recorder used by diagnostic + practice
   lib/
     api.ts              API URL, Bearer requests, direct/S3 audio upload
     auth.tsx            SecureStore-backed auth context and cache isolation
+    password-policy.ts  UTF-8-aware password rules shared by auth screens
     pending-assessment.ts durable interrupted-upload state machine
+    practice-flow.tsx   session-scoped handoff from attempt to feedback
     types.ts            strict runtime parsers for API contracts
     params.ts           route-param helpers
     theme.ts            colors

@@ -3,19 +3,22 @@
   "testRunner": "jest",
   "jest": {
     "projectType": "custom",
+    "configFile": "package.json",
     "config": {
-      "preset": "jest-expo"
+      "testPathIgnorePatterns": ["/node_modules/"]
     },
     "enableFindRelatedTests": true
   },
   "mutate": ["src/**/*.ts", "src/**/*.tsx"],
-  "ignoreStatic": true,
+  "ignorePatterns": ["/.env", "/.env.*", "/.expo", "/coverage", "/dist", "/reports"],
+  "ignoreStatic": false,
   "coverageAnalysis": "perTest",
   "timeoutMS": 60000,
   "timeoutFactor": 2,
   "concurrency": 2,
   "tempDirName": ".stryker-tmp",
   "cleanTempDir": true,
-  "reporters": ["clear-text", "progress", "html"],
+  "reporters": ["clear-text", "progress", "html", "json"],
+  "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
   "thresholds": { "high": 80, "low": 60, "break": 60 }
 }

@@ -54,7 +54,20 @@ describe('practice', () => {
     expect(help.status).toBe(200);
     expect(help.headers['cache-control']).toBe('private, max-age=3600');
     const etag = help.headers['etag'];
-    expect(typeof etag).toBe('string');
+    expect(etag).toMatch(/^"[0-9a-f]{64}"$/);
+    expect(help.body).toMatchObject({
+      promptWord: expect.any(String),
+      promptWordNative: expect.any(String),
+      questionText: expect.any(String),
+      questionTextNative: expect.any(String),
+      examples: expect.any(Array),
+    });
+    expect(help.body.examples).toHaveLength(3);
+    for (const example of help.body.examples) {
+      expect(example).toEqual({ en: expect.any(String), native: expect.any(String) });
+      expect(example.en.length).toBeGreaterThan(0);
+      expect(example.native.length).toBeGreaterThan(0);
+    }
 
     const cached = await request(a)
       .get(`/practice/question/${questionId}/help`)
@@ -74,13 +87,25 @@ describe('practice', () => {
   it('POST /attempt without audio returns 400', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
-    await completeDiagnostic(a, token);
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    const requestId = randomUUID();
 
     const r = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .field('questionId', 'x');
+      .field('questionId', question.rows[0].id)
+      .field('requestId', requestId);
     expect(r.status).toBe(400);
+    expect(r.body).toEqual({ error: 'audio file is required' });
+    const claims = await pool.query(
+      'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(claims.rows[0].count).toBe(0);
   });
 
   it('POST /attempt with a malformed UUID returns 400', async () => {
@@ -161,6 +186,79 @@ describe('practice', () => {
       .field('requestId', randomUUID());
     expect(r.status).toBe(415);
     expect(r.body.error).toBe('Invalid audio file');
+  });
+
+  it('preserves a live practice claim conflict and abandons the request', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token;
+    const userId = res.body.user.id;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    const questionId = question.rows[0].id;
+    const existingClaimId = randomUUID();
+    const requestId = randomUUID();
+    await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
+      userId,
+      questionId,
+      existingClaimId,
+    ]);
+
+    try {
+      const response = await request(a)
+        .post('/practice/attempt')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+          filename: 'answer.m4a',
+          contentType: 'audio/mp4',
+        })
+        .field('questionId', questionId)
+        .field('requestId', requestId);
+
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({ error: 'An assessment is already in progress for this question' });
+      const requests = await pool.query(
+        'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+        [userId, requestId],
+      );
+      expect(requests.rows[0].count).toBe(0);
+      const inflight = await pool.query<{ claim_id: string }>(
+        'SELECT claim_id FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
+        [userId, questionId],
+      );
+      expect(inflight.rows).toEqual([{ claim_id: existingClaimId }]);
+    } finally {
+      await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
+    }
+  });
+
+  it('reclaims an expired practice claim before starting the next assessment', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    const questionId = question.rows[0].id;
+    await pool.query(
+      `INSERT INTO practice_inflight (user_id, question_id, claim_id, started_at)
+       VALUES ($1, $2, $3, now() - interval '6 minutes')`,
+      [userId, questionId, randomUUID()],
+    );
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+    );
+
+    expect(response.status).toBe(200);
+    const inflight = await pool.query(
+      'SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
+      [userId, questionId],
+    );
+    expect(inflight.rows[0].count).toBe(0);
   });
 
   it('a practice attempt walks attempt numbers and never duplicates them', async () => {

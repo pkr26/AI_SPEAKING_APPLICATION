@@ -311,6 +311,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const changePassword = useCallback(
     async (currentPassword: string, newPassword: string) => {
       const epoch = beginTransition();
+      const sessionToken = tokenRef.current;
       let responseReceived = false;
       try {
         let response: unknown;
@@ -331,7 +332,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       } catch (error) {
         // Once the server rotates the token, failing to persist its replacement
         // leaves the old session invalid. Fail closed and require a fresh login.
-        if (epoch !== epochRef.current) throw error;
+        if (epoch !== epochRef.current) {
+          // If the provider disappeared after the server accepted the rotation
+          // but before the replacement could be persisted, do not leave the
+          // now-revoked token available for a stale restore on next launch.
+          if (responseReceived && sessionToken) {
+            await clearToken(sessionToken).catch(() => undefined);
+          }
+          throw error;
+        }
         if (responseReceived && !(error instanceof ApiError && error.status === 401)) {
           expireSession();
         }

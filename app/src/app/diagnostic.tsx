@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -24,8 +24,11 @@ import {
 } from '../lib/types';
 
 export default function DiagnosticScreen() {
-  const { user, setUser, logout } = useAuth();
+  const { user, setUser, logout, sessionVersion } = useAuth();
   const queryClient = useQueryClient();
+  const userId = user?.id ?? null;
+  const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;
+  const activeIdentityRef = useRef<string | null>(identityKey);
 
   const [question, setQuestion] = useState<Question | null>(null);
   const [progress, setProgress] = useState<{
@@ -34,9 +37,24 @@ export default function DiagnosticScreen() {
   } | null>(null);
   const [result, setResult] = useState<DiagnosticAnswerResult | null>(null);
   const [level, setLevel] = useState<CefrLevel | null>(null);
+  const [stateIdentity, setStateIdentity] = useState(identityKey);
+
+  useLayoutEffect(() => {
+    // Local diagnostic progress is sensitive account data and is not stored in
+    // the query cache. Clear it at every session/identity boundary.
+    activeIdentityRef.current = identityKey;
+    setStateIdentity(identityKey);
+    setQuestion(null);
+    setProgress(null);
+    setResult(null);
+    setLevel(null);
+    return () => {
+      if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;
+    };
+  }, [identityKey]);
 
   const nextQuery = useQuery({
-    queryKey: ['diagnostic-next', user?.id],
+    queryKey: ['diagnostic-next', sessionVersion, userId],
     queryFn: async ({ signal }) =>
       parseDiagnosticNext(await apiFetch<unknown>('/diagnostic/next', { signal })),
     enabled: !!user,
@@ -44,21 +62,39 @@ export default function DiagnosticScreen() {
   });
   useEffect(() => {
     const data = nextQuery.data;
-    if (!data) return;
+    if (!data || !userId) return;
+    setStateIdentity(identityKey);
+    setResult(null);
     if (data.done) {
+      setQuestion(null);
+      setProgress(null);
       setLevel(data.level);
     } else {
+      setLevel(null);
       setQuestion(data.question);
       setProgress(data.progress);
     }
-  }, [nextQuery.data]);
+  }, [identityKey, nextQuery.data, userId]);
+
+  const stateIsCurrent = stateIdentity === identityKey;
+  const currentQuestion = stateIsCurrent ? question : null;
+  const currentProgress = stateIsCurrent ? progress : null;
+  const currentResult = stateIsCurrent ? result : null;
+  const currentLevel = stateIsCurrent ? level : null;
 
   const handleResult = (data: DiagnosticAnswerResult) => {
+    if (activeIdentityRef.current !== identityKey) return;
     setResult(data);
   };
 
   const handleError = (message: string) => {
+    if (activeIdentityRef.current !== identityKey) return;
     Alert.alert('Could not assess your answer', message);
+  };
+
+  const handleRecoveryUnresolved = () => {
+    if (activeIdentityRef.current !== identityKey) return;
+    void nextQuery.refetch();
   };
 
   const handleLogout = async () => {
@@ -86,33 +122,35 @@ export default function DiagnosticScreen() {
   };
 
   const advance = () => {
-    if (!result) return;
-    if (result.done) {
-      const determinedLevel = result.level ?? null;
+    if (activeIdentityRef.current !== identityKey || !currentResult) return;
+    if (currentResult.done) {
+      const determinedLevel = currentResult.level ?? null;
       setLevel(determinedLevel);
       setResult(null);
-    } else if (result.nextQuestion) {
-      setQuestion(result.nextQuestion);
+    } else if (currentResult.nextQuestion) {
+      setQuestion(currentResult.nextQuestion);
       setProgress((prev) => (prev ? { ...prev, asked: prev.asked + 1 } : prev));
       setResult(null);
     }
   };
 
   const startPracticing = () => {
-    if (!user || !level) return;
+    if (activeIdentityRef.current !== identityKey || !user || !currentLevel) return;
     // Keep the diagnostic route protected until the completion screen has
     // actually been acknowledged; changing this earlier removes the screen.
     setUser({
       ...user,
       diagnosticCompleted: true,
-      cefrLevel: level,
+      cefrLevel: currentLevel,
     });
     void queryClient.invalidateQueries({ queryKey: ['me'] });
     router.replace('/');
   };
 
   // ----- Loading / error states -----
-  if (!level && !question) {
+  if (!user) return null;
+
+  if (!currentLevel && !currentQuestion) {
     if (nextQuery.isPending) {
       return (
         <View style={styles.center}>
@@ -146,7 +184,7 @@ export default function DiagnosticScreen() {
   }
 
   // ----- Done: congrats view -----
-  if (level) {
+  if (currentLevel) {
     return (
       <View style={styles.center}>
         <Text style={styles.congratsEmoji}>🎉</Text>
@@ -155,7 +193,7 @@ export default function DiagnosticScreen() {
         </Text>
         <Text style={styles.congratsText}>Your English level is</Text>
         <View style={styles.levelBadge}>
-          <Text style={styles.levelBadgeText}>{level}</Text>
+          <Text style={styles.levelBadgeText}>{currentLevel}</Text>
         </View>
         <Text style={styles.congratsHint}>
           We&apos;ll give you practice questions matched to this level.
@@ -171,7 +209,7 @@ export default function DiagnosticScreen() {
     );
   }
 
-  if (!question) {
+  if (!currentQuestion) {
     return null;
   }
 
@@ -197,21 +235,21 @@ export default function DiagnosticScreen() {
           <Text style={styles.accountButtonText}>Log out</Text>
         </Pressable>
       </View>
-      {progress && (
+      {currentProgress && (
         <Text style={styles.progressText}>
-          Question {Math.min(progress.asked + 1, progress.maxQuestions)} of up to{' '}
-          {progress.maxQuestions}
+          Question {Math.min(currentProgress.asked + 1, currentProgress.maxQuestions)} of up to{' '}
+          {currentProgress.maxQuestions}
         </Text>
       )}
 
       <View style={styles.card}>
         <Text style={styles.cardLabel}>Prompt word</Text>
-        <Text style={styles.promptWord}>{question.promptWord}</Text>
+        <Text style={styles.promptWord}>{currentQuestion.promptWord}</Text>
         <Text style={styles.cardLabel}>Question</Text>
-        <Text style={styles.questionText}>{question.questionText}</Text>
+        <Text style={styles.questionText}>{currentQuestion.questionText}</Text>
       </View>
 
-      {result ? (
+      {currentResult ? (
         <View accessibilityLiveRegion="polite" style={styles.resultCard}>
           <Text style={styles.resultTitle}>Answer received</Text>
           <Text style={styles.resultText}>
@@ -223,19 +261,19 @@ export default function DiagnosticScreen() {
             onPress={advance}
           >
             <Text style={styles.primaryButtonText}>
-              {result.done ? 'See My Level' : 'Next Question'}
+              {currentResult.done ? 'See My Level' : 'Next Question'}
             </Text>
           </Pressable>
         </View>
       ) : (
         <Recorder
-          ownerId={user!.id}
-          questionId={question.id}
+          ownerId={user.id}
+          questionId={currentQuestion.id}
           endpoint="/diagnostic/answer"
           parseResult={parseDiagnosticAnswerResult}
           onResult={handleResult}
           onError={handleError}
-          onRecoveryUnresolved={() => void nextQuery.refetch()}
+          onRecoveryUnresolved={handleRecoveryUnresolved}
         />
       )}
     </ScrollView>

@@ -80,7 +80,7 @@ EXPO_PUBLIC_API_URL=http://<your-LAN-IP>:4000 npx expo start
 | `GET /practice/question`                                                          | Next practice question at user's level                                                 |
 | `GET /practice/question/:id/help`                                                 | Bilingual help content (ETag + private caching)                                        |
 | `POST /practice/attempt`                                                          | Assess a recording; enforces 3-attempt rule                                            |
-| `GET /health` · `GET /ready`                                                      | Liveness / migration, question-inventory, database, and FFmpeg readiness                |
+| `GET /health` · `GET /ready`                                                      | Liveness / migration, question-inventory, database, and FFmpeg readiness               |
 
 See `server/.env.example` for all configuration knobs and `app/README.md` for the app.
 
@@ -108,6 +108,37 @@ assessment. Development/test deployments without `S3_BUCKET` return
 
 For the smoke test (`npm run smoke`, server running with `MOCK_AI=true`), start the dev server with relaxed limits so the practice loop doesn't trip them:
 `RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 npm run dev`
+
+## Mutation testing
+
+Both packages pin Stryker 9.6.1 in their development dependencies, so a clean
+`npm ci` installs the exact mutation toolchain. The app command mutates every
+production `.ts` and `.tsx` file:
+
+```bash
+cd app
+npm ci
+npm run mutation
+```
+
+The server command deliberately uses two sequential lanes: executable
+API/database code runs against the complete integration suite, while the large
+authored question catalog in `db/seed-data.ts` runs against its dedicated
+byte-for-byte artifact test. Give the server lane its own explicit-port loopback
+database. The guard requires the database name to contain `mutation`, end in
+`_test`, and differ from both the ordinary `ai_english_test` suite database and
+the configured application database (including `server/.env`) before the test
+harness may recreate it:
+
+```bash
+cd server
+npm ci
+TEST_DATABASE_URL=postgres://localhost:5432/ai_english_mutation_test npm run mutation
+```
+
+HTML and machine-readable JSON reports are written under
+`reports/mutation/`. The server's executable-code and catalog reports are
+separate so both results remain auditable.
 
 ## Deploying to production (checklist)
 

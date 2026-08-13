@@ -27,6 +27,30 @@ describe('diagnostic', () => {
     expect(rows[0].current_question_id).toBe(next.body.question.id);
   });
 
+  it('recreates first-use state atomically and reports exact initial progress', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    await pool.query('DELETE FROM diagnostic_state WHERE user_id = $1', [userId]);
+
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+
+    expect(next.status).toBe(200);
+    expect(next.body).toMatchObject({
+      done: false,
+      progress: { asked: 0, maxQuestions: 5 },
+      question: { id: expect.any(String), cefrLevel: 'B1' },
+    });
+    const state = await pool.query(
+      `SELECT low_idx, high_idx, questions_asked, current_question_id
+       FROM diagnostic_state WHERE user_id = $1`,
+      [userId],
+    );
+    expect(state.rows).toEqual([
+      { low_idx: 0, high_idx: 5, questions_asked: 0, current_question_id: next.body.question.id },
+    ]);
+  });
+
   it('GET /next reuses the outstanding question instead of rerolling it', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
@@ -127,6 +151,28 @@ describe('diagnostic', () => {
     );
     expect(r.status).toBe(400);
     expect(typeof r.body.error).toBe('string');
+  });
+
+  it('POST /answer with valid identifiers but no audio returns 400 and abandons its request claim', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const requestId = randomUUID();
+
+    const response = await request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .field('questionId', next.body.question.id)
+      .field('requestId', requestId);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'audio file is required' });
+    const claims = await pool.query(
+      'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(claims.rows[0].count).toBe(0);
   });
 
   it('cleans uploaded audio when multipart field validation fails', async () => {

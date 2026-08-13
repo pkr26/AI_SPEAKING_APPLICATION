@@ -75,6 +75,10 @@ export default function PracticeScreen() {
     ]);
   };
 
+  // The route gate will redirect after logout/session expiry. Avoid showing a
+  // disabled-query loading state during that transition.
+  if (!user) return null;
+
   return (
     <View style={styles.container}>
       <ScrollView
@@ -149,7 +153,7 @@ export default function PracticeScreen() {
 
             <View style={styles.recorderArea}>
               <Recorder
-                ownerId={user!.id}
+                ownerId={user.id}
                 questionId={question.id}
                 endpoint="/practice/attempt"
                 parseResult={parseAttemptResult}

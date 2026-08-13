@@ -1,7 +1,10 @@
 import { afterAll, describe, expect, it, vi } from 'vitest';
+import express from 'express';
 import request from 'supertest';
 import { assertDailyAssessmentCapacity } from '../src/assess';
+import { authRouter } from '../src/auth';
 import { config } from '../src/config';
+import { errorHandler } from '../src/middleware';
 import { app, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers';
 
 afterAll(async () => {
@@ -38,6 +41,24 @@ describe('auth: register validation', () => {
     // 30 three-byte characters + a letter/number is well under 72 characters
     // but exceeds bcrypt's 72-byte input boundary.
     expect((await registerUser(a, { password: `${'漢'.repeat(30)}a1` })).res.status).toBe(400);
+  });
+
+  it('accepts exact identity and minimum-password boundaries but rejects the next byte and blank names', async () => {
+    const local = `boundary${'a'.repeat(56)}`;
+    const exactEmail = `${local}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+    expect(exactEmail).toHaveLength(254);
+
+    const exact = await registerUser(a, {
+      name: 'n'.repeat(100),
+      email: exactEmail,
+      password: 'abcd1234',
+    });
+    expect(exact.res.status).toBe(201);
+    expect(exact.res.body.user.name).toBe('n'.repeat(100));
+    expect(exact.res.body.user.email).toBe(exactEmail);
+
+    expect((await registerUser(a, { name: '   ' })).res.status).toBe(400);
+    expect((await registerUser(a, { email: `${exactEmail}x` })).res.status).toBe(400);
   });
 
   it('registers a valid user (201) and creates diagnostic state', async () => {
@@ -186,6 +207,86 @@ describe('auth: login', () => {
 });
 
 describe('auth: infrastructure failures', () => {
+  it('rolls back and reports non-unique registration database failures as 500', async () => {
+    const failure = Object.assign(new Error('database unavailable'), { code: 'XX000' });
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [] };
+        if (text.startsWith('INSERT INTO users')) throw failure;
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    try {
+      // Mount the router directly so the shared rate-limit store can keep using
+      // Pool#connect internally without consuming this transaction-specific mock.
+      const direct = express();
+      direct.use(express.json());
+      direct.use('/auth', authRouter);
+      direct.use(errorHandler);
+      const response = await request(direct)
+        .post('/auth/register')
+        .send({
+          name: 'Infrastructure Test',
+          email: uniqueEmail('register-db-failure'),
+          password: STRONG_PASSWORD,
+          nativeLanguage: 'te',
+        });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ error: 'Internal server error' });
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+        'BEGIN',
+        expect.stringContaining('INSERT INTO users'),
+        'ROLLBACK',
+      ]);
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
+  it('preserves duplicate-email handling when rollback also fails', async () => {
+    const duplicate = Object.assign(new Error('duplicate email'), { code: '23505' });
+    const rollbackFailure = new Error('rollback failed');
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN') return { rows: [] };
+        if (text === 'ROLLBACK') throw rollbackFailure;
+        if (text.startsWith('INSERT INTO users')) throw duplicate;
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    try {
+      const direct = express();
+      direct.use(express.json());
+      direct.use('/auth', authRouter);
+      direct.use(errorHandler);
+      const response = await request(direct)
+        .post('/auth/register')
+        .send({
+          name: 'Rollback Test',
+          email: uniqueEmail('register-rollback-failure'),
+          password: STRONG_PASSWORD,
+          nativeLanguage: 'te',
+        });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({ error: 'Email already registered' });
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+        'BEGIN',
+        expect.stringContaining('INSERT INTO users'),
+        'ROLLBACK',
+      ]);
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
   it('reports an authenticated database failure as 500, not an invalid-token 401', async () => {
     const a = app();
     const { res } = await registerUser(a);

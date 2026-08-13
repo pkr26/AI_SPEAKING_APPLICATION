@@ -3,4 +3,5 @@ node_modules/
 coverage/
 uploads/
 .stryker-tmp/
+.stryker-catalog-tmp/
 reports/

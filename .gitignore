@@ -18,4 +18,5 @@ uploads/
 .expo/
 # Mutation testing (Stryker) scratch + reports
 .stryker-tmp/
+.stryker-catalog-tmp/
 reports/

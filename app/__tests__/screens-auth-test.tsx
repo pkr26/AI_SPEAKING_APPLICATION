@@ -5,7 +5,12 @@ import { Text } from 'react-native';
 import LoginScreen from '../src/app/(auth)/login';
 import SignupScreen from '../src/app/(auth)/signup';
 import { ApiError } from '../src/lib/api';
-import type { useAuth } from '../src/lib/auth';
+import {
+  MAX_EMAIL_LENGTH,
+  MAX_NAME_LENGTH,
+  MAX_PASSWORD_UTF8_BYTES,
+  type useAuth,
+} from '../src/lib/auth';
 import type { User } from '../src/lib/types';
 
 // ----- expo-router mock -----
@@ -55,6 +60,16 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     setUser: jest.fn(),
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 jest.mock('../src/lib/auth', () => ({
@@ -108,6 +123,43 @@ describe('login screen', () => {
     );
   });
 
+  it('rejects whitespace-only and oversized email values while accepting the exact limit', async () => {
+    await render(<LoginScreen />);
+
+    await fillLogin('   ', 'password1');
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState).toEqual({
+      disabled: true,
+      busy: false,
+    });
+
+    await fillLogin('a'.repeat(MAX_EMAIL_LENGTH), 'password1');
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState.disabled).toBe(
+      false,
+    );
+
+    await fillLogin('a'.repeat(MAX_EMAIL_LENGTH + 1), 'password1');
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState.disabled).toBe(
+      true,
+    );
+  });
+
+  it('configures login fields for email entry and password privacy', async () => {
+    await render(<LoginScreen />);
+
+    expect(screen.getByLabelText('Email').props).toMatchObject({
+      autoCapitalize: 'none',
+      autoCorrect: false,
+      keyboardType: 'email-address',
+      textContentType: 'emailAddress',
+      maxLength: MAX_EMAIL_LENGTH,
+    });
+    expect(screen.getByLabelText('Password').props).toMatchObject({
+      secureTextEntry: true,
+      textContentType: 'password',
+      maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
+  });
+
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
     await render(<LoginScreen />);
     await fillLogin('ada@example.com', 'a'.repeat(73));
@@ -128,23 +180,28 @@ describe('login screen', () => {
   });
 
   it('shows the busy state while the login request is in flight', async () => {
-    let resolveLogin!: (user: User) => void;
-    mockAuthValue.login = jest.fn(() => new Promise<User>((resolve) => (resolveLogin = resolve)));
+    const login = deferred<User>();
+    mockAuthValue.login = jest.fn(() => login.promise);
     await render(<LoginScreen />);
     await fillLogin('ada@example.com', 'password1');
     // fireEvent.press awaits the async handler; keep it pending while busy.
     const pressPromise = fireEvent.press(screen.getByRole('button', { name: 'Sign In' }));
 
-    const busyButton = await screen.findByRole('button', {
-      name: 'Signing in…',
-    });
-    expect(busyButton.props.accessibilityState).toEqual({
-      disabled: true,
-      busy: true,
-    });
-
-    await act(async () => resolveLogin(USER));
-    await pressPromise;
+    try {
+      const busyButton = await screen.findByRole('button', {
+        name: 'Signing in…',
+      });
+      expect(busyButton.props.accessibilityState).toEqual({
+        disabled: true,
+        busy: true,
+      });
+    } finally {
+      try {
+        await act(async () => login.resolve(USER));
+      } finally {
+        await pressPromise;
+      }
+    }
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
@@ -179,12 +236,23 @@ describe('login screen', () => {
   });
 
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.login = jest.fn().mockRejectedValue(new Error('network down'));
+    mockAuthValue.login = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(USER);
     await render(<LoginScreen />);
     await fillLogin('ada@example.com', 'password1');
     await fireEvent.press(screen.getByRole('button', { name: 'Sign In' }));
 
     expect(await screen.findByText('Could not sign in. Please try again.')).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState).toEqual({
+      disabled: false,
+      busy: false,
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Sign In' }));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(mockAuthValue.login).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -223,6 +291,71 @@ describe('signup screen', () => {
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
   });
 
+  it('keeps language selection mutually exclusive and exposed to accessibility', async () => {
+    await render(<SignupScreen />);
+    const telugu = screen.getByLabelText('Telugu, తెలుగు');
+    const spanish = screen.getByLabelText('Spanish, Español');
+
+    expect(telugu.props.accessibilityState).toEqual({ selected: false });
+    expect(spanish.props.accessibilityState).toEqual({ selected: false });
+
+    await fireEvent.press(telugu);
+    expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+      selected: true,
+    });
+    expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
+      selected: false,
+    });
+
+    await fireEvent.press(screen.getByLabelText('Spanish, Español'));
+    expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+      selected: false,
+    });
+    expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
+      selected: true,
+    });
+  });
+
+  it('enforces trimmed name and email boundaries', async () => {
+    await render(<SignupScreen />);
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+
+    await fillSignup('   ', 'ada@example.com', 'password1');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    await fillSignup('Ada', '   ', 'password1');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+
+    await fillSignup('n'.repeat(MAX_NAME_LENGTH), 'e'.repeat(MAX_EMAIL_LENGTH), 'password1');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(false);
+
+    await fillSignup('n'.repeat(MAX_NAME_LENGTH + 1), 'ada@example.com', 'password1');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    await fillSignup('Ada', 'e'.repeat(MAX_EMAIL_LENGTH + 1), 'password1');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+  });
+
+  it('configures signup fields for identity entry and password privacy', async () => {
+    await render(<SignupScreen />);
+
+    expect(screen.getByLabelText('Name').props).toMatchObject({
+      autoCapitalize: 'words',
+      textContentType: 'name',
+      maxLength: MAX_NAME_LENGTH,
+    });
+    expect(screen.getByLabelText('Email').props).toMatchObject({
+      autoCapitalize: 'none',
+      autoCorrect: false,
+      keyboardType: 'email-address',
+      textContentType: 'emailAddress',
+      maxLength: MAX_EMAIL_LENGTH,
+    });
+    expect(screen.getByLabelText('Password').props).toMatchObject({
+      secureTextEntry: true,
+      textContentType: 'newPassword',
+      maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
+  });
+
   it('rejects names over the maximum length client-side', async () => {
     await render(<SignupScreen />);
     await fillSignup('A'.repeat(101), 'ada@example.com', 'password1');
@@ -247,6 +380,16 @@ describe('signup screen', () => {
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
   });
 
+  it('rejects signup passwords over the shared UTF-8 byte limit', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', `a1${'é'.repeat(36)}`);
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+
+    expect(screen.getByText('Password must be at most 72 UTF-8 bytes.')).toBeTruthy();
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+  });
+
   it('registers and navigates home on success', async () => {
     await render(<SignupScreen />);
     await fillSignup('  Ada  ', '  ada@example.com ', 'password1');
@@ -262,27 +405,49 @@ describe('signup screen', () => {
     );
   });
 
-  it('shows the busy state while registering', async () => {
-    let resolveRegister!: (user: User) => void;
-    mockAuthValue.register = jest.fn(
-      () => new Promise<User>((resolve) => (resolveRegister = resolve)),
+  it.each([
+    ['Hindi, हिन्दी', 'hi'],
+    ['Chinese (Simplified), 简体中文', 'zh'],
+  ] as const)('submits the exact server language code for %s', async (label, code) => {
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText(label));
+    await fireEvent.press(signUpButton());
+
+    await waitFor(() =>
+      expect(mockAuthValue.register).toHaveBeenCalledWith(
+        'Ada',
+        'ada@example.com',
+        'password1',
+        code,
+      ),
     );
+  });
+
+  it('shows the busy state while registering', async () => {
+    const registration = deferred<User>();
+    mockAuthValue.register = jest.fn(() => registration.promise);
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     // fireEvent.press awaits the async handler; keep it pending while busy.
     const pressPromise = fireEvent.press(signUpButton());
 
-    const busyButton = await screen.findByRole('button', {
-      name: 'Creating account…',
-    });
-    expect(busyButton.props.accessibilityState).toEqual({
-      disabled: true,
-      busy: true,
-    });
-
-    await act(async () => resolveRegister(USER));
-    await pressPromise;
+    try {
+      const busyButton = await screen.findByRole('button', {
+        name: 'Creating account…',
+      });
+      expect(busyButton.props.accessibilityState).toEqual({
+        disabled: true,
+        busy: true,
+      });
+    } finally {
+      try {
+        await act(async () => registration.resolve(USER));
+      } finally {
+        await pressPromise;
+      }
+    }
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
@@ -307,8 +472,23 @@ describe('signup screen', () => {
     expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
   });
 
+  it('maps service failures to safe shared copy', async () => {
+    mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(500, 'private detail'));
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.press(signUpButton());
+
+    expect(
+      await screen.findByText('The service is temporarily unavailable. Please try again later.'),
+    ).toBeTruthy();
+  });
+
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.register = jest.fn().mockRejectedValue(new Error('network down'));
+    mockAuthValue.register = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(USER);
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
@@ -319,5 +499,10 @@ describe('signup screen', () => {
         'Could not create your account. Check your information and try again.',
       ),
     ).toBeTruthy();
+    expect(signUpButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
+
+    await fireEvent.press(signUpButton());
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(mockAuthValue.register).toHaveBeenCalledTimes(2);
   });
 });

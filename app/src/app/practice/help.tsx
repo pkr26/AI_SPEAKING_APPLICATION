@@ -39,9 +39,11 @@ export default function HelpScreen() {
   });
 
   const help = helpQuery.data;
-  const nativeAccessibilityLanguage = user
-    ? NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage]
-    : undefined;
+
+  // The protected-route gate owns navigation when the session disappears.
+  // Keep the disabled query from presenting an endless loading state.
+  if (!user) return null;
+  const nativeAccessibilityLanguage = NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage];
 
   if (!validQuestionId) {
     return (

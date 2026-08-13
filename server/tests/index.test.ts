@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { config } from '../src/config';
 import { pool } from '../src/db';
 import { logger } from '../src/logger';
@@ -11,7 +11,21 @@ import { logger } from '../src/logger';
  * file and nothing here may use the pool afterwards.
  */
 
+let originalSigtermListeners: Set<NodeJS.SignalsListener>;
+let originalSigintListeners: Set<NodeJS.SignalsListener>;
+
+beforeEach(() => {
+  originalSigtermListeners = new Set(process.listeners('SIGTERM'));
+  originalSigintListeners = new Set(process.listeners('SIGINT'));
+});
+
 afterEach(() => {
+  for (const listener of process.listeners('SIGTERM')) {
+    if (!originalSigtermListeners.has(listener)) process.removeListener('SIGTERM', listener);
+  }
+  for (const listener of process.listeners('SIGINT')) {
+    if (!originalSigintListeners.has(listener)) process.removeListener('SIGINT', listener);
+  }
   vi.restoreAllMocks();
 });
 

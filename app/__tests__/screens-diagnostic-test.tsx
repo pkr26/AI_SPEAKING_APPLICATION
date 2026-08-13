@@ -58,6 +58,13 @@ const USER: User = {
   diagnosticCompleted: false,
 };
 
+const OTHER_USER: User = {
+  ...USER,
+  id: '550e8400-e29b-41d4-a716-446655440010',
+  name: 'Grace Hopper',
+  email: 'grace@example.com',
+};
+
 let mockAuthValue: AuthValue;
 
 function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
@@ -126,16 +133,26 @@ let alertSpy: jest.SpyInstance;
 
 const queryClients: QueryClient[] = [];
 
-function renderScreen() {
+function makeQueryClient() {
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
   queryClients.push(queryClient);
-  return render(
+  return queryClient;
+}
+
+async function renderScreen(queryClient = makeQueryClient()) {
+  const tree = () => (
     <QueryClientProvider client={queryClient}>
       <DiagnosticScreen />
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+  const rendered = await render(tree());
+  return {
+    ...rendered,
+    queryClient,
+    rerenderScreen: () => rendered.rerender(tree()),
+  };
 }
 
 function recorderProps(): CapturedRecorderProps {
@@ -180,7 +197,8 @@ describe('diagnostic screen', () => {
 
   it('renders the question, progress, and wires the recorder', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
-    await renderScreen();
+    const queryClient = makeQueryClient();
+    await renderScreen(queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText('courage')).toBeTruthy();
@@ -196,6 +214,148 @@ describe('diagnostic screen', () => {
       '/diagnostic/next',
       expect.objectContaining({ signal: expect.anything() }),
     );
+    expect(
+      queryClient.getQueryCache().find({
+        queryKey: ['diagnostic-next', 1, USER.id],
+        exact: true,
+      }),
+    ).toBeDefined();
+  });
+
+  it('does not request diagnostic state without an authenticated user', async () => {
+    mockAuthValue = makeAuth({ user: null });
+
+    await renderScreen();
+
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockRecorderProps).toBeNull();
+  });
+
+  it('removes a loaded question immediately when the authenticated user disappears', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+
+    mockAuthValue = makeAuth({ user: null, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+
+    expect(screen.queryByText('Describe a time you showed courage.')).toBeNull();
+    expect(screen.queryByText('Diagnostic Test')).toBeNull();
+  });
+
+  it('never combines the previous account question with a new account identity', async () => {
+    let resolveOtherQuestion!: (value: ReturnType<typeof nextPayload>) => void;
+    const otherQuestion = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+      resolveOtherQuestion = resolve;
+    });
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockReturnValueOnce(otherQuestion);
+    const rendered = await renderScreen();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+
+    expect(screen.queryByText('Describe a time you showed courage.')).toBeNull();
+    expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+
+    await act(async () => resolveOtherQuestion(nextPayload(QUESTION_2, 0)));
+    expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
+    expect(recorderProps()).toMatchObject({
+      ownerId: OTHER_USER.id,
+      questionId: QUESTION_2.id,
+    });
+  });
+
+  it.each(['account', 'session'] as const)(
+    'rejects stale recorder callbacks after the %s identity changes and accepts current callbacks',
+    async (boundary) => {
+      let resolveCurrentQuestion!: (value: ReturnType<typeof nextPayload>) => void;
+      const currentQuestion = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+        resolveCurrentQuestion = resolve;
+      });
+      mockApiFetch
+        .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+        .mockReturnValueOnce(currentQuestion)
+        .mockResolvedValue(nextPayload(QUESTION_2, 0));
+      const rendered = await renderScreen();
+      expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+      const staleCallbacks = recorderProps();
+
+      mockAuthValue = makeAuth({
+        user: boundary === 'account' ? OTHER_USER : USER,
+        sessionVersion: boundary === 'account' ? 1 : 2,
+      });
+      await rendered.rerenderScreen();
+      await act(async () => resolveCurrentQuestion(nextPayload(QUESTION_2, 0)));
+      expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
+      const currentCallbacks = recorderProps();
+      expect(currentCallbacks).not.toBe(staleCallbacks);
+      alertSpy.mockClear();
+      const callsBeforeStaleRecovery = mockApiFetch.mock.calls.length;
+
+      await act(async () => {
+        staleCallbacks.onResult({
+          passed: true,
+          score: 99,
+          transcript: 'stale transcript',
+          feedback: 'stale feedback',
+          done: false,
+          nextQuestion: QUESTION_1,
+        });
+        staleCallbacks.onError('stale upload failure');
+        staleCallbacks.onRecoveryUnresolved();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+
+      expect(screen.queryByText('Answer received')).toBeNull();
+      expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
+      expect(alertSpy).not.toHaveBeenCalled();
+      expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleRecovery);
+
+      await act(async () => {
+        currentCallbacks.onError('current upload failure');
+        currentCallbacks.onRecoveryUnresolved();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(alertSpy).toHaveBeenCalledWith(
+        'Could not assess your answer',
+        'current upload failure',
+      );
+      expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleRecovery + 1);
+
+      await act(async () =>
+        currentCallbacks.onResult({
+          passed: true,
+          score: 90,
+          transcript: 'current transcript',
+          feedback: 'current feedback',
+          done: false,
+          nextQuestion: QUESTION_1,
+        }),
+      );
+      expect(screen.getByText('Answer received')).toBeTruthy();
+    },
+  );
+
+  it('invalidates captured recorder callbacks when the diagnostic screen unmounts', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen();
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+    const staleCallbacks = recorderProps();
+    const callsBeforeUnmount = mockApiFetch.mock.calls.length;
+
+    await rendered.unmount();
+    alertSpy.mockClear();
+    await act(async () => {
+      staleCallbacks.onError('late upload failure');
+      staleCallbacks.onRecoveryUnresolved();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeUnmount);
   });
 
   it('acknowledges an answer and advances to the next question', async () => {
@@ -224,7 +384,9 @@ describe('diagnostic screen', () => {
 
   it('reveals the level and completes the diagnostic', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
-    await renderScreen();
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(queryClient);
     await screen.findByText('Describe a time you showed courage.');
 
     const result: DiagnosticAnswerResult = {
@@ -248,7 +410,43 @@ describe('diagnostic screen', () => {
       diagnosticCompleted: true,
       cefrLevel: 'B2',
     });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
+  });
+
+  it('does not complete the profile when the user disappears before acknowledgement', async () => {
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2' });
+    const rendered = await renderScreen();
+    expect(await screen.findByText('Diagnostic complete!')).toBeTruthy();
+    const originalSetUser = mockAuthValue.setUser;
+
+    mockAuthValue = makeAuth({ user: null, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+    expect(screen.queryByRole('button', { name: 'Start Practicing' })).toBeNull();
+
+    expect(originalSetUser).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps the current result visible when an incomplete result has no next question', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: false,
+        score: 40,
+        transcript: 'An answer.',
+        feedback: 'Try again.',
+        done: false,
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
+
+    expect(screen.getByText('Answer received')).toBeTruthy();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(mockRecorderProps?.questionId).toBe(QUESTION_1.id);
   });
 
   it('shows the completion view immediately when the test is already done', async () => {
@@ -313,10 +511,11 @@ describe('diagnostic screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await fireEvent.press(screen.getByRole('button', { name: 'Account & privacy' }));
-    expect(alertSpy).toHaveBeenCalledWith('Account & privacy', undefined, expect.any(Array));
-    const buttons = alertSpy.mock.calls.at(-1)?.[2] as { text?: string }[];
-    expect(buttons).toHaveLength(3);
-    expect(buttons).toEqual(expect.arrayContaining([expect.objectContaining({ text: 'Cancel' })]));
+    expect(alertSpy).toHaveBeenCalledWith('Account & privacy', undefined, [
+      { text: 'Change Password', onPress: expect.any(Function) },
+      { text: 'Delete Account', style: 'destructive', onPress: expect.any(Function) },
+      { text: 'Cancel', style: 'cancel' },
+    ]);
 
     await pressAlertButton('Change Password');
     expect(mockRouter.push).toHaveBeenCalledWith('/settings/change-password');

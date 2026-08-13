@@ -15,17 +15,13 @@ export interface MigrationManifestEntry {
 
 export type SchemaQuery = (text: string, values?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 
-let cachedManifest: readonly MigrationManifestEntry[] | undefined;
-
-export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
-  if (cachedManifest) return cachedManifest;
-
+export function migrationManifestFromDirectory(migrationsDirectory: string): readonly MigrationManifestEntry[] {
   const entries = fs
-    .readdirSync(MIGRATIONS_DIR)
+    .readdirSync(migrationsDirectory)
     .filter((name) => name.endsWith('.sql'))
     .sort()
     .map((name) => {
-      const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, name), 'utf8');
+      const sql = fs.readFileSync(path.join(migrationsDirectory, name), 'utf8');
       return Object.freeze({
         name,
         checksum: createHash('sha256').update(sql).digest('hex'),
@@ -36,8 +32,11 @@ export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
     throw new Error('No database migrations were packaged with this release');
   }
 
-  cachedManifest = Object.freeze(entries);
-  return cachedManifest;
+  return Object.freeze(entries);
+}
+
+export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
+  return migrationManifestFromDirectory(MIGRATIONS_DIR);
 }
 
 const queryPool: SchemaQuery = async (text, values) => pool.query(text, values ? [...values] : undefined);

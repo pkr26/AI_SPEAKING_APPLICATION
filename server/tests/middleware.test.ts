@@ -1,11 +1,11 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import request from 'supertest';
 import { randomUUID } from 'crypto';
 import { config } from '../src/config';
-import { errorHandler, h, HttpError, JWT_AUDIENCE, JWT_ISSUER } from '../src/middleware';
+import { AuthedRequest, errorHandler, h, HttpError, JWT_AUDIENCE, JWT_ISSUER, requireAuth } from '../src/middleware';
 import { app, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -82,6 +82,28 @@ describe('requireAuth', () => {
     expect(stale.status).toBe(401);
     expect(stale.body.error).toContain('no longer valid');
   });
+
+  it('forwards a user lookup rejection exactly once without rewriting it as a 401', async () => {
+    const databaseError = new Error('database unavailable');
+    const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(databaseError as never);
+    const req = {
+      headers: { authorization: `Bearer ${sign({ sub: randomUUID(), tv: 1 })}` },
+    } as AuthedRequest;
+    const res = { status: vi.fn(), json: vi.fn() };
+    res.status.mockReturnValue(res);
+    const next = vi.fn();
+
+    try {
+      await requireAuth(req, res as never, next);
+      expect(next).toHaveBeenCalledOnce();
+      expect(next).toHaveBeenCalledWith(databaseError);
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).not.toHaveBeenCalled();
+      expect(req.user).toBeUndefined();
+    } finally {
+      query.mockRestore();
+    }
+  });
 });
 
 describe('validate', () => {
@@ -126,6 +148,8 @@ describe('errorHandler', () => {
     );
     a.get('/multer-size', (_req, _res, next) => next(new multer.MulterError('LIMIT_FILE_SIZE')));
     a.get('/multer-other', (_req, _res, next) => next(new multer.MulterError('LIMIT_FIELD_COUNT')));
+    a.get('/request-aborted', (_req, _res, next) => next({ type: 'request.aborted' }));
+    a.get('/request-size-invalid', (_req, _res, next) => next({ type: 'request.size.invalid' }));
     a.get(
       '/boom',
       h(async () => {
@@ -183,6 +207,15 @@ describe('errorHandler', () => {
     expect(charset.status).toBe(415);
     expect(charset.body).toEqual({ error: 'Unsupported request body encoding' });
   });
+
+  it.each(['/request-aborted', '/request-size-invalid'])(
+    'maps parser protocol failure %s to a stable 400',
+    async (path) => {
+      const res = await request(buildApp()).get(path);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Invalid request body' });
+    },
+  );
 
   it('maps unexpected errors to a generic 500', async () => {
     const res = await request(buildApp()).get('/boom');

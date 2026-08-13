@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
+  "testRunner": "vitest",
+  "vitest": {
+    "configFile": "vitest.catalog-mutation.config.mts",
+    "related": false
+  },
+  "mutate": ["db/seed-data.ts"],
+  "ignorePatterns": ["/.env", "/.env.*", "/coverage", "/dist", "/uploads", "/reports", "/.stryker-tmp"],
+  "ignoreStatic": false,
+  "coverageAnalysis": "perTest",
+  "timeoutMS": 10000,
+  "timeoutFactor": 2,
+  "concurrency": 1,
+  "tempDirName": ".stryker-catalog-tmp",
+  "cleanTempDir": true,
+  "reporters": ["clear-text", "progress", "html", "json"],
+  "htmlReporter": { "fileName": "reports/mutation/catalog.html" },
+  "jsonReporter": { "fileName": "reports/mutation/catalog.json" },
+  "thresholds": { "high": 100, "low": 100, "break": 100 }
+}

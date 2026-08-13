@@ -37,13 +37,18 @@ function acquireInspectionSlot(): () => void {
     inspectionsInFlight--;
   };
 }
+/** Build the complete, allowlisted environment passed to the native parser. */
+export function buildAudioInspectorEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return {
+    LANG: 'C',
+    LC_ALL: 'C',
+    ...(source.PATH ? { PATH: source.PATH } : {}),
+    ...(source.SystemRoot ? { SystemRoot: source.SystemRoot } : {}),
+  };
+}
+
 // Do not expose database/provider/storage credentials to the native parser.
-const INSPECTOR_ENV: NodeJS.ProcessEnv = {
-  LANG: 'C',
-  LC_ALL: 'C',
-  ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-  ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-};
+const INSPECTOR_ENV = buildAudioInspectorEnvironment(process.env);
 
 // Select the one demuxer family implied by the already magic-checked upload
 // extension. Besides reducing native parser attack surface, this prevents an
@@ -88,15 +93,18 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
   const inputFormat = INPUT_FORMAT_BY_EXTENSION[path.extname(filePath).toLowerCase()];
   if (!inputFormat) return Promise.reject(new InspectionError('invalid'));
 
-  let inputFd = -1;
+  let inputFd: number | undefined;
   const closeInput = () => {
-    if (inputFd < 0) return;
+    if (inputFd === undefined) return;
+    const fd = inputFd;
+    // Mark closed before the syscall so even an exceptional close remains
+    // idempotent and can never act on a later descriptor reuse.
+    inputFd = undefined;
     try {
-      fs.closeSync(inputFd);
+      fs.closeSync(fd);
     } catch {
       // The child has its own duplicate after spawn; this is best-effort.
     }
-    inputFd = -1;
   };
   try {
     // Open the private upload ourselves, refuse a final-component symlink, and
@@ -260,7 +268,9 @@ function runAudioInspectorAvailabilityCheck(): Promise<void> {
     });
     child.once('error', () => finish(new Error('FFmpeg is unavailable')));
     child.once('close', (code) => {
-      if (code === 0 && /^ffmpeg version\s+/m.test(versionOutput)) finish();
+      // The configured executable must identify itself at the very beginning
+      // of its bounded stdout. A later, injected-looking line is insufficient.
+      if (code === 0 && /^ffmpeg version[\t ]+\S/.test(versionOutput)) finish();
       else finish(new Error('FFmpeg is unavailable'));
     });
   });

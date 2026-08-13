@@ -18,7 +18,7 @@ import {
   useAuth,
 } from '../src/lib/auth';
 import { clearPendingAssessment } from '../src/lib/pending-assessment';
-import type { User } from '../src/lib/types';
+import { ContractError, type User } from '../src/lib/types';
 
 // React 19 requires this opt-in before act() can track async updates.
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -155,6 +155,18 @@ beforeEach(() => {
 });
 
 describe('AuthProvider session restore', () => {
+  it('stays in the restoring state until secure storage settles', async () => {
+    const stored = deferred<string | null>();
+    mockedGetToken.mockReturnValue(stored.promise);
+
+    await renderTree(new QueryClient());
+
+    expect(text('isRestoring')).toBe('true');
+    expect(text('token')).toBe('null');
+    await act(async () => stored.resolve(null));
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+  });
+
   it('restores a persisted token and bumps sessionVersion', async () => {
     const { clearSpy } = await renderAuth('tok-stored');
 
@@ -184,10 +196,15 @@ describe('AuthProvider session restore', () => {
       'Secure session storage is temporarily unavailable. Unlock your device and try again.',
     );
 
-    mockedGetToken.mockResolvedValueOnce('tok-recovered');
+    const retry = deferred<string | null>();
+    mockedGetToken.mockReturnValueOnce(retry.promise);
     await act(async () => {
       auth!.retrySessionRestore();
     });
+    expect(text('isRestoring')).toBe('true');
+    expect(text('restoreError')).toBe('null');
+
+    await act(async () => retry.resolve('tok-recovered'));
     await waitFor(() => expect(text('token')).toBe('tok-recovered'));
     expect(text('restoreError')).toBe('null');
     expect(text('sessionVersion')).toBe('1');
@@ -305,9 +322,40 @@ describe('register', () => {
     expect(text('token')).toBe('tok-registered');
     expect(text('sessionVersion')).toBe('2');
   });
+
+  it('releases the transition guard after a failed registration', async () => {
+    await renderAuth(null);
+    const failure = new ApiError(500, 'Request failed with status 500');
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.register('Test User', 'a@example.com', 'secret1', 'hi')).rejects.toBe(
+        failure,
+      );
+    });
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-register-retry'));
+    await act(async () => {
+      await auth!.register('Test User', 'a@example.com', 'secret1', 'hi');
+    });
+    expect(text('token')).toBe('tok-register-retry');
+  });
 });
 
 describe('logout', () => {
+  it('uses stable, actionable cleanup error names and messages', () => {
+    expect(new LogoutCleanupError()).toMatchObject({
+      name: 'LogoutCleanupError',
+      message:
+        'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
+    });
+    expect(new AccountDeletedCleanupError()).toMatchObject({
+      name: 'AccountDeletedCleanupError',
+      message:
+        'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
+    });
+  });
+
   it('revokes the token and resets the session', async () => {
     const { clearSpy } = await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
@@ -342,7 +390,21 @@ describe('logout', () => {
     expect(text('sessionVersion')).toBe('3');
   });
 
-  it('aborts the logout when the server call fails for another reason', async () => {
+  it('logs out an in-memory session with no persisted token without invoking conditional cleanup', async () => {
+    await renderAuth(null);
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearToken.mockClear();
+
+    await act(async () => {
+      await auth!.logout();
+    });
+
+    expect(mockedClearToken).not.toHaveBeenCalled();
+    expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(text('token')).toBe('null');
+  });
+
+  it('aborts a failed logout and releases the transition guard for a retry', async () => {
     await renderLoggedIn();
     const failure = new ApiError(500, 'Request failed with status 500');
     mockedApiFetch.mockRejectedValueOnce(failure);
@@ -354,6 +416,12 @@ describe('logout', () => {
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(text('token')).toBe('tok-1');
     expect(text('sessionVersion')).toBe('2');
+
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      await auth!.logout();
+    });
+    expect(text('token')).toBe('null');
   });
 
   it('still resets the session when clearing the persisted token fails', async () => {
@@ -368,6 +436,30 @@ describe('logout', () => {
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('reports a conditional token-cleanup miss after server-side logout', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearToken.mockResolvedValueOnce(false);
+
+    let error: unknown;
+    await act(async () => {
+      try {
+        await auth!.logout();
+      } catch (caught) {
+        error = caught;
+      }
+    });
+
+    expect(error).toBeInstanceOf(LogoutCleanupError);
+    expect(error).toMatchObject({
+      name: 'LogoutCleanupError',
+      message:
+        'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
+    });
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
   });
 
   it('reports pending-assessment cleanup failure after revoking the session', async () => {
@@ -574,6 +666,71 @@ describe('changePassword', () => {
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
+  it('does not treat an arbitrary object with status 401 as an authentication error', async () => {
+    await renderLoggedIn();
+    const failure = { status: 401, message: 'not an ApiError' };
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(failure);
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + change-password; no /auth/me
+    expect(text('token')).toBe('tok-1');
+    expect(mockedClearToken).not.toHaveBeenCalled();
+  });
+
+  it('preserves a valid session when change-password fails before receiving a response', async () => {
+    await renderLoggedIn();
+    const failure = new ApiError(500, 'Request failed with status 500');
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(failure);
+    });
+
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(mockedClearToken).not.toHaveBeenCalled();
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + change-password; no /auth/me
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-after-retry'));
+    await act(async () => auth!.changePassword('secret1', 'secret2'));
+    expect(text('token')).toBe('tok-after-retry');
+  });
+
+  it.each([
+    ['a non-auth API failure', new ApiError(500, 'Request failed with status 500')],
+    ['a malformed verification response', new ContractError()],
+  ])(
+    'preserves the session after credential verification encounters %s and permits a retry',
+    async (_label, verificationFailure) => {
+      await renderLoggedIn();
+      const credentialFailure = new ApiError(401, 'Request failed with status 401');
+      mockedApiFetch.mockImplementation((async (path: string) => {
+        if (path === '/auth/change-password') throw credentialFailure;
+        if (path === '/auth/me') throw verificationFailure;
+        throw new Error(`unexpected apiFetch call: ${path}`);
+      }) as unknown as typeof apiFetch);
+
+      await act(async () => {
+        await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(credentialFailure);
+      });
+
+      expect(text('token')).toBe('tok-1');
+      expect(text('userEmail')).toBe(USER.email);
+      expect(text('sessionVersion')).toBe('2');
+      expect(mockedClearToken).not.toHaveBeenCalled();
+
+      mockedApiFetch.mockReset();
+      mockedApiFetch.mockResolvedValueOnce(authResponse('tok-after-verification-failure'));
+      await act(async () => {
+        await auth!.changePassword('secret1', 'secret2');
+      });
+      expect(text('token')).toBe('tok-after-verification-failure');
+    },
+  );
+
   it('expires the session when the post-401 verification also fails with 401', async () => {
     await renderLoggedIn();
     const failure = new ApiError(401, 'Request failed with status 401');
@@ -630,6 +787,20 @@ describe('deleteAccount', () => {
     expect(text('sessionVersion')).toBe('3');
   });
 
+  it('finishes account deletion without conditional token cleanup when no token is persisted', async () => {
+    await renderAuth(null);
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearToken.mockClear();
+
+    await act(async () => {
+      await auth!.deleteAccount('secret1');
+    });
+
+    expect(mockedClearToken).not.toHaveBeenCalled();
+    expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(text('token')).toBe('null');
+  });
+
   it('still resets the session when clearing the persisted token fails', async () => {
     await renderLoggedIn();
     mockedApiFetch.mockResolvedValueOnce(undefined);
@@ -643,6 +814,30 @@ describe('deleteAccount', () => {
 
     expect(text('token')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('reports a conditional token-cleanup miss after the account was deleted', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearToken.mockResolvedValueOnce(false);
+
+    let error: unknown;
+    await act(async () => {
+      try {
+        await auth!.deleteAccount('secret1');
+      } catch (caught) {
+        error = caught;
+      }
+    });
+
+    expect(error).toBeInstanceOf(AccountDeletedCleanupError);
+    expect(error).toMatchObject({
+      name: 'AccountDeletedCleanupError',
+      message:
+        'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
+    });
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
   });
 
   it('reports pending-assessment cleanup failure after deleting the account', async () => {
@@ -678,6 +873,44 @@ describe('deleteAccount', () => {
     expect(text('token')).toBe('tok-1');
     expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
+
+    mockedApiFetch.mockReset();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      await auth!.deleteAccount('secret1');
+    });
+    expect(text('token')).toBe('null');
+  });
+
+  it('does not verify or expire for a non-ApiError object carrying status 401', async () => {
+    await renderLoggedIn();
+    const failure = { status: 401, message: 'untrusted status property' };
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(mockedClearToken).not.toHaveBeenCalled();
+  });
+
+  it('does not verify or expire after a non-401 account-deletion API failure', async () => {
+    await renderLoggedIn();
+    const failure = new ApiError(429, 'Request failed with status 429');
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('2');
+    expect(mockedClearToken).not.toHaveBeenCalled();
   });
 });
 
@@ -704,6 +937,43 @@ describe('epoch race guards', () => {
     expect(text('userEmail')).toBe(USER.email);
   });
 
+  it('does not let a late restore failure erase a freshly established session', async () => {
+    const stored = deferred<string | null>();
+    mockedGetToken.mockReturnValue(stored.promise);
+    await renderTree(new QueryClient());
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+
+    await act(async () => {
+      stored.reject(new Error('late keychain failure'));
+      await stored.promise.catch(() => undefined);
+    });
+
+    expect(text('token')).toBe('tok-login');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(text('restoreError')).toBe('null');
+  });
+
+  it('removes the revoked old token when a completed password rotation is cancelled before save', async () => {
+    const rendered = await renderLoggedIn('tok-old');
+    mockedSaveToken.mockClear();
+    mockedClearToken.mockClear();
+    const response = deferred<unknown>();
+    mockedApiFetch.mockReturnValueOnce(response.promise);
+
+    const rotation = auth!.changePassword('secret1', 'secret2');
+    await Promise.resolve();
+    await rendered.unmount();
+    response.resolve(authResponse('tok-rotated'));
+
+    await expect(rotation).rejects.toThrow('The account operation was cancelled.');
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-old');
+  });
+
   it('conditionally removes a token whose save finishes after unmount', async () => {
     const rendered = await renderAuth(null);
     const write = deferred<void>();
@@ -721,6 +991,29 @@ describe('epoch race guards', () => {
     write.resolve();
     await expect(login).rejects.toThrow('The account operation was cancelled.');
     expect(mockedClearToken).toHaveBeenCalledWith('tok-late');
+  });
+
+  it('does not persist a new token when unmounted while old-account cleanup is pending', async () => {
+    const rendered = await renderLoggedIn();
+    mockedSaveToken.mockClear();
+    const cleanup = deferred<void>();
+    mockedClearPendingAssessment.mockReturnValueOnce(cleanup.promise);
+
+    await act(async () => registeredUnauthorizedHandler()('tok-1'));
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1));
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-must-not-save'));
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+
+    await rendered.unmount();
+    cleanup.resolve();
+    await expect(login).rejects.toThrow('The account operation was cancelled.');
+    expect(mockedSaveToken).not.toHaveBeenCalled();
   });
 });
 

@@ -6,7 +6,7 @@ import { Alert } from 'react-native';
 import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
 import { ApiError } from '../src/lib/api';
-import { AccountDeletedCleanupError, useAuth } from '../src/lib/auth';
+import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
 import type { User } from '../src/lib/types';
 
 // ----- expo-router mock -----
@@ -55,6 +55,16 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 jest.mock('../src/lib/auth', () => ({
   ...jest.requireActual('../src/lib/auth'),
   useAuth: () => mockAuthValue,
@@ -84,11 +94,16 @@ function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
-function alertButtons(): { text?: string; onPress?: () => void }[] {
+function alertButtons(): {
+  text?: string;
+  style?: 'default' | 'cancel' | 'destructive';
+  onPress?: () => void;
+}[] {
   const calls = alertSpy.mock.calls;
   if (calls.length === 0) throw new Error('Alert.alert was not called');
   return (calls[calls.length - 1][2] ?? []) as {
     text?: string;
+    style?: 'default' | 'cancel' | 'destructive';
     onPress?: () => void;
   }[];
 }
@@ -135,17 +150,43 @@ describe('change password screen', () => {
     expect(updateButton().props.accessibilityState.disabled).toBe(false);
   });
 
+  it('requires an explicit matching confirmation and exposes complete disabled state', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', '');
+
+    expect(updateButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
+    expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+  });
+
+  it('configures every password field as private with the shared input limit', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    for (const label of ['Current password', 'New password', 'Confirm new password']) {
+      expect(screen.getByLabelText(label).props).toMatchObject({
+        secureTextEntry: true,
+        maxLength: MAX_PASSWORD_UTF8_BYTES,
+      });
+    }
+    expect(screen.getByLabelText('Current password').props.textContentType).toBe('password');
+    expect(screen.getByLabelText('New password').props.textContentType).toBe('newPassword');
+    expect(screen.getByLabelText('Confirm new password').props.textContentType).toBe('newPassword');
+  });
+
   it('shows a mismatch error when confirmation differs', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
-    expect(screen.getByText('Passwords do not match.')).toBeTruthy();
+    expect(screen.getByText('Passwords do not match.').props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
   it('enforces the password policy on the new password', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'short', 'short');
-    expect(screen.getByText('Password must be at least 8 characters.')).toBeTruthy();
+    expect(
+      screen.getByText('Password must be at least 8 characters.').props.accessibilityLiveRegion,
+    ).toBe('polite');
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'abcdefgh', 'abcdefgh');
@@ -183,25 +224,28 @@ describe('change password screen', () => {
   });
 
   it('shows the busy state while updating', async () => {
-    let resolveChange!: () => void;
-    mockAuthValue.changePassword = jest.fn(
-      () => new Promise<void>((resolve) => (resolveChange = resolve)),
-    );
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest.fn(() => change.promise);
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     // fireEvent.press awaits the async handler; keep it pending while busy.
     const pressPromise = fireEvent.press(updateButton());
 
-    const busyButton = await screen.findByRole('button', {
-      name: 'Updating…',
-    });
-    expect(busyButton.props.accessibilityState).toEqual({
-      disabled: true,
-      busy: true,
-    });
-
-    await act(async () => resolveChange());
-    await pressPromise;
+    try {
+      const busyButton = await screen.findByRole('button', {
+        name: 'Updating…',
+      });
+      expect(busyButton.props.accessibilityState).toEqual({
+        disabled: true,
+        busy: true,
+      });
+    } finally {
+      try {
+        await act(async () => change.resolve(undefined));
+      } finally {
+        await pressPromise;
+      }
+    }
     await waitFor(() => expect(alertSpy).toHaveBeenCalled());
   });
 
@@ -236,7 +280,10 @@ describe('change password screen', () => {
   });
 
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new Error('storage full'));
+    mockAuthValue.changePassword = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('storage full'))
+      .mockResolvedValueOnce(undefined);
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
@@ -244,6 +291,17 @@ describe('change password screen', () => {
     expect(
       await screen.findByText('Could not change your password. Please try again.'),
     ).toBeTruthy();
+    expect(updateButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
+
+    await fireEvent.press(updateButton());
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        'Password updated',
+        expect.any(String),
+        expect.any(Array),
+      ),
+    );
+    expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -261,7 +319,12 @@ describe('delete account screen', () => {
   it('renders the permanence warning and keeps delete disabled initially', async () => {
     await renderScreen(<DeleteAccountScreen />);
     expect(screen.getByText('This action is permanent')).toBeTruthy();
-    expect(deleteButton().props.accessibilityState.disabled).toBe(true);
+    expect(deleteButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
+    expect(screen.getByLabelText('Confirm your password').props).toMatchObject({
+      secureTextEntry: true,
+      textContentType: 'password',
+      maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
   });
 
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
@@ -279,7 +342,10 @@ describe('delete account screen', () => {
     expect(alertSpy).toHaveBeenCalledWith(
       'Delete your account?',
       'This permanently deletes your account and all progress. This cannot be undone.',
-      expect.any(Array),
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: expect.any(Function) },
+      ],
     );
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
@@ -307,17 +373,23 @@ describe('delete account screen', () => {
   });
 
   it('shows the busy state while deleting', async () => {
-    let resolveDelete!: () => void;
-    mockAuthValue.deleteAccount = jest.fn(
-      () => new Promise<void>((resolve) => (resolveDelete = resolve)),
-    );
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    const pressPromise = pressAlertButton('Delete');
 
-    expect(await screen.findByText('Deleting…')).toBeTruthy();
-    await act(async () => resolveDelete());
+    try {
+      const busyButton = await screen.findByRole('button', { name: 'Deleting…' });
+      expect(busyButton.props.accessibilityState).toEqual({ disabled: true, busy: true });
+    } finally {
+      try {
+        await pressPromise;
+      } finally {
+        await act(async () => deletion.resolve(undefined));
+      }
+    }
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
         'Account deleted',
@@ -348,6 +420,18 @@ describe('delete account screen', () => {
     expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
   });
 
+  it('maps delete service failures to safe shared copy', async () => {
+    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new ApiError(500, 'private detail'));
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton('Delete');
+
+    expect(
+      await screen.findByText('The service is temporarily unavailable. Please try again later.'),
+    ).toBeTruthy();
+  });
+
   it('surfaces local cleanup failures after deletion', async () => {
     mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new AccountDeletedCleanupError());
     await renderScreen(<DeleteAccountScreen />);
@@ -364,7 +448,10 @@ describe('delete account screen', () => {
   });
 
   it('falls back to generic copy for non-API errors', async () => {
-    mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new Error('network down'));
+    mockAuthValue.deleteAccount = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('network down'))
+      .mockResolvedValueOnce(undefined);
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
@@ -373,5 +460,17 @@ describe('delete account screen', () => {
     expect(
       await screen.findByText('Could not delete your account. Please try again.'),
     ).toBeTruthy();
+    expect(deleteButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
+
+    await fireEvent.press(deleteButton());
+    await pressAlertButton('Delete');
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        'Account deleted',
+        expect.any(String),
+        expect.any(Array),
+      ),
+    );
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(2);
   });
 });

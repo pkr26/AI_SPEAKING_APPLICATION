@@ -10,7 +10,7 @@ export default defineConfig({
     pool: 'forks',
     maxWorkers: 1,
     // Stryker sandboxes contain copies of the tests; never pick them up.
-    exclude: ['**/node_modules/**', '**/dist/**', '.stryker-tmp/**'],
+    exclude: ['**/node_modules/**', '**/dist/**', '.stryker-tmp/**', '.stryker-catalog-tmp/**'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],

@@ -6,6 +6,7 @@
 import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import dotenv from 'dotenv';
 import { Client } from 'pg';
 
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
@@ -18,14 +19,50 @@ function databaseClient(connectionString: string): Client {
   return new Client({ connectionString, connectionTimeoutMillis: CONNECTION_TIMEOUT_MS });
 }
 
+type CapturedError = { value: unknown };
+
+/**
+ * Run every cleanup action, preserving an error that is already propagating.
+ * Connection, rollback, and advisory-unlock failures must never replace the
+ * migration/seed failure that operators need in order to diagnose a deploy.
+ */
+async function cleanupPreservingPrimaryError(
+  actions: Array<() => Promise<unknown>>,
+  primaryError?: CapturedError,
+): Promise<void> {
+  let firstError = primaryError;
+  for (const action of actions) {
+    try {
+      await action();
+    } catch (error) {
+      firstError ??= { value: error };
+    }
+  }
+  if (!primaryError && firstError) throw firstError.value;
+}
+
 async function setOperationTimeouts(client: Client): Promise<void> {
   await client.query("SELECT set_config('statement_timeout', $1, false)", [String(MIGRATION_STATEMENT_TIMEOUT_MS)]);
   await client.query("SELECT set_config('lock_timeout', $1, false)", [String(MIGRATION_LOCK_TIMEOUT_MS)]);
 }
 
 function parseDbName(dbUrl: string): string {
-  const dbName = decodeURIComponent(new URL(dbUrl).pathname.replace(/^\//, ''));
-  if (!dbName) throw new Error('DATABASE_URL must include a database name');
+  let parsed: URL;
+  try {
+    parsed = new URL(dbUrl);
+  } catch {
+    throw new Error('DATABASE_URL must be a valid PostgreSQL URL');
+  }
+  if (parsed.protocol !== 'postgres:' && parsed.protocol !== 'postgresql:') {
+    throw new Error('DATABASE_URL must use the postgres or postgresql protocol');
+  }
+  let dbName: string;
+  try {
+    dbName = decodeURIComponent(parsed.pathname.slice(1));
+  } catch {
+    throw new Error('DATABASE_URL contains an invalid encoded database name');
+  }
+  if (!dbName || dbName.includes('/')) throw new Error('DATABASE_URL must include exactly one database name');
   return dbName;
 }
 
@@ -36,6 +73,7 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
   adminUrl.pathname = '/postgres';
   const admin = databaseClient(adminUrl.toString());
   await admin.connect();
+  let operationError: CapturedError | undefined;
   try {
     await setOperationTimeouts(admin);
     const { rows } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
@@ -45,8 +83,11 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
     } else {
       log(`database "${dbName}" already exists`);
     }
+  } catch (error) {
+    operationError = { value: error };
+    throw error;
   } finally {
-    await admin.end();
+    await cleanupPreservingPrimaryError([() => admin.end()], operationError);
   }
 }
 
@@ -59,6 +100,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
   const client = databaseClient(dbUrl);
   await client.connect();
   const applied: string[] = [];
+  let operationError: CapturedError | undefined;
   try {
     await setOperationTimeouts(client);
     const lock = await client.query<{ locked: boolean }>(
@@ -67,6 +109,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
     if (!lock.rows[0].locked) {
       throw new Error('another migration or seed operation is already in progress');
     }
+    let migrationError: CapturedError | undefined;
     try {
       await client.query(
         `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -111,19 +154,28 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
           await client.query('INSERT INTO schema_migrations (name, checksum) VALUES ($1, $2)', [file, checksum]);
           await client.query('COMMIT');
         } catch (err) {
-          await client.query('ROLLBACK');
+          await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], { value: err });
           throw err;
         }
         applied.push(file);
         log(`applied migration ${file}`);
       }
       await client.query('ALTER TABLE schema_migrations ALTER COLUMN checksum SET NOT NULL');
+    } catch (error) {
+      migrationError = { value: error };
+      throw error;
     } finally {
-      await client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
+      await cleanupPreservingPrimaryError(
+        [() => client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))")],
+        migrationError,
+      );
     }
     if (applied.length === 0) log('no pending migrations');
+  } catch (error) {
+    operationError = { value: error };
+    throw error;
   } finally {
-    await client.end();
+    await cleanupPreservingPrimaryError([() => client.end()], operationError);
   }
   return applied;
 }
@@ -133,6 +185,7 @@ export async function seed(dbUrl: string, log: (msg: string) => void = console.l
   const client = databaseClient(dbUrl);
   await client.connect();
   let operationLockHeld = false;
+  let operationError: CapturedError | undefined;
   try {
     await setOperationTimeouts(client);
     const lock = await client.query<{ locked: boolean }>(
@@ -147,51 +200,94 @@ export async function seed(dbUrl: string, log: (msg: string) => void = console.l
       await client.query(fs.readFileSync(SEED_FILE, 'utf8'));
       await client.query('COMMIT');
     } catch (error) {
-      await client.query('ROLLBACK');
+      await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], { value: error });
       throw error;
     }
     const { rows: counts } = await client.query(
       'SELECT cefr_level, count(*)::int AS n FROM questions GROUP BY cefr_level ORDER BY cefr_level',
     );
     log('questions per level: ' + JSON.stringify(counts));
+  } catch (error) {
+    operationError = { value: error };
+    throw error;
   } finally {
-    if (operationLockHeld) {
-      await client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))").catch(() => undefined);
-    }
-    await client.end();
+    await cleanupPreservingPrimaryError(
+      [
+        ...(operationLockHeld
+          ? [() => client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))")]
+          : []),
+        () => client.end(),
+      ],
+      operationError,
+    );
   }
 }
 
-export async function setupDatabase(dbUrl: string, log: (msg: string) => void = console.log): Promise<void> {
-  await ensureDatabase(dbUrl, log);
-  await migrate(dbUrl, log);
-  await seed(dbUrl, log);
+export interface DatabaseSetupSteps {
+  ensure: typeof ensureDatabase;
+  migrate: typeof migrate;
+  seed: typeof seed;
 }
 
-async function main() {
-  const { default: dotenv } = await import('dotenv');
-  dotenv.config();
-  const databaseUrl = process.env.DATABASE_URL;
+const defaultSetupSteps: DatabaseSetupSteps = {
+  ensure: ensureDatabase,
+  migrate,
+  seed,
+};
+
+export async function setupDatabase(
+  dbUrl: string,
+  log: (msg: string) => void = console.log,
+  steps: DatabaseSetupSteps = defaultSetupSteps,
+): Promise<void> {
+  await steps.ensure(dbUrl, log);
+  await steps.migrate(dbUrl, log);
+  await steps.seed(dbUrl, log);
+}
+
+export type DatabaseCommand = 'migrate' | 'seed' | 'setup';
+
+export interface DatabaseCommandActions {
+  migrate: typeof migrate;
+  seed: typeof seed;
+  setup: typeof setupDatabase;
+}
+
+const defaultCommandActions: DatabaseCommandActions = {
+  migrate,
+  seed,
+  setup: setupDatabase,
+};
+
+export async function runDatabaseCommand(
+  databaseUrl: string | undefined,
+  command = 'setup',
+  actions: DatabaseCommandActions = defaultCommandActions,
+): Promise<void> {
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
-  const command = process.argv[2] ?? 'setup';
   if (command === 'migrate') {
-    await migrate(databaseUrl);
+    await actions.migrate(databaseUrl);
     return;
   }
   if (command === 'seed') {
-    await seed(databaseUrl);
+    await actions.seed(databaseUrl);
     return;
   }
   if (command === 'setup') {
-    await setupDatabase(databaseUrl);
+    await actions.setup(databaseUrl);
     return;
   }
   throw new Error(`unknown database command "${command}" (expected "setup", "migrate", or "seed")`);
 }
 
+// Stryker disable all: command dispatch is unit-tested and this process
+// identity/error boundary is subprocess-tested. Mutating require.main in the
+// Vitest host produces runner bootstrap errors rather than useful mutants.
 if (require.main === module) {
-  main().catch((err) => {
+  dotenv.config();
+  runDatabaseCommand(process.env.DATABASE_URL, process.argv[2]).catch((err) => {
     console.error(err);
     process.exit(1);
   });
 }
+// Stryker restore all

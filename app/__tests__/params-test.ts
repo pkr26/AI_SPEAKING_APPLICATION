@@ -2,6 +2,8 @@ import { firstParam, isUuid } from '../src/lib/params';
 import { parsePendingAssessment } from '../src/lib/pending-assessment';
 
 describe('route parameter helpers', () => {
+  const validUuid = '550e8400-e29b-41d4-a716-446655440000';
+
   it('uses the first repeated route parameter and preserves scalar values', () => {
     expect(firstParam(['first', 'second'])).toBe('first');
     expect(firstParam([])).toBeUndefined();
@@ -18,17 +20,79 @@ describe('route parameter helpers', () => {
     expect(isUuid(value)).toBe(true);
   });
 
+  it.each(['1', '2', '3', '4', '5'])(
+    'accepts UUID version %s at the supported boundary',
+    (version) => {
+      expect(isUuid(`550e8400-e29b-${version}1d4-a716-446655440000`)).toBe(true);
+    },
+  );
+
+  it.each(['8', '9', 'a', 'b'])('accepts UUID variant nibble %s', (variant) => {
+    expect(isUuid(`550e8400-e29b-41d4-${variant}716-446655440000`)).toBe(true);
+  });
+
   it.each([
     undefined,
     '',
     'not-a-uuid',
     '550e8400e29b41d4a716446655440000',
     '550e8400-e29b-01d4-a716-446655440000',
+    '550e8400-e29b-61d4-a716-446655440000',
     '550e8400-e29b-41d4-c716-446655440000',
+    '550e8400-e29b-41d4-7716-446655440000',
     ' 550e8400-e29b-41d4-a716-446655440000',
     '550e8400-e29b-41d4-a716-446655440000?extra=1',
+    '550e8400-e29b-41d4-a716-446655440000#fragment',
+    '550e8400-e29b-41d4-a716-446655440000/path',
+    '550e8400-e29b-41d4-a716-446655440000%0A',
+    '550e8400-e29b-41d4-a716-446655440000\n',
+    '550e8400-e29b-41d4-a716-446655440000\r',
+    '550e8400-e29b-41d4-a716-446655440000\r\n',
+    '550e8400-e29b-41d4-a716-446655440000\t',
   ])('rejects malformed UUID %p', (value) => {
     expect(isUuid(value)).toBe(false);
+  });
+
+  it('requires every UUID segment to have its exact length', () => {
+    const malformedSegments = [
+      '550e840-e29b-41d4-a716-446655440000',
+      '550e84000-e29b-41d4-a716-446655440000',
+      '550e8400-e29-41d4-a716-446655440000',
+      '550e8400-e29bb-41d4-a716-446655440000',
+      '550e8400-e29b-41d-a716-446655440000',
+      '550e8400-e29b-41d44-a716-446655440000',
+      '550e8400-e29b-41d4-a71-446655440000',
+      '550e8400-e29b-41d4-a7166-446655440000',
+      '550e8400-e29b-41d4-a716-44665544000',
+      '550e8400-e29b-41d4-a716-4466554400000',
+    ];
+
+    for (const value of malformedSegments) expect(isUuid(value)).toBe(false);
+  });
+
+  it('requires all four UUID separators', () => {
+    const separatorIndexes = [8, 13, 18, 23];
+
+    for (const index of separatorIndexes) {
+      expect(isUuid(validUuid.slice(0, index) + validUuid.slice(index + 1))).toBe(false);
+    }
+  });
+
+  it.each(['', 'not-a-uuid', `${validUuid}\n`, `${validUuid}/smuggled`])(
+    'does not search later repeated parameters when the first value is %p',
+    (first) => {
+      const selected = firstParam([first, validUuid]);
+
+      expect(selected).toBe(first);
+      expect(isUuid(selected)).toBe(false);
+    },
+  );
+
+  it('ignores an unsafe duplicate after a valid first parameter', () => {
+    const selected = firstParam([validUuid, `${validUuid}/smuggled`]);
+
+    expect(selected).toBe(validUuid);
+    expect(isUuid(selected)).toBe(true);
   });
 });
 

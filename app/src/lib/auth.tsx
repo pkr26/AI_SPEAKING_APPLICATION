@@ -341,7 +341,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
           throw error;
         }
-        if (responseReceived && !(error instanceof ApiError && error.status === 401)) {
+        if (responseReceived) {
           expireSession();
         }
         throw error;

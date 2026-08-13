@@ -52,6 +52,23 @@ describe('durable assessment handoff', () => {
     expect(await loadPendingAssessment()).toBeNull();
   });
 
+  it('keeps a successful clear authoritative in the instrumented module cache', async () => {
+    await savePendingAssessment(pending);
+    await clearPendingAssessment(pending.requestId);
+
+    const getItem = jest.mocked(SecureStore.getItemAsync);
+    const originalImplementation = getItem.getMockImplementation();
+    getItem.mockClear();
+    getItem.mockRejectedValue(new Error('a stale secure-store read must not occur'));
+    try {
+      await expect(loadPendingAssessment()).resolves.toBeNull();
+      expect(getItem).not.toHaveBeenCalled();
+    } finally {
+      getItem.mockReset();
+      if (originalImplementation) getItem.mockImplementation(originalImplementation);
+    }
+  });
+
   it('persists the S3 key before upload and removes it when reconciling', async () => {
     await savePendingAssessment({ ...pending, stage: 'prepared' });
 

@@ -260,6 +260,27 @@ describe('audio inspection concurrency', () => {
     await proveNextSlotIsUsable();
   });
 
+  it('rejects an unsupported extension before native spawn and releases the slot', async () => {
+    const supportedPath = filePath;
+    const unsupportedPath = path.join(uploadsDir, `${randomUUID()}.txt`);
+    await fs.rename(supportedPath, unsupportedPath);
+    filePath = unsupportedPath;
+
+    try {
+      await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+        status: 415,
+        message: 'Invalid or unsupported audio file',
+      });
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      await fs.rename(unsupportedPath, supportedPath);
+      filePath = supportedPath;
+    }
+
+    await proveNextSlotIsUsable();
+    expect(spawnMock).toHaveBeenCalledOnce();
+  });
+
   it('closes the private descriptor only once even when closeSync throws', async () => {
     const close = vi.spyOn(nodeFs, 'closeSync').mockImplementationOnce(() => {
       throw new Error('close failed');

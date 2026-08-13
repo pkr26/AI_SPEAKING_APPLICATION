@@ -151,6 +151,17 @@ describe('database schema readiness', () => {
     }
   });
 
+  it('rejects a string count of six even when every CEFR inventory row is present', async () => {
+    const rows = completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '6' } : row));
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: successfulMigrationRows() })
+      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
+      .mockResolvedValueOnce({ rows });
+
+    await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow('Question inventory is incomplete');
+  });
+
   it.each(['schema', 'media inspector'] as const)('/ready hides a failed %s dependency check', async (failure) => {
     const sensitiveDetail = `${failure} failure with sensitive detail`;
     const a = createApp({

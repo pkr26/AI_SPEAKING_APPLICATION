@@ -210,6 +210,38 @@ describe('AuthProvider session restore', () => {
     expect(text('sessionVersion')).toBe('1');
   });
 
+  it('can retry more than once after repeated secure-storage read failures', async () => {
+    mockedGetToken
+      .mockRejectedValueOnce(new Error('keychain locked'))
+      .mockRejectedValueOnce(new Error('keychain still locked'))
+      .mockResolvedValueOnce('tok-recovered-after-two-retries');
+    await renderTree(new QueryClient());
+
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('restoreError')).toBe(
+      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+    );
+
+    await act(async () => {
+      auth!.retrySessionRestore();
+    });
+    await waitFor(() => expect(mockedGetToken).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('restoreError')).toBe(
+      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+    );
+
+    await act(async () => {
+      auth!.retrySessionRestore();
+    });
+    await waitFor(() => expect(text('token')).toBe('tok-recovered-after-two-retries'));
+
+    expect(mockedGetToken).toHaveBeenCalledTimes(3);
+    expect(text('restoreError')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+    expect(text('sessionVersion')).toBe('1');
+  });
+
   it('ignores a restore that resolves after unmount', async () => {
     const stored = deferred<string | null>();
     mockedGetToken.mockReturnValue(stored.promise);
@@ -762,6 +794,22 @@ describe('changePassword', () => {
     expect(text('userEmail')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).toHaveBeenCalled();
+  });
+
+  it('fails closed when token persistence reports a 401 after rotation', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-rotated'));
+    const persistenceFailure = new ApiError(401, 'secure storage rejected the replacement');
+    mockedSaveToken.mockRejectedValueOnce(persistenceFailure);
+
+    await act(async () => {
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(persistenceFailure);
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('3');
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
   });
 });
 

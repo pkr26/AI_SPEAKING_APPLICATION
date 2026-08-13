@@ -118,6 +118,16 @@ describe('practice feedback response bounds', () => {
     );
   });
 
+  it.each([
+    ['the requested language is absent', { translations: { hi: { examples: [{ en: 'नमस्ते' }] } } }],
+    ['the authored example list is empty', { translations: { te: { examples: [] } } }],
+    ['the first example has no English text', { translations: { te: { examples: [{ native: 'నా ఊరు' }] } } }],
+  ])('falls back when %s', (_caseName, malformedTranslation) => {
+    expect(authoredAnswerHint({ prompt_word: 'hometown', ...malformedTranslation }, 'te')).toBe(
+      'a few clear, on-topic sentences about "hometown"',
+    );
+  });
+
   it('caps unexpectedly large authored examples to the mobile contract', () => {
     const feedback = buildFinalFeedback('Keep practicing.', 'x'.repeat(10_000));
     expect(feedback).toHaveLength(MAX_FINAL_FEEDBACK_LENGTH);

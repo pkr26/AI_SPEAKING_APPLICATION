@@ -158,6 +158,15 @@ describe('change password screen', () => {
     expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
   });
 
+  it('does not submit valid replacement fields without the current password', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('', 'newpass1', 'newpass1');
+
+    expect(updateButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
+    await fireEvent.press(updateButton());
+    expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+  });
+
   it('configures every password field as private with the shared input limit', async () => {
     await renderScreen(<ChangePasswordScreen />);
 

@@ -160,6 +160,22 @@ function recorderProps(): CapturedRecorderProps {
   return mockRecorderProps;
 }
 
+function capturedPressHandler(accessibilityLabel: string): () => unknown {
+  type PressFiber = {
+    memoizedProps?: { onPress?: () => unknown };
+    return: PressFiber | null;
+  };
+  let fiber = screen.getByRole('button', {
+    name: accessibilityLabel,
+  }).unstable_fiber as unknown as PressFiber | null;
+  while (fiber) {
+    const onPress = fiber.memoizedProps?.onPress;
+    if (typeof onPress === 'function') return onPress;
+    fiber = fiber.return;
+  }
+  throw new Error(`Pressable "${accessibilityLabel}" not found`);
+}
+
 async function pressAlertButton(text: string) {
   const calls = alertSpy.mock.calls;
   const buttons = calls[calls.length - 1][2] as
@@ -336,6 +352,88 @@ describe('diagnostic screen', () => {
         }),
       );
       expect(screen.getByText('Answer received')).toBeTruthy();
+    },
+  );
+
+  it.each(['account', 'session'] as const)(
+    'rejects a captured Next Question action after the %s identity changes',
+    async (boundary) => {
+      const currentQuestion = new Promise<ReturnType<typeof nextPayload>>(() => undefined);
+      mockApiFetch
+        .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+        .mockReturnValueOnce(currentQuestion);
+      const rendered = await renderScreen();
+      expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+      await act(async () =>
+        recorderProps().onResult({
+          passed: true,
+          score: 88,
+          transcript: 'old transcript',
+          feedback: 'old feedback',
+          done: false,
+          nextQuestion: QUESTION_2,
+        }),
+      );
+      const staleAdvance = capturedPressHandler('Next Question');
+
+      const nextSetUser = jest.fn();
+      mockAuthValue = makeAuth({
+        user: boundary === 'account' ? OTHER_USER : USER,
+        sessionVersion: boundary === 'account' ? 1 : 2,
+        setUser: nextSetUser,
+      });
+      await rendered.rerenderScreen();
+      expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+      const callsBeforeStaleAdvance = mockApiFetch.mock.calls.length;
+
+      await act(async () => {
+        await staleAdvance();
+      });
+
+      expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+      expect(screen.queryByText('Tell me about a memorable journey.')).toBeNull();
+      expect(screen.queryByText('Answer received')).toBeNull();
+      expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleAdvance);
+      expect(nextSetUser).not.toHaveBeenCalled();
+      expect(mockRouter.replace).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['account', 'session'] as const)(
+    'rejects a captured Start Practicing action after the %s identity changes',
+    async (boundary) => {
+      const currentQuestion = new Promise<ReturnType<typeof nextPayload>>(() => undefined);
+      mockApiFetch
+        .mockResolvedValueOnce({ done: true, level: 'B2' })
+        .mockReturnValueOnce(currentQuestion);
+      const queryClient = makeQueryClient();
+      const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+      const rendered = await renderScreen(queryClient);
+      expect(await screen.findByText('Diagnostic complete!')).toBeTruthy();
+      const staleStartPracticing = capturedPressHandler('Start Practicing');
+      const originalSetUser = mockAuthValue.setUser;
+
+      const nextSetUser = jest.fn();
+      mockAuthValue = makeAuth({
+        user: boundary === 'account' ? OTHER_USER : USER,
+        sessionVersion: boundary === 'account' ? 1 : 2,
+        setUser: nextSetUser,
+      });
+      await rendered.rerenderScreen();
+      expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+      const callsBeforeStaleStart = mockApiFetch.mock.calls.length;
+      invalidateSpy.mockClear();
+
+      await act(async () => {
+        await staleStartPracticing();
+      });
+
+      expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+      expect(originalSetUser).not.toHaveBeenCalled();
+      expect(nextSetUser).not.toHaveBeenCalled();
+      expect(invalidateSpy).not.toHaveBeenCalled();
+      expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleStart);
+      expect(mockRouter.replace).not.toHaveBeenCalled();
     },
   );
 

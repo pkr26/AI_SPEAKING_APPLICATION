@@ -96,6 +96,26 @@ async function fillLogin(email: string, password: string) {
   await fireEvent.changeText(screen.getByPlaceholderText('Your password'), password);
 }
 
+function compositeButtonAccessibilityState(accessibilityLabel: string): unknown {
+  type PressFiber = {
+    memoizedProps?: {
+      accessibilityState?: unknown;
+      onPress?: () => unknown;
+    };
+    return: PressFiber | null;
+  };
+  let fiber = screen.getByRole('button', {
+    name: accessibilityLabel,
+  }).unstable_fiber as unknown as PressFiber | null;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.accessibilityState;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error(`Pressable "${accessibilityLabel}" not found`);
+}
+
 describe('login screen', () => {
   it('renders the brand, inputs, and signup link', async () => {
     await render(<LoginScreen />);
@@ -108,6 +128,10 @@ describe('login screen', () => {
 
   it('keeps Sign In disabled until email and password are present', async () => {
     await render(<LoginScreen />);
+    expect(compositeButtonAccessibilityState('Sign In')).toEqual({
+      disabled: true,
+      busy: false,
+    });
     expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState.disabled).toBe(
       true,
     );
@@ -118,6 +142,10 @@ describe('login screen', () => {
     );
 
     await fillLogin('ada@example.com', 'password1');
+    expect(compositeButtonAccessibilityState('Sign In')).toEqual({
+      disabled: false,
+      busy: false,
+    });
     expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState.disabled).toBe(
       false,
     );
@@ -284,9 +312,17 @@ describe('signup screen', () => {
   it('requires every field plus a language before enabling Sign Up', async () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
+    expect(compositeButtonAccessibilityState('Sign Up')).toEqual({
+      disabled: true,
+      busy: false,
+    });
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
 
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    expect(compositeButtonAccessibilityState('Sign Up')).toEqual({
+      disabled: false,
+      busy: false,
+    });
     expect(signUpButton().props.accessibilityState.disabled).toBe(false);
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
   });

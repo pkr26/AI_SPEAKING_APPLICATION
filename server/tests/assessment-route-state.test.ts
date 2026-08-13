@@ -214,6 +214,92 @@ describe('diagnostic finalization ownership', () => {
     );
   });
 
+  it.each([
+    ['processing question', 'processing_question_id'],
+    ['current question', 'current_question_id'],
+  ] as const)('rejects an independently corrupted %s during finalization', async (_caseName, column) => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const questionId = next.body.question.id as string;
+    const replacementQuestion = await pool.query<{ id: string }>(
+      'SELECT id FROM questions WHERE id <> $1 ORDER BY id LIMIT 1',
+      [questionId],
+    );
+    const replacementQuestionId = replacementQuestion.rows[0].id;
+    const requestId = randomUUID();
+    const triggerName = `test_corrupt_${column}_${randomUUID().replaceAll('-', '')}`;
+    const functionName = `${triggerName}_fn`;
+
+    await withTemporaryDatabaseArtifacts(
+      [
+        {
+          text: `ALTER TABLE diagnostic_state
+                 DROP CONSTRAINT diagnostic_state_processing_current_check`,
+        },
+        {
+          text: `
+            CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.user_id = '${userId}'::uuid THEN
+                UPDATE diagnostic_state
+                   SET ${column} = '${replacementQuestionId}'::uuid
+                 WHERE user_id = NEW.user_id;
+              END IF;
+              RETURN NEW;
+            END $$
+          `,
+        },
+        {
+          text: `
+            CREATE TRIGGER ${triggerName}
+            AFTER INSERT ON assessment_usage
+            FOR EACH ROW EXECUTE FUNCTION ${functionName}()
+          `,
+        },
+      ],
+      [
+        { text: `DROP TRIGGER IF EXISTS ${triggerName} ON assessment_usage` },
+        { text: `DROP FUNCTION IF EXISTS ${functionName}()` },
+        {
+          text: `UPDATE diagnostic_state
+                   SET current_question_id = NULL, processing_question_id = NULL,
+                       processing_started_at = NULL, processing_claim_id = NULL
+                 WHERE user_id = $1`,
+          values: [userId],
+        },
+        {
+          text: `ALTER TABLE diagnostic_state
+                 ADD CONSTRAINT diagnostic_state_processing_current_check CHECK (
+                   processing_question_id IS NULL OR processing_question_id = current_question_id
+                 )`,
+        },
+      ],
+      async () => {
+        const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
+
+        expect(response.status).toBe(409);
+        expect(response.body).toEqual({ error: 'Assessment state changed; please try again' });
+        expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
+        const state = await pool.query<{
+          current_question_id: string | null;
+          processing_question_id: string | null;
+          processing_claim_id: string | null;
+        }>(
+          `SELECT current_question_id, processing_question_id, processing_claim_id
+             FROM diagnostic_state WHERE user_id = $1`,
+          [userId],
+        );
+        expect(state.rows[0]).toEqual({
+          current_question_id: column === 'current_question_id' ? replacementQuestionId : questionId,
+          processing_question_id: null,
+          processing_claim_id: null,
+        });
+      },
+    );
+  });
+
   it('finishes on answer five while the adaptive search window remains open', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;

@@ -563,7 +563,6 @@ describe('S3 object download boundaries', () => {
       expect(req.file?.path).toBeTruthy();
       await expect(fs.stat(req.file!.path)).resolves.toBeTruthy();
       res.emit('close');
-      res.emit('finish');
       await vi.waitFor(async () => {
         await expect(fs.stat(req.file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
       });

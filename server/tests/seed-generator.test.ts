@@ -59,6 +59,17 @@ describe('question seed generator', () => {
     expect(() => renderSeedSql(duplicate)).toThrow('duplicate question key');
   });
 
+  it('rejects a 37th question at an unsupported Z9 level', () => {
+    const authored = copyQuestions();
+    const outOfRange = {
+      ...structuredClone(authored[0]!),
+      cefrLevel: 'Z9' as QuestionSeed['cefrLevel'],
+      promptWord: 'out-of-range-level',
+    };
+
+    expect(() => renderSeedSql([...authored, outOfRange])).toThrow('expected exactly 6 questions for each CEFR level');
+  });
+
   it.each([
     [
       'missing translation',

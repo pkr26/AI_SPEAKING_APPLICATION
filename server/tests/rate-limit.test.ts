@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { config } from '../src/config';
@@ -22,14 +22,14 @@ afterAll(async () => {
   await pool.end();
 });
 
-function okApp(...middleware: Parameters<express.Express['use']>) {
+function okApp(...middleware: express.RequestHandler[]) {
   const a = express();
   a.use(...middleware);
   a.get('/x', (_req, res) => res.json({ ok: true }));
   return a;
 }
 
-function userApp(userId: string, middleware: Parameters<express.Express['use']>[0]) {
+function userApp(userId: string, middleware: express.RequestHandler) {
   const a = express();
   a.use((req, _res, next) => {
     (req as AuthedRequest).user = { id: userId } as AuthedRequest['user'];
@@ -87,6 +87,18 @@ describe('rate limiters', () => {
     expect(limited.body).toEqual({ error: 'Too many attempts, please try again later' });
   });
 
+  it('throttles registration per source IP with its own budget', async () => {
+    config.rateLimit.registerWindowMs = 60_000;
+    config.rateLimit.registerMax = 2;
+    const a = okApp(buildLimiters().register);
+
+    expect((await request(a).get('/x')).status).toBe(200);
+    expect((await request(a).get('/x')).status).toBe(200);
+    const limited = await request(a).get('/x');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({ error: 'Too many accounts created from this network, please try again later' });
+  });
+
   it('keys the assess limiter per user, not per IP', async () => {
     config.rateLimit.assessWindowMs = 60_000;
     config.rateLimit.assessMax = 1;
@@ -111,6 +123,24 @@ describe('rate limiters', () => {
     // A different user (and an unauthenticated, IP-keyed request) still fits.
     expect((await request(as('user-2')).get('/x')).status).toBe(200);
     expect((await request(as()).get('/x')).status).toBe(200);
+  });
+
+  it('bounds paid assessments per source IP across identities', async () => {
+    const savedCap = config.assessIpDailyCap;
+    config.assessIpDailyCap = 1;
+    try {
+      // Two different authenticated users behind one test-agent IP share the
+      // daily network budget: re-registering cannot reset it.
+      const first = userApp('ip-cap-user-1', buildLimiters().assessIpDaily);
+      const second = userApp('ip-cap-user-2', buildLimiters().assessIpDaily);
+
+      expect((await request(first).get('/x')).status).toBe(200);
+      const limited = await request(second).get('/x');
+      expect(limited.status).toBe(429);
+      expect(limited.body).toEqual({ error: 'Daily assessment limit reached for this network' });
+    } finally {
+      config.assessIpDailyCap = savedCap;
+    }
   });
 
   it('shares upload-grant counters across replicas without consuming the assessment budget', async () => {
@@ -180,6 +210,33 @@ describe('rate limiters', () => {
 
     await store.resetKey('learner');
     await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
+  });
+
+  it('never lets a refund failure escape (express-rate-limit decrements fire-and-forget)', async () => {
+    const store = new PostgresRateLimitStore('store-fail-safe', 60_000);
+    const query = vi.spyOn(pool, 'query').mockRejectedValue(new Error('database unavailable'));
+    try {
+      await expect(store.decrement('learner')).resolves.toBeUndefined();
+      await expect(store.resetKey('learner')).resolves.toBeUndefined();
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  it('does not let a late refund eat a hit from an expired window', async () => {
+    const store = new PostgresRateLimitStore('store-window-guard', 60_000);
+    await store.increment('learner');
+    await pool.query(
+      "UPDATE rate_limit_windows SET reset_at = now() - interval '1 second' WHERE namespace = 'store-window-guard'",
+    );
+
+    // The refund lands after the window expired: it must leave the stale row
+    // untouched rather than decrementing a counter the next window inherits.
+    await store.decrement('learner');
+    const { rows } = await pool.query<{ hits: number }>(
+      "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-window-guard'",
+    );
+    expect(Number(rows[0].hits)).toBe(1);
   });
 
   it('isolates identical client keys between limiter namespaces', async () => {

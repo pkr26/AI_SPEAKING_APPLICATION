@@ -42,6 +42,10 @@ export const h =
 export const JWT_ISSUER = 'ai-english-api';
 export const JWT_AUDIENCE = 'ai-english-mobile';
 
+// Reject non-UUID subjects before they reach the uuid-typed query, so a
+// well-signed but malformed token gets a 401 instead of a 22P02 500.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   const header = req.headers.authorization || '';
   const [scheme, token] = header.split(' ');
@@ -60,7 +64,12 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 
-  if (typeof payload === 'string' || typeof payload.sub !== 'string' || typeof payload.tv !== 'number') {
+  if (
+    typeof payload === 'string' ||
+    typeof payload.sub !== 'string' ||
+    !UUID_PATTERN.test(payload.sub) ||
+    typeof payload.tv !== 'number'
+  ) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
 

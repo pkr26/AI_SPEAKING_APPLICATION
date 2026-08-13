@@ -25,7 +25,7 @@ class FakeChild extends EventEmitter {
   stdout = new PassThrough();
   stderr = new PassThrough();
   killed = false;
-  kill = vi.fn(() => {
+  kill = vi.fn((_signal?: string) => {
     this.killed = true;
     return true;
   });
@@ -135,7 +135,7 @@ describe('audio inspection concurrency', () => {
       '-i',
       'fd:',
       '-map',
-      '0:a:0',
+      '0:a?',
       '-vn',
       '-sn',
       '-dn',

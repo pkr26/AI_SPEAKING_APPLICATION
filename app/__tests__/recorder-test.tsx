@@ -477,6 +477,37 @@ describe('Recorder', () => {
       );
     });
 
+    it('announces the uploading phase when a submission starts', async () => {
+      const announce = jest.mocked(AccessibilityInfo.announceForAccessibility);
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      const { props } = await renderRecorder();
+      announce.mockClear();
+
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
+      await waitFor(() =>
+        expect(announce).toHaveBeenLastCalledWith('Uploading and assessing your answer.'),
+      );
+
+      await act(async () => {
+        upload.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+    });
+
+    it('announces the recovering phase when an interrupted assessment is restored', async () => {
+      const announce = jest.mocked(AccessibilityInfo.announceForAccessibility);
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      // Keep the reconciliation poll pending so the phase stays 'recovering'.
+      asMock(apiFetch).mockReturnValue(new Promise(() => undefined));
+      await renderRecorder();
+
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+      expect(announce).toHaveBeenCalledWith('Recovering your interrupted assessment.');
+    });
+
     it('requests permission when it was not granted yet', async () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
         granted: false,
@@ -1377,7 +1408,7 @@ describe('Recorder', () => {
     });
 
     it.each(['direct', 's3'] as const)(
-      'does not send audio when the durable %s stage transition is rejected',
+      'keeps the recording and reports when the durable %s stage transition is rejected',
       async (mode) => {
         if (mode === 's3') {
           asMock(apiRequestAudioUpload).mockResolvedValue({
@@ -1395,12 +1426,18 @@ describe('Recorder', () => {
         await recordAndStop();
 
         await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
-        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(
+            'Secure retry information could not be updated, so your recording was not uploaded. Please try again.',
+          ),
+        );
 
+        // Nothing was uploaded, so the recording stays armed for a retry.
         expect(apiUploadAudio).not.toHaveBeenCalled();
         expect(apiPostPresignedAudio).not.toHaveBeenCalled();
         expect(props.onResult).not.toHaveBeenCalled();
         expect(clearPendingAssessment).not.toHaveBeenCalled();
+        expect(screen.getByText('Submit Answer')).toBeTruthy();
       },
     );
 
@@ -1559,7 +1596,10 @@ describe('Recorder', () => {
           disabled: true,
         });
 
-        await fireEvent.press(screen.getByLabelText('Start recording'));
+        // The Pressable is disabled, which blocks event dispatch entirely;
+        // invoke the handler directly so the runtime re-entrancy guard itself
+        // is proven, not just the UI lockout.
+        await invokePressHandler(screen, 'Start recording');
         expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
         expect(apiUploadAudio).toHaveBeenCalledTimes(1);
         expect(clearPendingAssessment).not.toHaveBeenCalled();
@@ -1630,8 +1670,15 @@ describe('Recorder', () => {
       await recordAndStop();
 
       await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
-      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+      // With no tombstone to reconcile, the ambiguous failure releases the
+      // controls with an honest message instead of latching recovery.
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          'We could not confirm whether your answer was saved. If it does not appear, please record it again.',
+        ),
+      );
 
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
       expect(apiUploadAudio).toHaveBeenCalledTimes(1);
       expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
       expect(clearPendingAssessment).not.toHaveBeenCalled();
@@ -1817,7 +1864,9 @@ describe('Recorder', () => {
       });
       expect(screen.getByLabelText('Uploading and assessing your answer')).toBeTruthy();
 
-      await fireEvent.press(screen.getByLabelText('Start recording'));
+      // Disabled Pressables block dispatch, so invoke the handler directly to
+      // prove the runtime re-entrancy guard, not only the UI lockout.
+      await invokePressHandler(screen, 'Start recording');
       expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
 
       await act(async () => {
@@ -2240,7 +2289,9 @@ describe('Recorder', () => {
           disabled: true,
         });
 
-        await fireEvent.press(screen.getByLabelText('Start recording'));
+        // Disabled Pressables block dispatch, so invoke the handler directly
+        // to prove the runtime re-entrancy guard, not only the UI lockout.
+        await invokePressHandler(screen, 'Start recording');
         expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
         expect(apiFetch).toHaveBeenCalledTimes(1);
         expect(clearPendingAssessment).not.toHaveBeenCalled();
@@ -3253,10 +3304,36 @@ describe('Recorder', () => {
       });
 
       // Presses are guarded while the component is still in the recovering
-      // phase.
+      // phase. The disabled Pressable blocks event dispatch, so invoke the
+      // handler directly to prove the runtime guard itself.
       asMock(AudioModule.getRecordingPermissionsAsync).mockClear();
-      await fireEvent.press(screen.getByLabelText('Start recording'));
+      await invokePressHandler(screen, 'Start recording');
       expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
+    });
+
+    it('keeps controls locked without error copy when the initial submission is rejected with 401', async () => {
+      // A mid-submit 401 is not a definite rejection: the attempt may have
+      // committed, so the recorder enters recovery and lets the session-expiry
+      // flow unmount the screen rather than surfacing a misleading error.
+      asMock(apiUploadAudio).mockRejectedValue(new ApiError(401, 'Request failed with status 401'));
+      // No tombstone at mount or at submit's pre-upload check; it exists by
+      // the time recovery looks for it, so the 401 stops the poll silently.
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord({ stage: 'direct-posting' }));
+      asMock(apiFetch).mockRejectedValue(new ApiError(401, 'Request failed with status 401'));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
+
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(screen.getByLabelText('Start recording').props.accessibilityState).toEqual({
+        disabled: true,
+      });
     });
 
     it('refreshes when the completed assessment belongs to another route', async () => {

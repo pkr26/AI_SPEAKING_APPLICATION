@@ -21,7 +21,7 @@
     "mutation": "npm run mutation:code && npm run mutation:catalog",
     "mutation:code": "tsx db/mutation-db-guard.ts && stryker run",
     "mutation:catalog": "stryker run stryker.catalog.config.json",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json",
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check ."

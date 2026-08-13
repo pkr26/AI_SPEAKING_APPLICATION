@@ -46,6 +46,9 @@ const privateDiskStorage: multer.StorageEngine = {
     });
   },
   _removeFile: (_req, file, cb) => {
+    // A failed _handleFile can leave no stored path; fs.unlink(undefined)
+    // throws synchronously and would escape multer's error handling.
+    if (!file.path) return cb(null);
     fs.unlink(file.path, cb);
   },
 };

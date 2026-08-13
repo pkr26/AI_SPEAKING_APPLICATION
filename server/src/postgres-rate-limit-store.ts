@@ -2,6 +2,7 @@ import { createHmac } from 'crypto';
 import type { ClientRateLimitInfo, Store } from 'express-rate-limit';
 import { config } from './config';
 import { pool } from './db';
+import { logger } from './logger';
 
 interface CounterRow {
   hits: number;
@@ -53,20 +54,35 @@ export class PostgresRateLimitStore implements Store {
     };
   }
 
+  // The window guard keeps a late refund (response finishing after the window
+  // rolled over) from eating a hit that belongs to the NEXT window.
+  // The try/catch is load-bearing: express-rate-limit invokes decrement
+  // fire-and-forget without handling rejections, so a database brownout here
+  // would otherwise surface as an unhandled rejection and terminate the
+  // process. A lost refund only leaves the budget slightly consumed until the
+  // window expires.
   async decrement(key: string): Promise<void> {
-    await pool.query(
-      `UPDATE rate_limit_windows
-       SET hits = GREATEST(hits - 1, 0)
-       WHERE namespace = $1 AND key_hash = $2`,
-      [this.namespace, this.hash(key)],
-    );
+    try {
+      await pool.query(
+        `UPDATE rate_limit_windows
+         SET hits = GREATEST(hits - 1, 0)
+         WHERE namespace = $1 AND key_hash = $2 AND reset_at > clock_timestamp()`,
+        [this.namespace, this.hash(key)],
+      );
+    } catch (err) {
+      logger.warn({ err, namespace: this.namespace }, 'rate-limit refund failed');
+    }
   }
 
   async resetKey(key: string): Promise<void> {
-    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [
-      this.namespace,
-      this.hash(key),
-    ]);
+    try {
+      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [
+        this.namespace,
+        this.hash(key),
+      ]);
+    } catch (err) {
+      logger.warn({ err, namespace: this.namespace }, 'rate-limit key reset failed');
+    }
   }
 }
 

@@ -290,6 +290,26 @@ export default function Recorder<T>({
       (phaseRef.current !== 'idle' && phaseRef.current !== 'recovering') ||
       (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId)
     ) {
+      // An ambiguous submission enters 'recovering' before calling this. If
+      // the tombstone is already gone there is nothing to reconcile, so
+      // release the controls with an honest message instead of latching
+      // 'recovering' with no UI escape short of a remount.
+      if (
+        !pending &&
+        phaseRef.current === 'recovering' &&
+        !operationRef.current &&
+        uploadControllerRef.current === null &&
+        mountedRef.current &&
+        focusedRef.current &&
+        AppState.currentState === 'active' &&
+        identityIsCurrent() &&
+        (activeRecoveryOwner === null || activeRecoveryOwner === instanceId)
+      ) {
+        updatePhase('idle');
+        callbacksRef.current.onError(
+          'We could not confirm whether your answer was saved. If it does not appear, please record it again.',
+        );
+      }
       return;
     }
 
@@ -902,6 +922,11 @@ export default function Recorder<T>({
   const submit = async () => {
     if (operationRef.current || phaseRef.current !== 'recorded') return;
     const uri = activeUriRef.current ?? recorder.uri;
+    // Unreachable by design: every path that clears activeUriRef also leaves
+    // the recorded phase (pinned by the identity-change and lifecycle tests).
+    // Kept as fail-closed defense; the missing-FILE case is handled as a
+    // definite 400 inside apiUploadAudio.
+    /* istanbul ignore next */
     if (!uri) {
       updatePhase('idle');
       callbacksRef.current.onError('No recording was saved. Please record again.');
@@ -970,7 +995,16 @@ export default function Recorder<T>({
       let raw: unknown;
       if (grant.mode === 's3') {
         if (!(await markPendingAssessmentStage(requestId, 's3-granted', grant.audioKey))) {
-          throw new Error('Pending assessment disappeared');
+          // The tombstone vanished before anything was uploaded. Keep the
+          // recording and let the learner retry — there is nothing to
+          // reconcile, so recovery would latch with no way forward.
+          if (!isCurrentSubmission()) return;
+          requestIdRef.current = null;
+          updatePhase('recorded');
+          callbacksRef.current.onError(
+            'Secure retry information could not be updated, so your recording was not uploaded. Please try again.',
+          );
+          return;
         }
         if (!isCurrentSubmission()) return;
         await apiPostPresignedAudio(
@@ -990,7 +1024,14 @@ export default function Recorder<T>({
         });
       } else {
         if (!(await markPendingAssessmentStage(requestId, 'direct-posting'))) {
-          throw new Error('Pending assessment disappeared');
+          // Same vanished-tombstone handling as the S3 branch above.
+          if (!isCurrentSubmission()) return;
+          requestIdRef.current = null;
+          updatePhase('recorded');
+          callbacksRef.current.onError(
+            'Secure retry information could not be updated, so your recording was not uploaded. Please try again.',
+          );
+          return;
         }
         if (!isCurrentSubmission()) return;
         raw = await apiUploadAudio<unknown>(

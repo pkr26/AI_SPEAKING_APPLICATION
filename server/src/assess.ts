@@ -168,7 +168,9 @@ export async function assessSpeaking(audioPath: string, q: AssessQuestion, userI
           model: GRADING_MODEL,
           response_format: zodResponseFormat(gradingSchema, 'speaking_assessment'),
           temperature: 0,
-          max_tokens: 300,
+          // Headroom above the 800-char feedback cap so a near-max response is
+          // never truncated into unparseable JSON (a paid retryable 502).
+          max_tokens: 400,
           messages: [
             {
               role: 'system',

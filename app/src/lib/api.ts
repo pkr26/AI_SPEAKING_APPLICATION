@@ -302,6 +302,12 @@ export async function apiUploadAudio<T>(
     const blob = await audioResponse.blob();
     form.append('audio', blob, descriptor.name);
   } else {
+    // Mirror the presigned-upload check: if the OS evicted the cached
+    // recording, fail as a definite local 400 instead of an ambiguous network
+    // error that would trigger minutes of pointless recovery polling.
+    if (!new File(audioUri).exists) {
+      throw new ApiError(400, 'The recording is unavailable');
+    }
     // React Native's FormData accepts { uri, name, type } file descriptors.
     form.append('audio', {
       uri: audioUri,

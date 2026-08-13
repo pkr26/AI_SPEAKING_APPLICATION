@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import express from 'express';
-import { pino } from 'pino';
+import { symbols } from 'pino';
 import request from 'supertest';
 import { httpLogger, logger } from '../src/logger';
 import { errorHandler } from '../src/middleware';
@@ -20,7 +20,7 @@ interface LogEntry {
   err?: unknown;
 }
 
-const streamSym = pino.symbols.streamSym;
+const streamSym = symbols.streamSym;
 
 describe('httpLogger', () => {
   let lines: string[];

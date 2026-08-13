@@ -229,7 +229,7 @@ describe('database deployment runner', () => {
     const files = migrationRows().map((row) => row.name);
     const originalReaddir = fs.readdirSync.bind(fs);
     const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((directory: fs.PathLike) => {
-      if (String(directory) === migrationsDir) return ['README.txt', ...files.toReversed()];
+      if (String(directory) === migrationsDir) return ['README.txt', ...[...files].reverse()];
       return originalReaddir(directory);
     }) as typeof fs.readdirSync);
     const client = provideClient(async (sql) => {

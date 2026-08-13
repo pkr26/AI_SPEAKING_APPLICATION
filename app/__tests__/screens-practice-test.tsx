@@ -11,7 +11,7 @@ import PracticeScreen from '../src/app/practice/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import { LogoutCleanupError, useAuth } from '../src/lib/auth';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
-import type { AttemptResult, Question, User } from '../src/lib/types';
+import { parseAttemptResult, type AttemptResult, type Question, type User } from '../src/lib/types';
 
 // ----- expo-router mock -----
 
@@ -268,6 +268,9 @@ describe('practice home screen', () => {
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
     });
+    // The screen chooses which response contract the recorder parses with; a
+    // swapped parser breaks the flow at runtime, so pin the wiring.
+    expect(recorderProps().parseResult).toBe(parseAttemptResult);
     expect(
       queryClient.getQueryCache().find({
         queryKey: ['practice-question', USER.id, USER.cefrLevel],
@@ -450,6 +453,9 @@ describe('practice attempt screen', () => {
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
     });
+    // The screen chooses which response contract the recorder parses with; a
+    // swapped parser breaks the flow at runtime, so pin the wiring.
+    expect(recorderProps().parseResult).toBe(parseAttemptResult);
     expect(
       queryClient.getQueryCache().find({
         queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],

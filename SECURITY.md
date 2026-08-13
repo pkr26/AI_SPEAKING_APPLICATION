@@ -14,7 +14,7 @@ Do **not** file a public issue containing exploit details. This project has not 
 
 ## Security controls in place
 
-- Rate limiting (global, auth, and per-user assessment tiers) + per-user daily assessment caps
+- Rate limiting (global, auth, per-account credential budgets that throttle only failures, and per-user + per-IP assessment tiers) + per-user daily assessment caps
 - zod-validated inputs on every route; parameterized SQL data values (the database-creation CLI strictly quotes its one dynamic identifier)
 - helmet security headers, HSTS, CORS allowlist
 - Central error handling that never leaks stack traces or internals

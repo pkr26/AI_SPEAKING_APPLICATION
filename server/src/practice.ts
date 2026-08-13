@@ -271,6 +271,7 @@ export function createPracticeRouter(limiters: Limiters) {
   router.post(
     '/attempt',
     limiters.assess,
+    limiters.assessIpDaily,
     ...(config.s3.bucket
       ? [validate({ body: attemptJsonBodySchema })]
       : [uploadAudio, validate({ body: attemptBodySchema })]),

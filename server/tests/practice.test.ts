@@ -269,8 +269,9 @@ describe('practice', () => {
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const questionId = q.body.question.id;
 
-    // Fire several attempts; mock scores are random, so just verify invariants.
-    const seen: number[] = [];
+    // Fire several attempts; mock scores are random, so verify the transition
+    // rule each response's own pass/fail implies instead of a fixed walk.
+    const seen: { attemptNo: number; passed: boolean }[] = [];
     for (let i = 0; i < 6; i++) {
       const r = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
@@ -279,7 +280,12 @@ describe('practice', () => {
       expect(r.status).toBe(200);
       expect(r.body.attemptNo).toBeGreaterThanOrEqual(1);
       expect(r.body.attemptNo).toBeLessThanOrEqual(3);
-      seen.push(r.body.attemptNo);
+      seen.push({ attemptNo: r.body.attemptNo, passed: r.body.passed });
+      if (i > 0) {
+        const prev = seen[i - 1];
+        const expected = !prev.passed && prev.attemptNo < 3 ? prev.attemptNo + 1 : 1;
+        expect(seen[i].attemptNo).toBe(expected);
+      }
     }
     const { rows } = await pool.query(
       `SELECT count(*)::int AS n FROM attempts
@@ -287,7 +293,7 @@ describe('practice', () => {
       [res.body.user.email, questionId],
     );
     expect(rows[0].n).toBe(seen.length); // every request inserted exactly one attempt row
-    expect(seen[0]).toBe(1); // first attempt on a fresh question is always #1
+    expect(seen[0].attemptNo).toBe(1); // first attempt on a fresh question is always #1
   });
 
   it('replays the same practice request without another attempt or quota reservation', async () => {

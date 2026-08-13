@@ -247,10 +247,13 @@ describe('assessSpeaking (OpenAI path)', () => {
 
   it('constructs the client with a bounded timeout and no silent retries', async () => {
     mockProviderSuccess();
+    // Count relative to whatever earlier tests already constructed: the module
+    // singleton memoizes across the whole file, so absolute counts are brittle.
+    const constructionsBefore = openaiMocks.constructedWith.length;
     await assessSpeaking(audioPath, QUESTION, userId);
     await assessSpeaking(audioPath, QUESTION, userId);
-    expect(openaiMocks.constructedWith).toHaveLength(1);
-    expect(openaiMocks.constructedWith[0]).toEqual({
+    expect(openaiMocks.constructedWith).toHaveLength(constructionsBefore + 1);
+    expect(openaiMocks.constructedWith[constructionsBefore]).toEqual({
       apiKey: 'sk-test-key',
       timeout: config.openaiTimeoutMs,
       maxRetries: 0,
@@ -293,7 +296,7 @@ describe('assessSpeaking (OpenAI path)', () => {
     const [parseArgs, parseOpts] = openaiMocks.parse.mock.calls[0];
     expect(parseArgs.model).toBe('gpt-4o-mini-2024-07-18');
     expect(parseArgs.temperature).toBe(0);
-    expect(parseArgs.max_tokens).toBe(300);
+    expect(parseArgs.max_tokens).toBe(400);
     expect(parseArgs.response_format).toMatchObject({
       type: 'json_schema',
       json_schema: {

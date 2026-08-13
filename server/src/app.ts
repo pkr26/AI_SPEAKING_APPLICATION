@@ -2,7 +2,7 @@ import compression from 'compression';
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
-import { authRouter } from './auth';
+import { createAuthRouter } from './auth';
 import { assertAudioInspectorAvailable } from './audio-inspection';
 import { createAudioUploadRouter } from './audio-upload';
 import { config } from './config';
@@ -63,8 +63,10 @@ export function createApp({
   // Credential routes are throttled before JSON parsing/bcrypt work. Logout is
   // deliberately excluded: an authenticated learner must always be able to
   // revoke a token, even after an attacker exhausts the IP's login budget.
+  // Registration carries its own tighter per-IP budget instead of the generic
+  // credential one.
   app.use('/auth/login', limiters.auth);
-  app.use('/auth/register', limiters.auth);
+  app.use('/auth/register', limiters.register);
   app.use('/auth/change-password', limiters.auth);
   app.use('/auth/account', limiters.auth);
 
@@ -79,7 +81,7 @@ export function createApp({
   // parsing, while this shared budget prevents distributed credential attacks.
   app.use('/auth/login', limiters.loginAccount);
 
-  app.use('/auth', authRouter);
+  app.use('/auth', createAuthRouter(limiters));
   app.get(
     '/assessments/:requestId',
     requireAuth,

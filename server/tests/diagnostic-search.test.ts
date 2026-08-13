@@ -119,7 +119,7 @@ describe('diagnostic adaptive binary search', () => {
     expect(rows[0]).toEqual({ low_idx: 2, high_idx: 1, questions_asked: 5 });
   });
 
-  it('rejects answers after completion and rejects answers while one is in progress', async () => {
+  it('rejects answers after completion', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
     const userId = res.body.user.id;

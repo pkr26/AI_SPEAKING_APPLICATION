@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import type { PoolClient } from 'pg';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
@@ -12,7 +13,7 @@ interface ObservedLease {
 async function observePoolLeases<T>(action: () => Promise<T>): Promise<{ result: T; leases: ObservedLease[] }> {
   const originalConnect = pool.connect.bind(pool);
   const leases: ObservedLease[] = [];
-  const wrap = (client: Awaited<ReturnType<typeof pool.connect>>) => {
+  const wrap = (client: PoolClient) => {
     const statements: string[] = [];
     const mutable = client as unknown as {
       query: (...args: unknown[]) => unknown;

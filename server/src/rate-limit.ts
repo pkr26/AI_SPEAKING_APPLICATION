@@ -48,6 +48,11 @@ export function buildLimiters() {
   // This second login budget follows the normalized account identifier across
   // source IPs. It runs after JSON parsing, persists only an HMAC of the key,
   // and refunds successful logins so legitimate use cannot exhaust it.
+  // Over-budget requests are NOT rejected here: the route still verifies the
+  // password and lets a correct login through (flagged via res.locals), so an
+  // attacker saturating the account budget cannot lock out the real owner;
+  // only failures are throttled. The per-IP auth limiter above still bounds
+  // the bcrypt work this always-verify policy pays per source.
   const loginAccount = rateLimit({
     ...common,
     windowMs: config.rateLimit.loginAccountWindowMs,
@@ -63,8 +68,51 @@ export function buildLimiters() {
       // defensive value for custom express-rate-limit implementations.
       return email ? `email:${email}` : 'email:invalid';
     },
+    handler: (_req, res, next) => {
+      res.locals.loginAccountThrottled = true;
+      next();
+    },
     skipSuccessfulRequests: true,
-    message: { error: 'Too many login attempts, please try again later' },
+  });
+
+  // Password-confirmation routes (change-password, account deletion) run
+  // bcrypt on authenticated requests, so a stolen bearer token plus
+  // distributed IPs could otherwise brute-force the account password online.
+  // Same always-verify shape as loginAccount: over-budget requests still check
+  // the password, and only failures are throttled.
+  const passwordAccount = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.passwordWindowMs,
+    limit: config.rateLimit.passwordMax,
+    store: new PostgresRateLimitStore(
+      `password-account:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
+      config.rateLimit.passwordWindowMs,
+    ),
+    // Mounted after requireAuth; the user is always present. The IP fallback
+    // only protects against a future route that forgets that ordering.
+    keyGenerator: (req) => {
+      const user = (req as AuthedRequest).user;
+      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
+    },
+    handler: (_req, res, next) => {
+      res.locals.passwordAccountThrottled = true;
+      next();
+    },
+    skipSuccessfulRequests: true,
+  });
+
+  // Registration gets its own tighter per-IP budget: bulk account creation is
+  // the entry point for both account-cycling spend and email enumeration.
+  const register = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.registerWindowMs,
+    limit: config.rateLimit.registerMax,
+    store: new PostgresRateLimitStore(
+      `register:${config.rateLimit.registerWindowMs}:${config.rateLimit.registerMax}`,
+      config.rateLimit.registerWindowMs,
+    ),
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    message: { error: 'Too many accounts created from this network, please try again later' },
   });
 
   // Readiness performs a database query and may be reachable outside the
@@ -92,6 +140,21 @@ export function buildLimiters() {
     message: { error: 'Assessment rate limit reached, please slow down' },
   });
 
+  // Per-user daily caps reset with every re-registered account, so a spender
+  // cycling throwaway identities could otherwise keep consuming paid
+  // assessments until the global cap 429s every learner. This fixed-window
+  // daily budget follows the source IP across accounts; its default is
+  // deliberately several times the per-user daily cap so ordinary
+  // households/schools behind one NAT keep working.
+  const assessIpDaily = rateLimit({
+    ...common,
+    windowMs: 24 * 60 * 60 * 1000,
+    limit: config.assessIpDailyCap,
+    store: new PostgresRateLimitStore(`assess-ip-daily:${config.assessIpDailyCap}`, 24 * 60 * 60 * 1000),
+    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    message: { error: 'Daily assessment limit reached for this network' },
+  });
+
   // Issuing an S3 upload grant has its own shared per-user budget. It must not
   // consume the paid assessment budget before the assessment is submitted,
   // while still bounding abandoned/retried presigned uploads across replicas.
@@ -110,7 +173,7 @@ export function buildLimiters() {
     message: { error: 'Audio upload grant rate limit reached, please try again later' },
   });
 
-  return { global, auth, loginAccount, readiness, assess, uploadGrant };
+  return { global, auth, loginAccount, passwordAccount, readiness, register, assess, assessIpDaily, uploadGrant };
 }
 
 export type Limiters = ReturnType<typeof buildLimiters>;

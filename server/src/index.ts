@@ -12,7 +12,10 @@ import { assertAudioInspectorAvailable } from './audio-inspection';
 const app = createApp();
 const server = createServer(app);
 
-server.requestTimeout = 75_000;
+// The whole-request budget must exceed the slowest legitimate assessment
+// chain (S3 download + decode inspection + one provider deadline) plus upload
+// ingress margin, or worst-case requests are socket-killed mid-flight.
+server.requestTimeout = config.s3.operationTimeoutMs + config.openaiTimeoutMs + 40_000;
 server.headersTimeout = 30_000;
 
 const UPLOAD_JANITOR_INTERVAL_MS = 15 * 60 * 1000;

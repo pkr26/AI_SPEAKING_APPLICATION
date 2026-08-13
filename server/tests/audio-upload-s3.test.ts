@@ -45,7 +45,7 @@ import {
   MAX_AUDIO_BYTES,
   resolvePresignedAudio,
 } from '../src/audio-upload';
-import { AuthedRequest, HttpError } from '../src/middleware';
+import { AuthedRequest } from '../src/middleware';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 // Switch the whole app into S3 ingress mode (must precede createApp()).
@@ -216,7 +216,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     const req = {
       body: { audioKey },
       user: { id: userId },
-    } as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const listeners = new Map<string, () => void>();
     const res = {
       writableFinished: false,
@@ -254,7 +254,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     const req = {
       body: { audioKey, requestId },
       user: { id: userId },
-    } as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const listeners = new Map<string, () => void>();
     const res = {
       writableFinished: true,
@@ -266,7 +266,6 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     discardSubmittedPresignedAudio(req, res, vi.fn());
     listeners.get('finish')?.();
-    await vi.waitFor(() => expect(sendMock).not.toHaveBeenCalled());
     await finalizeSubmittedPresignedAudio(res);
     expect(sendMock).not.toHaveBeenCalled();
   });
@@ -276,7 +275,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     const req = {
       body: { audioKey: ownedKey(userId), requestId: randomUUID() },
       user: { id: userId },
-    } as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const listeners = new Map<string, Array<() => void>>();
     const res = {
       statusCode,
@@ -326,7 +325,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     const req = {
       body: { audioKey: ownedKey(userId), requestId: randomUUID() },
       user: { id: userId },
-    } as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const res = {
       statusCode: 200,
       writableFinished: true,
@@ -349,7 +348,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     const req = {
       body: { audioKey: ownedKey(userId) },
       user: { id: userId },
-    } as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const res = {
       statusCode: 200,
       writableFinished: true,
@@ -428,7 +427,7 @@ describe('S3 object download boundaries', () => {
   it('accepts the exact stream cap and rejects the first byte beyond it', async () => {
     await expect(consumeSizeCap([Buffer.from('ab'), Buffer.from('cd')], 4)).resolves.toEqual(Buffer.from('abcd'));
     await expect(consumeSizeCap([Buffer.from('abcd'), Buffer.from('e')], 4)).rejects.toEqual(
-      expect.objectContaining<HttpError>({ status: 413, message: 'Audio file is too large' }),
+      expect.objectContaining({ status: 413, message: 'Audio file is too large' }),
     );
   });
 
@@ -680,10 +679,10 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     expect(typeof res.body.score).toBe('number');
     expect(typeof res.body.done).toBe('boolean');
 
-    const kinds = sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind);
+    const kinds = sendMock.mock.calls.map(([command]) => command.kind);
     expect(kinds).toContain('get');
     expect(kinds).toContain('delete');
-    const deleteCommand = sendMock.mock.calls.find(([command]: [{ kind: string }]) => command.kind === 'delete')![0];
+    const deleteCommand = sendMock.mock.calls.find(([command]) => command.kind === 'delete')![0];
     expect(deleteCommand.input.Key).toBe(audioKey);
   });
 
@@ -712,7 +711,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
     expect(replay.status).toBe(200);
     expect(replay.body).toEqual(first.body);
-    expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['delete']);
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
   });
 
   it('does not let a losing processing retry delete the object while its owner is reading it', async () => {
@@ -750,7 +749,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
         error: 'Assessment is still processing',
         retryAfterSeconds: 2,
       });
-      expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['get']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
     } finally {
       if (releaseOwner) {
         releaseOwner({ Body: Readable.from(fakeM4aBuffer()) });
@@ -762,7 +761,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     if (ownerOutcome.status === 'rejected') throw ownerOutcome.reason;
     const owner = ownerOutcome.response;
     expect(owner.status).toBe(200);
-    expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['get', 'delete']);
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
   });
 
   it('deletes a submitted object when diagnostic completion rejects the request before download', async () => {
@@ -779,7 +778,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Diagnostic already completed');
-    expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['delete']);
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
   });
 
   it('deletes an owned object when body validation rejects the request before the route handler', async () => {
@@ -794,7 +793,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .send({ questionId, requestId: 'not-a-uuid', audioKey });
 
     expect(res.status).toBe(400);
-    expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['delete']);
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
   });
 
   it('returns 400 for a key owned by another user without touching S3', async () => {
@@ -923,7 +922,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('requestId must be a valid UUID');
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
     });
   });
 
@@ -971,7 +970,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     expect(response.status).toBe(404);
     expect(response.body).toEqual({ error: 'Question not found' });
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
     });
     const claims = await pool.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
@@ -1001,7 +1000,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey });
 
     expect(response.status).toBe(200);
-    const operations = sendMock.mock.calls.map(([command]: [{ kind: string; input: Record<string, string> }]) => ({
+    const operations = sendMock.mock.calls.map(([command]) => ({
       kind: command.kind,
       bucket: command.input.Bucket,
       key: command.input.Key,
@@ -1052,7 +1051,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
         error: 'Assessment is still processing',
         retryAfterSeconds: 2,
       });
-      expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['get']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
     } finally {
       if (releaseOwner) {
         releaseOwner({ Body: Readable.from(fakeM4aBuffer()) });
@@ -1063,7 +1062,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     }
     if (ownerOutcome.status === 'rejected') throw ownerOutcome.reason;
     expect(ownerOutcome.response.status).toBe(200);
-    expect(sendMock.mock.calls.map(([command]: [{ kind: string }]) => command.kind)).toEqual(['get', 'delete']);
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
   });
 
   it('rejects a foreign learner key before any S3 operation', async () => {

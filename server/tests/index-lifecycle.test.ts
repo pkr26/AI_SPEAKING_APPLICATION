@@ -27,18 +27,26 @@ const runtime = vi.hoisted(() => {
     logger,
     createServer: vi.fn(() => server),
     createApp: vi.fn(() => vi.fn()),
-    poolEnd: vi.fn(async () => undefined),
+    poolEnd: vi.fn(async (): Promise<void> => undefined),
     cleanupUploads: vi.fn(async () => 0),
     cleanupRequests: vi.fn(async () => 0),
     cleanupRateLimits: vi.fn(async () => 0),
-    assertSchema: vi.fn(async () => undefined),
-    assertAudio: vi.fn(async () => undefined),
+    assertSchema: vi.fn(async (): Promise<void> => undefined),
+    assertAudio: vi.fn(async (): Promise<void> => undefined),
   };
 });
 
 vi.mock('http', () => ({ createServer: runtime.createServer }));
 vi.mock('../src/app', () => ({ createApp: runtime.createApp }));
-vi.mock('../src/config', () => ({ config: { port: 43210, mockAi: true, nodeEnv: 'test' } }));
+vi.mock('../src/config', () => ({
+  config: {
+    port: 43210,
+    mockAi: true,
+    nodeEnv: 'test',
+    openaiTimeoutMs: 60_000,
+    s3: { operationTimeoutMs: 30_000 },
+  },
+}));
 vi.mock('../src/db', () => ({ pool: { end: runtime.poolEnd } }));
 vi.mock('../src/logger', () => ({ logger: runtime.logger }));
 vi.mock('../src/upload', () => ({ cleanupOldUploads: runtime.cleanupUploads }));
@@ -192,7 +200,9 @@ describe('server lifecycle failure handling', () => {
 
     await import('../src/index');
 
-    expect(runtime.server.requestTimeout).toBe(75_000);
+    // The whole-request budget tracks the slowest assessment chain: mocked
+    // S3 download 30s + provider 60s + decode/ingress margin 40s.
+    expect(runtime.server.requestTimeout).toBe(130_000);
     expect(runtime.server.headersTimeout).toBe(30_000);
     expect(runtime.assertSchema).toHaveBeenCalledOnce();
     expect(runtime.assertAudio).toHaveBeenCalledWith({ force: true });

@@ -62,6 +62,10 @@ const envSchema = z
     DB_LOCK_TIMEOUT_MS: z.coerce.number().int().min(100).max(30_000).default(5_000),
     ASSESS_DAILY_CAP: z.coerce.number().int().min(1).default(150),
     ASSESS_GLOBAL_DAILY_CAP: z.coerce.number().int().min(1).default(5000),
+    // Per-IP fixed-window daily budget on paid assessment submissions; bounds
+    // spend from account re-registration cycling (per-user caps reset with each
+    // new identity). Must cover at least one user's full daily allowance.
+    ASSESS_IP_DAILY_CAP: z.coerce.number().int().min(1).default(300),
     AI_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(10),
     AUDIO_INSPECTION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(4),
     OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).max(70_000).default(60_000),
@@ -85,6 +89,23 @@ const envSchema = z
       .max(86_400_000)
       .default(15 * 60 * 1000),
     RATE_LIMIT_LOGIN_ACCOUNT_MAX: z.coerce.number().int().min(1).max(100_000).default(10),
+    RATE_LIMIT_PASSWORD_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(15 * 60 * 1000),
+    RATE_LIMIT_PASSWORD_MAX: z.coerce.number().int().min(1).max(100_000).default(10),
+    // Account creation is the heaviest unauthenticated action (bcrypt +
+    // identity provisioning) and the entry point for bulk account cycling, so
+    // it carries a tighter per-IP budget than the credential routes.
+    RATE_LIMIT_REGISTER_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(60 * 60 * 1000),
+    RATE_LIMIT_REGISTER_MAX: z.coerce.number().int().min(1).max(100_000).default(10),
     RATE_LIMIT_ASSESS_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -185,6 +206,13 @@ const envSchema = z
         message: 'must be greater than or equal to ASSESS_DAILY_CAP',
       });
     }
+    if (env.ASSESS_IP_DAILY_CAP < env.ASSESS_DAILY_CAP) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['ASSESS_IP_DAILY_CAP'],
+        message: 'must be greater than or equal to ASSESS_DAILY_CAP so one learner keeps their full daily allowance',
+      });
+    }
   });
 
 const parsed = envSchema.safeParse(process.env);
@@ -212,6 +240,7 @@ export const config = {
   dbLockTimeoutMs: env.DB_LOCK_TIMEOUT_MS,
   assessDailyCap: env.ASSESS_DAILY_CAP,
   assessGlobalDailyCap: env.ASSESS_GLOBAL_DAILY_CAP,
+  assessIpDailyCap: env.ASSESS_IP_DAILY_CAP,
   aiMaxConcurrency: env.AI_MAX_CONCURRENCY,
   audioInspectionMaxConcurrency: env.AUDIO_INSPECTION_MAX_CONCURRENCY,
   openaiTimeoutMs: env.OPENAI_TIMEOUT_MS,
@@ -223,6 +252,10 @@ export const config = {
     authMax: env.RATE_LIMIT_AUTH_MAX,
     loginAccountWindowMs: env.RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS,
     loginAccountMax: env.RATE_LIMIT_LOGIN_ACCOUNT_MAX,
+    passwordWindowMs: env.RATE_LIMIT_PASSWORD_WINDOW_MS,
+    passwordMax: env.RATE_LIMIT_PASSWORD_MAX,
+    registerWindowMs: env.RATE_LIMIT_REGISTER_WINDOW_MS,
+    registerMax: env.RATE_LIMIT_REGISTER_MAX,
     assessWindowMs: env.RATE_LIMIT_ASSESS_WINDOW_MS,
     assessMax: env.RATE_LIMIT_ASSESS_MAX,
     uploadGrantWindowMs: env.RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS,

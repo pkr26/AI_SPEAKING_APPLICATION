@@ -4,9 +4,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
  * config.ts parses process.env at module load and fail-fasts with
  * process.exit(1) on invalid input. Each case loads a fresh module with a
  * controlled environment; process.exit is stubbed to throw so the runner
- * survives. Note: dotenv fills gaps from server/.env, so rejection cases set
- * explicitly invalid values instead of deleting keys.
+ * survives. dotenv is mocked out so a developer's server/.env can never
+ * backfill a key a test deliberately deleted (which would make "defaults"
+ * assertions vacuous on that machine).
  */
+vi.mock('dotenv', () => ({ default: { config: () => ({}) } }));
 
 const MANAGED_KEYS = [
   'DATABASE_URL',
@@ -21,6 +23,7 @@ const MANAGED_KEYS = [
   'DB_LOCK_TIMEOUT_MS',
   'ASSESS_DAILY_CAP',
   'ASSESS_GLOBAL_DAILY_CAP',
+  'ASSESS_IP_DAILY_CAP',
   'AI_MAX_CONCURRENCY',
   'AUDIO_INSPECTION_MAX_CONCURRENCY',
   'OPENAI_TIMEOUT_MS',
@@ -31,6 +34,10 @@ const MANAGED_KEYS = [
   'RATE_LIMIT_AUTH_MAX',
   'RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS',
   'RATE_LIMIT_LOGIN_ACCOUNT_MAX',
+  'RATE_LIMIT_PASSWORD_WINDOW_MS',
+  'RATE_LIMIT_PASSWORD_MAX',
+  'RATE_LIMIT_REGISTER_WINDOW_MS',
+  'RATE_LIMIT_REGISTER_MAX',
   'RATE_LIMIT_ASSESS_WINDOW_MS',
   'RATE_LIMIT_ASSESS_MAX',
   'RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS',
@@ -86,7 +93,7 @@ async function loadConfig(env: Record<string, string>) {
 async function expectInvalid(env: Record<string, string>, fragment: string) {
   await expect(loadConfig(env)).rejects.toThrow('process.exit called');
   expect(exitSpy).toHaveBeenCalledWith(1);
-  expect(errorSpy.mock.calls.map((c) => String(c[0])).join('\n')).toContain(fragment);
+  expect(errorSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n')).toContain(fragment);
 }
 
 describe('config env validation', () => {
@@ -100,6 +107,7 @@ describe('config env validation', () => {
     expect(config.dbLockTimeoutMs).toBe(5_000);
     expect(config.assessDailyCap).toBe(150);
     expect(config.assessGlobalDailyCap).toBe(5000);
+    expect(config.assessIpDailyCap).toBe(300);
     expect(config.aiMaxConcurrency).toBe(10);
     expect(config.audioInspectionMaxConcurrency).toBe(4);
     expect(config.openaiTimeoutMs).toBe(60_000);
@@ -111,6 +119,10 @@ describe('config env validation', () => {
       authMax: 20,
       loginAccountWindowMs: 15 * 60 * 1000,
       loginAccountMax: 10,
+      passwordWindowMs: 15 * 60 * 1000,
+      passwordMax: 10,
+      registerWindowMs: 60 * 60 * 1000,
+      registerMax: 10,
       assessWindowMs: 60 * 60 * 1000,
       assessMax: 20,
       uploadGrantWindowMs: 60 * 60 * 1000,
@@ -326,6 +338,15 @@ describe('config env validation', () => {
     );
     const ok = await loadConfig(baseEnv({ ASSESS_DAILY_CAP: '5', ASSESS_GLOBAL_DAILY_CAP: '5' }));
     expect(ok.assessGlobalDailyCap).toBe(5);
+  });
+
+  it('rejects ASSESS_IP_DAILY_CAP below ASSESS_DAILY_CAP', async () => {
+    await expectInvalid(
+      baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_IP_DAILY_CAP: '5' }),
+      'must be greater than or equal to ASSESS_DAILY_CAP',
+    );
+    const ok = await loadConfig(baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_IP_DAILY_CAP: '10' }));
+    expect(ok.assessIpDailyCap).toBe(10);
   });
 
   it('rejects out-of-range pool and timeout numbers', async () => {

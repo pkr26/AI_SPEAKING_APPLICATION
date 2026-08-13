@@ -38,6 +38,13 @@ const audioKey =
   'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
 
 describe('durable assessment handoff', () => {
+  // The module keeps an in-memory copy, so reset through the public API:
+  // clearing only the SecureStore mock would leave stale cached state behind.
+  beforeEach(async () => {
+    await clearPendingAssessment();
+    mockStorage.clear();
+  });
+
   it('persists a reconciliation tombstone before clearing a delivered result', async () => {
     await savePendingAssessment(pending);
     expect(await loadPendingAssessment()).toEqual(pending);

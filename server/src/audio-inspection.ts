@@ -81,13 +81,18 @@ class InspectionError extends Error {
 }
 
 /**
- * Decode the first audio stream to mono 8 kHz signed 16-bit PCM and count the
- * streamed bytes. Container duration headers are attacker controlled, while
- * FFmpeg progress timestamps vary across versions for very short/final
- * packets. Counting decoded samples is both version-independent and resistant
- * to forged metadata. A wall-clock deadline, one decoder thread, bounded
+ * Decode the audio to mono 8 kHz signed 16-bit PCM and count the streamed
+ * bytes. Container duration headers are attacker controlled, while FFmpeg
+ * progress timestamps vary across versions for very short/final packets.
+ * Counting decoded samples is both version-independent and resistant to
+ * forged metadata. A wall-clock deadline, one decoder thread, bounded
  * probe/allocation/diagnostic sizes, disabled network protocols, and a hard
  * decoded-byte cutoff contain malformed-media resource use.
+ *
+ * `-map 0:a?` deliberately covers EVERY audio stream: the raw-PCM muxer
+ * refuses more than one stream, so a multi-track container (whose uninspected
+ * tracks would still be sent to the paid transcriber) fails closed instead of
+ * passing a gate that only measured its first track.
  */
 function inspectDecodedDuration(filePath: string): Promise<number> {
   const inputFormat = INPUT_FORMAT_BY_EXTENSION[path.extname(filePath).toLowerCase()];
@@ -155,8 +160,10 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
           '3',
           '-i',
           'fd:',
+          // Map every audio stream: a single-stream PCM muxer then rejects
+          // multi-track containers outright (see the function docstring).
           '-map',
-          '0:a:0',
+          '0:a?',
           '-vn',
           '-sn',
           '-dn',

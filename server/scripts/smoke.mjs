@@ -3,7 +3,7 @@
 //
 // The practice-attempts loop fires dozens of assessments, so start the dev
 // server with relaxed limits, e.g.:
-//   RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 npm run dev
+//   RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 ASSESS_IP_DAILY_CAP=100000 npm run dev
 
 import { randomUUID } from 'node:crypto';
 
@@ -51,7 +51,8 @@ function audioForm(questionId, requestId = randomUUID()) {
   return form;
 }
 
-const isUuid = (s) => typeof s === 'string' && /^[0-9a-f-]{36}$/.test(s);
+const isUuid = (s) =>
+  typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
 const hasKeys = (obj, keys) => keys.every((k) => Object.prototype.hasOwnProperty.call(obj, k));
 const questionShape = (q) =>
   q &&
@@ -170,8 +171,11 @@ ok(
 );
 
 let diagResult = null;
+let firstAnswerRequestId = null;
 for (let i = 1; i <= 5; i++) {
-  r = await req('POST', '/diagnostic/answer', { token, form: audioForm(question.id) });
+  const answerRequestId = randomUUID();
+  if (i === 1) firstAnswerRequestId = answerRequestId;
+  r = await req('POST', '/diagnostic/answer', { token, form: audioForm(question.id, answerRequestId) });
   ok(
     `diagnostic answer ${i} returns score fields`,
     r.status === 200 &&
@@ -191,6 +195,16 @@ for (let i = 1; i <= 5; i++) {
 }
 ok('diagnostic finished within 5 answers', diagResult && diagResult.done === true && LEVELS.includes(diagResult.level));
 const assignedLevel = diagResult.level;
+
+// The app's interrupted-upload recovery reconciles through this endpoint.
+r = await req('GET', `/assessments/${firstAnswerRequestId}`, { token });
+ok(
+  'assessment reconciliation returns the completed first answer',
+  r.status === 200 && r.body.status === 'completed' && r.body.context === 'diagnostic',
+  JSON.stringify(r.body),
+);
+r = await req('GET', `/assessments/${randomUUID()}`, { token });
+ok('assessment reconciliation 404s an unknown requestId', r.status === 404, JSON.stringify(r.body));
 
 r = await req('GET', '/diagnostic/next', { token });
 ok(

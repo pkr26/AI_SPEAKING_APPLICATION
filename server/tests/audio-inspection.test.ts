@@ -161,6 +161,38 @@ describe('verifyAudioDuration', () => {
     await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 413 });
   });
 
+  it('rejects multi-track containers whose uninspected streams would reach the paid transcriber', async () => {
+    // Two mono sine tracks in one M4A: the first decodes to ~1s and would pass
+    // a first-stream-only gate, while the second would still be uploaded to
+    // Whisper. The gate must fail the whole container closed.
+    const filePath = path.join(uploadsDir, `${process.pid}-two-audio-streams.m4a`);
+    files.push(filePath);
+    await runFile(configuredFfmpegPath, [
+      '-y',
+      '-hide_banner',
+      '-loglevel',
+      'error',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:duration=1',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=880:duration=1',
+      '-map',
+      '0:a',
+      '-map',
+      '1:a',
+      '-c:a',
+      'aac',
+      filePath,
+    ]);
+    await fs.chmod(filePath, 0o600);
+
+    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 415 });
+  });
+
   it('keeps inspector fixture coverage aligned with every accepted extension', () => {
     expect(supportedAudioFixtures.map(([, name]) => path.extname(name)).sort()).toEqual(
       Object.keys(AUDIO_TYPES).sort(),

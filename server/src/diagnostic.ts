@@ -288,6 +288,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
   router.post(
     '/answer',
     limiters.assess,
+    limiters.assessIpDaily,
     ...(config.s3.bucket
       ? [validate({ body: answerJsonBodySchema })]
       : [uploadAudio, validate({ body: answerBodySchema })]),

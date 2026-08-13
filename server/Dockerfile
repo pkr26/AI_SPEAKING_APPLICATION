@@ -30,6 +30,7 @@ COPY package.json package-lock.json ./
 RUN mkdir -p dist/uploads && chown node:node dist/uploads
 USER node
 EXPOSE 4000
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4000/health"]
+# Shell form so the probe follows the configured PORT (default 4000).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-4000}/health" || exit 1
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["node", "dist/src/index.js"]

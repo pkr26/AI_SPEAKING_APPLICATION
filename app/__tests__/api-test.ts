@@ -760,6 +760,17 @@ describe('apiUploadAudio', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it('fails as a definite local 400 when the cached recording is gone', async () => {
+    mockFileState.exists = false;
+
+    const error = await catchAsync(
+      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}),
+    );
+
+    expect(error).toMatchObject({ status: 400, message: 'The recording is unavailable' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('times out slow uploads with a 408 ApiError', async () => {
     fetchUntilAborted();
 

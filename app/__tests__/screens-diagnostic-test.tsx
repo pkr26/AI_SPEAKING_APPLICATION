@@ -6,7 +6,12 @@ import { Alert } from 'react-native';
 import DiagnosticScreen from '../src/app/diagnostic';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
-import type { DiagnosticAnswerResult, Question, User } from '../src/lib/types';
+import {
+  parseDiagnosticAnswerResult,
+  type DiagnosticAnswerResult,
+  type Question,
+  type User,
+} from '../src/lib/types';
 
 // ----- expo-router mock -----
 
@@ -524,6 +529,16 @@ describe('diagnostic screen', () => {
 
     expect(originalSetUser).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('wires the diagnostic answer parser into the recorder', async () => {
+    // The screen chooses which response contract the recorder parses with; a
+    // swapped parser breaks the flow at runtime, so pin the wiring.
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(recorderProps().parseResult).toBe(parseDiagnosticAnswerResult);
   });
 
   it('keeps the current result visible when an incomplete result has no next question', async () => {

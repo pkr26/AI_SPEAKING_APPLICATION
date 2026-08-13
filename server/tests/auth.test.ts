@@ -1,10 +1,11 @@
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import { assertDailyAssessmentCapacity } from '../src/assess';
-import { authRouter } from '../src/auth';
+import { createAuthRouter } from '../src/auth';
 import { config } from '../src/config';
 import { errorHandler } from '../src/middleware';
+import { buildLimiters } from '../src/rate-limit';
 import { app, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers';
 
 afterAll(async () => {
@@ -190,6 +191,10 @@ describe('auth: login', () => {
       expect(blocked.status).toBe(429);
       expect(blocked.body).toEqual({ error: 'Too many login attempts, please try again later' });
 
+      // The budget blocks only failures: the real owner's correct password
+      // still authenticates while an attacker holds the window saturated.
+      expect((await login(firstReplica, '203.0.113.14', body.email, STRONG_PASSWORD)).status).toBe(200);
+
       const stored = await pool.query<{ key_hash: string }>(
         'SELECT key_hash FROM rate_limit_windows WHERE namespace = $1',
         [namespace],
@@ -223,7 +228,7 @@ describe('auth: infrastructure failures', () => {
       // Pool#connect internally without consuming this transaction-specific mock.
       const direct = express();
       direct.use(express.json());
-      direct.use('/auth', authRouter);
+      direct.use('/auth', createAuthRouter(buildLimiters()));
       direct.use(errorHandler);
       const response = await request(direct)
         .post('/auth/register')
@@ -263,7 +268,7 @@ describe('auth: infrastructure failures', () => {
     try {
       const direct = express();
       direct.use(express.json());
-      direct.use('/auth', authRouter);
+      direct.use('/auth', createAuthRouter(buildLimiters()));
       direct.use(errorHandler);
       const response = await request(direct)
         .post('/auth/register')
@@ -422,6 +427,67 @@ describe('auth: delete account', () => {
       config.assessDailyCap = previousUserCap;
       config.assessGlobalDailyCap = previousGlobalCap;
     }
+  });
+});
+
+describe('auth: password-confirmation throttling', () => {
+  const windowMs = 74_000;
+  const max = 2;
+  const namespace = `password-account:${windowMs}:${max}`;
+  let savedWindow: number;
+  let savedMax: number;
+
+  const throttleApp = () => {
+    config.rateLimit.passwordWindowMs = windowMs;
+    config.rateLimit.passwordMax = max;
+    return app();
+  };
+
+  beforeEach(async () => {
+    savedWindow = config.rateLimit.passwordWindowMs;
+    savedMax = config.rateLimit.passwordMax;
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+  });
+
+  afterEach(async () => {
+    config.rateLimit.passwordWindowMs = savedWindow;
+    config.rateLimit.passwordMax = savedMax;
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+  });
+
+  it('throttles change-password failures per account but never locks out the correct password', async () => {
+    const a = throttleApp();
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const attempt = (currentPassword: string) =>
+      request(a)
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ currentPassword, newPassword: 'newpass123' });
+
+    expect((await attempt('wrong-pass-1')).status).toBe(401);
+    expect((await attempt('wrong-pass-2')).status).toBe(401);
+    const blocked = await attempt('wrong-pass-3');
+    expect(blocked.status).toBe(429);
+    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later' });
+
+    // A stolen token could saturate the budget, yet the real owner's correct
+    // current password still goes through.
+    expect((await attempt(STRONG_PASSWORD)).status).toBe(200);
+  });
+
+  it('throttles account-deletion failures per account and tracks the identity across replicas', async () => {
+    const firstReplica = throttleApp();
+    const secondReplica = throttleApp();
+    const { res } = await registerUser(firstReplica);
+    const token = res.body.token as string;
+    const attempt = (target: ReturnType<typeof app>, password: string) =>
+      request(target).delete('/auth/account').set('Authorization', `Bearer ${token}`).send({ password });
+
+    expect((await attempt(firstReplica, 'wrong-pass-1')).status).toBe(401);
+    expect((await attempt(secondReplica, 'wrong-pass-2')).status).toBe(401);
+    expect((await attempt(firstReplica, 'wrong-pass-3')).status).toBe(429);
+    expect((await attempt(secondReplica, STRONG_PASSWORD)).status).toBe(204);
   });
 });
 

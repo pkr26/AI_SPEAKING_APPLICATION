@@ -300,3 +300,160 @@ Repeat threat modeling, dependency review, penetration testing, privacy/legal
 review, real-device testing, backup/restore testing, and release-artifact scans
 after the P0/P1 work, before launch, and after material authentication, storage,
 AI-provider, database, or mobile-runtime changes.
+
+---
+
+# Follow-up Audit and Remediation — 13 August 2026 (second pass)
+
+## Scope and method
+
+An independent second-pass audit covered every source file, test file,
+migration, CI workflow, container definition, and repository document in both
+packages after the `933e48a` hardening commit. Eleven parallel adversarial
+review passes were consolidated, and every material finding was manually
+re-verified against the code before remediation. No CRITICAL or HIGH defects
+were found. Eight medium findings and the actionable lows were remediated in
+this pass; the residual items below were reviewed and deliberately left.
+
+## Remediated in this pass
+
+### Production code
+
+- **Targeted login lockout (medium).** The per-account login budget previously
+  429'd over-budget requests before credential verification, so one attacker
+  IP could keep a victim's login locked out. The limiter now flags over-budget
+  requests and the route still verifies the password: only failures are
+  throttled and a correct password always authenticates
+  (`server/src/rate-limit.ts`, `server/src/auth.ts`).
+- **Rate-limit refund crash (medium).** `PostgresRateLimitStore.decrement` and
+  `resetKey` are invoked fire-and-forget by express-rate-limit; a database
+  brownout previously surfaced as an unhandled rejection that terminates the
+  process. Both are now fail-safe (logged, swallowed), and `decrement` is
+  window-guarded so a late refund cannot eat the next window's hit
+  (`server/src/postgres-rate-limit-store.ts`).
+- **Account-cycling spend (medium).** Per-user assessment budgets reset with
+  each re-registered account. A fixed-window per-source-IP daily assessment
+  budget (`ASSESS_IP_DAILY_CAP`, default 300, validated
+  `>= ASSESS_DAILY_CAP`) now follows the network across identities
+  (`server/src/rate-limit.ts`, mounted on both assess routes).
+- **Multi-track duration-gate bypass (medium).** The audio inspection decoded
+  only the first audio stream while the whole container was sent to the paid
+  transcriber. The gate now maps every audio stream (`-map 0:a?`), so
+  multi-track containers fail closed at the single-stream PCM muxer
+  (empirically verified with a two-track M4A)
+  (`server/src/audio-inspection.ts`).
+- **Password-confirmation brute force (low).** `change-password` and
+  `DELETE /auth/account` now carry a per-account throttle
+  (`RATE_LIMIT_PASSWORD_MAX`, default 10/15min) with the same always-verify
+  shape, closing online brute-force via stolen token plus distributed IPs.
+- **`requestTimeout` misalignment (low).** The 75s whole-request budget was
+  shorter than the worst-case assessment chain (~100s). It now tracks the
+  configured sub-deadlines: S3 operation timeout + provider timeout + 40s
+  decode/ingress margin (130s with defaults) (`server/src/index.ts`).
+- **Process-crash robustness (low).** multer `_removeFile` no longer throws
+  synchronously on a path-less file (`server/src/upload.ts`); a well-signed
+  JWT with a non-UUID `sub` now 401s instead of producing a 22P02 500
+  (`server/src/middleware.ts`).
+- **Paid-retry amplification (info).** Grading `max_tokens` raised 300 → 400
+  so a near-max-length feedback can no longer truncate into an unparseable,
+  retryable 502 (`server/src/assess.ts`).
+- **Misclassified missing recording (low, app).** The direct multipart upload
+  now fails with a definite local 400 when the OS evicted the cached
+  recording, instead of an ambiguous network error that triggered minutes of
+  recovery polling (`app/src/lib/api.ts`).
+
+### Tests and gates
+
+- Route-level duration-failure coverage: both assess routes now have tests
+  asserting a `verifyAudioDuration` rejection yields 413, zero provider calls,
+  and a cleanly abandoned, retryable request claim
+  (`server/tests/assessment-duration-route.test.ts`).
+- Multi-track rejection regression with a real two-track FFmpeg fixture
+  (`server/tests/audio-inspection.test.ts`).
+- Recorder re-entrancy guard tests now invoke the press handler directly past
+  the disabled Pressable, so the runtime guard (previously uncovered
+  `Recorder.tsx:769`) is genuinely exercised; uploading/recovering phase
+  announcements and the mid-submit 401 path are now pinned.
+- Screen→parser wiring is asserted (`parseResult` identity) on the diagnostic
+  and both practice screens.
+- App coverage floors raised toward actuals (global 95/88/95/99) with new
+  per-path floors for `Recorder.tsx` and `src/lib/`
+  (`app/package.json`).
+- Server `typecheck` now covers the test suite (`server/tsconfig.test.json`);
+  the latent test type errors it surfaced were fixed.
+- `config.test.ts` mocks dotenv out, so a developer `server/.env` can no
+  longer backfill deleted keys and vacate defaults assertions.
+- Weakened/over-claiming tests corrected: practice attempt-walk transition
+  rule, assess client-construction order independence, dead `vi.waitFor` in
+  the S3 upload suite, diagnostic-search title drift, pending-assessment state
+  reset.
+- Store fail-safe/window-guard, per-IP daily budget, password-throttle, and
+  login-lockout regression tests added; the transaction test's limiter stub
+  was extended for the new limiter.
+- Smoke now exercises the assessment-reconciliation endpoint (`GET
+/assessments/:requestId` completed + 404), uses the canonical UUID pattern,
+  and documents the full relaxed-limits command including
+  `ASSESS_IP_DAILY_CAP` (`server/scripts/smoke.mjs`).
+- Docker healthcheck follows the configured `PORT` instead of hardcoding 4000;
+  `.gitignore` now covers `google-services.json` / `GoogleService-Info.plist`;
+  `.env.example` documents the new knobs.
+
+## Reviewed and deliberately left
+
+- **Recorder `recoverPending` latch when the tombstone is gone (low, latent).**
+  Traced as not live-reachable: every tombstone-deletion path also unmounts
+  the recorder, and the conservative keep-controls-locked behavior is pinned
+  by three tests. A comment now records the invariant
+  (`app/src/components/Recorder.tsx`).
+- **Registration account-existence signal (409 vs generic 401).** Accepted and
+  documented in code: per-IP limits bound enumeration volume, bcrypt-before-
+  unique-check removes timing signal, and verified-email registration is
+  already a P1 roadmap item.
+- **Per-request sub-deadline sum vs `requestTimeout` in extreme configs** is
+  now computed; other info-level items (S3 grant TTL client messaging,
+  tombstone wipe on session expiry, logout requiring connectivity, readiness
+  re-hashing, fixed-window refund edges) are deliberate trade-offs or
+  negligible robustness notes recorded in the detailed findings.
+
+## Verification evidence for this pass
+
+- Server: format/lint/typecheck (now including tests)/build all pass; vitest
+  37/37 files and 591+/591+ tests pass (new counts include the added tests);
+  coverage thresholds met.
+- App: format/lint/typecheck pass; jest 14/14 suites and 753/753 tests pass
+  under the raised floors; doctor 20/20; `audit:ci` baseline unchanged.
+- Smoke: full journey green with the new reconciliation assertions (82
+  assertions) against a relaxed-limits `MOCK_AI=true` dev server.
+- The FFmpeg multi-track rejection was empirically verified against the host
+  FFmpeg before the code change (two-track M4A → muxer error → 415).
+
+## Follow-up addendum — remaining three items closed
+
+The three items the second pass initially left as documented-accepted were
+subsequently remediated as well:
+
+- **Recorder recovery latch.** `recoverPending` no longer latches the
+  `recovering` phase when the durable tombstone is gone: it returns the
+  controls to idle with an honest "could not confirm whether your answer was
+  saved" message. The two stage-transition failure paths in `submit` now
+  return to the `recorded` phase with the recording intact (nothing is
+  uploaded before the durable stage mark succeeds), and the three affected
+  tests were updated to pin the new, strictly better behavior
+  (`app/src/components/Recorder.tsx`, `app/__tests__/recorder-test.tsx`).
+- **Registration enumeration.** Account creation now carries a dedicated,
+  tighter per-IP budget (`RATE_LIMIT_REGISTER_MAX`, default 10/hour, shared
+  PostgreSQL store) instead of the generic credential budget, bounding bulk
+  enumeration and account cycling. The residual single-probe signal is
+  inherent to registration without verified email and remains documented in
+  code (`server/src/rate-limit.ts`, `server/src/app.ts`,
+  `server/src/auth.ts`).
+- **Recorder missing-URI guard.** Verified structurally unreachable: every
+  code path that clears the saved URI also leaves the `recorded` phase
+  (pinned by the identity-change and lifecycle tests), so the guard can never
+  fire. It is kept as fail-closed defense and now excluded from coverage with
+  an `istanbul ignore` pragma plus an explanatory comment; the missing-FILE
+  case is covered separately by the definite-400 check in `apiUploadAudio`.
+
+All gates re-run after these changes: server format/lint/typecheck/build +
+591 tests, app format/lint/typecheck + 753 tests under the raised floors,
+doctor, audit:ci, and the smoke journey — all green.

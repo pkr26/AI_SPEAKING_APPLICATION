@@ -507,6 +507,23 @@ describe('logout', () => {
     expect(text('userEmail')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
   });
+
+  it('does not reset query state after a pending logout is unmounted', async () => {
+    const { clearSpy, unmount } = await renderLoggedIn();
+    const cleanup = deferred<void>();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    mockedClearPendingAssessment.mockReturnValueOnce(cleanup.promise);
+
+    const logout = auth!.logout();
+    await waitFor(() => expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1));
+    const clearCountBeforeUnmount = clearSpy.mock.calls.length;
+
+    await unmount();
+    cleanup.resolve();
+    await expect(logout).resolves.toBeUndefined();
+
+    expect(clearSpy).toHaveBeenCalledTimes(clearCountBeforeUnmount);
+  });
 });
 
 describe('expireSession via the unauthorized handler', () => {
@@ -732,13 +749,14 @@ describe('changePassword', () => {
   });
 
   it.each([
-    ['a non-auth API failure', new ApiError(500, 'Request failed with status 500')],
-    ['a malformed verification response', new ContractError()],
+    ['a non-auth API failure', () => new ApiError(500, 'Request failed with status 500')],
+    ['a malformed verification response', () => new ContractError()],
   ])(
     'preserves the session after credential verification encounters %s and permits a retry',
-    async (_label, verificationFailure) => {
+    async (_label, makeVerificationFailure) => {
       await renderLoggedIn();
       const credentialFailure = new ApiError(401, 'Request failed with status 401');
+      const verificationFailure = makeVerificationFailure();
       mockedApiFetch.mockImplementation((async (path: string) => {
         if (path === '/auth/change-password') throw credentialFailure;
         if (path === '/auth/me') throw verificationFailure;
@@ -1006,7 +1024,7 @@ describe('epoch race guards', () => {
   });
 
   it('removes the revoked old token when a completed password rotation is cancelled before save', async () => {
-    const rendered = await renderLoggedIn('tok-old');
+    const { clearSpy, unmount } = await renderLoggedIn('tok-old');
     mockedSaveToken.mockClear();
     mockedClearToken.mockClear();
     const response = deferred<unknown>();
@@ -1014,12 +1032,33 @@ describe('epoch race guards', () => {
 
     const rotation = auth!.changePassword('secret1', 'secret2');
     await Promise.resolve();
-    await rendered.unmount();
+    const clearCountBeforeUnmount = clearSpy.mock.calls.length;
+    await unmount();
     response.resolve(authResponse('tok-rotated'));
 
     await expect(rotation).rejects.toThrow('The account operation was cancelled.');
     expect(mockedSaveToken).not.toHaveBeenCalled();
     expect(mockedClearToken).toHaveBeenCalledWith('tok-old');
+    expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
+    expect(clearSpy).toHaveBeenCalledTimes(clearCountBeforeUnmount);
+  });
+
+  it('keeps the old token when an unmounted password-rotation request fails', async () => {
+    const { unmount } = await renderLoggedIn('tok-old');
+    mockedClearToken.mockClear();
+    const response = deferred<unknown>();
+    const failure = new Error('request failed before rotation');
+    mockedApiFetch.mockReturnValueOnce(response.promise);
+
+    const rotation = auth!.changePassword('secret1', 'secret2');
+    const result = rotation.catch((error: unknown) => error);
+    await Promise.resolve();
+    await unmount();
+    response.reject(failure);
+
+    await expect(result).resolves.toBe(failure);
+    expect(mockedClearToken).not.toHaveBeenCalled();
+    expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
   });
 
   it('conditionally removes a token whose save finishes after unmount', async () => {

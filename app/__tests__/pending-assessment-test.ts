@@ -26,6 +26,16 @@ jest.mock('expo-secure-store', () => ({
 // See api-test.ts for why fresh module graphs use require instead of import().
 declare const require: (id: string) => unknown;
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 const pending: PendingAssessment = {
   ownerId: '550e8400-e29b-41d4-a716-446655440000',
   endpoint: '/practice/attempt',
@@ -137,6 +147,15 @@ describe('pending assessment edge cases', () => {
       expect(parsePendingAssessment(value)).toBeNull();
     },
   );
+
+  it('rejects callable metadata even when it exposes every valid field', () => {
+    const callable = () => undefined;
+    for (const [key, value] of Object.entries(pending)) {
+      Object.defineProperty(callable, key, { configurable: true, enumerable: true, value });
+    }
+
+    expect(parsePendingAssessment(callable)).toBeNull();
+  });
 
   it.each([
     { ...pending, createdAt: 0 },
@@ -422,5 +441,58 @@ describe('pending assessment edge cases', () => {
     ).rejects.toThrow('Invalid pending assessment metadata');
     expect(secureStore.setItemAsync).not.toHaveBeenCalled();
     expect(await mod.loadPendingAssessment()).toEqual({ ...pending, stage: 'prepared' });
+  });
+
+  it('serializes a deferred save before a concurrently requested clear', async () => {
+    const { secureStore, mod } = loadFresh();
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    const storageEvents: string[] = [];
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('save-started');
+        writeStarted.resolve();
+        await allowWrite.promise;
+        mockStorage.set(key, value);
+        storageEvents.push('save-finished');
+      });
+    jest.mocked(secureStore.deleteItemAsync).mockImplementationOnce(async (key: string) => {
+      storageEvents.push('cleared');
+      mockStorage.delete(key);
+    });
+
+    const saving = mod.savePendingAssessment(pending);
+    await writeStarted.promise;
+    const clearing = mod.clearPendingAssessment(pending.requestId);
+
+    expect(storageEvents).toEqual(['save-started']);
+    expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+
+    allowWrite.resolve();
+    await expect(Promise.all([saving, clearing])).resolves.toEqual([undefined, undefined]);
+
+    expect(storageEvents).toEqual(['save-started', 'save-finished', 'cleared']);
+    expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+    await expect(mod.loadPendingAssessment()).resolves.toBeNull();
+  });
+
+  it('preserves the prior memory and durable record when a queued save fails', async () => {
+    const { secureStore, mod } = loadFresh();
+    const replacement: PendingAssessment = {
+      ...pending,
+      requestId: '550e8400-e29b-41d4-a716-446655440004',
+      stage: 'prepared',
+    };
+    const storageFailure = new Error('keychain write failed');
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockRejectedValueOnce(storageFailure);
+
+    const saving = mod.savePendingAssessment(replacement);
+    const loadingAfterFailure = mod.loadPendingAssessment();
+
+    await expect(saving).rejects.toBe(storageFailure);
+    await expect(loadingAfterFailure).resolves.toEqual(pending);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(pending);
   });
 });

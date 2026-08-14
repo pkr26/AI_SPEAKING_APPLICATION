@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { Alert, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -11,6 +12,7 @@ import PracticeScreen from '../src/app/practice/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import { LogoutCleanupError, useAuth } from '../src/lib/auth';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
+import { colors, layout } from '../src/lib/theme';
 import { parseAttemptResult, type AttemptResult, type Question, type User } from '../src/lib/types';
 
 // ----- expo-router mock -----
@@ -200,6 +202,38 @@ function recorderProps(): CapturedRecorderProps {
   return mockRecorderProps;
 }
 
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+async function expectPressFeedback(
+  getButton: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getButton())).toMatchObject(resting);
+  await fireEvent(getButton(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getButton())).toMatchObject(pressed);
+  await fireEvent(getButton(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getButton());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
+}
+
 function buttonContainerPaddingBottom(name: string): unknown {
   const parent = screen.getByRole('button', { name }).parent;
   if (!parent) throw new Error(`Button "${name}" has no container`);
@@ -327,11 +361,43 @@ describe('practice home screen', () => {
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps a cached question visible when a recovery refresh fails', async () => {
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    mockApiFetch
+      .mockResolvedValueOnce({ question: QUESTION })
+      .mockRejectedValueOnce(new Error('background refresh failed'));
+    await renderScreen(<PracticeScreen />, queryClient);
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+
+    await act(async () => recorderProps().onRecoveryUnresolved());
+    await waitFor(() => expect(queryClient.getQueryState(queryKey)?.status).toBe('error'));
+    // The cache updates before TanStack Query delivers its batched observer notification.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(screen.queryByText("Couldn't load a question")).toBeNull();
+  });
+
   it('navigates to help for the current question', async () => {
     mockApiFetch.mockResolvedValue({ question: QUESTION });
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
+    await expectPressFeedback(
+      () => screen.getByLabelText('Help for this question'),
+      {
+        alignItems: 'center',
+        alignSelf: 'flex-end',
+        backgroundColor: colors.primary,
+        height: layout.minimumTarget,
+        justifyContent: 'center',
+        width: layout.minimumTarget,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByLabelText('Help for this question'));
     expect(mockRouter.push).toHaveBeenCalledWith({
       pathname: '/practice/help',
@@ -347,6 +413,11 @@ describe('practice home screen', () => {
     expect(
       screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
@@ -354,6 +425,16 @@ describe('practice home screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the practice fallback without also showing a loading state', async () => {
+    mockApiFetch.mockRejectedValue(new Error('private parse detail'));
+    await renderScreen(<PracticeScreen />);
+
+    expect(
+      await screen.findByText('Could not load a practice question. Please try again.'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Loading your question…')).toBeNull();
   });
 
   it('opens the settings menu and navigates to settings screens', async () => {
@@ -424,6 +505,11 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />);
 
     expect(screen.getByText('Invalid question link')).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Back to Practice' }),
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
     expect(mockApiFetch).not.toHaveBeenCalled();
@@ -500,6 +586,7 @@ describe('practice attempt screen', () => {
     expect(mockApiFetch).not.toHaveBeenCalled();
     expect(mockRecorderProps).toBeNull();
     expect(screen.queryByText('courage')).toBeNull();
+    expect(screen.queryByText("Couldn't load the question")).toBeNull();
   });
 
   it('forwards results to the practice flow and feedback route', async () => {
@@ -567,6 +654,11 @@ describe('practice attempt screen', () => {
     expect(
       screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
@@ -575,6 +667,16 @@ describe('practice attempt screen', () => {
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
+
+  it('uses the attempt-specific fallback for non-API failures', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockRejectedValue(new Error('private parse detail'));
+    await renderScreen(<AttemptScreen />);
+
+    expect(
+      await screen.findByText('Could not load this practice question. Please try again.'),
+    ).toBeTruthy();
+  });
 });
 
 describe('practice feedback screen', () => {
@@ -582,6 +684,11 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText('No result to show')).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Back to Practice' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
   });
@@ -603,6 +710,15 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText(/Not quite/)).toBeNull();
     expect(screen.queryByText('Out of attempts')).toBeNull();
     expect(screen.queryByText('Try Again')).toBeNull();
+    expect(flattenedStyle(screen.getByRole('header', { name: 'Great job!' }))).toMatchObject({
+      color: colors.success,
+      textAlign: 'center',
+    });
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Next Question' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
     expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
@@ -662,6 +778,14 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText('Great job!')).toBeNull();
     expect(screen.queryByText('Out of attempts')).toBeNull();
     expect(screen.queryByText('Next Question')).toBeNull();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: 'Not quite — attempt 2 of 3' })),
+    ).toMatchObject({ color: colors.warning, textAlign: 'center' });
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(mockRouter.back).toHaveBeenCalled();
@@ -715,6 +839,15 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText('Great job!')).toBeNull();
     expect(screen.queryByText(/Not quite/)).toBeNull();
     expect(screen.queryByText('Try Again')).toBeNull();
+    expect(flattenedStyle(screen.getByRole('header', { name: 'Out of attempts' }))).toMatchObject({
+      color: colors.danger,
+      textAlign: 'center',
+    });
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Next Question' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
   });
 
   it('ignores unexpected final feedback outside the final variant', async () => {
@@ -755,6 +888,11 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
 
     expect(screen.getByText('Invalid question link')).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Back to Practice' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Back to Practice' }));
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
     expect(mockApiFetch).not.toHaveBeenCalled();
@@ -842,6 +980,11 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
     await screen.findByText('Word');
 
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Start Practice' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Start Practice' }));
     expect(mockRouter.push).toHaveBeenCalledWith({
       pathname: '/practice/attempt',
@@ -858,6 +1001,11 @@ describe('practice help screen', () => {
     expect(
       screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { alignItems: 'center', backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
@@ -865,5 +1013,15 @@ describe('practice help screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the help-specific fallback for non-API failures', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockRejectedValue(new Error('private parse detail'));
+    await renderScreen(<HelpScreen />);
+
+    expect(
+      await screen.findByText('Could not load help for this question. Please try again.'),
+    ).toBeTruthy();
   });
 });

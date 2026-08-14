@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Text } from 'react-native';
+import { Platform, StyleSheet, Text, type TextProps } from 'react-native';
 
 import LoginScreen from '../src/app/(auth)/login';
 import SignupScreen from '../src/app/(auth)/signup';
@@ -11,12 +12,41 @@ import {
   MAX_PASSWORD_UTF8_BYTES,
   type useAuth,
 } from '../src/lib/auth';
+import { colors } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
+
+interface MockKeyboardAvoidingViewProps {
+  behavior?: 'height' | 'position' | 'padding';
+  children?: React.ReactNode;
+  style?: unknown;
+}
+
+function MockKeyboardAvoidingView({ behavior, children, style }: MockKeyboardAvoidingViewProps) {
+  return React.createElement(
+    'KeyboardAvoidingView',
+    { behavior, style, testID: 'keyboard-avoiding-view' },
+    children,
+  );
+}
+
+jest.mock('react-native/Libraries/Components/Keyboard/KeyboardAvoidingView', () => ({
+  __esModule: true,
+  default: MockKeyboardAvoidingView,
+}));
 
 // ----- expo-router mock -----
 
-function MockLink({ children }: { children: React.ReactNode; href: string }) {
-  return <Text>{children}</Text>;
+function MockLink({
+  children,
+  href,
+  accessibilityRole,
+  ...textProps
+}: TextProps & { children: React.ReactNode; href: string }) {
+  return (
+    <Text {...textProps} accessibilityRole={accessibilityRole ?? 'link'} {...{ href }}>
+      {children}
+    </Text>
+  );
 }
 
 jest.mock('expo-router', () => ({
@@ -96,24 +126,52 @@ async function fillLogin(email: string, password: string) {
   await fireEvent.changeText(screen.getByPlaceholderText('Your password'), password);
 }
 
-function compositeButtonAccessibilityState(accessibilityLabel: string): unknown {
-  type PressFiber = {
-    memoizedProps?: {
-      accessibilityState?: unknown;
-      onPress?: () => unknown;
-    };
-    return: PressFiber | null;
-  };
-  let fiber = screen.getByRole('button', {
-    name: accessibilityLabel,
-  }).unstable_fiber as unknown as PressFiber | null;
-  while (fiber) {
-    if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.accessibilityState;
-    }
-    fiber = fiber.return;
+async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
+  const originalOS = Object.getOwnPropertyDescriptor(Platform, 'OS');
+  Object.defineProperty(Platform, 'OS', { configurable: true, value: os });
+  try {
+    await run();
+  } finally {
+    if (originalOS) Object.defineProperty(Platform, 'OS', originalOS);
   }
-  throw new Error(`Pressable "${accessibilityLabel}" not found`);
+}
+
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+function textNode(node: TestInstance, text: string): TestInstance {
+  const match = node.queryAll((candidate) => candidate.children.includes(text))[0];
+  if (!match) throw new Error(`Text "${text}" not found inside rendered control`);
+  return match;
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+async function expectPressFeedback(
+  getButton: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getButton())).toMatchObject(resting);
+  await fireEvent(getButton(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getButton())).toMatchObject(pressed);
+  await fireEvent(getButton(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getButton());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
 }
 
 describe('login screen', () => {
@@ -121,14 +179,30 @@ describe('login screen', () => {
     await render(<LoginScreen />);
     expect(screen.getByText('AI English Coach')).toBeTruthy();
     expect(screen.getByText('Practice speaking English with instant AI feedback.')).toBeTruthy();
-    expect(screen.getByPlaceholderText('you@example.com')).toBeTruthy();
-    expect(screen.getByPlaceholderText('Your password')).toBeTruthy();
-    expect(screen.getByText('Create an account')).toBeTruthy();
+    expect(screen.getByPlaceholderText('you@example.com').props.value).toBe('');
+    expect(screen.getByPlaceholderText('Your password').props.value).toBe('');
+    expect(screen.getByRole('link', { name: 'Create an account' }).props.href).toBe('/signup');
+  });
+
+  it.each([
+    ['ios', 'padding'],
+    ['android', undefined],
+  ] as const)('uses the %s keyboard-avoidance behavior', async (os, expectedBehavior) => {
+    await withPlatformOS(os, async () => {
+      await render(<LoginScreen />);
+
+      expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
+    });
   });
 
   it('keeps Sign In disabled until email and password are present', async () => {
     await render(<LoginScreen />);
-    expect(compositeButtonAccessibilityState('Sign In')).toEqual({
+    expect(flattenedStyle(screen.getByRole('button', { name: 'Sign In' }))).toMatchObject({
+      alignItems: 'center',
+      backgroundColor: colors.primary,
+      opacity: 0.5,
+    });
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState).toEqual({
       disabled: true,
       busy: false,
     });
@@ -142,12 +216,18 @@ describe('login screen', () => {
     );
 
     await fillLogin('ada@example.com', 'password1');
-    expect(compositeButtonAccessibilityState('Sign In')).toEqual({
+    expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState).toEqual({
       disabled: false,
       busy: false,
     });
     expect(screen.getByRole('button', { name: 'Sign In' }).props.accessibilityState.disabled).toBe(
       false,
+    );
+    expect(flattenedStyle(screen.getByRole('button', { name: 'Sign In' })).opacity).toBeUndefined();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Sign In' }),
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
     );
   });
 
@@ -306,25 +386,51 @@ describe('signup screen', () => {
     expect(screen.getByLabelText('Hindi, हिन्दी')).toBeTruthy();
     expect(screen.getByLabelText('Spanish, Español')).toBeTruthy();
     expect(screen.getByLabelText('Chinese (Simplified), 简体中文')).toBeTruthy();
-    expect(screen.getByText('Sign in')).toBeTruthy();
+    expect(screen.getByLabelText('Name').props.value).toBe('');
+    expect(screen.getByLabelText('Email').props.value).toBe('');
+    expect(screen.getByLabelText('Password').props.value).toBe('');
+    expect(screen.queryByText('Password must be at least 8 characters.')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Sign in' }).props.href).toBe('/login');
+  });
+
+  it.each([
+    ['ios', 'padding'],
+    ['android', undefined],
+  ] as const)('uses the %s keyboard-avoidance behavior', async (os, expectedBehavior) => {
+    await withPlatformOS(os, async () => {
+      await render(<SignupScreen />);
+
+      expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
+    });
   });
 
   it('requires every field plus a language before enabling Sign Up', async () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
-    expect(compositeButtonAccessibilityState('Sign Up')).toEqual({
+    expect(flattenedStyle(signUpButton())).toMatchObject({
+      alignItems: 'center',
+      backgroundColor: colors.primary,
+      opacity: 0.5,
+    });
+    expect(signUpButton().props.accessibilityState).toEqual({
       disabled: true,
       busy: false,
     });
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
 
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
-    expect(compositeButtonAccessibilityState('Sign Up')).toEqual({
+    expect(signUpButton().props.accessibilityState).toEqual({
       disabled: false,
       busy: false,
     });
     expect(signUpButton().props.accessibilityState.disabled).toBe(false);
+    expect(flattenedStyle(signUpButton()).opacity).toBeUndefined();
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
+    await expectPressFeedback(
+      signUpButton,
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
   });
 
   it('keeps language selection mutually exclusive and exposed to accessibility', async () => {
@@ -334,10 +440,31 @@ describe('signup screen', () => {
 
     expect(telugu.props.accessibilityState).toEqual({ selected: false });
     expect(spanish.props.accessibilityState).toEqual({ selected: false });
+    expect(flattenedStyle(telugu)).toMatchObject({
+      alignItems: 'center',
+      backgroundColor: colors.card,
+      borderColor: colors.border,
+      flexBasis: '47%',
+    });
+    expect(flattenedStyle(textNode(telugu, 'తెలుగు'))).toMatchObject({
+      color: colors.text,
+    });
+    expect(flattenedStyle(textNode(telugu, 'Telugu'))).toMatchObject({ color: colors.muted });
 
     await fireEvent.press(telugu);
-    expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+    const selectedTelugu = screen.getByLabelText('Telugu, తెలుగు');
+    expect(selectedTelugu.props.accessibilityState).toEqual({
       selected: true,
+    });
+    expect(flattenedStyle(selectedTelugu)).toMatchObject({
+      backgroundColor: colors.primaryLight,
+      borderColor: colors.primary,
+    });
+    expect(flattenedStyle(textNode(selectedTelugu, 'తెలుగు'))).toMatchObject({
+      color: colors.primary,
+    });
+    expect(flattenedStyle(textNode(selectedTelugu, 'Telugu'))).toMatchObject({
+      color: colors.primary,
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       selected: false,

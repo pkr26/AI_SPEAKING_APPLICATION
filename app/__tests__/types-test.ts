@@ -32,6 +32,13 @@ function expectContractError(run: () => unknown): void {
 }
 
 describe('identity contract parsers', () => {
+  it('uses stable, actionable contract-error identity and copy', () => {
+    expect(new ContractError()).toMatchObject({
+      name: 'ContractError',
+      message: 'The server returned an invalid response. Please try again.',
+    });
+  });
+
   it('accepts valid user and auth envelopes', () => {
     expect(parseUser(user)).toEqual(user);
     expect(parseUserResponse({ user })).toEqual({ user });
@@ -58,6 +65,22 @@ describe('identity contract parsers', () => {
     expectContractError(() => parseAuthResponse({ token: 123, user }));
     expectContractError(() => parseAuthResponse({ token: '', user }));
     expectContractError(() => parseAuthResponse({ token: 'jwt', user: null }));
+  });
+
+  it('rejects a callable user even when it exposes every valid field', () => {
+    const callable = () => undefined;
+    for (const [key, value] of Object.entries(user)) {
+      Object.defineProperty(callable, key, { configurable: true, enumerable: true, value });
+    }
+
+    expectContractError(() => parseUser(callable));
+  });
+
+  it('enforces the auth token length boundary', () => {
+    const token = 'x'.repeat(16_384);
+
+    expect(parseAuthResponse({ token, user })).toEqual({ token, user });
+    expectContractError(() => parseAuthResponse({ token: 'x'.repeat(16_385), user }));
   });
 
   it('rejects null and array auth, user, and question envelopes', () => {
@@ -632,6 +655,7 @@ describe('help and attempt detail boundaries', () => {
     ).toMatchObject({ promptWordNative: 'x'.repeat(500), questionTextNative: 'x'.repeat(4_000) });
 
     expectContractError(() => parseUser({ ...user, name: 'x'.repeat(101) }));
+    expectContractError(() => parseUser({ ...user, email: 'x'.repeat(255) }));
     expectContractError(() =>
       parseQuestionResponse({
         question: { ...question, questionText: 'x'.repeat(1_001) },
@@ -645,6 +669,28 @@ describe('help and attempt detail boundaries', () => {
         feedback: 'Good.',
         done: true,
         level: 'B1',
+      }),
+    );
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        passed: true,
+        score: 80,
+        transcript: 'Answer.',
+        feedback: 'x'.repeat(801),
+        done: true,
+        level: 'B1',
+      }),
+    );
+    expectContractError(() =>
+      parseHelpContent({
+        ...help,
+        examples: [{ en: 'x'.repeat(4_001), native: 'y' }, help.examples[1], help.examples[2]],
+      }),
+    );
+    expectContractError(() =>
+      parseHelpContent({
+        ...help,
+        examples: [{ en: 'x', native: 'y'.repeat(4_001) }, help.examples[1], help.examples[2]],
       }),
     );
     expectContractError(() =>
@@ -665,6 +711,20 @@ describe('help and attempt detail boundaries', () => {
         nextQuestion: question,
       }),
     );
+
+    const boundedAttempt = {
+      passed: true,
+      attemptNo: 1,
+      score: 80,
+      transcript: 'x'.repeat(12_000),
+      feedback: 'x'.repeat(800),
+      nextQuestion: question,
+    };
+    expect(parseAttemptResult(boundedAttempt)).toEqual(boundedAttempt);
+    expectContractError(() =>
+      parseAttemptResult({ ...boundedAttempt, transcript: 'x'.repeat(12_001) }),
+    );
+    expectContractError(() => parseAttemptResult({ ...boundedAttempt, feedback: 'x'.repeat(801) }));
   });
 });
 

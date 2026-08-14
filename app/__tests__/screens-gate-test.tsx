@@ -1,7 +1,13 @@
-import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  focusManager,
+  QueryClient,
+  QueryClientProvider,
+  useQueryClient,
+} from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { AppState, type AppStateStatus, Text } from 'react-native';
+import { AppState, type AppStateStatus, StyleSheet, Text } from 'react-native';
 import { router } from 'expo-router';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -11,6 +17,7 @@ import RootLayout, { ErrorBoundary } from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
+import { colors, layout } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 // ----- expo-router mock (captures Stack structure and redirects) -----
@@ -78,6 +85,7 @@ const USER: User = {
 };
 
 let mockAuthValue: AuthValue;
+let rootQueryClient: QueryClient | undefined;
 
 function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
   return {
@@ -98,6 +106,10 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
 }
 
 function MockAuthProvider({ children }: { children: React.ReactNode }) {
+  const queryClient = useQueryClient();
+  React.useEffect(() => {
+    rootQueryClient = queryClient;
+  }, [queryClient]);
   return <>{children}</>;
 }
 
@@ -162,6 +174,38 @@ async function renderGate(queryClient = makeQueryClient()) {
   };
 }
 
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+async function expectPressFeedback(
+  getButton: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getButton())).toMatchObject(resting);
+  await fireEvent(getButton(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getButton())).toMatchObject(pressed);
+  await fireEvent(getButton(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getButton());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
+}
+
 afterEach(async () => {
   // Flush TanStack Query's batched notifications inside act().
   await act(async () => {
@@ -178,6 +222,7 @@ beforeEach(() => {
   capturedStackProps.length = 0;
   capturedScreenProps.length = 0;
   capturedProtectedProps.length = 0;
+  rootQueryClient = undefined;
   mockAuthValue = makeAuth();
 });
 
@@ -200,6 +245,45 @@ describe('root layout route guards', () => {
       'settings/change-password',
       'settings/delete-account',
     ]);
+  });
+
+  it('configures the exact header title for every visible nested route', async () => {
+    await render(<RootLayout />);
+    const titleFor = (name: string) =>
+      (
+        capturedScreenProps.find((props) => props?.name === name)?.options as
+          { title?: unknown } | undefined
+      )?.title;
+
+    expect([
+      titleFor('diagnostic'),
+      titleFor('practice/index'),
+      titleFor('practice/help'),
+      titleFor('practice/attempt'),
+      titleFor('practice/feedback'),
+      titleFor('settings/change-password'),
+      titleFor('settings/delete-account'),
+    ]).toEqual([
+      'Diagnostic Test',
+      'Practice',
+      'Help',
+      'Practice Mode',
+      'Feedback',
+      'Change Password',
+      'Delete Account',
+    ]);
+  });
+
+  it('configures bounded retries and a five-minute stale window for queries', async () => {
+    await render(<RootLayout />);
+
+    expect(rootQueryClient).toBeDefined();
+    expect(rootQueryClient?.getDefaultOptions().queries).toEqual(
+      expect.objectContaining({
+        retry: 1,
+        staleTime: 300_000,
+      }),
+    );
   });
 
   it('closes every protected group while the session is restoring', async () => {
@@ -310,6 +394,35 @@ describe('root layout route guards', () => {
       }
     }
   });
+
+  it('defaults to focused while the initial native app state is unavailable', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      value: undefined,
+    });
+    const remove = jest.fn();
+    const addListenerSpy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockReturnValue({ remove } as ReturnType<typeof AppState.addEventListener>);
+    const setFocusedSpy = jest.spyOn(focusManager, 'setFocused');
+
+    try {
+      const rendered = await render(<RootLayout />);
+      expect(setFocusedSpy).toHaveBeenCalledWith(true);
+
+      await rendered.unmount();
+      expect(remove).toHaveBeenCalledTimes(1);
+    } finally {
+      addListenerSpy.mockRestore();
+      setFocusedSpy.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
+  });
 });
 
 describe('root fallback screens', () => {
@@ -322,6 +435,15 @@ describe('root fallback screens', () => {
       'Your learning data is safe. Try this screen again.',
     );
     expect(screen.queryByText(/sensitive stack details/)).toBeNull();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      {
+        backgroundColor: colors.primary,
+        justifyContent: 'center',
+        minHeight: layout.minimumTarget,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(retry).toHaveBeenCalledTimes(1);
   });
@@ -330,6 +452,15 @@ describe('root fallback screens', () => {
     await render(<NotFoundScreen />);
 
     expect(screen.getByRole('header', { name: 'Page not found' })).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Return Home' }),
+      {
+        backgroundColor: colors.primary,
+        justifyContent: 'center',
+        minHeight: layout.minimumTarget,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Return Home' }));
     expect(router.replace).toHaveBeenCalledWith('/');
   });
@@ -367,6 +498,11 @@ describe('index gate', () => {
     expect(screen.getByText("Can't access your secure session")).toBeTruthy();
     expect(screen.getByRole('alert')).toHaveTextContent(mockAuthValue.restoreError!);
     expect(mockApiFetch).not.toHaveBeenCalled();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { backgroundColor: colors.primary, minHeight: layout.minimumTarget },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(retrySessionRestore).toHaveBeenCalledTimes(1);
   });
@@ -474,6 +610,11 @@ describe('index gate', () => {
     expect(
       screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      { backgroundColor: colors.primary, minHeight: layout.minimumTarget },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));

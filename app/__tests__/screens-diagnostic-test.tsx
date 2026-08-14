@@ -1,11 +1,13 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert } from 'react-native';
+import { Alert, StyleSheet } from 'react-native';
 
 import DiagnosticScreen from '../src/app/diagnostic';
-import { ApiError, apiFetch } from '../src/lib/api';
+import { ApiError, apiFetch, userMessageForError } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
+import { colors, layout } from '../src/lib/theme';
 import {
   parseDiagnosticAnswerResult,
   type DiagnosticAnswerResult,
@@ -97,12 +99,17 @@ jest.mock('../src/lib/auth', () => ({
 
 // ----- api mock -----
 
-jest.mock('../src/lib/api', () => ({
-  ...jest.requireActual('../src/lib/api'),
-  apiFetch: jest.fn(),
-}));
+jest.mock('../src/lib/api', () => {
+  const actual = jest.requireActual<typeof import('../src/lib/api')>('../src/lib/api');
+  return {
+    ...actual,
+    apiFetch: jest.fn(),
+    userMessageForError: jest.fn(actual.userMessageForError),
+  };
+});
 
 const mockApiFetch = apiFetch as jest.Mock;
+const mockUserMessageForError = jest.mocked(userMessageForError);
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
   replace: jest.Mock;
@@ -165,6 +172,38 @@ function recorderProps(): CapturedRecorderProps {
   return mockRecorderProps;
 }
 
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+async function expectPressFeedback(
+  getButton: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getButton())).toMatchObject(resting);
+  await fireEvent(getButton(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getButton())).toMatchObject(pressed);
+  await fireEvent(getButton(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getButton());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
+}
+
 function capturedPressHandler(accessibilityLabel: string): () => unknown {
   type PressFiber = {
     memoizedProps?: { onPress?: () => unknown };
@@ -222,6 +261,7 @@ describe('diagnostic screen', () => {
     await renderScreen(queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(mockUserMessageForError).not.toHaveBeenCalled();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText(/Question 1 of up to 5/)).toBeTruthy();
     expect(screen.getByText('Diagnostic Test')).toBeTruthy();
@@ -250,6 +290,7 @@ describe('diagnostic screen', () => {
 
     expect(mockApiFetch).not.toHaveBeenCalled();
     expect(mockRecorderProps).toBeNull();
+    expect(screen.queryByText('Preparing your diagnostic test…')).toBeNull();
   });
 
   it('removes a loaded question immediately when the authenticated user disappears', async () => {
@@ -276,10 +317,12 @@ describe('diagnostic screen', () => {
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
 
     mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    mockRecorderProps = null;
     await rendered.rerenderScreen();
 
     expect(screen.queryByText('Describe a time you showed courage.')).toBeNull();
     expect(screen.getByText('Preparing your diagnostic test…')).toBeTruthy();
+    expect(mockRecorderProps).toBeNull();
 
     await act(async () => resolveOtherQuestion(nextPayload(QUESTION_2, 0)));
     expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
@@ -287,6 +330,26 @@ describe('diagnostic screen', () => {
       ownerId: OTHER_USER.id,
       questionId: QUESTION_2.id,
     });
+  });
+
+  it('keeps the current diagnostic question visible when recovery refresh fails', async () => {
+    const queryClient = makeQueryClient();
+    const queryKey = ['diagnostic-next', 1, USER.id] as const;
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockRejectedValueOnce(new Error('background refresh failed'));
+    await renderScreen(queryClient);
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+
+    await act(async () => recorderProps().onRecoveryUnresolved());
+    await waitFor(() => expect(queryClient.getQueryState(queryKey)?.status).toBe('error'));
+    // The cache updates before TanStack Query delivers its batched observer notification.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(screen.queryByText("Couldn't load the test")).toBeNull();
   });
 
   it.each(['account', 'session'] as const)(
@@ -477,6 +540,15 @@ describe('diagnostic screen', () => {
     await act(async () => recorderProps().onResult(result));
 
     expect(screen.getByText('Answer received')).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Next Question' }),
+      {
+        alignItems: 'center',
+        alignSelf: 'stretch',
+        backgroundColor: colors.primary,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
 
     expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
@@ -507,6 +579,15 @@ describe('diagnostic screen', () => {
     expect(screen.getByText('Your English level is')).toBeTruthy();
     expect(screen.getByText('B2')).toBeTruthy();
 
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Start Practicing' }),
+      {
+        alignItems: 'center',
+        alignSelf: 'stretch',
+        backgroundColor: colors.primary,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Start Practicing' }));
     expect(mockAuthValue.setUser).toHaveBeenCalledWith({
       ...USER,
@@ -578,6 +659,15 @@ describe('diagnostic screen', () => {
     expect(
       screen.getByText('The service is temporarily unavailable. Please try again later.'),
     ).toBeTruthy();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Try Again' }),
+      {
+        alignItems: 'center',
+        alignSelf: 'stretch',
+        backgroundColor: colors.primary,
+      },
+      { backgroundColor: colors.primaryDark },
+    );
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
@@ -623,6 +713,11 @@ describe('diagnostic screen', () => {
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
 
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Account & privacy' }),
+      { borderColor: colors.border, justifyContent: 'center', minHeight: layout.minimumTarget },
+      { backgroundColor: colors.card },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Account & privacy' }));
     expect(alertSpy).toHaveBeenCalledWith('Account & privacy', undefined, [
       { text: 'Change Password', onPress: expect.any(Function) },
@@ -642,6 +737,11 @@ describe('diagnostic screen', () => {
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
 
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Log out' }),
+      { borderColor: colors.border, justifyContent: 'center', minHeight: layout.minimumTarget },
+      { backgroundColor: colors.card },
+    );
     await fireEvent.press(screen.getByRole('button', { name: 'Log out' }));
 
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));

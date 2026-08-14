@@ -257,6 +257,42 @@ describe('token storage', () => {
     });
   });
 
+  it('keeps the prior token snapshot authoritative when saving a replacement fails', async () => {
+    await api.saveToken('jwt-prior');
+    const cause = new Error('keychain write failed');
+    jest.mocked(SecureStore.setItemAsync).mockRejectedValueOnce(cause);
+
+    await expect(api.saveToken('jwt-replacement')).rejects.toBe(cause);
+
+    jest.mocked(SecureStore.getItemAsync).mockClear();
+    fetchMock.mockResolvedValue(fakeResponse());
+    await api.apiFetch('/me');
+
+    expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer jwt-prior',
+    });
+  });
+
+  it('keeps the prior token snapshot authoritative when deletion fails', async () => {
+    await api.saveToken('jwt-prior');
+    const cause = new Error('keychain delete failed');
+    jest.mocked(SecureStore.deleteItemAsync).mockRejectedValueOnce(cause);
+
+    await expect(api.clearToken()).rejects.toBe(cause);
+
+    jest.mocked(SecureStore.getItemAsync).mockClear();
+    fetchMock.mockResolvedValue(fakeResponse());
+    await api.apiFetch('/me');
+
+    expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer jwt-prior',
+    });
+  });
+
   it('fails closed when conditional token cleanup cannot read secure storage', async () => {
     const cause = new Error('keychain locked');
     jest.mocked(SecureStore.getItemAsync).mockRejectedValueOnce(cause);
@@ -346,6 +382,14 @@ describe('token storage', () => {
 });
 
 describe('userMessageForError', () => {
+  it('uses a stable ApiError identity', () => {
+    expect(new api.ApiError(418, 'short and stout')).toMatchObject({
+      name: 'ApiError',
+      status: 418,
+      message: 'short and stout',
+    });
+  });
+
   it.each([
     [0, 'Could not connect to the server. Check your connection and try again.'],
     [408, 'The request timed out. Check your connection and try again.'],
@@ -554,7 +598,10 @@ describe('apiFetch', () => {
     const error = await catchAsync(api.apiFetch('/slow', { timeoutMs: 10 }));
 
     expect(error).toBeInstanceOf(api.ApiError);
-    expect(error).toMatchObject({ status: 408 });
+    expect(error).toMatchObject({
+      status: 408,
+      message: 'The request timed out. Please check your connection and try again.',
+    });
   });
 
   it('propagates external aborts without wrapping them', async () => {
@@ -1036,7 +1083,10 @@ describe('apiPostPresignedAudio', () => {
     if (succeeds) {
       await expect(upload).resolves.toBeUndefined();
     } else {
-      await expect(upload).rejects.toMatchObject({ status });
+      await expect(upload).rejects.toMatchObject({
+        status,
+        message: `Request failed with status ${status}`,
+      });
     }
   });
 
@@ -1061,7 +1111,10 @@ describe('apiPostPresignedAudio', () => {
       ),
     );
 
-    expect(error).toMatchObject({ status: 408 });
+    expect(error).toMatchObject({
+      status: 408,
+      message: 'The recording upload timed out',
+    });
   });
 
   it('propagates caller cancellation and removes its one-shot native listener', async () => {
@@ -1139,7 +1192,7 @@ describe('apiPostPresignedAudio', () => {
         'audio/mp4',
         maxBytes,
       ),
-    ).rejects.toMatchObject({ status: 413 });
+    ).rejects.toMatchObject({ status: 413, message: 'The recording is too large' });
     expect(mockFileUpload).not.toHaveBeenCalled();
   });
 
@@ -1179,7 +1232,7 @@ describe('apiPostPresignedAudio', () => {
         'audio/webm',
         maxBytes,
       ),
-    ).rejects.toMatchObject({ status: 413 });
+    ).rejects.toMatchObject({ status: 413, message: 'The recording is too large' });
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 

@@ -1,13 +1,34 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert } from 'react-native';
+import { Alert, Platform, StyleSheet } from 'react-native';
 
 import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
 import { ApiError } from '../src/lib/api';
 import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
+import { colors, layout } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
+
+interface MockKeyboardAvoidingViewProps {
+  behavior?: 'height' | 'position' | 'padding';
+  children?: React.ReactNode;
+  style?: unknown;
+}
+
+function MockKeyboardAvoidingView({ behavior, children, style }: MockKeyboardAvoidingViewProps) {
+  return React.createElement(
+    'KeyboardAvoidingView',
+    { behavior, style, testID: 'keyboard-avoiding-view' },
+    children,
+  );
+}
+
+jest.mock('react-native/Libraries/Components/Keyboard/KeyboardAvoidingView', () => ({
+  __esModule: true,
+  default: MockKeyboardAvoidingView,
+}));
 
 // ----- expo-router mock -----
 
@@ -94,6 +115,48 @@ function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+async function expectPressFeedback(
+  getButton: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getButton())).toMatchObject(resting);
+  await fireEvent(getButton(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getButton())).toMatchObject(pressed);
+  await fireEvent(getButton(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getButton());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
+}
+
+async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
+  const originalOS = Object.getOwnPropertyDescriptor(Platform, 'OS');
+  Object.defineProperty(Platform, 'OS', { configurable: true, value: os });
+  try {
+    await run();
+  } finally {
+    if (originalOS) Object.defineProperty(Platform, 'OS', originalOS);
+  }
+}
+
 function alertButtons(): {
   text?: string;
   style?: 'default' | 'cancel' | 'destructive';
@@ -144,18 +207,48 @@ function updateButton() {
 describe('change password screen', () => {
   it('keeps Update disabled until all fields validate', async () => {
     await renderScreen(<ChangePasswordScreen />);
+    expect(screen.getByLabelText('Current password').props.value).toBe('');
+    expect(screen.getByLabelText('New password').props.value).toBe('');
+    expect(screen.getByLabelText('Confirm new password').props.value).toBe('');
+    expect(screen.queryByText('Password must be at least 8 characters.')).toBeNull();
+    expect(screen.queryByText('Passwords do not match.')).toBeNull();
+    expect(flattenedStyle(updateButton())).toMatchObject({
+      alignItems: 'center',
+      backgroundColor: colors.primary,
+      minHeight: layout.minimumTarget,
+      opacity: 0.5,
+    });
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    expect(screen.queryByText('Passwords do not match.')).toBeNull();
     expect(updateButton().props.accessibilityState.disabled).toBe(false);
+    expect(flattenedStyle(updateButton()).opacity).toBeUndefined();
+    await expectPressFeedback(
+      updateButton,
+      { backgroundColor: colors.primary },
+      { backgroundColor: colors.primaryDark },
+    );
   });
 
   it('requires an explicit matching confirmation and exposes complete disabled state', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', '');
 
+    expect(screen.queryByText('Passwords do not match.')).toBeNull();
     expect(updateButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
     expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['ios', 'padding'],
+    ['android', undefined],
+  ] as const)('uses the %s keyboard-avoidance behavior', async (os, expectedBehavior) => {
+    await withPlatformOS(os, async () => {
+      await renderScreen(<ChangePasswordScreen />);
+
+      expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
+    });
   });
 
   it('does not submit valid replacement fields without the current password', async () => {
@@ -327,12 +420,40 @@ function deleteButton() {
 describe('delete account screen', () => {
   it('renders the permanence warning and keeps delete disabled initially', async () => {
     await renderScreen(<DeleteAccountScreen />);
-    expect(screen.getByText('This action is permanent')).toBeTruthy();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: 'This action is permanent' })),
+    ).toMatchObject({ color: colors.danger });
+    const warningCard = screen.getByRole('header', { name: 'This action is permanent' }).parent;
+    if (!warningCard) throw new Error('Permanence warning has no rendered card');
+    expect(flattenedStyle(warningCard)).toMatchObject({
+      backgroundColor: colors.dangerLight,
+      borderColor: colors.danger,
+      alignSelf: 'center',
+      maxWidth: layout.formMaxWidth,
+      width: '100%',
+    });
+    expect(flattenedStyle(deleteButton())).toMatchObject({
+      alignItems: 'center',
+      backgroundColor: colors.danger,
+      minHeight: layout.minimumTarget,
+      opacity: 0.5,
+    });
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
     expect(screen.getByLabelText('Confirm your password').props).toMatchObject({
       secureTextEntry: true,
       textContentType: 'password',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
+  });
+
+  it.each([
+    ['ios', 'padding'],
+    ['android', undefined],
+  ] as const)('uses the %s keyboard-avoidance behavior', async (os, expectedBehavior) => {
+    await withPlatformOS(os, async () => {
+      await renderScreen(<DeleteAccountScreen />);
+
+      expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
     });
   });
 
@@ -346,6 +467,12 @@ describe('delete account screen', () => {
   it('asks for confirmation before deleting', async () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
+    expect(flattenedStyle(deleteButton()).opacity).toBeUndefined();
+    await expectPressFeedback(
+      deleteButton,
+      { backgroundColor: colors.danger },
+      { backgroundColor: colors.danger, opacity: 0.85 },
+    );
     await fireEvent.press(deleteButton());
 
     expect(alertSpy).toHaveBeenCalledWith(

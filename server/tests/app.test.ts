@@ -3,6 +3,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app';
 import { config } from '../src/config';
+import { logger } from '../src/logger';
 import { pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -158,6 +159,27 @@ describe('app wiring', () => {
       resolveInspector?.();
       if (!responseSettled) readinessRequest.abort();
       await response;
+    }
+  });
+
+  it('logs exact dependency context when readiness fails', async () => {
+    const failure = new Error('database schema is unavailable');
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+
+    try {
+      const response = await request(
+        createApp({
+          schemaCheck: async () => {
+            throw failure;
+          },
+          audioInspectorCheck: async () => undefined,
+        }),
+      ).get('/ready');
+
+      expect(response.status).toBe(503);
+      expect(error).toHaveBeenCalledWith({ err: failure }, 'readiness dependency check failed');
+    } finally {
+      error.mockRestore();
     }
   });
 

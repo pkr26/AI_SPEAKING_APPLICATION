@@ -64,6 +64,25 @@ async function constructClientWith(environment: Record<string, string>) {
   return s3ClientConstructorMock.mock.calls[0][0] as Record<string, unknown>;
 }
 
+async function constructClientAfterCredentialMutation(accessKeyId: string, secretAccessKey: string) {
+  vi.resetModules();
+  for (const name of managedEnvironment) delete process.env[name];
+  Object.assign(process.env, {
+    S3_BUCKET: 'credential-mode-bucket',
+    S3_REGION: 'eu-west-2',
+  });
+  const { config } = await import('../src/config');
+  config.s3.accessKeyId = accessKeyId;
+  config.s3.secretAccessKey = secretAccessKey;
+  const { discardPresignedAudio } = await import('../src/audio-upload');
+  const userId = randomUUID();
+
+  await discardPresignedAudio(userId, `audio-uploads/${userId}/${randomUUID()}.m4a`);
+  expect(sendMock).toHaveBeenCalledOnce();
+  expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
+  return s3ClientConstructorMock.mock.calls[0][0] as Record<string, unknown>;
+}
+
 describe('S3 client credential modes', () => {
   it('uses the configured region and the AWS default provider chain when static credentials are absent', async () => {
     await expect(constructClientWith({})).resolves.toEqual({ region: 'eu-west-2' });
@@ -83,6 +102,16 @@ describe('S3 client credential modes', () => {
       },
     });
   });
+
+  it.each([
+    ['access key only', 'orphan-access-key', ''],
+    ['secret key only', '', 'orphan-secret-key'],
+  ])(
+    'falls back to the provider chain if runtime config has an incomplete %s pair',
+    async (_caseName, access, secret) => {
+      await expect(constructClientAfterCredentialMutation(access, secret)).resolves.toEqual({ region: 'eu-west-2' });
+    },
+  );
 
   it('passes the configured session token only with a complete static access-key pair', async () => {
     await expect(

@@ -2,15 +2,16 @@
   "$schema": "./node_modules/@stryker-mutator/core/schema/stryker-schema.json",
   "testRunner": "vitest",
   "mutate": ["src/**/*.ts", "db/**/*.ts", "!db/seed-data.ts"],
-  "ignorePatterns": ["/.env", "/.env.*", "/coverage", "/dist", "/uploads", "/reports", "/.stryker-catalog-tmp"],
+  "ignorePatterns": ["/.env", "/.env.*", "/coverage", "/dist", "/uploads", "/reports", "/.stryker-*-tmp"],
   "ignoreStatic": false,
   "coverageAnalysis": "perTest",
   "timeoutMS": 90000,
   "timeoutFactor": 2.5,
   "concurrency": 1,
+  "vitest": { "related": false },
   "tempDirName": ".stryker-tmp",
-  "cleanTempDir": true,
+  "cleanTempDir": "always",
   "reporters": ["clear-text", "progress", "html", "json"],
   "jsonReporter": { "fileName": "reports/mutation/mutation.json" },
-  "thresholds": { "high": 80, "low": 60, "break": 60 }
+  "thresholds": { "high": 95, "low": 90, "break": 90 }
 }

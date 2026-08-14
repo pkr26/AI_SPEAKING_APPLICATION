@@ -35,6 +35,7 @@ describe('POST /uploads/audio-url', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ contentType: 'text/plain' });
     expect(res.status).toBe(415);
+    expect(res.body).toEqual({ error: 'Unsupported audio media type' });
   });
 });
 

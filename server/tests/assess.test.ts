@@ -21,6 +21,7 @@ vi.mock('openai', () => ({
 
 import { assessSpeaking, assertDailyAssessmentCapacity, AssessQuestion } from '../src/assess';
 import { config } from '../src/config';
+import { logger } from '../src/logger';
 import { app, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
@@ -211,7 +212,13 @@ describe('assertDailyAssessmentCapacity', () => {
     const primaryError = new Error('quota query failed');
     const client = {
       query: vi.fn(async (text: string) => {
-        if (text === 'BEGIN') return undefined;
+        if (
+          text === 'BEGIN' ||
+          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))" ||
+          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))"
+        ) {
+          return undefined;
+        }
         if (text === 'ROLLBACK') throw new Error('rollback failed');
         throw primaryError;
       }),
@@ -220,10 +227,12 @@ describe('assertDailyAssessmentCapacity', () => {
     const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
     try {
       await expect(assertDailyAssessmentCapacity(userId)).rejects.toBe(primaryError);
-      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
-        'BEGIN',
-        expect.stringContaining('pg_advisory_xact_lock'),
-        'ROLLBACK',
+      expect(client.query.mock.calls).toEqual([
+        ['BEGIN'],
+        ["SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))"],
+        ["SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))", [userId]],
+        ["DELETE FROM assessment_usage WHERE created_at <= now() - interval '1 day'"],
+        ['ROLLBACK'],
       ]);
       expect(client.release).toHaveBeenCalledOnce();
     } finally {
@@ -460,11 +469,15 @@ describe('assessSpeaking (OpenAI path)', () => {
       message: 'Assessment timed out; please try again',
     });
 
-    openaiMocks.transcribe.mockRejectedValue(new Error('socket hangup'));
+    const providerError = new Error('socket hangup');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    openaiMocks.transcribe.mockRejectedValue(providerError);
     await expect(assessSpeaking(audioPath, QUESTION, userId)).rejects.toMatchObject({
       status: 502,
       message: 'Assessment provider unavailable; please try again',
     });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith({ err: providerError }, 'assessment provider request failed');
   });
 
   it('aborts the provider request at the configured deadline', async () => {

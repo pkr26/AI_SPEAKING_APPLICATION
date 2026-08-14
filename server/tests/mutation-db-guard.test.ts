@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   assertSafeDestructiveDatabase,
   configuredApplicationDatabaseUrl,
@@ -10,6 +10,16 @@ import {
 import { assertSafeMutationDatabaseUrl, runMutationDatabaseGuard } from '../db/mutation-db-guard';
 
 const tempDirectories = new Set<string>();
+
+function thrownMessage(action: () => unknown): string {
+  try {
+    action();
+  } catch (error) {
+    expect(error).toBeInstanceOf(Error);
+    return (error as Error).message;
+  }
+  throw new Error('Expected action to throw');
+}
 
 function tempEnv(contents?: string): { directory: string; envPath: string } {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-english-database-safety-'));
@@ -20,6 +30,7 @@ function tempEnv(contents?: string): { directory: string; envPath: string } {
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const directory of tempDirectories) fs.rmSync(directory, { recursive: true, force: true });
   tempDirectories.clear();
 });
@@ -89,6 +100,24 @@ describe('application database URL selection', () => {
     expect(() => configuredApplicationDatabaseUrl(undefined, directory)).toThrow();
   });
 
+  it('propagates deterministic non-ENOENT errors instead of treating every Error as a missing file', () => {
+    const denied = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    vi.spyOn(fs, 'readFileSync').mockImplementationOnce(() => {
+      throw denied;
+    });
+
+    expect(() => configuredApplicationDatabaseUrl(undefined, '/injected/.env')).toThrow(denied);
+  });
+
+  it('does not trust a forged non-Error value that merely claims the ENOENT code', () => {
+    const forgedFailure = { code: 'ENOENT' };
+    vi.spyOn(fs, 'readFileSync').mockImplementationOnce(() => {
+      throw forgedFailure;
+    });
+
+    expect(() => configuredApplicationDatabaseUrl(undefined, '/injected/.env')).toThrow(forgedFailure);
+  });
+
   it('supports a private injected file and deterministic cleanup', () => {
     const { directory, envPath } = tempEnv('DATABASE_URL=postgres://localhost:5432/private_app\n');
     expect(fs.statSync(envPath).mode & 0o777).toBe(0o600);
@@ -101,6 +130,21 @@ describe('application database URL selection', () => {
 });
 
 describe('backend mutation database guard', () => {
+  it('uses purpose-specific missing-target diagnostics without weakening the ordinary test guard', () => {
+    expect(thrownMessage(() => assertSafeMutationDatabaseUrl(undefined))).toBe(
+      'TEST_DATABASE_URL is required for backend mutation testing',
+    );
+    expect(thrownMessage(() => assertSafeDestructiveDatabase(undefined, undefined, 'test'))).toBe(
+      'TEST_DATABASE_URL is required',
+    );
+  });
+
+  it('names TEST_DATABASE_URL exactly when target parsing fails', () => {
+    expect(() => assertSafeMutationDatabaseUrl('postgres://localhost/mutation_test')).toThrowError(
+      'TEST_DATABASE_URL must include an explicit port',
+    );
+  });
+
   it.each([
     'postgres://localhost:5432/ai_english_mutation_test',
     'postgresql://127.0.0.1:5432/backend_mutation_20260812_test',

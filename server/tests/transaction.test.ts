@@ -121,6 +121,95 @@ describe('transaction rollback error precedence', () => {
 });
 
 describe('diagnostic transaction rollback precedence', () => {
+  it('returns the exact 404 when the served question disappears before the diagnostic claim', async () => {
+    const user: UserRow = {
+      id: randomUUID(),
+      name: 'Missing Question Test',
+      email: 'missing-question@example.com',
+      password_hash: 'not-used',
+      native_language: 'te',
+      cefr_level: null,
+      diagnostic_completed: false,
+      token_version: 1,
+      created_at: new Date().toISOString(),
+    };
+    const questionId = randomUUID();
+    const requestId = randomUUID();
+    const token = jwt.sign({ sub: user.id, tv: user.token_version }, config.jwtSecret, {
+      algorithm: 'HS256',
+      expiresIn: '1h',
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    const requestClaimClient = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: null };
+        if (text.includes('DELETE FROM assessment_requests')) return { rows: [], rowCount: 0 };
+        if (text.includes('INSERT INTO assessment_requests')) return { rows: [], rowCount: 1 };
+        throw new Error(`unexpected request-claim query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const diagnosticClient = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [], rowCount: null };
+        if (text.includes('SELECT * FROM diagnostic_state')) {
+          return {
+            rows: [
+              {
+                user_id: user.id,
+                low_idx: 0,
+                high_idx: 5,
+                questions_asked: 0,
+                current_question_id: questionId,
+                processing_question_id: null,
+                processing_claim_id: null,
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (text.includes('SELECT * FROM questions')) return { rows: [], rowCount: 0 };
+        throw new Error(`unexpected diagnostic query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    vi.spyOn(pool, 'query').mockImplementation(async (text: string) => {
+      if (text === 'SELECT * FROM users WHERE id = $1') return { rows: [user], rowCount: 1 } as never;
+      if (text === 'SELECT 1 FROM questions WHERE id = $1') return { rows: [{}], rowCount: 1 } as never;
+      if (text.includes('DELETE FROM assessment_requests')) return { rows: [], rowCount: 1 } as never;
+      throw new Error(`unexpected pool query: ${text}`);
+    });
+    vi.spyOn(pool, 'connect')
+      .mockResolvedValueOnce(requestClaimClient as never)
+      .mockResolvedValueOnce(diagnosticClient as never);
+    const pass: RequestHandler = (_req, _res, next) => next();
+    const direct = express();
+    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass } as Limiters));
+    direct.use(errorHandler);
+
+    const response = await request(direct)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+        filename: 'answer.m4a',
+        contentType: 'audio/mp4',
+      })
+      .field('questionId', questionId)
+      .field('requestId', requestId);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Question not found' });
+    expect(requestClaimClient.release).toHaveBeenCalledOnce();
+    expect(diagnosticClient.release).toHaveBeenCalledOnce();
+    expect(diagnosticClient.query.mock.calls.map(([text]) => text)).toEqual([
+      'BEGIN',
+      expect.stringContaining('SELECT * FROM diagnostic_state'),
+      expect.stringContaining('SELECT * FROM questions'),
+      'ROLLBACK',
+    ]);
+  });
+
   it('keeps the GET /next transaction error when rollback also fails and releases the client', async () => {
     const user: UserRow = {
       id: randomUUID(),

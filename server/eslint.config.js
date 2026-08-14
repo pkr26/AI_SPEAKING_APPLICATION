@@ -5,7 +5,7 @@ const prettier = require('eslint-config-prettier');
 const tseslint = require('typescript-eslint');
 
 module.exports = tseslint.config(
-  { ignores: ['dist/', 'node_modules/', 'uploads/', 'coverage/'] },
+  { ignores: ['dist/', 'node_modules/', 'uploads/', 'coverage/', '.stryker-tmp/**', '.stryker-*-tmp/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {

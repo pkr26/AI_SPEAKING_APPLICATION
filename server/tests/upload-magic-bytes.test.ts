@@ -199,6 +199,31 @@ describe('upload fileFilter extension/MIME matrix', () => {
 });
 
 describe('uploadAudio cleanup', () => {
+  it('lets the exported storage engine discard a file that never received a stored path', async () => {
+    const storage = (
+      upload as unknown as {
+        storage: {
+          _removeFile: (req: unknown, file: { path?: string }, callback: (error: Error | null) => void) => void;
+        };
+      }
+    ).storage;
+    const unlink = vi.spyOn(fsSync, 'unlink');
+
+    try {
+      await expect(
+        new Promise<void>((resolve, reject) => {
+          storage._removeFile({}, {}, (error) => {
+            if (error) reject(error);
+            else resolve();
+          });
+        }),
+      ).resolves.toBeUndefined();
+      expect(unlink).not.toHaveBeenCalled();
+    } finally {
+      unlink.mockRestore();
+    }
+  });
+
   it('propagates an output-stream failure exactly once and attempts to remove the partial file', async () => {
     const outputFailure = Object.assign(new Error('disk full'), { code: 'ENOSPC' });
     const createWriteStream = vi.spyOn(fsSync, 'createWriteStream').mockImplementationOnce(() => {

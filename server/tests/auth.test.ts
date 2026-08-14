@@ -18,7 +18,9 @@ describe('auth: register validation', () => {
   it('rejects a bad nativeLanguage with 400', async () => {
     const { res } = await registerUser(a, { nativeLanguage: 'xx' });
     expect(res.status).toBe(400);
-    expect(typeof res.body.error).toBe('string');
+    expect(res.body).toEqual({
+      error: "nativeLanguage: nativeLanguage must be one of 'te','hi','es','zh'",
+    });
   });
 
   it('rejects a short password (<8) with 400', async () => {
@@ -317,6 +319,7 @@ describe('auth: change-password token revocation', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ currentPassword: 'nope-nope1', newPassword: 'newpass123' });
     expect(r.status).toBe(401);
+    expect(r.body).toEqual({ error: 'Current password is incorrect' });
   });
 
   it('success bumps token_version: old token dies, new token works', async () => {
@@ -372,6 +375,7 @@ describe('auth: delete account', () => {
       .set('Authorization', `Bearer ${res.body.token}`)
       .send({ password: 'nope-nope1' });
     expect(r.status).toBe(401);
+    expect(r.body).toEqual({ error: 'Password is incorrect' });
   });
 
   it('deletes personal data but retains an anonymous global provider-cost reservation', async () => {
@@ -458,6 +462,7 @@ describe('auth: password-confirmation throttling', () => {
   it('throttles change-password failures per account but never locks out the correct password', async () => {
     const a = throttleApp();
     const { res } = await registerUser(a);
+    const { res: otherUser } = await registerUser(a);
     const token = res.body.token as string;
     const attempt = (currentPassword: string) =>
       request(a)
@@ -470,6 +475,17 @@ describe('auth: password-confirmation throttling', () => {
     const blocked = await attempt('wrong-pass-3');
     expect(blocked.status).toBe(429);
     expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later' });
+
+    // Exhausting one learner's password-confirmation budget must not throttle
+    // a different authenticated account.
+    expect(
+      (
+        await request(a)
+          .post('/auth/change-password')
+          .set('Authorization', `Bearer ${otherUser.body.token as string}`)
+          .send({ currentPassword: 'wrong-pass-other', newPassword: 'newpass123' })
+      ).status,
+    ).toBe(401);
 
     // A stolen token could saturate the budget, yet the real owner's correct
     // current password still goes through.
@@ -486,7 +502,9 @@ describe('auth: password-confirmation throttling', () => {
 
     expect((await attempt(firstReplica, 'wrong-pass-1')).status).toBe(401);
     expect((await attempt(secondReplica, 'wrong-pass-2')).status).toBe(401);
-    expect((await attempt(firstReplica, 'wrong-pass-3')).status).toBe(429);
+    const blocked = await attempt(firstReplica, 'wrong-pass-3');
+    expect(blocked.status).toBe(429);
+    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later' });
     expect((await attempt(secondReplica, STRONG_PASSWORD)).status).toBe(204);
   });
 });
@@ -552,5 +570,6 @@ describe('auth: data export', () => {
       .get(`/auth/me/data?cursor=${foreignAttempt.rows[0].id}`)
       .set('Authorization', `Bearer ${first.res.body.token}`);
     expect(foreignCursor.status).toBe(400);
+    expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor' });
   });
 });

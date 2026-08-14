@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vites
 import express from 'express';
 import request from 'supertest';
 import { config } from '../src/config';
+import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
 import { buildLimiters, normalizeLoginEmail } from '../src/rate-limit';
 import { cleanupRateLimitWindows, PostgresRateLimitStore } from '../src/postgres-rate-limit-store';
@@ -87,6 +88,30 @@ describe('rate limiters', () => {
     expect(limited.body).toEqual({ error: 'Too many attempts, please try again later' });
   });
 
+  it('keeps the defensive password-account fallback isolated by source IP', async () => {
+    config.rateLimit.passwordWindowMs = 60_000;
+    config.rateLimit.passwordMax = 1;
+
+    const a = express();
+    a.set('trust proxy', 1);
+    a.use(buildLimiters().passwordAccount);
+    a.get('/x', (_req, res) => {
+      const throttled = res.locals.passwordAccountThrottled === true;
+      res.status(throttled ? 429 : 401).json({ throttled });
+    });
+
+    const firstIp = () => request(a).get('/x').set('X-Forwarded-For', '203.0.113.11');
+    expect((await firstIp()).status).toBe(401);
+    expect((await firstIp()).status).toBe(429);
+
+    // This limiter is mounted after authentication in production, but its
+    // documented fallback must still avoid coupling distinct IPs if a future
+    // route is mounted in the wrong order.
+    const otherIp = await request(a).get('/x').set('X-Forwarded-For', '203.0.113.12');
+    expect(otherIp.status).toBe(401);
+    expect(otherIp.body).toEqual({ throttled: false });
+  });
+
   it('throttles registration per source IP with its own budget', async () => {
     config.rateLimit.registerWindowMs = 60_000;
     config.rateLimit.registerMax = 2;
@@ -106,6 +131,7 @@ describe('rate limiters', () => {
 
     const as = (userId?: string) => {
       const a = express();
+      a.set('trust proxy', 1);
       a.use((req, _res, next) => {
         if (userId) (req as AuthedRequest).user = { id: userId } as AuthedRequest['user'];
         next();
@@ -120,9 +146,12 @@ describe('rate limiters', () => {
     expect(limited.status).toBe(429);
     expect(limited.body).toEqual({ error: 'Assessment rate limit reached, please slow down' });
 
-    // A different user (and an unauthenticated, IP-keyed request) still fits.
+    // A different user (and unauthenticated requests from distinct source IPs)
+    // still fit. The fallback must retain the IP instead of collapsing every
+    // unauthenticated request into one shared key.
     expect((await request(as('user-2')).get('/x')).status).toBe(200);
-    expect((await request(as()).get('/x')).status).toBe(200);
+    expect((await request(as()).get('/x').set('X-Forwarded-For', '203.0.113.21')).status).toBe(200);
+    expect((await request(as()).get('/x').set('X-Forwarded-For', '203.0.113.22')).status).toBe(200);
   });
 
   it('bounds paid assessments per source IP across identities', async () => {
@@ -131,13 +160,18 @@ describe('rate limiters', () => {
     try {
       // Two different authenticated users behind one test-agent IP share the
       // daily network budget: re-registering cannot reset it.
-      const first = userApp('ip-cap-user-1', buildLimiters().assessIpDaily);
-      const second = userApp('ip-cap-user-2', buildLimiters().assessIpDaily);
+      const first = userApp('ip-cap-user-1', buildLimiters().assessIpDaily).set('trust proxy', 1);
+      const second = userApp('ip-cap-user-2', buildLimiters().assessIpDaily).set('trust proxy', 1);
+      const otherNetwork = userApp('ip-cap-user-3', buildLimiters().assessIpDaily).set('trust proxy', 1);
 
-      expect((await request(first).get('/x')).status).toBe(200);
-      const limited = await request(second).get('/x');
+      expect((await request(first).get('/x').set('X-Forwarded-For', '203.0.113.31')).status).toBe(200);
+      const limited = await request(second).get('/x').set('X-Forwarded-For', '203.0.113.31');
       expect(limited.status).toBe(429);
       expect(limited.body).toEqual({ error: 'Daily assessment limit reached for this network' });
+
+      // A different network retains its own daily budget. Collapsing all
+      // populated IPs to an empty fallback key would incorrectly reject it.
+      expect((await request(otherNetwork).get('/x').set('X-Forwarded-For', '203.0.113.32')).status).toBe(200);
     } finally {
       config.assessIpDailyCap = savedCap;
     }
@@ -170,6 +204,24 @@ describe('rate limiters', () => {
     const assessment = userApp(userId, buildLimiters().assess);
     expect((await request(assessment).get('/x')).status).toBe(200);
     expect((await request(assessment).get('/x')).status).toBe(429);
+  });
+
+  it('keeps the defensive upload-grant fallback isolated by source IP', async () => {
+    config.rateLimit.uploadGrantWindowMs = 60_000;
+    config.rateLimit.uploadGrantMax = 1;
+
+    const a = express();
+    a.set('trust proxy', 1);
+    a.use(buildLimiters().uploadGrant);
+    a.get('/x', (_req, res) => res.json({ ok: true }));
+
+    const firstIp = () => request(a).get('/x').set('X-Forwarded-For', '203.0.113.41');
+    expect((await firstIp()).status).toBe(200);
+    expect((await firstIp()).status).toBe(429);
+
+    // Production authenticates before this limiter, while the fallback keeps
+    // a future mis-mounted route from collapsing all clients into one budget.
+    expect((await request(a).get('/x').set('X-Forwarded-For', '203.0.113.42')).status).toBe(200);
   });
 
   it('throttles the readiness probe at its built-in budget', async () => {
@@ -212,6 +264,16 @@ describe('rate limiters', () => {
     await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
   });
 
+  it('fails closed with a stable diagnostic when an increment returns no counter row', async () => {
+    const store = new PostgresRateLimitStore('store-missing-row', 60_000);
+    const query = vi.spyOn(pool, 'query').mockResolvedValueOnce({ rows: [] } as never);
+    try {
+      await expect(store.increment('learner')).rejects.toThrowError('rate limit counter was not returned');
+    } finally {
+      query.mockRestore();
+    }
+  });
+
   it('never lets a refund failure escape (express-rate-limit decrements fire-and-forget)', async () => {
     const store = new PostgresRateLimitStore('store-fail-safe', 60_000);
     const query = vi.spyOn(pool, 'query').mockRejectedValue(new Error('database unavailable'));
@@ -219,6 +281,25 @@ describe('rate limiters', () => {
       await expect(store.decrement('learner')).resolves.toBeUndefined();
       await expect(store.resetKey('learner')).resolves.toBeUndefined();
     } finally {
+      query.mockRestore();
+    }
+  });
+
+  it('logs exact diagnostic context when fail-safe store cleanup fails', async () => {
+    const namespace = 'store-fail-safe-observability';
+    const store = new PostgresRateLimitStore(namespace, 60_000);
+    const failure = new Error('database unavailable');
+    const query = vi.spyOn(pool, 'query').mockRejectedValue(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(store.decrement('learner')).resolves.toBeUndefined();
+      await expect(store.resetKey('learner')).resolves.toBeUndefined();
+
+      expect(warn).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenNthCalledWith(1, { err: failure, namespace }, 'rate-limit refund failed');
+      expect(warn).toHaveBeenNthCalledWith(2, { err: failure, namespace }, 'rate-limit key reset failed');
+    } finally {
+      warn.mockRestore();
       query.mockRestore();
     }
   });

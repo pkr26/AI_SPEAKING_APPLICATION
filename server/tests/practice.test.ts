@@ -1,13 +1,18 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import request from 'supertest';
 import fs from 'fs/promises';
 import { config } from '../src/config';
+import { logger } from '../src/logger';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
 afterAll(async () => {
   await pool.end();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
 });
 
 describe('practice', () => {
@@ -40,6 +45,28 @@ describe('practice', () => {
     const r = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(r.status).toBe(200);
     expect(r.headers['cache-control']).toContain('no-store');
+  });
+
+  it('GET /question fails with the exact contract when the learner level has no questions', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const level = await completeDiagnostic(a, token);
+    const questions = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1', [level]);
+    const movedQuestionIds = questions.rows.map(({ id }) => id);
+    const temporaryLevel = level === 'A1' ? 'A2' : 'A1';
+
+    await pool.query('UPDATE questions SET cefr_level = $1 WHERE id = ANY($2::uuid[])', [
+      temporaryLevel,
+      movedQuestionIds,
+    ]);
+    try {
+      const response = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ error: 'No questions available for this level' });
+    } finally {
+      await pool.query('UPDATE questions SET cefr_level = $1 WHERE id = ANY($2::uuid[])', [level, movedQuestionIds]);
+    }
   });
 
   it('help endpoint: Cache-Control + ETag, 304 on If-None-Match, 400 on bad UUID', async () => {
@@ -82,6 +109,38 @@ describe('practice', () => {
       .get('/practice/question/00000000-0000-0000-0000-000000000000/help')
       .set('Authorization', `Bearer ${token}`);
     expect(missing.status).toBe(404);
+    expect(missing.body).toEqual({ error: 'Question not found' });
+  });
+
+  it('help returns the exact 404 contract when the learner translation is missing', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string; translations: Record<string, unknown> }>(
+      'SELECT * FROM questions WHERE cefr_level = $1 LIMIT 1',
+      [level],
+    );
+    const questionId = question.rows[0].id;
+    const malformedQuestion = {
+      ...question.rows[0],
+      translations: { ...question.rows[0].translations },
+    };
+    delete malformedQuestion.translations.te;
+    const originalQuery = pool.query.bind(pool);
+    vi.spyOn(pool, 'query').mockImplementation(((...args: unknown[]) => {
+      const [text, values] = args;
+      if (text === 'SELECT * FROM questions WHERE id = $1' && Array.isArray(values) && values[0] === questionId) {
+        return Promise.resolve({ rows: [malformedQuestion] });
+      }
+      return Reflect.apply(originalQuery, undefined, args);
+    }) as typeof pool.query);
+
+    const response = await request(a)
+      .get(`/practice/question/${questionId}/help`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Translation not available for this question' });
   });
 
   it('POST /attempt without audio returns 400', async () => {
@@ -164,12 +223,14 @@ describe('practice', () => {
 
     const help = await request(a).get(`/practice/question/${questionId}/help`).set('Authorization', `Bearer ${token}`);
     expect(help.status).toBe(403);
+    expect(help.body).toEqual({ error: 'Question is not available at your level' });
 
     const attempt = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
     );
     expect(attempt.status).toBe(403);
+    expect(attempt.body).toEqual({ error: 'Question is not available at your level' });
   });
 
   it('POST /attempt with a text file renamed .m4a returns 415', async () => {
@@ -259,6 +320,78 @@ describe('practice', () => {
       [userId, questionId],
     );
     expect(inflight.rows[0].count).toBe(0);
+  });
+
+  it('logs exact ownership context when best-effort practice-claim cleanup fails', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    await completeDiagnostic(a, token);
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = next.body.question.id as string;
+    const cleanupError = new Error('practice cleanup unavailable');
+    const originalQuery = pool.query.bind(pool);
+    vi.spyOn(pool, 'query').mockImplementation(((...args: unknown[]) => {
+      const [text] = args;
+      if (typeof text === 'string' && text.includes('DELETE FROM practice_inflight WHERE user_id')) {
+        return Promise.reject(cleanupError);
+      }
+      return Reflect.apply(originalQuery, undefined, args);
+    }) as typeof pool.query);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const unlink = vi.spyOn(fs, 'unlink');
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+    );
+
+    expect(response.status).toBe(200);
+    // res.json() can finish before the route's async finally blocks settle.
+    // Waiting for the last local cleanup step prevents mock restoration and
+    // the next test from racing the claim-cleanup warning under inspection.
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalledOnce();
+      expect(unlink).toHaveBeenCalledOnce();
+    });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(
+      {
+        err: cleanupError,
+        userId,
+        questionId,
+        claimId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      },
+      'failed to clear practice assessment claim',
+    );
+  });
+
+  it('does not redundantly abandon an assessment request after successful completion', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    await completeDiagnostic(a, token);
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const query = vi.spyOn(pool, 'query');
+    const unlink = vi.spyOn(fs, 'unlink');
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      next.body.question.id as string,
+    );
+
+    expect(response.status).toBe(200);
+    // Express can finish the response before the async route finally blocks
+    // settle. File cleanup runs after request-claim cleanup, so waiting for it
+    // makes the negative assertion below deterministic.
+    await vi.waitFor(() => expect(unlink).toHaveBeenCalledOnce());
+    expect(
+      query.mock.calls.filter(
+        ([text]) =>
+          typeof text === 'string' &&
+          text.includes('DELETE FROM assessment_requests') &&
+          text.includes("status = 'processing'"),
+      ),
+    ).toHaveLength(0);
   });
 
   it('a practice attempt walks attempt numbers and never duplicates them', async () => {

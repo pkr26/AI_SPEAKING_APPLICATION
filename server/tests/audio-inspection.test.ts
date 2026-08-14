@@ -131,6 +131,7 @@ describe('verifyAudioDuration', () => {
     });
     await expect(verifyAudioDuration(await fixture('short.wav', pcmWav(0.25)))).rejects.toMatchObject({
       status: 422,
+      message: 'Recording is too short to assess',
     });
     await expect(
       verifyAudioDuration(await generatedAudio('generated-short.wav', { codec: 'pcm_s16le', durationSeconds: 0.25 })),
@@ -141,6 +142,7 @@ describe('verifyAudioDuration', () => {
     const overLimit = pcmWav(MAX_AUDIO_DURATION_SECONDS + 1 / 8_000);
     await expect(verifyAudioDuration(await fixture('long.wav', overLimit))).rejects.toMatchObject({
       status: 413,
+      message: 'Recording must be two minutes or shorter',
     });
   });
 
@@ -235,6 +237,7 @@ describe('verifyAudioDuration', () => {
       verifyAudioDuration(await fixture('valid-for-missing-inspector.wav', pcmWav(1))),
     ).rejects.toMatchObject({
       status: 503,
+      message: 'Audio inspection is temporarily unavailable',
     });
   });
 

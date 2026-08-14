@@ -295,6 +295,34 @@ describe('audio inspection concurrency', () => {
     }
   });
 
+  it('does not signal a decoder that is already marked as killed while settling', async () => {
+    const failed = startInspection();
+    failed.child.killed = true;
+
+    failed.child.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
+
+    await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(failed.child.kill).not.toHaveBeenCalled();
+  });
+
+  it('ignores repeated decoder terminal output after the first settlement', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      const failed = startInspection();
+      failed.child.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
+      await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+      expect(failed.child.kill).toHaveBeenCalledTimes(1);
+      const clearCallsAfterSettlement = clearTimeoutSpy.mock.calls.length;
+
+      failed.child.stderr.emit('data', Buffer.from('late diagnostic output'));
+
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(clearCallsAfterSettlement);
+      expect(failed.child.kill).toHaveBeenCalledTimes(1);
+    } finally {
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
   it('rejects diagnostic stderr only after the exact 64 KiB boundary is exceeded', async () => {
     const accepted = startInspection();
     accepted.child.stderr.emit('data', Buffer.alloc(64 * 1024));
@@ -452,6 +480,47 @@ describe('audio inspector readiness coalescing', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
 
+  it('normalizes a non-Error synchronous readiness failure', async () => {
+    const nonErrorFailure: unknown = 'native spawn failed without an Error';
+    spawnMock.mockImplementationOnce(() => {
+      throw nonErrorFailure;
+    });
+
+    await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow('FFmpeg is unavailable');
+  });
+
+  it('does not signal a readiness child that is already marked as killed while settling', async () => {
+    const child = new FakeChild();
+    child.killed = true;
+    spawnMock.mockReturnValueOnce(child);
+    const check = assertAudioInspectorAvailable({ force: true });
+    child.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    child.emit('close', 0);
+
+    await expect(check).resolves.toBeUndefined();
+    expect(child.kill).not.toHaveBeenCalled();
+  });
+
+  it('ignores repeated readiness output after the first settlement', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    try {
+      const child = new FakeChild();
+      spawnMock.mockReturnValueOnce(child);
+      const check = assertAudioInspectorAvailable({ force: true });
+      child.stdout.emit('data', Buffer.alloc(16 * 1024 + 1));
+      await expect(check).rejects.toThrow('FFmpeg availability check returned unexpected output');
+      expect(child.kill).toHaveBeenCalledTimes(1);
+      const clearCallsAfterSettlement = clearTimeoutSpy.mock.calls.length;
+
+      child.stdout.emit('data', Buffer.from('late version output'));
+
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(clearCallsAfterSettlement);
+      expect(child.kill).toHaveBeenCalledTimes(1);
+    } finally {
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
   it.each([
     ['a successful exit without an FFmpeg version', Buffer.from('not the expected tool\n'), 0],
     ['an unsuccessful exit with an FFmpeg version', Buffer.from('ffmpeg version test-build\n'), 1],
@@ -483,6 +552,16 @@ describe('audio inspector readiness coalescing', () => {
     oversized.stdout.emit('data', Buffer.concat([exactOutput.subarray(9_000), Buffer.from('x')]));
     await expect(oversizedCheck).rejects.toThrow('FFmpeg availability check returned unexpected output');
     expect(oversized.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  it('accepts multiple horizontal separators in the FFmpeg identity line', async () => {
+    const child = new FakeChild();
+    spawnMock.mockReturnValueOnce(child);
+    const check = assertAudioInspectorAvailable({ force: true });
+    child.stdout.emit('data', Buffer.from('ffmpeg version   test-build\n'));
+    child.emit('close', 0);
+
+    await expect(check).resolves.toBeUndefined();
   });
 
   it.each([

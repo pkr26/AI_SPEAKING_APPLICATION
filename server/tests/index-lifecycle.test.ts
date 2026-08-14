@@ -114,10 +114,34 @@ describe('server lifecycle failure handling', () => {
 
     await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
     await vi.waitFor(() => {
-      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: uploadError }, expect.any(String));
-      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: replayError }, expect.any(String));
-      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: rateLimitError }, expect.any(String));
+      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: uploadError }, 'upload janitor failed');
+      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: replayError }, 'assessment replay janitor failed');
+      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: rateLimitError }, 'rate-limit janitor failed');
     });
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it('logs exact positive janitor results and stays quiet when no stale records were removed', async () => {
+    vi.useFakeTimers();
+    runtime.cleanupUploads.mockResolvedValueOnce(2);
+    runtime.cleanupRequests.mockResolvedValueOnce(3);
+    runtime.cleanupRateLimits.mockResolvedValueOnce(4);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => {
+      expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 2 }, 'janitor removed stale uploads');
+      expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 3 }, 'janitor removed expired assessment replays');
+      expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 4 }, 'janitor removed expired rate-limit counters');
+    });
+
+    runtime.logger.info.mockClear();
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+
+    expect(runtime.cleanupUploads).toHaveBeenCalledTimes(2);
+    expect(runtime.logger.info).not.toHaveBeenCalled();
+
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
@@ -214,6 +238,10 @@ describe('server lifecycle failure handling', () => {
 
     releaseAudio();
     await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.logger.info).toHaveBeenCalledWith(
+      { port: 43210, mockAi: true, nodeEnv: 'test' },
+      'AI English API listening',
+    );
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
@@ -234,6 +262,9 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
     expect(runtime.server.close).not.toHaveBeenCalled();
     expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(runtime.logger.info).toHaveBeenCalledWith({ signal: 'SIGTERM' }, 'shutting down');
+    expect(runtime.logger.info).toHaveBeenCalledWith('shutdown complete');
+    expect(runtime.logger.error).not.toHaveBeenCalledWith({ err: undefined }, 'error closing HTTP server');
     releaseSchema();
     await new Promise<void>((resolve) => setImmediate(resolve));
     expect(runtime.server.listen).not.toHaveBeenCalled();
@@ -394,6 +425,7 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function));
 
     addedSignalListener('SIGINT')('SIGINT');
+    expect(runtime.logger.info).toHaveBeenCalledWith({ signal: 'SIGINT' }, 'shutting down');
     await vi.advanceTimersByTimeAsync(9_999);
     expect(exit).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);

@@ -4,8 +4,19 @@ import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import request from 'supertest';
 import { randomUUID } from 'crypto';
+import { z } from 'zod';
 import { config } from '../src/config';
-import { AuthedRequest, errorHandler, h, HttpError, JWT_AUDIENCE, JWT_ISSUER, requireAuth } from '../src/middleware';
+import { logger } from '../src/logger';
+import {
+  AuthedRequest,
+  errorHandler,
+  h,
+  HttpError,
+  JWT_AUDIENCE,
+  JWT_ISSUER,
+  requireAuth,
+  validate,
+} from '../src/middleware';
 import { app, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -104,6 +115,30 @@ describe('requireAuth', () => {
       query.mockRestore();
     }
   });
+
+  it('rejects a coercible non-string token subject before querying PostgreSQL', async () => {
+    const userId = randomUUID();
+    const verify = vi.spyOn(jwt, 'verify').mockReturnValueOnce({
+      sub: { toString: () => userId },
+      tv: 1,
+    } as never);
+    const query = vi.spyOn(pool, 'query');
+    const req = { headers: { authorization: 'Bearer structurally-valid-token' } } as AuthedRequest;
+    const res = { status: vi.fn(), json: vi.fn() };
+    res.status.mockReturnValue(res);
+    const next = vi.fn();
+
+    try {
+      await requireAuth(req, res as never, next);
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid or expired token' });
+      expect(query).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+    } finally {
+      query.mockRestore();
+      verify.mockRestore();
+    }
+  });
 });
 
 describe('validate', () => {
@@ -133,6 +168,30 @@ describe('validate', () => {
     expect(res.status).toBe(201);
     expect(res.body.user.name).toBe('Trim Me');
     expect(res.body.user.email).toBe('upper@example.com');
+  });
+
+  it('replaces route params with transformed data and keeps root issue messages unprefixed', async () => {
+    const a = express();
+    a.get(
+      '/items/:slug',
+      validate({ params: z.object({ slug: z.string().transform((value) => value.toUpperCase()) }) }),
+      (req, res) => res.json(req.params),
+    );
+    a.post(
+      '/root-error',
+      express.json(),
+      validate({ body: z.object({ value: z.string() }).refine(() => false, 'root validation failed') }),
+      (_req, res) => res.sendStatus(204),
+    );
+    a.use(errorHandler);
+
+    const transformed = await request(a).get('/items/lowercase');
+    expect(transformed.status).toBe(200);
+    expect(transformed.body).toEqual({ slug: 'LOWERCASE' });
+
+    const rootError = await request(a).post('/root-error').send({ value: 'valid-shape' });
+    expect(rootError.status).toBe(400);
+    expect(rootError.body).toEqual({ error: 'root validation failed' });
   });
 });
 
@@ -218,8 +277,18 @@ describe('errorHandler', () => {
   );
 
   it('maps unexpected errors to a generic 500', async () => {
-    const res = await request(buildApp()).get('/boom');
-    expect(res.status).toBe(500);
-    expect(res.body).toEqual({ error: 'Internal server error' });
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      const res = await request(buildApp()).get('/boom');
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'Internal server error' });
+      expect(error).toHaveBeenCalledWith({ err: expect.any(Error), requestId: undefined }, 'unhandled error');
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('keeps a stable HttpError identity for routing and diagnostics', () => {
+    expect(new HttpError(418, 'teapot').name).toBe('HttpError');
   });
 });

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import { symbols } from 'pino';
 import request from 'supertest';
@@ -154,4 +154,60 @@ describe('httpLogger', () => {
     }
     expect(line).toContain('[redacted]');
   });
+});
+
+describe('logger initialization', () => {
+  afterEach(() => {
+    vi.doUnmock('../src/config');
+    vi.doUnmock('pino');
+    vi.doUnmock('pino-http');
+    vi.resetModules();
+  });
+
+  async function capturePinoOptions(config: {
+    nodeEnv: 'development' | 'test' | 'production';
+    isProduction: boolean;
+    logLevel: undefined;
+  }): Promise<unknown> {
+    const mockLogger = { kind: 'base-logger' };
+    const mockHttpLogger = vi.fn();
+    const pinoSpy = vi.fn((_options: unknown) => mockLogger);
+    const pinoHttpSpy = vi.fn((_options: unknown) => mockHttpLogger);
+
+    vi.resetModules();
+    vi.doMock('../src/config', () => ({ config }));
+    vi.doMock('pino', () => ({ pino: pinoSpy }));
+    vi.doMock('pino-http', () => ({ pinoHttp: pinoHttpSpy }));
+
+    const isolatedModule = await import('../src/logger');
+
+    expect(isolatedModule.logger).toBe(mockLogger);
+    expect(isolatedModule.httpLogger).toBe(mockHttpLogger);
+    expect(pinoSpy).toHaveBeenCalledOnce();
+    expect(pinoHttpSpy).toHaveBeenCalledOnce();
+    expect(pinoHttpSpy).toHaveBeenCalledWith(expect.objectContaining({ logger: mockLogger }));
+    return pinoSpy.mock.calls[0]?.[0];
+  }
+
+  it.each([
+    { nodeEnv: 'test' as const, isProduction: false, expectedLevel: 'silent' },
+    { nodeEnv: 'production' as const, isProduction: true, expectedLevel: 'info' },
+    { nodeEnv: 'development' as const, isProduction: false, expectedLevel: 'debug' },
+  ])(
+    'uses the $expectedLevel fallback and exact transport for $nodeEnv',
+    async ({ nodeEnv, isProduction, expectedLevel }) => {
+      const options = await capturePinoOptions({ nodeEnv, isProduction, logLevel: undefined });
+
+      expect(options).toHaveProperty('level', expectedLevel);
+      expect(options).toHaveProperty(
+        'transport',
+        nodeEnv === 'development'
+          ? {
+              target: 'pino-pretty',
+              options: { translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname' },
+            }
+          : undefined,
+      );
+    },
+  );
 });

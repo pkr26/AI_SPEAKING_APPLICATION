@@ -54,14 +54,24 @@ describe('diagnostic', () => {
   it('GET /next reuses the outstanding question instead of rerolling it', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
+    const userId = res.body.user.id as string;
 
     const first = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const before = await pool.query<{ xmin: string }>(
+      'SELECT xmin::text AS xmin FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
     const second = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const after = await pool.query<{ xmin: string }>(
+      'SELECT xmin::text AS xmin FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
 
     expect(first.status).toBe(200);
     expect(second.status).toBe(200);
     expect(second.body.question.id).toBe(first.body.question.id);
     expect(second.body.progress).toEqual(first.body.progress);
+    expect(after.rows[0].xmin).toBe(before.rows[0].xmin);
   });
 
   it('POST /answer with a wrong questionId returns 409', async () => {

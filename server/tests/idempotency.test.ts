@@ -168,7 +168,10 @@ describe('assessment request recovery', () => {
     await abandonAssessmentRequest(ownerId, requestId, staleClaimId);
     await expect(
       completeAssessmentRequest(pool, ownerId, requestId, staleClaimId, { passed: false }),
-    ).rejects.toMatchObject({ status: 409 });
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Assessment request ownership changed; please retry',
+    });
 
     const stillOwned = await pool.query<{ claim_id: string; status: string }>(
       'SELECT claim_id, status FROM assessment_requests WHERE user_id = $1 AND request_id = $2',

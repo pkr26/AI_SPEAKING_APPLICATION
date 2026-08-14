@@ -26,6 +26,14 @@ describe('claimAssessmentRequest ownership and replay', () => {
     [questionId, otherQuestionId] = [rows[0].id, rows[1].id];
   });
 
+  it('preserves the in-flight subtype name for diagnostics', () => {
+    const error = new AssessmentRequestInFlightError('Assessment is still processing', {
+      retryAfterSeconds: 2,
+    });
+
+    expect(error.name).toBe('AssessmentRequestInFlightError');
+  });
+
   it('rejects reuse of the same requestId for a different question or context', async () => {
     const requestId = randomUUID();
     const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId);
@@ -131,6 +139,87 @@ describe('claimAssessmentRequest ownership and replay', () => {
       expect(client.release).toHaveBeenCalledOnce();
     } finally {
       connect.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      label: 'a processing row that unexpectedly has a response body',
+      status: 'processing',
+      responseBody: { passed: true, score: 88 },
+    },
+    {
+      label: 'a completed row that unexpectedly has no response body',
+      status: 'completed',
+      responseBody: null,
+    },
+  ] as const)('fails closed instead of replaying $label', async ({ status, responseBody }) => {
+    const requestId = randomUUID();
+    const client = {
+      query: vi
+        .fn()
+        .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce({ rowCount: 0 })
+        .mockResolvedValueOnce({ rowCount: 0 })
+        .mockResolvedValueOnce({
+          rows: [
+            {
+              context: 'practice',
+              question_id: questionId,
+              status,
+              response_body: responseBody,
+            },
+          ],
+        })
+        .mockResolvedValueOnce(undefined),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    try {
+      await expect(claimAssessmentRequest(userId, requestId, 'practice', questionId)).rejects.toMatchObject({
+        name: 'AssessmentRequestInFlightError',
+        status: 409,
+        message: 'Assessment is still processing',
+      });
+
+      expect(client.query.mock.calls.at(-1)?.[0]).toBe('ROLLBACK');
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
+  it.each([
+    {
+      label: 'a processing row that unexpectedly has a response body',
+      status: 'processing',
+      responseBody: { passed: true, score: 88 },
+    },
+    {
+      label: 'a completed row that unexpectedly has no response body',
+      status: 'completed',
+      responseBody: null,
+    },
+  ] as const)('reports $label as processing', async ({ status, responseBody }) => {
+    const requestId = randomUUID();
+    const query = vi.spyOn(pool, 'query').mockResolvedValue({
+      rows: [
+        {
+          context: 'practice',
+          question_id: questionId,
+          status,
+          response_body: responseBody,
+        },
+      ],
+    } as never);
+    try {
+      await expect(getAssessmentRequestStatus(userId, requestId)).resolves.toEqual({
+        status: 'processing',
+        context: 'practice',
+        questionId,
+      });
+    } finally {
+      query.mockRestore();
     }
   });
 

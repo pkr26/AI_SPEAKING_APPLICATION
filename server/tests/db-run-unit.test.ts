@@ -222,6 +222,9 @@ describe('database deployment runner', () => {
     expect(recorded).toHaveLength(files.length);
     expect(recorded.map((params) => params[0])).toEqual(files);
     expect(recorded.every((params) => /^[0-9a-f]{64}$/.test(String(params[1])))).toBe(true);
+    for (const file of files) {
+      expect(client.query).toHaveBeenCalledWith(fs.readFileSync(path.join(migrationsDir, file), 'utf8'));
+    }
     expect(log.mock.calls.map(([message]) => message)).toEqual(files.map((file) => `applied migration ${file}`));
   });
 
@@ -250,17 +253,21 @@ describe('database deployment runner', () => {
     expect(recorded).toEqual(files);
   });
 
-  it('rejects migration records that are absent from the release', async () => {
-    const rows = [...migrationRows(), { name: '999_removed.sql', checksum: '0'.repeat(64) }];
+  it('rejects and identifies every migration record that is absent from the release', async () => {
+    const rows = [
+      ...migrationRows(),
+      { name: '998_removed.sql', checksum: '0'.repeat(64) },
+      { name: '999_removed.sql', checksum: 'f'.repeat(64) },
+    ];
     const client = provideClient(async (sql) => {
       if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
       return { rows: [] };
     });
 
-    await expect(migrate('postgres://localhost/release_test')).rejects.toThrow(
-      'database contains migration records missing from this release: 999_removed.sql',
-    );
+    await expect(migrate('postgres://localhost/release_test')).rejects.toMatchObject({
+      message: 'database contains migration records missing from this release: 998_removed.sql, 999_removed.sql',
+    });
     expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
     expect(client.end).toHaveBeenCalledOnce();
   });
@@ -401,6 +408,35 @@ describe('database deployment runner', () => {
     expect(seedStep).toHaveBeenCalledWith('postgres://localhost:5432/setup_test', log);
   });
 
+  it('uses the real default setup steps when no test seam is supplied', async () => {
+    const admin = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [{ exists: 1 }] };
+      return { rows: [] };
+    });
+    const migration = provideClient(async (sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      return { rows: [] };
+    });
+    const seeding = provideClient(async (sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql.startsWith('SELECT cefr_level')) return { rows: [] };
+      return { rows: [] };
+    });
+    const log = vi.fn();
+
+    await expect(setupDatabase('postgres://localhost:5432/default_setup_test', log)).resolves.toBeUndefined();
+
+    expect(pgMock.clients).toEqual([]);
+    for (const client of [admin, migration, seeding]) {
+      expect(client.connect).toHaveBeenCalledOnce();
+      expect(client.end).toHaveBeenCalledOnce();
+    }
+    expect(log).toHaveBeenCalledWith('database "default_setup_test" already exists');
+    expect(log).toHaveBeenCalledWith('no pending migrations');
+    expect(log).toHaveBeenCalledWith('questions per level: []');
+  });
+
   it.each(['migrate', 'seed', 'setup'] as const)('dispatches the %s database command exactly once', async (command) => {
     const actions = {
       migrate: vi.fn(async () => []),
@@ -414,6 +450,27 @@ describe('database deployment runner', () => {
     expect(actions[command]).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
     for (const other of ['migrate', 'seed', 'setup'] as const) {
       if (other !== command) expect(actions[other]).not.toHaveBeenCalled();
+    }
+  });
+
+  it('uses the real default command actions when no dispatch seam is supplied', async () => {
+    const client = provideClient(async (sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      return { rows: [] };
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        runDatabaseCommand('postgres://localhost:5432/default_command_test', 'migrate'),
+      ).resolves.toBeUndefined();
+
+      expect(client.connect).toHaveBeenCalledOnce();
+      expect(client.end).toHaveBeenCalledOnce();
+      expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
+    } finally {
+      log.mockRestore();
     }
   });
 

@@ -96,6 +96,15 @@ async function expectInvalid(env: Record<string, string>, fragment: string) {
   expect(errorSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n')).toContain(fragment);
 }
 
+async function expectSingleInvalidIssue(env: Record<string, string>, path: string, message: string) {
+  exitSpy.mockClear();
+  errorSpy.mockClear();
+  await expect(loadConfig(env)).rejects.toThrow('process.exit called');
+  expect(exitSpy).toHaveBeenCalledWith(1);
+  expect(errorSpy).toHaveBeenCalledOnce();
+  expect(errorSpy).toHaveBeenCalledWith(`Invalid environment configuration:\n  - ${path}: ${message}`);
+}
+
 describe('config env validation', () => {
   it('applies documented defaults when optional variables are absent', async () => {
     const config = await loadConfig(baseEnv({}));
@@ -363,5 +372,80 @@ describe('config env validation', () => {
     await expectInvalid(baseEnv({ RATE_LIMIT_UPLOAD_GRANT_MAX: '0' }), 'RATE_LIMIT_UPLOAD_GRANT_MAX');
     await expectInvalid(baseEnv({ S3_UPLOAD_URL_TTL_SECONDS: '30' }), 'S3_UPLOAD_URL_TTL_SECONDS');
     await expectInvalid(baseEnv({ S3_OPERATION_TIMEOUT_MS: '500' }), 'S3_OPERATION_TIMEOUT_MS');
+  });
+
+  it('reports exact paths and messages for cross-field security invariants', async () => {
+    const validProduction = {
+      NODE_ENV: 'production',
+      MOCK_AI: 'false',
+      OPENAI_API_KEY: 'sk-real',
+      S3_BUCKET: 'audio-bucket',
+      DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+    };
+
+    await expectSingleInvalidIssue(
+      baseEnv({ ...validProduction, DATABASE_URL: 'postgres://db.example/ai_english?sslmode=require' }),
+      'DATABASE_URL',
+      'must set sslmode=verify-full in production',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ MOCK_AI: 'false', OPENAI_API_KEY: '' }),
+      'OPENAI_API_KEY',
+      'is required when MOCK_AI=false',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...validProduction, MOCK_AI: 'true' }),
+      'MOCK_AI',
+      'must be false in production; simulated scoring must never reach learners',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...validProduction, JWT_SECRET: 'this-is-a-test-secret-with-enough-length' }),
+      'JWT_SECRET',
+      'looks like a placeholder and is not allowed in production',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...validProduction, S3_BUCKET: '' }),
+      'S3_BUCKET',
+      'is required in production; learner audio must use size-constrained S3 presigned POST grants',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access-only' }),
+      'S3_ACCESS_KEY_ID',
+      'and S3_SECRET_ACCESS_KEY must either both be set or both be empty',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_BUCKET: 'audio-bucket', S3_SESSION_TOKEN: 'session-only' }),
+      'S3_SESSION_TOKEN',
+      'requires both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_ACCESS_KEY_ID: 'access', S3_SECRET_ACCESS_KEY: 'secret' }),
+      'S3_BUCKET',
+      'is required when static S3 credentials are configured',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_GLOBAL_DAILY_CAP: '9' }),
+      'ASSESS_GLOBAL_DAILY_CAP',
+      'must be greater than or equal to ASSESS_DAILY_CAP',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_IP_DAILY_CAP: '9' }),
+      'ASSESS_IP_DAILY_CAP',
+      'must be greater than or equal to ASSESS_DAILY_CAP so one learner keeps their full daily allowance',
+    );
+  });
+
+  it('keeps multiple configuration issues on separate operator-readable lines', async () => {
+    exitSpy.mockClear();
+    errorSpy.mockClear();
+    await expect(
+      loadConfig(baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access', S3_SESSION_TOKEN: 'token' })),
+    ).rejects.toThrow('process.exit called');
+    expect(errorSpy).toHaveBeenCalledOnce();
+    expect(errorSpy).toHaveBeenCalledWith(
+      'Invalid environment configuration:\n' +
+        '  - S3_ACCESS_KEY_ID: and S3_SECRET_ACCESS_KEY must either both be set or both be empty\n' +
+        '  - S3_SESSION_TOKEN: requires both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY',
+    );
   });
 });

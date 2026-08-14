@@ -1036,7 +1036,11 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Internal server error' });
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+      // Error-path finalization runs from the response-finish listener, which
+      // sees the real status the error handler set.
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+      });
     } finally {
       connect.mockRestore();
     }
@@ -1127,7 +1131,11 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Diagnostic already completed');
-    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+    // Error-path finalization runs from the response-finish listener, which
+    // sees the real status the error handler set.
+    await vi.waitFor(() => {
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+    });
   });
 
   it('deletes an owned object when body validation rejects the request before the route handler', async () => {
@@ -1252,6 +1260,70 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 });
 
 describe('POST /practice/attempt (S3 mode)', () => {
+  it('never schedules deletion for read routes carrying an owned audioKey body', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await completeDiagnosticInS3Mode(a, token, userId);
+    sendMock.mockClear();
+    sendMock.mockResolvedValue({});
+
+    const practiceQuestion = await request(a)
+      .get('/practice/question')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ audioKey: ownedKey(userId) });
+    expect(practiceQuestion.status).toBe(200);
+
+    const diagnosticNext = await request(a)
+      .get('/diagnostic/next')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ audioKey: ownedKey(userId) });
+    expect(diagnosticNext.status).toBe(200);
+
+    // Reads have no submission semantics: no GetObject and no DeleteObject may
+    // be scheduled, even after any response-finish finalizer would have run.
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('preserves the submitted object when the route throws a claim-conflict 409', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await completeDiagnosticInS3Mode(a, token, userId);
+    sendMock.mockClear();
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = next.body.question.id as string;
+    const audioKey = ownedKey(userId);
+    await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
+      userId,
+      questionId,
+      randomUUID(),
+    ]);
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+
+    try {
+      const response = await request(a)
+        .post('/practice/attempt')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId, requestId: randomUUID(), audioKey });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({ error: 'An assessment is already in progress for this question' });
+      // A route-thrown 409 must preserve the object: the response-finish
+      // finalizer sees the real status and keeps it for the active owner.
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
+    } finally {
+      await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
+    }
+  });
+
   it('validates a malformed requestId before the route and deletes the owned object', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
@@ -1378,7 +1450,11 @@ describe('POST /practice/attempt (S3 mode)', () => {
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Internal server error' });
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+      // Error-path finalization runs from the response-finish listener, which
+      // sees the real status the error handler set.
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
+      });
     } finally {
       connect.mockRestore();
     }

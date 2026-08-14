@@ -229,13 +229,17 @@ describe('audio inspection concurrency', () => {
     const inspection = startInspection();
     const [, args] = spawnMock.mock.calls[0] as [string, string[]];
     const formatIndex = args.indexOf('-format_whitelist');
-    expect(args.slice(formatIndex, formatIndex + 10)).toEqual([
+    expect(args.slice(formatIndex, formatIndex + 12)).toEqual([
       '-format_whitelist',
       'mov',
       '-enable_drefs',
       '0',
       '-use_absolute_path',
       '0',
+      // Edit lists are attacker-controlled presentation metadata: the gate must
+      // decode the container's full audio payload, not a forged window of it.
+      '-ignore_editlist',
+      '1',
       '-fd',
       '3',
       '-i',

@@ -38,7 +38,19 @@ function userApp(userId: string, middleware: express.RequestHandler) {
   });
   a.use(middleware);
   a.get('/x', (_req, res) => res.json({ ok: true }));
+  a.get('/rejected', (_req, res) => res.status(400).json({ error: 'invalid request' }));
   return a;
+}
+
+/** Wait until fire-and-forget failure refunds have settled for one namespace. */
+async function expectRefunded(namespace: string) {
+  await vi.waitFor(async () => {
+    const { rows } = await pool.query<{ hits: number }>(
+      'SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = $1',
+      [namespace],
+    );
+    expect(rows[0].hits).toBe(0);
+  });
 }
 
 describe('rate limiters', () => {
@@ -172,6 +184,45 @@ describe('rate limiters', () => {
       // A different network retains its own daily budget. Collapsing all
       // populated IPs to an empty fallback key would incorrectly reject it.
       expect((await request(otherNetwork).get('/x').set('X-Forwarded-For', '203.0.113.32')).status).toBe(200);
+    } finally {
+      config.assessIpDailyCap = savedCap;
+    }
+  });
+
+  it('refunds failed requests on the per-user assess budget while successful requests still count', async () => {
+    config.rateLimit.assessWindowMs = 60_000;
+    config.rateLimit.assessMax = 1;
+    const a = userApp('assess-refund-user', buildLimiters().assess);
+
+    // Any number of >=400 rejections never spends the paid budget. Refunds run
+    // fire-and-forget on response finish, so each one must settle before the
+    // next request for the assertion to stay deterministic.
+    for (let i = 0; i < 5; i++) {
+      expect((await request(a).get('/rejected')).status).toBe(400);
+      await expectRefunded('assess:60000:1');
+    }
+
+    // Successful requests still consume the budget exactly as before.
+    expect((await request(a).get('/x')).status).toBe(200);
+    expect((await request(a).get('/x')).status).toBe(429);
+  });
+
+  it("does not let one account's failed requests burn the shared per-IP daily assessment budget", async () => {
+    const savedCap = config.assessIpDailyCap;
+    config.assessIpDailyCap = 1;
+    try {
+      const first = userApp('ip-refund-user-1', buildLimiters().assessIpDaily).set('trust proxy', 1);
+      const second = userApp('ip-refund-user-2', buildLimiters().assessIpDaily).set('trust proxy', 1);
+
+      for (let i = 0; i < 5; i++) {
+        expect((await request(first).get('/rejected').set('X-Forwarded-For', '203.0.113.61')).status).toBe(400);
+        await expectRefunded('assess-ip-daily:1');
+      }
+
+      // A second account behind the same NAT keeps its full paid budget...
+      expect((await request(second).get('/x').set('X-Forwarded-For', '203.0.113.61')).status).toBe(200);
+      // ...which a successful request still spends.
+      expect((await request(second).get('/x').set('X-Forwarded-For', '203.0.113.61')).status).toBe(429);
     } finally {
       config.assessIpDailyCap = savedCap;
     }

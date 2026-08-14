@@ -101,7 +101,15 @@ export const uploadAudio: RequestHandler = (req, res, next) => {
 
     if (err) {
       unlink();
-      return next(err);
+      if (err instanceof multer.MulterError || err instanceof HttpError) {
+        return next(err);
+      }
+      // Busboy reports multipart framing failures (missing boundary, truncated
+      // form, malformed part header) as plain Errors — malformed client input
+      // that must 400, never 500. Errors carrying a system errno (storage/IO
+      // failures) remain genuine server errors.
+      if ((err as NodeJS.ErrnoException).code) return next(err);
+      return next(new HttpError(400, 'Malformed multipart body'));
     }
 
     if (file) {

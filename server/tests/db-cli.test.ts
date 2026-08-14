@@ -58,6 +58,33 @@ describe('database CLI entrypoints', () => {
     expect(result.stderr).toContain('unknown database command "drop"');
   });
 
+  it('refuses setup and seed with NODE_ENV=production before connecting', () => {
+    for (const command of ['setup', 'seed']) {
+      const result = runTypeScriptCli('db/run.ts', [command], {
+        DATABASE_URL: 'postgres://localhost:5432/cli_prod_guard',
+        NODE_ENV: 'production',
+      });
+
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(
+        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"`,
+      );
+    }
+  });
+
+  it('still allows migrate with NODE_ENV=production (the db:migrate:prod path)', () => {
+    // The already-migrated test database makes the production migrate a no-op.
+    const result = runTypeScriptCli('db/run.ts', ['migrate'], {
+      DATABASE_URL: process.env.TEST_DATABASE_URL || 'postgres://localhost:5432/ai_english_test',
+      NODE_ENV: 'production',
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain('no pending migrations');
+  });
+
   it('executes the seed generator entrypoint without changing the deterministic artifact', () => {
     const seedPath = path.join(SERVER_DIRECTORY, 'db', 'seed.sql');
     const before = fs.readFileSync(seedPath, 'utf8');

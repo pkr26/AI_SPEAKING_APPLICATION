@@ -326,14 +326,38 @@ export type AudioUploadGrant =
     };
 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-const AUDIO_CONTENT_TYPES = new Set([
-  'audio/mp4',
-  'audio/m4a',
-  'audio/x-m4a',
-  'audio/webm',
-  'audio/wav',
-  'audio/x-wav',
-]);
+
+// Every content type the API can issue an S3 grant for, with the canonical
+// audio-key extension the server derives for it (first allowlisted extension
+// wins, so e.g. audio/mp4 maps to .m4a). Mirrors AUDIO_TYPES +
+// CONTENT_TYPE_TO_EXT in server/src/upload.ts and server/src/audio-upload.ts.
+const AUDIO_CONTENT_TYPE_TO_EXT: Readonly<Record<string, string>> = {
+  'audio/m4a': 'm4a',
+  'audio/mp4': 'm4a',
+  'audio/x-m4a': 'm4a',
+  'video/mp4': 'm4a',
+  'audio/mpeg': 'mp3',
+  'audio/mp3': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/wave': 'wav',
+  'audio/ogg': 'ogg',
+  'application/ogg': 'ogg',
+  'audio/webm': 'webm',
+  'video/webm': 'webm',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+};
+
+// The server only ever issues AWS S3 presigned POSTs, so the upload
+// destination must be a genuine AWS S3 host (e.g.
+// <bucket>.s3.<region>.amazonaws.com); otherwise a compromised API could
+// redirect the microphone recording anywhere. S3-compatible non-AWS providers
+// would need this pin relaxed to their own hostnames.
+function isAwsS3Hostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === 'amazonaws.com' || host.endsWith('.amazonaws.com');
+}
 
 function safeUploadUrl(value: string): boolean {
   if (value.length > 2048) return false;
@@ -341,7 +365,7 @@ function safeUploadUrl(value: string): boolean {
     const url = new URL(value);
     return (
       url.protocol === 'https:' &&
-      !!url.hostname &&
+      isAwsS3Hostname(url.hostname) &&
       !url.username &&
       !url.password &&
       !url.search &&
@@ -353,7 +377,7 @@ function safeUploadUrl(value: string): boolean {
 }
 
 function safeAudioKey(value: string): boolean {
-  return /^audio-uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp4|webm|wav)$/i.test(
+  return /^audio-uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
     value,
   );
 }
@@ -387,6 +411,9 @@ export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
   if (!isRecord(value)) throw new ContractError();
   if (value.mode === 'direct') return { mode: 'direct' };
   const uploadFields = parseUploadFields(value.uploadFields);
+  const audioKeyExt = isNonEmptyString(value.contentType)
+    ? AUDIO_CONTENT_TYPE_TO_EXT[value.contentType]
+    : undefined;
   if (
     value.mode === 's3' &&
     isNonEmptyString(value.uploadUrl) &&
@@ -395,8 +422,8 @@ export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
     safeAudioKey(value.audioKey) &&
     uploadFields !== null &&
     uploadFields.key === value.audioKey &&
-    isNonEmptyString(value.contentType) &&
-    AUDIO_CONTENT_TYPES.has(value.contentType) &&
+    audioKeyExt !== undefined &&
+    value.audioKey.toLowerCase().endsWith(`.${audioKeyExt}`) &&
     uploadFields['Content-Type'] === value.contentType &&
     isNumber(value.expiresIn) &&
     Number.isInteger(value.expiresIn) &&

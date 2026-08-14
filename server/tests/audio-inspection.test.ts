@@ -163,6 +163,47 @@ describe('verifyAudioDuration', () => {
     await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 413 });
   });
 
+  it('rejects an overlong M4A whose edit list forges a short presentation window', async () => {
+    // FFmpeg writes an elst atom for AAC-in-MOV; patching entry0's
+    // segment_duration (12 bytes past the atom type, in movie-timescale units
+    // of 1/1000s) makes default edit-list handling present only that window.
+    // The gate must ignore the edit list and measure the full audio payload.
+    const filePath = await generatedAudio('forged-edit-list.m4a', {
+      bitrate: '32k',
+      codec: 'aac',
+      durationSeconds: MAX_AUDIO_DURATION_SECONDS + 30,
+    });
+    const contents = await fs.readFile(filePath);
+    const elstType = Buffer.from('elst', 'ascii');
+    const elstOffset = contents.indexOf(elstType);
+    expect(elstOffset).toBeGreaterThanOrEqual(0);
+    expect(contents.indexOf(elstType, elstOffset + 1)).toBe(-1);
+    expect(contents.readUInt32BE(elstOffset + 12)).toBeGreaterThan(120_000);
+    contents.writeUInt32BE(10_000, elstOffset + 12);
+    await fs.writeFile(filePath, contents);
+
+    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 413 });
+
+    // An honest short M4A from the same encoder still passes the gate.
+    await expect(
+      verifyAudioDuration(
+        await generatedAudio('honest-short.m4a', { bitrate: '32k', codec: 'aac', durationSeconds: 2 }),
+      ),
+    ).resolves.toBe(true);
+  });
+
+  it('rejects a FIFO without ever blocking the event loop on open', async () => {
+    // Opening a FIFO for read blocks synchronously until a writer appears, so
+    // the gate must reject non-regular files before any open attempt.
+    const filePath = path.join(uploadsDir, `${process.pid}-fifo.wav`);
+    files.push(filePath);
+    await runFile('mkfifo', [filePath]);
+
+    const startedAt = Date.now();
+    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 415 });
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+  });
+
   it('rejects multi-track containers whose uninspected streams would reach the paid transcriber', async () => {
     // Two mono sine tracks in one M4A: the first decodes to ~1s and would pass
     // a first-stream-only gate, while the second would still be uploaded to

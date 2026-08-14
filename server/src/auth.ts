@@ -57,12 +57,21 @@ const comparablePasswordSchema = (field: string) =>
       message: `${field} must be at most ${BCRYPT_MAX_BYTES} UTF-8 bytes`,
     });
 
+// PostgreSQL text rejects U+0000 (22021 → unhandled 500), and the rest of the
+// C0/DEL control range has no place in a stored display name.
+const hasNoControlCharacters = (value: string) =>
+  [...value].every((char) => {
+    const codePoint = char.codePointAt(0)!;
+    return codePoint > 0x1f && codePoint !== 0x7f;
+  });
+
 const registerSchema = z.object({
   name: z
     .string()
     .trim()
     .min(1, 'name is required')
-    .max(MAX_NAME_LENGTH, `name must be at most ${MAX_NAME_LENGTH} characters`),
+    .max(MAX_NAME_LENGTH, `name must be at most ${MAX_NAME_LENGTH} characters`)
+    .refine(hasNoControlCharacters, 'name must not contain control characters'),
   email: z
     .string()
     .trim()

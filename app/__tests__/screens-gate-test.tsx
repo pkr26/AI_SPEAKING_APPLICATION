@@ -95,6 +95,7 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     isRestoring: false,
     restoreError: null,
     retrySessionRestore: jest.fn(),
+    resetStoredSession: jest.fn(),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -505,6 +506,31 @@ describe('index gate', () => {
     );
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
     expect(retrySessionRestore).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers an explicit session-reset escape when secure storage stays unreadable', async () => {
+    const resetStoredSession = jest.fn();
+    mockAuthValue = makeAuth({
+      token: null,
+      user: null,
+      restoreError:
+        'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+      resetStoredSession,
+    });
+    await renderGate();
+
+    expect(screen.queryByTestId('redirect')).toBeNull();
+    await expectPressFeedback(
+      () => screen.getByRole('button', { name: 'Reset saved session' }),
+      {
+        backgroundColor: colors.card,
+        borderColor: colors.danger,
+        minHeight: layout.minimumTarget,
+      },
+      { backgroundColor: colors.dangerLight },
+    );
+    await fireEvent.press(screen.getByRole('button', { name: 'Reset saved session' }));
+    expect(resetStoredSession).toHaveBeenCalledTimes(1);
   });
 
   it('redirects to login when there is no token', async () => {

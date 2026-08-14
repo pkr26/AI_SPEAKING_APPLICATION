@@ -30,7 +30,10 @@ function isOwnedAudioKey(ownerId: string, audioKey: string): boolean {
     extra === undefined &&
     prefix === 'audio-uploads' &&
     keyOwnerId === ownerId &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp4|webm|wav)$/i.test(
+    // Server-issuable key extensions: mirrors AUDIO_CONTENT_TYPE_TO_EXT in
+    // types.ts (the server derives .m4a for MP4-family and .ogg for Ogg-family
+    // content types, so .mp4/.oga keys are never issued).
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
       filename ?? '',
     )
   );

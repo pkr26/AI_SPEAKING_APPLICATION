@@ -82,6 +82,7 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     isRestoring: false,
     restoreError: null,
     retrySessionRestore: jest.fn(),
+    resetStoredSession: jest.fn(),
     login: jest.fn().mockResolvedValue(USER),
     register: jest.fn().mockResolvedValue(USER),
     logout: jest.fn(),

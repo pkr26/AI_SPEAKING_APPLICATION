@@ -169,6 +169,16 @@ const envSchema = z
         message: 'looks like a placeholder and is not allowed in production',
       });
     }
+    // A 32-character secret built from a handful of characters (all-same-char,
+    // short repeating cycles) still passes the length check but is trivially
+    // brute-forced; anyone with the secret forges every user's token.
+    if (env.NODE_ENV === 'production' && new Set(env.JWT_SECRET).size < 10) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['JWT_SECRET'],
+        message: 'must have at least 10 distinct characters in production; use a randomly generated secret',
+      });
+    }
     if (env.NODE_ENV === 'production' && !env.S3_BUCKET) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

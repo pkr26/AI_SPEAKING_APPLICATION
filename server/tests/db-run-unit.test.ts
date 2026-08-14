@@ -492,4 +492,34 @@ describe('database deployment runner', () => {
     expect(actions.seed).not.toHaveBeenCalled();
     expect(actions.setup).toHaveBeenCalledOnce();
   });
+
+  it('refuses setup and seed in production while migrate stays allowed', async () => {
+    const actions = {
+      migrate: vi.fn(async () => []),
+      seed: vi.fn(async () => undefined),
+      setup: vi.fn(async () => undefined),
+    } as unknown as DatabaseCommandActions;
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+
+    try {
+      await expect(runDatabaseCommand('postgres://localhost:5432/command_test', 'setup', actions)).rejects.toThrow(
+        'refusing to run "setup" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"',
+      );
+      await expect(runDatabaseCommand('postgres://localhost:5432/command_test', 'seed', actions)).rejects.toThrow(
+        'refusing to run "seed" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"',
+      );
+      expect(actions.setup).not.toHaveBeenCalled();
+      expect(actions.seed).not.toHaveBeenCalled();
+
+      // `npm run db:migrate:prod` is the supported production path.
+      await expect(
+        runDatabaseCommand('postgres://localhost:5432/command_test', 'migrate', actions),
+      ).resolves.toBeUndefined();
+      expect(actions.migrate).toHaveBeenCalledOnce();
+      expect(actions.migrate).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
+    } finally {
+      process.env.NODE_ENV = previousNodeEnv;
+    }
+  });
 });

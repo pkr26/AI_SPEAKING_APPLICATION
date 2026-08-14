@@ -31,6 +31,8 @@ interface AuthContextValue {
   /** Safe user-facing error when the OS credential store could not be read. */
   restoreError: string | null;
   retrySessionRestore: () => void;
+  /** User-initiated escape from an unreadable store entry: wipe it and continue logged out. */
+  resetStoredSession: () => void;
   login: (email: string, password: string) => Promise<User>;
   register: (
     name: string,
@@ -190,6 +192,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setIsRestoring(true);
     setRestoreAttempt((attempt) => attempt + 1);
   }, []);
+
+  const resetStoredSession = useCallback(() => {
+    // Escape hatch for a permanently unreadable credential-store entry (e.g. an
+    // undecryptable entry restored from an Android backup without its Keystore
+    // key). Never invoked automatically: only the user's explicit action may
+    // wipe the persisted session, and the fail-closed restore error stays the
+    // default. The delete is best-effort — if it also fails, the unreadable
+    // entry stays behind and the session still degrades to logged-out so
+    // sign-in/register become reachable. Bump the epoch so a restore already
+    // in flight cannot resurrect the wiped session afterwards.
+    epochRef.current += 1;
+    void clearToken().catch(() => undefined);
+    resetMemorySession();
+  }, [resetMemorySession]);
 
   const beginTransition = () => {
     if (transitionRef.current) {
@@ -398,6 +414,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isRestoring,
       restoreError,
       retrySessionRestore,
+      resetStoredSession,
       login,
       register,
       logout,
@@ -412,6 +429,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       isRestoring,
       restoreError,
       retrySessionRestore,
+      resetStoredSession,
       login,
       register,
       logout,

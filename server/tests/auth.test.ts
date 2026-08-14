@@ -91,6 +91,18 @@ describe('auth: register validation', () => {
     expect(second.res.status).toBe(409);
     expect(typeof second.res.body.error).toBe('string');
   });
+
+  it('rejects control characters in the name with 400 instead of a database 500', async () => {
+    // PostgreSQL text rejects U+0000 with 22021; validation must catch control
+    // characters first so the register INSERT never sees them.
+    const nul = await registerUser(a, { name: 'Ab\u0000cd' });
+    expect(nul.res.status).toBe(400);
+    expect(nul.res.body).toEqual({ error: 'name: name must not contain control characters' });
+
+    for (const name of ['line\nbreak', 'tab\tname', 'bell\x07name', 'del\x7Fname']) {
+      expect((await registerUser(a, { name })).res.status).toBe(400);
+    }
+  });
 });
 
 describe('auth: login', () => {

@@ -37,6 +37,20 @@ describe('POST /uploads/audio-url', () => {
     expect(res.status).toBe(415);
     expect(res.body).toEqual({ error: 'Unsupported audio media type' });
   });
+
+  it('returns 415 for prototype-chain content types that inherit truthy members', async () => {
+    const a = app();
+    const { res: reg } = await registerUser(a);
+    const token = reg.body.token as string;
+    for (const contentType of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+      const res = await request(a)
+        .post('/uploads/audio-url')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ contentType });
+      expect(res.status).toBe(415);
+      expect(res.body).toEqual({ error: 'Unsupported audio media type' });
+    }
+  });
 });
 
 describe('contentTypeToExt', () => {
@@ -65,6 +79,13 @@ describe('contentTypeToExt', () => {
     expect(contentTypeToExt('text/plain')).toBeUndefined();
     expect(contentTypeToExt('')).toBeUndefined();
   });
+
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'rejects prototype-chain member %s instead of resolving an inherited value',
+    (contentType) => {
+      expect(contentTypeToExt(contentType)).toBeUndefined();
+    },
+  );
 });
 
 describe('isOwnedAudioKey', () => {

@@ -33,6 +33,7 @@ const runtime = vi.hoisted(() => {
     cleanupRateLimits: vi.fn(async () => 0),
     assertSchema: vi.fn(async (): Promise<void> => undefined),
     assertAudio: vi.fn(async (): Promise<void> => undefined),
+    trustProxy: false as false | number,
   };
 });
 
@@ -45,6 +46,9 @@ vi.mock('../src/config', () => ({
     nodeEnv: 'test',
     openaiTimeoutMs: 60_000,
     s3: { operationTimeoutMs: 30_000 },
+    get trustProxy() {
+      return runtime.trustProxy;
+    },
   },
 }));
 vi.mock('../src/db', () => ({ pool: { end: runtime.poolEnd } }));
@@ -68,6 +72,7 @@ function addedSignalListener(signal: 'SIGTERM' | 'SIGINT'): NodeJS.SignalsListen
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  runtime.trustProxy = false;
   runtime.server.listening = false;
   runtime.server.listen.mockImplementation((_: number, callback?: () => void) => {
     runtime.server.listening = true;
@@ -101,6 +106,35 @@ afterEach(() => {
 });
 
 describe('server lifecycle failure handling', () => {
+  it('warns at boot when TRUST_PROXY is configured, and stays silent at zero hops', async () => {
+    runtime.trustProxy = 2;
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.logger.warn).toHaveBeenCalledWith(
+      { trustProxy: 2 },
+      'TRUST_PROXY is set: the hop count must exactly match the deployment proxy chain; if this port is reachable directly, clients can spoof X-Forwarded-For to reset per-IP rate-limit budgets',
+    );
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+
+    // The default zero-hop configuration boots without the warning.
+    runtime.trustProxy = false;
+    runtime.logger.warn.mockClear();
+    runtime.server.listen.mockClear();
+    vi.resetModules();
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(
+      runtime.logger.warn.mock.calls.filter(([, message]) => String(message).includes('TRUST_PROXY')),
+    ).toHaveLength(0);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
   it('contains every boot janitor rejection and reports it without blocking startup', async () => {
     const uploadError = new Error('upload cleanup failed');
     const replayError = new Error('replay cleanup failed');

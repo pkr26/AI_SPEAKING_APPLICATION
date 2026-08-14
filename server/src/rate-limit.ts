@@ -124,7 +124,11 @@ export function buildLimiters() {
   });
 
   // Assessment endpoints are expensive (upload + AI) — per-user, not per-IP,
-  // so shared networks don't let one user exhaust another's budget.
+  // so shared networks don't let one user exhaust another's budget. Failed
+  // (>=400) requests are refunded on response finish: schema-invalid and other
+  // rejected submissions never reach paid work, so they must not spend the
+  // budget. The store's decrement is window-guarded and fail-safe (the same
+  // refund path the login limiter already relies on).
   const assess = rateLimit({
     ...common,
     windowMs: config.rateLimit.assessWindowMs,
@@ -137,6 +141,7 @@ export function buildLimiters() {
       const user = (req as AuthedRequest).user;
       return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
     },
+    skipFailedRequests: true,
     message: { error: 'Assessment rate limit reached, please slow down' },
   });
 
@@ -145,13 +150,16 @@ export function buildLimiters() {
   // assessments until the global cap 429s every learner. This fixed-window
   // daily budget follows the source IP across accounts; its default is
   // deliberately several times the per-user daily cap so ordinary
-  // households/schools behind one NAT keep working.
+  // households/schools behind one NAT keep working. Failed (>=400) requests
+  // are refunded so one account's rejected submissions cannot deny the shared
+  // network budget to every other account behind the same NAT.
   const assessIpDaily = rateLimit({
     ...common,
     windowMs: 24 * 60 * 60 * 1000,
     limit: config.assessIpDailyCap,
     store: new PostgresRateLimitStore(`assess-ip-daily:${config.assessIpDailyCap}`, 24 * 60 * 60 * 1000),
     keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    skipFailedRequests: true,
     message: { error: 'Daily assessment limit reached for this network' },
   });
 

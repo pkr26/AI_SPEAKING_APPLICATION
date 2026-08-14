@@ -12,6 +12,15 @@ import { assertAudioInspectorAvailable } from './audio-inspection';
 const app = createApp();
 const server = createServer(app);
 
+// A nonzero hop count is only safe behind a proxy chain that strips
+// client-supplied forwarding headers on exactly this many hops.
+if (config.trustProxy) {
+  logger.warn(
+    { trustProxy: config.trustProxy },
+    'TRUST_PROXY is set: the hop count must exactly match the deployment proxy chain; if this port is reachable directly, clients can spoof X-Forwarded-For to reset per-IP rate-limit budgets',
+  );
+}
+
 // The whole-request budget must exceed the slowest legitimate assessment
 // chain (S3 download + decode inspection + one provider deadline) plus upload
 // ingress margin, or worst-case requests are socket-killed mid-flight.

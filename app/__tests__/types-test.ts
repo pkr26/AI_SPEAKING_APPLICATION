@@ -763,35 +763,63 @@ describe('audio upload grant parser', () => {
     });
   });
 
-  it.each(['audio/mp4', 'audio/m4a', 'audio/x-m4a', 'audio/webm', 'audio/wav', 'audio/x-wav'])(
-    'accepts the supported signed content type %s',
-    (contentType) => {
+  it.each([
+    ['audio/m4a', 'm4a'],
+    ['audio/mp4', 'm4a'],
+    ['audio/x-m4a', 'm4a'],
+    ['video/mp4', 'm4a'],
+    ['audio/mpeg', 'mp3'],
+    ['audio/mp3', 'mp3'],
+    ['audio/wav', 'wav'],
+    ['audio/x-wav', 'wav'],
+    ['audio/wave', 'wav'],
+    ['audio/ogg', 'ogg'],
+    ['application/ogg', 'ogg'],
+    ['audio/webm', 'webm'],
+    ['video/webm', 'webm'],
+    ['audio/flac', 'flac'],
+    ['audio/x-flac', 'flac'],
+  ])(
+    'accepts the server-issuable signed content type %s with its canonical .%s key',
+    (contentType, extension) => {
+      const nextAudioKey = audioKey.replace(/\.m4a$/, `.${extension}`);
       const value = {
         ...s3,
+        audioKey: nextAudioKey,
         contentType,
-        uploadFields: { ...s3.uploadFields, 'Content-Type': contentType },
+        uploadFields: {
+          ...s3.uploadFields,
+          key: nextAudioKey,
+          'Content-Type': contentType,
+        },
       };
       expect(parseAudioUploadGrant(value)).toEqual(value);
     },
   );
 
   it.each([
+    // The server derives .m4a for every MP4-family content type and .ogg for
+    // every Ogg-family one, so .mp4 and .oga keys are never issued.
     ['mp4', 'audio/mp4'],
-    ['webm', 'audio/webm'],
-    ['wav', 'audio/wav'],
-  ])('accepts a valid .%s object key', (extension, contentType) => {
+    ['oga', 'audio/ogg'],
+    // Well-formed keys whose extension does not match the grant's content type.
+    ['wav', 'audio/webm'],
+    ['webm', 'audio/wav'],
+    ['m4a', 'audio/wav'],
+  ])('rejects the never-issued or mismatched .%s key for %s', (extension, contentType) => {
     const nextAudioKey = audioKey.replace(/\.m4a$/, `.${extension}`);
-    const value = {
-      ...s3,
-      audioKey: nextAudioKey,
-      contentType,
-      uploadFields: {
-        ...s3.uploadFields,
-        key: nextAudioKey,
-        'Content-Type': contentType,
-      },
-    };
-    expect(parseAudioUploadGrant(value)).toEqual(value);
+    expectContractError(() =>
+      parseAudioUploadGrant({
+        ...s3,
+        audioKey: nextAudioKey,
+        contentType,
+        uploadFields: {
+          ...s3.uploadFields,
+          key: nextAudioKey,
+          'Content-Type': contentType,
+        },
+      }),
+    );
   });
 
   it.each([60, 3_600])('accepts the upload-grant lifetime boundary %i', (expiresIn) => {
@@ -803,7 +831,7 @@ describe('audio upload grant parser', () => {
   });
 
   it('enforces URL length without accepting credentials, query strings, fragments, or junk', () => {
-    const prefix = 'https://bucket.example/';
+    const prefix = 'https://bucket.s3.us-east-1.amazonaws.com/';
     const exact = prefix + 'a'.repeat(2_048 - prefix.length);
     expect(parseAudioUploadGrant({ ...s3, uploadUrl: exact })).toMatchObject({ uploadUrl: exact });
     expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl: `${exact}a` }));
@@ -811,7 +839,30 @@ describe('audio upload grant parser', () => {
     expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl: 'https://[' }));
   });
 
-  it.each(['https://user@bucket.example/', 'https://:secret@bucket.example/'])(
+  it('pins the upload destination to a genuine AWS S3 host', () => {
+    for (const uploadUrl of [
+      'https://bucket.s3.us-east-1.amazonaws.com/',
+      'https://bucket.s3.amazonaws.com/',
+      'https://BUCKET.S3.US-EAST-1.AMAZONAWS.COM/',
+      'https://amazonaws.com/',
+    ]) {
+      expect(parseAudioUploadGrant({ ...s3, uploadUrl })).toMatchObject({ uploadUrl });
+    }
+  });
+
+  it.each([
+    'https://attacker.example/collect',
+    'https://amazonaws.com.evil.com/',
+    'https://evilamazonaws.com/',
+    'https://notamazonaws.com.attacker.tld/',
+    'https://amazonaws.com./',
+    'http://amazonaws.com/',
+    'http://bucket.s3.us-east-1.amazonaws.com/',
+  ])('rejects the non-AWS or cleartext upload destination %s', (uploadUrl) => {
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl }));
+  });
+
+  it.each(['https://user@bucket.s3.amazonaws.com/', 'https://:secret@bucket.s3.amazonaws.com/'])(
     'rejects an HTTPS upload URL with one credential component: %s',
     (uploadUrl) => {
       expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl }));
@@ -927,9 +978,9 @@ describe('audio upload grant parser', () => {
     { mode: 's3' },
     { ...s3, uploadUrl: '' },
     { ...s3, uploadUrl: 'http://bucket.s3.amazonaws.com/' },
-    { ...s3, uploadUrl: 'https://user:secret@bucket.example/' },
-    { ...s3, uploadUrl: 'https://bucket.example/?signature=secret' },
-    { ...s3, uploadUrl: 'https://bucket.example/#fragment' },
+    { ...s3, uploadUrl: 'https://user:secret@bucket.s3.amazonaws.com/' },
+    { ...s3, uploadUrl: 'https://bucket.s3.amazonaws.com/?signature=secret' },
+    { ...s3, uploadUrl: 'https://bucket.s3.amazonaws.com/#fragment' },
     { ...s3, audioKey: '' },
     { ...s3, audioKey: '../another-user/audio.m4a' },
     { ...s3, uploadFields: {} },
@@ -940,6 +991,8 @@ describe('audio upload grant parser', () => {
       uploadFields: { ...s3.uploadFields, 'Content-Type': 'audio/wav' },
     },
     { ...s3, contentType: 'application/octet-stream' },
+    { ...s3, contentType: 'audio/aac' },
+    { ...s3, contentType: 'AUDIO/WEBM' },
     { ...s3, expiresIn: 59 },
     { ...s3, expiresIn: 3601 },
     { ...s3, expiresIn: '900' },

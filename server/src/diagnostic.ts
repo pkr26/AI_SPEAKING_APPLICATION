@@ -245,9 +245,6 @@ export function createDiagnosticRouter(limiters: Limiters) {
     next();
   });
   router.use(requireAuth);
-  // Register transient-object cleanup before per-route rate limiting and body
-  // validation so every authenticated submission path discards its owned key.
-  if (config.s3.bucket) router.use(discardSubmittedPresignedAudio);
 
   router.get(
     '/next',
@@ -287,6 +284,11 @@ export function createDiagnosticRouter(limiters: Limiters) {
 
   router.post(
     '/answer',
+    // Transient-object cleanup belongs to this submission route only: after
+    // authentication, before rate limiting and validation, so every
+    // authenticated submission path discards its owned key while reads that
+    // happen to carry an audioKey body can never trigger a deletion.
+    ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
     limiters.assess,
     limiters.assessIpDaily,
     ...(config.s3.bucket
@@ -294,6 +296,13 @@ export function createDiagnosticRouter(limiters: Limiters) {
       : [uploadAudio, validate({ body: answerBodySchema })]),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
+      // Only the route's own response finalizes here. On error paths the error
+      // handler sets the real status only after this handler unwinds, so
+      // finalizing now would read a stale 200 and delete objects that the
+      // 409/429 contract preserves; the response-finish listener (registered
+      // by discardSubmittedPresignedAudio) sees the final status and
+      // finalizes those paths instead. Finalization is idempotent.
+      let responded = false;
       try {
         const { questionId, requestId } = req.body as z.infer<typeof answerBodySchema>;
         const knownQuestion = await pool.query('SELECT 1 FROM questions WHERE id = $1', [questionId]);
@@ -311,6 +320,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
         }
         if (requestClaim.kind === 'completed') {
           completeSubmittedPresignedAudioReplay(res);
+          responded = true;
           return res.json(requestClaim.response);
         }
         ownSubmittedPresignedAudio(res);
@@ -349,6 +359,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
             result,
           );
           completed = true;
+          responded = true;
           res.json(body);
         } finally {
           if (claimId) await clearDiagnosticClaim(user.id, claimId);
@@ -356,7 +367,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
         }
       } finally {
         if (req.file) await fs.unlink(req.file.path).catch(() => {});
-        if (config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
+        if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
       }
     }),
   );

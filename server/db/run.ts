@@ -269,11 +269,19 @@ export async function runDatabaseCommand(
     await actions.migrate(databaseUrl);
     return;
   }
-  if (command === 'seed') {
-    await actions.seed(databaseUrl);
-    return;
-  }
-  if (command === 'setup') {
+  if (command === 'seed' || command === 'setup') {
+    // Local bootstrap only: deploys apply compiled migrations via
+    // `npm run db:migrate:prod` and must never reseed or recreate a
+    // production database by operator mistake.
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"`,
+      );
+    }
+    if (command === 'seed') {
+      await actions.seed(databaseUrl);
+      return;
+    }
     await actions.setup(databaseUrl);
     return;
   }

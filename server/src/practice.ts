@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'crypto';
-import { Router } from 'express';
+import { NextFunction, Response, Router } from 'express';
 import fs from 'fs/promises';
 import { z } from 'zod';
 import { assessSpeaking } from './assess';
@@ -215,18 +215,17 @@ export function createPracticeRouter(limiters: Limiters) {
     next();
   });
   router.use(requireAuth);
-  // Register transient-object cleanup before eligibility checks, per-route rate
-  // limiting, and validation so every authenticated submission path is covered.
-  if (config.s3.bucket) router.use(discardSubmittedPresignedAudio);
-  router.use((req: AuthedRequest, _res, next) => {
+
+  const requireCompletedDiagnostic = (req: AuthedRequest, _res: Response, next: NextFunction) => {
     if (!req.user!.diagnostic_completed || !req.user!.cefr_level) {
       return next(new HttpError(403, 'Diagnostic not completed'));
     }
     return next();
-  });
+  };
 
   router.get(
     '/question',
+    requireCompletedDiagnostic,
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       const question = await pickPracticeQuestion(user.id, user.cefr_level!);
@@ -237,6 +236,7 @@ export function createPracticeRouter(limiters: Limiters) {
 
   router.get(
     '/question/:id/help',
+    requireCompletedDiagnostic,
     validate({ params: helpParamsSchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
@@ -270,6 +270,12 @@ export function createPracticeRouter(limiters: Limiters) {
 
   router.post(
     '/attempt',
+    // Transient-object cleanup belongs to this submission route only: after
+    // authentication, before eligibility, rate limiting, and validation, so
+    // every authenticated submission path discards its owned key while reads
+    // that happen to carry an audioKey body can never trigger a deletion.
+    ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
+    requireCompletedDiagnostic,
     limiters.assess,
     limiters.assessIpDaily,
     ...(config.s3.bucket
@@ -277,6 +283,13 @@ export function createPracticeRouter(limiters: Limiters) {
       : [uploadAudio, validate({ body: attemptBodySchema })]),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
+      // Only the route's own response finalizes here. On error paths the error
+      // handler sets the real status only after this handler unwinds, so
+      // finalizing now would read a stale 200 and delete objects that the
+      // 409/429 contract preserves; the response-finish listener (registered
+      // by discardSubmittedPresignedAudio) sees the final status and
+      // finalizes those paths instead. Finalization is idempotent.
+      let responded = false;
       try {
         const { questionId, requestId } = req.body as z.infer<typeof attemptBodySchema>;
         const { rows: qRows } = await pool.query('SELECT * FROM questions WHERE id = $1', [questionId]);
@@ -297,6 +310,7 @@ export function createPracticeRouter(limiters: Limiters) {
         }
         if (requestClaim.kind === 'completed') {
           completeSubmittedPresignedAudioReplay(res);
+          responded = true;
           return res.json(requestClaim.response);
         }
         ownSubmittedPresignedAudio(res);
@@ -354,6 +368,7 @@ export function createPracticeRouter(limiters: Limiters) {
             finalFeedback,
           );
           completed = true;
+          responded = true;
           return res.json(response);
         } finally {
           if (claim) await clearPracticeClaim(user.id, q.id, claim.claimId);
@@ -361,7 +376,7 @@ export function createPracticeRouter(limiters: Limiters) {
         }
       } finally {
         if (req.file) await fs.unlink(req.file.path).catch(() => {});
-        if (config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
+        if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
       }
     }),
   );

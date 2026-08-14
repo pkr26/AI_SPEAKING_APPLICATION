@@ -304,6 +304,38 @@ describe('config env validation', () => {
     );
   });
 
+  it('rejects low-entropy JWT secrets in production but not in development', async () => {
+    const production = {
+      NODE_ENV: 'production',
+      MOCK_AI: 'false',
+      OPENAI_API_KEY: 'sk-real',
+      S3_BUCKET: 'audio-bucket',
+      DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+    };
+
+    // All-same-character and short repeating cycles pass the length check but
+    // carry almost no entropy.
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, JWT_SECRET: 'a'.repeat(32) }),
+      'JWT_SECRET',
+      'must have at least 10 distinct characters in production; use a randomly generated secret',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, JWT_SECRET: 'ab'.repeat(16) }),
+      'JWT_SECRET',
+      'must have at least 10 distinct characters in production; use a randomly generated secret',
+    );
+
+    // A random hex secret has ample distinct characters.
+    const accepted = await loadConfig(
+      baseEnv({ ...production, JWT_SECRET: '9f1badb54e8c47d2a6f03c1e72d85b94c0e6a3f817d29b4c65e80a1f3d7c5b92' }),
+    );
+    expect(accepted.isProduction).toBe(true);
+
+    // Outside production the length floor is the only constraint.
+    expect((await loadConfig(baseEnv({ JWT_SECRET: 'a'.repeat(32) }))).jwtSecret).toBe('a'.repeat(32));
+  });
+
   it('requires complete, nonblank static S3 credentials and supports a session token', async () => {
     await expectInvalid(
       baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access-only' }),

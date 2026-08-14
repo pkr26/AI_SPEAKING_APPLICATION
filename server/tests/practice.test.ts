@@ -4,7 +4,7 @@ import request from 'supertest';
 import fs from 'fs/promises';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
 afterAll(async () => {
@@ -212,6 +212,103 @@ describe('practice', () => {
       });
     expect(missing.status).toBe(400);
     expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);
+  });
+
+  it('maps malformed multipart framing to 400 instead of 500', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token;
+    await completeDiagnostic(a, token);
+    const before = (await fs.readdir(uploadsDir)).sort();
+
+    const postRaw = (contentType: string, body: string | Buffer) =>
+      request(a)
+        .post('/practice/attempt')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', contentType)
+        .send(body);
+
+    // A multipart content type without a boundary parameter.
+    const noBoundary = await postRaw('multipart/form-data', 'garbage');
+    expect(noBoundary.status).toBe(400);
+    expect(noBoundary.body).toEqual({ error: 'Malformed multipart body' });
+
+    // A form that opens a part but never sends the closing boundary.
+    const truncated = await postRaw(
+      'multipart/form-data; boundary=abc',
+      '--abc\r\nContent-Disposition: form-data; name="questionId"\r\n\r\n9f1badb5',
+    );
+    expect(truncated.status).toBe(400);
+    expect(truncated.body).toEqual({ error: 'Malformed multipart body' });
+
+    // A NUL byte inside the file part's filename header.
+    const nulFilename = await postRaw(
+      'multipart/form-data; boundary=abc',
+      Buffer.concat([
+        Buffer.from('--abc\r\nContent-Disposition: form-data; name="audio"; filename="a.m4a', 'utf8'),
+        Buffer.from([0]),
+        Buffer.from('.exe"\r\nContent-Type: audio/mp4\r\n\r\n', 'utf8'),
+        fakeM4aBuffer(),
+        Buffer.from('\r\n--abc--\r\n', 'utf8'),
+      ]),
+    );
+    expect(nulFilename.status).toBe(400);
+    expect(nulFilename.body).toEqual({ error: 'Malformed multipart body' });
+
+    expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);
+  });
+
+  it('refunds schema-invalid attempts instead of spending the paid assessment budgets', async () => {
+    const savedRateLimit = { ...config.rateLimit };
+    const savedIpCap = config.assessIpDailyCap;
+    config.rateLimit.assessWindowMs = 60_000;
+    config.rateLimit.assessMax = 1;
+    config.assessIpDailyCap = 1;
+    try {
+      const scoped = app();
+      const { res } = await registerUser(scoped);
+      const token = res.body.token as string;
+      const userId = res.body.user.id as string;
+      // Force-complete the diagnostic so no paid budget is spent on setup.
+      await pool.query("UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1", [userId]);
+      await pool.query('DELETE FROM rate_limit_windows');
+
+      // Schema-invalid submissions are 400s and must not consume either the
+      // per-user assess budget or the shared per-IP daily budget. Refunds are
+      // applied fire-and-forget on response finish, so each one must settle
+      // before the next request for the assertions to stay deterministic.
+      const expectRefunded = () =>
+        vi.waitFor(async () => {
+          const { rows } = await pool.query<{ hits: number }>(
+            "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace IN ('assess:60000:1', 'assess-ip-daily:1')",
+          );
+          expect(rows[0].hits).toBe(0);
+        });
+      for (let i = 0; i < 3; i++) {
+        const invalid = await answerForm(
+          request(scoped).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+          'not-a-uuid',
+        );
+        expect(invalid.status).toBe(400);
+        await expectRefunded();
+      }
+
+      // The single paid slot still works, and the next paid attempt is limited.
+      const q = await request(scoped).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      const valid = await answerForm(
+        request(scoped).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        q.body.question.id,
+      );
+      expect(valid.status).toBe(200);
+
+      const limited = await answerForm(
+        request(scoped).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        q.body.question.id,
+      );
+      expect(limited.status).toBe(429);
+    } finally {
+      Object.assign(config.rateLimit, savedRateLimit);
+      config.assessIpDailyCap = savedIpCap;
+    }
   });
 
   it('rejects help and attempts for questions outside the user CEFR level', async () => {

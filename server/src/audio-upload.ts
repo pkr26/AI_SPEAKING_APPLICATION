@@ -34,8 +34,10 @@ type AudioCleanupResponse = Response & {
 
 // Canonical extension per content type (first allowlisted extension wins, so
 // e.g. audio/mp4 maps to .m4a). Used to build S3 keys for presigned uploads.
+// The map has no prototype: lookups like `__proto__`/`constructor` must miss
+// instead of resolving inherited Object members into a truthy "extension".
 const CONTENT_TYPE_TO_EXT: Readonly<Record<string, string>> = (() => {
-  const map: Record<string, string> = {};
+  const map: Record<string, string> = Object.create(null);
   for (const [ext, mimes] of Object.entries(AUDIO_TYPES)) {
     for (const mime of mimes) {
       if (!(mime in map)) map[mime] = ext.slice(1);

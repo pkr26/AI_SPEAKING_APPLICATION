@@ -27,8 +27,16 @@ function LoadingView({ label }: { label: string }) {
  * An expired/invalid token (401) is cleared and the user lands on login.
  */
 export default function Gate() {
-  const { token, user, sessionVersion, isRestoring, restoreError, retrySessionRestore, setUser } =
-    useAuth();
+  const {
+    token,
+    user,
+    sessionVersion,
+    isRestoring,
+    restoreError,
+    retrySessionRestore,
+    resetStoredSession,
+    setUser,
+  } = useAuth();
 
   const meQuery = useQuery({
     queryKey: ['me', sessionVersion],
@@ -63,6 +71,13 @@ export default function Gate() {
           onPress={retrySessionRestore}
         >
           <Text style={styles.buttonText}>Try Again</Text>
+        </Pressable>
+        <Pressable
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.resetButton, pressed && styles.resetPressed]}
+          onPress={resetStoredSession}
+        >
+          <Text style={styles.resetButtonText}>Reset saved session</Text>
         </Pressable>
       </View>
     );
@@ -141,6 +156,25 @@ const styles = StyleSheet.create({
   },
   buttonText: {
     color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  resetButton: {
+    marginTop: 16,
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    backgroundColor: colors.card,
+    borderColor: colors.danger,
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 32,
+  },
+  resetPressed: {
+    backgroundColor: colors.dangerLight,
+  },
+  resetButtonText: {
+    color: colors.danger,
     fontSize: 16,
     fontWeight: '600',
   },

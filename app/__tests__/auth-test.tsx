@@ -259,6 +259,58 @@ describe('AuthProvider session restore', () => {
     expect(consoleSpy).not.toHaveBeenCalled();
     consoleSpy.mockRestore();
   });
+
+  it('wipes the stored session and re-enables login only after an explicit reset', async () => {
+    mockedGetToken.mockRejectedValue(new Error('undecryptable entry'));
+    await renderTree(new QueryClient());
+
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('token')).toBe('null');
+    expect(text('restoreError')).toBe(
+      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+    );
+    // The fail-closed default never wipes the entry on its own.
+    expect(mockedClearToken).not.toHaveBeenCalled();
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+
+    expect(mockedClearToken).toHaveBeenCalledTimes(1);
+    expect(mockedClearToken).toHaveBeenCalledWith();
+    expect(text('restoreError')).toBe('null');
+    expect(text('token')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+
+    // Logged-out state is reachable again: a fresh login establishes a session.
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-after-reset'));
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+    expect(text('token')).toBe('tok-after-reset');
+  });
+
+  it('still degrades to logged out when wiping the unreadable entry also fails', async () => {
+    mockedGetToken.mockRejectedValue(new Error('undecryptable entry'));
+    mockedClearToken.mockRejectedValue(new Error('store unavailable'));
+    await renderTree(new QueryClient());
+
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('restoreError')).toBe(
+      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
+    );
+
+    await act(async () => {
+      auth!.resetStoredSession();
+      // Let the rejected delete settle; the wipe is best-effort.
+      await Promise.resolve();
+    });
+
+    expect(mockedClearToken).toHaveBeenCalledTimes(1);
+    expect(text('restoreError')).toBe('null');
+    expect(text('token')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+  });
 });
 
 describe('login', () => {

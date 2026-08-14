@@ -457,3 +457,101 @@ subsequently remediated as well:
 All gates re-run after these changes: server format/lint/typecheck/build +
 591 tests, app format/lint/typecheck + 753 tests under the raised floors,
 doctor, audit:ci, and the smoke journey — all green.
+
+---
+
+# Third-Pass Adversarial Audit and Remediation — 14 August 2026
+
+## Scope and method
+
+A third, live-attack audit: nine parallel adversarial lanes (auth/session,
+rate limiting, upload ingress, idempotency/concurrency, injection/validation,
+FFmpeg inspection, S3/assess pipeline, app client, config/lifecycle) against a
+running server on a throwaway database, plus tight-limit probe instances.
+Baseline smoke journey passed before attacking. Every finding was independently
+re-produced by the lead auditor before acceptance, and every fix was
+re-attacked after landing. Full evidence: `reports/adversarial/` (gitignored).
+No CRITICAL or HIGH defects were found. One medium and twelve low findings were
+remediated in this pass.
+
+## Remediated in this pass
+
+- **Duration-gate bypass via forged MP4 edit list (medium).** The inspection
+  decode ran with FFmpeg's default edit-list handling, so a 4-byte `elst`
+  patch made a 150 s M4A measure 10 s and pass the ≤120 s gate. The MOV branch
+  now decodes with `-ignore_editlist 1`; regression test patches a real
+  150 s fixture and asserts 413 (`server/src/audio-inspection.ts`,
+  `server/tests/audio-inspection.test.ts`). Re-attack: forged file → 413,
+  honest file unaffected.
+- **Rejected requests burned paid-assessment budgets (low).** Three
+  schema-invalid 400s exhausted the per-user assess budget and drained the
+  shared per-IP daily budget (cross-account NAT denial). The assess and
+  assess-ip-daily limiters now set `skipFailedRequests`
+  (`server/src/rate-limit.ts`). Re-attack: 5×400 → budget untouched;
+  3 paid requests → 200×3 then 429.
+- **S3 deletion-hook defects (two lows).** The hook was registered router-wide
+  (any request carrying an owned `audioKey` deleted the object); it is now
+  scoped to the two assessment POST routes, preserving the documented
+  pre-eligibility position. And the route-level `finalize` ran before the error
+  handler set the status, dead-lettering the "409/429 → preserve" branch for
+  route-thrown conflicts; routes now finalize only on responded paths and the
+  finish listener (which sees the real status) handles error paths. The full
+  deletion matrix is regression-pinned
+  (`server/src/practice.ts`, `server/src/diagnostic.ts`,
+  `server/src/audio-upload.ts`, `server/tests/audio-upload-s3.test.ts`).
+- **`contentType` allowlist prototype-chain bypass (low).** A plain-object map
+  made `__proto__`/`constructor` content types truthy (200 instead of 415). The
+  map is now null-prototype (`server/src/audio-upload.ts`); re-attack → 415.
+- **Malformed multipart → 500 (low).** Busboy framing errors are not
+  `MulterError`s and reached the generic 500; they now map to
+  `400 Malformed multipart body` (`server/src/upload.ts`). Re-attack: no
+  boundary / truncated / NUL-in-filename → 400, no residue.
+- **NUL byte in register `name` → 500 (low).** pg rejects C0 controls with
+  22021 after zod passed them; the schema now rejects control characters with a
+  clean 400 (`server/src/auth.ts`).
+- **Blocking `openSync` before the regular-file check (low, latent).** A FIFO
+  at the inspected path could wedge the event loop before `O_NOFOLLOW`/`fstat`
+  ran; an `lstatSync` regular-file pre-check now rejects first
+  (`server/src/audio-inspection.ts`).
+- **`db:setup`/`db:seed` missing production guard (low).** Both now refuse
+  `NODE_ENV=production` with a clear error; `migrate` stays allowed
+  (`server/db/run.ts`, CLI + unit tests).
+- **Low-entropy production `JWT_SECRET` (low).** Production now additionally
+  requires ≥10 distinct characters (32×`a`, `abab…` rejected), keeping the
+  length ≥32 and placeholder blocklist (`server/src/config.ts`).
+- **`TRUST_PROXY > 0` spoofing risk (low).** A boot warning now states the hop
+  count must exactly match the deployment and that a directly reachable port
+  lets clients spoof `X-Forwarded-For` to reset IP budgets
+  (`server/src/index.ts`).
+- **App: S3 grant host not pinned (low).** `safeUploadUrl` now requires a
+  genuine AWS S3 hostname (`*.amazonaws.com`), closing recording exfiltration
+  to lookalike hosts (`amazonaws.com.evil.com`, trailing-dot, cleartext)
+  (`app/src/lib/types.ts`).
+- **App: permanent SecureStore failure bricked the app (low).** The
+  restore-error gate now offers an explicit "Reset saved session" escape that
+  best-effort clears the entry and reaches sign-in; the fail-closed default
+  and "Try Again" are unchanged (`app/src/lib/auth.tsx`,
+  `app/src/app/index.tsx`).
+- **Client/server grant contract alignment (info).** The client grant
+  validator now accepts exactly the server-issuable (content-type, extension)
+  pairs — 15 content types with canonical extensions — and the pending-
+  assessment tombstone regex matches
+  (`app/src/lib/types.ts`, `app/src/lib/pending-assessment.ts`).
+
+## Verification evidence for this pass
+
+- Every fix re-attacked live against the hardened server: all prior repros now
+  return the hardened result (413/415/400 as applicable); legitimate flows
+  verified unaffected (valid content types → 200, paid requests still count).
+- Server: format/lint/typecheck/build green; vitest **38/38 files, 676/676
+  tests**, coverage thresholds met; `npm audit --audit-level=high` 0
+  vulnerabilities; smoke journey green on the hardened build.
+- App: format/lint/typecheck green; jest **14/14 suites, 836/836 tests** under
+  enforced floors (re-run after the dependency bump below); doctor **20/20**
+  after `npx expo install --fix` bumped expo `~57.0.13`, expo-linking
+  `~57.0.6`, expo-router `~57.0.13` (patch drift published upstream after the
+  previous audit); production `expo export` passed for iOS and Android with an
+  explicit HTTPS API URL; `audit:ci` passed with the reviewed upstream baseline
+  unchanged (raw `npm audit`: 22 — 15 high, 7 moderate, 0 critical).
+- Not run: full mutation campaign (`npm run mutation` in both packages) —
+  recommended before release per the P0 sequence, since test files changed.

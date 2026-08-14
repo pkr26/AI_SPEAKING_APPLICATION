@@ -112,6 +112,13 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
     }
   };
   try {
+    // A FIFO or blocking device node wedges the whole event loop inside
+    // openSync until a writer appears, before O_NOFOLLOW or fstat could run,
+    // so reject non-regular files up front. The post-open fstat stays as
+    // defense in depth: it verifies the object actually opened.
+    if (!fs.lstatSync(filePath).isFile()) {
+      return Promise.reject(new InspectionError('invalid'));
+    }
     // Open the private upload ourselves, refuse a final-component symlink, and
     // hand FFmpeg only this already-open descriptor. Unlike stdin this remains
     // seekable for ordinary tail-moov MP4/M4A files; unlike `file`, FFmpeg has
@@ -129,8 +136,13 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     // MOV's external data references are disabled by default; passing the
     // options explicitly makes that security boundary resilient to defaults
-    // changing in a future FFmpeg release.
-    const movSafetyOptions = inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0'] : [];
+    // changing in a future FFmpeg release. `-ignore_editlist 1` makes the
+    // decode cover the container's full audio payload: the default edit-list
+    // handling would let a forged elst atom shrink the presented window (and
+    // with it this gate's measured duration) while every sample still ships
+    // to the paid transcriber.
+    const movSafetyOptions =
+      inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0', '-ignore_editlist', '1'] : [];
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(

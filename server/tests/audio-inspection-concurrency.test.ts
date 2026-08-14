@@ -35,9 +35,15 @@ const originalMaxConcurrency = config.audioInspectionMaxConcurrency;
 let filePath: string;
 let activeChildren: FakeChild[];
 
-function startInspection(child = new FakeChild()) {
-  spawnMock.mockReturnValueOnce(child);
-  activeChildren.push(child);
+function completeProbe(child: FakeChild, listing = '0\n'): void {
+  child.stdout.emit('data', Buffer.from(listing));
+  child.emit('close', 0);
+}
+
+async function startInspection(child = new FakeChild(), probeListing = '0\n') {
+  const probe = new FakeChild();
+  spawnMock.mockReturnValueOnce(probe);
+  activeChildren.push(probe);
   // Attach a rejection observer immediately. Some mutants fail synchronously
   // after spawn; waiting until a later assertion to observe that promise makes
   // Node report an unhandled rejection and can crash the mutation worker.
@@ -45,7 +51,18 @@ function startInspection(child = new FakeChild()) {
     (value) => ({ status: 'fulfilled' as const, value }),
     (reason: unknown) => ({ status: 'rejected' as const, reason }),
   );
-  return { child, result };
+  // Probe listeners attach synchronously inside the spawn flow, so the probe
+  // can settle immediately. Queue the decoder child only when the probe will
+  // pass, so a rejected listing never leaves an unconsumed mock behind.
+  completeProbe(probe, probeListing);
+  if (probeListing === '0\n') {
+    spawnMock.mockReturnValueOnce(child);
+    activeChildren.push(child);
+  }
+  // The decoder then spawns in the following microtasks, which this flush
+  // awaits before returning the decoder child.
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  return { child, probe, result };
 }
 
 function completeSuccessfully(child: FakeChild): void {
@@ -55,7 +72,7 @@ function completeSuccessfully(child: FakeChild): void {
 }
 
 async function proveNextSlotIsUsable(): Promise<void> {
-  const { child, result } = startInspection();
+  const { child, result } = await startInspection();
   completeSuccessfully(child);
   await expect(result).resolves.toEqual({ status: 'fulfilled', value: true });
 }
@@ -102,9 +119,41 @@ describe('audio inspection concurrency', () => {
   });
 
   it('spawns the decoder with only the private descriptor and bounded security options', async () => {
-    const inspection = startInspection();
-    expect(spawnMock).toHaveBeenCalledOnce();
-    const [executable, args, options] = spawnMock.mock.calls[0] as [
+    const inspection = await startInspection();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    const [probeExecutable, probeArgs, probeOptions] = spawnMock.mock.calls[0] as [
+      string,
+      string[],
+      { env: NodeJS.ProcessEnv; shell: boolean; stdio: unknown[]; windowsHide: boolean },
+    ];
+    expect(probeExecutable).toBe(config.ffprobePath);
+    expect(probeArgs).toEqual([
+      '-hide_banner',
+      '-v',
+      'error',
+      '-probesize',
+      String(5 * 1024 * 1024),
+      '-analyzeduration',
+      String(5 * 1_000_000),
+      '-protocol_whitelist',
+      'fd',
+      '-format_whitelist',
+      'wav',
+      '-fd',
+      '3',
+      '-i',
+      'fd:',
+      '-select_streams',
+      'a',
+      '-show_entries',
+      'stream=index',
+      '-of',
+      'default=nokey=1:noprint_wrappers=1',
+    ]);
+    expect(probeArgs).not.toContain(filePath);
+    expect(probeOptions.stdio).toEqual(['ignore', 'pipe', 'pipe', expect.any(Number)]);
+
+    const [executable, args, options] = spawnMock.mock.calls[1] as [
       string,
       string[],
       { env: NodeJS.ProcessEnv; shell: boolean; stdio: unknown[]; windowsHide: boolean },
@@ -167,19 +216,19 @@ describe('audio inspection concurrency', () => {
   });
 
   it('fails fast before spawn at capacity and releases the slot after success', async () => {
-    const first = startInspection();
+    const first = await startInspection();
 
     await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
       status: 503,
       message: 'Audio inspection capacity busy',
       extra: { retryAfterSeconds: 2 },
     });
-    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
 
     completeSuccessfully(first.child);
     await expect(first.result).resolves.toEqual({ status: 'fulfilled', value: true });
     await proveNextSlotIsUsable();
-    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock).toHaveBeenCalledTimes(4);
   });
 
   it('releases the slot after a synchronous spawn failure', async () => {
@@ -208,14 +257,45 @@ describe('audio inspection concurrency', () => {
   });
 
   it('releases the slot after a child-process error', async () => {
-    const failed = startInspection();
+    const failed = await startInspection();
     failed.child.emit('error', new Error('child error'));
     await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 503 } });
     await proveNextSlotIsUsable();
   });
 
+  it('rejects multi-track media on the probed stream count without decoding', async () => {
+    // The multi-track invariant must not depend on muxer behavior (FFmpeg 8
+    // errors on multi-stream s16le, 6.1 decodes it): the ffprobe count alone
+    // fails the container closed and the decoder never spawns.
+    const rejected = await startInspection(new FakeChild(), '0\n1\n');
+    await expect(rejected.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(spawnMock).toHaveBeenCalledOnce();
+    await proveNextSlotIsUsable();
+  });
+
+  it('rejects an unparsable stream listing without decoding', async () => {
+    const rejected = await startInspection(new FakeChild(), 'not-a-stream-index\n');
+    await expect(rejected.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(spawnMock).toHaveBeenCalledOnce();
+    await proveNextSlotIsUsable();
+  });
+
+  it('maps a prober process error to unavailable without decoding', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+    probe.emit('error', new Error('missing ffprobe'));
+    await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 503 } });
+    expect(spawnMock).toHaveBeenCalledOnce();
+    await proveNextSlotIsUsable();
+  });
+
   it('releases the slot after a nonzero decoder exit', async () => {
-    const failed = startInspection();
+    const failed = await startInspection();
     failed.child.stdout.emit('data', Buffer.alloc(8_000 * 2));
     failed.child.emit('close', 1);
     await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
@@ -226,8 +306,9 @@ describe('audio inspection concurrency', () => {
     const originalPath = filePath;
     filePath = path.join(uploadsDir, `${randomUUID()}.m4a`);
     await fs.rename(originalPath, filePath);
-    const inspection = startInspection();
-    const [, args] = spawnMock.mock.calls[0] as [string, string[]];
+    const inspection = await startInspection();
+    // The decoder is the second spawn (the ffprobe stream count runs first).
+    const [, args] = spawnMock.mock.calls[1] as [string, string[]];
     const formatIndex = args.indexOf('-format_whitelist');
     expect(args.slice(formatIndex, formatIndex + 12)).toEqual([
       '-format_whitelist',
@@ -282,25 +363,26 @@ describe('audio inspection concurrency', () => {
     }
 
     await proveNextSlotIsUsable();
-    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
   });
 
-  it('closes the private descriptor only once even when closeSync throws', async () => {
+  it('closes each stage descriptor exactly once even when closeSync throws', async () => {
     const close = vi.spyOn(nodeFs, 'closeSync').mockImplementationOnce(() => {
       throw new Error('close failed');
     });
     try {
-      const inspection = startInspection();
+      const inspection = await startInspection();
       completeSuccessfully(inspection.child);
       await expect(inspection.result).resolves.toEqual({ status: 'fulfilled', value: true });
-      expect(close).toHaveBeenCalledOnce();
+      // One close per stage (probe, decoder); the throwing first close is tolerated.
+      expect(close).toHaveBeenCalledTimes(2);
     } finally {
       close.mockRestore();
     }
   });
 
   it('does not signal a decoder that is already marked as killed while settling', async () => {
-    const failed = startInspection();
+    const failed = await startInspection();
     failed.child.killed = true;
 
     failed.child.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
@@ -312,7 +394,7 @@ describe('audio inspection concurrency', () => {
   it('ignores repeated decoder terminal output after the first settlement', async () => {
     const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
     try {
-      const failed = startInspection();
+      const failed = await startInspection();
       failed.child.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
       await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
       expect(failed.child.kill).toHaveBeenCalledTimes(1);
@@ -328,12 +410,12 @@ describe('audio inspection concurrency', () => {
   });
 
   it('rejects diagnostic stderr only after the exact 64 KiB boundary is exceeded', async () => {
-    const accepted = startInspection();
+    const accepted = await startInspection();
     accepted.child.stderr.emit('data', Buffer.alloc(64 * 1024));
     completeSuccessfully(accepted.child);
     await expect(accepted.result).resolves.toEqual({ status: 'fulfilled', value: true });
 
-    const rejected = startInspection();
+    const rejected = await startInspection();
     rejected.child.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
     await expect(rejected.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
     expect(rejected.child.kill).toHaveBeenCalledWith('SIGKILL');
@@ -343,7 +425,7 @@ describe('audio inspection concurrency', () => {
     ['no decoded samples', Buffer.alloc(0)],
     ['an incomplete signed 16-bit sample', Buffer.alloc(1)],
   ])('rejects %s and releases the slot', async (_caseName, decoded) => {
-    const failed = startInspection();
+    const failed = await startInspection();
     if (decoded.length > 0) failed.child.stdout.emit('data', decoded);
     failed.child.emit('close', 0);
     await expect(failed.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
@@ -351,7 +433,7 @@ describe('audio inspection concurrency', () => {
   });
 
   it('kills and rejects decoded audio beyond the exact maximum', async () => {
-    const failed = startInspection();
+    const failed = await startInspection();
     failed.child.stdout.emit('data', Buffer.alloc(Math.floor(120.5 * 8_000 * 2) + 1));
     expect(failed.child.kill).toHaveBeenCalledWith('SIGKILL');
     failed.child.emit('close', null);
@@ -361,7 +443,7 @@ describe('audio inspection concurrency', () => {
 
   it('kills a timed-out decoder, settles immediately, and releases its slot', async () => {
     vi.useFakeTimers();
-    const timedOut = startInspection();
+    const timedOut = await startInspection();
     const rejection = expect(timedOut.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
 
     await vi.advanceTimersByTimeAsync(10_000);

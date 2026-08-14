@@ -28,6 +28,7 @@ const MANAGED_KEYS = [
   'AUDIO_INSPECTION_MAX_CONCURRENCY',
   'OPENAI_TIMEOUT_MS',
   'FFMPEG_PATH',
+  'FFPROBE_PATH',
   'RATE_LIMIT_GLOBAL_WINDOW_MS',
   'RATE_LIMIT_GLOBAL_MAX',
   'RATE_LIMIT_AUTH_WINDOW_MS',
@@ -121,6 +122,7 @@ describe('config env validation', () => {
     expect(config.audioInspectionMaxConcurrency).toBe(4);
     expect(config.openaiTimeoutMs).toBe(60_000);
     expect(config.ffmpegPath).toBe('ffmpeg');
+    expect(config.ffprobePath).toBe('ffprobe');
     expect(config.rateLimit).toEqual({
       globalWindowMs: 15 * 60 * 1000,
       globalMax: 300,
@@ -163,6 +165,7 @@ describe('config env validation', () => {
         AUDIO_INSPECTION_MAX_CONCURRENCY: '3',
         OPENAI_TIMEOUT_MS: '5000',
         FFMPEG_PATH: '/opt/tools/ffmpeg',
+        FFPROBE_PATH: '/opt/tools/ffprobe',
         RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS: '180000',
         RATE_LIMIT_LOGIN_ACCOUNT_MAX: '6',
         RATE_LIMIT_ASSESS_MAX: '4',
@@ -182,6 +185,7 @@ describe('config env validation', () => {
     expect(config.audioInspectionMaxConcurrency).toBe(3);
     expect(config.openaiTimeoutMs).toBe(5000);
     expect(config.ffmpegPath).toBe('/opt/tools/ffmpeg');
+    expect(config.ffprobePath).toBe('/opt/tools/ffprobe');
     expect(config.rateLimit.loginAccountWindowMs).toBe(180_000);
     expect(config.rateLimit.loginAccountMax).toBe(6);
     expect(config.rateLimit.assessMax).toBe(4);

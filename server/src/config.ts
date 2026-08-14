@@ -70,6 +70,7 @@ const envSchema = z
     AUDIO_INSPECTION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(4),
     OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).max(70_000).default(60_000),
     FFMPEG_PATH: z.string().trim().min(1).max(1024).default('ffmpeg'),
+    FFPROBE_PATH: z.string().trim().min(1).max(1024).default('ffprobe'),
     RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -255,6 +256,7 @@ export const config = {
   audioInspectionMaxConcurrency: env.AUDIO_INSPECTION_MAX_CONCURRENCY,
   openaiTimeoutMs: env.OPENAI_TIMEOUT_MS,
   ffmpegPath: env.FFMPEG_PATH,
+  ffprobePath: env.FFPROBE_PATH,
   rateLimit: {
     globalWindowMs: env.RATE_LIMIT_GLOBAL_WINDOW_MS,
     globalMax: env.RATE_LIMIT_GLOBAL_MAX,

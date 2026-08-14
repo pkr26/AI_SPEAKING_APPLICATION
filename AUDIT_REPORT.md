@@ -555,3 +555,24 @@ remediated in this pass.
   unchanged (raw `npm audit`: 22 — 15 high, 7 moderate, 0 critical).
 - Not run: full mutation campaign (`npm run mutation` in both packages) —
   recommended before release per the P0 sequence, since test files changed.
+
+## Post-push addendum — multi-track rejection made FFmpeg-version-proof
+
+CI (Ubuntu's FFmpeg 6.1.1) exposed that the second pass's multi-track
+fail-closed test passed on the host (FFmpeg 8.0) but not in CI: mapping every
+audio stream into a single raw-PCM muxer errors on FFmpeg 8 but silently
+decodes on 6.1 — and the production Alpine image ships 6.1.x, so the
+"multi-track containers fail closed" invariant did not hold in the
+production-like environment. The gate now counts audio streams with ffprobe
+(machine-readable `nokey/noprint` output over the same sandboxed `fd:`
+descriptor, bounded output, wall-clock deadline) and rejects anything but
+exactly one audio stream before any decode; two intermediate single-spawn
+alternatives were evaluated and rejected empirically (the CLI's automatic
+stream-selection fallback duplicates the first stream into an optional
+`0:a:1?` tripwire output, and negative mapping hard-errors on honest
+single-track files). Each stage opens its own descriptor because duplicated
+descriptors share the file offset. `FFPROBE_PATH` joins `FFMPEG_PATH` as a
+config knob (default `ffprobe`; both ship in the same package on Alpine,
+Debian/Ubuntu, and Homebrew). Regression coverage: probed multi-track count
+rejects without decoding, unparsable listings 415, prober process errors map
+to 503, plus the pre-existing real-fixture multi-track and elst tests.

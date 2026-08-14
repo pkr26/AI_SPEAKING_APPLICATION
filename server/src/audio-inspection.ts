@@ -14,6 +14,9 @@ const AVAILABILITY_TIMEOUT_MS = 2_000;
 const AVAILABILITY_SUCCESS_TTL_MS = 30_000;
 const AVAILABILITY_FAILURE_TTL_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+// One audio-stream index per line; anything beyond this is hostile, not a
+// long listing.
+const MAX_STREAM_LISTING_BYTES = 4 * 1024;
 const MAX_VERSION_BYTES = 16 * 1024;
 const DECODED_SAMPLE_RATE = 8_000;
 const DECODED_BYTES_PER_SAMPLE = 2;
@@ -89,60 +92,211 @@ class InspectionError extends Error {
  * probe/allocation/diagnostic sizes, disabled network protocols, and a hard
  * decoded-byte cutoff contain malformed-media resource use.
  *
- * `-map 0:a?` deliberately covers EVERY audio stream: the raw-PCM muxer
- * refuses more than one stream, so a multi-track container (whose uninspected
- * tracks would still be sent to the paid transcriber) fails closed instead of
- * passing a gate that only measured its first track.
+ * Before decoding, ffprobe counts the container's audio streams and anything
+ * but exactly one is rejected: an uninspected track would still be sent to
+ * the paid transcriber, and relying on the raw-PCM muxer to refuse multiple
+ * mapped streams is not version-independent (FFmpeg 8 errors, 6.1 decodes),
+ * while CLI map fallbacks can silently duplicate the first stream into a
+ * per-stream tripwire output. A machine-readable stream count is the only
+ * behavior-stable gate. With exactly one audio stream known to exist,
+ * `-map 0:a?` in the decoder decodes that single stream for measurement, so
+ * multi-stream muxer behavior is moot.
+ *
+ * Each stage opens its own descriptor: duplicated descriptors share the file
+ * offset, so the prober would otherwise leave the decoder at EOF. The upload
+ * directory is server-private (mode 0700), so a hostile swap between the two
+ * opens is not reachable; both opens still re-verify a regular file.
  */
-function inspectDecodedDuration(filePath: string): Promise<number> {
+async function inspectDecodedDuration(filePath: string): Promise<number> {
   const inputFormat = INPUT_FORMAT_BY_EXTENSION[path.extname(filePath).toLowerCase()];
-  if (!inputFormat) return Promise.reject(new InspectionError('invalid'));
+  if (!inputFormat) throw new InspectionError('invalid');
 
-  let inputFd: number | undefined;
-  const closeInput = () => {
-    if (inputFd === undefined) return;
-    const fd = inputFd;
-    // Mark closed before the syscall so even an exceptional close remains
-    // idempotent and can never act on a later descriptor reuse.
-    inputFd = undefined;
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // The child has its own duplicate after spawn; this is best-effort.
-    }
-  };
+  // MOV's external data references are disabled by default; passing the
+  // options explicitly makes that security boundary resilient to defaults
+  // changing in a future FFmpeg release. `-ignore_editlist 1` makes the
+  // decode cover the container's full audio payload: the default edit-list
+  // handling would let a forged elst atom shrink the presented window (and
+  // with it this gate's measured duration) while every sample still ships
+  // to the paid transcriber.
+  const movSafetyOptions =
+    inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0', '-ignore_editlist', '1'] : [];
+
+  const audioStreamCount = await probeAudioStreamCount(filePath, inputFormat, movSafetyOptions);
+  if (audioStreamCount !== 1) throw new InspectionError('invalid');
+  return decodeMeasuredDuration(filePath, inputFormat, movSafetyOptions);
+}
+
+/**
+ * Open the private upload for one native stage. A FIFO or blocking device
+ * node wedges the whole event loop inside openSync until a writer appears,
+ * before O_NOFOLLOW or fstat could run, so reject non-regular files up front.
+ * The post-open fstat stays as defense in depth: it verifies the object
+ * actually opened. Unlike stdin the descriptor remains seekable for ordinary
+ * tail-moov MP4/M4A files; unlike `file`, FFmpeg has no protocol capable of
+ * opening another local path from hostile metadata.
+ */
+function openPrivateInput(filePath: string): number {
+  let fd: number | undefined;
   try {
-    // A FIFO or blocking device node wedges the whole event loop inside
-    // openSync until a writer appears, before O_NOFOLLOW or fstat could run,
-    // so reject non-regular files up front. The post-open fstat stays as
-    // defense in depth: it verifies the object actually opened.
     if (!fs.lstatSync(filePath).isFile()) {
-      return Promise.reject(new InspectionError('invalid'));
+      throw new InspectionError('invalid');
     }
-    // Open the private upload ourselves, refuse a final-component symlink, and
-    // hand FFmpeg only this already-open descriptor. Unlike stdin this remains
-    // seekable for ordinary tail-moov MP4/M4A files; unlike `file`, FFmpeg has
-    // no protocol capable of opening another local path from hostile metadata.
-    inputFd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-    if (!fs.fstatSync(inputFd).isFile()) {
-      closeInput();
-      return Promise.reject(new InspectionError('invalid'));
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    if (!fs.fstatSync(fd).isFile()) {
+      throw new InspectionError('invalid');
     }
-  } catch {
-    closeInput();
-    return Promise.reject(new InspectionError('invalid'));
+    const opened = fd;
+    fd = undefined;
+    return opened;
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Best-effort cleanup on the failure path.
+      }
+    }
+    throw error instanceof InspectionError ? error : new InspectionError('invalid');
   }
+}
 
+/**
+ * Count the container's audio streams with ffprobe over an already-open
+ * private descriptor. Header-only and machine-readable (`nokey/noprint`
+ * prints one stream index per line), with the same sandboxing as the decoder:
+ * allowlisted demuxer/protocol, bounded probe window, capped output, and a
+ * wall-clock deadline. A missing/unstartable ffprobe is 'unavailable' (the
+ * caller maps it to 503); anything unparsable is 'invalid'.
+ */
+function probeAudioStreamCount(filePath: string, inputFormat: string, movSafetyOptions: string[]): Promise<number> {
   return new Promise((resolve, reject) => {
-    // MOV's external data references are disabled by default; passing the
-    // options explicitly makes that security boundary resilient to defaults
-    // changing in a future FFmpeg release. `-ignore_editlist 1` makes the
-    // decode cover the container's full audio payload: the default edit-list
-    // handling would let a forged elst atom shrink the presented window (and
-    // with it this gate's measured duration) while every sample still ships
-    // to the paid transcriber.
-    const movSafetyOptions =
-      inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0', '-ignore_editlist', '1'] : [];
+    let inputFd: number;
+    try {
+      inputFd = openPrivateInput(filePath);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const closeInput = () => {
+      try {
+        fs.closeSync(inputFd);
+      } catch {
+        // The child has its own duplicate after spawn; this is best-effort.
+      }
+    };
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(
+        config.ffprobePath,
+        [
+          '-hide_banner',
+          '-v',
+          'error',
+          '-probesize',
+          String(5 * 1024 * 1024),
+          '-analyzeduration',
+          String(5 * 1_000_000),
+          '-protocol_whitelist',
+          'fd',
+          '-format_whitelist',
+          inputFormat,
+          ...movSafetyOptions,
+          '-fd',
+          '3',
+          '-i',
+          'fd:',
+          '-select_streams',
+          'a',
+          '-show_entries',
+          'stream=index',
+          '-of',
+          'default=nokey=1:noprint_wrappers=1',
+        ],
+        {
+          env: INSPECTOR_ENV,
+          stdio: ['ignore', 'pipe', 'pipe', inputFd],
+          windowsHide: true,
+          shell: false,
+        },
+      );
+    } catch {
+      closeInput();
+      reject(new InspectionError('unavailable'));
+      return;
+    }
+    // spawn(2) duplicated the descriptor into the child before returning.
+    closeInput();
+
+    let settled = false;
+    let listingBytes = 0;
+    let diagnosticBytes = 0;
+    let listing = '';
+    const finish = (result: number | InspectionError) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (!child.killed) child.kill('SIGKILL');
+      if (result instanceof InspectionError) reject(result);
+      else resolve(result);
+    };
+    const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
+    timeout.unref();
+
+    child.stdout!.on('data', (chunk: Buffer) => {
+      listingBytes += chunk.length;
+      // One line per audio stream; far more lines than any honest container
+      // can hold means hostile media, not a long listing.
+      if (listingBytes > MAX_STREAM_LISTING_BYTES) {
+        finish(new InspectionError('invalid'));
+        return;
+      }
+      listing += chunk.toString('utf8');
+    });
+    child.stderr!.on('data', (chunk: Buffer) => {
+      diagnosticBytes += chunk.length;
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InspectionError('invalid'));
+    });
+    child.once('error', () => {
+      // A ChildProcess error here is an inability to start/control the
+      // configured prober, not evidence that the learner's media is bad.
+      finish(new InspectionError('unavailable'));
+    });
+    child.once('close', (code) => {
+      if (settled) return;
+      if (code !== 0) {
+        finish(new InspectionError('invalid'));
+        return;
+      }
+      const lines = listing
+        .trim()
+        .split('\n')
+        .filter((line) => line !== '');
+      if (!lines.every((line) => /^\d+$/.test(line))) {
+        finish(new InspectionError('invalid'));
+        return;
+      }
+      finish(lines.length);
+    });
+  });
+}
+
+/** Decode the single known audio stream and measure it by counted PCM bytes. */
+function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafetyOptions: string[]): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let inputFd: number;
+    try {
+      inputFd = openPrivateInput(filePath);
+    } catch (error) {
+      reject(error);
+      return;
+    }
+    const closeInput = () => {
+      try {
+        fs.closeSync(inputFd);
+      } catch {
+        // The child has its own duplicate after spawn; this is best-effort.
+      }
+    };
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(
@@ -172,8 +326,7 @@ function inspectDecodedDuration(filePath: string): Promise<number> {
           '3',
           '-i',
           'fd:',
-          // Map every audio stream: a single-stream PCM muxer then rejects
-          // multi-track containers outright (see the function docstring).
+          // The probe above has already proven exactly one audio stream.
           '-map',
           '0:a?',
           '-vn',

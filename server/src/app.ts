@@ -9,7 +9,8 @@ import { config } from './config';
 import { createDiagnosticRouter } from './diagnostic';
 import { httpLogger, logger } from './logger';
 import { getAssessmentRequestStatus } from './idempotency';
-import { AuthedRequest, errorHandler, h, HttpError, requireAuth, validate } from './middleware';
+import { httpMetricsMiddleware, registry } from './metrics';
+import { AuthedRequest, clientVersionGate, errorHandler, h, HttpError, requireAuth, validate } from './middleware';
 import { z } from 'zod';
 import { createPracticeRouter } from './practice';
 import { buildLimiters } from './rate-limit';
@@ -32,6 +33,9 @@ export function createApp({
 
   app.use(helmet());
   app.use(httpLogger);
+  // Time every request (including limiter/gate rejections) with bounded route
+  // labels; see metrics.ts for the label contract.
+  app.use(httpMetricsMiddleware);
 
   // Allowlist CORS: requests without an Origin header (mobile apps, curl)
   // pass; browser origins must be listed in CORS_ORIGINS. No credentials.
@@ -46,6 +50,10 @@ export function createApp({
     }),
   );
 
+  // Outdated clients (per MIN_CLIENT_VERSION) get a cheap, deterministic 426
+  // before any budget or parsing work; probes and version-less clients pass.
+  app.use(clientVersionGate);
+
   const limiters = buildLimiters();
 
   // Liveness stays cheap and independent of external services.
@@ -56,9 +64,26 @@ export function createApp({
       res.json({ ok: true });
     } catch (err) {
       logger.error({ err }, 'readiness dependency check failed');
-      res.status(503).json({ ok: false, error: 'required service dependency unavailable' });
+      res.status(503).json({ ok: false, error: 'required service dependency unavailable', code: 'INTERNAL' });
     }
   });
+
+  // Prometheus scrape endpoint, resolved at app build time (tests flip
+  // config.metricsEnabled before creating the app). Disabled deployments fall
+  // through to the terminal JSON 404 below. Mounted with /health and /ready,
+  // before the global limiter, so a private scraper cannot be starved by a
+  // saturated per-IP budget; METRICS_ENABLED deployments must only expose the
+  // route to a private scrape network.
+  if (config.metricsEnabled) {
+    app.get(
+      '/metrics',
+      h(async (_req, res) => {
+        res.set('Cache-Control', 'no-store');
+        res.set('Content-Type', registry.contentType);
+        res.send(await registry.metrics());
+      }),
+    );
+  }
 
   // Credential routes are throttled before JSON parsing/bcrypt work. Logout is
   // deliberately excluded: an authenticated learner must always be able to
@@ -69,6 +94,12 @@ export function createApp({
   app.use('/auth/register', limiters.register);
   app.use('/auth/change-password', limiters.auth);
   app.use('/auth/account', limiters.auth);
+  // Password-reset routes are unauthenticated credential surfaces: the same
+  // per-IP budget bounds token minting, mail fan-out, and code guessing. The
+  // additional per-target-email budget lives on the route (it needs the
+  // parsed body).
+  app.use('/auth/forgot-password', limiters.auth);
+  app.use('/auth/reset-password', limiters.auth);
 
   // Reject over-budget requests before compression/body parsing allocates work.
   app.use(limiters.global);
@@ -97,7 +128,7 @@ export function createApp({
   app.use('/practice', createPracticeRouter(limiters));
   app.use('/uploads', createAudioUploadRouter(limiters));
 
-  app.use((_req, res) => res.status(404).json({ error: 'Not found' }));
+  app.use((_req, res) => res.status(404).json({ error: 'Not found', code: 'NOT_FOUND' }));
   app.use(errorHandler);
 
   return app;

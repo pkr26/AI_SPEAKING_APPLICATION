@@ -15,11 +15,21 @@ concurrency:
 
 jobs:
   server:
+    name: server (postgres ${{ matrix.postgres-version }})
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Oldest supported (schema targets PostgreSQL 14+) and current major.
+        include:
+          - postgres-version: "14"
+            postgres-image: postgres:14.19-alpine@sha256:cb54bb67c0fca8b439f18c1daadb315ad67de1faf8c387988c63080d15a54145
+          - postgres-version: "18"
+            postgres-image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
     services:
       postgres:
-        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        image: ${{ matrix.postgres-image }}
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
@@ -91,6 +101,21 @@ jobs:
           RATE_LIMIT_REGISTER_MAX: "100000"
           RATE_LIMIT_ASSESS_MAX: "100000"
           RATE_LIMIT_UPLOAD_GRANT_MAX: "100000"
+
+  server-docker:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Build-only (no push): catches Dockerfile/runtime-image regressions on
+      # every change instead of at release time.
+      - name: Build server image
+        run: docker build --file server/Dockerfile --tag ai-english-server:ci server
+      - name: Exercise container liveness healthcheck command
+        run: |
+          docker run --rm --entrypoint node ai-english-server:ci --version
 
   app:
     runs-on: ubuntu-24.04

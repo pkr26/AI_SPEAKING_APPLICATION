@@ -69,14 +69,68 @@ const envSchema = z
     AI_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(100).default(10),
     AUDIO_INSPECTION_MAX_CONCURRENCY: z.coerce.number().int().min(1).max(32).default(4),
     OPENAI_TIMEOUT_MS: z.coerce.number().int().min(1000).max(70_000).default(60_000),
+    // Structured-output transcript grader. Kept in config so a model
+    // deprecation is an env change, not a code release.
+    GRADING_MODEL: z.string().trim().min(1).max(128).default('gpt-4o-mini-2024-07-18'),
+    // Graceful-shutdown drain budget. The default sits above the 130s
+    // worst-case request budget (S3 download + provider deadline + ingress
+    // margin, see index.ts requestTimeout) so a deploy never socket-kills the
+    // slowest legitimate assessment.
+    SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(10_000).max(300_000).default(140_000),
+    // Prometheus endpoint gate. Off by default: GET /metrics exposes
+    // operational detail (routes, latencies, provider error rates) and must
+    // only be scraped from a private network when enabled (404 when off).
+    METRICS_ENABLED: bool(false),
+    // Oldest app version the API still answers ("1.2.3"); empty disables the
+    // X-Client-Version gate. Response contracts are additive-only, so this is
+    // for retiring clients that predate a required behavior, not routine use.
+    MIN_CLIENT_VERSION: z
+      .string()
+      .trim()
+      .default('')
+      .refine((value) => value === '' || /^\d{1,9}(\.\d{1,9}){0,2}$/.test(value), {
+        message: "must be a dotted numeric version like '1.2.3' (or empty to disable the client gate)",
+      }),
     FFMPEG_PATH: z.string().trim().min(1).max(1024).default('ffmpeg'),
     FFPROBE_PATH: z.string().trim().min(1).max(1024).default('ffprobe'),
+    // Password-reset delivery. 'log' (default) writes the mail to the info log
+    // for dev/manual delivery; 'webhook' POSTs {to, subject, text} to
+    // MAIL_WEBHOOK_URL so an external relay owns the actual sending.
+    MAIL_MODE: z
+      .enum(['log', 'webhook'], {
+        errorMap: () => ({ message: "must be 'log' or 'webhook'" }),
+      })
+      .default('log'),
+    MAIL_WEBHOOK_URL: z
+      .string()
+      .trim()
+      .max(2048)
+      .default('')
+      .refine((value) => {
+        if (value === '') return true;
+        try {
+          const url = new URL(value);
+          return url.protocol === 'http:' || url.protocol === 'https:';
+        } catch {
+          return false;
+        }
+      }, 'must be an http(s) URL (or empty when MAIL_MODE=log)'),
     RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce
       .number()
       .int()
       .min(1000)
       .default(15 * 60 * 1000),
     RATE_LIMIT_GLOBAL_MAX: z.coerce.number().int().min(1).default(300),
+    // Counter store for the coarse global per-IP flood brake. 'memory'
+    // (default) keeps it in-process: RATE_LIMIT_GLOBAL_MAX becomes a
+    // per-replica budget and no database row is written per client IP.
+    // 'postgres' shares one cluster-wide budget through the shared store.
+    // Security-sensitive limiters always stay PostgreSQL-backed.
+    RATE_LIMIT_GLOBAL_STORE: z
+      .enum(['memory', 'postgres'], {
+        errorMap: () => ({ message: "must be 'memory' or 'postgres'" }),
+      })
+      .default('memory'),
     RATE_LIMIT_AUTH_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -107,6 +161,17 @@ const envSchema = z
       .max(86_400_000)
       .default(60 * 60 * 1000),
     RATE_LIMIT_REGISTER_MAX: z.coerce.number().int().min(1).max(100_000).default(10),
+    // Per-target-email budget for password-reset requests: bounds mailbox spam
+    // and token churn against one address across source IPs. Over-budget
+    // requests still answer 204 (the route silently skips issuing/sending), so
+    // the response never becomes an existence or throttling oracle.
+    RATE_LIMIT_FORGOT_EMAIL_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(60 * 60 * 1000),
+    RATE_LIMIT_FORGOT_EMAIL_MAX: z.coerce.number().int().min(1).max(100_000).default(5),
     RATE_LIMIT_ASSESS_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -148,6 +213,13 @@ const envSchema = z
       } catch {
         // The field-level URL issue is more specific.
       }
+    }
+    if (env.MAIL_MODE === 'webhook' && !env.MAIL_WEBHOOK_URL) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MAIL_WEBHOOK_URL'],
+        message: 'is required when MAIL_MODE=webhook',
+      });
     }
     if (!env.MOCK_AI && !env.OPENAI_API_KEY) {
       ctx.addIssue({
@@ -255,11 +327,16 @@ export const config = {
   aiMaxConcurrency: env.AI_MAX_CONCURRENCY,
   audioInspectionMaxConcurrency: env.AUDIO_INSPECTION_MAX_CONCURRENCY,
   openaiTimeoutMs: env.OPENAI_TIMEOUT_MS,
+  gradingModel: env.GRADING_MODEL,
+  shutdownDrainMs: env.SHUTDOWN_DRAIN_MS,
+  metricsEnabled: env.METRICS_ENABLED,
+  minClientVersion: env.MIN_CLIENT_VERSION || undefined,
   ffmpegPath: env.FFMPEG_PATH,
   ffprobePath: env.FFPROBE_PATH,
   rateLimit: {
     globalWindowMs: env.RATE_LIMIT_GLOBAL_WINDOW_MS,
     globalMax: env.RATE_LIMIT_GLOBAL_MAX,
+    globalStore: env.RATE_LIMIT_GLOBAL_STORE,
     authWindowMs: env.RATE_LIMIT_AUTH_WINDOW_MS,
     authMax: env.RATE_LIMIT_AUTH_MAX,
     loginAccountWindowMs: env.RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS,
@@ -268,10 +345,16 @@ export const config = {
     passwordMax: env.RATE_LIMIT_PASSWORD_MAX,
     registerWindowMs: env.RATE_LIMIT_REGISTER_WINDOW_MS,
     registerMax: env.RATE_LIMIT_REGISTER_MAX,
+    forgotEmailWindowMs: env.RATE_LIMIT_FORGOT_EMAIL_WINDOW_MS,
+    forgotEmailMax: env.RATE_LIMIT_FORGOT_EMAIL_MAX,
     assessWindowMs: env.RATE_LIMIT_ASSESS_WINDOW_MS,
     assessMax: env.RATE_LIMIT_ASSESS_MAX,
     uploadGrantWindowMs: env.RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS,
     uploadGrantMax: env.RATE_LIMIT_UPLOAD_GRANT_MAX,
+  },
+  mail: {
+    mode: env.MAIL_MODE,
+    webhookUrl: env.MAIL_WEBHOOK_URL,
   },
   mockAi: env.MOCK_AI,
   openaiApiKey: env.OPENAI_API_KEY,

@@ -283,12 +283,18 @@ describe('practice stuck cases', () => {
       expect((await send('/practice/attempt', englishRequestId)).status).toBe(200);
       const wrongNativeReplay = await send('/practice/attempt/native', englishRequestId);
       expect(wrongNativeReplay.status).toBe(409);
-      expect(wrongNativeReplay.body).toEqual({ error: 'Assessment request identifier was already used' });
+      expect(wrongNativeReplay.body).toEqual({
+        error: 'Assessment request identifier was already used',
+        code: 'REQUEST_ID_REUSED',
+      });
 
       expect((await send('/practice/attempt/native', nativeRequestId)).status).toBe(200);
       const wrongEnglishReplay = await send('/practice/attempt', nativeRequestId);
       expect(wrongEnglishReplay.status).toBe(409);
-      expect(wrongEnglishReplay.body).toEqual({ error: 'Assessment request identifier was already used' });
+      expect(wrongEnglishReplay.body).toEqual({
+        error: 'Assessment request identifier was already used',
+        code: 'REQUEST_ID_REUSED',
+      });
 
       const nativeStatus = await request(a)
         .get(`/assessments/${nativeRequestId}`)
@@ -316,7 +322,7 @@ describe('practice stuck cases', () => {
         other.rows[0].id,
       );
       expect(foreign.status).toBe(403);
-      expect(foreign.body).toEqual({ error: 'Question is not available at your level' });
+      expect(foreign.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
 
       const missing = await answerForm(
         request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
@@ -343,7 +349,7 @@ describe('practice stuck cases', () => {
         .field('requestId', randomUUID());
 
       expect(r.status).toBe(400);
-      expect(r.body).toEqual({ error: 'audio file is required' });
+      expect(r.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
       expect(nativeMock).not.toHaveBeenCalled();
     });
   });

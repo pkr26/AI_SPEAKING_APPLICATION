@@ -87,7 +87,7 @@ describe('practice eligibility state', () => {
     const response = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
     expect(response.status).toBe(403);
-    expect(response.body).toEqual({ error: 'Diagnostic not completed' });
+    expect(response.body).toEqual({ error: 'Diagnostic not completed', code: 'FORBIDDEN' });
   });
 });
 
@@ -131,7 +131,7 @@ describe('diagnostic failure cleanup', () => {
         const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
 
         expect(response.status).toBe(500);
-        expect(response.body).toEqual({ error: 'Internal server error' });
+        expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
         expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
         const state = await pool.query(
           `SELECT current_question_id, processing_question_id, processing_started_at, processing_claim_id
@@ -219,7 +219,7 @@ describe('diagnostic failure cleanup', () => {
           const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
 
           expect(response.status).toBe(500);
-          expect(response.body).toEqual({ error: 'Internal server error' });
+          expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
           const state = await pool.query<{ processing_claim_id: string }>(
             'SELECT processing_claim_id FROM diagnostic_state WHERE user_id = $1',
             [userId],
@@ -288,7 +288,7 @@ describe('diagnostic failure cleanup', () => {
           .field('requestId', requestId);
 
         expect(response.status).toBe(400);
-        expect(response.body).toEqual({ error: 'audio file is required' });
+        expect(response.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
         const audit = await pool.query<{ calls: number }>(`SELECT calls FROM ${auditTable}`);
         expect(audit.rows[0].calls).toBe(0);
         expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
@@ -415,7 +415,7 @@ describe('diagnostic failure cleanup', () => {
           const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
 
           expect(response.status).toBe(500);
-          expect(response.body).toEqual({ error: 'No questions available for this level' });
+          expect(response.body).toEqual({ error: 'No questions available for this level', code: 'INTERNAL' });
           expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
         },
       );
@@ -462,7 +462,7 @@ describe('diagnostic question availability', () => {
         const response = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
 
         expect(response.status).toBe(500);
-        expect(response.body).toEqual({ error: 'No questions available for this level' });
+        expect(response.body).toEqual({ error: 'No questions available for this level', code: 'INTERNAL' });
       },
     );
   });
@@ -515,7 +515,7 @@ describe('diagnostic finalization ownership', () => {
         const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
 
         expect(response.status).toBe(409);
-        expect(response.body).toEqual({ error: 'Assessment state changed; please try again' });
+        expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
         expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
         const state = await pool.query<{
           current_question_id: string | null;
@@ -601,7 +601,7 @@ describe('diagnostic finalization ownership', () => {
         const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
 
         expect(response.status).toBe(409);
-        expect(response.body).toEqual({ error: 'Assessment state changed; please try again' });
+        expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
         expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
         const state = await pool.query<{
           current_question_id: string | null;
@@ -699,7 +699,7 @@ describe('practice finalization and cleanup', () => {
         const response = await fixedRequestForm('/practice/attempt', token, questionId, requestId);
 
         expect(response.status).toBe(409);
-        expect(response.body).toEqual({ error: 'Assessment state changed; please try again' });
+        expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
         expect(await routeArtifacts(userId, requestId, 'practice')).toEqual({ attempts: 0, requests: 0 });
         const inflight = await pool.query(
           'SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1 AND question_id = $2',

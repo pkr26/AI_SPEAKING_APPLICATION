@@ -69,6 +69,104 @@ describe('database content seeding', () => {
   });
 });
 
+describe('migration 010 invariants', () => {
+  it('restricts question deletion while attempts reference it (no cascade data loss)', async () => {
+    const email = `restrict_${randomUUID()}@example.com`;
+    const user = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('Restrict Test', $1, 'not-used', 'te') RETURNING id`,
+      [email],
+    );
+    const question = await pool.query<{ id: string }>(
+      `SELECT id FROM questions WHERE cefr_level = 'A1' AND prompt_word = 'family'`,
+    );
+    await pool.query(
+      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
+       VALUES ($1, $2, 'practice', 1, 'hello', 80, true, 'good')`,
+      [user.rows[0].id, question.rows[0].id],
+    );
+
+    await expect(pool.query('DELETE FROM questions WHERE id = $1', [question.rows[0].id])).rejects.toMatchObject({
+      code: '23503', // foreign_key_violation: attempts history survives content ops
+    });
+    await pool.query('DELETE FROM users WHERE id = $1', [user.rows[0].id]);
+  });
+
+  it('defaults SRS columns for new progress rows and bounds the interval index', async () => {
+    const email = `srs_${randomUUID()}@example.com`;
+    const user = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('SRS Test', $1, 'not-used', 'te') RETURNING id`,
+      [email],
+    );
+    const question = await pool.query<{ id: string }>(`SELECT id FROM questions WHERE cefr_level = 'A1' LIMIT 1`);
+    const userId = user.rows[0].id;
+    const questionId = question.rows[0].id;
+
+    // Skip rows carry zero attempts; the relaxed CHECK must admit them while
+    // the SRS columns pick up their schema defaults.
+    const inserted = await pool.query<{ srs_interval_index: number; due_now: boolean; skipped_until: string | null }>(
+      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count)
+       VALUES ($1, $2, 'learning', 0, 0)
+       RETURNING srs_interval_index, due_at <= now() AS due_now, skipped_until`,
+      [userId, questionId],
+    );
+    expect(inserted.rows[0]).toEqual({ srs_interval_index: 0, due_now: true, skipped_until: null });
+
+    await expect(
+      pool.query(`UPDATE practice_progress SET srs_interval_index = 9 WHERE user_id = $1`, [userId]),
+    ).rejects.toMatchObject({ code: '23514' }); // check_violation: index clamps at 8
+    await expect(
+      pool.query(`UPDATE practice_progress SET attempt_count = -1 WHERE user_id = $1`, [userId]),
+    ).rejects.toMatchObject({ code: '23514' }); // relaxed to >= 0, not unbounded
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+  });
+
+  it('stores one lowercase-hex reset token per user and cascades with the account', async () => {
+    const email = `reset_${randomUUID()}@example.com`;
+    const user = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('Reset Test', $1, 'not-used', 'te') RETURNING id`,
+      [email],
+    );
+    const userId = user.rows[0].id;
+    const tokenHash = 'a'.repeat(64);
+
+    await pool.query(
+      `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+       VALUES ($1, $2, now() + interval '30 minutes')`,
+      [userId, tokenHash],
+    );
+    // One active token per user: a second request must upsert, not accumulate.
+    await expect(
+      pool.query(
+        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, $2, now() + interval '30 minutes')`,
+        [userId, 'b'.repeat(64)],
+      ),
+    ).rejects.toMatchObject({ code: '23505' }); // unique_violation on the PK
+    await expect(
+      pool.query(`UPDATE password_reset_tokens SET token_hash = $2 WHERE user_id = $1`, [userId, 'Z'.repeat(64)]),
+    ).rejects.toMatchObject({ code: '23514' }); // only lowercase sha256 hex is storable
+
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    const remaining = await pool.query('SELECT 1 FROM password_reset_tokens WHERE user_id = $1', [userId]);
+    expect(remaining.rowCount).toBe(0);
+  });
+
+  it('tunes autovacuum and fillfactor on the hot upsert tables', async () => {
+    const { rows } = await pool.query<{ relname: string; reloptions: string[] | null }>(
+      `SELECT relname, reloptions FROM pg_class
+       WHERE relname IN ('practice_progress', 'rate_limit_windows')
+       ORDER BY relname`,
+    );
+    expect(rows).toEqual([
+      { relname: 'practice_progress', reloptions: ['autovacuum_vacuum_scale_factor=0.01', 'fillfactor=80'] },
+      { relname: 'rate_limit_windows', reloptions: ['autovacuum_vacuum_scale_factor=0.01', 'fillfactor=80'] },
+    ]);
+  });
+});
+
 describe('migration integrity', () => {
   it('rejects edits to an already-applied migration', async () => {
     const name = '001_init.sql';

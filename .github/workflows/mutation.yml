@@ -1,0 +1,76 @@
+name: mutation
+
+on:
+  schedule:
+    # Weekly: the full server mutation campaign is far too slow for every push.
+    - cron: "17 3 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  server:
+    runs-on: ubuntu-24.04
+    # Stryker runs the integration suite per mutant at concurrency 1; give the
+    # campaign the full job budget and report whatever it produced.
+    timeout-minutes: 360
+    services:
+      postgres:
+        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: server
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_english
+      JWT_SECRET: ci-jwt-secret-0123456789abcdef0123456789abcdef
+      MOCK_AI: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - name: Verify media inspector dependency
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install --yes ffmpeg
+          fi
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+      # Advisory only: a below-threshold score should surface in the report
+      # artifact for review, not block the scheduled run from uploading it.
+      - name: Run server mutation campaign
+        continue-on-error: true
+        run: npm run mutation
+        env:
+          # The guard requires a dedicated loopback database whose name contains
+          # "mutation", ends in "_test", and differs from the app/test DBs.
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_english_mutation_test
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: server-mutation-report
+          path: server/reports/mutation/
+          if-no-files-found: warn
+          retention-days: 30

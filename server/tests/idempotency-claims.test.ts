@@ -27,11 +27,12 @@ describe('claimAssessmentRequest ownership and replay', () => {
   });
 
   it('preserves the in-flight subtype name for diagnostics', () => {
-    const error = new AssessmentRequestInFlightError('Assessment is still processing', {
+    const error = new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
       retryAfterSeconds: 2,
     });
 
     expect(error.name).toBe('AssessmentRequestInFlightError');
+    expect(error.code).toBe('REQUEST_IN_FLIGHT');
   });
 
   it('rejects reuse of the same requestId for a different question or context', async () => {

@@ -73,7 +73,7 @@ export const upload = multer({
     if (ext in AUDIO_TYPES && mime && AUDIO_TYPES[ext].includes(mime)) {
       return cb(null, true);
     }
-    cb(new HttpError(415, 'Unsupported audio filename or media type'));
+    cb(new HttpError(415, 'Unsupported audio filename or media type', 'AUDIO_INVALID'));
   },
 });
 
@@ -175,7 +175,7 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
 
   if (!is) {
     await fsPromises.unlink(filePath).catch(() => {});
-    throw new HttpError(415, 'Invalid audio file');
+    throw new HttpError(415, 'Invalid audio file', 'AUDIO_INVALID');
   }
   return true;
 }

@@ -75,7 +75,7 @@ describe('practice', () => {
       const response = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(500);
-      expect(response.body).toEqual({ error: 'No questions available for this level' });
+      expect(response.body).toEqual({ error: 'No questions available for this level', code: 'INTERNAL' });
     } finally {
       if (catalogMoved) {
         const restored = await pool.query(
@@ -130,7 +130,7 @@ describe('practice', () => {
       .get('/practice/question/00000000-0000-0000-0000-000000000000/help')
       .set('Authorization', `Bearer ${token}`);
     expect(missing.status).toBe(404);
-    expect(missing.body).toEqual({ error: 'Question not found' });
+    expect(missing.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
   });
 
   it('help returns the exact 404 contract when the learner translation is missing', async () => {
@@ -150,7 +150,12 @@ describe('practice', () => {
     const originalQuery = pool.query.bind(pool);
     vi.spyOn(pool, 'query').mockImplementation(((...args: unknown[]) => {
       const [text, values] = args;
-      if (text === 'SELECT * FROM questions WHERE id = $1' && Array.isArray(values) && values[0] === questionId) {
+      if (
+        typeof text === 'string' &&
+        text.includes('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1') &&
+        Array.isArray(values) &&
+        values[0] === questionId
+      ) {
         return Promise.resolve({ rows: [malformedQuestion] });
       }
       return Reflect.apply(originalQuery, undefined, args);
@@ -161,7 +166,7 @@ describe('practice', () => {
       .set('Authorization', `Bearer ${token}`);
 
     expect(response.status).toBe(404);
-    expect(response.body).toEqual({ error: 'Translation not available for this question' });
+    expect(response.body).toEqual({ error: 'Translation not available for this question', code: 'NOT_FOUND' });
   });
 
   it('POST /attempt without audio returns 400', async () => {
@@ -180,7 +185,7 @@ describe('practice', () => {
       .field('questionId', question.rows[0].id)
       .field('requestId', requestId);
     expect(r.status).toBe(400);
-    expect(r.body).toEqual({ error: 'audio file is required' });
+    expect(r.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
     const claims = await pool.query(
       'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
       [userId, requestId],
@@ -251,7 +256,7 @@ describe('practice', () => {
     // A multipart content type without a boundary parameter.
     const noBoundary = await postRaw('multipart/form-data', 'garbage');
     expect(noBoundary.status).toBe(400);
-    expect(noBoundary.body).toEqual({ error: 'Malformed multipart body' });
+    expect(noBoundary.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     // A form that opens a part but never sends the closing boundary.
     const truncated = await postRaw(
@@ -259,7 +264,7 @@ describe('practice', () => {
       '--abc\r\nContent-Disposition: form-data; name="questionId"\r\n\r\n9f1badb5',
     );
     expect(truncated.status).toBe(400);
-    expect(truncated.body).toEqual({ error: 'Malformed multipart body' });
+    expect(truncated.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     // A NUL byte inside the file part's filename header.
     const nulFilename = await postRaw(
@@ -273,7 +278,7 @@ describe('practice', () => {
       ]),
     );
     expect(nulFilename.status).toBe(400);
-    expect(nulFilename.body).toEqual({ error: 'Malformed multipart body' });
+    expect(nulFilename.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);
   });
@@ -341,14 +346,14 @@ describe('practice', () => {
 
     const help = await request(a).get(`/practice/question/${questionId}/help`).set('Authorization', `Bearer ${token}`);
     expect(help.status).toBe(403);
-    expect(help.body).toEqual({ error: 'Question is not available at your level' });
+    expect(help.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
 
     const attempt = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
     );
     expect(attempt.status).toBe(403);
-    expect(attempt.body).toEqual({ error: 'Question is not available at your level' });
+    expect(attempt.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
   });
 
   it('POST /attempt with a text file renamed .m4a returns 415', async () => {
@@ -396,12 +401,52 @@ describe('practice', () => {
         .field('requestId', requestId);
 
       expect(response.status).toBe(409);
-      expect(response.body).toEqual({ error: 'An assessment is already in progress for this question' });
+      expect(response.body).toEqual({
+        error: 'An assessment is already in progress for this question',
+        code: 'ASSESSMENT_IN_PROGRESS',
+      });
       const requests = await pool.query(
         'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
         [userId, requestId],
       );
       expect(requests.rows[0].count).toBe(0);
+      const inflight = await pool.query<{ claim_id: string }>(
+        'SELECT claim_id FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
+        [userId, questionId],
+      );
+      expect(inflight.rows).toEqual([{ claim_id: existingClaimId }]);
+    } finally {
+      await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
+    }
+  });
+
+  it('requires the audio file before taking the per-question practice claim', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    const questionId = question.rows[0].id;
+    const existingClaimId = randomUUID();
+    await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
+      userId,
+      questionId,
+      existingClaimId,
+    ]);
+
+    try {
+      // A rival claim is live, but the missing-audio 400 must win: the audio
+      // gates run before claimPracticeAttempt, so no 409 and no claim churn.
+      const response = await request(a)
+        .post('/practice/attempt')
+        .set('Authorization', `Bearer ${token}`)
+        .field('questionId', questionId)
+        .field('requestId', randomUUID());
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
       const inflight = await pool.query<{ claim_id: string }>(
         'SELECT claim_id FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
         [userId, questionId],
@@ -602,6 +647,103 @@ describe('practice', () => {
       [userId],
     );
     expect(counts.rows[0]).toEqual({ attempts: 0, progress: 0 });
+  });
+
+  it('serializes native attempts per question and clears the in-flight claim on success', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    const questionId = question.rows[0].id;
+    const existingClaimId = randomUUID();
+    await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
+      userId,
+      questionId,
+      existingClaimId,
+    ]);
+
+    try {
+      const conflicted = await answerForm(
+        request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+        questionId,
+      );
+      expect(conflicted.status).toBe(409);
+      expect(conflicted.body).toEqual({
+        error: 'An assessment is already in progress for this question',
+        code: 'ASSESSMENT_IN_PROGRESS',
+      });
+      const preserved = await pool.query<{ claim_id: string }>(
+        'SELECT claim_id FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
+        [userId, questionId],
+      );
+      expect(preserved.rows).toEqual([{ claim_id: existingClaimId }]);
+    } finally {
+      await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
+    }
+
+    // With the rival claim gone, a successful native attempt takes and then
+    // clears its own claim: nothing may linger in practice_inflight.
+    const succeeded = await answerForm(
+      request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+      questionId,
+    );
+    expect(succeeded.status).toBe(200);
+    expect(succeeded.body.mode).toBe('native');
+    const remaining = await pool.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1',
+      [userId],
+    );
+    expect(remaining.rows[0].count).toBe(0);
+  });
+
+  it('sheds saturated AI capacity as 503 with Retry-After and the capacity code', async () => {
+    const previousConcurrency = config.aiMaxConcurrency;
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    config.aiMaxConcurrency = 0;
+    try {
+      const r = await answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        question.rows[0].id,
+      );
+      expect(r.status).toBe(503);
+      expect(r.headers['retry-after']).toBe('5');
+      expect(r.body).toEqual({ error: 'Assessment capacity busy', code: 'CAPACITY_BUSY', retryAfterSeconds: 5 });
+    } finally {
+      config.aiMaxConcurrency = previousConcurrency;
+    }
+  });
+
+  it('advertises the daily-cap retry window in hours through Retry-After', async () => {
+    const previousCap = config.assessDailyCap;
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+    await pool.query('DELETE FROM assessment_usage WHERE user_id = $1', [userId]);
+    config.assessDailyCap = 0;
+    try {
+      const r = await answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        question.rows[0].id,
+      );
+      expect(r.status).toBe(429);
+      expect(r.body).toEqual({ error: 'Daily assessment limit reached', code: 'DAILY_LIMIT', retryAfterHours: 24 });
+      // The uniform Retry-After contract converts hour hints to seconds.
+      expect(r.headers['retry-after']).toBe(String(24 * 3600));
+    } finally {
+      config.assessDailyCap = previousCap;
+    }
   });
 
   it('atomically enforces daily quota across different parallel questions', async () => {

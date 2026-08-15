@@ -62,7 +62,7 @@ describe('upload storage', () => {
         .post('/upload')
         .attach('audio', Buffer.alloc(maxBytes + 1, 0x61), { filename: 'answer.m4a', contentType: 'audio/mp4' });
       expect(oversized.status).toBe(413);
-      expect(oversized.body).toEqual({ error: 'File too large (max 25MB)' });
+      expect(oversized.body).toEqual({ error: 'File too large (max 25MB)', code: 'AUDIO_TOO_LARGE' });
       expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);
     } finally {
       if (exactFilename) await fs.rm(path.join(uploadsDir, exactFilename), { force: true });

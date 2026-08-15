@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { QuestionRow } from '../src/db';
 import { authoredAnswerHint, buildFinalFeedback, MAX_FINAL_FEEDBACK_LENGTH } from '../src/practice';
 
 afterAll(async () => {
@@ -104,26 +105,33 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
 });
 
 describe('practice feedback response bounds', () => {
+  // authoredAnswerHint takes a full questions row; only prompt_word and
+  // translations influence the hint.
+  const questionRow = (translations: QuestionRow['translations']): QuestionRow => ({
+    id: '00000000-0000-4000-8000-000000000000',
+    cefr_level: 'A1',
+    prompt_word: 'hometown',
+    question_text: 'Describe your hometown.',
+    translations,
+  });
+
   it('uses a trimmed authored example and safely falls back when translations are incomplete', () => {
-    const question = {
-      prompt_word: 'hometown',
-      translations: { te: { examples: [{ en: '  My hometown is peaceful.  ' }] } },
-    };
+    const question = questionRow({
+      te: { word: 'ఊరు', question: 'మీ ఊరు గురించి చెప్పండి.', examples: [{ en: '  My hometown is peaceful.  ' }] },
+    });
     expect(authoredAnswerHint(question, 'te')).toBe('My hometown is peaceful.');
-    expect(authoredAnswerHint({ prompt_word: 'hometown' }, 'te')).toBe(
-      'a few clear, on-topic sentences about "hometown"',
-    );
-    expect(authoredAnswerHint({ prompt_word: 'hometown', translations: { te: {} } }, 'te')).toBe(
-      'a few clear, on-topic sentences about "hometown"',
-    );
+    expect(authoredAnswerHint(questionRow({}), 'te')).toBe('a few clear, on-topic sentences about "hometown"');
   });
 
   it.each([
-    ['the requested language is absent', { translations: { hi: { examples: [{ en: 'नमस्ते' }] } } }],
-    ['the authored example list is empty', { translations: { te: { examples: [] } } }],
-    ['the first example has no English text', { translations: { te: { examples: [{ native: 'నా ఊరు' }] } } }],
-  ])('falls back when %s', (_caseName, malformedTranslation) => {
-    expect(authoredAnswerHint({ prompt_word: 'hometown', ...malformedTranslation }, 'te')).toBe(
+    ['the requested language is absent', { hi: { word: 'नगर', question: 'प्रश्न', examples: [{ en: 'नमस्ते' }] } }],
+    ['the authored example list is empty', { te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [] } }],
+    [
+      'the first example has no English text',
+      { te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [{ native: 'నా ఊరు' }] } },
+    ],
+  ] as Array<[string, QuestionRow['translations']]>)('falls back when %s', (_caseName, malformedTranslation) => {
+    expect(authoredAnswerHint(questionRow(malformedTranslation), 'te')).toBe(
       'a few clear, on-topic sentences about "hometown"',
     );
   });

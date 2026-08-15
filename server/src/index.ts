@@ -1,10 +1,12 @@
 import { createServer } from 'http';
 import { config } from './config';
 import { createApp } from './app';
-import { cleanupAssessmentUsage } from './assess';
+import { abortInFlightAssessments, cleanupAssessmentUsage } from './assess';
+import { cleanupPasswordResetTokens } from './auth';
 import { pool } from './db';
 import { logger } from './logger';
 import { cleanupAssessmentRequests } from './idempotency';
+import { janitorRemovedTotal } from './metrics';
 import { cleanupOldUploads } from './upload';
 import { cleanupRateLimitWindows } from './postgres-rate-limit-store';
 import { assertDatabaseSchemaCurrent } from './schema-readiness';
@@ -32,6 +34,8 @@ const UPLOAD_JANITOR_INTERVAL_MS = 15 * 60 * 1000;
 const DATABASE_JANITOR_INTERVAL_MS = 60 * 60 * 1000;
 
 interface JanitorDefinition {
+  /** Stable metric label for janitor_removed_total (metrics.ts). */
+  janitor: string;
   cleanup: () => Promise<number>;
   intervalMs: number;
   successMessage: string;
@@ -40,28 +44,39 @@ interface JanitorDefinition {
 
 const janitorDefinitions: JanitorDefinition[] = [
   {
+    janitor: 'uploads',
     cleanup: cleanupOldUploads,
     intervalMs: UPLOAD_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed stale uploads',
     failureMessage: 'upload janitor failed',
   },
   {
+    janitor: 'assessment-requests',
     cleanup: cleanupAssessmentRequests,
     intervalMs: DATABASE_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed expired assessment replays',
     failureMessage: 'assessment replay janitor failed',
   },
   {
+    janitor: 'rate-limit-windows',
     cleanup: cleanupRateLimitWindows,
     intervalMs: DATABASE_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed expired rate-limit counters',
     failureMessage: 'rate-limit janitor failed',
   },
   {
+    janitor: 'assessment-usage',
     cleanup: cleanupAssessmentUsage,
     intervalMs: DATABASE_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed expired assessment reservations',
     failureMessage: 'assessment usage janitor failed',
+  },
+  {
+    janitor: 'password-reset-tokens',
+    cleanup: cleanupPasswordResetTokens,
+    intervalMs: DATABASE_JANITOR_INTERVAL_MS,
+    successMessage: 'janitor removed expired password reset tokens',
+    failureMessage: 'password reset token janitor failed',
   },
 ];
 
@@ -71,6 +86,7 @@ function runJanitor(definition: JanitorDefinition): void {
   void definition
     .cleanup()
     .then((removed) => {
+      janitorRemovedTotal.inc({ janitor: definition.janitor }, removed);
       if (removed > 0) logger.info({ removed }, definition.successMessage);
     })
     .catch((err) => logger.warn({ err }, definition.failureMessage));
@@ -101,11 +117,13 @@ function shutdown(signal: string) {
   clearJanitors();
   logger.info({ signal }, 'shutting down');
 
-  // Hard stop if graceful shutdown takes too long.
+  // Hard stop if the drain takes too long. SHUTDOWN_DRAIN_MS defaults above
+  // the whole-request budget (server.requestTimeout) so the slowest
+  // legitimate in-flight assessment can still finish before the force exit.
   const forceTimer = setTimeout(() => {
     logger.error('graceful shutdown timed out — forcing exit');
     process.exit(1);
-  }, 10_000);
+  }, config.shutdownDrainMs);
   forceTimer.unref();
 
   const finishShutdown = (err?: Error) => {
@@ -128,8 +146,17 @@ function shutdown(signal: string) {
   // listen(). Calling close() on that state reports ERR_SERVER_NOT_RUNNING,
   // which is not a shutdown failure and should not turn a normal deploy into
   // exit status 1.
-  if (server.listening) server.close(finishShutdown);
-  else finishShutdown();
+  if (server.listening) {
+    server.close(finishShutdown);
+    // Sever idle keep-alive sockets immediately so they cannot pin the drain
+    // open; active requests keep their connection until they respond.
+    server.closeIdleConnections?.();
+  } else {
+    finishShutdown();
+  }
+  // Abort in-flight provider calls so paid work dies fast and each route
+  // unwinds through its normal timeout path, abandoning its idempotency claim.
+  abortInFlightAssessments();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

@@ -70,7 +70,7 @@ describe('assessment request recovery', () => {
 
     const foreign = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${outsiderToken}`);
     expect(foreign.status).toBe(404);
-    expect(foreign.body).toEqual({ error: 'Assessment request not found' });
+    expect(foreign.body).toEqual({ error: 'Assessment request not found', code: 'NOT_FOUND' });
   });
 
   it('rejects a malformed request UUID with 400', async () => {
@@ -225,5 +225,25 @@ describe('assessment request recovery', () => {
       'SELECT request_id FROM assessment_requests ORDER BY request_id',
     );
     expect(remaining.rows.map((row) => row.request_id).sort()).toEqual([liveProcessingId, recentCompletedId].sort());
+  });
+
+  it('skips the replay-janitor tick while another replica holds its advisory lock', async () => {
+    await pool.query('DELETE FROM assessment_requests');
+    await insertRequest(randomUUID(), {
+      startedAt: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
+    });
+    const rival = await pool.connect();
+    try {
+      const locked = await rival.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtext('janitor:assessment-requests')) AS locked",
+      );
+      expect(locked.rows[0].locked).toBe(true);
+      await expect(cleanupAssessmentRequests()).resolves.toBe(0);
+
+      await rival.query("SELECT pg_advisory_unlock(hashtext('janitor:assessment-requests'))");
+      await expect(cleanupAssessmentRequests()).resolves.toBe(1);
+    } finally {
+      rival.release();
+    }
   });
 });

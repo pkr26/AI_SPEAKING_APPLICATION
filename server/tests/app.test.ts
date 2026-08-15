@@ -72,7 +72,7 @@ describe('app wiring', () => {
   it('returns a JSON 404 for unknown routes', async () => {
     const res = await request(a).get('/no-such-route');
     expect(res.status).toBe(404);
-    expect(res.body).toEqual({ error: 'Not found' });
+    expect(res.body).toEqual({ error: 'Not found', code: 'NOT_FOUND' });
   });
 
   it('echoes an inbound x-request-id and generates one otherwise', async () => {
@@ -212,7 +212,7 @@ describe('app wiring', () => {
       .get(`/assessments/${requestId}`)
       .set('Authorization', `Bearer ${second.body.token}`);
     expect(otherUser.status).toBe(404);
-    expect(otherUser.body).toEqual({ error: 'Assessment request not found' });
+    expect(otherUser.body).toEqual({ error: 'Assessment request not found', code: 'NOT_FOUND' });
 
     const malformed = await request(a)
       .get('/assessments/not-a-uuid')

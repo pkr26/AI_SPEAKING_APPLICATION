@@ -94,7 +94,7 @@ describe('route audio-duration enforcement', () => {
     const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
     routeMocks.verifyDuration
       .mockReset()
-      .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter'))
+      .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG'))
       .mockResolvedValue(true);
     const requestId = randomUUID();
 
@@ -106,7 +106,7 @@ describe('route audio-duration enforcement', () => {
       .field('requestId', requestId);
 
     expect(rejected.status).toBe(413);
-    expect(rejected.body).toEqual({ error: 'Recording must be two minutes or shorter' });
+    expect(rejected.body).toEqual({ error: 'Recording must be two minutes or shorter', code: 'AUDIO_TOO_LONG' });
     expect(routeMocks.assess).not.toHaveBeenCalled();
 
     // The abandoned claim must not strand the logical request: an immediate
@@ -127,7 +127,7 @@ describe('route audio-duration enforcement', () => {
     const level = await completeDiagnostic(a, token);
     routeMocks.verifyDuration
       .mockReset()
-      .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter'))
+      .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG'))
       .mockResolvedValue(true);
     routeMocks.assess.mockClear();
     const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
@@ -140,7 +140,7 @@ describe('route audio-duration enforcement', () => {
     );
 
     expect(rejected.status).toBe(413);
-    expect(rejected.body).toEqual({ error: 'Recording must be two minutes or shorter' });
+    expect(rejected.body).toEqual({ error: 'Recording must be two minutes or shorter', code: 'AUDIO_TOO_LONG' });
     expect(routeMocks.assess).not.toHaveBeenCalled();
   });
 });

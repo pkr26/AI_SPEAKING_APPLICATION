@@ -27,10 +27,17 @@ const MANAGED_KEYS = [
   'AI_MAX_CONCURRENCY',
   'AUDIO_INSPECTION_MAX_CONCURRENCY',
   'OPENAI_TIMEOUT_MS',
+  'GRADING_MODEL',
+  'SHUTDOWN_DRAIN_MS',
+  'METRICS_ENABLED',
+  'MIN_CLIENT_VERSION',
   'FFMPEG_PATH',
   'FFPROBE_PATH',
+  'MAIL_MODE',
+  'MAIL_WEBHOOK_URL',
   'RATE_LIMIT_GLOBAL_WINDOW_MS',
   'RATE_LIMIT_GLOBAL_MAX',
+  'RATE_LIMIT_GLOBAL_STORE',
   'RATE_LIMIT_AUTH_WINDOW_MS',
   'RATE_LIMIT_AUTH_MAX',
   'RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS',
@@ -39,6 +46,8 @@ const MANAGED_KEYS = [
   'RATE_LIMIT_PASSWORD_MAX',
   'RATE_LIMIT_REGISTER_WINDOW_MS',
   'RATE_LIMIT_REGISTER_MAX',
+  'RATE_LIMIT_FORGOT_EMAIL_WINDOW_MS',
+  'RATE_LIMIT_FORGOT_EMAIL_MAX',
   'RATE_LIMIT_ASSESS_WINDOW_MS',
   'RATE_LIMIT_ASSESS_MAX',
   'RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS',
@@ -121,11 +130,16 @@ describe('config env validation', () => {
     expect(config.aiMaxConcurrency).toBe(10);
     expect(config.audioInspectionMaxConcurrency).toBe(4);
     expect(config.openaiTimeoutMs).toBe(60_000);
+    expect(config.gradingModel).toBe('gpt-4o-mini-2024-07-18');
+    expect(config.shutdownDrainMs).toBe(140_000);
+    expect(config.metricsEnabled).toBe(false);
+    expect(config.minClientVersion).toBeUndefined();
     expect(config.ffmpegPath).toBe('ffmpeg');
     expect(config.ffprobePath).toBe('ffprobe');
     expect(config.rateLimit).toEqual({
       globalWindowMs: 15 * 60 * 1000,
       globalMax: 300,
+      globalStore: 'memory',
       authWindowMs: 15 * 60 * 1000,
       authMax: 20,
       loginAccountWindowMs: 15 * 60 * 1000,
@@ -134,6 +148,8 @@ describe('config env validation', () => {
       passwordMax: 10,
       registerWindowMs: 60 * 60 * 1000,
       registerMax: 10,
+      forgotEmailWindowMs: 60 * 60 * 1000,
+      forgotEmailMax: 5,
       assessWindowMs: 60 * 60 * 1000,
       assessMax: 20,
       uploadGrantWindowMs: 60 * 60 * 1000,
@@ -141,6 +157,7 @@ describe('config env validation', () => {
     });
     expect(config.trustProxy).toBe(false);
     expect(config.corsOrigins).toEqual([]);
+    expect(config.mail).toEqual({ mode: 'log', webhookUrl: '' });
     expect(config.mockAi).toBe(true);
     expect(config.openaiApiKey).toBe('');
     expect(config.s3).toEqual({
@@ -213,6 +230,24 @@ describe('config env validation', () => {
     expect((await loadConfig(baseEnv({ MOCK_AI: '0', OPENAI_API_KEY: 'sk-x' }))).mockAi).toBe(false);
     expect((await loadConfig(baseEnv({ MOCK_AI: 'false', OPENAI_API_KEY: 'sk-x' }))).mockAi).toBe(false);
     await expectInvalid(baseEnv({ MOCK_AI: 'yes' }), "must be one of 'true', 'false', '1', or '0'");
+  });
+
+  it('parses RATE_LIMIT_GLOBAL_STORE modes and rejects junk', async () => {
+    expect((await loadConfig(baseEnv({}))).rateLimit.globalStore).toBe('memory');
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_GLOBAL_STORE: 'postgres' }))).rateLimit.globalStore).toBe('postgres');
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_GLOBAL_STORE: 'memory' }))).rateLimit.globalStore).toBe('memory');
+    await expectSingleInvalidIssue(
+      baseEnv({ RATE_LIMIT_GLOBAL_STORE: 'redis' }),
+      'RATE_LIMIT_GLOBAL_STORE',
+      "must be 'memory' or 'postgres'",
+    );
+  });
+
+  it('parses METRICS_ENABLED boolean spellings and rejects junk', async () => {
+    expect((await loadConfig(baseEnv({ METRICS_ENABLED: 'true' }))).metricsEnabled).toBe(true);
+    expect((await loadConfig(baseEnv({ METRICS_ENABLED: '1' }))).metricsEnabled).toBe(true);
+    expect((await loadConfig(baseEnv({ METRICS_ENABLED: '0' }))).metricsEnabled).toBe(false);
+    await expectInvalid(baseEnv({ METRICS_ENABLED: 'on' }), "must be one of 'true', 'false', '1', or '0'");
   });
 
   it('parses TRUST_PROXY hop counts and rejects unsafe values', async () => {
@@ -392,6 +427,65 @@ describe('config env validation', () => {
     );
     const ok = await loadConfig(baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_IP_DAILY_CAP: '10' }));
     expect(ok.assessIpDailyCap).toBe(10);
+  });
+
+  it('parses the grading model, shutdown drain, and minimum client version knobs', async () => {
+    const config = await loadConfig(
+      baseEnv({
+        GRADING_MODEL: ' gpt-4o-mini-2025-01-01 ',
+        SHUTDOWN_DRAIN_MS: '10000',
+        MIN_CLIENT_VERSION: ' 1.2.3 ',
+      }),
+    );
+    expect(config.gradingModel).toBe('gpt-4o-mini-2025-01-01');
+    expect(config.shutdownDrainMs).toBe(10_000);
+    expect(config.minClientVersion).toBe('1.2.3');
+
+    const maxDrain = await loadConfig(baseEnv({ SHUTDOWN_DRAIN_MS: '300000' }));
+    expect(maxDrain.shutdownDrainMs).toBe(300_000);
+
+    // Blank stays "gate disabled" rather than becoming an empty string.
+    const disabledGate = await loadConfig(baseEnv({ MIN_CLIENT_VERSION: '   ' }));
+    expect(disabledGate.minClientVersion).toBeUndefined();
+  });
+
+  it('parses the mailer knobs and enforces the webhook-mode URL invariants', async () => {
+    const webhook = await loadConfig(
+      baseEnv({ MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: ' https://relay.example/hooks/mail ' }),
+    );
+    expect(webhook.mail).toEqual({ mode: 'webhook', webhookUrl: 'https://relay.example/hooks/mail' });
+
+    // A relay URL may be pre-provisioned while the mode still logs.
+    const provisioned = await loadConfig(baseEnv({ MAIL_WEBHOOK_URL: 'http://relay.internal:8080/mail' }));
+    expect(provisioned.mail).toEqual({ mode: 'log', webhookUrl: 'http://relay.internal:8080/mail' });
+
+    await expectInvalid(baseEnv({ MAIL_MODE: 'smtp' }), "must be 'log' or 'webhook'");
+    await expectSingleInvalidIssue(
+      baseEnv({ MAIL_MODE: 'webhook' }),
+      'MAIL_WEBHOOK_URL',
+      'is required when MAIL_MODE=webhook',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: 'ftp://relay.example/mail' }),
+      'MAIL_WEBHOOK_URL',
+      'must be an http(s) URL (or empty when MAIL_MODE=log)',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ MAIL_WEBHOOK_URL: 'not a url' }),
+      'MAIL_WEBHOOK_URL',
+      'must be an http(s) URL (or empty when MAIL_MODE=log)',
+    );
+  });
+
+  it('rejects an unusable grading model, drain budget, or client version pin', async () => {
+    await expectInvalid(baseEnv({ GRADING_MODEL: '   ' }), 'GRADING_MODEL');
+    await expectInvalid(baseEnv({ SHUTDOWN_DRAIN_MS: '9999' }), 'SHUTDOWN_DRAIN_MS');
+    await expectInvalid(baseEnv({ SHUTDOWN_DRAIN_MS: '300001' }), 'SHUTDOWN_DRAIN_MS');
+    await expectSingleInvalidIssue(
+      baseEnv({ MIN_CLIENT_VERSION: 'v1.2.3' }),
+      'MIN_CLIENT_VERSION',
+      "must be a dotted numeric version like '1.2.3' (or empty to disable the client gate)",
+    );
   });
 
   it('rejects out-of-range pool and timeout numbers', async () => {

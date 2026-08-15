@@ -66,7 +66,7 @@ EXPO_PUBLIC_API_URL=http://<your-LAN-IP>:4000 npx expo start
 1. Sign up (pick your native language) → you're taken straight to the **Diagnostic Test**.
 2. Answer the spoken questions → your CEFR level is assigned.
 3. **Practice**: read the prompt word + question, choose English or your native language, and optionally tap **?** for bilingual help and examples before recording.
-4. English: score 75+ to master the word; lower scores keep it in revision, with at most 3 scored tries before moving on. Silence is free. Native mode checks understanding, shows a model English answer, and leaves mastery unchanged.
+4. English: score 75+ to master the word; lower scores keep it in revision, with at most 3 scored tries before moving on. Silence is free. Native mode checks understanding, shows a model English answer, and leaves mastery unchanged. Mastered words come back on a spaced-repetition schedule (1/3/7/21/60 days; failing one demotes it), and mastering 85% of a level promotes you to the next CEFR level.
 
 ## API overview (server, port 4000)
 
@@ -74,16 +74,30 @@ EXPO_PUBLIC_API_URL=http://<your-LAN-IP>:4000 npx expo start
 | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
 | `POST /auth/register` · `POST /auth/login` · `POST /auth/logout` · `GET /auth/me` | JWT auth and all-device logout revocation                                              |
 | `POST /auth/change-password` · `DELETE /auth/account` · `GET /auth/me/data`       | Password rotation (revokes old tokens), account deletion, cursor-paginated data export |
+| `POST /auth/forgot-password` · `POST /auth/reset-password`                        | Anti-enumeration reset (always 204; hashed 30-min single-use code via log/webhook mailer; reset revokes all tokens) |
+| `PATCH /auth/me`                                                                  | Update profile name and/or native language (register-grade validation)                 |
 | `GET /diagnostic/next` · `POST /diagnostic/answer`                                | Diagnostic binary search (server tracks the served question)                           |
+| `POST /diagnostic/restart`                                                        | Confirmed placement retake: resets level/diagnostic state, keeps all history           |
 | `POST /uploads/audio-url`                                                         | Direct-mode marker or signed S3 upload grant                                           |
 | `GET /assessments/:requestId`                                                     | User-scoped, no-store status/replay recovery for an interrupted assessment             |
-| `GET /practice/question`                                                          | Next practice question at user's level                                                 |
+| `GET /practice/question`                                                          | Next practice question at user's level (SRS due-first revision/new interleave)         |
 | `GET /practice/question/:id/help`                                                 | Bilingual help content (ETag + private caching)                                        |
-| `POST /practice/attempt`                                                          | Assess a recording; enforces 3-attempt rule                                            |
+| `POST /practice/attempt`                                                          | Assess a recording; enforces 3-attempt rule; may return `levelUp` on promotion         |
 | `POST /practice/attempt/native`                                                   | Check native-language comprehension; never changes English mastery                     |
+| `POST /practice/skip`                                                             | Park a word out of new/revision selection for 7 days (retention unaffected)            |
+| `GET /practice/history`                                                           | Keyset-paginated attempt history, newest first, questions joined                       |
+| `GET /practice/stats`                                                             | Home stats: mastery progress + due count, UTC-day streak, totals, last practiced       |
 | `GET /health` · `GET /ready`                                                      | Liveness / migration, question-inventory, database, and FFmpeg readiness               |
 
 See `server/.env.example` for all configuration knobs and `app/README.md` for the app.
+
+Every error response is `{ error: string, code: string, ...extras }` where `code` is a stable
+machine-readable identifier (e.g. `VALIDATION_FAILED`, `RATE_LIMITED`, `DAILY_LIMIT`,
+`ASSESSMENT_IN_PROGRESS`, `PROVIDER_TIMEOUT`, `INTERNAL`) that clients map to localized copy;
+whenever the body carries `retryAfterSeconds`/`retryAfterHours`, the same hint is advertised in a
+standard `Retry-After` header (seconds). When `MIN_CLIENT_VERSION` is set, requests whose
+`X-Client-Version` header parses lower are rejected with `426 { code: 'CLIENT_UPGRADE_REQUIRED' }`;
+response contracts are otherwise additive-only.
 
 The S3 response contract is
 `{mode:'s3', uploadUrl, uploadFields, audioKey, contentType, expiresIn, maxBytes}`.
@@ -96,19 +110,38 @@ assessment. Development/test deployments without `S3_BUCKET` return
 
 - **Migrations** — schema lives in `server/db/migrations/`; applied filenames and checksums are tracked in `schema_migrations`, and an advisory lock serializes deploys. `npm run db:setup` is for initial/local setup. Production deploys run `npm run db:migrate:prod`, then publish reviewed question content with the idempotent `npm run db:catalog:prod`, which preserves question IDs and user progress.
 - **Config** — validated with zod at boot (`src/config.ts`); the server refuses to start without a real `JWT_SECRET` (≥32 chars) or `DATABASE_URL`. Runtime PostgreSQL statements and lock waits have bounded deadlines.
-- **Logging & shutdown** — structured logs via pino with per-request IDs (`x-request-id` honored); graceful SIGTERM/SIGINT shutdown (HTTP → pool → exit, 10s force timer).
+- **Logging & shutdown** — structured logs via pino with per-request IDs (`x-request-id` honored); graceful SIGTERM/SIGINT shutdown: new connections stop, idle keep-alive sockets are severed, in-flight OpenAI calls are aborted so their routes unwind through the normal error paths, then HTTP → pool → exit under a `SHUTDOWN_DRAIN_MS` force timer (default 140s, deliberately above the 130s worst-case request budget).
 - **Security headers / TLS** — `helmet` defaults including HSTS. TLS is expected to terminate at the reverse proxy/load balancer in front of this service; set `TRUST_PROXY` to the exact number of trusted proxy hops so client IPs are correct.
 - **CORS** — allowlist from `CORS_ORIGINS`; requests without an `Origin` header (mobile app, curl) always pass. No credentials.
-- **Rate limits** — global 300/15min/IP, credential endpoints 20/15min/IP, registration 10/hour/IP, failed logins 10/15min/normalized-email across source IPs, password-confirmation routes (change-password, account deletion) 10/15min/account, assessment endpoints 20/hour/user plus a fixed-window daily budget per source IP (`ASSESS_IP_DAILY_CAP`, default 300), and production S3 grant issuance 40/hour/user (all tunable via `RATE_LIMIT_*`). Credential budgets throttle only failures: over-budget requests still verify the password, so a saturated budget can never lock out the real owner, and successes are refunded. The upload-grant budget is separate so one submitted assessment consumes only one assessment-limit unit. Security-sensitive counters use PostgreSQL fixed windows shared across API replicas; raw IPs, user IDs, and email targets are HMACed before storage. An hourly janitor removes expired counter rows.
+- **Rate limits** — global 300/15min/IP, credential endpoints 20/15min/IP, registration 10/hour/IP, failed logins 10/15min/normalized-email across source IPs, password-confirmation routes (change-password, account deletion) 10/15min/account, assessment endpoints 20/hour/user plus a fixed-window daily budget per source IP (`ASSESS_IP_DAILY_CAP`, default 300), and production S3 grant issuance 40/hour/user (all tunable via `RATE_LIMIT_*`). Credential budgets throttle only failures: over-budget requests still verify the password, so a saturated budget can never lock out the real owner, and successes are refunded. The upload-grant budget is separate so one submitted assessment consumes only one assessment-limit unit. Security-sensitive counters use PostgreSQL fixed windows shared across API replicas; raw IPs, user IDs, and email targets are HMACed before storage. An hourly janitor removes expired counter rows. The coarse global limiter is the exception: with `RATE_LIMIT_GLOBAL_STORE=memory` (the default) each replica enforces its own in-process budget — `RATE_LIMIT_GLOBAL_MAX` is per replica and floods never write counter rows — while `postgres` opts into one shared cluster-wide budget; keep an upstream WAF/edge limit for volumetric attacks in either mode.
 - **Uploads** — 25MB cap, random UUID filenames, extension+MIME checks, magic-byte sniffing, then resource-bounded FFmpeg decoding with sample-count timestamps to reject malformed, sub-0.5-second, and over-two-minute media before paid AI work. Native decoders have an independent fail-fast per-process cap (`AUDIO_INSPECTION_MAX_CONCURRENCY`, default 4). Production S3 grants are size-constrained presigned POST forms; GetObject/body streaming and best-effort deletion have an explicit `S3_OPERATION_TIMEOUT_MS` deadline. Submitted objects are deleted after assessment except non-definitive pre-claim 409/429 conflicts, which are retained for a possible owner or the lifecycle backstop; the local-upload janitor removes leftovers older than 1h, and production S3 needs a short lifecycle expiration for grants abandoned before submission.
 - **Assessment guardrails** — atomic rolling-24-hour per-user and cross-account/provider budget caps (`ASSESS_DAILY_CAP`, `ASSESS_GLOBAL_DAILY_CAP`), a fixed-window per-source-IP daily budget that survives account re-registration (`ASSESS_IP_DAILY_CAP`), bounded per-process AI concurrency (`AI_MAX_CONCURRENCY`), one OpenAI client, and a shared end-to-end provider deadline (`OPENAI_TIMEOUT_MS`). Multi-track audio containers are rejected at the inspection gate so only duration-verified audio reaches the paid transcriber.
 - **Auth hardening** — bcrypt cost 12 (native `bcrypt`; it verifies existing bcryptjs `$2a$/$2b$` hashes), password policy min 8 + letter + number, HS256-pinned JWTs carrying `{sub, tv: token_version}`; logout and password change bump `token_version` and invalidate all previously issued tokens for the account.
 - **Diagnostic anti-cheat** — `GET /diagnostic/next` records the served question; `POST /diagnostic/answer` rejects anything else with 409. Short, token-owned database claims serialize assessments across instances without holding a database connection during AI provider calls.
+- **Metrics** — set `METRICS_ENABLED=true` to expose Prometheus metrics at `GET /metrics` (404 when disabled, the default) — request/provider latency histograms, pool/AI/inspection-slot gauges, shed-request and janitor counters — and scrape it privately only (network policy or ingress rule); never expose it to the public internet.
 - **Tests & CI** — `npm test` runs vitest + supertest with enforced coverage floors against an auto-created loopback database whose name must end in `_test`; destructive setup refuses remote hosts and the configured app database. GitHub Actions runs server format/lint/typecheck/build/tests with Postgres, mobile tests with coverage floors, Expo Doctor, production iOS/Android bundle exports, and scheduled dependency-audit checks.
 - **Container** — `server/Dockerfile` is a multi-stage node:22-alpine build (production dependencies only, root-owned application files, non-root `node` process, writable upload directory, dumb-init, and a liveness healthcheck).
 
 For the smoke test (`npm run smoke`, server running with `MOCK_AI=true`), start the dev server with relaxed limits so the practice loop doesn't trip them:
 `RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 ASSESS_IP_DAILY_CAP=100000 npm run dev`
+
+## Backups and restore (runbook)
+
+PostgreSQL is the only stateful service (submitted audio is transient by design), so backing up the
+database backs up the product.
+
+- **Cadence** — enable your platform's automated daily snapshots plus WAL/point-in-time recovery
+  where available. Additionally take a logical dump before every migration deploy and before any
+  `db:catalog:prod` content publish. Retain dumps for at least 30 days.
+- **Dump** (custom format, safe while the API is live):
+  `pg_dump --format=custom --no-owner --file=ai_english_$(date +%Y%m%dT%H%M%S).dump "$DATABASE_URL"`
+- **Restore** (into an empty database; never restore over a live one):
+  `createdb ai_english_restore && pg_restore --no-owner --dbname=postgres://.../ai_english_restore ai_english_<timestamp>.dump`
+  then point a staging API at it and check `/ready` before switching traffic.
+- **Verify restores quarterly** — a backup that has never been restored is a hope, not a backup.
+- **Migrations are forward-only** — applied files are checksummed in `schema_migrations` and must
+  never be edited or reverted; there are no down migrations. To undo a schema mistake, roll forward
+  with a new migration (restore from backup only for data disasters, not schema course corrections).
 
 ## Mutation testing
 
@@ -149,10 +182,10 @@ The API has no server-side session store. Assessment claims, quotas, and securit
 2. **Secrets and transport** — inject `JWT_SECRET` (≥32 random chars), `DATABASE_URL`, and `OPENAI_API_KEY` via your platform's secret manager. Never commit `.env`. Set `MOCK_AI=false`. The production PostgreSQL URL must use `sslmode=verify-full` with a trusted server certificate; the API refuses weaker database transport.
 3. **Audio storage (S3)** — production requires `S3_BUCKET` (boot fails without it): the app uploads recordings through a short-lived, size-constrained presigned POST grant from `POST /uploads/audio-url`, and the API downloads each submitted object for assessment, then deletes it. Create a private bucket (block all public access), set `S3_REGION`, and grant the API identity only `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `arn:aws:s3:::<bucket>/audio-uploads/*` — prefer an IAM task/instance role over `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`. Static credentials must be supplied as a complete pair; temporary credentials also set `S3_SESSION_TOKEN`. Configure a short S3 lifecycle expiration on the `audio-uploads/` prefix as a backstop for clients that upload but never submit an assessment, including requests rejected by an upstream/global limit before the API can read their object key. The native client does not require bucket CORS; reassess CORS if browser uploads are ever supported.
 4. **Database** — use a managed, currently supported PostgreSQL 17/18 release. For an existing database, back up and verify a restore first, run the read-only `npm run db:preflight:prod`, then run exactly one `npm run db:migrate:prod` job followed by one `npm run db:catalog:prod` job from the built image before starting the new application version. Preflight is an upgrade check and expects the existing tables; the same migrate-then-catalog sequence initializes a fresh production database. The API refuses to listen, and `/ready` returns 503, unless packaged migration names/checksums, the required runtime table, and at least 100 published questions per CEFR level are present. Drain older replicas before the first rollout containing migration `006_assessment_request_claims.sql` (older binaries do not write the ownership column) or `008_practice_progress.sql` (older binaries do not maintain mastery rows); a fresh deployment applying the migrations before any API starts is safe. Do not use `db:setup` in a deploy. On later releases, run `db:catalog:prod` only when intentionally publishing reviewed question-content changes. Size the pool: `DB_POOL_MAX` × number of API replicas should stay under the Postgres `max_connections` budget (e.g. 20 × 4 replicas = 80).
-5. **Multi-instance rate limiting** — migration `007_distributed_rate_limits.sql` provides the shared PostgreSQL fixed-window store. Monitor counter-table growth and database latency, and retain an upstream WAF/load-balancer limit for volumetric attacks that should not reach the application or database.
-6. **Container** — build `server/Dockerfile`, run ≥2 replicas behind the LB, point `/health` and `/ready` at your orchestrator's probes.
+5. **Multi-instance rate limiting** — migration `007_distributed_rate_limits.sql` provides the shared PostgreSQL fixed-window store used by every security-sensitive limiter. The coarse global limiter defaults to `RATE_LIMIT_GLOBAL_STORE=memory` (per-replica budget, no database write per request); switch it to `postgres` only if you need one cluster-wide global budget. Monitor counter-table growth and database latency, and retain an upstream WAF/load-balancer limit for volumetric attacks that should not reach the application or database.
+6. **Container & horizontal scaling** — build `server/Dockerfile`, run ≥2 replicas behind the LB, point `/health` and `/ready` at your orchestrator's probes. `AI_MAX_CONCURRENCY` is a **per-process** semaphore: divide the OpenAI account's concurrency budget by the replica count (e.g. a 40-request provider budget across 4 replicas → `AI_MAX_CONCURRENCY=10` on each). The daily caps and rate limits live in PostgreSQL and are already cluster-wide — never divide those. DB janitors coordinate through advisory locks, so extra replicas do not duplicate cleanup work.
 7. **Backups & retention** — enable automated Postgres backups; submitted audio is deleted after assessment, the local janitor removes crash leftovers older than one hour, and the S3 lifecycle rule expires abandoned objects. Replay responses expire after 24 hours. `attempts` transcripts currently grow unbounded, so define and implement archival/deletion windows in the consumer privacy policy before launch.
-8. **Observability (next step)** — logs are structured JSON; ship them to your log platform and add error tracking (Sentry) and metrics before launch.
+8. **Observability** — logs are structured JSON; ship them to your log platform and add error tracking (Sentry) before launch. Prometheus metrics are built in: enable `METRICS_ENABLED=true` and scrape `GET /metrics` from a private network only.
 9. **App builds** — build the mobile app with EAS Build pointing `EXPO_PUBLIC_API_URL` at the production HTTPS URL; enable EAS Update for OTA fixes.
 
 Deliberately not built yet (roadmap): refresh-token rotation, WAF/DDoS protection, CDN for static content, multi-region DB, push notifications, upload virus scanning, Sentry/Datadog integration.

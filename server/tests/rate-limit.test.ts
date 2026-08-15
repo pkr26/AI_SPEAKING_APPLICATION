@@ -4,8 +4,9 @@ import express from 'express';
 import request from 'supertest';
 import { ipKeyGenerator } from 'express-rate-limit';
 import { config } from '../src/config';
+import { JANITOR_BATCH_SIZE } from '../src/janitor';
 import { logger } from '../src/logger';
-import { AuthedRequest } from '../src/middleware';
+import { AuthedRequest, errorHandler } from '../src/middleware';
 import { buildLimiters, normalizeLoginEmail } from '../src/rate-limit';
 import { cleanupRateLimitWindows, PostgresRateLimitStore } from '../src/postgres-rate-limit-store';
 import { pool } from './helpers';
@@ -77,11 +78,12 @@ describe('rate limiters', () => {
 
     const third = await request(a).get('/x');
     expect(third.status).toBe(429);
-    expect(third.body).toEqual({ error: 'Too many requests, please try again later' });
+    expect(third.body).toEqual({ error: 'Too many requests, please try again later', code: 'RATE_LIMITED' });
     expect(third.headers['ratelimit-remaining']).toBe('0');
   });
 
-  it('shares counters across independently built app instances', async () => {
+  it('shares global counters across independently built app instances in postgres mode', async () => {
+    config.rateLimit.globalStore = 'postgres';
     config.rateLimit.globalWindowMs = 60_000;
     config.rateLimit.globalMax = 1;
     const firstReplica = okApp(buildLimiters().global);
@@ -89,6 +91,25 @@ describe('rate limiters', () => {
 
     expect((await request(firstReplica).get('/x')).status).toBe(200);
     expect((await request(secondReplica).get('/x')).status).toBe(429);
+  });
+
+  it('keeps the default memory-mode global limiter out of the shared counter table', async () => {
+    expect(config.rateLimit.globalStore).toBe('memory');
+    config.rateLimit.globalWindowMs = 60_000;
+    config.rateLimit.globalMax = 1;
+    const firstReplica = okApp(buildLimiters().global);
+    const secondReplica = okApp(buildLimiters().global);
+
+    // Each replica enforces its own in-process budget: the shared window is
+    // untouched, and a second replica still has its full per-replica budget.
+    expect((await request(firstReplica).get('/x')).status).toBe(200);
+    expect((await request(secondReplica).get('/x')).status).toBe(200);
+    expect((await request(firstReplica).get('/x')).status).toBe(429);
+
+    const { rows } = await pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM rate_limit_windows WHERE namespace LIKE 'global:%'",
+    );
+    expect(rows[0].n).toBe(0);
   });
 
   it('throttles the auth limiter with its own message', async () => {
@@ -99,7 +120,7 @@ describe('rate limiters', () => {
     expect((await request(a).get('/x')).status).toBe(200);
     const limited = await request(a).get('/x');
     expect(limited.status).toBe(429);
-    expect(limited.body).toEqual({ error: 'Too many attempts, please try again later' });
+    expect(limited.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
   });
 
   it('keeps the defensive password-account fallback isolated by source IP', async () => {
@@ -135,7 +156,10 @@ describe('rate limiters', () => {
     expect((await request(a).get('/x')).status).toBe(200);
     const limited = await request(a).get('/x');
     expect(limited.status).toBe(429);
-    expect(limited.body).toEqual({ error: 'Too many accounts created from this network, please try again later' });
+    expect(limited.body).toEqual({
+      error: 'Too many accounts created from this network, please try again later',
+      code: 'RATE_LIMITED',
+    });
   });
 
   it('keys the assess limiter per user, not per IP', async () => {
@@ -158,7 +182,7 @@ describe('rate limiters', () => {
     expect((await request(as('user-1')).get('/x')).status).toBe(200);
     const limited = await request(as('user-1')).get('/x');
     expect(limited.status).toBe(429);
-    expect(limited.body).toEqual({ error: 'Assessment rate limit reached, please slow down' });
+    expect(limited.body).toEqual({ error: 'Assessment rate limit reached, please slow down', code: 'RATE_LIMITED' });
 
     // A different user (and unauthenticated requests from distinct source IPs)
     // still fit. The fallback must retain the IP instead of collapsing every
@@ -181,7 +205,10 @@ describe('rate limiters', () => {
       expect((await request(first).get('/x').set('X-Forwarded-For', '203.0.113.31')).status).toBe(200);
       const limited = await request(second).get('/x').set('X-Forwarded-For', '203.0.113.31');
       expect(limited.status).toBe(429);
-      expect(limited.body).toEqual({ error: 'Daily assessment limit reached for this network' });
+      expect(limited.body).toEqual({
+        error: 'Daily assessment limit reached for this network',
+        code: 'NETWORK_DAILY_LIMIT',
+      });
 
       // A different network retains its own daily budget. Collapsing all
       // populated IPs to an empty fallback key would incorrectly reject it.
@@ -207,6 +234,62 @@ describe('rate limiters', () => {
     // Successful requests still consume the budget exactly as before.
     expect((await request(a).get('/x')).status).toBe(200);
     expect((await request(a).get('/x')).status).toBe(429);
+  });
+
+  it('keeps the assess hit when a request fails after the capacity reservation committed', async () => {
+    config.rateLimit.assessWindowMs = 60_000;
+    config.rateLimit.assessMax = 5;
+    const a = express();
+    a.use((req, _res, next) => {
+      (req as AuthedRequest).user = { id: 'assess-keep-user' } as AuthedRequest['user'];
+      next();
+    });
+    a.use(buildLimiters().assess);
+    // A provider failure AFTER the daily-capacity reservation committed: paid
+    // work was spent, so the usual >=400 refund must be suppressed.
+    a.get('/reserved-failure', (_req, res) => {
+      res.locals.assessmentCapacityReserved = true;
+      res.status(502).json({ error: 'Assessment provider unavailable; please try again', code: 'PROVIDER_FAILED' });
+    });
+
+    const decrement = vi.spyOn(PostgresRateLimitStore.prototype, 'decrement');
+    try {
+      expect((await request(a).get('/reserved-failure')).status).toBe(502);
+      // Refunds run fire-and-forget on response finish; give one a chance to
+      // fire before asserting it never did.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(decrement).not.toHaveBeenCalled();
+      const { rows } = await pool.query<{ hits: number }>(
+        "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = 'assess:60000:5'",
+      );
+      expect(rows[0].hits).toBe(1);
+    } finally {
+      decrement.mockRestore();
+    }
+  });
+
+  it('sheds a counter-store brownout as 503 with Retry-After through the error handler', async () => {
+    config.rateLimit.globalStore = 'postgres';
+    config.rateLimit.globalWindowMs = 60_000;
+    config.rateLimit.globalMax = 5;
+    const a = okApp(buildLimiters().global);
+    a.use(errorHandler);
+    const failure = new Error('database unavailable');
+    const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(failure as never);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const res = await request(a).get('/x');
+      expect(res.status).toBe(503);
+      expect(res.headers['retry-after']).toBe('5');
+      expect(res.body).toEqual({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
+    } finally {
+      warn.mockRestore();
+      query.mockRestore();
+    }
   });
 
   it("does not let one account's failed requests burn the shared per-IP daily assessment budget", async () => {
@@ -245,6 +328,7 @@ describe('rate limiters', () => {
     expect(limitedGrant.status).toBe(429);
     expect(limitedGrant.body).toEqual({
       error: 'Audio upload grant rate limit reached, please try again later',
+      code: 'RATE_LIMITED',
     });
 
     // Authenticated learners behind the same test-agent IP retain independent
@@ -284,7 +368,7 @@ describe('rate limiters', () => {
     }
     const limited = await request(a).get('/x');
     expect(limited.status).toBe(429);
-    expect(limited.body).toEqual({ error: 'Too many requests, please try again later' });
+    expect(limited.body).toEqual({ error: 'Too many requests, please try again later', code: 'RATE_LIMITED' });
   });
 
   it('stores only HMACed client identifiers and removes expired rows', async () => {
@@ -473,5 +557,47 @@ describe('rate limiters', () => {
     );
     expect(rows).toHaveLength(2);
     expect(rows[0].key_hash).not.toBe(rows[1].key_hash);
+  });
+
+  it('purges an expired backlog larger than one janitor batch and leaves live windows alone', async () => {
+    await pool.query(
+      `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
+       SELECT 'janitor-batch-test', encode(sha256(i::text::bytea), 'hex'), 1, now() - interval '2 hours'
+       FROM generate_series(1, $1) AS i`,
+      [JANITOR_BATCH_SIZE + 1],
+    );
+    await pool.query(
+      `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
+       VALUES ('janitor-live-test', encode(sha256('live'::bytea), 'hex'), 1, now() + interval '1 hour')`,
+    );
+
+    await expect(cleanupRateLimitWindows()).resolves.toBe(JANITOR_BATCH_SIZE + 1);
+    const { rows } = await pool.query<{ namespace: string }>('SELECT namespace FROM rate_limit_windows');
+    expect(rows).toEqual([{ namespace: 'janitor-live-test' }]);
+  });
+
+  it('skips the janitor tick while another replica holds its advisory lock, then resumes after release', async () => {
+    await pool.query(
+      `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
+       VALUES ('janitor-lock-test', encode(sha256('locked'::bytea), 'hex'), 1, now() - interval '2 hours')`,
+    );
+    const rival = await pool.connect();
+    try {
+      const locked = await rival.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtext('janitor:rate-limit-windows')) AS locked",
+      );
+      expect(locked.rows[0].locked).toBe(true);
+
+      await expect(cleanupRateLimitWindows()).resolves.toBe(0);
+      const held = await pool.query("SELECT 1 FROM rate_limit_windows WHERE namespace = 'janitor-lock-test'");
+      expect(held.rowCount).toBe(1);
+
+      await rival.query("SELECT pg_advisory_unlock(hashtext('janitor:rate-limit-windows'))");
+      await expect(cleanupRateLimitWindows()).resolves.toBe(1);
+      // Each tick releases the lock afterwards: an immediate rerun still runs.
+      await expect(cleanupRateLimitWindows()).resolves.toBe(0);
+    } finally {
+      rival.release();
+    }
   });
 });

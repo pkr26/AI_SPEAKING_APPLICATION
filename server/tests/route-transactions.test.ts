@@ -153,7 +153,10 @@ describe('assessment route transaction lifecycles', () => {
         answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), question.rows[0].id),
       );
       expect(result.status).toBe(409);
-      expect(result.body).toEqual({ error: 'An assessment is already in progress for this question' });
+      expect(result.body).toEqual({
+        error: 'An assessment is already in progress for this question',
+        code: 'ASSESSMENT_IN_PROGRESS',
+      });
       const claim = leases.find(({ statements }) =>
         statements.some((text) => text.includes('INSERT INTO practice_inflight (user_id, question_id, claim_id)')),
       );

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
@@ -9,13 +9,17 @@ import { config } from '../src/config';
 import { logger } from '../src/logger';
 import {
   AuthedRequest,
+  clientVersionGate,
+  defaultErrorCode,
   errorHandler,
   h,
   HttpError,
   JWT_AUDIENCE,
   JWT_ISSUER,
+  parseClientVersion,
   requireAuth,
   validate,
+  validated,
 } from '../src/middleware';
 import { app, pool, registerUser } from './helpers';
 
@@ -131,7 +135,7 @@ describe('requireAuth', () => {
     try {
       await requireAuth(req, res as never, next);
       expect(res.status).toHaveBeenCalledWith(401);
-      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid or expired token' });
+      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
       expect(query).not.toHaveBeenCalled();
       expect(next).not.toHaveBeenCalled();
     } finally {
@@ -191,7 +195,107 @@ describe('validate', () => {
 
     const rootError = await request(a).post('/root-error').send({ value: 'valid-shape' });
     expect(rootError.status).toBe(400);
-    expect(rootError.body).toEqual({ error: 'root validation failed' });
+    expect(rootError.body).toEqual({ error: 'root validation failed', code: 'VALIDATION_FAILED' });
+  });
+});
+
+describe('validated', () => {
+  it('returns the exact parsed output validate() stored for the schema instance', async () => {
+    const schema = z.object({ value: z.string().transform((value) => value.toUpperCase()) });
+    const a = express();
+    a.use(express.json());
+    a.post('/echo', validate({ body: schema }), (req, res) => res.json(validated(req, schema)));
+    a.use(errorHandler);
+
+    const res = await request(a).post('/echo').send({ value: 'shout' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ value: 'SHOUT' });
+  });
+
+  it('throws loudly when a route reads a schema it never validated', async () => {
+    const validatedSchema = z.object({ value: z.string() });
+    const strangerSchema = z.object({ value: z.string() });
+    const a = express();
+    a.use(express.json());
+    a.post(
+      '/wrong',
+      validate({ body: validatedSchema }),
+      h(async (req, res) => res.json(validated(req, strangerSchema))),
+    );
+    a.use(errorHandler);
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      const res = await request(a).post('/wrong').send({ value: 'x' });
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+      expect(error).toHaveBeenCalledWith(
+        {
+          err: expect.objectContaining({ message: 'validated() called for a schema this request did not validate' }),
+          requestId: undefined,
+        },
+        'unhandled error',
+      );
+    } finally {
+      error.mockRestore();
+    }
+  });
+});
+
+describe('clientVersionGate', () => {
+  const a = app();
+  const savedMinClientVersion = config.minClientVersion;
+
+  afterEach(() => {
+    config.minClientVersion = savedMinClientVersion;
+  });
+
+  it('parses dotted numeric versions and rejects junk', () => {
+    expect(parseClientVersion('1.2.3')).toEqual([1, 2, 3]);
+    expect(parseClientVersion(' 2.0 ')).toEqual([2, 0]);
+    expect(parseClientVersion('7')).toEqual([7]);
+    expect(parseClientVersion('1.2.3.4')).toBeUndefined();
+    expect(parseClientVersion('v1.2')).toBeUndefined();
+    expect(parseClientVersion('1..2')).toBeUndefined();
+    expect(parseClientVersion('')).toBeUndefined();
+  });
+
+  it('rejects an older client with the exact 426 upgrade contract', async () => {
+    config.minClientVersion = '1.4.0';
+    const res = await request(a).get('/health').set('X-Client-Version', '1.3.9');
+    expect(res.status).toBe(426);
+    expect(res.body).toEqual({
+      error: 'This app version is no longer supported; please update it',
+      code: 'CLIENT_UPGRADE_REQUIRED',
+    });
+  });
+
+  it('passes equal and newer versions, comparing missing segments as zero', async () => {
+    config.minClientVersion = '1.4';
+    expect((await request(a).get('/health').set('X-Client-Version', '1.4.0')).status).toBe(200);
+    expect((await request(a).get('/health').set('X-Client-Version', '1.4')).status).toBe(200);
+    expect((await request(a).get('/health').set('X-Client-Version', '2')).status).toBe(200);
+    expect((await request(a).get('/health').set('X-Client-Version', '1.10.0')).status).toBe(200);
+    expect((await request(a).get('/health').set('X-Client-Version', '1.3.9')).status).toBe(426);
+  });
+
+  it('passes through when the gate is disabled or the header is absent or unparseable', async () => {
+    config.minClientVersion = undefined;
+    expect((await request(a).get('/health').set('X-Client-Version', '0.0.1')).status).toBe(200);
+
+    config.minClientVersion = '1.0.0';
+    expect((await request(a).get('/health')).status).toBe(200);
+    expect((await request(a).get('/health').set('X-Client-Version', 'not-a-version')).status).toBe(200);
+  });
+
+  it('is exported as standalone middleware that forwards the 426 as an HttpError', () => {
+    config.minClientVersion = '2.0.0';
+    const next = vi.fn();
+    clientVersionGate({ headers: { 'x-client-version': '1.9.9' } } as never, {} as never, next);
+    expect(next).toHaveBeenCalledOnce();
+    const forwarded = next.mock.calls[0][0] as HttpError;
+    expect(forwarded).toBeInstanceOf(HttpError);
+    expect(forwarded.status).toBe(426);
+    expect(forwarded.code).toBe('CLIENT_UPGRADE_REQUIRED');
   });
 });
 
@@ -203,6 +307,18 @@ describe('errorHandler', () => {
       '/http-error',
       h(async () => {
         throw new HttpError(418, 'teapot', { hint: 'use coffee' });
+      }),
+    );
+    a.get(
+      '/retry-seconds',
+      h(async () => {
+        throw new HttpError(503, 'busy', { retryAfterSeconds: 7 }, 'CAPACITY_BUSY');
+      }),
+    );
+    a.get(
+      '/retry-hours',
+      h(async () => {
+        throw new HttpError(429, 'capped', { retryAfterHours: 3 }, 'DAILY_LIMIT');
       }),
     );
     a.get('/multer-size', (_req, _res, next) => next(new multer.MulterError('LIMIT_FILE_SIZE')));
@@ -222,7 +338,41 @@ describe('errorHandler', () => {
   it('maps HttpError to its status and spreads extra fields', async () => {
     const res = await request(buildApp()).get('/http-error');
     expect(res.status).toBe(418);
-    expect(res.body).toEqual({ error: 'teapot', hint: 'use coffee' });
+    expect(res.body).toEqual({ error: 'teapot', code: 'VALIDATION_FAILED', hint: 'use coffee' });
+    // No retry extras: the uniform contract must not invent a header.
+    expect(res.headers['retry-after']).toBeUndefined();
+  });
+
+  it('advertises Retry-After uniformly for second- and hour-denominated retry extras', async () => {
+    const seconds = await request(buildApp()).get('/retry-seconds');
+    expect(seconds.status).toBe(503);
+    expect(seconds.headers['retry-after']).toBe('7');
+    expect(seconds.body).toEqual({ error: 'busy', code: 'CAPACITY_BUSY', retryAfterSeconds: 7 });
+
+    const hours = await request(buildApp()).get('/retry-hours');
+    expect(hours.status).toBe(429);
+    expect(hours.headers['retry-after']).toBe('10800'); // 3 hours in seconds
+    expect(hours.body).toEqual({ error: 'capped', code: 'DAILY_LIMIT', retryAfterHours: 3 });
+  });
+
+  it('defaults missing codes by status family and keeps explicit codes', () => {
+    expect(defaultErrorCode(400)).toBe('VALIDATION_FAILED');
+    expect(defaultErrorCode(401)).toBe('UNAUTHENTICATED');
+    expect(defaultErrorCode(403)).toBe('FORBIDDEN');
+    expect(defaultErrorCode(404)).toBe('NOT_FOUND');
+    expect(defaultErrorCode(409)).toBe('VALIDATION_FAILED');
+    expect(defaultErrorCode(418)).toBe('VALIDATION_FAILED');
+    expect(defaultErrorCode(429)).toBe('RATE_LIMITED');
+    expect(defaultErrorCode(500)).toBe('INTERNAL');
+    expect(defaultErrorCode(503)).toBe('INTERNAL');
+
+    expect(new HttpError(409, 'x', 'QUESTION_MISMATCH').code).toBe('QUESTION_MISMATCH');
+    expect(new HttpError(409, 'x', { a: 1 }, 'STATE_CHANGED')).toMatchObject({
+      extra: { a: 1 },
+      code: 'STATE_CHANGED',
+    });
+    expect(new HttpError(418, 'x').code).toBeUndefined();
+    expect(new HttpError(418, 'x', { a: 1 }).extra).toEqual({ a: 1 });
   });
 
   it('maps MulterError LIMIT_FILE_SIZE to 413 and other codes to 400', async () => {
@@ -247,7 +397,7 @@ describe('errorHandler', () => {
       .set('Content-Type', 'application/json')
       .send(JSON.stringify({ value: 'x'.repeat(110 * 1024) }));
     expect(res.status).toBe(413);
-    expect(res.body).toEqual({ error: 'Request body is too large' });
+    expect(res.body).toEqual({ error: 'Request body is too large', code: 'VALIDATION_FAILED' });
   });
 
   it('maps unsupported JSON encodings and charsets to 415', async () => {
@@ -257,14 +407,14 @@ describe('errorHandler', () => {
       .set('Content-Encoding', 'made-up')
       .send('{"ok":true}');
     expect(encoding.status).toBe(415);
-    expect(encoding.body).toEqual({ error: 'Unsupported request body encoding' });
+    expect(encoding.body).toEqual({ error: 'Unsupported request body encoding', code: 'VALIDATION_FAILED' });
 
     const charset = await request(buildApp())
       .post('/anything')
       .set('Content-Type', 'application/json; charset=iso-8859-1')
       .send('{"ok":true}');
     expect(charset.status).toBe(415);
-    expect(charset.body).toEqual({ error: 'Unsupported request body encoding' });
+    expect(charset.body).toEqual({ error: 'Unsupported request body encoding', code: 'VALIDATION_FAILED' });
   });
 
   it.each(['/request-aborted', '/request-size-invalid'])(
@@ -272,7 +422,7 @@ describe('errorHandler', () => {
     async (path) => {
       const res = await request(buildApp()).get(path);
       expect(res.status).toBe(400);
-      expect(res.body).toEqual({ error: 'Invalid request body' });
+      expect(res.body).toEqual({ error: 'Invalid request body', code: 'VALIDATION_FAILED' });
     },
   );
 
@@ -281,7 +431,7 @@ describe('errorHandler', () => {
     try {
       const res = await request(buildApp()).get('/boom');
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ error: 'Internal server error' });
+      expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       expect(error).toHaveBeenCalledWith({ err: expect.any(Error), requestId: undefined }, 'unhandled error');
     } finally {
       error.mockRestore();

@@ -28,9 +28,14 @@ const MAX_DECODED_BYTES = Math.floor(MAX_AUDIO_DURATION_SECONDS * DECODED_BYTES_
 // process slot is unavailable.
 let inspectionsInFlight = 0;
 
+/** Live slot count backing the audio_inspection_slots_in_use gauge (metrics.ts). */
+export function getAudioInspectionSlotsInUse(): number {
+  return inspectionsInFlight;
+}
+
 function acquireInspectionSlot(): () => void {
   if (inspectionsInFlight >= config.audioInspectionMaxConcurrency) {
-    throw new HttpError(503, 'Audio inspection capacity busy', { retryAfterSeconds: 2 });
+    throw new HttpError(503, 'Audio inspection capacity busy', { retryAfterSeconds: 2 }, 'CAPACITY_BUSY');
   }
   inspectionsInFlight++;
   let released = false;
@@ -543,15 +548,15 @@ export async function verifyAudioDuration(filePath: string): Promise<true> {
     if (error instanceof InspectionError && error.kind === 'timeout') {
       throw new HttpError(503, 'Audio inspection timed out; please try again', { retryAfterSeconds: 5 });
     }
-    throw new HttpError(415, 'Invalid or unsupported audio file');
+    throw new HttpError(415, 'Invalid or unsupported audio file', 'AUDIO_UNREADABLE');
   } finally {
     releaseSlot();
   }
   if (duration < MIN_AUDIO_DURATION_SECONDS) {
-    throw new HttpError(422, 'Recording is too short to assess');
+    throw new HttpError(422, 'Recording is too short to assess', 'AUDIO_INVALID');
   }
   if (duration > MAX_AUDIO_DURATION_SECONDS) {
-    throw new HttpError(413, 'Recording must be two minutes or shorter');
+    throw new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG');
   }
   return true;
 }

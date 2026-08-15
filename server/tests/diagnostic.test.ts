@@ -177,12 +177,57 @@ describe('diagnostic', () => {
       .field('requestId', requestId);
 
     expect(response.status).toBe(400);
-    expect(response.body).toEqual({ error: 'audio file is required' });
+    expect(response.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
     const claims = await pool.query(
       'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
       [userId, requestId],
     );
     expect(claims.rows[0].count).toBe(0);
+  });
+
+  it('rejects an already-completed diagnostic before the audio gate and abandons its request claim', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    await pool.query("UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1", [userId]);
+    const requestId = randomUUID();
+
+    // No audio attached: the completed-diagnostic rejection must win over the
+    // missing-audio 400, and the request UUID claimed on entry must be
+    // abandoned so a future retake can reuse it.
+    const response = await request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .field('questionId', next.body.question.id)
+      .field('requestId', requestId);
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'Diagnostic already completed', code: 'DIAGNOSTIC_DONE' });
+    const claims = await pool.query(
+      'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(claims.rows[0].count).toBe(0);
+  });
+
+  it('requires the audio file before the durable claim rejects a wrong-question submission', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const { rows } = await pool.query('SELECT id FROM questions WHERE id != $1 LIMIT 1', [next.body.question.id]);
+
+    // A known-but-unserved question without audio: the audio gate answers
+    // first (400), because the question-mismatch 409 belongs to the durable
+    // claim taken only after the audio checks pass.
+    const response = await request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .field('questionId', rows[0].id)
+      .field('requestId', randomUUID());
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
   });
 
   it('cleans uploaded audio when multipart field validation fails', async () => {

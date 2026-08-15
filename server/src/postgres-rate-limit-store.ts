@@ -2,7 +2,9 @@ import { createHmac } from 'crypto';
 import type { ClientRateLimitInfo, Store } from 'express-rate-limit';
 import { config } from './config';
 import { pool } from './db';
+import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
 import { logger } from './logger';
+import { shedRequestsTotal } from './metrics';
 import { HttpError } from './middleware';
 
 interface CounterRow {
@@ -54,7 +56,8 @@ export class PostgresRateLimitStore implements Store {
       // database brownout here is backpressure, not an application fault: fail
       // closed as a retryable 503 instead of an unhandled 500.
       logger.warn({ err, namespace: this.namespace }, 'rate-limit increment failed; shedding request');
-      throw new HttpError(503, 'Server is busy, please try again shortly', { retryAfterSeconds: 5 });
+      shedRequestsTotal.inc({ reason: 'store_brownout' });
+      throw new HttpError(503, 'Server is busy, please try again shortly', { retryAfterSeconds: 5 }, 'POOL_SATURATED');
     }
     const row = rows[0];
     if (!row) throw new Error('rate limit counter was not returned');
@@ -97,6 +100,13 @@ export class PostgresRateLimitStore implements Store {
 }
 
 export async function cleanupRateLimitWindows(): Promise<number> {
-  const removed = await pool.query("DELETE FROM rate_limit_windows WHERE reset_at < now() - interval '1 hour'");
-  return removed.rowCount ?? 0;
+  return runExclusiveBatchedDelete(
+    'janitor:rate-limit-windows',
+    `DELETE FROM rate_limit_windows
+     WHERE ctid IN (
+       SELECT ctid FROM rate_limit_windows
+       WHERE reset_at < now() - interval '1 hour'
+       LIMIT ${JANITOR_BATCH_SIZE}
+     )`,
+  );
 }

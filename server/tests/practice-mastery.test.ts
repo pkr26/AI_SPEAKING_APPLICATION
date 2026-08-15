@@ -84,7 +84,7 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     });
   });
 
-  it('never downgrades a mastered word and keeps the best score', async () => {
+  it('keeps a mastered word mastered on a 60-74 retention pass but demotes it on a failed attempt', async () => {
     const { token, userId } = await freshUser();
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const questionId = q.body.question.id as string;
@@ -95,13 +95,25 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     random.mockReturnValue(SCORE_HIGH);
     expect((await attempt()).body).toMatchObject({ mastered: true, score: 95 });
 
-    random.mockReturnValue(SCORE_LOW);
-    const failed = await attempt();
-    expect(failed.body).toMatchObject({ passed: false, mastered: false, score: 40, attemptNo: 1 });
+    // A mediocre retention pass (60-74) never downgrades mastery.
+    random.mockReturnValue(SCORE_74);
+    const retained = await attempt();
+    expect(retained.body).toMatchObject({ passed: true, mastered: false, score: 74, attemptNo: 1 });
     expect(await progressRow(userId, questionId)).toEqual({
       status: 'mastered',
       best_score: 95,
       attempt_count: 2,
+    });
+
+    // A failed retention attempt (<60) is the one downgrade path: back to
+    // learning while the historical best score is kept.
+    random.mockReturnValue(SCORE_LOW);
+    const failed = await attempt();
+    expect(failed.body).toMatchObject({ passed: false, mastered: false, score: 40, attemptNo: 1 });
+    expect(await progressRow(userId, questionId)).toEqual({
+      status: 'learning',
+      best_score: 95,
+      attempt_count: 3,
     });
   });
 
@@ -130,10 +142,10 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     expect(next.body.question.id).not.toBe(questionId);
   });
 
-  it('serves the oldest mastered word as retention revision when the level is exhausted', async () => {
+  it('serves the most overdue mastered word as retention revision when the level is exhausted', async () => {
     const { token, userId, level } = await freshUser();
     await pool.query(
-      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, last_attempt_at)
+      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, due_at)
        SELECT $1, id, 'mastered', 90, 1,
               now() - (row_number() OVER (ORDER BY id) || ' days')::interval
        FROM questions WHERE cefr_level = $2`,
@@ -141,7 +153,7 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     );
     const expected = await pool.query<{ question_id: string }>(
       `SELECT question_id FROM practice_progress
-       WHERE user_id = $1 ORDER BY last_attempt_at ASC LIMIT 1`,
+       WHERE user_id = $1 ORDER BY due_at ASC LIMIT 1`,
       [userId],
     );
 
@@ -154,20 +166,24 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     expect(r.body.progress.learningCount).toBe(0);
   });
 
-  it('reports mastered and learning counts in the progress snapshot', async () => {
+  it('reports mastered, learning, and due counts in the progress snapshot', async () => {
     const { token, userId, level } = await freshUser();
     const questions = await pool.query<{ id: string }>(
       'SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id LIMIT 3',
       [level],
     );
     const [m1, m2, learning] = questions.rows;
-    for (const m of [m1, m2]) {
-      await pool.query(
-        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count)
-         VALUES ($1, $2, 'mastered', 90, 1)`,
-        [userId, m.id],
-      );
-    }
+    // One mastered word is due now (default due_at), the other only tomorrow.
+    await pool.query(
+      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count)
+       VALUES ($1, $2, 'mastered', 90, 1)`,
+      [userId, m1.id],
+    );
+    await pool.query(
+      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, due_at)
+       VALUES ($1, $2, 'mastered', 90, 1, now() + interval '1 day')`,
+      [userId, m2.id],
+    );
     await pool.query(
       `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count)
        VALUES ($1, $2, 'learning', 55, 2)`,
@@ -184,6 +200,7 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
       masteredCount: 2,
       learningCount: 1,
       totalAtLevel: total.rows[0].n,
+      dueCount: 2,
     });
     // A learning word exists and there is no attempt history: revision opens.
     expect(r.body.kind).toBe('revision');

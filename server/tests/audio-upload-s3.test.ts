@@ -196,7 +196,10 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
         .send({ contentType: 'audio/mp4' });
       expect(limited.status).toBe(429);
       expect(limited.headers['cache-control']).toBe('no-store');
-      expect(limited.body).toEqual({ error: 'Audio upload grant rate limit reached, please try again later' });
+      expect(limited.body).toEqual({
+        error: 'Audio upload grant rate limit reached, please try again later',
+        code: 'RATE_LIMITED',
+      });
 
       expect(
         (
@@ -561,28 +564,29 @@ describe('S3 object download boundaries', () => {
       return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()), ContentLength: MAX_AUDIO_BYTES });
     });
 
+    let file: { path: string } | undefined;
     try {
-      await resolvePresignedAudio(req, res as never);
+      file = await resolvePresignedAudio(req, res as never);
 
-      expect(req.file?.path).toBeTruthy();
+      expect(file.path).toBeTruthy();
       expect(sendMock.mock.calls[0][0]).toEqual({
         kind: 'get',
         input: { Bucket: config.s3.bucket, Key: req.body.audioKey },
       });
       expect(observedSignal).toBeInstanceOf(AbortSignal);
-      expect(createWriteStream).toHaveBeenCalledWith(req.file!.path, { flags: 'wx', mode: 0o600 });
-      expect(chmod).toHaveBeenCalledWith(req.file!.path, 0o600);
-      const stat = await fs.stat(req.file!.path);
+      expect(createWriteStream).toHaveBeenCalledWith(file.path, { flags: 'wx', mode: 0o600 });
+      expect(chmod).toHaveBeenCalledWith(file.path, 0o600);
+      const stat = await fs.stat(file.path);
       expect(stat.mode & 0o777).toBe(0o600);
       res.emit('finish');
       await vi.waitFor(async () => {
-        await expect(fs.stat(req.file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(fs.stat(file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
       });
     } finally {
       // A killed mutant or failed assertion must not leave a private fixture in
       // the shared uploads directory. The second emit is harmless (`once`).
       res.emit('finish');
-      if (req.file?.path) await fs.rm(req.file.path, { force: true });
+      if (file?.path) await fs.rm(file.path, { force: true });
       createWriteStream.mockRestore();
       chmod.mockRestore();
     }
@@ -623,13 +627,14 @@ describe('S3 object download boundaries', () => {
       return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
     });
 
+    let file: { path: string } | undefined;
     try {
-      await resolvePresignedAudio(req, res as never);
+      file = await resolvePresignedAudio(req, res as never);
       await vi.advanceTimersByTimeAsync(20);
       expect(observedSignal?.aborted).toBe(false);
     } finally {
       res.emit('finish');
-      if (req.file?.path) await fs.rm(req.file.path, { force: true });
+      if (file?.path) await fs.rm(file.path, { force: true });
       config.s3.operationTimeoutMs = previousTimeout;
       vi.useRealTimers();
     }
@@ -666,17 +671,18 @@ describe('S3 object download boundaries', () => {
     const unlink = vi.spyOn(fsSync, 'unlink');
     sendMock.mockResolvedValue({ Body: Readable.from(fakeM4aBuffer()) });
 
+    let file: { path: string } | undefined;
     try {
-      await resolvePresignedAudio(req, res as never);
+      file = await resolvePresignedAudio(req, res as never);
       res.emit('finish');
       res.emit('close');
 
-      expect(unlink.mock.calls.filter(([filePath]) => filePath === req.file!.path)).toHaveLength(1);
+      expect(unlink.mock.calls.filter(([filePath]) => filePath === file!.path)).toHaveLength(1);
       await vi.waitFor(async () => {
-        await expect(fs.stat(req.file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(fs.stat(file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
       });
     } finally {
-      if (req.file?.path) await fs.rm(req.file.path, { force: true });
+      if (file?.path) await fs.rm(file.path, { force: true });
       unlink.mockRestore();
     }
   });
@@ -709,12 +715,13 @@ describe('S3 object download boundaries', () => {
       ContentLength: String(MAX_AUDIO_BYTES + 1),
     });
 
+    let file: { path: string } | undefined;
     try {
-      await expect(resolvePresignedAudio(req, res as never)).resolves.toBeUndefined();
-      expect(req.file?.path).toBeTruthy();
+      file = await resolvePresignedAudio(req, res as never);
+      expect(file.path).toBeTruthy();
     } finally {
       res.emit('finish');
-      if (req.file?.path) await fs.rm(req.file.path, { force: true });
+      if (file?.path) await fs.rm(file.path, { force: true });
     }
   });
 
@@ -736,18 +743,19 @@ describe('S3 object download boundaries', () => {
     const unlink = vi.spyOn(fsSync, 'unlink');
     sendMock.mockResolvedValue({ Body: Readable.from(fakeM4aBuffer()) });
 
+    let file: { path: string } | undefined;
     try {
-      await resolvePresignedAudio(req, res as never);
-      expect(req.file?.path).toBeTruthy();
-      await expect(fs.stat(req.file!.path)).resolves.toBeTruthy();
+      file = await resolvePresignedAudio(req, res as never);
+      expect(file.path).toBeTruthy();
+      await expect(fs.stat(file.path)).resolves.toBeTruthy();
       res.emit('close');
       await vi.waitFor(async () => {
-        await expect(fs.stat(req.file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(fs.stat(file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
       });
-      expect(unlink.mock.calls.filter(([filePath]) => filePath === req.file!.path)).toHaveLength(1);
+      expect(unlink.mock.calls.filter(([filePath]) => filePath === file!.path)).toHaveLength(1);
     } finally {
       res.emit('close');
-      if (req.file?.path) await fs.rm(req.file.path, { force: true });
+      if (file?.path) await fs.rm(file.path, { force: true });
       unlink.mockRestore();
     }
   });
@@ -961,6 +969,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       expect(loser.status).toBe(409);
       expect(loser.body).toEqual({
         error: 'Assessment is still processing',
+        code: 'REQUEST_IN_FLIGHT',
         retryAfterSeconds: 2,
       });
       expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
@@ -997,7 +1006,11 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
         .send({ questionId, requestId, audioKey });
 
       expect(loser.status).toBe(409);
-      expect(loser.body).toEqual({ error: 'Assessment is still processing', retryAfterSeconds: 2 });
+      expect(loser.body).toEqual({
+        error: 'Assessment is still processing',
+        code: 'REQUEST_IN_FLIGHT',
+        retryAfterSeconds: 2,
+      });
       expect(
         query.mock.calls.filter(
           ([text]) =>
@@ -1035,7 +1048,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
         .send({ questionId, requestId: randomUUID(), audioKey });
 
       expect(response.status).toBe(500);
-      expect(response.body).toEqual({ error: 'Internal server error' });
+      expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       // Error-path finalization runs from the response-finish listener, which
       // sees the real status the error handler set.
       await vi.waitFor(() => {
@@ -1242,7 +1255,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
         .set('Authorization', `Bearer ${token}`)
         .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
       expect(res.status).toBe(504);
-      expect(res.body).toEqual({ error: 'Audio storage timed out; please try again' });
+      expect(res.body).toEqual({ error: 'Audio storage timed out; please try again', code: 'PROVIDER_TIMEOUT' });
     } finally {
       config.s3.operationTimeoutMs = previousTimeout;
     }
@@ -1314,7 +1327,10 @@ describe('POST /practice/attempt (S3 mode)', () => {
         .send({ questionId, requestId: randomUUID(), audioKey });
 
       expect(response.status).toBe(409);
-      expect(response.body).toEqual({ error: 'An assessment is already in progress for this question' });
+      expect(response.body).toEqual({
+        error: 'An assessment is already in progress for this question',
+        code: 'ASSESSMENT_IN_PROGRESS',
+      });
       // A route-thrown 409 must preserve the object: the response-finish
       // finalizer sees the real status and keeps it for the active owner.
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
@@ -1412,7 +1428,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       .send({ questionId: randomUUID(), requestId, audioKey });
 
     expect(response.status).toBe(404);
-    expect(response.body).toEqual({ error: 'Question not found' });
+    expect(response.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
     await vi.waitFor(() => {
       expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
     });
@@ -1449,7 +1465,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
         .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey });
 
       expect(response.status).toBe(500);
-      expect(response.body).toEqual({ error: 'Internal server error' });
+      expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       // Error-path finalization runs from the response-finish listener, which
       // sees the real status the error handler set.
       await vi.waitFor(() => {
@@ -1530,6 +1546,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       expect(loser.status).toBe(409);
       expect(loser.body).toEqual({
         error: 'Assessment is still processing',
+        code: 'REQUEST_IN_FLIGHT',
         retryAfterSeconds: 2,
       });
       expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);

@@ -169,14 +169,30 @@ describe('diagnostic transaction rollback precedence', () => {
             rowCount: 1,
           };
         }
-        if (text.includes('SELECT * FROM questions')) return { rows: [], rowCount: 0 };
+        if (text.includes('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions'))
+          return { rows: [], rowCount: 0 };
         throw new Error(`unexpected diagnostic query: ${text}`);
       }),
       release: vi.fn(),
     };
     vi.spyOn(pool, 'query').mockImplementation(async (text: string) => {
       if (text === 'SELECT * FROM users WHERE id = $1') return { rows: [user], rowCount: 1 } as never;
-      if (text === 'SELECT 1 FROM questions WHERE id = $1') return { rows: [{}], rowCount: 1 } as never;
+      // The shared submission pipeline's typed-row pre-check still sees the
+      // question; it disappears before the claim transaction re-reads it.
+      if (text === 'SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1') {
+        return {
+          rows: [
+            {
+              id: questionId,
+              cefr_level: 'B1',
+              prompt_word: 'hometown',
+              question_text: 'Describe it.',
+              translations: {},
+            },
+          ],
+          rowCount: 1,
+        } as never;
+      }
       if (text.includes('DELETE FROM assessment_requests')) return { rows: [], rowCount: 1 } as never;
       throw new Error(`unexpected pool query: ${text}`);
     });
@@ -185,7 +201,15 @@ describe('diagnostic transaction rollback precedence', () => {
       .mockResolvedValueOnce(diagnosticClient as never);
     const pass: RequestHandler = (_req, _res, next) => next();
     const direct = express();
-    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass, assessAbortGuard: pass } as Limiters));
+    direct.use(
+      '/diagnostic',
+      createDiagnosticRouter({
+        assess: pass,
+        assessIpDaily: pass,
+        assessAbortGuard: pass,
+        diagnosticRestart: pass,
+      } as Limiters),
+    );
     direct.use(errorHandler);
 
     const response = await request(direct)
@@ -199,13 +223,13 @@ describe('diagnostic transaction rollback precedence', () => {
       .field('requestId', requestId);
 
     expect(response.status).toBe(404);
-    expect(response.body).toEqual({ error: 'Question not found' });
+    expect(response.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
     expect(requestClaimClient.release).toHaveBeenCalledOnce();
     expect(diagnosticClient.release).toHaveBeenCalledOnce();
     expect(diagnosticClient.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
       expect.stringContaining('SELECT * FROM diagnostic_state'),
-      expect.stringContaining('SELECT * FROM questions'),
+      expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions'),
       'ROLLBACK',
     ]);
   });
@@ -242,13 +266,21 @@ describe('diagnostic transaction rollback precedence', () => {
     vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
     const pass: RequestHandler = (_req, _res, next) => next();
     const direct = express();
-    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass, assessAbortGuard: pass } as Limiters));
+    direct.use(
+      '/diagnostic',
+      createDiagnosticRouter({
+        assess: pass,
+        assessIpDaily: pass,
+        assessAbortGuard: pass,
+        diagnosticRestart: pass,
+      } as Limiters),
+    );
     direct.use(errorHandler);
 
     const response = await request(direct).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
 
     expect(response.status).toBe(409);
-    expect(response.body).toEqual({ error: 'diagnostic transaction failed' });
+    expect(response.body).toEqual({ error: 'diagnostic transaction failed', code: 'VALIDATION_FAILED' });
     expect(client.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
       expect.stringContaining('SELECT * FROM diagnostic_state'),

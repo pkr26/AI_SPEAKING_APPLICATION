@@ -10,7 +10,7 @@ import { z } from 'zod';
 import { config } from './config';
 import { isAssessmentRequestProcessing } from './idempotency';
 import { logger } from './logger';
-import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
+import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
 import { AUDIO_TYPES, MAX_AUDIO_BYTES, uploadsDir } from './upload';
 
@@ -70,7 +70,7 @@ export function createAudioSizeCap(maxBytes = MAX_AUDIO_BYTES): Transform {
     transform(chunk: Buffer, _encoding, callback) {
       received += chunk.length;
       if (received > maxBytes) {
-        callback(new HttpError(413, 'Audio file is too large'));
+        callback(new HttpError(413, 'Audio file is too large', 'AUDIO_TOO_LARGE'));
       } else {
         callback(null, chunk);
       }
@@ -144,11 +144,11 @@ export function createAudioUploadRouter(limiters: Limiters) {
     ...(config.s3.bucket ? [limiters.uploadGrant] : []),
     validate({ body: audioUrlBodySchema }),
     h(async (req: AuthedRequest, res) => {
-      const { contentType: requestedContentType } = req.body as z.infer<typeof audioUrlBodySchema>;
+      const { contentType: requestedContentType } = validated(req, audioUrlBodySchema);
       const contentType = requestedContentType.trim().toLowerCase();
       const ext = contentTypeToExt(contentType);
       if (!ext) {
-        throw new HttpError(415, 'Unsupported audio media type');
+        throw new HttpError(415, 'Unsupported audio media type', 'AUDIO_INVALID');
       }
       if (!config.s3.bucket) {
         return res.json({ mode: 'direct' });
@@ -294,13 +294,25 @@ export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next
 };
 
 /**
- * S3-mode audio ingress: downloads the object referenced by the validated
- * `audioKey` body field into a private temp file and exposes it as `req.file`,
- * so downstream handlers (magic-byte check, assessment, unlink) are identical
- * to the multipart flow. A route middleware registered before validation
- * discards the S3 object when the response finishes.
+ * The slice of an uploaded audio file the assessment pipeline consumes.
+ * Multer's Express.Multer.File satisfies it structurally, and the S3 download
+ * below produces it honestly instead of casting a partial object to the full
+ * multer shape.
  */
-export async function resolvePresignedAudio(authed: AuthedRequest, res: Response): Promise<void> {
+export interface SubmittedAudioFile {
+  path: string;
+  originalname: string;
+}
+
+/**
+ * S3-mode audio ingress: downloads the object referenced by the validated
+ * `audioKey` body field into a private temp file and returns it in the same
+ * shape routes read off `req.file`, so downstream handling (magic-byte check,
+ * assessment, unlink) is identical to the multipart flow. A route middleware
+ * registered before validation discards the S3 object when the response
+ * finishes.
+ */
+export async function resolvePresignedAudio(authed: AuthedRequest, res: Response): Promise<SubmittedAudioFile> {
   const audioKey = (authed.body as { audioKey?: string }).audioKey;
   if (!audioKey || !isOwnedAudioKey(authed.user!.id, audioKey)) {
     throw new HttpError(400, 'audioKey is missing or invalid');
@@ -340,20 +352,17 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     cleanup();
     if (err instanceof HttpError) throw err;
     if (controller.signal.aborted || (err as { name?: string }).name === 'AbortError') {
-      throw new HttpError(504, 'Audio storage timed out; please try again');
+      throw new HttpError(504, 'Audio storage timed out; please try again', 'PROVIDER_TIMEOUT');
     }
     const s3Err = err as { name?: string };
     if (s3Err.name === 'NoSuchKey' || s3Err.name === 'NotFound' || s3Err.name === '404') {
       throw new HttpError(400, 'audio upload not found or expired');
     }
     logger.warn({ err, userId: authed.user!.id }, 'failed to fetch audio from S3');
-    throw new HttpError(502, 'Audio storage unavailable; please try again');
+    throw new HttpError(502, 'Audio storage unavailable; please try again', 'PROVIDER_FAILED');
   } finally {
     clearTimeout(operationTimer);
   }
 
-  authed.file = {
-    path: tempPath,
-    originalname: path.basename(audioKey),
-  } as Express.Multer.File;
+  return { path: tempPath, originalname: path.basename(audioKey) };
 }

@@ -23,17 +23,27 @@ export function buildLimiters() {
   const common = {
     standardHeaders: true as const,
     legacyHeaders: false as const,
-    message: { error: 'Too many requests, please try again later' },
+    message: { error: 'Too many requests, please try again later', code: 'RATE_LIMITED' },
   };
 
+  // The global limiter is a coarse per-IP flood brake, not a security budget.
+  // With RATE_LIMIT_GLOBAL_STORE=memory (the default) it uses express-rate-
+  // limit's in-process store: the budget is enforced per replica and busy
+  // traffic never writes a counter row per client IP. 'postgres' opts into one
+  // cluster-wide budget through the shared store; the security limiters below
+  // are always PostgreSQL-backed regardless.
   const global = rateLimit({
     ...common,
     windowMs: config.rateLimit.globalWindowMs,
     limit: config.rateLimit.globalMax,
-    store: new PostgresRateLimitStore(
-      `global:${config.rateLimit.globalWindowMs}:${config.rateLimit.globalMax}`,
-      config.rateLimit.globalWindowMs,
-    ),
+    ...(config.rateLimit.globalStore === 'postgres'
+      ? {
+          store: new PostgresRateLimitStore(
+            `global:${config.rateLimit.globalWindowMs}:${config.rateLimit.globalMax}`,
+            config.rateLimit.globalWindowMs,
+          ),
+        }
+      : {}),
   });
 
   const auth = rateLimit({
@@ -44,7 +54,7 @@ export function buildLimiters() {
       `auth:${config.rateLimit.authWindowMs}:${config.rateLimit.authMax}`,
       config.rateLimit.authWindowMs,
     ),
-    message: { error: 'Too many attempts, please try again later' },
+    message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
   });
 
   // This second login budget follows the normalized account identifier across
@@ -103,6 +113,34 @@ export function buildLimiters() {
     skipSuccessfulRequests: true,
   });
 
+  // Password-reset requests follow the normalized TARGET email across source
+  // IPs (same key shape as loginAccount) so distributed requests cannot spam
+  // one mailbox or churn one account's active reset token. Over-budget
+  // requests are not rejected: the route sees the flag, silently skips
+  // issuing/sending, and still answers the uniform 204 — a 429 here would
+  // leak throttling state and break the always-204 anti-enumeration contract.
+  // Unlike loginAccount there is no success refund: every issued mail counts.
+  const forgotPasswordEmail = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.forgotEmailWindowMs,
+    limit: config.rateLimit.forgotEmailMax,
+    store: new PostgresRateLimitStore(
+      `forgot-email:${config.rateLimit.forgotEmailWindowMs}:${config.rateLimit.forgotEmailMax}`,
+      config.rateLimit.forgotEmailWindowMs,
+    ),
+    skip: (req) => normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email) === undefined,
+    keyGenerator: (req) => {
+      const email = normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email);
+      // `skip` excludes this case before key generation; retain a stable
+      // defensive value for custom express-rate-limit implementations.
+      return email ? `email:${email}` : 'email:invalid';
+    },
+    handler: (_req, res, next) => {
+      res.locals.forgotEmailThrottled = true;
+      next();
+    },
+  });
+
   // Registration gets its own tighter per-IP budget: bulk account creation is
   // the entry point for both account-cycling spend and email enumeration.
   const register = rateLimit({
@@ -114,7 +152,29 @@ export function buildLimiters() {
       config.rateLimit.registerWindowMs,
     ),
     keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
-    message: { error: 'Too many accounts created from this network, please try again later' },
+    message: { error: 'Too many accounts created from this network, please try again later', code: 'RATE_LIMITED' },
+  });
+
+  // Restarting the placement test resets the learner's level, so it shares
+  // the passwordAccount budget shape (PG-backed, per authenticated user).
+  // Unlike the credential budgets it rejects outright: the operation is
+  // destructive-ish and every accepted request counts, so there is no
+  // always-verify pass-through and no success refund.
+  const diagnosticRestart = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.passwordWindowMs,
+    limit: config.rateLimit.passwordMax,
+    store: new PostgresRateLimitStore(
+      `diagnostic-restart:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
+      config.rateLimit.passwordWindowMs,
+    ),
+    // Mounted after requireAuth; the user is always present. The IP fallback
+    // only protects against a future route that forgets that ordering.
+    keyGenerator: (req) => {
+      const user = (req as AuthedRequest).user;
+      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
+    },
+    message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
   });
 
   // Readiness performs a database query and may be reachable outside the
@@ -138,7 +198,10 @@ export function buildLimiters() {
   // so shared networks don't let one user exhaust another's budget. Failed
   // (>=400) requests that never reached paid work are refunded on response
   // finish. The store's decrement is window-guarded and fail-safe (the same
-  // refund path the login limiter already relies on).
+  // refund path the login limiter already relies on). Note that a silence
+  // (empty-transcript) response deliberately keeps its hit even though the
+  // practice attempt counter treats it as a free retry: the Whisper
+  // transcription that detected the silence already spent real provider money.
   const assessStore = new PostgresRateLimitStore(
     `assess:${config.rateLimit.assessWindowMs}:${config.rateLimit.assessMax}`,
     config.rateLimit.assessWindowMs,
@@ -154,7 +217,7 @@ export function buildLimiters() {
     },
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
-    message: { error: 'Assessment rate limit reached, please slow down' },
+    message: { error: 'Assessment rate limit reached, please slow down', code: 'RATE_LIMITED' },
   });
 
   // Per-user daily caps reset with every re-registered account, so a spender
@@ -178,7 +241,7 @@ export function buildLimiters() {
     keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
-    message: { error: 'Daily assessment limit reached for this network' },
+    message: { error: 'Daily assessment limit reached for this network', code: 'NETWORK_DAILY_LIMIT' },
   });
 
   // express-rate-limit refunds an aborted request unconditionally on 'close'
@@ -221,7 +284,7 @@ export function buildLimiters() {
       const user = (req as AuthedRequest).user;
       return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
     },
-    message: { error: 'Audio upload grant rate limit reached, please try again later' },
+    message: { error: 'Audio upload grant rate limit reached, please try again later', code: 'RATE_LIMITED' },
   });
 
   return {
@@ -229,6 +292,8 @@ export function buildLimiters() {
     auth,
     loginAccount,
     passwordAccount,
+    forgotPasswordEmail,
+    diagnosticRestart,
     readiness,
     register,
     assess,

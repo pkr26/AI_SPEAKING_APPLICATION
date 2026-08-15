@@ -35,7 +35,7 @@ describe('POST /uploads/audio-url', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ contentType: 'text/plain' });
     expect(res.status).toBe(415);
-    expect(res.body).toEqual({ error: 'Unsupported audio media type' });
+    expect(res.body).toEqual({ error: 'Unsupported audio media type', code: 'AUDIO_INVALID' });
   });
 
   it('returns 415 for prototype-chain content types that inherit truthy members', async () => {
@@ -48,7 +48,7 @@ describe('POST /uploads/audio-url', () => {
         .set('Authorization', `Bearer ${token}`)
         .send({ contentType });
       expect(res.status).toBe(415);
-      expect(res.body).toEqual({ error: 'Unsupported audio media type' });
+      expect(res.body).toEqual({ error: 'Unsupported audio media type', code: 'AUDIO_INVALID' });
     }
   });
 });

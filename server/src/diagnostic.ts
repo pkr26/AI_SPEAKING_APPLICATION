@@ -1,31 +1,15 @@
 import { randomUUID } from 'crypto';
 import { Router } from 'express';
-import fs from 'fs/promises';
 import { PoolClient } from 'pg';
 import { z } from 'zod';
-import { assessSpeaking } from './assess';
-import { verifyAudioDuration } from './audio-inspection';
-import {
-  completeSubmittedPresignedAudioReplay,
-  discardSubmittedPresignedAudio,
-  finalizeSubmittedPresignedAudio,
-  ownSubmittedPresignedAudio,
-  preserveSubmittedPresignedAudio,
-  resolvePresignedAudio,
-} from './audio-upload';
-import { config } from './config';
-import { pool } from './db';
-import {
-  abandonAssessmentRequest,
-  AssessmentRequestInFlightError,
-  claimAssessmentRequest,
-  completeAssessmentRequest,
-} from './idempotency';
+import { AssessResult, assessSpeaking } from './assess';
+import { buildAssessmentSubmissionChain, runAssessmentSubmission } from './assessment-pipeline';
+import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
+import { completeAssessmentRequest } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
-import { uploadAudio, verifyAudioMagicBytes } from './upload';
 
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
 const MAX_QUESTIONS = 5;
@@ -82,21 +66,12 @@ async function questionById(client: PoolClient, questionId: string): Promise<Que
   return rows[0];
 }
 
-const answerBodySchema = z.object({
-  questionId: z.string().uuid('questionId must be a valid UUID'),
-  requestId: z.string().uuid('requestId must be a valid UUID'),
+// Restart resets the learner's level, so the client must confirm explicitly.
+const restartBodySchema = z.object({
+  confirm: z.literal(true, {
+    errorMap: () => ({ message: 'must be true to restart the diagnostic' }),
+  }),
 });
-
-// S3 mode receives JSON with the presigned object key; local mode receives
-// multipart audio (see audio-upload.ts / upload.ts).
-const answerJsonBodySchema = answerBodySchema.extend({ audioKey: z.string().max(512) });
-
-interface QuestionRow {
-  id: string;
-  cefr_level: (typeof LEVELS)[number];
-  prompt_word: string;
-  question_text: string;
-}
 
 interface DiagnosticClaim {
   claimId: string;
@@ -114,10 +89,12 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
     await client.query('BEGIN');
     const state = await lockState(client, userId);
     if (!state.current_question_id || state.current_question_id !== questionId) {
-      throw new HttpError(409, 'Question mismatch');
+      throw new HttpError(409, 'Question mismatch', 'QUESTION_MISMATCH');
     }
 
-    const { rows } = await client.query<QuestionRow>('SELECT * FROM questions WHERE id = $1', [questionId]);
+    const { rows } = await client.query<QuestionRow>(`SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`, [
+      questionId,
+    ]);
     const question = rows[0];
     if (!question) throw new HttpError(404, 'Question not found');
 
@@ -130,7 +107,7 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
       [questionId, claimId, userId],
     );
     if (claimed.rowCount !== 1) {
-      throw new HttpError(409, 'An assessment is already in progress');
+      throw new HttpError(409, 'An assessment is already in progress', 'ASSESSMENT_IN_PROGRESS');
     }
 
     await client.query('COMMIT');
@@ -163,7 +140,7 @@ async function finalizeDiagnosticAnswer(
   claimId: string,
   requestId: string,
   requestClaimId: string,
-  result: Awaited<ReturnType<typeof assessSpeaking>>,
+  result: AssessResult,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
@@ -174,7 +151,7 @@ async function finalizeDiagnosticAnswer(
       state.processing_question_id !== question.id ||
       state.current_question_id !== question.id
     ) {
-      throw new HttpError(409, 'Assessment state changed; please try again');
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
 
     const attemptNo = state.questions_asked + 1;
@@ -246,6 +223,12 @@ export function createDiagnosticRouter(limiters: Limiters) {
   });
   router.use(requireAuth);
 
+  // Shared submission choreography (S3-conditional cleanup + paid limiters +
+  // dual-mode validation); see assessment-pipeline.ts. Unlike practice there
+  // is no eligibility middleware: the already-completed rejection runs inside
+  // the pipeline after the request UUID is owned, so it abandons the claim.
+  const submission = buildAssessmentSubmissionChain(limiters);
+
   router.get(
     '/next',
     h(async (req: AuthedRequest, res) => {
@@ -282,98 +265,77 @@ export function createDiagnosticRouter(limiters: Limiters) {
     }),
   );
 
+  // Retake the placement test. Resets the adaptive search and clears the
+  // learner's placement (users_diagnostic_level_check allows a NULL level once
+  // diagnostic_completed is false) while KEEPING all attempt history and
+  // practice progress — re-placement resumes mastery already earned at the
+  // newly assigned level.
   router.post(
-    '/answer',
-    // Transient-object cleanup belongs to this submission route only: after
-    // authentication, before rate limiting and validation, so every
-    // authenticated submission path discards its owned key while reads that
-    // happen to carry an audioKey body can never trigger a deletion.
-    ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
-    limiters.assess,
-    limiters.assessIpDaily,
-    limiters.assessAbortGuard,
-    ...(config.s3.bucket
-      ? [validate({ body: answerJsonBodySchema })]
-      : [uploadAudio, validate({ body: answerBodySchema })]),
+    '/restart',
+    limiters.diagnosticRestart,
+    validate({ body: restartBodySchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      // Only the route's own response finalizes here. On error paths the error
-      // handler sets the real status only after this handler unwinds, so
-      // finalizing now would read a stale 200 and delete objects that the
-      // 409/429 contract preserves; the response-finish listener (registered
-      // by discardSubmittedPresignedAudio) sees the final status and
-      // finalizes those paths instead. Finalization is idempotent.
-      let responded = false;
+      const client = await pool.connect();
       try {
-        const { questionId, requestId } = req.body as z.infer<typeof answerBodySchema>;
-        const knownQuestion = await pool.query('SELECT 1 FROM questions WHERE id = $1', [questionId]);
-        if (knownQuestion.rowCount !== 1) {
-          throw new HttpError(409, 'Question mismatch');
-        }
-        let requestClaim;
-        try {
-          requestClaim = await claimAssessmentRequest(user.id, requestId, 'diagnostic', questionId);
-        } catch (err) {
-          if (err instanceof AssessmentRequestInFlightError) {
-            preserveSubmittedPresignedAudio(res);
-          }
-          throw err;
-        }
-        if (requestClaim.kind === 'completed') {
-          completeSubmittedPresignedAudioReplay(res);
-          responded = true;
-          return res.json(requestClaim.response);
-        }
-        ownSubmittedPresignedAudio(res);
+        await client.query('BEGIN');
+        // Locks the row (creating it on first use) so a restart serializes
+        // against any concurrent answer finalization.
+        await lockState(client, user.id);
+        await client.query(
+          `UPDATE diagnostic_state
+           SET low_idx = 0, high_idx = 5, questions_asked = 0,
+               current_question_id = NULL, processing_question_id = NULL,
+               processing_started_at = NULL, processing_claim_id = NULL
+           WHERE user_id = $1`,
+          [user.id],
+        );
+        await client.query('UPDATE users SET diagnostic_completed = false, cefr_level = NULL WHERE id = $1', [user.id]);
+        await client.query('COMMIT');
+      } catch (err) {
+        return await rollbackTransaction(client, { value: err });
+      } finally {
+        releaseTransactionClient(client);
+      }
+      res.status(204).end();
+    }),
+  );
 
-        if (user.diagnostic_completed) {
-          await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
-          throw new HttpError(400, 'Diagnostic already completed');
-        }
-
-        let claimId: string | undefined;
-        let completed = false;
-        try {
-          if (config.s3.bucket) await resolvePresignedAudio(req, res);
-          if (!req.file) {
-            throw new HttpError(400, 'audio file is required');
+  router.post(
+    '/answer',
+    ...submission.middleware,
+    h(async (req: AuthedRequest, res) =>
+      runAssessmentSubmission<DiagnosticClaim, AssessResult>(req, res, {
+        context: 'diagnostic',
+        bodySchema: submission.bodySchema,
+        // A questionId that matches no catalog row can never be the served
+        // question, so it shares the mismatch contract instead of a 404.
+        questionMissingError: () => new HttpError(409, 'Question mismatch', 'QUESTION_MISMATCH'),
+        requireQuestionAtUserLevel: false,
+        assertEligibleAfterOwned: (user) => {
+          if (user.diagnostic_completed) {
+            throw new HttpError(400, 'Diagnostic already completed', 'DIAGNOSTIC_DONE');
           }
-          await verifyAudioMagicBytes(req.file.path);
-          if (!config.mockAi) await verifyAudioDuration(req.file.path);
-          const claim = await claimDiagnosticAnswer(user.id, questionId);
-          claimId = claim.claimId;
-          const result = await assessSpeaking(
-            req.file.path,
+        },
+        claimAttempt: (user, question) => claimDiagnosticAnswer(user.id, question.id),
+        // The claim's question is authoritative (it must match the served
+        // current_question_id), so the prompt context comes from the claim.
+        assess: (audioPath, user, _question, claim, options) =>
+          assessSpeaking(
+            audioPath,
             {
               cefrLevel: claim.question.cefr_level,
               promptWord: claim.question.prompt_word,
               questionText: claim.question.question_text,
             },
             user.id,
-            // Once the capacity reservation commits, the assessment limiters
-            // must not refund this request even if it later fails (>=400).
-            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
-          );
-          const body = await finalizeDiagnosticAnswer(
-            user.id,
-            claim.question,
-            claim.claimId,
-            requestId,
-            requestClaim.claimId,
-            result,
-          );
-          completed = true;
-          responded = true;
-          res.json(body);
-        } finally {
-          if (claimId) await clearDiagnosticClaim(user.id, claimId);
-          if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
-        }
-      } finally {
-        if (req.file) await fs.unlink(req.file.path).catch(() => {});
-        if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
-      }
-    }),
+            options,
+          ),
+        persist: (user, _question, claim, result, requestId, requestClaimId) =>
+          finalizeDiagnosticAnswer(user.id, claim.question, claim.claimId, requestId, requestClaimId, result),
+        clearClaim: (user, _question, claim) => clearDiagnosticClaim(user.id, claim.claimId),
+      }),
+    ),
   );
 
   return router;

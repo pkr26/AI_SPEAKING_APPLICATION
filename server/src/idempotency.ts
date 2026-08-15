@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import { pool } from './db';
-import { HttpError } from './middleware';
+import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
+import { ApiErrorCode, HttpError } from './middleware';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
@@ -21,8 +22,8 @@ export type AssessmentRequestClaim =
  * public status/message remain the normal HttpError contract.
  */
 export class AssessmentRequestInFlightError extends HttpError {
-  constructor(message: string, extra?: Record<string, unknown>) {
-    super(409, message, extra);
+  constructor(message: string, code: ApiErrorCode, extra?: Record<string, unknown>) {
+    super(409, message, extra, code);
     this.name = 'AssessmentRequestInFlightError';
   }
 }
@@ -73,19 +74,21 @@ export async function claimAssessmentRequest(
     );
     const row = existing.rows[0];
     if (!row) {
-      throw new HttpError(409, 'Assessment request identifier was already used');
+      throw new HttpError(409, 'Assessment request identifier was already used', 'REQUEST_ID_REUSED');
     }
     if (row.context !== context || row.question_id !== questionId) {
       if (row.status === 'processing') {
-        throw new AssessmentRequestInFlightError('Assessment request identifier was already used');
+        throw new AssessmentRequestInFlightError('Assessment request identifier was already used', 'REQUEST_ID_REUSED');
       }
-      throw new HttpError(409, 'Assessment request identifier was already used');
+      throw new HttpError(409, 'Assessment request identifier was already used', 'REQUEST_ID_REUSED');
     }
     if (row.status === 'completed' && row.response_body) {
       await client.query('COMMIT');
       return { kind: 'completed', response: row.response_body };
     }
-    throw new AssessmentRequestInFlightError('Assessment is still processing', { retryAfterSeconds: 2 });
+    throw new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
+      retryAfterSeconds: 2,
+    });
   } catch (error) {
     return await rollbackTransaction(client, { value: error });
   } finally {
@@ -108,7 +111,7 @@ export async function completeAssessmentRequest(
     [JSON.stringify(response), userId, requestId, claimId],
   )) as { rowCount?: number | null };
   if (completed.rowCount !== 1) {
-    throw new HttpError(409, 'Assessment request ownership changed; please retry');
+    throw new HttpError(409, 'Assessment request ownership changed; please retry', 'STATE_CHANGED');
   }
 }
 
@@ -123,12 +126,16 @@ export async function abandonAssessmentRequest(userId: string, requestId: string
 }
 
 export async function cleanupAssessmentRequests(): Promise<number> {
-  const removed = await pool.query(
+  return runExclusiveBatchedDelete(
+    'janitor:assessment-requests',
     `DELETE FROM assessment_requests
-     WHERE (status = 'processing' AND started_at < now() - interval '5 minutes')
-        OR (status = 'completed' AND completed_at < now() - interval '1 day')`,
+     WHERE ctid IN (
+       SELECT ctid FROM assessment_requests
+       WHERE (status = 'processing' AND started_at < now() - interval '5 minutes')
+          OR (status = 'completed' AND completed_at < now() - interval '1 day')
+       LIMIT ${JANITOR_BATCH_SIZE}
+     )`,
   );
-  return removed.rowCount ?? 0;
 }
 
 export type AssessmentRequestStatus =

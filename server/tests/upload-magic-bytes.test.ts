@@ -244,7 +244,7 @@ describe('uploadAudio cleanup', () => {
         .post('/upload')
         .attach('audio', FTYP, { filename: 'answer.m4a', contentType: 'audio/mp4' });
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ error: 'Internal server error' });
+      expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       expect(unlink).toHaveBeenCalledOnce();
     } finally {
       createWriteStream.mockRestore();
@@ -267,7 +267,7 @@ describe('uploadAudio cleanup', () => {
         .post('/upload')
         .attach('audio', FTYP, { filename: 'answer.m4a', contentType: 'audio/mp4' });
       expect(res.status).toBe(500);
-      expect(res.body).toEqual({ error: 'Internal server error' });
+      expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);
     } finally {
       chmod.mockRestore();

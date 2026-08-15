@@ -1,35 +1,42 @@
 import { createHash, randomUUID } from 'crypto';
 import { NextFunction, Response, Router } from 'express';
-import fs from 'fs/promises';
 import { z } from 'zod';
-import { assessNativeComprehension, assessSpeaking, type NativeLanguage } from './assess';
-import { verifyAudioDuration } from './audio-inspection';
 import {
-  completeSubmittedPresignedAudioReplay,
-  discardSubmittedPresignedAudio,
-  finalizeSubmittedPresignedAudio,
-  ownSubmittedPresignedAudio,
-  preserveSubmittedPresignedAudio,
-  resolvePresignedAudio,
-} from './audio-upload';
-import { config } from './config';
-import { pool } from './db';
+  AssessResult,
+  assessNativeComprehension,
+  assessSpeaking,
+  NativeAssessResult,
+  type NativeLanguage,
+} from './assess';
+import { buildAssessmentSubmissionChain, runAssessmentSubmission } from './assessment-pipeline';
+import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
 import { logger } from './logger';
-import {
-  abandonAssessmentRequest,
-  AssessmentRequestInFlightError,
-  claimAssessmentRequest,
-  completeAssessmentRequest,
-} from './idempotency';
-import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
+import { completeAssessmentRequest } from './idempotency';
+import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
-import { uploadAudio, verifyAudioMagicBytes } from './upload';
 
 const MAX_ATTEMPTS = 3;
 export const MAX_FINAL_FEEDBACK_LENGTH = 4000;
 /** One practice attempt at or above this score masters the word. */
 export const MASTER_SCORE = 75;
+/** Scores below this fail the attempt (and demote a mastered word). */
+export const PASS_SCORE = 60;
+/**
+ * Spaced-repetition review intervals in days, indexed by
+ * practice_progress.srs_interval_index; the index clamps at the last entry.
+ */
+export const SRS_INTERVALS_DAYS = [1, 3, 7, 21, 60] as const;
+const MAX_SRS_INTERVAL_INDEX = SRS_INTERVALS_DAYS.length - 1;
+/** A skipped word stays out of new/revision selection for this long. */
+const SKIP_DAYS = 7;
+
+const CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
+/**
+ * Mastering this share of the level's word bank (with the next level existing)
+ * promotes the learner inside the same transaction as the mastering attempt.
+ */
+export const LEVEL_UP_MASTERY_RATIO = 0.85;
 
 interface QuestionJson {
   id: string;
@@ -49,6 +56,7 @@ interface PracticeProgressJson {
   masteredCount: number;
   learningCount: number;
   totalAtLevel: number;
+  dueCount: number;
 }
 
 interface Queryable {
@@ -57,7 +65,12 @@ interface Queryable {
 
 const QUESTION_COLUMNS = `q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"`;
 
-/** Oldest first: the word struggled with longest ago is revised first. */
+/**
+ * SRS ordering: earliest due_at first, so overdue words (due_at <= now())
+ * always outrank not-yet-due ones, and when nothing is due the word closest to
+ * its review date is the fallback. Skipped words are ineligible until
+ * skipped_until passes.
+ */
 async function pickRevisionQuestion(
   userId: string,
   level: string,
@@ -69,14 +82,18 @@ async function pickRevisionQuestion(
      FROM practice_progress pp
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'learning'
+       AND (pp.skipped_until IS NULL OR pp.skipped_until <= now())
        AND ($3::uuid IS NULL OR q.id <> $3)
-     ORDER BY pp.last_attempt_at ASC, random()
+     ORDER BY pp.due_at ASC, random()
      LIMIT 1`,
     [userId, level, excludeQuestionId ?? null],
   );
   return rows[0];
 }
 
+// A skipped word already has a practice_progress row (the skip upsert creates
+// one), so the row-existence filter below is also what keeps skipped words out
+// of the "new" bucket until their skip expires into the revision bucket.
 async function pickNewQuestion(
   userId: string,
   level: string,
@@ -96,7 +113,10 @@ async function pickNewQuestion(
   return rows[0];
 }
 
-/** Bank exhausted: keep mastered words in rotation, least recently seen first. */
+/**
+ * Bank exhausted: keep mastered words in rotation, due-first like revision.
+ * Deliberately ignores skipped_until — retention is unaffected by skips.
+ */
 async function pickRetentionQuestion(
   userId: string,
   level: string,
@@ -109,7 +129,7 @@ async function pickRetentionQuestion(
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'mastered'
        AND ($3::uuid IS NULL OR q.id <> $3)
-     ORDER BY pp.last_attempt_at ASC, random()
+     ORDER BY pp.due_at ASC, random()
      LIMIT 1`,
     [userId, level, excludeQuestionId ?? null],
   );
@@ -173,11 +193,14 @@ async function practiceProgressSnapshot(
   level: string,
   db: Queryable = pool,
 ): Promise<PracticeProgressJson> {
-  const { rows } = await db.query<{ masteredCount: number; learningCount: number; totalAtLevel: number }>(
+  const { rows } = await db.query<PracticeProgressJson>(
     `SELECT
        count(*) FILTER (WHERE pp.status = 'mastered')::int AS "masteredCount",
        count(*) FILTER (WHERE pp.status = 'learning')::int AS "learningCount",
-       (SELECT count(*) FROM questions WHERE cefr_level = $2)::int AS "totalAtLevel"
+       (SELECT count(*) FROM questions WHERE cefr_level = $2)::int AS "totalAtLevel",
+       count(*) FILTER (
+         WHERE pp.due_at <= now() AND (pp.skipped_until IS NULL OR pp.skipped_until <= now())
+       )::int AS "dueCount"
      FROM practice_progress pp
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2`,
@@ -190,14 +213,14 @@ const helpParamsSchema = z.object({
   id: z.string().uuid('question id must be a valid UUID'),
 });
 
-const attemptBodySchema = z.object({
+const skipBodySchema = z.object({
   questionId: z.string().uuid('questionId must be a valid UUID'),
-  requestId: z.string().uuid('requestId must be a valid UUID'),
 });
 
-// S3 mode receives JSON with the presigned object key; local mode receives
-// multipart audio (see audio-upload.ts / upload.ts).
-const attemptJsonBodySchema = attemptBodySchema.extend({ audioKey: z.string().max(512) });
+const historyQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(20),
+  cursor: z.string().uuid('cursor must be a valid UUID').optional(),
+});
 
 interface PracticeClaim {
   attemptNo: number;
@@ -224,7 +247,7 @@ async function claimPracticeAttempt(userId: string, questionId: string): Promise
       [userId, questionId, claimId],
     );
     if (claimed.rowCount !== 1) {
-      throw new HttpError(409, 'An assessment is already in progress for this question');
+      throw new HttpError(409, 'An assessment is already in progress for this question', 'ASSESSMENT_IN_PROGRESS');
     }
 
     const { rows } = await client.query<{ attempt_no: number; passed: boolean | null }>(
@@ -258,15 +281,17 @@ async function clearPracticeClaim(userId: string, questionId: string, claimId: s
 
 /**
  * Persist a scored attempt: insert the attempts row, upsert the word's
- * practice_progress (mastery at >= MASTER_SCORE, mastered words never
- * downgrade), and — for responses that advance — pick the next question inside
- * the same transaction so the idempotent replay always matches.
+ * practice_progress with its SRS schedule (mastery at >= MASTER_SCORE; a
+ * mastered word demotes back to learning only when a scored attempt on it
+ * fails below PASS_SCORE), evaluate CEFR promotion when the attempt just
+ * mastered a word, and — for responses that advance — pick the next question
+ * inside the same transaction so the idempotent replay always matches.
  */
 async function storePracticeResult(
   userId: string,
   questionId: string,
   claim: PracticeClaim,
-  result: Awaited<ReturnType<typeof assessSpeaking>>,
+  result: AssessResult,
   mastered: boolean,
   requestId: string,
   requestClaimId: string,
@@ -285,36 +310,102 @@ async function storePracticeResult(
       [userId, questionId, claim.claimId],
     );
     if (owned.rowCount !== 1) {
-      throw new HttpError(409, 'Assessment state changed; please try again');
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
     await client.query(
       `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
        VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7)`,
       [userId, questionId, claim.attemptNo, result.transcript, result.score, result.passed, result.feedback],
     );
+    // Lock the word's progress row (when it exists) so the mastery transition
+    // and the promotion decision below read a stable prior state even if a
+    // rival transaction touches the same word.
+    const prior = await client.query<{ status: string }>(
+      'SELECT status FROM practice_progress WHERE user_id = $1 AND question_id = $2 FOR UPDATE',
+      [userId, questionId],
+    );
+    const justMastered = mastered && prior.rows[0]?.status !== 'mastered';
+    // SRS schedule, bucketed by score:
+    //   < PASS_SCORE          -> due now, index 0 (a mastered word DEMOTES to
+    //                            learning — the only downgrade path);
+    //   PASS_SCORE..<MASTER   -> due in 1 day, index 1 (a mastered word keeps
+    //                            its status but reviews again soon);
+    //   >= MASTER_SCORE       -> mastered, index advances (clamped), due after
+    //                            SRS_INTERVALS_DAYS[new index] days.
+    // The insert branch bakes the same rules for a first attempt (prior
+    // index 0): mastered -> index 1 / +3d, passed -> index 1 / +1d,
+    // failed -> index 0 / due now.
+    const insertIndex = mastered || result.score >= PASS_SCORE ? 1 : 0;
+    const insertDueDays = mastered ? SRS_INTERVALS_DAYS[1] : result.score >= PASS_SCORE ? 1 : 0;
     await client.query(
-      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, last_attempt_at)
-       VALUES ($1, $2, $3, $4, 1, now())
+      `INSERT INTO practice_progress
+         (user_id, question_id, status, best_score, attempt_count, last_attempt_at, srs_interval_index, due_at)
+       VALUES ($1, $2, $3, $4, 1, now(), $5, now() + $6 * interval '1 day')
        ON CONFLICT (user_id, question_id) DO UPDATE SET
          status = CASE
-           WHEN practice_progress.status = 'mastered' THEN 'mastered'
-           ELSE EXCLUDED.status
+           WHEN EXCLUDED.status = 'mastered' THEN 'mastered'
+           WHEN practice_progress.status = 'mastered' AND EXCLUDED.best_score >= ${PASS_SCORE} THEN 'mastered'
+           ELSE 'learning'
          END,
          best_score = greatest(practice_progress.best_score, EXCLUDED.best_score),
          attempt_count = practice_progress.attempt_count + 1,
-         last_attempt_at = now()`,
-      [userId, questionId, mastered ? 'mastered' : 'learning', result.score],
+         last_attempt_at = now(),
+         srs_interval_index = CASE
+           WHEN EXCLUDED.status = 'mastered'
+             THEN least(practice_progress.srs_interval_index + 1, ${MAX_SRS_INTERVAL_INDEX})
+           WHEN EXCLUDED.best_score >= ${PASS_SCORE} THEN 1
+           ELSE 0
+         END,
+         due_at = CASE
+           WHEN EXCLUDED.status = 'mastered'
+             THEN now() +
+               (ARRAY[${SRS_INTERVALS_DAYS.join(', ')}])[least(practice_progress.srs_interval_index + 1, ${MAX_SRS_INTERVAL_INDEX}) + 1]
+               * interval '1 day'
+           WHEN EXCLUDED.best_score >= ${PASS_SCORE} THEN now() + interval '1 day'
+           ELSE now()
+         END`,
+      [userId, questionId, mastered ? 'mastered' : 'learning', result.score, insertIndex, insertDueDays],
     );
+
+    // Level promotion: mastering this word may complete the level. The
+    // level-guarded UPDATE serializes rival promotions on the user row — the
+    // loser re-evaluates against the already-promoted level, matches zero
+    // rows, and reports no levelUp. C2 never promotes (no next level).
+    let effectiveLevel = level;
+    let levelUp: { from: string; to: string } | undefined;
+    if (justMastered) {
+      const nextLevel = CEFR_LEVELS[CEFR_LEVELS.indexOf(level as (typeof CEFR_LEVELS)[number]) + 1];
+      if (nextLevel) {
+        const snapshot = await practiceProgressSnapshot(userId, level, client);
+        if (snapshot.masteredCount >= Math.ceil(LEVEL_UP_MASTERY_RATIO * snapshot.totalAtLevel)) {
+          const promoted = await client.query('UPDATE users SET cefr_level = $1 WHERE id = $2 AND cefr_level = $3', [
+            nextLevel,
+            userId,
+            level,
+          ]);
+          if (promoted.rowCount === 1) {
+            levelUp = { from: level, to: nextLevel };
+            effectiveLevel = nextLevel;
+          }
+        }
+      }
+    }
+
     let response: Record<string, unknown>;
     if (responseKind === 'retry') {
       response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
     } else {
       // Select after the current attempt is visible in this transaction and
-      // explicitly exclude it. A pass/final failure must always advance.
-      const nextPick = await pickPracticeNext(userId, level, client, questionId);
-      const progress = await practiceProgressSnapshot(userId, level, client);
+      // explicitly exclude it. A pass/final failure must always advance, and
+      // after a promotion both the next question and the progress snapshot
+      // come from the NEW level.
+      const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
+      const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
       const next = nextPick ? { ...nextPick, progress } : undefined;
-      response = responseKind === 'passed' ? { ...body, next } : { ...body, attemptsLeft: 0, finalFeedback, next };
+      response =
+        responseKind === 'passed'
+          ? { ...body, ...(levelUp ? { levelUp } : {}), next }
+          : { ...body, attemptsLeft: 0, finalFeedback, ...(levelUp ? { levelUp } : {}), next };
     }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
       userId,
@@ -354,7 +445,7 @@ async function storeSilenceResult(
       [userId, questionId, claim.claimId],
     );
     if (owned.rowCount !== 1) {
-      throw new HttpError(409, 'Assessment state changed; please try again');
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
       userId,
@@ -371,17 +462,13 @@ async function storeSilenceResult(
   }
 }
 
-export function authoredAnswerHint(question: Record<string, unknown>, language: string): string {
-  const translations = question.translations as
-    Record<string, { examples?: Array<{ en?: string }> } | undefined> | undefined;
-  const example = translations?.[language]?.examples?.[0]?.en?.trim();
-  return example || `a few clear, on-topic sentences about "${String(question.prompt_word)}"`;
+export function authoredAnswerHint(question: QuestionRow, language: string): string {
+  const example = question.translations[language]?.examples?.[0]?.en?.trim();
+  return example || `a few clear, on-topic sentences about "${question.prompt_word}"`;
 }
 
-function authoredNativeExample(question: Record<string, unknown>, language: string): string | undefined {
-  const translations = question.translations as
-    Record<string, { examples?: Array<{ native?: string }> } | undefined> | undefined;
-  return translations?.[language]?.examples?.[0]?.native?.trim() || undefined;
+function authoredNativeExample(question: QuestionRow, language: string): string | undefined {
+  return question.translations[language]?.examples?.[0]?.native?.trim() || undefined;
 }
 
 export function buildFinalFeedback(providerFeedback: string, hint: string): string {
@@ -405,6 +492,15 @@ function buildNativeFallbackFeedback(providerFeedback: string, nativeExample?: s
   return `${prefix}${nativeExample.slice(0, available)}${suffix}`.slice(0, 800);
 }
 
+/** Prompt context handed to the assess pipeline for a catalog question. */
+function assessQuestionContext(question: QuestionRow) {
+  return {
+    cefrLevel: question.cefr_level,
+    promptWord: question.prompt_word,
+    questionText: question.question_text,
+  };
+}
+
 export function createPracticeRouter(limiters: Limiters) {
   const router = Router();
   router.use((_req, res, next) => {
@@ -420,6 +516,10 @@ export function createPracticeRouter(limiters: Limiters) {
     return next();
   };
 
+  // Shared submission choreography (S3-conditional cleanup + eligibility +
+  // paid limiters + dual-mode validation); see assessment-pipeline.ts.
+  const submission = buildAssessmentSubmissionChain(limiters, [requireCompletedDiagnostic]);
+
   router.get(
     '/question',
     requireCompletedDiagnostic,
@@ -432,20 +532,146 @@ export function createPracticeRouter(limiters: Limiters) {
     }),
   );
 
+  // "Skip this word for now": parks the word out of new/revision selection
+  // without inventing an attempt. The upsert never touches an existing row's
+  // learning state — a repeat skip only refreshes skipped_until. Retention
+  // selection deliberately ignores skips.
+  router.post(
+    '/skip',
+    requireCompletedDiagnostic,
+    validate({ body: skipBodySchema }),
+    h(async (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const { questionId } = validated(req, skipBodySchema);
+      const { rows } = await pool.query<{ cefr_level: string }>('SELECT cefr_level FROM questions WHERE id = $1', [
+        questionId,
+      ]);
+      const q = rows[0];
+      if (!q) throw new HttpError(404, 'Question not found');
+      if (q.cefr_level !== user.cefr_level) {
+        throw new HttpError(403, 'Question is not available at your level');
+      }
+      await pool.query(
+        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
+         VALUES ($1, $2, 'learning', 0, 0, now() + interval '${SKIP_DAYS} days')
+         ON CONFLICT (user_id, question_id) DO UPDATE SET
+           skipped_until = now() + interval '${SKIP_DAYS} days'`,
+        [user.id, questionId],
+      );
+      res.status(204).end();
+    }),
+  );
+
+  // Attempt history for the History screen. Deliberately no diagnostic gate:
+  // diagnostic attempts are part of the history (`context` tells them apart).
+  router.get(
+    '/history',
+    validate({ query: historyQuerySchema }),
+    h(async (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const { limit, cursor } = validated(req, historyQuerySchema);
+      if (cursor) {
+        const cursorRow = await pool.query('SELECT 1 FROM attempts WHERE id = $1 AND user_id = $2', [cursor, user.id]);
+        if (!cursorRow.rows[0]) throw new HttpError(400, 'Invalid history cursor');
+      }
+
+      // Newest first with a (created_at, id) keyset cursor, mirroring the
+      // ascending export pagination in auth.ts.
+      const { rows } = await pool.query(
+        `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
+                q.question_text AS "questionText", q.cefr_level AS "cefrLevel", a.context,
+                a.attempt_no AS "attemptNo", a.score, a.passed, a.transcript, a.feedback,
+                a.created_at AS "createdAt"
+         FROM attempts a
+         JOIN questions q ON q.id = a.question_id
+         WHERE a.user_id = $1
+           AND (
+             $2::uuid IS NULL
+             OR (a.created_at, a.id) < (
+               SELECT created_at, id FROM attempts WHERE id = $2 AND user_id = $1
+             )
+           )
+         ORDER BY a.created_at DESC, a.id DESC
+         LIMIT $3`,
+        [user.id, cursor ?? null, limit + 1],
+      );
+      const hasMore = rows.length > limit;
+      const items = hasMore ? rows.slice(0, limit) : rows;
+      res.json({ items, nextCursor: hasMore ? (items[items.length - 1] as { id: string }).id : null });
+    }),
+  );
+
+  // Home-screen stats. No diagnostic gate either: before placement the level
+  // is null and the progress counters are simply zero.
+  router.get(
+    '/stats',
+    h(async (req: AuthedRequest, res) => {
+      const user = req.user!;
+      const level = user.cefr_level;
+      const progress = level
+        ? await practiceProgressSnapshot(user.id, level)
+        : { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 };
+      // Streak = consecutive UTC calendar days with at least one practice
+      // attempt, anchored on the most recent practiced day and counted only
+      // when that anchor is today or yesterday (one quiet day is allowed
+      // before the streak dies). Gaps-and-islands over the distinct day list:
+      // the run starting at the latest day is exactly the rows where
+      // day = latest - (rank - 1).
+      const { rows } = await pool.query<{
+        streakDays: number;
+        practicedToday: number;
+        totalAttempts: number;
+        lastPracticedAt: string | null;
+      }>(
+        `WITH practice_days AS (
+           SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date AS day
+           FROM attempts
+           WHERE user_id = $1 AND context = 'practice'
+         ),
+         ranked AS (
+           SELECT day,
+                  max(day) OVER () AS latest,
+                  row_number() OVER (ORDER BY day DESC) AS rn
+           FROM practice_days
+         )
+         SELECT
+           (SELECT count(*)::int FROM ranked
+            WHERE latest >= (now() AT TIME ZONE 'UTC')::date - 1
+              AND day = latest - (rn - 1)::int) AS "streakDays",
+           (SELECT count(*)::int FROM attempts
+            WHERE user_id = $1 AND context = 'practice'
+              AND (created_at AT TIME ZONE 'UTC')::date = (now() AT TIME ZONE 'UTC')::date) AS "practicedToday",
+           (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS "totalAttempts",
+           (SELECT max(created_at) FROM attempts WHERE user_id = $1 AND context = 'practice') AS "lastPracticedAt"`,
+        [user.id],
+      );
+      const stats = rows[0];
+      res.json({
+        level,
+        progress,
+        streakDays: stats.streakDays,
+        practicedToday: stats.practicedToday,
+        totalAttempts: stats.totalAttempts,
+        lastPracticedAt: stats.lastPracticedAt,
+      });
+    }),
+  );
+
   router.get(
     '/question/:id/help',
     requireCompletedDiagnostic,
     validate({ params: helpParamsSchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const { rows } = await pool.query('SELECT * FROM questions WHERE id = $1', [req.params.id]);
+      const { rows } = await pool.query<QuestionRow>(`SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`, [
+        req.params.id,
+      ]);
       const q = rows[0];
       if (!q) throw new HttpError(404, 'Question not found');
       if (q.cefr_level !== user.cefr_level) {
         throw new HttpError(403, 'Question is not available at your level');
       }
-      const t = q.translations?.[user.native_language] as
-        { word: string; question: string; examples: { en: string; native: string }[] } | undefined;
+      const t = q.translations[user.native_language];
       if (!t) throw new HttpError(404, 'Translation not available for this question');
       const payload = {
         promptWord: q.prompt_word,
@@ -468,80 +694,21 @@ export function createPracticeRouter(limiters: Limiters) {
 
   router.post(
     '/attempt',
-    // Transient-object cleanup belongs to this submission route only: after
-    // authentication, before eligibility, rate limiting, and validation, so
-    // every authenticated submission path discards its owned key while reads
-    // that happen to carry an audioKey body can never trigger a deletion.
-    ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
-    requireCompletedDiagnostic,
-    limiters.assess,
-    limiters.assessIpDaily,
-    limiters.assessAbortGuard,
-    ...(config.s3.bucket
-      ? [validate({ body: attemptJsonBodySchema })]
-      : [uploadAudio, validate({ body: attemptBodySchema })]),
-    h(async (req: AuthedRequest, res) => {
-      const user = req.user!;
-      // Only the route's own response finalizes here. On error paths the error
-      // handler sets the real status only after this handler unwinds, so
-      // finalizing now would read a stale 200 and delete objects that the
-      // 409/429 contract preserves; the response-finish listener (registered
-      // by discardSubmittedPresignedAudio) sees the final status and
-      // finalizes those paths instead. Finalization is idempotent.
-      let responded = false;
-      try {
-        const { questionId, requestId } = req.body as z.infer<typeof attemptBodySchema>;
-        const { rows: qRows } = await pool.query('SELECT * FROM questions WHERE id = $1', [questionId]);
-        const q = qRows[0];
-        if (!q) throw new HttpError(404, 'Question not found');
-        if (q.cefr_level !== user.cefr_level) {
-          throw new HttpError(403, 'Question is not available at your level');
-        }
-
-        let requestClaim;
-        try {
-          requestClaim = await claimAssessmentRequest(user.id, requestId, 'practice', questionId);
-        } catch (err) {
-          if (err instanceof AssessmentRequestInFlightError) {
-            preserveSubmittedPresignedAudio(res);
-          }
-          throw err;
-        }
-        if (requestClaim.kind === 'completed') {
-          completeSubmittedPresignedAudioReplay(res);
-          responded = true;
-          return res.json(requestClaim.response);
-        }
-        ownSubmittedPresignedAudio(res);
-
-        let claim: PracticeClaim | undefined;
-        let completed = false;
-        try {
-          if (config.s3.bucket) await resolvePresignedAudio(req, res);
-          if (!req.file) {
-            throw new HttpError(400, 'audio file is required');
-          }
-          await verifyAudioMagicBytes(req.file.path);
-          if (!config.mockAi) await verifyAudioDuration(req.file.path);
-          claim = await claimPracticeAttempt(user.id, q.id);
-          const result = await assessSpeaking(
-            req.file.path,
-            {
-              cefrLevel: q.cefr_level,
-              promptWord: q.prompt_word,
-              questionText: q.question_text,
-            },
-            user.id,
-            // Once the capacity reservation commits, the assessment limiters
-            // must not refund this request even if it later fails (>=400).
-            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
-          );
-
-          let response: Record<string, unknown>;
+    ...submission.middleware,
+    h(async (req: AuthedRequest, res) =>
+      runAssessmentSubmission<PracticeClaim, AssessResult>(req, res, {
+        context: 'practice',
+        bodySchema: submission.bodySchema,
+        questionMissingError: () => new HttpError(404, 'Question not found'),
+        requireQuestionAtUserLevel: true,
+        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id),
+        assess: (audioPath, user, question, _claim, options) =>
+          assessSpeaking(audioPath, assessQuestionContext(question), user.id, options),
+        persist: (user, question, claim, result, requestId, requestClaimId) => {
           if (result.transcript === '') {
             // Silence: not an attempt. Nothing is persisted about the word and
             // the attempt counter does not advance; the retry is free.
-            response = await storeSilenceResult(user.id, q.id, claim, requestId, requestClaim.claimId, {
+            return storeSilenceResult(user.id, question.id, claim, requestId, requestClaimId, {
               passed: false,
               noSpeech: true,
               mastered: false,
@@ -551,56 +718,47 @@ export function createPracticeRouter(limiters: Limiters) {
               feedback: result.feedback,
               attemptsLeft: MAX_ATTEMPTS - (claim.attemptNo - 1),
             });
-          } else {
-            const mastered = result.score >= MASTER_SCORE;
-            const body: Record<string, unknown> = {
-              passed: result.passed,
-              mastered,
-              attemptNo: claim.attemptNo,
-              score: result.score,
-              transcript: result.transcript,
-              feedback: result.feedback,
-            };
-
-            let responseKind: 'passed' | 'retry' | 'final-failed';
-            let finalFeedback: string | undefined;
-            if (result.passed) {
-              responseKind = 'passed';
-            } else if (claim.attemptNo < MAX_ATTEMPTS) {
-              responseKind = 'retry';
-            } else {
-              // Use reviewed, authored examples instead of making a second,
-              // unmetered provider call after the assessment has already succeeded.
-              const hint = authoredAnswerHint(q, user.native_language);
-              finalFeedback = buildFinalFeedback(result.feedback, hint);
-              responseKind = 'final-failed';
-            }
-            response = await storePracticeResult(
-              user.id,
-              q.id,
-              claim,
-              result,
-              mastered,
-              requestId,
-              requestClaim.claimId,
-              body,
-              responseKind,
-              user.cefr_level!,
-              finalFeedback,
-            );
           }
-          completed = true;
-          responded = true;
-          return res.json(response);
-        } finally {
-          if (claim) await clearPracticeClaim(user.id, q.id, claim.claimId);
-          if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
-        }
-      } finally {
-        if (req.file) await fs.unlink(req.file.path).catch(() => {});
-        if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
-      }
-    }),
+          const mastered = result.score >= MASTER_SCORE;
+          const body: Record<string, unknown> = {
+            passed: result.passed,
+            mastered,
+            attemptNo: claim.attemptNo,
+            score: result.score,
+            transcript: result.transcript,
+            feedback: result.feedback,
+          };
+
+          let responseKind: 'passed' | 'retry' | 'final-failed';
+          let finalFeedback: string | undefined;
+          if (result.passed) {
+            responseKind = 'passed';
+          } else if (claim.attemptNo < MAX_ATTEMPTS) {
+            responseKind = 'retry';
+          } else {
+            // Use reviewed, authored examples instead of making a second,
+            // unmetered provider call after the assessment has already succeeded.
+            const hint = authoredAnswerHint(question, user.native_language);
+            finalFeedback = buildFinalFeedback(result.feedback, hint);
+            responseKind = 'final-failed';
+          }
+          return storePracticeResult(
+            user.id,
+            question.id,
+            claim,
+            result,
+            mastered,
+            requestId,
+            requestClaimId,
+            body,
+            responseKind,
+            user.cefr_level!,
+            finalFeedback,
+          );
+        },
+        clearClaim: (user, question, claim) => clearPracticeClaim(user.id, question.id, claim.claimId),
+      }),
+    ),
   );
 
   // Native-language mode ("answer in my language"): the learner answers in
@@ -610,70 +768,30 @@ export function createPracticeRouter(limiters: Limiters) {
   // identical to /attempt.
   router.post(
     '/attempt/native',
-    ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
-    requireCompletedDiagnostic,
-    limiters.assess,
-    limiters.assessIpDaily,
-    limiters.assessAbortGuard,
-    ...(config.s3.bucket
-      ? [validate({ body: attemptJsonBodySchema })]
-      : [uploadAudio, validate({ body: attemptBodySchema })]),
-    h(async (req: AuthedRequest, res) => {
-      const user = req.user!;
-      let responded = false;
-      try {
-        const { questionId, requestId } = req.body as z.infer<typeof attemptBodySchema>;
-        const { rows: qRows } = await pool.query('SELECT * FROM questions WHERE id = $1', [questionId]);
-        const q = qRows[0];
-        if (!q) throw new HttpError(404, 'Question not found');
-        if (q.cefr_level !== user.cefr_level) {
-          throw new HttpError(403, 'Question is not available at your level');
-        }
-
-        let requestClaim;
-        try {
-          requestClaim = await claimAssessmentRequest(user.id, requestId, 'practice-native', questionId);
-        } catch (err) {
-          if (err instanceof AssessmentRequestInFlightError) {
-            preserveSubmittedPresignedAudio(res);
-          }
-          throw err;
-        }
-        if (requestClaim.kind === 'completed') {
-          completeSubmittedPresignedAudioReplay(res);
-          responded = true;
-          return res.json(requestClaim.response);
-        }
-        ownSubmittedPresignedAudio(res);
-
-        let claim: PracticeClaim | undefined;
-        let completed = false;
-        try {
-          if (config.s3.bucket) await resolvePresignedAudio(req, res);
-          if (!req.file) {
-            throw new HttpError(400, 'audio file is required');
-          }
-          await verifyAudioMagicBytes(req.file.path);
-          if (!config.mockAi) await verifyAudioDuration(req.file.path);
-          // Same per-question serialization as English practice: without a
-          // claim, concurrent native submissions with distinct requestIds each
-          // trigger their own paid provider calls for one question.
-          claim = await claimPracticeAttempt(user.id, q.id);
-          const result = await assessNativeComprehension(
-            req.file.path,
-            {
-              cefrLevel: q.cefr_level,
-              promptWord: q.prompt_word,
-              questionText: q.question_text,
-            },
+    ...submission.middleware,
+    h(async (req: AuthedRequest, res) =>
+      runAssessmentSubmission<PracticeClaim, NativeAssessResult>(req, res, {
+        context: 'practice-native',
+        bodySchema: submission.bodySchema,
+        questionMissingError: () => new HttpError(404, 'Question not found'),
+        requireQuestionAtUserLevel: true,
+        // Same per-question serialization as English practice: without a
+        // claim, concurrent native submissions with distinct requestIds each
+        // trigger their own paid provider calls for one question.
+        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id),
+        assess: (audioPath, user, question, _claim, options) =>
+          assessNativeComprehension(
+            audioPath,
+            assessQuestionContext(question),
             user.native_language as NativeLanguage,
             user.id,
-            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
-          );
+            options,
+          ),
+        persist: async (user, question, _claim, result, requestId, requestClaimId) => {
           const feedback =
             result.understood || result.transcript === ''
               ? result.feedback
-              : buildNativeFallbackFeedback(result.feedback, authoredNativeExample(q, user.native_language));
+              : buildNativeFallbackFeedback(result.feedback, authoredNativeExample(question, user.native_language));
           const response: Record<string, unknown> = {
             mode: 'native',
             understood: result.understood,
@@ -684,25 +802,18 @@ export function createPracticeRouter(limiters: Limiters) {
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
-            await completeAssessmentRequest(client, user.id, requestId, requestClaim.claimId, response);
+            await completeAssessmentRequest(client, user.id, requestId, requestClaimId, response);
             await client.query('COMMIT');
           } catch (err) {
             return await rollbackTransaction(client, { value: err });
           } finally {
             releaseTransactionClient(client);
           }
-          completed = true;
-          responded = true;
-          return res.json(response);
-        } finally {
-          if (claim) await clearPracticeClaim(user.id, q.id, claim.claimId);
-          if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
-        }
-      } finally {
-        if (req.file) await fs.unlink(req.file.path).catch(() => {});
-        if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
-      }
-    }),
+          return response;
+        },
+        clearClaim: (user, question, claim) => clearPracticeClaim(user.id, question.id, claim.claimId),
+      }),
+    ),
   );
 
   return router;

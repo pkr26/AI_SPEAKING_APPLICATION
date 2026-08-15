@@ -20,6 +20,7 @@ vi.mock('openai', () => ({
 }));
 
 import {
+  abortInFlightAssessments,
   assessNativeComprehension,
   assessSpeaking,
   assertDailyAssessmentCapacity,
@@ -222,6 +223,26 @@ describe('assertDailyAssessmentCapacity', () => {
     }
   });
 
+  it('skips the usage-janitor tick while another replica holds its advisory lock', async () => {
+    await pool.query('DELETE FROM assessment_usage');
+    await pool.query(`INSERT INTO assessment_usage (user_id, created_at) VALUES ($1, now() - interval '25 hours')`, [
+      userId,
+    ]);
+    const rival = await pool.connect();
+    try {
+      const locked = await rival.query<{ locked: boolean }>(
+        "SELECT pg_try_advisory_lock(hashtext('janitor:assessment-usage')) AS locked",
+      );
+      expect(locked.rows[0].locked).toBe(true);
+      await expect(cleanupAssessmentUsage()).resolves.toBe(0);
+
+      await rival.query("SELECT pg_advisory_unlock(hashtext('janitor:assessment-usage'))");
+      await expect(cleanupAssessmentUsage()).resolves.toBe(1);
+    } finally {
+      rival.release();
+    }
+  });
+
   it('preserves the quota transaction failure when rollback also fails', async () => {
     const primaryError = new Error('quota query failed');
     const client = {
@@ -282,6 +303,44 @@ describe('assessSpeaking (OpenAI path)', () => {
       maxRetries: 0,
     });
     expect(openaiMocks.transcribe).toHaveBeenCalledTimes(2);
+  });
+
+  it('grades with the configured GRADING_MODEL instead of a hardcoded id', async () => {
+    const previousModel = config.gradingModel;
+    config.gradingModel = 'gpt-test-grader';
+    try {
+      mockProviderSuccess();
+      await assessSpeaking(audioPath, QUESTION, userId);
+      expect(openaiMocks.parse.mock.calls[0][0].model).toBe('gpt-test-grader');
+    } finally {
+      config.gradingModel = previousModel;
+    }
+  });
+
+  it('aborts an in-flight provider call at shutdown and unregisters settled ones', async () => {
+    // Nothing in flight: nothing to abort.
+    expect(abortInFlightAssessments()).toBe(0);
+
+    let observedSignal: AbortSignal | undefined;
+    openaiMocks.transcribe.mockImplementation(
+      (_args: unknown, opts: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = opts.signal;
+          opts.signal.addEventListener('abort', () => reject(new Error('aborted by shutdown')));
+        }),
+    );
+    const inFlight = assessSpeaking(audioPath, QUESTION, userId);
+    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
+
+    expect(abortInFlightAssessments()).toBe(1);
+    // The abort unwinds through the route's normal timeout path.
+    await expect(inFlight).rejects.toMatchObject({
+      status: 504,
+      message: 'Assessment timed out; please try again',
+      code: 'PROVIDER_TIMEOUT',
+    });
+    // The settled call removed its controller from the shutdown registry.
+    expect(abortInFlightAssessments()).toBe(0);
   });
 
   it('fails closed with 503 when no API key is configured', async () => {
@@ -600,6 +659,27 @@ describe('assessNativeComprehension (OpenAI path)', () => {
 
   afterAll(() => {
     restoreConfig(snap);
+  });
+
+  it('registers native comprehension calls in the shutdown abort registry too', async () => {
+    let observedSignal: AbortSignal | undefined;
+    openaiMocks.transcribe.mockImplementation(
+      (_args: unknown, opts: { signal: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = opts.signal;
+          opts.signal.addEventListener('abort', () => reject(new Error('aborted by shutdown')));
+        }),
+    );
+    const inFlight = assessNativeComprehension(audioPath, QUESTION, 'te', userId);
+    await vi.waitFor(() => expect(observedSignal).toBeInstanceOf(AbortSignal));
+
+    expect(abortInFlightAssessments()).toBe(1);
+    await expect(inFlight).rejects.toMatchObject({
+      status: 504,
+      message: 'Assessment timed out; please try again',
+      code: 'PROVIDER_TIMEOUT',
+    });
+    expect(abortInFlightAssessments()).toBe(0);
   });
 
   it('pins whisper to the learner language and grades with the pinned model', async () => {

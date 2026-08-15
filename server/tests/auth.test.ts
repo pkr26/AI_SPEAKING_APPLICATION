@@ -20,6 +20,7 @@ describe('auth: register validation', () => {
     expect(res.status).toBe(400);
     expect(res.body).toEqual({
       error: "nativeLanguage: nativeLanguage must be one of 'te','hi','es','zh'",
+      code: 'VALIDATION_FAILED',
     });
   });
 
@@ -97,7 +98,10 @@ describe('auth: register validation', () => {
     // characters first so the register INSERT never sees them.
     const nul = await registerUser(a, { name: 'Ab\u0000cd' });
     expect(nul.res.status).toBe(400);
-    expect(nul.res.body).toEqual({ error: 'name: name must not contain control characters' });
+    expect(nul.res.body).toEqual({
+      error: 'name: name must not contain control characters',
+      code: 'VALIDATION_FAILED',
+    });
 
     for (const name of ['line\nbreak', 'tab\tname', 'bell\x07name', 'del\x7Fname']) {
       expect((await registerUser(a, { name })).res.status).toBe(400);
@@ -203,7 +207,7 @@ describe('auth: login', () => {
       expect((await login(secondReplica, '203.0.113.12', ` ${body.email} `, 'wrong-2')).status).toBe(401);
       const blocked = await login(firstReplica, '203.0.113.13', body.email, 'wrong-3');
       expect(blocked.status).toBe(429);
-      expect(blocked.body).toEqual({ error: 'Too many login attempts, please try again later' });
+      expect(blocked.body).toEqual({ error: 'Too many login attempts, please try again later', code: 'RATE_LIMITED' });
 
       // The budget blocks only failures: the real owner's correct password
       // still authenticates while an attacker holds the window saturated.
@@ -254,7 +258,7 @@ describe('auth: infrastructure failures', () => {
         });
 
       expect(response.status).toBe(500);
-      expect(response.body).toEqual({ error: 'Internal server error' });
+      expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       expect(client.query.mock.calls.map(([text]) => text)).toEqual([
         'BEGIN',
         expect.stringContaining('INSERT INTO users'),
@@ -294,7 +298,7 @@ describe('auth: infrastructure failures', () => {
         });
 
       expect(response.status).toBe(409);
-      expect(response.body).toEqual({ error: 'Email already registered' });
+      expect(response.body).toEqual({ error: 'Email already registered', code: 'EMAIL_TAKEN' });
       expect(client.query.mock.calls.map(([text]) => text)).toEqual([
         'BEGIN',
         expect.stringContaining('INSERT INTO users'),
@@ -340,7 +344,11 @@ describe('auth: infrastructure failures', () => {
     try {
       const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${res.body.token}`);
       expect(me.status).toBe(503);
-      expect(me.body).toEqual({ error: 'Server is busy, please try again shortly', retryAfterSeconds: 5 });
+      expect(me.body).toEqual({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
       expect(me.headers['retry-after']).toBe('5');
     } finally {
       query.mockRestore();
@@ -359,7 +367,7 @@ describe('auth: change-password token revocation', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ currentPassword: 'nope-nope1', newPassword: 'newpass123' });
     expect(r.status).toBe(401);
-    expect(r.body).toEqual({ error: 'Current password is incorrect' });
+    expect(r.body).toEqual({ error: 'Current password is incorrect', code: 'INVALID_CREDENTIALS' });
   });
 
   it('success bumps token_version: old token dies, new token works', async () => {
@@ -415,7 +423,7 @@ describe('auth: delete account', () => {
       .set('Authorization', `Bearer ${res.body.token}`)
       .send({ password: 'nope-nope1' });
     expect(r.status).toBe(401);
-    expect(r.body).toEqual({ error: 'Password is incorrect' });
+    expect(r.body).toEqual({ error: 'Password is incorrect', code: 'INVALID_CREDENTIALS' });
   });
 
   it('deletes personal data but retains an anonymous global provider-cost reservation', async () => {
@@ -514,7 +522,7 @@ describe('auth: password-confirmation throttling', () => {
     expect((await attempt('wrong-pass-2')).status).toBe(401);
     const blocked = await attempt('wrong-pass-3');
     expect(blocked.status).toBe(429);
-    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later' });
+    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
 
     // Exhausting one learner's password-confirmation budget must not throttle
     // a different authenticated account.
@@ -544,7 +552,7 @@ describe('auth: password-confirmation throttling', () => {
     expect((await attempt(secondReplica, 'wrong-pass-2')).status).toBe(401);
     const blocked = await attempt(firstReplica, 'wrong-pass-3');
     expect(blocked.status).toBe(429);
-    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later' });
+    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
     expect((await attempt(secondReplica, STRONG_PASSWORD)).status).toBe(204);
   });
 });
@@ -610,6 +618,6 @@ describe('auth: data export', () => {
       .get(`/auth/me/data?cursor=${foreignAttempt.rows[0].id}`)
       .set('Authorization', `Bearer ${first.res.body.token}`);
     expect(foreignCursor.status).toBe(400);
-    expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor' });
+    expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor', code: 'VALIDATION_FAILED' });
   });
 });

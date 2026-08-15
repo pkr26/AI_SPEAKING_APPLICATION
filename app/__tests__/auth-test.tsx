@@ -17,11 +17,19 @@ import {
   LogoutCleanupError,
   useAuth,
 } from '../src/lib/auth';
+import { translateFor, type MessageKey } from '../src/lib/i18n';
+import { cancelDailyReminderQuietly } from '../src/lib/daily-reminder';
 import { clearPendingAssessment } from '../src/lib/pending-assessment';
+import { markSessionExpiredNotice } from '../src/lib/session-notice';
 import { ContractError, type User } from '../src/lib/types';
 
 // React 19 requires this opt-in before act() can track async updates.
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+// Under jest the active language is 'en'; assertions read the same catalog
+// the app renders from instead of pinning literal copy.
+const t = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('en', key, params);
 
 jest.mock('../src/lib/api', () => {
   // A local class keeps `error instanceof ApiError` working inside auth.tsx,
@@ -50,12 +58,22 @@ jest.mock('../src/lib/pending-assessment', () => ({
   clearPendingAssessment: jest.fn(),
 }));
 
+jest.mock('../src/lib/session-notice', () => ({
+  markSessionExpiredNotice: jest.fn(),
+}));
+
+jest.mock('../src/lib/daily-reminder', () => ({
+  cancelDailyReminderQuietly: jest.fn(async () => undefined),
+}));
+
 const mockedApiFetch = jest.mocked(apiFetch);
 const mockedGetToken = jest.mocked(getToken);
 const mockedSaveToken = jest.mocked(saveToken);
 const mockedClearToken = jest.mocked(clearToken);
 const mockedSetUnauthorizedHandler = jest.mocked(setUnauthorizedHandler);
 const mockedClearPendingAssessment = jest.mocked(clearPendingAssessment);
+const mockedCancelDailyReminder = jest.mocked(cancelDailyReminderQuietly);
+const mockedMarkSessionExpiredNotice = jest.mocked(markSessionExpiredNotice);
 
 const USER: User = {
   id: '550e8400-e29b-41d4-a716-446655440000',
@@ -152,6 +170,8 @@ beforeEach(() => {
   mockedSaveToken.mockResolvedValue(undefined);
   mockedClearToken.mockResolvedValue(true);
   mockedClearPendingAssessment.mockResolvedValue(undefined);
+  mockedMarkSessionExpiredNotice.mockResolvedValue(undefined);
+  mockedCancelDailyReminder.mockResolvedValue(undefined);
 });
 
 describe('AuthProvider session restore', () => {
@@ -192,9 +212,7 @@ describe('AuthProvider session restore', () => {
 
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
     expect(text('token')).toBe('null');
-    expect(text('restoreError')).toBe(
-      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
-    );
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
 
     const retry = deferred<string | null>();
     mockedGetToken.mockReturnValueOnce(retry.promise);
@@ -218,18 +236,14 @@ describe('AuthProvider session restore', () => {
     await renderTree(new QueryClient());
 
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
-    expect(text('restoreError')).toBe(
-      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
-    );
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
 
     await act(async () => {
       auth!.retrySessionRestore();
     });
     await waitFor(() => expect(mockedGetToken).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
-    expect(text('restoreError')).toBe(
-      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
-    );
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
 
     await act(async () => {
       auth!.retrySessionRestore();
@@ -266,9 +280,7 @@ describe('AuthProvider session restore', () => {
 
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
     expect(text('token')).toBe('null');
-    expect(text('restoreError')).toBe(
-      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
-    );
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
     // The fail-closed default never wipes the entry on its own.
     expect(mockedClearToken).not.toHaveBeenCalled();
 
@@ -296,9 +308,7 @@ describe('AuthProvider session restore', () => {
     await renderTree(new QueryClient());
 
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
-    expect(text('restoreError')).toBe(
-      'Secure session storage is temporarily unavailable. Unlock your device and try again.',
-    );
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
 
     await act(async () => {
       auth!.resetStoredSession();
@@ -430,13 +440,11 @@ describe('logout', () => {
   it('uses stable, actionable cleanup error names and messages', () => {
     expect(new LogoutCleanupError()).toMatchObject({
       name: 'LogoutCleanupError',
-      message:
-        'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
+      message: t('auth.logoutCleanupFailed'),
     });
     expect(new AccountDeletedCleanupError()).toMatchObject({
       name: 'AccountDeletedCleanupError',
-      message:
-        'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
+      message: t('auth.accountDeletedCleanupFailed'),
     });
   });
 
@@ -455,10 +463,14 @@ describe('logout', () => {
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    // The signed-out device must stop nudging its former user to practice.
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3); // mount + login + logout
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
+    // A user-initiated logout is not a surprise; no sign-out notice is left.
+    expect(mockedMarkSessionExpiredNotice).not.toHaveBeenCalled();
   });
 
   it('tolerates a 401 from the logout endpoint', async () => {
@@ -539,8 +551,7 @@ describe('logout', () => {
     expect(error).toBeInstanceOf(LogoutCleanupError);
     expect(error).toMatchObject({
       name: 'LogoutCleanupError',
-      message:
-        'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
+      message: t('auth.logoutCleanupFailed'),
     });
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
@@ -601,7 +612,21 @@ describe('expireSession via the unauthorized handler', () => {
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    // P-M5: the login screen explains the surprise sign-out via a one-shot flag.
+    expect(mockedMarkSessionExpiredNotice).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('records the sign-out notice as best effort when the store is unavailable', async () => {
+    mockedMarkSessionExpiredNotice.mockRejectedValue(new Error('keychain unavailable'));
+    await renderLoggedIn();
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+
+    expect(text('token')).toBe('null');
+    expect(mockedMarkSessionExpiredNotice).toHaveBeenCalledTimes(1);
   });
 
   it('expires a session restored from storage', async () => {
@@ -627,6 +652,7 @@ describe('expireSession via the unauthorized handler', () => {
     expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
+    expect(mockedMarkSessionExpiredNotice).not.toHaveBeenCalled();
   });
 
   it('ignores a rejection that arrives during an account transition', async () => {
@@ -951,8 +977,7 @@ describe('deleteAccount', () => {
     expect(error).toBeInstanceOf(AccountDeletedCleanupError);
     expect(error).toMatchObject({
       name: 'AccountDeletedCleanupError',
-      message:
-        'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
+      message: t('auth.accountDeletedCleanupFailed'),
     });
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
@@ -1192,5 +1217,43 @@ describe('useAuth', () => {
 
     await expect(render(<Bare />)).rejects.toThrow('useAuth must be used within an AuthProvider');
     consoleSpy.mockRestore();
+  });
+});
+
+describe('daily reminder cleanup', () => {
+  it('cancels the reminder when the server rejects the active token', async () => {
+    await renderLoggedIn();
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels the reminder when the account is deleted', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await auth!.deleteAccount('secret1');
+    });
+
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('never blocks logout on reminder cleanup: the quiet cancel resolves internally', async () => {
+    // The cleanup contract is fire-and-forget; even a rejected promise from a
+    // misbehaving mock must not fail the logout path.
+    mockedCancelDailyReminder.mockResolvedValueOnce(undefined);
+    await renderLoggedIn();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await auth!.logout();
+    });
+
+    expect(text('token')).toBe('null');
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
   });
 });

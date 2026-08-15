@@ -10,8 +10,11 @@ import React, {
 } from 'react';
 
 import { ApiError, apiFetch, clearToken, getToken, saveToken, setUnauthorizedHandler } from './api';
+import { cancelDailyReminderQuietly } from './daily-reminder';
+import { translate } from './i18n';
 import { parseAuthResponse, parseUserResponse, type NativeLanguage, type User } from './types';
 import { clearPendingAssessment } from './pending-assessment';
+import { markSessionExpiredNotice } from './session-notice';
 export {
   comparablePasswordError,
   MAX_EMAIL_LENGTH,
@@ -48,25 +51,19 @@ interface AuthContextValue {
 
 export class AccountDeletedCleanupError extends Error {
   constructor() {
-    super(
-      'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
-    );
+    super(translate('auth.accountDeletedCleanupFailed'));
     this.name = 'AccountDeletedCleanupError';
   }
 }
 
 export class LogoutCleanupError extends Error {
   constructor() {
-    super(
-      'You were logged out, but the revoked local session could not be removed. Restart the app before signing in again.',
-    );
+    super(translate('auth.logoutCleanupFailed'));
     this.name = 'LogoutCleanupError';
   }
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
-const SESSION_RESTORE_ERROR =
-  'Secure session storage is temporarily unavailable. Unlock your device and try again.';
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
@@ -132,7 +129,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (rejectedToken && transitionRef.current) return;
       const tokenToClear = rejectedToken ?? tokenRef.current;
       epochRef.current += 1;
+      // The learner did not ask to sign out; leave a one-shot explanation for
+      // the login screen. Best effort — expiry itself must never block.
+      void markSessionExpiredNotice().catch(() => undefined);
       void schedulePendingCleanup().catch(() => undefined);
+      // A dead session must not keep nudging this device to practice.
+      void cancelDailyReminderQuietly();
       resetMemorySession();
       // The server has already rejected this token. Clear persistence
       // best-effort and conditionally: a newer login must never be deleted by
@@ -168,7 +170,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           tokenRef.current = null;
           setToken(null);
           setUser(null);
-          setRestoreError(SESSION_RESTORE_ERROR);
+          setRestoreError(translate('auth.restoreUnavailable'));
           setIsRestoring(false);
         }
       }
@@ -292,6 +294,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // let that 401 keep protected data or the stale token on this device.
         if (!(error instanceof ApiError && error.status === 401)) throw error;
       }
+      // The learner signed out: stop the daily practice reminder on this
+      // device. Best effort — logout must not fail on notification cleanup.
+      void cancelDailyReminderQuietly();
       const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
         sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
         schedulePendingCleanup(),
@@ -386,6 +391,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           throw error;
         }
 
+        // The account is gone; its practice reminder must not outlive it.
+        void cancelDailyReminderQuietly();
         const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
           sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
           schedulePendingCleanup(),

@@ -9,18 +9,20 @@ import {
   AppState,
   Linking,
   Pressable,
-  StyleSheet,
   Text,
   useAnimatedValue,
   View,
 } from 'react-native';
 import {
   AudioModule,
+  createAudioPlayer,
   RecordingPresets,
   setAudioModeAsync,
   useAudioRecorder,
   useAudioRecorderState,
+  type AudioPlayer,
 } from 'expo-audio';
+import * as Haptics from 'expo-haptics';
 
 import {
   ApiError,
@@ -32,6 +34,7 @@ import {
   resolveAudioFileDescriptor,
   userMessageForError,
 } from '../lib/api';
+import { translate, useT, type MessageKey } from '../lib/i18n';
 import {
   clearPendingAssessment,
   loadPendingAssessment,
@@ -41,8 +44,9 @@ import {
   type AssessmentEndpoint,
   type PendingAssessment,
 } from '../lib/pending-assessment';
-import { colors } from '../lib/theme';
+import { createThemedStyles, useTheme } from '../lib/theme';
 import { ContractError } from '../lib/types';
+import Button from './Button';
 
 type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering';
 
@@ -54,6 +58,12 @@ interface RecorderProps<T> {
   parseResult: (data: unknown) => T;
   onResult: (data: T) => void;
   onError: (message: string) => void;
+  /**
+   * Rate/daily-limit rejections (HTTP 429) carry a localized "when can I try
+   * again" message. Screens that render it inline near the record button pass
+   * this; without it those rejections fall back to onError like any other.
+   */
+  onRateLimited?: (message: string) => void;
   /** Refreshes canonical server state when feedback cannot be reconstructed. */
   onRecoveryUnresolved: () => void;
   /** Locks controls that would discard or retarget the current recording. */
@@ -75,11 +85,22 @@ const RECOVERY_POLL_MS = 2_000;
 const NOT_FOUND_CONFIRMATIONS = 3;
 const MAX_S3_RESUBMISSIONS = 3;
 const S3_RESUBMIT_BASE_BACKOFF_MS = 5_000;
+const UPLOAD_STAGE_LISTENING_MS = 8_000;
+const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
+const WAIT_TICK_MS = 1_000;
+const METER_SEGMENT_COUNT = 6;
+const METER_RANGE_DB = 60;
+const REMAINING_TIME_ANNOUNCEMENTS: readonly (readonly [number, MessageKey])[] = [
+  [60_000, 'recorder.oneMinuteLeft'],
+  [90_000, 'recorder.thirtySecondsLeft'],
+  [110_000, 'recorder.tenSecondsLeft'],
+];
 const SPEECH_RECORDING_OPTIONS = {
   ...RecordingPresets.HIGH_QUALITY,
   sampleRate: 16_000,
   numberOfChannels: 1,
   bitRate: 64_000,
+  isMeteringEnabled: true,
   web: {
     ...RecordingPresets.HIGH_QUALITY.web,
     bitsPerSecond: 64_000,
@@ -91,6 +112,13 @@ function formatElapsed(durationMillis: number): string {
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
   return `${minutes}:${seconds.toString().padStart(2, '0')}`;
+}
+
+/** Maps a recorder metering reading (dBFS, ≤ 0) onto filled meter segments. */
+function activeMeterSegments(metering: number | undefined): number {
+  if (typeof metering !== 'number' || !Number.isFinite(metering)) return 0;
+  const level = Math.min(1, Math.max(0, (metering + METER_RANGE_DB) / METER_RANGE_DB));
+  return Math.round(level * METER_SEGMENT_COUNT);
 }
 
 async function restoreAudioMode(): Promise<void> {
@@ -134,18 +162,24 @@ export default function Recorder<T>({
   parseResult,
   onResult,
   onError,
+  onRateLimited,
   onRecoveryUnresolved,
   onInteractionLockChange,
   onRecoveryEndpointMismatch,
 }: RecorderProps<T>) {
   const recorder = useAudioRecorder(SPEECH_RECORDING_OPTIONS);
   const recorderState = useAudioRecorderState(recorder, 200);
+  const t = useT();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);
   const [reduceMotion, setReduceMotion] = useState(false);
   const [recordedDurationMillis, setRecordedDurationMillis] = useState(0);
+  const [waitElapsedMillis, setWaitElapsedMillis] = useState(0);
+  const [previewPlaying, setPreviewPlaying] = useState(false);
   const pulse = useAnimatedValue(1);
   const phaseRef = useRef<Phase>('idle');
   const operationRef = useRef(false);
@@ -161,11 +195,17 @@ export default function Recorder<T>({
   const autoStoppedAtRef = useRef<number | null>(null);
   const previousIdentityRef = useRef({ ownerId, endpoint, questionId });
   const requestIdRef = useRef<string | null>(null);
+  const cancelRequestedRef = useRef(false);
+  const assessmentPostedRef = useRef(false);
+  const waitStartedAtRef = useRef<number | null>(null);
+  const previewPlayerRef = useRef<AudioPlayer | null>(null);
+  const previewListenerRef = useRef<{ remove: () => void } | null>(null);
   const recoveringRef = useRef(false);
   const recoveryGenerationRef = useRef(0);
   const instanceIdRef = useRef(Symbol('recorder-recovery'));
   const callbacksRef = useRef({
     onError,
+    onRateLimited,
     onRecoveryEndpointMismatch,
     onRecoveryUnresolved,
     onResult,
@@ -176,12 +216,20 @@ export default function Recorder<T>({
   useLayoutEffect(() => {
     callbacksRef.current = {
       onError,
+      onRateLimited,
       onRecoveryEndpointMismatch,
       onRecoveryUnresolved,
       onResult,
       parseResult,
     };
-  }, [onError, onRecoveryEndpointMismatch, onRecoveryUnresolved, onResult, parseResult]);
+  }, [
+    onError,
+    onRateLimited,
+    onRecoveryEndpointMismatch,
+    onRecoveryUnresolved,
+    onResult,
+    parseResult,
+  ]);
 
   useLayoutEffect(() => {
     identityRef.current = { ownerId, endpoint, questionId };
@@ -200,7 +248,25 @@ export default function Recorder<T>({
 
   const updatePhase = useCallback((next: Phase) => {
     phaseRef.current = next;
-    if (mountedRef.current) setPhase(next);
+    // Each wait (upload or recovery) shows its own elapsed clock from zero.
+    waitStartedAtRef.current = next === 'uploading' || next === 'recovering' ? Date.now() : null;
+    if (mountedRef.current) {
+      setPhase(next);
+      setWaitElapsedMillis(0);
+    }
+  }, []);
+
+  const releasePreviewPlayer = useCallback(() => {
+    previewListenerRef.current?.remove();
+    previewListenerRef.current = null;
+    const player = previewPlayerRef.current;
+    previewPlayerRef.current = null;
+    try {
+      player?.remove();
+    } catch {
+      // Releasing native player resources is best effort.
+    }
+    if (mountedRef.current) setPreviewPlaying(false);
   }, []);
 
   const discardRecording = useCallback((candidateUri?: string | null) => {
@@ -307,9 +373,7 @@ export default function Recorder<T>({
         (phaseRef.current === 'idle' || phaseRef.current === 'recovering')
       ) {
         updatePhase('recovering');
-        callbacksRef.current.onError(
-          'Secure retry information is temporarily unavailable. Restart the app before recording another answer.',
-        );
+        callbacksRef.current.onError(translate('recorder.errRetryInfoUnavailable'));
       }
       return;
     }
@@ -340,9 +404,7 @@ export default function Recorder<T>({
         (activeRecoveryOwner === null || activeRecoveryOwner === instanceId)
       ) {
         updatePhase('idle');
-        callbacksRef.current.onError(
-          'We could not confirm whether your answer was saved. If it does not appear, please record it again.',
-        );
+        callbacksRef.current.onError(translate('recorder.errNothingToConfirm'));
       }
       return;
     }
@@ -379,9 +441,7 @@ export default function Recorder<T>({
         if (isCurrent()) {
           updatePhase(cleared ? 'idle' : 'recovering');
           if (!cleared) {
-            callbacksRef.current.onError(
-              'Secure retry information could not be cleared. Restart the app before recording another answer.',
-            );
+            callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
           }
         }
         return;
@@ -405,9 +465,7 @@ export default function Recorder<T>({
           cleared ? (activeUriRef.current && routeMatches ? 'recorded' : 'idle') : 'recovering',
         );
         if (!cleared) {
-          callbacksRef.current.onError(
-            'Secure retry information could not be cleared. Restart the app before recording another answer.',
-          );
+          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
         }
         return;
       }
@@ -420,9 +478,7 @@ export default function Recorder<T>({
         } catch {
           if (!isCurrent()) return;
           updatePhase('recovering');
-          callbacksRef.current.onError(
-            'Secure retry information could not be updated. Restart the app to finish recovery.',
-          );
+          callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
           return;
         }
         if (!isCurrent()) return;
@@ -463,10 +519,7 @@ export default function Recorder<T>({
           notFoundCount = 0;
           resubmissionConflictPending = false;
           if (!status || typeof status !== 'object' || !('status' in status)) {
-            await finishUnresolved(
-              'The server returned an invalid recovery response. Your learning state has been refreshed.',
-              false,
-            );
+            await finishUnresolved(translate('recorder.errBadRecoveryResponse'), false);
             return;
           }
           const expectedContext =
@@ -481,10 +534,7 @@ export default function Recorder<T>({
             !('questionId' in status) ||
             status.questionId !== pending.questionId
           ) {
-            await finishUnresolved(
-              'The server returned inconsistent recovery data. Your learning state has been refreshed.',
-              false,
-            );
+            await finishUnresolved(translate('recorder.errRecoveryMismatch'), false);
             return;
           }
           if (status.status === 'processing') {
@@ -498,9 +548,7 @@ export default function Recorder<T>({
               } catch {
                 if (isCurrent()) {
                   updatePhase('recovering');
-                  callbacksRef.current.onError(
-                    'Secure retry information could not be updated. Restart the app to finish recovery.',
-                  );
+                  callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
                 }
                 return;
               }
@@ -509,9 +557,7 @@ export default function Recorder<T>({
               if (!isCurrent()) return;
               discardRecording();
               updatePhase('idle');
-              callbacksRef.current.onError(
-                'Your interrupted assessment was saved. Your current learning state has been refreshed.',
-              );
+              callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
               void clearRequestTracking(pending.requestId);
               return;
             }
@@ -526,9 +572,7 @@ export default function Recorder<T>({
               } catch {
                 if (isCurrent()) {
                   updatePhase('recovering');
-                  callbacksRef.current.onError(
-                    'Secure retry information could not be updated. Restart the app to finish recovery.',
-                  );
+                  callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
                 }
                 return;
               }
@@ -537,9 +581,7 @@ export default function Recorder<T>({
               if (!isCurrent()) return;
               discardRecording();
               updatePhase('idle');
-              callbacksRef.current.onError(
-                'The assessment was saved, but this app version could not display it. Your learning state has been refreshed.',
-              );
+              callbacksRef.current.onError(translate('recorder.errCannotDisplay'));
               void clearRequestTracking(pending.requestId);
               return;
             }
@@ -551,9 +593,7 @@ export default function Recorder<T>({
             } catch {
               if (isCurrent()) {
                 updatePhase('recovering');
-                callbacksRef.current.onError(
-                  'The result is safe, but secure retry information could not be updated. Restart the app to finish recovery.',
-                );
+                callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
               }
               return;
             }
@@ -566,10 +606,7 @@ export default function Recorder<T>({
             void clearRequestTracking(pending.requestId);
             return;
           } else {
-            await finishUnresolved(
-              'The server returned inconsistent recovery data. Your learning state has been refreshed.',
-              false,
-            );
+            await finishUnresolved(translate('recorder.errRecoveryMismatch'), false);
             return;
           }
         } catch (error) {
@@ -580,10 +617,7 @@ export default function Recorder<T>({
               // The 409 was never this request's own in-flight row — that row
               // would have answered this status read. Its claim was abandoned:
               // the question moved on, or another session owns it.
-              await finishUnresolved(
-                'This answer was already submitted or the question has moved on. Your learning state has been refreshed.',
-                true,
-              );
+              await finishUnresolved(translate('recorder.errAlreadyAnswered'), true);
               return;
             }
             const absenceConfirmed =
@@ -613,20 +647,14 @@ export default function Recorder<T>({
                 });
                 if (!isCurrent()) return;
                 if (!routeMatches) {
-                  await finishUnresolved(
-                    'Your interrupted assessment was saved. Your current learning state has been refreshed.',
-                    false,
-                  );
+                  await finishUnresolved(translate('recorder.errInterruptedSaved'), false);
                   return;
                 }
                 let data: T;
                 try {
                   data = callbacksRef.current.parseResult(raw);
                 } catch {
-                  await finishUnresolved(
-                    'The assessment was saved, but this app version could not display it. Your learning state has been refreshed.',
-                    false,
-                  );
+                  await finishUnresolved(translate('recorder.errCannotDisplay'), false);
                   return;
                 }
                 try {
@@ -636,9 +664,7 @@ export default function Recorder<T>({
                 } catch {
                   if (isCurrent()) {
                     updatePhase('recovering');
-                    callbacksRef.current.onError(
-                      'The result is safe, but secure retry information could not be updated. Restart the app to finish recovery.',
-                    );
+                    callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
                   }
                   return;
                 }
@@ -665,10 +691,7 @@ export default function Recorder<T>({
                   retryError instanceof ApiError &&
                   [400, 403, 404, 413, 415, 422].includes(retryError.status)
                 ) {
-                  await finishUnresolved(
-                    'The interrupted upload is no longer available. Please submit the recording again if the question remains.',
-                    true,
-                  );
+                  await finishUnresolved(translate('recorder.errUploadGone'), true);
                   return;
                 }
                 // An ambiguous failure may have committed. Continue polling the
@@ -678,10 +701,7 @@ export default function Recorder<T>({
               }
             }
             if (absenceConfirmed && pending.stage !== 's3-granted') {
-              await finishUnresolved(
-                'The interrupted upload could not be confirmed. Your learning state has been refreshed; please record again only if the question remains.',
-                false,
-              );
+              await finishUnresolved(translate('recorder.errUploadUnconfirmed'), false);
               return;
             }
           } else if (error instanceof ApiError && error.status === 401) {
@@ -693,10 +713,7 @@ export default function Recorder<T>({
         await new Promise((resolve) => setTimeout(resolve, RECOVERY_POLL_MS));
         if (!isCurrent()) return;
       }
-      await finishUnresolved(
-        'The interrupted assessment expired safely. Your learning state has been refreshed.',
-        false,
-      );
+      await finishUnresolved(translate('recorder.errRecoveryExpired'), false);
     } finally {
       if (recoveryGenerationRef.current === generation) {
         recoveringRef.current = false;
@@ -769,6 +786,49 @@ export default function Recorder<T>({
     };
   }, []);
 
+  // Pre-submit playback exists only while a take is held for review; every
+  // other phase releases the native player (submit, re-record, lifecycle).
+  useEffect(() => {
+    if (phase !== 'recorded') releasePreviewPlayer();
+  }, [phase, releasePreviewPlayer]);
+
+  useEffect(() => () => releasePreviewPlayer(), [releasePreviewPlayer]);
+
+  // The assessment wait shows honest progress: an elapsed clock plus staged
+  // copy while uploading, and a longer-than-usual note while recovering. The
+  // clock zero point is stamped by updatePhase; this effect only ticks.
+  useEffect(() => {
+    if (phase !== 'uploading' && phase !== 'recovering') return;
+    const interval = setInterval(() => {
+      const startedAt = waitStartedAtRef.current;
+      if (startedAt !== null) setWaitElapsedMillis(Date.now() - startedAt);
+    }, WAIT_TICK_MS);
+    return () => clearInterval(interval);
+  }, [phase]);
+
+  // Screen-reader users cannot watch the countdown; announce the remaining
+  // time at fixed marks of the two-minute recording window.
+  useEffect(() => {
+    if (phase !== 'recording') return;
+    const timers = REMAINING_TIME_ANNOUNCEMENTS.map(([atMillis, messageKey]) =>
+      setTimeout(() => AccessibilityInfo.announceForAccessibility(translate(messageKey)), atMillis),
+    );
+    return () => {
+      for (const timer of timers) clearTimeout(timer);
+    };
+  }, [phase]);
+
+  // Light tap on record start and on a take being saved; failures are ignored
+  // because haptics are unavailable on some devices and on web.
+  const hapticPhaseRef = useRef<Phase>('idle');
+  useEffect(() => {
+    const previous = hapticPhaseRef.current;
+    hapticPhaseRef.current = phase;
+    if (phase === 'recording' || (previous === 'recording' && phase === 'recorded')) {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(() => undefined);
+    }
+  }, [phase]);
+
   const announcedPhaseRef = useRef<Phase>('idle');
   useEffect(() => {
     if (announcedPhaseRef.current === phase) return;
@@ -776,13 +836,13 @@ export default function Recorder<T>({
     if (!focusedRef.current || AppState.currentState !== 'active') return;
     const announcement =
       phase === 'recording'
-        ? 'Recording started. Tap the microphone to stop.'
+        ? translate('recorder.announceStarted')
         : phase === 'recorded'
-          ? 'Recording saved. Ready to submit.'
+          ? translate('recorder.a11ySaved')
           : phase === 'uploading'
-            ? 'Uploading and assessing your answer.'
+            ? translate('recorder.a11yUploading')
             : phase === 'recovering'
-              ? 'Recovering your interrupted assessment.'
+              ? translate('recorder.a11yRecovering')
               : null;
     if (announcement) AccessibilityInfo.announceForAccessibility(announcement);
   }, [phase]);
@@ -846,9 +906,7 @@ export default function Recorder<T>({
 
   useEffect(() => {
     if (phaseRef.current === 'recording' && recorderState.mediaServicesDidReset) {
-      callbacksRef.current.onError(
-        'Recording was interrupted by the device. Please record your answer again.',
-      );
+      callbacksRef.current.onError(translate('recorder.errDeviceInterrupted'));
       void stopForLifecycle();
     }
   }, [recorderState.mediaServicesDidReset, stopForLifecycle]);
@@ -895,9 +953,7 @@ export default function Recorder<T>({
         if (!isCurrentLifecycle()) return;
         if (!cleared) {
           updatePhase('recovering');
-          callbacksRef.current.onError(
-            'Secure retry information could not be cleared. Restart the app before recording another answer.',
-          );
+          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
           return;
         }
       }
@@ -933,9 +989,7 @@ export default function Recorder<T>({
       updatePhase('idle');
       await restoreAudioMode().catch(() => undefined);
       if (isCurrentLifecycle()) {
-        callbacksRef.current.onError(
-          'Could not start recording. Check microphone access and try again.',
-        );
+        callbacksRef.current.onError(translate('recorder.errStartFailed'));
       }
     } finally {
       operationRef.current = false;
@@ -970,9 +1024,7 @@ export default function Recorder<T>({
       if (!uri || durationBeforeStop < 500) {
         discardRecording(uri);
         updatePhase('idle');
-        callbacksRef.current.onError(
-          'The recording was too short. Please record your answer again.',
-        );
+        callbacksRef.current.onError(translate('recorder.errTooShort'));
         return;
       }
       activeUriRef.current = uri;
@@ -999,9 +1051,7 @@ export default function Recorder<T>({
         discardRecording(uri);
         updatePhase('idle');
         if (isCurrentLifecycle()) {
-          callbacksRef.current.onError(
-            'Could not save the recording. Please record your answer again.',
-          );
+          callbacksRef.current.onError(translate('recorder.errSaveFailed'));
         }
       }
     } finally {
@@ -1020,11 +1070,13 @@ export default function Recorder<T>({
     /* istanbul ignore next */
     if (!uri) {
       updatePhase('idle');
-      callbacksRef.current.onError('No recording was saved. Please record again.');
+      callbacksRef.current.onError(translate('recorder.errNoRecording'));
       return;
     }
 
     operationRef.current = true;
+    cancelRequestedRef.current = false;
+    assessmentPostedRef.current = false;
     updatePhase('uploading');
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentSubmission = () =>
@@ -1070,9 +1122,7 @@ export default function Recorder<T>({
           if (!isCurrentSubmission()) return;
           requestIdRef.current = null;
           updatePhase('recorded');
-          callbacksRef.current.onError(
-            'The app could not securely save retry information, so your recording was not uploaded. Please try again.',
-          );
+          callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
           return;
         }
       }
@@ -1093,6 +1143,10 @@ export default function Recorder<T>({
         let capacityRetries = 0;
         for (;;) {
           try {
+            // Once the assessment POST is issued, a user cancel can no longer
+            // simply return to 'recorded': the server may have committed the
+            // attempt, so cancellation defers to the recovery flow instead.
+            if (!controller.signal.aborted) assessmentPostedRef.current = true;
             if (grant.mode === 's3') {
               return await apiFetch<unknown>(endpoint, {
                 method: 'POST',
@@ -1134,9 +1188,7 @@ export default function Recorder<T>({
           if (!isCurrentSubmission()) return;
           requestIdRef.current = null;
           updatePhase('recorded');
-          callbacksRef.current.onError(
-            'Secure retry information could not be updated, so your recording was not uploaded. Please try again.',
-          );
+          callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
           return;
         }
         if (!isCurrentSubmission()) return;
@@ -1156,9 +1208,7 @@ export default function Recorder<T>({
           if (!isCurrentSubmission()) return;
           requestIdRef.current = null;
           updatePhase('recorded');
-          callbacksRef.current.onError(
-            'Secure retry information could not be updated, so your recording was not uploaded. Please try again.',
-          );
+          callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
           return;
         }
         if (!isCurrentSubmission()) return;
@@ -1183,17 +1233,13 @@ export default function Recorder<T>({
         } catch {
           if (!isCurrentSubmission()) return;
           updatePhase('recovering');
-          callbacksRef.current.onError(
-            'The assessment was saved, but secure retry information could not be updated. Restart the app to finish recovery.',
-          );
+          callbacksRef.current.onError(translate('recorder.errAnswerSavedRetryInfo'));
           return;
         }
         if (!isCurrentSubmission()) return;
         updatePhase('idle');
         callbacksRef.current.onRecoveryUnresolved();
-        callbacksRef.current.onError(
-          'The assessment was saved, but this app version could not display it. Your learning state has been refreshed.',
-        );
+        callbacksRef.current.onError(translate('recorder.errCannotDisplay'));
         void clearRequestTracking(requestId);
         return;
       }
@@ -1205,9 +1251,7 @@ export default function Recorder<T>({
       } catch {
         if (!isCurrentSubmission()) return;
         updatePhase('recovering');
-        callbacksRef.current.onError(
-          'The result is safe, but secure retry information could not be updated. Restart the app to finish recovery.',
-        );
+        callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
         return;
       }
       if (!isCurrentSubmission()) return;
@@ -1215,7 +1259,31 @@ export default function Recorder<T>({
       callbacksRef.current.onResult(data);
       void clearRequestTracking(requestId);
     } catch (error) {
-      if (controller.signal.aborted) return;
+      if (controller.signal.aborted) {
+        // Lifecycle cleanup (blur, background, unmount) owns non-user aborts.
+        if (!cancelRequestedRef.current) return;
+        cancelRequestedRef.current = false;
+        if (!isCurrentSubmission()) return;
+        if (assessmentPostedRef.current) {
+          // The cancelled POST may have committed server-side. Resolve the
+          // durable request instead of risking a double submission.
+          recoverAfterUpload = true;
+          updatePhase('recovering');
+          return;
+        }
+        // Nothing was claimed server-side: forget the handoff and hand the
+        // saved take back so the learner can replay or resubmit it.
+        const requestId = requestIdRef.current;
+        const cleared = requestId ? await clearRequestTracking(requestId) : true;
+        if (!isCurrentSubmission()) return;
+        if (!cleared) {
+          updatePhase('recovering');
+          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+          return;
+        }
+        updatePhase('recorded');
+        return;
+      }
       if (!isCurrentSubmission()) return;
       const definitelyRejected =
         error instanceof ApiError && [400, 403, 404, 413, 415, 422, 429].includes(error.status);
@@ -1225,18 +1293,18 @@ export default function Recorder<T>({
         if (!isCurrentSubmission()) return;
         if (!cleared) {
           updatePhase('recovering');
-          callbacksRef.current.onError(
-            'Secure retry information could not be cleared. Restart the app before recording another answer.',
-          );
+          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
           return;
         }
         updatePhase('recorded');
-        callbacksRef.current.onError(
-          userMessageForError(
-            error,
-            'The server rejected this recording. Please review the question and try again.',
-          ),
-        );
+        const message = userMessageForError(error, translate('recorder.errRejected'));
+        // 429 covers RATE_LIMITED, DAILY_LIMIT, and NETWORK_DAILY_LIMIT; their
+        // localized wait line deserves an inline home, not just an alert.
+        if (error.status === 429 && callbacksRef.current.onRateLimited) {
+          callbacksRef.current.onRateLimited(message);
+        } else {
+          callbacksRef.current.onError(message);
+        }
       } else {
         // A timeout, disconnect, 409, or server failure can happen after the
         // attempt commits. Resolve its durable status before enabling controls.
@@ -1269,36 +1337,76 @@ export default function Recorder<T>({
     return startRecording();
   };
 
+  const cancelUpload = () => {
+    if (phaseRef.current !== 'uploading') return;
+    const controller = uploadControllerRef.current;
+    if (!controller) return;
+    cancelRequestedRef.current = true;
+    controller.abort();
+  };
+
+  const togglePreview = () => {
+    if (previewPlaying) {
+      previewPlayerRef.current?.pause();
+      setPreviewPlaying(false);
+      return;
+    }
+    if (!previewPlayerRef.current) {
+      const uri = activeUriRef.current;
+      // Unreachable by design: the recorded phase always holds a saved take
+      // (same invariant as submit). Kept as fail-closed defense.
+      /* istanbul ignore next */
+      if (!uri) return;
+      let player: AudioPlayer;
+      try {
+        player = createAudioPlayer(uri);
+      } catch {
+        callbacksRef.current.onError(translate('recorder.errPlayFailed'));
+        return;
+      }
+      previewPlayerRef.current = player;
+      previewListenerRef.current = player.addListener('playbackStatusUpdate', (status) => {
+        if (!status.didJustFinish) return;
+        // Rewind so Play starts the take from the beginning next time.
+        void player.seekTo(0).catch(() => undefined);
+        if (mountedRef.current && previewPlayerRef.current === player) {
+          setPreviewPlaying(false);
+        }
+      });
+    }
+    previewPlayerRef.current.play();
+    setPreviewPlaying(true);
+  };
+
   const busy = phase === 'uploading' || phase === 'recovering';
   const elapsed = formatElapsed(
     phase === 'recorded' ? recordedDurationMillis : (recorderState.durationMillis ?? 0),
   );
+  const meterSegments = activeMeterSegments(recorderState.metering);
+  const uploadStageText =
+    waitElapsedMillis >= UPLOAD_STAGE_ALMOST_DONE_MS
+      ? t('recorder.stageAlmostDone')
+      : waitElapsedMillis >= UPLOAD_STAGE_LISTENING_MS
+        ? t('recorder.stageListening')
+        : t('recorder.stageUploading');
 
   return (
     <View style={styles.container}>
       {permissionDenied && (
         <View accessibilityRole="alert" style={styles.permissionBanner}>
-          <Text style={styles.permissionText}>
-            Microphone access is needed to record your answer. Please allow microphone permission
-            for this app in your device settings, then try again.
-          </Text>
+          <Text style={styles.permissionText}>{t('recorder.permissionBody')}</Text>
           {permissionNeedsSettings && (
-            <Pressable
-              accessibilityRole="button"
+            <Button
+              title={t('recorder.openSettings')}
+              variant="danger"
+              size="sm"
               onPress={() => {
                 void Linking.openSettings().catch(() =>
-                  callbacksRef.current.onError(
-                    'Could not open device settings. Open Settings manually and allow microphone access for this app.',
-                  ),
+                  callbacksRef.current.onError(translate('recorder.openSettingsFailed')),
                 );
               }}
-              style={({ pressed }) => [
-                styles.settingsButton,
-                pressed && styles.settingsButtonPressed,
-              ]}
-            >
-              <Text style={styles.settingsButtonText}>Open Settings</Text>
-            </Pressable>
+              style={styles.settingsButton}
+            />
           )}
         </View>
       )}
@@ -1312,7 +1420,7 @@ export default function Recorder<T>({
         )}
         <Pressable
           accessibilityRole="button"
-          accessibilityLabel={isRecording ? 'Stop recording' : 'Start recording'}
+          accessibilityLabel={isRecording ? t('recorder.stopLabel') : t('recorder.startLabel')}
           accessibilityState={{ disabled: busy }}
           disabled={busy}
           onPress={handleMicPress}
@@ -1326,106 +1434,126 @@ export default function Recorder<T>({
         </Pressable>
       </View>
 
+      {isRecording &&
+        (reduceMotion ? (
+          <Text style={styles.listeningText}>{t('recorder.listening')}</Text>
+        ) : (
+          <View
+            testID="live-level-meter"
+            accessible={false}
+            accessibilityElementsHidden
+            importantForAccessibility="no-hide-descendants"
+            style={styles.meterRow}
+          >
+            {Array.from({ length: METER_SEGMENT_COUNT }, (_, index) => (
+              <View
+                key={index}
+                testID={index < meterSegments ? 'level-segment-active' : 'level-segment-idle'}
+                style={[styles.meterSegment, index < meterSegments && styles.meterSegmentActive]}
+              />
+            ))}
+          </View>
+        ))}
+
       <Text
         accessible={!isRecording}
         accessibilityLabel={
           isRecording
-            ? 'Recording in progress. Tap the microphone to stop.'
+            ? t('recorder.a11yRecording')
             : phase === 'recorded'
-              ? 'Recording saved. Ready to submit.'
+              ? t('recorder.a11ySaved')
               : phase === 'recovering'
-                ? 'Recovering your interrupted assessment.'
+                ? t('recorder.a11yRecovering')
                 : busy
-                  ? 'Uploading and assessing your answer.'
-                  : 'Ready to record.'
+                  ? t('recorder.a11yUploading')
+                  : t('recorder.a11yIdle')
         }
         style={styles.statusText}
       >
         {isRecording
-          ? `Recording… ${elapsed} of 2:00 — tap to stop`
+          ? t('recorder.statusRecording', { elapsed })
           : phase === 'recorded'
-            ? `Recorded ${elapsed} — ready to submit`
+            ? t('recorder.statusRecorded', { elapsed })
             : phase === 'recovering'
-              ? 'Confirming whether your interrupted assessment was saved…'
+              ? t('recorder.statusRecovering')
               : busy
-                ? 'Uploading and assessing your answer…'
-                : 'Tap the microphone to record your answer'}
+                ? uploadStageText
+                : t('recorder.statusIdle')}
       </Text>
 
-      <Text style={styles.privacyText}>
-        Your recording is uploaded only after you choose Submit Answer.
-      </Text>
+      <Text style={styles.privacyText}>{t('recorder.privacyNote')}</Text>
 
       {busy && (
-        <ActivityIndicator
-          accessibilityLabel={
-            phase === 'recovering'
-              ? 'Recovering your interrupted assessment'
-              : 'Uploading and assessing your answer'
-          }
-          style={styles.spinner}
-          size="large"
-          color={colors.primary}
-        />
+        <>
+          <ActivityIndicator
+            accessibilityLabel={
+              phase === 'recovering' ? t('recorder.a11yRecovering') : t('recorder.a11yUploading')
+            }
+            style={styles.spinner}
+            size="large"
+            color={theme.colors.primary}
+          />
+          {phase === 'recovering' && (
+            <Text style={styles.waitHintText}>{t('recorder.waitHint')}</Text>
+          )}
+          <Text style={styles.waitElapsedText}>
+            {t('recorder.waitingFor', { elapsed: formatElapsed(waitElapsedMillis) })}
+          </Text>
+          {phase === 'uploading' && (
+            <Button
+              title={t('common.cancel')}
+              variant="secondary"
+              size="sm"
+              accessibilityHint={t('recorder.cancelHint')}
+              onPress={cancelUpload}
+              style={styles.cancelButton}
+            />
+          )}
+        </>
       )}
 
       {phase === 'recorded' && (
         <View style={styles.actions}>
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.submitButton, pressed && styles.submitButtonPressed]}
-            onPress={() => void submit()}
-          >
-            <Text style={styles.submitButtonText}>Submit Answer</Text>
-          </Pressable>
-          <Pressable
-            accessibilityRole="button"
-            style={styles.rerecordButton}
+          <Button
+            title={previewPlaying ? t('recorder.pause') : t('recorder.play')}
+            variant="secondary"
+            accessibilityLabel={previewPlaying ? t('recorder.pauseLabel') : t('recorder.playLabel')}
+            onPress={togglePreview}
+          />
+          <Button title={t('recorder.submit')} onPress={() => void submit()} />
+          <Button
+            title={t('recorder.rerecord')}
+            variant="quiet"
             onPress={() => void startRecording()}
-          >
-            <Text style={styles.rerecordButtonText}>Re-record</Text>
-          </Pressable>
+          />
         </View>
       )}
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => ({
   container: {
     alignItems: 'center',
-    paddingVertical: 24,
+    paddingVertical: spacing.xl,
   },
   permissionBanner: {
     backgroundColor: colors.dangerLight,
     borderColor: colors.danger,
     borderWidth: 1,
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 20,
+    borderRadius: radii.input,
+    padding: spacing.md,
+    marginBottom: spacing.lg,
   },
   permissionText: {
-    color: '#B91C1C',
+    color: colors.danger,
     fontSize: 14,
     lineHeight: 20,
     textAlign: 'center',
   },
   settingsButton: {
-    minHeight: 44,
     marginTop: 10,
     alignSelf: 'center',
-    justifyContent: 'center',
-    borderRadius: 10,
-    paddingHorizontal: 18,
-    backgroundColor: colors.danger,
-  },
-  settingsButtonPressed: {
-    opacity: 0.82,
-  },
-  settingsButtonText: {
-    color: '#FFFFFF',
-    fontSize: 15,
-    fontWeight: '700',
   },
   buttonWrap: {
     width: 120,
@@ -1438,7 +1566,7 @@ const styles = StyleSheet.create({
     width: 96,
     height: 96,
     borderRadius: 48,
-    backgroundColor: 'rgba(220, 38, 38, 0.25)',
+    backgroundColor: colors.dangerPulse,
   },
   recordButton: {
     width: 88,
@@ -1447,14 +1575,16 @@ const styles = StyleSheet.create({
     backgroundColor: colors.danger,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.2,
+    shadowColor: colors.shadow,
+    // Black shadows disappear against the dark background; lean on a stronger
+    // cast (and the bright fill itself) instead of a light-mode-tuned haze.
+    shadowOpacity: scheme === 'dark' ? 0.5 : 0.2,
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 4 },
     elevation: 6,
   },
   recordButtonActive: {
-    backgroundColor: '#B91C1C',
+    backgroundColor: colors.danger,
   },
   recordButtonDimmed: {
     opacity: 0.6,
@@ -1463,57 +1593,72 @@ const styles = StyleSheet.create({
     width: 30,
     height: 30,
     borderRadius: 15,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.onDanger,
   },
   stopIcon: {
     width: 28,
     height: 28,
     borderRadius: 6,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.onDanger,
+  },
+  listeningText: {
+    marginTop: spacing.md,
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.muted,
+  },
+  meterRow: {
+    marginTop: spacing.md,
+    height: 16,
+    flexDirection: 'row',
+    alignItems: 'flex-end',
+    gap: 6,
+  },
+  meterSegment: {
+    width: 10,
+    height: 6,
+    borderRadius: 2,
+    backgroundColor: colors.border,
+  },
+  meterSegmentActive: {
+    height: 14,
+    backgroundColor: colors.success,
   },
   statusText: {
-    marginTop: 16,
+    marginTop: spacing.ml,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
   },
+  waitHintText: {
+    marginTop: spacing.md,
+    fontSize: 14,
+    color: colors.muted,
+    textAlign: 'center',
+  },
+  waitElapsedText: {
+    marginTop: spacing.sm,
+    fontSize: 13,
+    color: colors.muted,
+    textAlign: 'center',
+  },
+  cancelButton: {
+    marginTop: spacing.md,
+    alignSelf: 'center',
+  },
   privacyText: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     fontSize: 12,
     lineHeight: 17,
     color: colors.muted,
     textAlign: 'center',
   },
   spinner: {
-    marginTop: 16,
+    marginTop: spacing.ml,
   },
   actions: {
-    marginTop: 24,
+    marginTop: spacing.xl,
     alignSelf: 'stretch',
-    gap: 12,
+    gap: spacing.md,
   },
-  submitButton: {
-    backgroundColor: colors.primary,
-    borderRadius: 14,
-    paddingVertical: 16,
-    alignItems: 'center',
-  },
-  submitButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  submitButtonText: {
-    color: '#FFFFFF',
-    fontSize: 17,
-    fontWeight: '600',
-  },
-  rerecordButton: {
-    minHeight: 44,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  rerecordButtonText: {
-    color: colors.primary,
-    fontSize: 15,
-    fontWeight: '500',
-  },
-});
+}));

@@ -1,4 +1,5 @@
 import {
+  CEFR_LEVELS,
   ContractError,
   parseAttemptResult,
   parseAudioUploadGrant,
@@ -7,9 +8,15 @@ import {
   parseDiagnosticNext,
   parseHelpContent,
   parseNativeAttemptResult,
+  parsePracticeHistory,
   parsePracticeQuestion,
+  parsePracticeStats,
   parseUser,
+  parseUserDataPage,
   parseUserResponse,
+  PRACTICE_MASTER_SCORE,
+  PRACTICE_MAX_ATTEMPTS,
+  PRACTICE_PASS_SCORE,
 } from '../src/lib/types';
 
 const user = {
@@ -43,6 +50,14 @@ const practicePayload = {
 function expectContractError(run: () => unknown): void {
   expect(run).toThrow(ContractError);
 }
+
+describe('practice scoring constants', () => {
+  it('pins the server-mirrored pass, mastery, and attempt limits', () => {
+    expect(PRACTICE_PASS_SCORE).toBe(60);
+    expect(PRACTICE_MASTER_SCORE).toBe(75);
+    expect(PRACTICE_MAX_ATTEMPTS).toBe(3);
+  });
+});
 
 describe('identity contract parsers', () => {
   it('uses stable, actionable contract-error identity and copy', () => {
@@ -1251,5 +1266,320 @@ describe('audio upload grant parser', () => {
     { ...s3, maxBytes: 25 * 1024 * 1024 + 1 },
   ])('rejects malformed grant %#', (value) => {
     expectContractError(() => parseAudioUploadGrant(value));
+  });
+});
+
+// ----- Level-up, SRS dueCount, stats, history, and export parsers -----
+
+describe('levelUp attempt variant', () => {
+  const b2Question = {
+    id: '550e8400-e29b-41d4-a716-446655440002',
+    cefrLevel: 'B2',
+    promptWord: 'ambition',
+    questionText: 'What is your biggest ambition?',
+  } as const;
+
+  const promotedPayload = {
+    question: b2Question,
+    kind: 'new',
+    progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 12 },
+  } as const;
+
+  const promotedAttempt = {
+    passed: true,
+    mastered: true,
+    attemptNo: 1,
+    score: 90,
+    transcript: 'A detailed answer.',
+    feedback: 'Excellent.',
+    next: promotedPayload,
+    levelUp: { from: 'B1', to: 'B2' },
+  } as const;
+
+  it('accepts a mastering pass whose next question comes from the new level', () => {
+    expect(parseAttemptResult(promotedAttempt)).toEqual(promotedAttempt);
+  });
+
+  it('rejects a level-up whose next question is not from the new level', () => {
+    expectContractError(() => parseAttemptResult({ ...promotedAttempt, next: practicePayload }));
+  });
+
+  it('rejects a level-up on a pass that did not master the word', () => {
+    expectContractError(() =>
+      parseAttemptResult({
+        ...promotedAttempt,
+        mastered: false,
+        score: 70,
+      }),
+    );
+  });
+
+  it('rejects a level-up on failed and no-speech attempts', () => {
+    expectContractError(() =>
+      parseAttemptResult({
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 40,
+        transcript: 'Short.',
+        feedback: 'Add detail.',
+        levelUp: { from: 'B1', to: 'B2' },
+      }),
+    );
+    expectContractError(() =>
+      parseAttemptResult({
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 3,
+        noSpeech: true,
+        score: 0,
+        transcript: '',
+        feedback: 'We heard nothing.',
+        levelUp: { from: 'B1', to: 'B2' },
+      }),
+    );
+  });
+
+  it.each([
+    ['a skipped level', { from: 'A2', to: 'C1' }],
+    ['no movement', { from: 'B1', to: 'B1' }],
+    ['a demotion', { from: 'B2', to: 'B1' }],
+    ['an unknown source level', { from: 'Z9', to: 'B2' }],
+    ['an unknown target level', { from: 'B1', to: 'Z9' }],
+    ['a non-record value', 'B1->B2'],
+  ])('rejects a level-up with %s', (_label, levelUp) => {
+    expectContractError(() => parseAttemptResult({ ...promotedAttempt, levelUp }));
+  });
+
+  it('tolerates unknown additive fields on attempt responses', () => {
+    const attempt = {
+      passed: true,
+      mastered: true,
+      attemptNo: 1,
+      score: 90,
+      transcript: 'An answer.',
+      feedback: 'Great.',
+      next: practicePayload,
+      someFutureField: { anything: true },
+    };
+    expect(parseAttemptResult(attempt)).toEqual({
+      passed: true,
+      mastered: true,
+      attemptNo: 1,
+      score: 90,
+      transcript: 'An answer.',
+      feedback: 'Great.',
+      next: practicePayload,
+    });
+  });
+});
+
+describe('progress dueCount (additive SRS field)', () => {
+  it('accepts progress without dueCount from older servers', () => {
+    expect(parsePracticeQuestion(practicePayload)).toEqual(practicePayload);
+  });
+
+  it('accepts a valid dueCount within the learning+mastered rows', () => {
+    const payload = {
+      ...practicePayload,
+      progress: { ...practiceProgress, dueCount: 3 },
+    };
+    expect(parsePracticeQuestion(payload)).toEqual(payload);
+  });
+
+  it.each([
+    ['a negative dueCount', -1],
+    ['a fractional dueCount', 1.5],
+    ['a dueCount above the learning+mastered rows', 4],
+    ['a non-number dueCount', 'many'],
+  ])('rejects %s', (_label, dueCount) => {
+    expectContractError(() =>
+      parsePracticeQuestion({
+        ...practicePayload,
+        progress: { ...practiceProgress, dueCount },
+      }),
+    );
+  });
+});
+
+describe('practice stats parser', () => {
+  const stats = {
+    level: 'B1',
+    progress: { masteredCount: 3, learningCount: 2, totalAtLevel: 10, dueCount: 4 },
+    streakDays: 2,
+    practicedToday: 1,
+    totalAttempts: 12,
+    lastPracticedAt: '2026-08-15T10:00:00.000Z',
+  } as const;
+
+  it('accepts complete stats and a never-practiced null timestamp', () => {
+    expect(parsePracticeStats(stats)).toEqual(stats);
+    expect(
+      parsePracticeStats({
+        ...stats,
+        streakDays: 0,
+        practicedToday: 0,
+        totalAttempts: 0,
+        lastPracticedAt: null,
+      }),
+    ).toEqual({
+      ...stats,
+      streakDays: 0,
+      practicedToday: 0,
+      totalAttempts: 0,
+      lastPracticedAt: null,
+    });
+  });
+
+  it('drops unknown additive fields instead of failing on them', () => {
+    expect(parsePracticeStats({ ...stats, someFutureField: 1 })).toEqual(stats);
+  });
+
+  it.each([
+    ['a non-record value', 'stats'],
+    ['an unknown level', { ...stats, level: 'Z9' }],
+    ['missing progress', { ...stats, progress: undefined }],
+    [
+      'progress without dueCount (stats are post-SRS)',
+      { ...stats, progress: { masteredCount: 3, learningCount: 2, totalAtLevel: 10 } },
+    ],
+    [
+      'dueCount above the learning+mastered rows',
+      { ...stats, progress: { ...stats.progress, dueCount: 6 } },
+    ],
+    [
+      'more mastered+learning than words at the level',
+      { ...stats, progress: { ...stats.progress, masteredCount: 9 } },
+    ],
+    [
+      'an empty level word list',
+      { ...stats, progress: { ...stats.progress, totalAtLevel: 0, dueCount: 0 } },
+    ],
+    ['a negative streak', { ...stats, streakDays: -1 }],
+    ['a fractional streak', { ...stats, streakDays: 1.5 }],
+    ['a negative practicedToday', { ...stats, practicedToday: -1 }],
+    ['practicedToday above totalAttempts', { ...stats, practicedToday: 13 }],
+    ['a negative totalAttempts', { ...stats, totalAttempts: -1 }],
+    ['an unparseable timestamp', { ...stats, lastPracticedAt: 'yesterday-ish' }],
+    ['a numeric timestamp', { ...stats, lastPracticedAt: 1_755_252_000 }],
+  ])('rejects stats with %s', (_label, value) => {
+    expectContractError(() => parsePracticeStats(value));
+  });
+});
+
+describe('practice history parser', () => {
+  const item = {
+    id: '550e8400-e29b-41d4-a716-446655440031',
+    questionId: '550e8400-e29b-41d4-a716-446655440032',
+    promptWord: 'courage',
+    questionText: 'Describe a time you showed courage.',
+    cefrLevel: 'B1',
+    context: 'practice',
+    attemptNo: 2,
+    score: 59,
+    passed: false,
+    transcript: 'I tried.',
+    feedback: 'Add more detail.',
+    createdAt: '2026-08-15T10:00:00.000Z',
+  } as const;
+
+  const cursor = '550e8400-e29b-41d4-a716-446655440033';
+
+  it('accepts a page with items and a keyset cursor', () => {
+    const page = { items: [item, { ...item, context: 'diagnostic' }], nextCursor: cursor };
+    expect(parsePracticeHistory(page)).toEqual(page);
+  });
+
+  it('accepts the final empty page and an empty transcript', () => {
+    expect(parsePracticeHistory({ items: [], nextCursor: null })).toEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect(
+      parsePracticeHistory({ items: [{ ...item, transcript: '' }], nextCursor: null }).items[0]
+        .transcript,
+    ).toBe('');
+  });
+
+  it('rejects an empty page that still advertises another page', () => {
+    expectContractError(() => parsePracticeHistory({ items: [], nextCursor: cursor }));
+  });
+
+  it('rejects pages larger than the server maximum', () => {
+    const items = Array.from({ length: 51 }, (_value, index) => ({
+      ...item,
+      id: `550e8400-e29b-41d4-a716-4466554400${(index + 10).toString().padStart(2, '0')}`,
+    }));
+    expectContractError(() => parsePracticeHistory({ items, nextCursor: null }));
+  });
+
+  it.each([
+    ['a non-uuid id', { ...item, id: 'row-1' }],
+    ['a non-uuid questionId', { ...item, questionId: 'question-1' }],
+    ['a blank prompt word', { ...item, promptWord: '  ' }],
+    ['an oversized question', { ...item, questionText: 'x'.repeat(1_001) }],
+    ['an unknown level', { ...item, cefrLevel: 'Z9' }],
+    ['an unknown context', { ...item, context: 'homework' }],
+    ['a zero attempt number', { ...item, attemptNo: 0 }],
+    ['an attempt number above the retry cap', { ...item, attemptNo: PRACTICE_MAX_ATTEMPTS + 1 }],
+    ['an out-of-range score', { ...item, score: 101 }],
+    ['a non-boolean passed flag', { ...item, passed: 'no' }],
+    ['an oversized transcript', { ...item, transcript: 'x'.repeat(12_001) }],
+    ['empty feedback', { ...item, feedback: '' }],
+    ['an unparseable createdAt', { ...item, createdAt: 'last week' }],
+  ])('rejects a history item with %s', (_label, value) => {
+    expectContractError(() => parsePracticeHistory({ items: [value], nextCursor: null }));
+  });
+
+  it.each([
+    ['a non-record page', 'page'],
+    ['non-array items', { items: 'rows', nextCursor: null }],
+    ['a non-uuid cursor', { items: [item], nextCursor: 'next' }],
+  ])('rejects a page envelope with %s', (_label, value) => {
+    expectContractError(() => parsePracticeHistory(value));
+  });
+});
+
+describe('user data export page parser', () => {
+  const exportUser = { ...user } as const;
+  const cursor = '550e8400-e29b-41d4-a716-446655440034';
+
+  it('passes attempt rows through verbatim for export fidelity', () => {
+    const page = {
+      user: exportUser,
+      attempts: [{ id: 'a1', anything: { nested: true } }],
+      nextCursor: cursor,
+    };
+    expect(parseUserDataPage(page)).toEqual(page);
+  });
+
+  it('accepts the final page of an account with no attempts', () => {
+    expect(parseUserDataPage({ user: exportUser, attempts: [], nextCursor: null })).toEqual({
+      user: exportUser,
+      attempts: [],
+      nextCursor: null,
+    });
+  });
+
+  it.each([
+    ['a non-record envelope', 'page'],
+    ['a malformed user', { user: { ...exportUser, email: '' }, attempts: [], nextCursor: null }],
+    ['non-array attempts', { user: exportUser, attempts: 'rows', nextCursor: null }],
+    ['a non-record attempt row', { user: exportUser, attempts: ['row'], nextCursor: null }],
+    ['a non-uuid cursor', { user: exportUser, attempts: [{}], nextCursor: 'next' }],
+    [
+      'an empty page that advertises another page',
+      { user: exportUser, attempts: [], nextCursor: '550e8400-e29b-41d4-a716-446655440035' },
+    ],
+  ])('rejects %s', (_label, value) => {
+    expectContractError(() => parseUserDataPage(value));
+  });
+});
+
+describe('CEFR level order', () => {
+  it('pins the promotion ladder', () => {
+    expect(CEFR_LEVELS).toEqual(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']);
   });
 });

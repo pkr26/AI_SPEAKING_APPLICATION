@@ -1,3 +1,5 @@
+import { translate, type Translator } from './i18n';
+
 export const MAX_NAME_LENGTH = 100;
 export const MAX_EMAIL_LENGTH = 254;
 export const MAX_PASSWORD_UTF8_BYTES = 72;
@@ -27,22 +29,25 @@ export function utf8ByteLength(value: string): number {
   return bytes;
 }
 
-export function comparablePasswordError(password: string): string | null {
+export function comparablePasswordError(
+  password: string,
+  t: Translator = translate,
+): string | null {
   if (utf8ByteLength(password) > MAX_PASSWORD_UTF8_BYTES) {
-    return `Password must be at most ${MAX_PASSWORD_UTF8_BYTES} UTF-8 bytes.`;
+    return t('password.tooLong');
   }
   return null;
 }
 
 /** Client-side mirror of the server password policy. */
-export function passwordPolicyError(password: string): string | null {
+export function passwordPolicyError(password: string, t: Translator = translate): string | null {
   if (password.length < 8) {
-    return 'Password must be at least 8 characters.';
+    return t('password.tooShort');
   }
   if (!/\p{L}/u.test(password) || !/[0-9]/.test(password)) {
-    return 'Password must include at least one letter and one number.';
+    return t('password.needsLetterAndNumber');
   }
-  const byteError = comparablePasswordError(password);
+  const byteError = comparablePasswordError(password, t);
   if (byteError) return byteError;
   return null;
 }

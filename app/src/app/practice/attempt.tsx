@@ -1,26 +1,21 @@
-import React, { useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
-import { router, useLocalSearchParams } from 'expo-router';
+import React, { useCallback, useLayoutEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
+import { router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
+import Button from '../../components/Button';
 import Recorder from '../../components/Recorder';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
+import { useT } from '../../lib/i18n';
 import { firstParam, isUuid } from '../../lib/params';
 import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
-import { colors, layout } from '../../lib/theme';
+import { createThemedStyles, useTheme } from '../../lib/theme';
 import {
   parseAttemptResult,
   parseHelpContent,
   parseNativeAttemptResult,
+  PRACTICE_MAX_ATTEMPTS,
   type PracticeOutcome,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
@@ -31,13 +26,32 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
  */
 export default function AttemptScreen() {
   const { user } = useAuth();
+  const t = useT();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
   const queryClient = useQueryClient();
-  const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
+  const navigation = useNavigation();
+  const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const [recorderLocked, setRecorderLocked] = useState(false);
+  // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
+  // rendered inline next to the recorder instead of only in a passing alert.
+  const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
   const validQuestionId = isUuid(questionId) ? questionId : null;
   const nativeMode = answerMode === 'native';
+
+  // This is the one recorder screen with a visible header back button. While
+  // the recorder holds a take (recording, uploading, recovering), header back
+  // and the iOS swipe gesture must not pop the screen — blur cleanup would
+  // discard it. Restore normal exits as soon as the lock releases.
+  useLayoutEffect(() => {
+    navigation.setOptions(
+      recorderLocked
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  }, [navigation, recorderLocked]);
 
   const helpQuery = useQuery({
     queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
@@ -58,15 +72,23 @@ export default function AttemptScreen() {
   // recovery is active — popping then would let blur cleanup discard the take.
   useHardwareBack(() => recorderLocked);
 
+  // A new submission owns the inline space again: clear the old wait line the
+  // moment the recorder locks for the next take.
+  const handleLockChange = useCallback((locked: boolean) => {
+    setRecorderLocked(locked);
+    if (locked) setRateLimitNotice(null);
+  }, []);
+
   const handleResult = (result: PracticeOutcome) => {
     if (!user || !validQuestionId) return;
+    setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, validQuestionId, result);
     showFeedback(validQuestionId, result);
     router.push('/practice/feedback');
   };
 
   const handleError = (message: string) => {
-    Alert.alert('Could not assess your answer', message);
+    Alert.alert(t('diag.assessFailedTitle'), message);
   };
 
   // The protected-route gate owns navigation when the session disappears.
@@ -77,18 +99,14 @@ export default function AttemptScreen() {
     return (
       <View style={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
-          Invalid question link
+          {t('help.invalidLinkTitle')}
         </Text>
-        <Text style={styles.muted}>
-          Return to practice and choose Practice Mode from the current question.
-        </Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.retryButton, pressed && styles.retryButtonPressed]}
+        <Text style={styles.muted}>{t('attempt.invalidLinkBody')}</Text>
+        <Button
+          title={t('common.backToPractice')}
           onPress={() => router.replace('/practice')}
-        >
-          <Text style={styles.retryButtonText}>Back to Practice</Text>
-        </Pressable>
+          style={styles.retryButton}
+        />
       </View>
     );
   }
@@ -98,12 +116,12 @@ export default function AttemptScreen() {
       return (
         <View style={styles.center}>
           <ActivityIndicator
-            accessibilityLabel="Loading question"
+            accessibilityLabel={t('attempt.loading')}
             size="large"
-            color={colors.primary}
+            color={theme.colors.primary}
           />
           <Text accessibilityLiveRegion="polite" style={styles.muted}>
-            Loading question…
+            {t('attempt.loading')}
           </Text>
         </View>
       );
@@ -112,27 +130,22 @@ export default function AttemptScreen() {
       return (
         <View style={styles.center}>
           <Text accessibilityRole="header" style={styles.errorTitle}>
-            Couldn&apos;t load the question
+            {t('attempt.loadFailedTitle')}
           </Text>
           <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-            {userMessageForError(
-              helpQuery.error,
-              'Could not load this practice question. Please try again.',
-            )}
+            {userMessageForError(helpQuery.error, t('attempt.loadFailed'))}
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.retryButton, pressed && styles.retryButtonPressed]}
+          <Button
+            title={t('common.tryAgain')}
             onPress={() => void helpQuery.refetch()}
-          >
-            <Text style={styles.retryButtonText}>Try Again</Text>
-          </Pressable>
+            style={styles.retryButton}
+          />
         </View>
       );
     }
     return (
       <View style={styles.center}>
-        <ActivityIndicator size="large" color={colors.primary} />
+        <ActivityIndicator size="large" color={theme.colors.primary} />
       </View>
     );
   }
@@ -140,6 +153,16 @@ export default function AttemptScreen() {
   return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
       <View style={styles.card}>
+        {attemptStatus !== null && attemptStatus.questionId === validQuestionId && (
+          <View style={styles.attemptChip}>
+            <Text style={styles.attemptChipText}>
+              {t('practice.attemptChip', {
+                current: PRACTICE_MAX_ATTEMPTS + 1 - attemptStatus.attemptsLeft,
+                max: PRACTICE_MAX_ATTEMPTS,
+              })}
+            </Text>
+          </View>
+        )}
         <Text accessibilityRole="header" style={styles.promptWord}>
           {promptWord}
         </Text>
@@ -148,25 +171,30 @@ export default function AttemptScreen() {
 
       <Pressable
         accessibilityRole="switch"
-        accessibilityLabel="Answer in my language"
-        accessibilityHint={
-          recorderLocked
-            ? 'Finish the current recording before changing answer language.'
-            : undefined
-        }
+        accessibilityLabel={t('practice.answerInMyLanguage')}
+        accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
         accessibilityState={{ checked: nativeMode, disabled: recorderLocked }}
         disabled={recorderLocked}
         style={({ pressed }) => [
           styles.modeToggle,
+          nativeMode && styles.modeToggleOn,
           recorderLocked && styles.modeToggleDisabled,
-          pressed && styles.modeTogglePressed,
+          pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
         ]}
         onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
       >
-        <Text style={styles.modeToggleText}>
-          {nativeMode ? 'Answering in your language — tap for English' : 'Answer in my language'}
+        <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
+          {nativeMode ? t('practice.answeringNative') : t('practice.answerInMyLanguage')}
         </Text>
       </Pressable>
+
+      {rateLimitNotice && (
+        <View style={styles.rateLimitCard}>
+          <Text accessibilityRole="alert" style={styles.rateLimitText}>
+            {rateLimitNotice}
+          </Text>
+        </View>
+      )}
 
       <View style={styles.recorderArea}>
         <Recorder
@@ -177,6 +205,7 @@ export default function AttemptScreen() {
           parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
           onResult={handleResult}
           onError={handleError}
+          onRateLimited={setRateLimitNotice}
           onRecoveryUnresolved={() => {
             void queryClient.invalidateQueries({
               queryKey: ['practice-question', user?.id, user?.cefrLevel],
@@ -194,17 +223,17 @@ export default function AttemptScreen() {
             }
             return false;
           }}
-          onInteractionLockChange={setRecorderLocked}
+          onInteractionLockChange={handleLockChange}
         />
       </View>
     </ScrollView>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   container: {
     flexGrow: 1,
-    padding: 20,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -214,11 +243,11 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
     backgroundColor: colors.background,
   },
   muted: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
@@ -229,25 +258,13 @@ const styles = StyleSheet.create({
     color: colors.text,
   },
   retryButton: {
-    marginTop: 20,
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 13,
-    paddingHorizontal: 28,
-  },
-  retryButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  retryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '600',
+    marginTop: spacing.lg,
   },
   card: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 20,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -262,17 +279,38 @@ const styles = StyleSheet.create({
     lineHeight: 26,
     color: colors.text,
   },
+  attemptChip: {
+    alignSelf: 'flex-start',
+    backgroundColor: colors.primaryLight,
+    borderRadius: radii.badge,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+    marginBottom: spacing.xs,
+  },
+  attemptChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.primary,
+  },
   modeToggle: {
     alignSelf: 'center',
-    marginTop: 16,
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
+    marginTop: spacing.ml,
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.ml,
+    borderRadius: radii.pill,
     borderWidth: 1,
     borderColor: colors.primary,
   },
+  modeToggleOn: {
+    backgroundColor: colors.primary,
+  },
   modeTogglePressed: {
     backgroundColor: colors.primaryLight,
+  },
+  modeTogglePressedOn: {
+    backgroundColor: colors.primaryDark,
   },
   modeToggleDisabled: {
     opacity: 0.5,
@@ -282,8 +320,25 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.primary,
   },
+  modeToggleTextOn: {
+    color: colors.onPrimary,
+  },
   recorderArea: {
     flex: 1,
     justifyContent: 'center',
   },
-});
+  rateLimitCard: {
+    marginTop: spacing.md,
+    backgroundColor: colors.dangerLight,
+    borderColor: colors.danger,
+    borderWidth: 1,
+    borderRadius: radii.input,
+    padding: spacing.md,
+  },
+  rateLimitText: {
+    color: colors.danger,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+  },
+}));

@@ -3,11 +3,21 @@ import { File, UploadType } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
+import { translate, type MessageKey } from './i18n';
 import {
   audioKeyBelongsToOwner,
   ContractError,
+  HISTORY_PAGE_LIMIT,
   parseAudioUploadGrant,
+  parsePracticeHistory,
+  parsePracticeStats,
+  parseUserDataPage,
+  parseUserResponse,
   type AudioUploadGrant,
+  type HistoryPage,
+  type NativeLanguage,
+  type PracticeStats,
+  type User,
 } from './types';
 
 const TOKEN_KEY = 'auth_token';
@@ -69,45 +79,156 @@ function resolveBaseUrl(): string {
 
 export const API_URL = resolveBaseUrl();
 
+/**
+ * Machine-readable error codes the server attaches to error bodies. Older
+ * server deployments may omit them; status-based mapping remains the fallback.
+ */
+export const API_ERROR_CODES = [
+  'VALIDATION_FAILED',
+  'INVALID_CREDENTIALS',
+  'EMAIL_TAKEN',
+  'UNAUTHENTICATED',
+  'TOKEN_REVOKED',
+  'FORBIDDEN',
+  'NOT_FOUND',
+  'QUESTION_MISMATCH',
+  'DIAGNOSTIC_DONE',
+  'REQUEST_IN_FLIGHT',
+  'REQUEST_ID_REUSED',
+  'ASSESSMENT_IN_PROGRESS',
+  'STATE_CHANGED',
+  'RATE_LIMITED',
+  'DAILY_LIMIT',
+  'NETWORK_DAILY_LIMIT',
+  'CAPACITY_BUSY',
+  'POOL_SATURATED',
+  'AUDIO_INVALID',
+  'AUDIO_TOO_LARGE',
+  'AUDIO_TOO_LONG',
+  'AUDIO_UNREADABLE',
+  'PROVIDER_FAILED',
+  'PROVIDER_TIMEOUT',
+  'RESET_INVALID',
+  'CLIENT_UPGRADE_REQUIRED',
+  'INTERNAL',
+] as const;
+
+export type ApiErrorCode = (typeof API_ERROR_CODES)[number];
+
+const API_ERROR_CODE_SET: ReadonlySet<string> = new Set(API_ERROR_CODES);
+
+function isApiErrorCode(value: unknown): value is ApiErrorCode {
+  return typeof value === 'string' && API_ERROR_CODE_SET.has(value);
+}
+
 export class ApiError extends Error {
   readonly status: number;
+  /** Machine-readable error code from the response body, when present. */
+  readonly code?: ApiErrorCode;
   /** Bounded server-supplied retry delay from the 503 backpressure contract. */
   readonly retryAfterSeconds?: number;
+  /** Bounded server-supplied retry delay for daily limits, in hours. */
+  readonly retryAfterHours?: number;
 
-  constructor(status: number, message: string, retryAfterSeconds?: number) {
+  constructor(
+    status: number,
+    message: string,
+    retryAfterSeconds?: number,
+    extra?: { code?: ApiErrorCode; retryAfterHours?: number },
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.retryAfterSeconds = retryAfterSeconds;
+    this.code = extra?.code;
+    this.retryAfterHours = extra?.retryAfterHours;
   }
 }
 
-/** Converts transport/API failures into copy that cannot expose backend details. */
+/** Localized message key for each machine-readable server error code. */
+const CODE_MESSAGE_KEYS: Readonly<Record<ApiErrorCode, MessageKey>> = {
+  VALIDATION_FAILED: 'error.validation',
+  INVALID_CREDENTIALS: 'error.wrongCredentials',
+  EMAIL_TAKEN: 'error.emailTaken',
+  UNAUTHENTICATED: 'error.loginAgain',
+  TOKEN_REVOKED: 'error.loginAgain',
+  FORBIDDEN: 'error.forbidden',
+  NOT_FOUND: 'error.notFound',
+  QUESTION_MISMATCH: 'error.questionChanged',
+  DIAGNOSTIC_DONE: 'error.diagnosticDone',
+  REQUEST_IN_FLIGHT: 'error.stillChecking',
+  REQUEST_ID_REUSED: 'error.alreadySent',
+  ASSESSMENT_IN_PROGRESS: 'error.stillChecking',
+  STATE_CHANGED: 'error.stateChanged',
+  RATE_LIMITED: 'error.tooMany',
+  DAILY_LIMIT: 'error.dailyLimit',
+  NETWORK_DAILY_LIMIT: 'error.networkDailyLimit',
+  CAPACITY_BUSY: 'error.busy',
+  POOL_SATURATED: 'error.busy',
+  AUDIO_INVALID: 'error.audioInvalid',
+  AUDIO_TOO_LARGE: 'error.tooLarge',
+  AUDIO_TOO_LONG: 'error.audioTooLong',
+  AUDIO_UNREADABLE: 'error.audioUnreadable',
+  PROVIDER_FAILED: 'error.checkFailed',
+  PROVIDER_TIMEOUT: 'error.timeout',
+  RESET_INVALID: 'error.resetInvalid',
+  CLIENT_UPGRADE_REQUIRED: 'error.upgradeRequired',
+  INTERNAL: 'error.internal',
+};
+
+/** Localized "Please wait N seconds/minutes/hours." from server retry hints. */
+function retryWaitLine(error: ApiError): string | null {
+  if (error.retryAfterHours !== undefined) {
+    const hours = Math.max(1, Math.ceil(error.retryAfterHours));
+    return hours === 1 ? translate('wait.hour') : translate('wait.hours', { count: hours });
+  }
+  if (error.retryAfterSeconds === undefined) return null;
+  if (error.retryAfterSeconds >= 60) {
+    const minutes = Math.ceil(error.retryAfterSeconds / 60);
+    return minutes === 1 ? translate('wait.minute') : translate('wait.minutes', { count: minutes });
+  }
+  const seconds = Math.max(1, Math.ceil(error.retryAfterSeconds));
+  return seconds === 1 ? translate('wait.second') : translate('wait.seconds', { count: seconds });
+}
+
+function withRetryWait(message: string, error: ApiError): string {
+  const wait = retryWaitLine(error);
+  return wait ? `${message} ${wait}` : message;
+}
+
+/**
+ * Converts transport/API failures into localized copy that cannot expose
+ * backend details. A machine-readable `code` from the server wins; the HTTP
+ * status is the fallback for servers that do not send codes yet.
+ */
 export function userMessageForError(error: unknown, fallback: string): string {
   if (!(error instanceof ApiError)) return fallback;
+  if (error.code) {
+    return withRetryWait(translate(CODE_MESSAGE_KEYS[error.code]), error);
+  }
   if (error.status === 0) {
-    return 'Could not connect to the server. Check your connection and try again.';
+    return translate('error.network');
   }
   if (error.status === 408) {
-    return 'The request timed out. Check your connection and try again.';
+    return translate('error.timeout');
   }
   if (error.status === 413) {
-    return 'The recording is too large. Please record a shorter answer.';
+    return translate('error.tooLarge');
   }
   if (error.status === 415) {
-    return 'This recording format is not supported. Please record your answer again.';
+    return translate('error.unsupportedFormat');
   }
   if (error.status === 422) {
-    return 'The recording could not be assessed. Speak for at least a moment and keep the answer under two minutes.';
+    return translate('error.cannotAssess');
   }
   if (error.status === 409) {
-    return 'An assessment is already in progress or the question changed. Wait a moment and try again.';
+    return translate('error.conflict');
   }
   if (error.status === 429) {
-    return 'Too many attempts. Please wait and try again later.';
+    return withRetryWait(translate('error.tooMany'), error);
   }
   if (error.status >= 500) {
-    return 'The service is temporarily unavailable. Please try again later.';
+    return withRetryWait(translate('error.serverBusy'), error);
   }
   return fallback;
 }
@@ -187,31 +308,57 @@ async function tokenForRequest(): Promise<string | null> {
   return tokenSnapshotReady ? tokenSnapshot : getToken();
 }
 
-function parseRetryAfterSecondsHeader(header: string | null): number | undefined {
-  if (!header) return undefined;
-  const seconds = Number(header);
-  return Number.isFinite(seconds) && seconds > 0 && seconds <= 120 ? seconds : undefined;
+function boundedSeconds(value: unknown, maxSeconds: number): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= maxSeconds
+    ? value
+    : undefined;
 }
+
+function parseRetryAfterSecondsHeader(
+  header: string | null,
+  maxSeconds: number,
+): number | undefined {
+  if (!header) return undefined;
+  return boundedSeconds(Number(header), maxSeconds);
+}
+
+// The 503 backpressure contract (assess semaphore, pool shed) promises a small
+// bounded delay; 429 rate/daily limits may legitimately ask for much longer.
+const MAX_RETRY_AFTER_SECONDS_503 = 120;
+const MAX_RETRY_AFTER_SECONDS_429 = 24 * 60 * 60;
+const MAX_RETRY_AFTER_HOURS = 48;
 
 async function throwForStatus(res: Response): Promise<never> {
   // Do not forward server or upstream-provider error bodies into the UI. The
-  // single exception is the bounded, non-sensitive retryAfterSeconds number
-  // that drives the 503 backpressure contract (assess semaphore, pool shed).
+  // only fields read are the machine-readable `code` (mapped to localized
+  // copy by userMessageForError) and the bounded, non-sensitive retry delays
+  // that drive the 429/503 "please wait" contract.
+  const body: unknown = await res.json().catch(() => undefined);
+  const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : undefined;
+  const code = isApiErrorCode(record?.code) ? record.code : undefined;
+
   let retryAfterSeconds: number | undefined;
-  if (res.status === 503) {
-    retryAfterSeconds = parseRetryAfterSecondsHeader(res.headers.get('Retry-After'));
-    if (retryAfterSeconds === undefined) {
-      const body: unknown = await res.json().catch(() => undefined);
-      const value =
-        body && typeof body === 'object'
-          ? (body as { retryAfterSeconds?: unknown }).retryAfterSeconds
-          : undefined;
-      if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 120) {
-        retryAfterSeconds = value;
-      }
+  let retryAfterHours: number | undefined;
+  if (res.status === 503 || res.status === 429) {
+    const maxSeconds =
+      res.status === 503 ? MAX_RETRY_AFTER_SECONDS_503 : MAX_RETRY_AFTER_SECONDS_429;
+    retryAfterSeconds =
+      parseRetryAfterSecondsHeader(res.headers.get('Retry-After'), maxSeconds) ??
+      boundedSeconds(record?.retryAfterSeconds, maxSeconds);
+    const hours = record?.retryAfterHours;
+    if (
+      typeof hours === 'number' &&
+      Number.isFinite(hours) &&
+      hours > 0 &&
+      hours <= MAX_RETRY_AFTER_HOURS
+    ) {
+      retryAfterHours = hours;
     }
   }
-  throw new ApiError(res.status, `Request failed with status ${res.status}`, retryAfterSeconds);
+  throw new ApiError(res.status, `Request failed with status ${res.status}`, retryAfterSeconds, {
+    code,
+    retryAfterHours,
+  });
 }
 
 function authHeader(token: string | null): Record<string, string> {
@@ -254,7 +401,7 @@ async function fetchWithTimeout(
 }
 
 interface ApiFetchOptions {
-  method?: 'GET' | 'POST' | 'PUT' | 'DELETE';
+  method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -542,4 +689,106 @@ export async function apiPostPresignedAudio(
     options.signal,
   );
   if (!res.ok) await throwForStatus(res);
+}
+
+// ----- Typed endpoint helpers -----
+// Screens call these instead of hand-rolling apiFetch + parser pairs, so
+// contract drift fails loudly in exactly one place per endpoint.
+
+/** Home-screen mastery/streak/due statistics. */
+export async function apiGetPracticeStats(signal?: AbortSignal): Promise<PracticeStats> {
+  return parsePracticeStats(await apiFetch<unknown>('/practice/stats', { signal }));
+}
+
+/** One newest-first page of attempt history; pass the previous nextCursor to page older. */
+export async function apiGetPracticeHistory(
+  cursor?: string,
+  signal?: AbortSignal,
+): Promise<HistoryPage> {
+  const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+  return parsePracticeHistory(
+    await apiFetch<unknown>(`/practice/history?limit=${HISTORY_PAGE_LIMIT}${cursorParam}`, {
+      signal,
+    }),
+  );
+}
+
+/** Defers the current word for a week and frees the queue for the next one. */
+export async function apiSkipPracticeWord(questionId: string): Promise<void> {
+  await apiFetch<void>('/practice/skip', {
+    method: 'POST',
+    body: { questionId },
+  });
+}
+
+/** Always succeeds with 204 (no account enumeration); errors are transport/rate-limit only. */
+export async function apiForgotPassword(email: string): Promise<void> {
+  await apiFetch<void>('/auth/forgot-password', {
+    method: 'POST',
+    body: { email },
+    auth: false,
+  });
+}
+
+export async function apiResetPassword(
+  email: string,
+  token: string,
+  newPassword: string,
+): Promise<void> {
+  await apiFetch<void>('/auth/reset-password', {
+    method: 'POST',
+    body: { email, token, newPassword },
+    auth: false,
+  });
+}
+
+/** Updates name and/or native language; returns the server's updated user. */
+export async function apiUpdateProfile(update: {
+  name?: string;
+  nativeLanguage?: NativeLanguage;
+}): Promise<User> {
+  return parseUserResponse(
+    await apiFetch<unknown>('/auth/me', {
+      method: 'PATCH',
+      body: update,
+    }),
+  ).user;
+}
+
+/** Resets the placement test; practice history and progress are kept. */
+export async function apiRestartDiagnostic(): Promise<void> {
+  await apiFetch<void>('/diagnostic/restart', {
+    method: 'POST',
+    body: { confirm: true },
+  });
+}
+
+// The export walker refuses to loop forever on a server that keeps handing
+// out cursors; 500 pages ≥ 500k attempt rows, far beyond any real account.
+const EXPORT_MAX_PAGES = 500;
+
+/**
+ * Walks every page of GET /auth/me/data and returns the combined export.
+ * Repeated or excessive cursors abort as contract errors instead of spinning.
+ */
+export async function apiExportUserData(
+  signal?: AbortSignal,
+): Promise<{ user: User; attempts: Record<string, unknown>[] }> {
+  const attempts: Record<string, unknown>[] = [];
+  let user: User | null = null;
+  let cursor: string | null = null;
+  const seenCursors = new Set<string>();
+  for (let page = 0; page < EXPORT_MAX_PAGES; page += 1) {
+    const cursorParam: string = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const data = parseUserDataPage(
+      await apiFetch<unknown>(`/auth/me/data${cursorParam}`, { signal }),
+    );
+    user ??= data.user;
+    attempts.push(...data.attempts);
+    if (data.nextCursor === null) return { user, attempts };
+    if (seenCursors.has(data.nextCursor)) throw new ContractError();
+    seenCursors.add(data.nextCursor);
+    cursor = data.nextCursor;
+  }
+  throw new ContractError();
 }

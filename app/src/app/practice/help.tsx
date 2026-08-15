@@ -1,13 +1,15 @@
 import React from 'react';
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import Button from '../../components/Button';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
+import { useT } from '../../lib/i18n';
 import { firstParam, isUuid } from '../../lib/params';
-import { colors, layout } from '../../lib/theme';
+import { createThemedStyles, useTheme } from '../../lib/theme';
 import { parseHelpContent, type NativeLanguage } from '../../lib/types';
 
 const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
@@ -20,6 +22,9 @@ const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
 export default function HelpScreen() {
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
+  const t = useT();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
   const validQuestionId = isUuid(questionId) ? questionId : null;
@@ -49,18 +54,14 @@ export default function HelpScreen() {
     return (
       <View style={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
-          Invalid question link
+          {t('help.invalidLinkTitle')}
         </Text>
-        <Text style={styles.muted}>
-          Return to practice and open help from the current question.
-        </Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+        <Text style={styles.muted}>{t('help.invalidLinkBody')}</Text>
+        <Button
+          title={t('common.backToPractice')}
           onPress={() => router.replace('/practice')}
-        >
-          <Text style={styles.primaryButtonText}>Back to Practice</Text>
-        </Pressable>
+          style={styles.retryButton}
+        />
       </View>
     );
   }
@@ -70,12 +71,12 @@ export default function HelpScreen() {
       {helpQuery.isPending && (
         <View style={styles.center}>
           <ActivityIndicator
-            accessibilityLabel="Loading help"
+            accessibilityLabel={t('help.loading')}
             size="large"
-            color={colors.primary}
+            color={theme.colors.primary}
           />
           <Text accessibilityLiveRegion="polite" style={styles.muted}>
-            Loading help…
+            {t('help.loading')}
           </Text>
         </View>
       )}
@@ -83,21 +84,16 @@ export default function HelpScreen() {
       {helpQuery.isError && (
         <View style={styles.center}>
           <Text accessibilityRole="header" style={styles.errorTitle}>
-            Couldn&apos;t load help
+            {t('help.loadFailedTitle')}
           </Text>
           <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-            {userMessageForError(
-              helpQuery.error,
-              'Could not load help for this question. Please try again.',
-            )}
+            {userMessageForError(helpQuery.error, t('help.loadFailed'))}
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+          <Button
+            title={t('common.tryAgain')}
             onPress={() => void helpQuery.refetch()}
-          >
-            <Text style={styles.primaryButtonText}>Try Again</Text>
-          </Pressable>
+            style={styles.retryButton}
+          />
         </View>
       )}
 
@@ -108,7 +104,7 @@ export default function HelpScreen() {
             contentContainerStyle={styles.content}
           >
             <View style={styles.section}>
-              <Text style={styles.sectionLabel}>Word</Text>
+              <Text style={styles.sectionLabel}>{t('label.word')}</Text>
               <Text style={styles.promptWord}>{help.promptWord}</Text>
               <Text accessibilityLanguage={nativeAccessibilityLanguage} style={styles.nativeText}>
                 {help.promptWordNative}
@@ -116,7 +112,7 @@ export default function HelpScreen() {
             </View>
 
             <View style={styles.section}>
-              <Text style={styles.sectionLabel}>Question</Text>
+              <Text style={styles.sectionLabel}>{t('label.question')}</Text>
               <Text style={styles.englishText}>{help.questionText}</Text>
               <Text accessibilityLanguage={nativeAccessibilityLanguage} style={styles.nativeText}>
                 {help.questionTextNative}
@@ -124,10 +120,12 @@ export default function HelpScreen() {
             </View>
 
             <View style={styles.section}>
-              <Text style={styles.sectionLabel}>Example sentences</Text>
+              <Text style={styles.sectionLabel}>{t('help.examplesLabel')}</Text>
               {help.examples.map((example, index) => (
                 <View key={index} style={styles.exampleCard}>
-                  <Text style={styles.exampleNumber}>Example {index + 1}</Text>
+                  <Text style={styles.exampleNumber}>
+                    {t('help.exampleNumber', { number: index + 1 })}
+                  </Text>
                   <Text style={styles.englishText}>{example.en}</Text>
                   <Text
                     accessibilityLanguage={nativeAccessibilityLanguage}
@@ -141,12 +139,8 @@ export default function HelpScreen() {
           </ScrollView>
 
           <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-            <Pressable
-              accessibilityRole="button"
-              style={({ pressed }) => [
-                styles.primaryButton,
-                pressed && styles.primaryButtonPressed,
-              ]}
+            <Button
+              title={t('help.startPractice')}
               onPress={() =>
                 router.push({
                   pathname: '/practice/attempt',
@@ -155,9 +149,7 @@ export default function HelpScreen() {
                   },
                 })
               }
-            >
-              <Text style={styles.primaryButtonText}>Start Practice</Text>
-            </Pressable>
+            />
           </View>
         </>
       )}
@@ -165,7 +157,7 @@ export default function HelpScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -174,17 +166,17 @@ const styles = StyleSheet.create({
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
   },
   content: {
-    padding: 20,
-    paddingBottom: 32,
+    padding: layout.screenPadding,
+    paddingBottom: spacing.xxl,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
   },
   muted: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
@@ -194,10 +186,13 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: colors.text,
   },
+  retryButton: {
+    marginTop: spacing.lg,
+  },
   section: {
     backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 18,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
     marginBottom: 14,
@@ -208,7 +203,7 @@ const styles = StyleSheet.create({
     color: colors.muted,
     textTransform: 'uppercase',
     letterSpacing: 0.8,
-    marginBottom: 8,
+    marginBottom: spacing.sm,
   },
   promptWord: {
     fontSize: 28,
@@ -229,33 +224,19 @@ const styles = StyleSheet.create({
   exampleCard: {
     borderTopWidth: 1,
     borderTopColor: colors.border,
-    paddingTop: 12,
-    marginTop: 12,
+    paddingTop: spacing.md,
+    marginTop: spacing.md,
   },
   exampleNumber: {
     fontSize: 13,
     fontWeight: '700',
     color: colors.primary,
-    marginBottom: 4,
+    marginBottom: spacing.xs,
   },
   bottomBar: {
-    padding: 16,
+    padding: spacing.ml,
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
   },
-  primaryButton: {
-    backgroundColor: colors.primary,
-    borderRadius: 14,
-    paddingVertical: 15,
-    alignItems: 'center',
-  },
-  primaryButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  primaryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 17,
-    fontWeight: '600',
-  },
-});
+}));

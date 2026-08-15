@@ -1,9 +1,16 @@
 import { File } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 
+import type { ApiErrorCode } from '../src/lib/api';
+import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { ContractError } from '../src/lib/types';
 
 type ApiModule = typeof import('../src/lib/api');
+type ApiErrorInstance = InstanceType<ApiModule['ApiError']>;
+
+/** Asserts UI copy via the catalog; the active language under jest is 'en'. */
+const t = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('en', key, params);
 
 // jest-expo keeps dynamic import() intact, but jest cannot execute it without
 // --experimental-vm-modules, so fresh module graphs are loaded with require.
@@ -112,12 +119,15 @@ function fakeResponse(
     ok?: boolean;
     status?: number;
     json?: () => Promise<unknown>;
+    headers?: Record<string, string>;
   } = {},
 ): Response {
+  const headers = options.headers ?? {};
   return {
     ok: options.ok ?? true,
     status: options.status ?? 200,
     json: options.json ?? (async () => ({})),
+    headers: { get: (name: string) => headers[name] ?? null },
   } as unknown as Response;
 }
 
@@ -390,29 +400,38 @@ describe('userMessageForError', () => {
     });
   });
 
+  it('carries the optional machine-readable code and retry hints', () => {
+    const error = new api.ApiError(429, 'internal', 30, {
+      code: 'RATE_LIMITED',
+      retryAfterHours: 2,
+    });
+
+    expect(error).toMatchObject({
+      name: 'ApiError',
+      status: 429,
+      code: 'RATE_LIMITED',
+      retryAfterSeconds: 30,
+      retryAfterHours: 2,
+    });
+  });
+
   it.each([
-    [0, 'Could not connect to the server. Check your connection and try again.'],
-    [408, 'The request timed out. Check your connection and try again.'],
-    [413, 'The recording is too large. Please record a shorter answer.'],
-    [415, 'This recording format is not supported. Please record your answer again.'],
-    [
-      422,
-      'The recording could not be assessed. Speak for at least a moment and keep the answer under two minutes.',
-    ],
-    [
-      409,
-      'An assessment is already in progress or the question changed. Wait a moment and try again.',
-    ],
-    [429, 'Too many attempts. Please wait and try again later.'],
-    [500, 'The service is temporarily unavailable. Please try again later.'],
-    [503, 'The service is temporarily unavailable. Please try again later.'],
-  ])('maps status %i to safe copy', (status, expected) => {
+    [0, t('error.network')],
+    [408, t('error.timeout')],
+    [413, t('error.tooLarge')],
+    [415, t('error.unsupportedFormat')],
+    [422, t('error.cannotAssess')],
+    [409, t('error.conflict')],
+    [429, t('error.tooMany')],
+    [500, t('error.serverBusy')],
+    [503, t('error.serverBusy')],
+  ])('maps codeless status %i to localized catalog copy', (status, expected) => {
     expect(api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback')).toBe(
       expected,
     );
   });
 
-  it.each([400, 401, 404, 499])('falls back for status %i', (status) => {
+  it.each([400, 401, 404, 499])('falls back for codeless status %i', (status) => {
     expect(api.userMessageForError(new api.ApiError(status, 'internal'), 'Fallback')).toBe(
       'Fallback',
     );
@@ -422,6 +441,87 @@ describe('userMessageForError', () => {
     expect(api.userMessageForError(new Error('boom'), 'Fallback')).toBe('Fallback');
     expect(api.userMessageForError('nope', 'Fallback')).toBe('Fallback');
     expect(api.userMessageForError(null, 'Fallback')).toBe('Fallback');
+  });
+
+  describe('error-code mapping', () => {
+    const codeCases: readonly [ApiErrorCode, MessageKey][] = [
+      ['VALIDATION_FAILED', 'error.validation'],
+      ['INVALID_CREDENTIALS', 'error.wrongCredentials'],
+      ['EMAIL_TAKEN', 'error.emailTaken'],
+      ['TOKEN_REVOKED', 'error.loginAgain'],
+      ['QUESTION_MISMATCH', 'error.questionChanged'],
+      ['RATE_LIMITED', 'error.tooMany'],
+      ['DAILY_LIMIT', 'error.dailyLimit'],
+      ['CAPACITY_BUSY', 'error.busy'],
+      ['AUDIO_TOO_LONG', 'error.audioTooLong'],
+      ['PROVIDER_TIMEOUT', 'error.timeout'],
+      ['CLIENT_UPGRADE_REQUIRED', 'error.upgradeRequired'],
+      ['INTERNAL', 'error.internal'],
+    ];
+
+    it.each(codeCases)('maps code %s to the %s catalog message', (code, key) => {
+      const error = new api.ApiError(400, 'internal', undefined, { code });
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(t(key));
+    });
+
+    it('prefers the code mapping over the status mapping', () => {
+      const error = new api.ApiError(409, 'internal', undefined, { code: 'EMAIL_TAKEN' });
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.emailTaken'));
+      expect(api.userMessageForError(error, 'Fallback')).not.toBe(t('error.conflict'));
+    });
+  });
+
+  describe('retry-wait line', () => {
+    it.each([
+      [30, t('wait.seconds', { count: 30 })],
+      [1, t('wait.second')],
+      [0.4, t('wait.second')],
+      [90, t('wait.minutes', { count: 2 })],
+      [60, t('wait.minute')],
+    ])('appends the wait line for a 429 with retryAfterSeconds %d', (seconds, waitLine) => {
+      const error = new api.ApiError(429, 'internal', seconds);
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(`${t('error.tooMany')} ${waitLine}`);
+    });
+
+    it.each([
+      [24, t('wait.hours', { count: 24 })],
+      [1, t('wait.hour')],
+      [1.5, t('wait.hours', { count: 2 })],
+    ])('appends the wait line for a 429 with retryAfterHours %d', (hours, waitLine) => {
+      const error = new api.ApiError(429, 'internal', undefined, { retryAfterHours: hours });
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(`${t('error.tooMany')} ${waitLine}`);
+    });
+
+    it('appends the wait line to the 503 server-busy message', () => {
+      const error = new api.ApiError(503, 'internal', 45);
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.serverBusy')} ${t('wait.seconds', { count: 45 })}`,
+      );
+    });
+
+    it('prefers hours over seconds when both retry hints are set', () => {
+      const error = new api.ApiError(429, 'internal', 30, { retryAfterHours: 2 });
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.tooMany')} ${t('wait.hours', { count: 2 })}`,
+      );
+    });
+
+    it('appends the wait line to code-mapped messages', () => {
+      const error = new api.ApiError(429, 'internal', undefined, {
+        code: 'DAILY_LIMIT',
+        retryAfterHours: 24,
+      });
+
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.dailyLimit')} ${t('wait.hours', { count: 24 })}`,
+      );
+    });
   });
 });
 
@@ -657,6 +757,213 @@ describe('apiFetch', () => {
     expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
     addSpy.mockRestore();
     removeSpy.mockRestore();
+  });
+});
+
+describe('error response parsing', () => {
+  it('extracts an allowlisted code from any non-ok response body', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ ok: false, status: 400, json: async () => ({ code: 'QUESTION_MISMATCH' }) }),
+    );
+
+    const error = await catchAsync(api.apiFetch('/attempt'));
+
+    expect(error).toBeInstanceOf(api.ApiError);
+    expect(error).toMatchObject({
+      status: 400,
+      code: 'QUESTION_MISMATCH',
+      message: 'Request failed with status 400',
+    });
+    expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.questionChanged'));
+  });
+
+  it('reads the error body exactly once for every non-ok response', async () => {
+    const json = jest.fn(async () => ({ code: 'VALIDATION_FAILED' }));
+    fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 400, json }));
+
+    const error = await catchAsync(api.apiFetch('/attempt'));
+
+    expect(json).toHaveBeenCalledTimes(1);
+    expect(error).toMatchObject({ status: 400, code: 'VALIDATION_FAILED' });
+  });
+
+  it('ignores codes outside the allowlist and falls back to the status mapping', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ ok: false, status: 400, json: async () => ({ code: 'NOT_A_CODE' }) }),
+    );
+
+    const error = (await catchAsync(api.apiFetch('/attempt'))) as ApiErrorInstance;
+
+    expect(error).toBeInstanceOf(api.ApiError);
+    expect(error.code).toBeUndefined();
+    expect(api.userMessageForError(error, 'Fallback')).toBe('Fallback');
+  });
+
+  it('swallows an unparseable error body and keeps the status ApiError', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status: 500,
+        json: async () => {
+          throw new SyntaxError('Unexpected token');
+        },
+      }),
+    );
+
+    const error = (await catchAsync(api.apiFetch('/broken'))) as ApiErrorInstance;
+
+    expect(error).toBeInstanceOf(api.ApiError);
+    expect(error).toMatchObject({ status: 500, message: 'Request failed with status 500' });
+    expect(error.code).toBeUndefined();
+  });
+
+  it('extracts the code from failed audio uploads too', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ ok: false, status: 422, json: async () => ({ code: 'AUDIO_TOO_LONG' }) }),
+    );
+
+    const error = await catchAsync(
+      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}),
+    );
+
+    expect(error).toMatchObject({ status: 422, code: 'AUDIO_TOO_LONG' });
+    expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.audioTooLong'));
+  });
+
+  describe('retry hints', () => {
+    it.each([
+      [86_400, 86_400],
+      [30, 30],
+    ])('honors a bounded 429 Retry-After header of %d seconds', async (header, expected) => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, headers: { 'Retry-After': String(header) } }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBe(expected);
+    });
+
+    it('ignores a 429 Retry-After header above the 24-hour bound', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, headers: { 'Retry-After': '86401' } }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBeUndefined();
+    });
+
+    it('uses the 429 body retryAfterSeconds when no header is present', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, json: async () => ({ retryAfterSeconds: 3600 }) }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBe(3600);
+    });
+
+    it('prefers the Retry-After header over the body retryAfterSeconds', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 429,
+          headers: { 'Retry-After': '30' },
+          json: async () => ({ retryAfterSeconds: 60 }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBe(30);
+    });
+
+    it.each([
+      [24, 24],
+      [48, 48],
+      [49, undefined],
+      [0, undefined],
+    ])('bounds the body retryAfterHours %d to (0, 48]', async (hours, expected) => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, json: async () => ({ retryAfterHours: hours }) }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterHours).toBe(expected);
+    });
+
+    it.each([
+      [120, 120],
+      [121, undefined],
+      [0, undefined],
+    ])(
+      'retains the (0, 120] bound for 503 body retryAfterSeconds %d',
+      async (seconds, expected) => {
+        fetchMock.mockResolvedValue(
+          fakeResponse({
+            ok: false,
+            status: 503,
+            json: async () => ({ retryAfterSeconds: seconds }),
+          }),
+        );
+
+        const error = (await catchAsync(api.apiFetch('/busy'))) as ApiErrorInstance;
+
+        expect(error.retryAfterSeconds).toBe(expected);
+      },
+    );
+
+    it.each([
+      [120, 120],
+      [121, undefined],
+    ])(
+      'retains the (0, 120] bound for a 503 Retry-After header of %d',
+      async (header, expected) => {
+        fetchMock.mockResolvedValue(
+          fakeResponse({ ok: false, status: 503, headers: { 'Retry-After': String(header) } }),
+        );
+
+        const error = (await catchAsync(api.apiFetch('/busy'))) as ApiErrorInstance;
+
+        expect(error.retryAfterSeconds).toBe(expected);
+      },
+    );
+
+    it('ignores retry hints on statuses outside the 429/503 contract', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 500,
+          headers: { 'Retry-After': '30' },
+          json: async () => ({ retryAfterSeconds: 30, retryAfterHours: 2 }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/broken'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBeUndefined();
+      expect(error.retryAfterHours).toBeUndefined();
+    });
+
+    it('produces a fully localized message from a coded 429 with a retry hint', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 429,
+          headers: { 'Retry-After': '30' },
+          json: async () => ({ code: 'RATE_LIMITED' }),
+        }),
+      );
+
+      const error = await catchAsync(api.apiFetch('/limited'));
+
+      expect(error).toMatchObject({ status: 429, code: 'RATE_LIMITED', retryAfterSeconds: 30 });
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.tooMany')} ${t('wait.seconds', { count: 30 })}`,
+      );
+    });
   });
 });
 
@@ -1612,5 +1919,234 @@ describe('developmentBaseUrl', () => {
     mockHostUri.value = '';
 
     expect(importFreshApi().API_URL).toBe('http://localhost:4000');
+  });
+});
+
+// ----- Typed endpoint helpers -----
+
+const STATS_BODY = {
+  level: 'B1',
+  progress: { masteredCount: 3, learningCount: 2, totalAtLevel: 10, dueCount: 4 },
+  streakDays: 2,
+  practicedToday: 1,
+  totalAttempts: 12,
+  lastPracticedAt: '2026-08-15T10:00:00.000Z',
+};
+
+const HISTORY_ITEM = {
+  id: '550e8400-e29b-41d4-a716-446655440031',
+  questionId: '550e8400-e29b-41d4-a716-446655440032',
+  promptWord: 'courage',
+  questionText: 'Describe a time you showed courage.',
+  cefrLevel: 'B1',
+  context: 'practice',
+  attemptNo: 1,
+  score: 82,
+  passed: true,
+  transcript: 'I was brave.',
+  feedback: 'Nice work.',
+  createdAt: '2026-08-15T10:00:00.000Z',
+};
+
+const PROFILE_USER = {
+  id: '550e8400-e29b-41d4-a716-446655440000',
+  name: 'Ada Lovelace',
+  email: 'ada@example.com',
+  nativeLanguage: 'hi',
+  cefrLevel: 'B1',
+  diagnosticCompleted: true,
+};
+
+describe('typed endpoint helpers', () => {
+  it('apiGetPracticeStats fetches /practice/stats and returns the parsed stats', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
+
+    await expect(api.apiGetPracticeStats()).resolves.toEqual(STATS_BODY);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/practice/stats',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
+  it('apiGetPracticeStats rejects contract drift with a ContractError', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ ...STATS_BODY, streakDays: -1 }) }),
+    );
+
+    await expect(api.apiGetPracticeStats()).rejects.toBeInstanceOf(ContractError);
+  });
+
+  it('apiGetPracticeHistory pins the page limit and omits the cursor on the first page', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ items: [HISTORY_ITEM], nextCursor: null }) }),
+    );
+
+    await expect(api.apiGetPracticeHistory()).resolves.toEqual({
+      items: [HISTORY_ITEM],
+      nextCursor: null,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/practice/history?limit=20',
+      expect.objectContaining({ method: 'GET' }),
+    );
+  });
+
+  it('apiGetPracticeHistory URL-encodes the keyset cursor', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ items: [HISTORY_ITEM], nextCursor: null }) }),
+    );
+
+    await api.apiGetPracticeHistory(HISTORY_ITEM.id);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `http://localhost:4000/practice/history?limit=20&cursor=${HISTORY_ITEM.id}`,
+      expect.anything(),
+    );
+  });
+
+  it('apiSkipPracticeWord POSTs the question id to /practice/skip', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
+
+    await api.apiSkipPracticeWord(HISTORY_ITEM.questionId);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/practice/skip',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ questionId: HISTORY_ITEM.questionId }),
+      }),
+    );
+  });
+
+  it('apiForgotPassword POSTs without any Authorization header', async () => {
+    await api.saveToken('secret-token');
+    fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
+
+    await api.apiForgotPassword('ada@example.com');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:4000/auth/forgot-password');
+    expect(init.method).toBe('POST');
+    expect(init.body).toBe(JSON.stringify({ email: 'ada@example.com' }));
+    expect(init.headers).not.toHaveProperty('Authorization');
+  });
+
+  it('apiResetPassword POSTs email, token, and new password without auth', async () => {
+    await api.saveToken('secret-token');
+    fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
+
+    await api.apiResetPassword('ada@example.com', 'abcdef123456', 'NewPass123');
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe('http://localhost:4000/auth/reset-password');
+    expect(init.body).toBe(
+      JSON.stringify({
+        email: 'ada@example.com',
+        token: 'abcdef123456',
+        newPassword: 'NewPass123',
+      }),
+    );
+    expect(init.headers).not.toHaveProperty('Authorization');
+  });
+
+  it('apiResetPassword surfaces RESET_INVALID through the localized code mapping', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status: 400,
+        json: async () => ({ error: 'Reset code is invalid or expired', code: 'RESET_INVALID' }),
+      }),
+    );
+
+    const error = (await catchAsync(
+      api.apiResetPassword('ada@example.com', 'bad', 'NewPass123'),
+    )) as ApiErrorInstance;
+    expect(error.code).toBe('RESET_INVALID');
+    expect(api.userMessageForError(error, 'fallback')).toBe(t('error.resetInvalid'));
+  });
+
+  it('apiUpdateProfile PATCHes /auth/me and returns the parsed user', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ user: PROFILE_USER }) }));
+
+    await expect(api.apiUpdateProfile({ nativeLanguage: 'hi' })).resolves.toEqual(PROFILE_USER);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/auth/me',
+      expect.objectContaining({
+        method: 'PATCH',
+        body: JSON.stringify({ nativeLanguage: 'hi' }),
+      }),
+    );
+  });
+
+  it('apiUpdateProfile rejects a malformed user payload', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ user: { ...PROFILE_USER, nativeLanguage: 'fr' } }) }),
+    );
+
+    await expect(api.apiUpdateProfile({ name: 'Ada' })).rejects.toBeInstanceOf(ContractError);
+  });
+
+  it('apiRestartDiagnostic POSTs the explicit confirmation body', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
+
+    await api.apiRestartDiagnostic();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/diagnostic/restart',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ confirm: true }),
+      }),
+    );
+  });
+
+  it('apiExportUserData walks every page and combines the attempts', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            user: PROFILE_USER,
+            attempts: [{ id: 'a1' }],
+            nextCursor: cursor,
+          }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            user: PROFILE_USER,
+            attempts: [{ id: 'a2' }],
+            nextCursor: null,
+          }),
+        }),
+      );
+
+    await expect(api.apiExportUserData()).resolves.toEqual({
+      user: PROFILE_USER,
+      attempts: [{ id: 'a1' }, { id: 'a2' }],
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      'http://localhost:4000/auth/me/data',
+      expect.anything(),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:4000/auth/me/data?cursor=${cursor}`,
+      expect.anything(),
+    );
+  });
+
+  it('apiExportUserData aborts on a repeated cursor instead of spinning forever', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440042';
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          user: PROFILE_USER,
+          attempts: [{ id: 'a1' }],
+          nextCursor: cursor,
+        }),
+      }),
+    );
+
+    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    // First page + the page fetched with the repeated cursor.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

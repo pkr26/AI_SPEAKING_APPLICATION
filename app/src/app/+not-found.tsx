@@ -1,37 +1,37 @@
 import { router } from 'expo-router';
 import React from 'react';
-import { Pressable, StyleSheet, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 
-import { colors, layout } from '../lib/theme';
+import Button from '../components/Button';
+import { useT } from '../lib/i18n';
+import { createThemedStyles, useTheme } from '../lib/theme';
 
 export default function NotFoundScreen() {
+  const t = useT();
+  const styles = themedStyles(useTheme());
   return (
     <View style={styles.screen}>
       <View style={styles.card}>
         <Text accessibilityRole="header" style={styles.title}>
-          Page not found
+          {t('notFound.title')}
         </Text>
-        <Text style={styles.body}>
-          This link is unavailable or no longer belongs to your current lesson.
-        </Text>
-        <Pressable
-          accessibilityRole="button"
+        <Text style={styles.body}>{t('notFound.body')}</Text>
+        <Button
+          title={t('notFound.goHome')}
           onPress={() => router.replace('/')}
-          style={({ pressed }) => [styles.button, pressed && styles.buttonPressed]}
-        >
-          <Text style={styles.buttonText}>Return Home</Text>
-        </Pressable>
+          style={styles.button}
+        />
       </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   screen: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
     backgroundColor: colors.background,
   },
   card: {
@@ -40,9 +40,9 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 16,
+    borderRadius: radii.card,
     backgroundColor: colors.card,
-    padding: 24,
+    padding: spacing.xl,
   },
   title: {
     color: colors.text,
@@ -58,20 +58,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   button: {
-    minHeight: layout.minimumTarget,
-    marginTop: 24,
-    justifyContent: 'center',
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 28,
-    backgroundColor: colors.primary,
+    marginTop: spacing.xl,
   },
-  buttonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  buttonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-});
+}));

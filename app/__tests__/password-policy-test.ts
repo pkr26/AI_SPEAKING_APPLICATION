@@ -1,9 +1,13 @@
+import { translateFor, type MessageKey } from '../src/lib/i18n';
 import {
   comparablePasswordError,
   MAX_PASSWORD_UTF8_BYTES,
   passwordPolicyError,
   utf8ByteLength,
 } from '../src/lib/password-policy';
+
+const t = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('en', key, params);
 
 describe('UTF-8 password policy', () => {
   test.each([
@@ -28,7 +32,7 @@ describe('UTF-8 password policy', () => {
     const password = `a1${'é'.repeat(35)}b`;
     expect(password.length).toBeLessThan(MAX_PASSWORD_UTF8_BYTES);
     expect(utf8ByteLength(password)).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
-    expect(passwordPolicyError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
+    expect(passwordPolicyError(password)).toBe(t('password.tooLong'));
   });
 
   it('rejects 73 bytes when a three-byte scalar precedes an unpaired low surrogate', () => {
@@ -36,8 +40,8 @@ describe('UTF-8 password policy', () => {
 
     expect(new TextEncoder().encode(password).byteLength).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
     expect(utf8ByteLength(password)).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
-    expect(comparablePasswordError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
-    expect(passwordPolicyError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
+    expect(comparablePasswordError(password)).toBe(t('password.tooLong'));
+    expect(passwordPolicyError(password)).toBe(t('password.tooLong'));
   });
 
   it('rejects 73 bytes across a low-high malformed surrogate boundary', () => {
@@ -45,18 +49,14 @@ describe('UTF-8 password policy', () => {
 
     expect(new TextEncoder().encode(password).byteLength).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
     expect(utf8ByteLength(password)).toBe(MAX_PASSWORD_UTF8_BYTES + 1);
-    expect(comparablePasswordError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
-    expect(passwordPolicyError(password)).toBe('Password must be at most 72 UTF-8 bytes.');
+    expect(comparablePasswordError(password)).toBe(t('password.tooLong'));
+    expect(passwordPolicyError(password)).toBe(t('password.tooLong'));
   });
 
   it('rejects short passwords and passwords missing a required character class', () => {
-    expect(passwordPolicyError('abc123')).toBe('Password must be at least 8 characters.');
-    expect(passwordPolicyError('abcdefgh')).toBe(
-      'Password must include at least one letter and one number.',
-    );
-    expect(passwordPolicyError('12345678')).toBe(
-      'Password must include at least one letter and one number.',
-    );
+    expect(passwordPolicyError('abc123')).toBe(t('password.tooShort'));
+    expect(passwordPolicyError('abcdefgh')).toBe(t('password.needsLetterAndNumber'));
+    expect(passwordPolicyError('12345678')).toBe(t('password.needsLetterAndNumber'));
   });
 
   it.each(['भाषा1234', 'భాషా1234', 'Español1'])('accepts Unicode letters in %p', (password) => {
@@ -122,12 +122,21 @@ describe('UTF-8 password policy', () => {
     expect(utf8ByteLength(overLimit)).toBe(new TextEncoder().encode(overLimit).byteLength);
     expect(comparablePasswordError(exact)).toBeNull();
     expect(passwordPolicyError(exact)).toBeNull();
-    expect(comparablePasswordError(overLimit)).toBe('Password must be at most 72 UTF-8 bytes.');
-    expect(passwordPolicyError(overLimit)).toBe('Password must be at most 72 UTF-8 bytes.');
+    expect(comparablePasswordError(overLimit)).toBe(t('password.tooLong'));
+    expect(passwordPolicyError(overLimit)).toBe(t('password.tooLong'));
   });
 
   it('accepts exactly eight characters when the required classes are present', () => {
-    expect(passwordPolicyError('abcdef1')).toBe('Password must be at least 8 characters.');
+    expect(passwordPolicyError('abcdef1')).toBe(t('password.tooShort'));
     expect(passwordPolicyError('abcdefg1')).toBeNull();
+  });
+
+  it('honors a caller-provided translator instead of the module default', () => {
+    const keyEcho = (key: MessageKey) => key;
+
+    expect(passwordPolicyError('abc123', keyEcho)).toBe('password.tooShort');
+    expect(passwordPolicyError('abcdefgh', keyEcho)).toBe('password.needsLetterAndNumber');
+    expect(comparablePasswordError(`a1${'é'.repeat(36)}`, keyEcho)).toBe('password.tooLong');
+    expect(passwordPolicyError(`a1${'é'.repeat(36)}`, keyEcho)).toBe('password.tooLong');
   });
 });

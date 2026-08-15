@@ -1,17 +1,24 @@
 {
   "expo": {
-    "name": "app",
-    "slug": "app",
-    "scheme": "app",
+    "name": "AI English Coach",
+    "slug": "ai-english-coach",
+    "scheme": "aienglishcoach",
     "platforms": ["ios", "android"],
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#FFFFFF"
+    },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.aienglish.coach"
     },
     "android": {
+      "package": "com.aienglish.coach",
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -31,7 +38,8 @@
           "enableBackgroundRecording": false
         }
       ],
-      "expo-asset"
+      "expo-asset",
+      "expo-sharing"
     ]
   }
 }

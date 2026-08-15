@@ -1,17 +1,21 @@
 import React, { useEffect } from 'react';
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, Text, View } from 'react-native';
 import { Redirect } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 
+import Button from '../components/Button';
 import { ApiError, apiFetch, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
-import { colors, layout } from '../lib/theme';
+import { useT } from '../lib/i18n';
+import { createThemedStyles, useTheme } from '../lib/theme';
 import { parseUserResponse } from '../lib/types';
 
 function LoadingView({ label }: { label: string }) {
+  const theme = useTheme();
+  const styles = themedStyles(theme);
   return (
     <View style={styles.center}>
-      <ActivityIndicator accessibilityLabel={label} size="large" color={colors.primary} />
+      <ActivityIndicator accessibilityLabel={label} size="large" color={theme.colors.primary} />
       <Text accessibilityLiveRegion="polite" style={styles.muted}>
         {label}
       </Text>
@@ -23,10 +27,12 @@ function LoadingView({ label }: { label: string }) {
  * Entry gate: routes based on auth state.
  *  - no token            → login
  *  - token, not assessed → diagnostic
- *  - otherwise           → practice
+ *  - otherwise           → home (progress screen; practice is one tap away)
  * An expired/invalid token (401) is cleared and the user lands on login.
  */
 export default function Gate() {
+  const t = useT();
+  const styles = themedStyles(useTheme());
   const {
     token,
     user,
@@ -53,32 +59,29 @@ export default function Gate() {
   }, [meQuery.data, setUser]);
 
   if (isRestoring) {
-    return <LoadingView label="Restoring your session…" />;
+    return <LoadingView label={t('gate.restoring')} />;
   }
 
   if (restoreError) {
     return (
       <View style={styles.center}>
         <Text accessibilityRole="header" style={styles.title}>
-          Can&apos;t access your secure session
+          {t('gate.sessionErrorTitle')}
         </Text>
         <Text accessibilityRole="alert" style={styles.muted}>
           {restoreError}
         </Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+        <Button
+          title={t('common.tryAgain')}
           onPress={retrySessionRestore}
-        >
-          <Text style={styles.buttonText}>Try Again</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.resetButton, pressed && styles.resetPressed]}
+          style={styles.retryButton}
+        />
+        <Button
+          title={t('gate.resetSession')}
+          variant="danger"
           onPress={resetStoredSession}
-        >
-          <Text style={styles.resetButtonText}>Reset saved session</Text>
-        </Pressable>
+          style={styles.resetButton}
+        />
       </View>
     );
   }
@@ -88,94 +91,65 @@ export default function Gate() {
   }
 
   if (!user && meQuery.isPending) {
-    return <LoadingView label="Loading your profile…" />;
+    return <LoadingView label={t('gate.loadingProfile')} />;
   }
 
   if (!user && meQuery.isError) {
     // The API client clears rejected sessions centrally. Show a spinner while
     // protected routes are removed and the login screen becomes available.
     if (meQuery.error instanceof ApiError && meQuery.error.status === 401) {
-      return <LoadingView label="Signing you out…" />;
+      return <LoadingView label={t('gate.signingOut')} />;
     }
     return (
       <View style={styles.center}>
-        <Text style={styles.title}>Can&apos;t reach the server</Text>
-        <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-          {userMessageForError(meQuery.error, 'Could not load your profile. Please try again.')}
+        <Text accessibilityRole="header" style={styles.title}>
+          {t('gate.serverErrorTitle')}
         </Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.button, pressed && styles.pressed]}
+        <Text accessibilityLiveRegion="assertive" style={styles.muted}>
+          {userMessageForError(meQuery.error, t('gate.profileFailed'))}
+        </Text>
+        <Button
+          title={t('common.tryAgain')}
           onPress={() => void meQuery.refetch()}
-        >
-          <Text style={styles.buttonText}>Try Again</Text>
-        </Pressable>
+          style={styles.retryButton}
+        />
       </View>
     );
   }
 
   const profile = user ?? meQuery.data;
   if (!profile) {
-    return <LoadingView label="Loading your profile…" />;
+    return <LoadingView label={t('gate.loadingProfile')} />;
   }
 
-  return <Redirect href={profile.diagnosticCompleted ? '/practice' : '/diagnostic'} />;
+  return <Redirect href={profile.diagnosticCompleted ? '/home' : '/diagnostic'} />;
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, spacing }) => ({
   center: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
     backgroundColor: colors.background,
   },
   title: {
     fontSize: 20,
     fontWeight: '700',
     color: colors.text,
-    marginBottom: 8,
+    marginBottom: spacing.sm,
     textAlign: 'center',
   },
   muted: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
   },
-  button: {
-    marginTop: 24,
-    minHeight: layout.minimumTarget,
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 32,
-  },
-  pressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  buttonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '600',
+  retryButton: {
+    marginTop: spacing.xl,
   },
   resetButton: {
-    marginTop: 16,
-    minHeight: layout.minimumTarget,
-    justifyContent: 'center',
-    backgroundColor: colors.card,
-    borderColor: colors.danger,
-    borderWidth: 1,
-    borderRadius: 12,
-    paddingVertical: 14,
-    paddingHorizontal: 32,
+    marginTop: spacing.ml,
   },
-  resetPressed: {
-    backgroundColor: colors.dangerLight,
-  },
-  resetButtonText: {
-    color: colors.danger,
-    fontSize: 16,
-    fontWeight: '600',
-  },
-});
+}));

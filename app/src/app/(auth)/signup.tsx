@@ -1,10 +1,9 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
   Pressable,
   ScrollView,
-  StyleSheet,
   Text,
   TextInput,
   View,
@@ -12,6 +11,7 @@ import {
 import { Link, router } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import Button from '../../components/Button';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
   MAX_EMAIL_LENGTH,
@@ -20,7 +20,8 @@ import {
   passwordPolicyError,
   useAuth,
 } from '../../lib/auth';
-import { colors, layout } from '../../lib/theme';
+import { translateFor, useI18n, type MessageParams, type MessageKey } from '../../lib/i18n';
+import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
 
 const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
@@ -32,14 +33,33 @@ const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
 
 export default function SignupScreen() {
   const { register } = useAuth();
+  const { language: contextLanguage, setPreviewLanguage } = useI18n();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
+  const { colors } = theme;
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [focusedField, setFocusedField] = useState<'name' | 'email' | 'password' | null>(null);
   const [busy, setBusy] = useState(false);
+  const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const emailRef = useRef<TextInput>(null);
+  const passwordRef = useRef<TextInput>(null);
 
-  const passwordError = password.length > 0 ? passwordPolicyError(password) : null;
+  // Live preview: tapping a language chip switches this screen's UI language
+  // immediately, before any account exists. The chosen language is also pushed
+  // into the provider so event-time copy (alerts, API errors) follows along.
+  const language = nativeLanguage ?? contextLanguage;
+  const t = (key: MessageKey, params?: MessageParams) => translateFor(language, key, params);
+
+  const chooseLanguage = (code: NativeLanguage) => {
+    setNativeLanguage(code);
+    setPreviewLanguage(code);
+  };
+
+  const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
 
   const canSubmit =
     name.trim().length > 0 &&
@@ -59,16 +79,9 @@ export default function SignupScreen() {
       router.replace('/');
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setError('An account with this email already exists.');
-      } else if (err instanceof ApiError && err.status === 429) {
-        setError('Too many attempts, please try again later.');
+        setError(t('error.emailTaken'));
       } else {
-        setError(
-          userMessageForError(
-            err,
-            'Could not create your account. Check your information and try again.',
-          ),
-        );
+        setError(userMessageForError(err, t('signup.failed')));
       }
     } finally {
       setBusy(false);
@@ -83,60 +96,93 @@ export default function SignupScreen() {
       >
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
           <Text accessibilityRole="header" style={styles.brand}>
-            Create your account
+            {t('signup.title')}
           </Text>
-          <Text style={styles.subtitle}>
-            We&apos;ll tailor your practice to your native language.
-          </Text>
+          <Text style={styles.subtitle}>{t('signup.subtitle')}</Text>
 
           <View style={styles.form}>
-            <Text style={styles.label}>Name</Text>
+            <Text style={styles.label}>{t('signup.nameLabel')}</Text>
             <TextInput
-              accessibilityLabel="Name"
-              style={styles.input}
+              accessibilityLabel={t('signup.nameLabel')}
+              style={[styles.input, focusedField === 'name' && styles.inputFocused]}
               value={name}
               onChangeText={setName}
-              placeholder="Your name"
+              onFocus={() => setFocusedField('name')}
+              onBlur={() => setFocusedField(null)}
+              placeholder={t('signup.namePlaceholder')}
               placeholderTextColor={colors.muted}
               autoCapitalize="words"
+              autoComplete="name"
               textContentType="name"
+              returnKeyType="next"
+              onSubmitEditing={() => emailRef.current?.focus()}
               maxLength={MAX_NAME_LENGTH}
             />
 
-            <Text style={styles.label}>Email</Text>
+            <Text style={styles.label}>{t('login.emailLabel')}</Text>
             <TextInput
-              accessibilityLabel="Email"
-              style={styles.input}
+              ref={emailRef}
+              accessibilityLabel={t('login.emailLabel')}
+              style={[styles.input, focusedField === 'email' && styles.inputFocused]}
               value={email}
               onChangeText={setEmail}
-              placeholder="you@example.com"
+              onFocus={() => setFocusedField('email')}
+              onBlur={() => setFocusedField(null)}
+              placeholder={t('login.emailPlaceholder')}
               placeholderTextColor={colors.muted}
               autoCapitalize="none"
+              autoComplete="email"
               autoCorrect={false}
               keyboardType="email-address"
               textContentType="emailAddress"
+              returnKeyType="next"
+              onSubmitEditing={() => passwordRef.current?.focus()}
               maxLength={MAX_EMAIL_LENGTH}
             />
 
-            <Text style={styles.label}>Password</Text>
-            <TextInput
-              accessibilityLabel="Password"
-              style={styles.input}
-              value={password}
-              onChangeText={setPassword}
-              placeholder="At least 8 characters, with a letter and a number"
-              placeholderTextColor={colors.muted}
-              secureTextEntry
-              textContentType="newPassword"
-              maxLength={MAX_PASSWORD_UTF8_BYTES}
-            />
+            <Text style={styles.label}>{t('login.passwordLabel')}</Text>
+            <View style={styles.inputRow}>
+              <TextInput
+                ref={passwordRef}
+                accessibilityLabel={t('login.passwordLabel')}
+                style={[
+                  styles.input,
+                  styles.inputWithAction,
+                  focusedField === 'password' && styles.inputFocused,
+                ]}
+                value={password}
+                onChangeText={setPassword}
+                onFocus={() => setFocusedField('password')}
+                onBlur={() => setFocusedField(null)}
+                placeholder={t('signup.passwordPlaceholder')}
+                placeholderTextColor={colors.muted}
+                secureTextEntry={!passwordVisible}
+                autoComplete="new-password"
+                textContentType="newPassword"
+                returnKeyType="go"
+                onSubmitEditing={() => void handleSignup()}
+                maxLength={MAX_PASSWORD_UTF8_BYTES}
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={
+                  passwordVisible ? t('common.hidePassword') : t('common.showPassword')
+                }
+                onPress={() => setPasswordVisible((visible) => !visible)}
+                style={styles.inputAction}
+              >
+                <Text style={styles.inputActionText}>
+                  {passwordVisible ? t('common.hide') : t('common.show')}
+                </Text>
+              </Pressable>
+            </View>
             {passwordError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
                 {passwordError}
               </Text>
             )}
 
-            <Text style={styles.label}>Native language</Text>
+            <Text style={styles.label}>{t('signup.languageLabel')}</Text>
             <View style={styles.languageGrid}>
               {LANGUAGES.map((lang) => {
                 const selected = nativeLanguage === lang.code;
@@ -146,7 +192,7 @@ export default function SignupScreen() {
                     accessibilityRole="button"
                     accessibilityLabel={`${lang.english}, ${lang.native}`}
                     accessibilityState={{ selected }}
-                    onPress={() => setNativeLanguage(lang.code)}
+                    onPress={() => chooseLanguage(lang.code)}
                     style={[styles.languageChip, selected && styles.languageChipSelected]}
                   >
                     <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
@@ -166,25 +212,19 @@ export default function SignupScreen() {
               </Text>
             )}
 
-            <Pressable
-              accessibilityRole="button"
-              accessibilityState={{ disabled: !canSubmit, busy }}
+            <Button
+              title={busy ? t('signup.submitBusy') : t('signup.submit')}
               disabled={!canSubmit}
-              onPress={handleSignup}
-              style={({ pressed }) => [
-                styles.button,
-                !canSubmit && styles.buttonDisabled,
-                pressed && canSubmit && styles.buttonPressed,
-              ]}
-            >
-              <Text style={styles.buttonText}>{busy ? 'Creating account…' : 'Sign Up'}</Text>
-            </Pressable>
+              loading={busy}
+              onPress={() => void handleSignup()}
+              style={styles.submitButton}
+            />
           </View>
 
           <View style={styles.footer}>
-            <Text style={styles.footerText}>Already have an account? </Text>
+            <Text style={styles.footerText}>{t('signup.footerPrompt')}</Text>
             <Link href="/login" style={styles.footerLink}>
-              Sign in
+              {t('signup.footerLink')}
             </Link>
           </View>
         </ScrollView>
@@ -193,7 +233,7 @@ export default function SignupScreen() {
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   flex: {
     flex: 1,
     backgroundColor: colors.background,
@@ -201,7 +241,7 @@ const styles = StyleSheet.create({
   container: {
     flexGrow: 1,
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
     width: '100%',
     maxWidth: layout.formMaxWidth,
     alignSelf: 'center',
@@ -213,7 +253,7 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   subtitle: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
@@ -221,8 +261,8 @@ const styles = StyleSheet.create({
   form: {
     marginTop: 28,
     backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 20,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -231,17 +271,42 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.text,
     marginBottom: 6,
-    marginTop: 12,
+    marginTop: spacing.md,
   },
   input: {
     borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 12,
+    borderColor: colors.inputBorder,
+    borderRadius: radii.input,
     paddingHorizontal: 14,
-    paddingVertical: 12,
+    paddingVertical: spacing.md,
     fontSize: 16,
     color: colors.text,
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.inputBackground,
+  },
+  inputFocused: {
+    borderWidth: 2,
+    borderColor: colors.primary,
+  },
+  inputRow: {
+    position: 'relative',
+    justifyContent: 'center',
+  },
+  inputWithAction: {
+    paddingRight: 64,
+  },
+  inputAction: {
+    position: 'absolute',
+    right: 4,
+    minHeight: layout.minimumTarget,
+    minWidth: layout.minimumTarget,
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: spacing.sm,
+  },
+  inputActionText: {
+    color: colors.primary,
+    fontSize: 14,
+    fontWeight: '600',
   },
   languageGrid: {
     flexDirection: 'row',
@@ -253,10 +318,10 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     borderWidth: 1.5,
     borderColor: colors.border,
-    borderRadius: 12,
-    paddingVertical: 12,
+    borderRadius: radii.input,
+    paddingVertical: spacing.md,
     alignItems: 'center',
-    backgroundColor: '#FFFFFF',
+    backgroundColor: colors.card,
   },
   languageChipSelected: {
     borderColor: colors.primary,
@@ -286,26 +351,11 @@ const styles = StyleSheet.create({
     color: colors.danger,
     fontSize: 13,
   },
-  button: {
-    marginTop: 20,
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 15,
-    alignItems: 'center',
-  },
-  buttonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  buttonDisabled: {
-    opacity: 0.5,
-  },
-  buttonText: {
-    color: '#FFFFFF',
-    fontSize: 17,
-    fontWeight: '600',
+  submitButton: {
+    marginTop: spacing.lg,
   },
   footer: {
-    marginTop: 24,
+    marginTop: spacing.xl,
     minHeight: layout.minimumTarget,
     flexDirection: 'row',
     alignItems: 'center',
@@ -316,9 +366,9 @@ const styles = StyleSheet.create({
     color: colors.muted,
   },
   footerLink: {
-    paddingVertical: 12,
+    paddingVertical: spacing.md,
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',
   },
-});
+}));

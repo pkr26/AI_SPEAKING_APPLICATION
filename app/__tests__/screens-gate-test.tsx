@@ -17,8 +17,16 @@ import RootLayout, { ErrorBoundary } from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
+import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, layout } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
+
+// Screens rendered without an I18nProvider (Gate, NotFound, ErrorBoundary)
+// translate with the module-level language, which beforeEach pins to English.
+// RootLayout mounts the real provider fed by the mocked user's nativeLanguage,
+// so copy inside it renders in that language instead.
+const t = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('en', key, params);
 
 // ----- expo-router mock (captures Stack structure and redirects) -----
 
@@ -219,6 +227,9 @@ afterEach(async () => {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // RootLayout renders with a 'te' user sync the module-level language via the
+  // real I18nProvider's effect; pin it back so every test starts in English.
+  setActiveLanguage('en');
   mockApiFetch.mockReset();
   capturedStackProps.length = 0;
   capturedScreenProps.length = 0;
@@ -239,12 +250,17 @@ describe('root layout route guards', () => {
       'index',
       '(auth)',
       'diagnostic',
+      'home',
       'practice/index',
       'practice/help',
       'practice/attempt',
       'practice/feedback',
+      'history',
+      'settings/index',
       'settings/change-password',
       'settings/delete-account',
+      'settings/privacy',
+      'settings/terms',
     ]);
   });
 
@@ -258,20 +274,32 @@ describe('root layout route guards', () => {
 
     expect([
       titleFor('diagnostic'),
+      titleFor('home'),
       titleFor('practice/index'),
       titleFor('practice/help'),
       titleFor('practice/attempt'),
       titleFor('practice/feedback'),
+      titleFor('history'),
+      titleFor('settings/index'),
       titleFor('settings/change-password'),
       titleFor('settings/delete-account'),
+      titleFor('settings/privacy'),
+      titleFor('settings/terms'),
+      // RootLayout mounts the real I18nProvider fed by the mocked user's 'te'
+      // native language, so header titles come from the Telugu catalog.
     ]).toEqual([
-      'Diagnostic Test',
-      'Practice',
-      'Help',
-      'Practice Mode',
-      'Feedback',
-      'Change Password',
-      'Delete Account',
+      translateFor('te', 'header.diagnostic'),
+      translateFor('te', 'header.home'),
+      translateFor('te', 'header.practice'),
+      translateFor('te', 'header.help'),
+      translateFor('te', 'header.attempt'),
+      translateFor('te', 'header.feedback'),
+      translateFor('te', 'header.history'),
+      translateFor('te', 'header.settings'),
+      translateFor('te', 'header.changePassword'),
+      translateFor('te', 'header.deleteAccount'),
+      translateFor('te', 'header.privacy'),
+      translateFor('te', 'header.terms'),
     ]);
   });
 
@@ -431,13 +459,11 @@ describe('root fallback screens', () => {
     const retry = jest.fn();
     await render(<ErrorBoundary error={new Error('sensitive stack details')} retry={retry} />);
 
-    expect(screen.getByRole('header', { name: 'Something went wrong' })).toBeTruthy();
-    expect(screen.getByRole('alert')).toHaveTextContent(
-      'Your learning data is safe. Try this screen again.',
-    );
+    expect(screen.getByRole('header', { name: t('boundary.title') })).toBeTruthy();
+    expect(screen.getByRole('alert')).toHaveTextContent(t('boundary.body'));
     expect(screen.queryByText(/sensitive stack details/)).toBeNull();
     await expectPressFeedback(
-      () => screen.getByRole('button', { name: 'Try Again' }),
+      () => screen.getByRole('button', { name: t('common.tryAgain') }),
       {
         backgroundColor: colors.primary,
         justifyContent: 'center',
@@ -445,16 +471,16 @@ describe('root fallback screens', () => {
       },
       { backgroundColor: colors.primaryDark },
     );
-    await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
   it('returns an invalid deep link to the protected entry gate', async () => {
     await render(<NotFoundScreen />);
 
-    expect(screen.getByRole('header', { name: 'Page not found' })).toBeTruthy();
+    expect(screen.getByRole('header', { name: t('notFound.title') })).toBeTruthy();
     await expectPressFeedback(
-      () => screen.getByRole('button', { name: 'Return Home' }),
+      () => screen.getByRole('button', { name: t('notFound.goHome') }),
       {
         backgroundColor: colors.primary,
         justifyContent: 'center',
@@ -462,17 +488,18 @@ describe('root fallback screens', () => {
       },
       { backgroundColor: colors.primaryDark },
     );
-    await fireEvent.press(screen.getByRole('button', { name: 'Return Home' }));
+    await fireEvent.press(screen.getByRole('button', { name: t('notFound.goHome') }));
     expect(router.replace).toHaveBeenCalledWith('/');
   });
 });
 
 describe('(auth) layout', () => {
-  it('hides headers for the auth stack', async () => {
+  it('hides headers and themes the card background for the auth stack', async () => {
     await render(<AuthLayout />);
     expect(capturedStackProps).toHaveLength(1);
     expect(capturedStackProps[0].screenOptions).toEqual({
       headerShown: false,
+      contentStyle: { backgroundColor: colors.background },
     });
   });
 });
@@ -481,7 +508,7 @@ describe('index gate', () => {
   it('shows a restoring message while the session is being read', async () => {
     mockAuthValue = makeAuth({ isRestoring: true });
     await renderGate();
-    expect(screen.getByText('Restoring your session…')).toBeTruthy();
+    expect(screen.getByText(t('gate.restoring'))).toBeTruthy();
     expect(screen.queryByTestId('redirect')).toBeNull();
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -496,15 +523,15 @@ describe('index gate', () => {
     await renderGate();
 
     expect(screen.queryByTestId('redirect')).toBeNull();
-    expect(screen.getByText("Can't access your secure session")).toBeTruthy();
+    expect(screen.getByText(t('gate.sessionErrorTitle'))).toBeTruthy();
     expect(screen.getByRole('alert')).toHaveTextContent(mockAuthValue.restoreError!);
     expect(mockApiFetch).not.toHaveBeenCalled();
     await expectPressFeedback(
-      () => screen.getByRole('button', { name: 'Try Again' }),
+      () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { backgroundColor: colors.primary, minHeight: layout.minimumTarget },
       { backgroundColor: colors.primaryDark },
     );
-    await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
     expect(retrySessionRestore).toHaveBeenCalledTimes(1);
   });
 
@@ -521,15 +548,14 @@ describe('index gate', () => {
 
     expect(screen.queryByTestId('redirect')).toBeNull();
     await expectPressFeedback(
-      () => screen.getByRole('button', { name: 'Reset saved session' }),
+      () => screen.getByRole('button', { name: t('gate.resetSession') }),
       {
-        backgroundColor: colors.card,
-        borderColor: colors.danger,
+        backgroundColor: colors.danger,
         minHeight: layout.minimumTarget,
       },
-      { backgroundColor: colors.dangerLight },
+      { backgroundColor: colors.danger, opacity: 0.85 },
     );
-    await fireEvent.press(screen.getByRole('button', { name: 'Reset saved session' }));
+    await fireEvent.press(screen.getByRole('button', { name: t('gate.resetSession') }));
     expect(resetStoredSession).toHaveBeenCalledTimes(1);
   });
 
@@ -540,10 +566,10 @@ describe('index gate', () => {
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
-  it('redirects to practice when the diagnostic is complete', async () => {
+  it('redirects to the home progress screen when the diagnostic is complete', async () => {
     mockAuthValue = makeAuth();
     await renderGate();
-    expect(screen.getByTestId('redirect')).toHaveTextContent('/practice');
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
@@ -561,7 +587,7 @@ describe('index gate', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     const queryClient = makeQueryClient();
     await renderGate(queryClient);
-    expect(screen.getByText('Loading your profile…')).toBeTruthy();
+    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/auth/me',
       expect.objectContaining({ signal: expect.anything() }),
@@ -601,19 +627,19 @@ describe('index gate', () => {
     await act(async () => resolveFirst({ user: { ...USER, name: 'Stale User' } }));
     expect(firstSetUser).not.toHaveBeenCalled();
     expect(secondSetUser).not.toHaveBeenCalled();
-    expect(screen.getByText('Loading your profile…')).toBeTruthy();
+    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
 
     const currentProfile = { ...USER, name: 'Current User' };
     await act(async () => resolveSecond({ user: currentProfile }));
     await waitFor(() => expect(secondSetUser).toHaveBeenCalledWith(currentProfile));
-    expect(screen.getByTestId('redirect')).toHaveTextContent('/practice');
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
   });
 
   it('shows a signing-out spinner when the stored token is rejected', async () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockRejectedValue(new ApiError(401, 'unauthorized'));
     await renderGate();
-    expect(await screen.findByText('Signing you out…')).toBeTruthy();
+    expect(await screen.findByText(t('gate.signingOut'))).toBeTruthy();
   });
 
   it('does not treat a non-ApiError status property as an authenticated rejection', async () => {
@@ -621,8 +647,8 @@ describe('index gate', () => {
     mockApiFetch.mockRejectedValue({ status: 401, message: 'not an ApiError' });
     await renderGate();
 
-    expect(await screen.findByText("Can't reach the server")).toBeTruthy();
-    expect(screen.queryByText('Signing you out…')).toBeNull();
+    expect(await screen.findByText(t('gate.serverErrorTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('gate.signingOut'))).toBeNull();
   });
 
   it('shows a retryable error when the profile fetch fails', async () => {
@@ -632,18 +658,18 @@ describe('index gate', () => {
       .mockRejectedValueOnce(new ApiError(500, 'boom'))
       .mockResolvedValueOnce({ user: fetched });
     await renderGate();
-    expect(await screen.findByText("Can't reach the server")).toBeTruthy();
-    expect(
-      screen.getByText('The service is temporarily unavailable. Please try again later.'),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('gate.serverErrorTitle'))).toBeTruthy();
+    // The error title is a screen-reader landmark for the failure state.
+    expect(screen.getByRole('header', { name: t('gate.serverErrorTitle') })).toBeTruthy();
+    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
     await expectPressFeedback(
-      () => screen.getByRole('button', { name: 'Try Again' }),
+      () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { backgroundColor: colors.primary, minHeight: layout.minimumTarget },
       { backgroundColor: colors.primaryDark },
     );
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
       // Let the refetch settle and the batched query notification fire.
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
@@ -656,6 +682,6 @@ describe('index gate', () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockRejectedValue(new Error('parse failure'));
     await renderGate();
-    expect(await screen.findByText('Could not load your profile. Please try again.')).toBeTruthy();
+    expect(await screen.findByText(t('gate.profileFailed'))).toBeTruthy();
   });
 });

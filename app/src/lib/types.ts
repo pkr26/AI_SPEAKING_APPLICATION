@@ -1,6 +1,9 @@
 export type NativeLanguage = 'te' | 'hi' | 'es' | 'zh';
 export type CefrLevel = 'A1' | 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 
+/** CEFR levels in promotion order; level-up responses move one step right. */
+export const CEFR_LEVELS: readonly CefrLevel[] = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+
 export interface User {
   id: string;
   name: string;
@@ -48,11 +51,23 @@ export type PracticeAnswerMode = 'english' | 'native';
 
 export const PRACTICE_PASS_SCORE = 60;
 export const PRACTICE_MASTER_SCORE = 75;
+export const PRACTICE_MAX_ATTEMPTS = 3;
 
 export interface PracticeProgress {
   masteredCount: number;
   learningCount: number;
   totalAtLevel: number;
+  /**
+   * Words due for spaced-repetition review. Additive server field: older
+   * deployments omit it, so it stays optional and is validated when present.
+   */
+  dueCount?: number;
+}
+
+/** Level promotion attached to the attempt response that earned it. */
+export interface LevelUp {
+  from: CefrLevel;
+  to: CefrLevel;
 }
 
 export interface PracticeQuestionPayload {
@@ -72,6 +87,51 @@ export interface AttemptResult {
   feedback: string;
   finalFeedback?: string;
   next?: PracticeQuestionPayload;
+  levelUp?: LevelUp;
+}
+
+export interface PracticeStats {
+  level: CefrLevel;
+  progress: {
+    masteredCount: number;
+    learningCount: number;
+    totalAtLevel: number;
+    dueCount: number;
+  };
+  streakDays: number;
+  practicedToday: number;
+  totalAttempts: number;
+  lastPracticedAt: string | null;
+}
+
+export type HistoryContext = 'diagnostic' | 'practice';
+
+export interface HistoryItem {
+  id: string;
+  questionId: string;
+  promptWord: string;
+  questionText: string;
+  cefrLevel: CefrLevel;
+  context: HistoryContext;
+  attemptNo: number;
+  score: number;
+  passed: boolean;
+  transcript: string;
+  feedback: string;
+  createdAt: string;
+}
+
+export interface HistoryPage {
+  items: HistoryItem[];
+  nextCursor: string | null;
+}
+
+/** One page of the GET /auth/me/data export. Attempt rows are passed through
+ * verbatim so the exported file keeps full server fidelity. */
+export interface UserDataPage {
+  user: User;
+  attempts: Record<string, unknown>[];
+  nextCursor: string | null;
 }
 
 export interface NativeAttemptResult {
@@ -201,7 +261,21 @@ function isPracticeProgress(value: unknown): value is PracticeProgress {
     isCount(value.learningCount) &&
     isCount(value.totalAtLevel) &&
     value.totalAtLevel >= 1 &&
-    value.masteredCount + value.learningCount <= value.totalAtLevel
+    value.masteredCount + value.learningCount <= value.totalAtLevel &&
+    // Additive SRS field: absent on older servers, and never larger than the
+    // learning+mastered rows it counts due entries of.
+    (value.dueCount === undefined ||
+      (isCount(value.dueCount) && value.dueCount <= value.masteredCount + value.learningCount))
+  );
+}
+
+function isLevelUp(value: unknown): value is LevelUp {
+  return (
+    isRecord(value) &&
+    isCefrLevel(value.from) &&
+    isCefrLevel(value.to) &&
+    // Promotion always moves exactly one step up the CEFR ladder.
+    CEFR_LEVELS.indexOf(value.to) === CEFR_LEVELS.indexOf(value.from) + 1
   );
 }
 
@@ -323,7 +397,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     !isNumber(value.attemptNo) ||
     !Number.isInteger(value.attemptNo) ||
     value.attemptNo < 1 ||
-    value.attemptNo > 3 ||
+    value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
     !isScore(value.score) ||
     !isBoundedString(value.transcript, 12_000) ||
     !isBoundedNonEmptyString(value.feedback, 800)
@@ -349,6 +423,9 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     throw new ContractError();
   }
 
+  // A level promotion can only be earned by the attempt that mastered a word.
+  if (value.levelUp !== undefined && !value.mastered) throw new ContractError();
+
   // Silence is a free retry: nothing was scored and the attempt counter did
   // not advance, so attemptsLeft reflects one more attempt than a real miss.
   if (value.noSpeech !== undefined) {
@@ -360,7 +437,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
       value.transcript !== '' ||
       value.finalFeedback !== undefined ||
       value.next !== undefined ||
-      value.attemptsLeft !== 3 - (value.attemptNo - 1)
+      value.attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (value.attemptNo - 1)
     ) {
       throw new ContractError();
     }
@@ -382,11 +459,18 @@ export function parseAttemptResult(value: unknown): AttemptResult {
       throw new ContractError();
     }
     result.next = parseWith(value.next, isPracticeQuestionPayload);
+    if (value.levelUp !== undefined) {
+      const levelUp = parseWith(value.levelUp, isLevelUp);
+      // The promotion response already serves the next question and progress
+      // from the new level; a mismatch would desync the whole practice UI.
+      if (result.next.question.cefrLevel !== levelUp.to) throw new ContractError();
+      result.levelUp = levelUp;
+    }
     return result;
   }
 
-  if (value.attemptNo < 3) {
-    const expectedAttemptsLeft = 3 - value.attemptNo;
+  if (value.attemptNo < PRACTICE_MAX_ATTEMPTS) {
+    const expectedAttemptsLeft = PRACTICE_MAX_ATTEMPTS - value.attemptNo;
     if (
       value.attemptsLeft !== expectedAttemptsLeft ||
       value.finalFeedback !== undefined ||
@@ -437,6 +521,129 @@ export function parseNativeAttemptResult(value: unknown): NativeAttemptResult {
     transcript: value.transcript,
     modelAnswer: value.modelAnswer,
     feedback: value.feedback,
+  };
+}
+
+/** Server timestamps are ISO-8601 strings; anything unparseable is contract drift. */
+function isTimestamp(value: unknown): value is string {
+  return isBoundedNonEmptyString(value, 64) && !Number.isNaN(Date.parse(value));
+}
+
+export function parsePracticeStats(value: unknown): PracticeStats {
+  if (
+    !isRecord(value) ||
+    !isCefrLevel(value.level) ||
+    !isRecord(value.progress) ||
+    !isCount(value.progress.masteredCount) ||
+    !isCount(value.progress.learningCount) ||
+    !isCount(value.progress.totalAtLevel) ||
+    value.progress.totalAtLevel < 1 ||
+    value.progress.masteredCount + value.progress.learningCount > value.progress.totalAtLevel ||
+    // Stats were born after SRS, so dueCount is required here.
+    !isCount(value.progress.dueCount) ||
+    value.progress.dueCount > value.progress.masteredCount + value.progress.learningCount ||
+    !isCount(value.streakDays) ||
+    !isCount(value.practicedToday) ||
+    !isCount(value.totalAttempts) ||
+    // Today's attempts are a subset of all attempts.
+    value.practicedToday > value.totalAttempts ||
+    (value.lastPracticedAt !== null && !isTimestamp(value.lastPracticedAt))
+  ) {
+    throw new ContractError();
+  }
+  return {
+    level: value.level,
+    progress: {
+      masteredCount: value.progress.masteredCount,
+      learningCount: value.progress.learningCount,
+      totalAtLevel: value.progress.totalAtLevel,
+      dueCount: value.progress.dueCount,
+    },
+    streakDays: value.streakDays,
+    practicedToday: value.practicedToday,
+    totalAttempts: value.totalAttempts,
+    lastPracticedAt: value.lastPracticedAt,
+  };
+}
+
+export const HISTORY_PAGE_LIMIT = 20;
+const HISTORY_MAX_PAGE_ITEMS = 50;
+
+function parseHistoryItem(value: unknown): HistoryItem {
+  if (
+    !isRecord(value) ||
+    !isUuid(value.id) ||
+    !isUuid(value.questionId) ||
+    !isBoundedNonEmptyString(value.promptWord, 100) ||
+    !isBoundedNonEmptyString(value.questionText, 1_000) ||
+    !isCefrLevel(value.cefrLevel) ||
+    (value.context !== 'diagnostic' && value.context !== 'practice') ||
+    !isNumber(value.attemptNo) ||
+    !Number.isInteger(value.attemptNo) ||
+    value.attemptNo < 1 ||
+    value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
+    !isScore(value.score) ||
+    typeof value.passed !== 'boolean' ||
+    !isBoundedString(value.transcript, 12_000) ||
+    !isBoundedNonEmptyString(value.feedback, 4_000) ||
+    !isTimestamp(value.createdAt)
+  ) {
+    throw new ContractError();
+  }
+  return {
+    id: value.id,
+    questionId: value.questionId,
+    promptWord: value.promptWord,
+    questionText: value.questionText,
+    cefrLevel: value.cefrLevel,
+    context: value.context,
+    attemptNo: value.attemptNo,
+    score: value.score,
+    passed: value.passed,
+    transcript: value.transcript,
+    feedback: value.feedback,
+    createdAt: value.createdAt,
+  };
+}
+
+export function parsePracticeHistory(value: unknown): HistoryPage {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.items) ||
+    value.items.length > HISTORY_MAX_PAGE_ITEMS ||
+    (value.nextCursor !== null && !isUuid(value.nextCursor))
+  ) {
+    throw new ContractError();
+  }
+  // An empty page must be the last page, or paging would spin forever.
+  if (value.items.length === 0 && value.nextCursor !== null) throw new ContractError();
+  return {
+    items: value.items.map(parseHistoryItem),
+    nextCursor: value.nextCursor,
+  };
+}
+
+const EXPORT_MAX_PAGE_ITEMS = 1_000;
+
+export function parseUserDataPage(value: unknown): UserDataPage {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.attempts) ||
+    value.attempts.length > EXPORT_MAX_PAGE_ITEMS ||
+    (value.nextCursor !== null && !isUuid(value.nextCursor)) ||
+    (value.attempts.length === 0 && value.nextCursor !== null)
+  ) {
+    throw new ContractError();
+  }
+  const attempts = value.attempts.map((attempt) => {
+    // Rows are exported verbatim, but they must at least be JSON objects.
+    if (!isRecord(attempt)) throw new ContractError();
+    return attempt;
+  });
+  return {
+    user: parseUser(value.user),
+    attempts,
+    nextCursor: value.nextCursor,
   };
 }
 

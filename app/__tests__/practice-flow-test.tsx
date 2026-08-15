@@ -124,6 +124,165 @@ describe('PracticeFlowProvider', () => {
     expect(feedbackText()).toBe('none');
   });
 
+  it('pins the attempt status for a scored miss and keeps it past clearFeedback', async () => {
+    await render(tree());
+    expect(flow!.attemptStatus).toBeNull();
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried to answer.',
+        feedback: 'Add more detail.',
+      });
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+
+    // Dismissing the feedback card must not lose the retry position: the
+    // practice screens show "Try N of 3" from this state before submit.
+    await act(async () => {
+      flow!.clearFeedback();
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+  });
+
+  it('ends the attempt status when the word passes or runs out of attempts', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 2,
+        attemptsLeft: 1,
+        score: 40,
+        transcript: 'again',
+        feedback: 'Almost.',
+      });
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 1 });
+
+    await act(async () => {
+      flow!.showFeedback('q-1', RESULT);
+    });
+    expect(flow!.attemptStatus).toBeNull();
+
+    await act(async () => {
+      flow!.showFeedback('q-2', {
+        passed: false,
+        mastered: false,
+        attemptNo: 3,
+        attemptsLeft: 0,
+        score: 30,
+        transcript: 'last try',
+        feedback: 'Out of attempts.',
+        finalFeedback: 'Work on word order.',
+      });
+    });
+    expect(flow!.attemptStatus).toBeNull();
+  });
+
+  it('treats a scored miss without attemptsLeft as an ended attempt run', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried to answer.',
+        feedback: 'Add more detail.',
+      });
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+
+    // The parsed contract always supplies attemptsLeft on a scored miss, but
+    // a missing value must fail closed to "no chip" rather than crash.
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 2,
+        score: 45,
+        transcript: 'I tried again.',
+        feedback: 'Add more detail.',
+      } as AttemptResult);
+    });
+    expect(flow!.attemptStatus).toBeNull();
+  });
+
+  it.each([
+    [
+      'silence',
+      {
+        passed: false,
+        mastered: false,
+        noSpeech: true,
+        attemptNo: 2,
+        attemptsLeft: 2,
+        score: 0,
+        transcript: '',
+        feedback: 'We could not detect any speech.',
+      } satisfies AttemptResult,
+    ],
+    [
+      'a native-mode answer',
+      {
+        mode: 'native',
+        understood: true,
+        transcript: 'నాకు ప్రయాణం ఇష్టం.',
+        modelAnswer: 'I enjoy travelling.',
+        feedback: 'On topic.',
+      } satisfies NativeAttemptResult,
+    ],
+  ])('leaves the attempt status untouched for %s', async (_case, result) => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried to answer.',
+        feedback: 'Add more detail.',
+      });
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+
+    await act(async () => {
+      flow!.showFeedback('q-1', result);
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+  });
+
+  it('discards the attempt status when the auth sessionVersion changes', async () => {
+    const { rerender } = await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried to answer.',
+        feedback: 'Add more detail.',
+      });
+    });
+    expect(flow!.attemptStatus).toEqual({ questionId: 'q-1', attemptsLeft: 2 });
+
+    setSessionVersion(1);
+    await rerender(tree());
+    expect(flow!.attemptStatus).toBeNull();
+  });
+
   it('discards feedback when the auth sessionVersion changes', async () => {
     const { rerender } = await render(tree());
 
@@ -301,5 +460,96 @@ describe('applyFailedAttemptToQuestionCache', () => {
     applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, MISS);
 
     expect(queryClient.getQueryData(QUERY_KEY)).toBeUndefined();
+  });
+});
+
+describe('session tally', () => {
+  const failResult: AttemptResult = {
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    score: 40,
+    transcript: 'short answer',
+    feedback: 'Add detail.',
+  };
+
+  const passResult: AttemptResult = {
+    passed: true,
+    mastered: false,
+    attemptNo: 2,
+    score: 65,
+    transcript: 'a better answer',
+    feedback: 'Good.',
+  };
+
+  const levelUpResult: AttemptResult = {
+    ...RESULT,
+    levelUp: { from: 'B1', to: 'B2' },
+  };
+
+  const nativeResult: NativeAttemptResult = {
+    mode: 'native',
+    understood: true,
+    transcript: 'నా జవాబు',
+    modelAnswer: 'My answer.',
+    feedback: 'You understood.',
+  };
+
+  const noSpeechResult: AttemptResult = {
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 3,
+    noSpeech: true,
+    score: 0,
+    transcript: '',
+    feedback: 'We heard nothing.',
+  };
+
+  it('starts empty and counts scored English attempts by outcome', async () => {
+    await render(tree());
+    expect(flow!.sessionTally).toEqual({ attempts: 0, passed: 0, mastered: 0, levelUps: 0 });
+
+    await act(async () => flow!.showFeedback('q-1', failResult));
+    expect(flow!.sessionTally).toEqual({ attempts: 1, passed: 0, mastered: 0, levelUps: 0 });
+
+    await act(async () => flow!.showFeedback('q-1', passResult));
+    expect(flow!.sessionTally).toEqual({ attempts: 2, passed: 1, mastered: 0, levelUps: 0 });
+
+    await act(async () => flow!.showFeedback('q-2', RESULT));
+    expect(flow!.sessionTally).toEqual({ attempts: 3, passed: 2, mastered: 1, levelUps: 0 });
+
+    await act(async () => flow!.showFeedback('q-3', levelUpResult));
+    expect(flow!.sessionTally).toEqual({ attempts: 4, passed: 3, mastered: 2, levelUps: 1 });
+  });
+
+  it('ignores native answers and silence — they never count as attempts', async () => {
+    await render(tree());
+
+    await act(async () => flow!.showFeedback('q-1', nativeResult));
+    await act(async () => flow!.showFeedback('q-1', noSpeechResult));
+    expect(flow!.sessionTally).toEqual({ attempts: 0, passed: 0, mastered: 0, levelUps: 0 });
+  });
+
+  it('resets on demand for the Home summary dismissal', async () => {
+    await render(tree());
+
+    await act(async () => flow!.showFeedback('q-1', passResult));
+    expect(flow!.sessionTally.attempts).toBe(1);
+
+    await act(async () => flow!.resetSessionTally());
+    expect(flow!.sessionTally).toEqual({ attempts: 0, passed: 0, mastered: 0, levelUps: 0 });
+  });
+
+  it('discards the tally on an authentication transition', async () => {
+    const view = await render(tree());
+
+    await act(async () => flow!.showFeedback('q-1', passResult));
+    expect(flow!.sessionTally.attempts).toBe(1);
+
+    setSessionVersion(1);
+    await view.rerender(tree());
+    expect(flow!.sessionTally).toEqual({ attempts: 0, passed: 0, mastered: 0, levelUps: 0 });
   });
 });

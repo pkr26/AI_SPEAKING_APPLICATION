@@ -15,12 +15,33 @@ interface PracticeFeedback {
   result: PracticeOutcome;
 }
 
+/** Retry state for the question the learner is still on, kept after the
+ * feedback card is dismissed so screens can show "Attempt N of 3" up front. */
+interface PracticeAttemptStatus {
+  questionId: string;
+  attemptsLeft: number;
+}
+
+/** Client-side tally of the current practice session for the Home summary.
+ * Counts scored English attempts only; native answers and silence are free. */
+export interface SessionTally {
+  attempts: number;
+  passed: number;
+  mastered: number;
+  levelUps: number;
+}
+
+const EMPTY_TALLY: SessionTally = { attempts: 0, passed: 0, mastered: 0, levelUps: 0 };
+
 interface PracticeFlowValue {
   answerMode: PracticeAnswerMode;
   feedback: PracticeFeedback | null;
+  attemptStatus: PracticeAttemptStatus | null;
+  sessionTally: SessionTally;
   setAnswerMode: (mode: PracticeAnswerMode) => void;
   showFeedback: (questionId: string, result: PracticeOutcome) => void;
   clearFeedback: () => void;
+  resetSessionTally: () => void;
 }
 
 const PracticeFlowContext = createContext<PracticeFlowValue | undefined>(undefined);
@@ -36,15 +57,51 @@ export function PracticeFlowProvider({ children }: { children: React.ReactNode }
 function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) {
   const [answerMode, setAnswerMode] = useState<PracticeAnswerMode>('english');
   const [feedback, setFeedback] = useState<PracticeFeedback | null>(null);
+  const [attemptStatus, setAttemptStatus] = useState<PracticeAttemptStatus | null>(null);
+  const [sessionTally, setSessionTally] = useState<SessionTally>(EMPTY_TALLY);
 
   const showFeedback = useCallback((questionId: string, result: PracticeOutcome) => {
     setFeedback({ questionId, result });
+    // Native answers and silence never count as attempts, so they leave the
+    // retry state and the session tally alone. A scored miss with retries left
+    // pins the question's attempt state; a pass or the final miss ends it (the
+    // word advances).
+    if (isNativeOutcome(result) || result.noSpeech) return;
+    setSessionTally((tally) => ({
+      attempts: tally.attempts + 1,
+      passed: tally.passed + (result.passed ? 1 : 0),
+      mastered: tally.mastered + (result.mastered ? 1 : 0),
+      levelUps: tally.levelUps + (result.levelUp ? 1 : 0),
+    }));
+    if (!result.passed && (result.attemptsLeft ?? 0) > 0) {
+      setAttemptStatus({ questionId, attemptsLeft: result.attemptsLeft! });
+    } else {
+      setAttemptStatus(null);
+    }
   }, []);
   const clearFeedback = useCallback(() => setFeedback(null), []);
+  const resetSessionTally = useCallback(() => setSessionTally(EMPTY_TALLY), []);
 
   const value = useMemo(
-    () => ({ answerMode, feedback, setAnswerMode, showFeedback, clearFeedback }),
-    [answerMode, feedback, showFeedback, clearFeedback],
+    () => ({
+      answerMode,
+      feedback,
+      attemptStatus,
+      sessionTally,
+      setAnswerMode,
+      showFeedback,
+      clearFeedback,
+      resetSessionTally,
+    }),
+    [
+      answerMode,
+      feedback,
+      attemptStatus,
+      sessionTally,
+      showFeedback,
+      clearFeedback,
+      resetSessionTally,
+    ],
   );
 
   return <PracticeFlowContext.Provider value={value}>{children}</PracticeFlowContext.Provider>;

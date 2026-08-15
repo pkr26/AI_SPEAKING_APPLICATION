@@ -2,12 +2,14 @@ import React, { useEffect } from 'react';
 import { Stack, type ErrorBoundaryProps } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { AppState, Pressable, StyleSheet, Text, View } from 'react-native';
+import { AppState, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
+import Button from '../components/Button';
 import { AuthProvider, useAuth } from '../lib/auth';
+import { I18nProvider, translate, useT } from '../lib/i18n';
 import { PracticeFlowProvider } from '../lib/practice-flow';
-import { colors, layout } from '../lib/theme';
+import { createThemedStyles, useTheme } from '../lib/theme';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -20,12 +22,14 @@ const queryClient = new QueryClient({
 
 function RootNavigator() {
   const { token, user, isRestoring, restoreError } = useAuth();
+  const t = useT();
+  const { scheme, colors } = useTheme();
   const hasProfile = !isRestoring && !restoreError && !!token && !!user;
   const canPractice = hasProfile && user?.diagnosticCompleted === true;
 
   return (
     <>
-      <StatusBar style="dark" />
+      <StatusBar style={scheme === 'dark' ? 'light' : 'dark'} />
       <Stack
         screenOptions={{
           headerTintColor: colors.text,
@@ -42,7 +46,7 @@ function RootNavigator() {
           <Stack.Screen
             name="diagnostic"
             options={{
-              title: 'Diagnostic Test',
+              title: t('header.diagnostic'),
               headerBackVisible: false,
               gestureEnabled: false,
             }}
@@ -50,31 +54,57 @@ function RootNavigator() {
         </Stack.Protected>
         <Stack.Protected guard={canPractice}>
           <Stack.Screen
-            name="practice/index"
+            name="home"
             options={{
-              title: 'Practice',
+              title: t('header.home'),
               headerBackVisible: false,
               gestureEnabled: false,
             }}
           />
-          <Stack.Screen name="practice/help" options={{ title: 'Help' }} />
-          <Stack.Screen name="practice/attempt" options={{ title: 'Practice Mode' }} />
+          <Stack.Screen
+            name="practice/index"
+            options={{
+              title: t('header.practice'),
+              // The screen relaxes these while no recording/upload holds the
+              // interaction lock; locked exits would discard the take.
+              headerBackVisible: false,
+              gestureEnabled: false,
+            }}
+          />
+          <Stack.Screen name="practice/help" options={{ title: t('header.help') }} />
+          <Stack.Screen name="practice/attempt" options={{ title: t('header.attempt') }} />
           <Stack.Screen
             name="practice/feedback"
             options={{
-              title: 'Feedback',
+              title: t('header.feedback'),
               headerBackVisible: false,
               gestureEnabled: false,
             }}
           />
+          <Stack.Screen name="history" options={{ title: t('header.history') }} />
         </Stack.Protected>
         <Stack.Protected guard={hasProfile}>
-          <Stack.Screen name="settings/change-password" options={{ title: 'Change Password' }} />
-          <Stack.Screen name="settings/delete-account" options={{ title: 'Delete Account' }} />
+          <Stack.Screen name="settings/index" options={{ title: t('header.settings') }} />
+          <Stack.Screen
+            name="settings/change-password"
+            options={{ title: t('header.changePassword') }}
+          />
+          <Stack.Screen
+            name="settings/delete-account"
+            options={{ title: t('header.deleteAccount') }}
+          />
+          <Stack.Screen name="settings/privacy" options={{ title: t('header.privacy') }} />
+          <Stack.Screen name="settings/terms" options={{ title: t('header.terms') }} />
         </Stack.Protected>
       </Stack>
     </>
   );
+}
+
+/** Bridges the authenticated user's language into the i18n provider. */
+function LocalizedProviders({ children }: { children: React.ReactNode }) {
+  const { user } = useAuth();
+  return <I18nProvider userLanguage={user?.nativeLanguage ?? null}>{children}</I18nProvider>;
 }
 
 function QueryFocusBridge() {
@@ -92,24 +122,22 @@ function QueryFocusBridge() {
   return null;
 }
 
-/** Last-resort route boundary; never expose stack traces or provider details. */
+/**
+ * Last-resort route boundary; never expose stack traces or provider details.
+ * It can render outside the providers, so it uses the module-level translator.
+ */
 export function ErrorBoundary({ retry }: ErrorBoundaryProps) {
+  const styles = themedStyles(useTheme());
   return (
     <SafeAreaView style={styles.errorScreen}>
       <View style={styles.errorCard}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
-          Something went wrong
+          {translate('boundary.title')}
         </Text>
         <Text accessibilityRole="alert" style={styles.errorBody}>
-          Your learning data is safe. Try this screen again.
+          {translate('boundary.body')}
         </Text>
-        <Pressable
-          accessibilityRole="button"
-          onPress={retry}
-          style={({ pressed }) => [styles.errorButton, pressed && styles.errorButtonPressed]}
-        >
-          <Text style={styles.errorButtonText}>Try Again</Text>
-        </Pressable>
+        <Button title={translate('common.tryAgain')} onPress={retry} style={styles.errorButton} />
       </View>
     </SafeAreaView>
   );
@@ -121,21 +149,23 @@ export default function RootLayout() {
       <QueryClientProvider client={queryClient}>
         <QueryFocusBridge />
         <AuthProvider>
-          <PracticeFlowProvider>
-            <RootNavigator />
-          </PracticeFlowProvider>
+          <LocalizedProviders>
+            <PracticeFlowProvider>
+              <RootNavigator />
+            </PracticeFlowProvider>
+          </LocalizedProviders>
         </AuthProvider>
       </QueryClientProvider>
     </SafeAreaProvider>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   errorScreen: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
     backgroundColor: colors.background,
   },
   errorCard: {
@@ -143,9 +173,9 @@ const styles = StyleSheet.create({
     maxWidth: layout.formMaxWidth,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 16,
+    borderRadius: radii.card,
     backgroundColor: colors.card,
-    padding: 24,
+    padding: spacing.xl,
     alignItems: 'center',
   },
   errorTitle: {
@@ -162,20 +192,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   errorButton: {
-    minHeight: layout.minimumTarget,
-    marginTop: 24,
-    paddingHorizontal: 28,
-    paddingVertical: 12,
-    justifyContent: 'center',
-    borderRadius: 12,
-    backgroundColor: colors.primary,
+    marginTop: spacing.xl,
   },
-  errorButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  errorButtonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '700',
-  },
-});
+}));

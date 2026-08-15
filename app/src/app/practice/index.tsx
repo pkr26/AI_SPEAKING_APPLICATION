@@ -1,36 +1,64 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { router } from 'expo-router';
-import React, { useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { router, useNavigation } from 'expo-router';
+import React, { useCallback, useEffect, useLayoutEffect, useState } from 'react';
+import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import Button from '../../components/Button';
 import Recorder from '../../components/Recorder';
-import { apiFetch, userMessageForError } from '../../lib/api';
+import { apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
+import { useT } from '../../lib/i18n';
 import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
-import { colors, layout } from '../../lib/theme';
+import { hasSeenPracticeIntro, markPracticeIntroSeen } from '../../lib/practice-intro';
+import { createThemedStyles, useTheme } from '../../lib/theme';
 import {
   parseAttemptResult,
   parseNativeAttemptResult,
   parsePracticeQuestion,
+  PRACTICE_MASTER_SCORE,
+  PRACTICE_MAX_ATTEMPTS,
   type PracticeOutcome,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function PracticeScreen() {
   const { user, logout } = useAuth();
-  const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
+  const t = useT();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
+  const navigation = useNavigation();
+  const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
   const [recorderLocked, setRecorderLocked] = useState(false);
+  const [skipBusy, setSkipBusy] = useState(false);
+  // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
+  // rendered inline next to the recorder instead of only in a passing alert.
+  const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
+  // First-practice-visit one-shot explainer of the mastery rules. The stored
+  // flag is keyed by account so a stale read from a previous session's user
+  // can never show or hide the card for the wrong learner; while unknown
+  // (null) nothing renders, so the card cannot flash for returning learners.
+  const [introState, setIntroState] = useState<{ userId: string; seen: boolean } | null>(null);
+  const userId = user?.id ?? null;
+  useEffect(() => {
+    let active = true;
+    if (!userId) return undefined;
+    void hasSeenPracticeIntro(userId).then((seen) => {
+      if (active) setIntroState({ userId, seen });
+    });
+    return () => {
+      active = false;
+    };
+  }, [userId]);
+  const introSeen = introState && introState.userId === userId ? introState.seen : null;
+
+  const dismissIntro = () => {
+    if (!userId) return;
+    setIntroState({ userId, seen: true });
+    void markPracticeIntroSeen(userId);
+  };
   const nativeMode = answerMode === 'native';
 
   const questionQuery = useQuery({
@@ -46,19 +74,53 @@ export default function PracticeScreen() {
   const kind = questionQuery.data?.kind;
   const progress = questionQuery.data?.progress;
 
-  // Practice is the root of the practice stack: Android hardware back would
-  // pop it and let blur cleanup discard an active recording.
-  useHardwareBack(() => true);
+  // Practice now sits above Home. Leaving is a normal exit, except while a
+  // recording, upload, or recovery is active — popping then would let blur
+  // cleanup discard the take. Hardware back, header back, and the iOS swipe
+  // gesture all follow the same lock.
+  useHardwareBack(() => recorderLocked);
+  useLayoutEffect(() => {
+    navigation.setOptions(
+      recorderLocked
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  }, [navigation, recorderLocked]);
+
+  // A new submission owns the inline space again: clear the old wait line the
+  // moment the recorder locks for the next take.
+  const handleLockChange = useCallback((locked: boolean) => {
+    setRecorderLocked(locked);
+    if (locked) setRateLimitNotice(null);
+  }, []);
 
   const handleResult = (result: PracticeOutcome) => {
     if (!user || !question) return;
+    setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, question.id, result);
     showFeedback(question.id, result);
     router.push('/practice/feedback');
   };
 
   const handleError = (message: string) => {
-    Alert.alert('Could not assess your answer', message);
+    Alert.alert(t('diag.assessFailedTitle'), message);
+  };
+
+  const handleSkip = async () => {
+    if (!question || skipBusy || recorderLocked) return;
+    setSkipBusy(true);
+    try {
+      await apiSkipPracticeWord(question.id);
+      setRateLimitNotice(null);
+      await questionQuery.refetch();
+    } catch (error) {
+      Alert.alert(
+        t('practice.skipFailedTitle'),
+        userMessageForError(error, t('practice.skipFailed')),
+      );
+    } finally {
+      setSkipBusy(false);
+    }
   };
 
   const handleLogout = async () => {
@@ -67,29 +129,11 @@ export default function PracticeScreen() {
       router.replace('/');
     } catch (error) {
       if (error instanceof LogoutCleanupError) {
-        Alert.alert('Logged out', error.message);
+        Alert.alert(t('logout.cleanupTitle'), error.message);
       } else {
-        Alert.alert(
-          'Could not log out',
-          'Could not revoke the server session. Check your connection and try again.',
-        );
+        Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
       }
     }
-  };
-
-  const openSettingsMenu = () => {
-    Alert.alert('Settings', undefined, [
-      {
-        text: 'Change Password',
-        onPress: () => router.push('/settings/change-password'),
-      },
-      {
-        text: 'Delete Account',
-        style: 'destructive',
-        onPress: () => router.push('/settings/delete-account'),
-      },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
   };
 
   // The route gate will redirect after logout/session expiry. Avoid showing a
@@ -103,17 +147,17 @@ export default function PracticeScreen() {
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
       >
-        {user && <Text style={styles.greeting}>Hi, {user.name}</Text>}
+        {user && <Text style={styles.greeting}>{t('practice.greeting', { name: user.name })}</Text>}
 
         {!question && questionQuery.isPending && (
           <View style={styles.center}>
             <ActivityIndicator
-              accessibilityLabel="Loading your question"
+              accessibilityLabel={t('practice.loadingQuestion')}
               size="large"
-              color={colors.primary}
+              color={theme.colors.primary}
             />
             <Text accessibilityLiveRegion="polite" style={styles.muted}>
-              Loading your question…
+              {t('practice.loadingQuestion')}
             </Text>
           </View>
         )}
@@ -121,21 +165,32 @@ export default function PracticeScreen() {
         {!question && questionQuery.isError && (
           <View style={styles.center}>
             <Text accessibilityRole="header" style={styles.errorTitle}>
-              Couldn&apos;t load a question
+              {t('practice.loadFailedTitle')}
             </Text>
             <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-              {userMessageForError(
-                questionQuery.error,
-                'Could not load a practice question. Please try again.',
-              )}
+              {userMessageForError(questionQuery.error, t('practice.loadFailed'))}
             </Text>
-            <Pressable
-              accessibilityRole="button"
-              style={({ pressed }) => [styles.retryButton, pressed && styles.retryButtonPressed]}
+            <Button
+              title={t('common.tryAgain')}
               onPress={() => void questionQuery.refetch()}
-            >
-              <Text style={styles.retryButtonText}>Try Again</Text>
-            </Pressable>
+              style={styles.retryButton}
+            />
+          </View>
+        )}
+
+        {question && introSeen === false && (
+          <View style={styles.introCard}>
+            <Text accessibilityRole="header" style={styles.introTitle}>
+              {t('practiceIntro.title')}
+            </Text>
+            <Text style={styles.introLine}>
+              {t('practiceIntro.master', { score: PRACTICE_MASTER_SCORE })}
+            </Text>
+            <Text style={styles.introLine}>
+              {t('practiceIntro.tries', { count: PRACTICE_MAX_ATTEMPTS })}
+            </Text>
+            <Text style={styles.introLine}>{t('practiceIntro.silence')}</Text>
+            <Button title={t('practiceIntro.dismiss')} onPress={dismissIntro} style={styles.retryButton} />
           </View>
         )}
 
@@ -143,10 +198,8 @@ export default function PracticeScreen() {
           <>
             <Pressable
               accessibilityRole="button"
-              accessibilityLabel="Help for this question"
-              accessibilityHint={
-                recorderLocked ? 'Finish the current recording before opening help.' : undefined
-              }
+              accessibilityLabel={t('practice.helpLabel')}
+              accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
               accessibilityState={{ disabled: recorderLocked }}
               disabled={recorderLocked}
               hitSlop={4}
@@ -172,49 +225,73 @@ export default function PracticeScreen() {
                 </View>
                 {kind && (
                   <View style={[styles.kindBadge, kind === 'revision' && styles.kindBadgeRevision]}>
-                    <Text style={styles.kindBadgeText}>
-                      {kind === 'revision' ? 'Revision' : 'New word'}
+                    <Text
+                      style={[
+                        styles.kindBadgeText,
+                        kind === 'revision' && styles.kindBadgeRevisionText,
+                      ]}
+                    >
+                      {kind === 'revision' ? t('practice.revision') : t('practice.newWord')}
+                    </Text>
+                  </View>
+                )}
+                {attemptStatus !== null && attemptStatus.questionId === question.id && (
+                  <View style={styles.attemptChip}>
+                    <Text style={styles.attemptChipText}>
+                      {t('practice.attemptChip', {
+                        current: PRACTICE_MAX_ATTEMPTS + 1 - attemptStatus.attemptsLeft,
+                        max: PRACTICE_MAX_ATTEMPTS,
+                      })}
                     </Text>
                   </View>
                 )}
               </View>
+              <Text style={styles.levelExplainLine}>{t(`cefr.${question.cefrLevel}`)}</Text>
               {progress && (
                 <Text style={styles.progressLine}>
-                  {progress.masteredCount} of {progress.totalAtLevel} words mastered
-                  {progress.learningCount > 0 ? ` · ${progress.learningCount} in revision` : ''}
+                  {t('practice.progressLine', {
+                    mastered: progress.masteredCount,
+                    total: progress.totalAtLevel,
+                  })}
+                  {progress.learningCount > 0
+                    ? t('practice.progressLearning', { count: progress.learningCount })
+                    : ''}
                 </Text>
               )}
-              <Text style={styles.cardLabel}>Prompt word</Text>
+              <Text style={styles.cardLabel}>{t('label.word')}</Text>
               <Text accessibilityRole="header" style={styles.promptWord}>
                 {question.promptWord}
               </Text>
-              <Text style={styles.cardLabel}>Question</Text>
+              <Text style={styles.cardLabel}>{t('label.question')}</Text>
               <Text style={styles.questionText}>{question.questionText}</Text>
             </View>
 
             <Pressable
               accessibilityRole="switch"
-              accessibilityLabel="Answer in my language"
-              accessibilityHint={
-                recorderLocked
-                  ? 'Finish the current recording before changing answer language.'
-                  : undefined
-              }
+              accessibilityLabel={t('practice.answerInMyLanguage')}
+              accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
               accessibilityState={{ checked: nativeMode, disabled: recorderLocked }}
               disabled={recorderLocked}
               style={({ pressed }) => [
                 styles.modeToggle,
+                nativeMode && styles.modeToggleOn,
                 recorderLocked && styles.modeToggleDisabled,
-                pressed && styles.modeTogglePressed,
+                pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
               ]}
               onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
             >
-              <Text style={styles.modeToggleText}>
-                {nativeMode
-                  ? 'Answering in your language — tap for English'
-                  : 'Answer in my language'}
+              <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
+                {nativeMode ? t('practice.answeringNative') : t('practice.answerInMyLanguage')}
               </Text>
             </Pressable>
+
+            {rateLimitNotice && (
+              <View style={styles.rateLimitCard}>
+                <Text accessibilityRole="alert" style={styles.rateLimitText}>
+                  {rateLimitNotice}
+                </Text>
+              </View>
+            )}
 
             <View style={styles.recorderArea}>
               <Recorder
@@ -225,6 +302,7 @@ export default function PracticeScreen() {
                 parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
                 onResult={handleResult}
                 onError={handleError}
+                onRateLimited={setRateLimitNotice}
                 onRecoveryUnresolved={() => void questionQuery.refetch()}
                 onRecoveryEndpointMismatch={(savedEndpoint) => {
                   if (savedEndpoint === '/practice/attempt/native') {
@@ -237,9 +315,21 @@ export default function PracticeScreen() {
                   }
                   return false;
                 }}
-                onInteractionLockChange={setRecorderLocked}
+                onInteractionLockChange={handleLockChange}
               />
             </View>
+
+            <Pressable
+              accessibilityRole="button"
+              accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
+              accessibilityState={{ disabled: recorderLocked || skipBusy, busy: skipBusy }}
+              disabled={recorderLocked || skipBusy}
+              hitSlop={4}
+              style={[styles.skipButton, (recorderLocked || skipBusy) && styles.controlDisabled]}
+              onPress={() => void handleSkip()}
+            >
+              <Text style={styles.skipButtonText}>{t('practice.skipWord')}</Text>
+            </Pressable>
           </>
         )}
       </ScrollView>
@@ -247,43 +337,39 @@ export default function PracticeScreen() {
       <View style={[styles.footerRow, { paddingBottom: Math.max(insets.bottom, 10) }]}>
         <Pressable
           accessibilityRole="button"
-          accessibilityHint={
-            recorderLocked ? 'Finish the current recording before opening settings.' : undefined
-          }
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
           accessibilityState={{ disabled: recorderLocked }}
           disabled={recorderLocked}
           hitSlop={4}
           style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
-          onPress={openSettingsMenu}
+          onPress={() => router.push('/settings')}
         >
-          <Text style={styles.footerButtonText}>Settings</Text>
+          <Text style={styles.footerButtonText}>{t('practice.settings')}</Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
-          accessibilityHint={
-            recorderLocked ? 'Finish the current recording before logging out.' : undefined
-          }
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
           accessibilityState={{ disabled: recorderLocked }}
           disabled={recorderLocked}
           hitSlop={4}
           style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
           onPress={() => void handleLogout()}
         >
-          <Text style={styles.footerButtonText}>Log out</Text>
+          <Text style={styles.footerButtonText}>{t('common.logOut')}</Text>
         </Pressable>
       </View>
     </View>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
   },
   content: {
     flexGrow: 1,
-    padding: 20,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -297,10 +383,10 @@ const styles = StyleSheet.create({
   greeting: {
     fontSize: 15,
     color: colors.muted,
-    marginBottom: 12,
+    marginBottom: spacing.md,
   },
   muted: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
@@ -311,30 +397,18 @@ const styles = StyleSheet.create({
     color: colors.text,
   },
   retryButton: {
-    marginTop: 20,
-    backgroundColor: colors.primary,
-    borderRadius: 12,
-    paddingVertical: 13,
-    paddingHorizontal: 28,
-  },
-  retryButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  retryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 16,
-    fontWeight: '600',
+    marginTop: spacing.lg,
   },
   helpButton: {
     alignSelf: 'flex-end',
-    width: 44,
-    height: 44,
-    borderRadius: 22,
+    width: layout.minimumTarget,
+    height: layout.minimumTarget,
+    borderRadius: radii.pill,
     backgroundColor: colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: '#000',
-    shadowOpacity: 0.15,
+    shadowColor: colors.shadow,
+    shadowOpacity: scheme === 'dark' ? 0.4 : 0.15,
     shadowRadius: 6,
     shadowOffset: { width: 0, height: 3 },
     elevation: 4,
@@ -343,25 +417,25 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primaryDark,
   },
   helpButtonText: {
-    color: '#FFFFFF',
+    color: colors.onPrimary,
     fontSize: 20,
     fontWeight: '800',
   },
   card: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 20,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
   },
   levelBadge: {
     alignSelf: 'flex-start',
     backgroundColor: colors.primaryLight,
-    borderRadius: 8,
+    borderRadius: radii.badge,
     paddingVertical: 3,
     paddingHorizontal: 10,
-    marginBottom: 4,
+    marginBottom: spacing.xs,
   },
   levelBadgeText: {
     fontSize: 12,
@@ -371,12 +445,12 @@ const styles = StyleSheet.create({
   badgeRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 8,
-    marginBottom: 4,
+    gap: spacing.sm,
+    marginBottom: spacing.xs,
   },
   kindBadge: {
     backgroundColor: colors.success,
-    borderRadius: 8,
+    borderRadius: radii.badge,
     paddingVertical: 3,
     paddingHorizontal: 10,
   },
@@ -386,24 +460,70 @@ const styles = StyleSheet.create({
   kindBadgeText: {
     fontSize: 12,
     fontWeight: '700',
-    color: '#FFFFFF',
+    color: colors.onSuccess,
+  },
+  kindBadgeRevisionText: {
+    color: colors.onWarning,
   },
   progressLine: {
     fontSize: 13,
     color: colors.muted,
-    marginBottom: 4,
+    marginBottom: spacing.xs,
   },
-  modeToggle: {
-    alignSelf: 'center',
-    marginTop: 12,
-    paddingVertical: 8,
-    paddingHorizontal: 16,
-    borderRadius: 20,
+  levelExplainLine: {
+    fontSize: 13,
+    color: colors.muted,
+    marginBottom: spacing.xs,
+  },
+  introCard: {
+    marginBottom: spacing.md,
+    backgroundColor: colors.primaryLight,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.primary,
   },
+  introTitle: {
+    fontSize: 17,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  introLine: {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    lineHeight: 22,
+    color: colors.text,
+  },
+  attemptChip: {
+    backgroundColor: colors.primaryLight,
+    borderRadius: radii.badge,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+  },
+  attemptChipText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.primary,
+  },
+  modeToggle: {
+    alignSelf: 'center',
+    marginTop: spacing.md,
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.ml,
+    borderRadius: radii.pill,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  modeToggleOn: {
+    backgroundColor: colors.primary,
+  },
   modeTogglePressed: {
     backgroundColor: colors.primaryLight,
+  },
+  modeTogglePressedOn: {
+    backgroundColor: colors.primaryDark,
   },
   modeToggleDisabled: {
     opacity: 0.5,
@@ -416,22 +536,25 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: colors.primary,
   },
+  modeToggleTextOn: {
+    color: colors.onPrimary,
+  },
   cardLabel: {
     fontSize: 12,
     fontWeight: '700',
     color: colors.muted,
     textTransform: 'uppercase',
     letterSpacing: 0.8,
-    marginTop: 12,
+    marginTop: spacing.md,
   },
   promptWord: {
-    marginTop: 4,
+    marginTop: spacing.xs,
     fontSize: 30,
     fontWeight: '800',
     color: colors.primary,
   },
   questionText: {
-    marginTop: 4,
+    marginTop: spacing.xs,
     fontSize: 18,
     lineHeight: 26,
     color: colors.text,
@@ -440,13 +563,38 @@ const styles = StyleSheet.create({
     minHeight: 330,
     justifyContent: 'center',
   },
+  rateLimitCard: {
+    marginTop: spacing.md,
+    backgroundColor: colors.dangerLight,
+    borderColor: colors.danger,
+    borderWidth: 1,
+    borderRadius: radii.input,
+    padding: spacing.md,
+  },
+  rateLimitText: {
+    color: colors.danger,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
+  },
+  skipButton: {
+    alignSelf: 'center',
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    paddingHorizontal: spacing.ml,
+  },
+  skipButtonText: {
+    fontSize: 14,
+    color: colors.muted,
+    textDecorationLine: 'underline',
+  },
   footerRow: {
     minHeight: 56,
     flexDirection: 'row',
     justifyContent: 'center',
-    gap: 24,
-    paddingTop: 4,
-    paddingHorizontal: 16,
+    gap: spacing.xl,
+    paddingTop: spacing.xs,
+    paddingHorizontal: spacing.ml,
     borderTopWidth: 1,
     borderTopColor: colors.border,
     backgroundColor: colors.card,
@@ -454,11 +602,11 @@ const styles = StyleSheet.create({
   footerButton: {
     minHeight: layout.minimumTarget,
     justifyContent: 'center',
-    paddingHorizontal: 16,
+    paddingHorizontal: spacing.ml,
   },
   footerButtonText: {
     fontSize: 14,
     color: colors.muted,
     textDecorationLine: 'underline',
   },
-});
+}));

@@ -1,20 +1,14 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import {
-  ActivityIndicator,
-  Alert,
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { ActivityIndicator, Alert, ScrollView, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
+import Button from '../components/Button';
 import Recorder from '../components/Recorder';
 import { apiFetch, userMessageForError } from '../lib/api';
-import { useAuth } from '../lib/auth';
-import { colors, layout } from '../lib/theme';
+import { LogoutCleanupError, useAuth } from '../lib/auth';
+import { useT } from '../lib/i18n';
+import { createThemedStyles, useTheme } from '../lib/theme';
 import {
   parseDiagnosticAnswerResult,
   parseDiagnosticNext,
@@ -24,8 +18,17 @@ import {
 } from '../lib/types';
 import { useHardwareBack } from '../lib/use-hardware-back';
 
+/** Per-answer outcome kept in screen state for the completion reveal. */
+interface AnswerRecord {
+  score: number;
+  passed: boolean;
+}
+
 export default function DiagnosticScreen() {
   const { user, setUser, logout, sessionVersion } = useAuth();
+  const t = useT();
+  const theme = useTheme();
+  const styles = themedStyles(theme);
   const queryClient = useQueryClient();
   const userId = user?.id ?? null;
   const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;
@@ -38,6 +41,10 @@ export default function DiagnosticScreen() {
   } | null>(null);
   const [result, setResult] = useState<DiagnosticAnswerResult | null>(null);
   const [level, setLevel] = useState<CefrLevel | null>(null);
+  // One-shot per test state: tapping Start hides the intro for this session.
+  // A resumed test (asked > 0) never shows it, so resuming is not blocked.
+  const [introStarted, setIntroStarted] = useState(false);
+  const [answers, setAnswers] = useState<AnswerRecord[]>([]);
   const [stateIdentity, setStateIdentity] = useState(identityKey);
   const [recorderLocked, setRecorderLocked] = useState(false);
   // Mirrors the on-screen answer card for the /next effect below (effects must
@@ -61,6 +68,8 @@ export default function DiagnosticScreen() {
     setProgress(null);
     setResult(null);
     setLevel(null);
+    setIntroStarted(false);
+    setAnswers([]);
     return () => {
       if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;
     };
@@ -103,11 +112,14 @@ export default function DiagnosticScreen() {
   const handleResult = (data: DiagnosticAnswerResult) => {
     if (activeIdentityRef.current !== identityKey) return;
     setResult(data);
+    // Remember the per-answer outcome for the completion reveal. A resumed
+    // test only lists the answers given in this session.
+    setAnswers((previous) => [...previous, { score: data.score, passed: data.passed }]);
   };
 
   const handleError = (message: string) => {
     if (activeIdentityRef.current !== identityKey) return;
-    Alert.alert('Could not assess your answer', message);
+    Alert.alert(t('diag.assessFailedTitle'), message);
   };
 
   const handleRecoveryUnresolved = () => {
@@ -119,24 +131,13 @@ export default function DiagnosticScreen() {
     try {
       await logout();
       router.replace('/');
-    } catch {
-      Alert.alert('Could not log out', 'Check your connection and try again.');
+    } catch (error) {
+      if (error instanceof LogoutCleanupError) {
+        Alert.alert(t('logout.cleanupTitle'), error.message);
+      } else {
+        Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
+      }
     }
-  };
-
-  const openAccountMenu = () => {
-    Alert.alert('Account & privacy', undefined, [
-      {
-        text: 'Change Password',
-        onPress: () => router.push('/settings/change-password'),
-      },
-      {
-        text: 'Delete Account',
-        style: 'destructive',
-        onPress: () => router.push('/settings/delete-account'),
-      },
-      { text: 'Cancel', style: 'cancel' },
-    ]);
   };
 
   const advance = () => {
@@ -172,8 +173,8 @@ export default function DiagnosticScreen() {
     if (nextQuery.isPending) {
       return (
         <View style={styles.center}>
-          <ActivityIndicator size="large" color={colors.primary} />
-          <Text style={styles.muted}>Preparing your diagnostic test…</Text>
+          <ActivityIndicator size="large" color={theme.colors.primary} />
+          <Text style={styles.muted}>{t('diag.preparing')}</Text>
         </View>
       );
     }
@@ -181,49 +182,66 @@ export default function DiagnosticScreen() {
       return (
         <View style={styles.center}>
           <Text accessibilityRole="header" style={styles.errorTitle}>
-            Couldn&apos;t load the test
+            {t('diag.loadFailedTitle')}
           </Text>
           <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-            {userMessageForError(
-              nextQuery.error,
-              'Could not load the diagnostic test. Please try again.',
-            )}
+            {userMessageForError(nextQuery.error, t('diag.loadFailed'))}
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+          <Button
+            title={t('common.tryAgain')}
+            fullWidth
             onPress={() => void nextQuery.refetch()}
-          >
-            <Text style={styles.primaryButtonText}>Try Again</Text>
-          </Pressable>
+            style={styles.primaryAction}
+          />
         </View>
       );
     }
   }
 
-  // ----- Done: congrats view -----
+  // ----- Done: congrats view with the per-answer reveal -----
   if (currentLevel) {
     return (
-      <View style={styles.center}>
-        <Text style={styles.congratsEmoji}>🎉</Text>
-        <Text accessibilityRole="header" style={styles.congratsTitle}>
-          Diagnostic complete!
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={styles.centerScroll}
+      >
+        <Text
+          accessibilityElementsHidden
+          importantForAccessibility="no-hide-descendants"
+          style={styles.congratsEmoji}
+        >
+          🎉
         </Text>
-        <Text style={styles.congratsText}>Your English level is</Text>
+        <Text accessibilityRole="header" style={styles.congratsTitle}>
+          {t('diag.completeTitle')}
+        </Text>
+        <Text style={styles.congratsText}>{t('diag.levelIntro')}</Text>
         <View style={styles.levelBadge}>
           <Text style={styles.levelBadgeText}>{currentLevel}</Text>
         </View>
-        <Text style={styles.congratsHint}>
-          We&apos;ll give you practice questions matched to this level.
-        </Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+        <Text style={styles.levelExplainText}>{t(`cefr.${currentLevel}`)}</Text>
+        {answers.length > 0 && (
+          <View style={styles.answersCard}>
+            <Text style={styles.answersTitle}>{t('diag.answersTitle')}</Text>
+            {answers.map((answer, index) => (
+              <Text key={index} style={styles.answerLine}>
+                {t('diag.answerLine', {
+                  number: index + 1,
+                  score: answer.score,
+                  mark: answer.passed ? '✓' : '✗',
+                })}
+              </Text>
+            ))}
+          </View>
+        )}
+        <Text style={styles.congratsHint}>{t('diag.levelHint')}</Text>
+        <Button
+          title={t('diag.startPracticing')}
+          fullWidth
           onPress={startPracticing}
-        >
-          <Text style={styles.primaryButtonText}>Start Practicing</Text>
-        </Pressable>
-      </View>
+          style={styles.primaryAction}
+        />
+      </ScrollView>
     );
   }
 
@@ -231,105 +249,123 @@ export default function DiagnosticScreen() {
     return null;
   }
 
+  // The intro shows once per fresh test, before the first question. A resumed
+  // test (asked > 0) goes straight to its question.
+  const showIntro = !introStarted && !currentResult && (currentProgress?.asked ?? 0) === 0;
+
   // ----- Question view -----
   return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
       <Text accessibilityRole="header" style={styles.heading}>
-        Diagnostic Test
+        {t('header.diagnostic')}
       </Text>
       <View style={styles.accountActions}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityHint={
-            recorderLocked
-              ? 'Finish the current recording before managing your account.'
-              : undefined
-          }
-          accessibilityState={{ disabled: recorderLocked }}
+        <Button
+          title={t('header.settings')}
+          variant="secondary"
+          size="sm"
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
           disabled={recorderLocked}
-          style={({ pressed }) => [
-            styles.accountButton,
-            recorderLocked && styles.accountButtonDisabled,
-            pressed && styles.accountButtonPressed,
-          ]}
-          onPress={openAccountMenu}
-        >
-          <Text style={styles.accountButtonText}>Account & privacy</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityHint={
-            recorderLocked ? 'Finish the current recording before logging out.' : undefined
-          }
-          accessibilityState={{ disabled: recorderLocked }}
+          onPress={() => router.push('/settings')}
+        />
+        <Button
+          title={t('common.logOut')}
+          variant="secondary"
+          size="sm"
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
           disabled={recorderLocked}
-          style={({ pressed }) => [
-            styles.accountButton,
-            recorderLocked && styles.accountButtonDisabled,
-            pressed && styles.accountButtonPressed,
-          ]}
           onPress={() => void handleLogout()}
-        >
-          <Text style={styles.accountButtonText}>Log out</Text>
-        </Pressable>
-      </View>
-      {currentProgress && (
-        <Text style={styles.progressText}>
-          Question {Math.min(currentProgress.asked + 1, currentProgress.maxQuestions)} of up to{' '}
-          {currentProgress.maxQuestions}
-        </Text>
-      )}
-
-      <View style={styles.card}>
-        <Text style={styles.cardLabel}>Prompt word</Text>
-        <Text style={styles.promptWord}>{currentQuestion.promptWord}</Text>
-        <Text style={styles.cardLabel}>Question</Text>
-        <Text style={styles.questionText}>{currentQuestion.questionText}</Text>
+        />
       </View>
 
-      {currentResult ? (
-        <View accessibilityLiveRegion="polite" style={styles.resultCard}>
-          <Text style={styles.resultTitle}>Answer received</Text>
-          <Text style={styles.resultText}>
-            Your answer was saved. Your score and level are revealed at the end of the test.
+      {showIntro ? (
+        <View style={styles.card}>
+          <Text accessibilityRole="header" style={styles.resultTitle}>
+            {t('diag.introTitle')}
           </Text>
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
-            onPress={advance}
-          >
-            <Text style={styles.primaryButtonText}>
-              {currentResult.done ? 'See My Level' : 'Next Question'}
+          <Text style={styles.introLine}>{t('diag.introWhat')}</Text>
+          {currentProgress && (
+            <Text style={styles.introLine}>
+              {t('diag.introCount', { count: currentProgress.maxQuestions })}
             </Text>
-          </Pressable>
+          )}
+          <Text style={styles.introLine}>{t('diag.introRecorded')}</Text>
+          <Text style={styles.introLine}>{t('diag.introSpeakEnglish')}</Text>
+          <Button
+            title={t('diag.introStart')}
+            fullWidth
+            onPress={() => setIntroStarted(true)}
+            style={styles.primaryAction}
+          />
         </View>
       ) : (
-        <Recorder
-          ownerId={user.id}
-          questionId={currentQuestion.id}
-          endpoint="/diagnostic/answer"
-          parseResult={parseDiagnosticAnswerResult}
-          onResult={handleResult}
-          onError={handleError}
-          onRecoveryUnresolved={handleRecoveryUnresolved}
-          onInteractionLockChange={setRecorderLocked}
-        />
+        <>
+          {currentProgress && (
+            <Text style={styles.progressText}>
+              {t('diag.progress', {
+                current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
+                max: currentProgress.maxQuestions,
+              })}
+            </Text>
+          )}
+
+          <View style={styles.card}>
+            <Text style={styles.cardLabel}>{t('label.word')}</Text>
+            <Text style={styles.promptWord}>{currentQuestion.promptWord}</Text>
+            <Text style={styles.cardLabel}>{t('label.question')}</Text>
+            <Text style={styles.questionText}>{currentQuestion.questionText}</Text>
+          </View>
+
+          {currentResult ? (
+            <View accessibilityLiveRegion="polite" style={styles.resultCard}>
+              <Text style={styles.resultTitle}>{t('diag.answerSavedTitle')}</Text>
+              <Text style={styles.resultText}>{t('diag.answerSavedBody')}</Text>
+              <Button
+                title={currentResult.done ? t('diag.seeLevel') : t('diag.nextQuestion')}
+                fullWidth
+                onPress={advance}
+                style={styles.primaryAction}
+              />
+            </View>
+          ) : (
+            <Recorder
+              ownerId={user.id}
+              questionId={currentQuestion.id}
+              endpoint="/diagnostic/answer"
+              parseResult={parseDiagnosticAnswerResult}
+              onResult={handleResult}
+              onError={handleError}
+              onRecoveryUnresolved={handleRecoveryUnresolved}
+              onInteractionLockChange={setRecorderLocked}
+            />
+          )}
+        </>
       )}
     </ScrollView>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   center: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 24,
+    padding: spacing.xl,
+    backgroundColor: colors.background,
+  },
+  centerScroll: {
+    flexGrow: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   container: {
     flexGrow: 1,
-    padding: 20,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -341,41 +377,22 @@ const styles = StyleSheet.create({
     color: colors.text,
   },
   progressText: {
-    marginTop: 4,
+    marginTop: spacing.xs,
     fontSize: 14,
     color: colors.muted,
-  },
-  accountButton: {
-    minHeight: layout.minimumTarget,
-    justifyContent: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 10,
-  },
-  accountButtonPressed: {
-    backgroundColor: colors.card,
-  },
-  accountButtonDisabled: {
-    opacity: 0.5,
   },
   accountActions: {
     alignSelf: 'flex-start',
     flexDirection: 'row',
     flexWrap: 'wrap',
-    gap: 8,
-    marginTop: 12,
-  },
-  accountButtonText: {
-    color: colors.primary,
-    fontWeight: '700',
+    gap: spacing.sm,
+    marginTop: spacing.md,
   },
   card: {
-    marginTop: 20,
+    marginTop: spacing.lg,
     backgroundColor: colors.card,
-    borderRadius: 16,
-    padding: 20,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -385,22 +402,22 @@ const styles = StyleSheet.create({
     color: colors.muted,
     textTransform: 'uppercase',
     letterSpacing: 0.8,
-    marginTop: 12,
+    marginTop: spacing.md,
   },
   promptWord: {
-    marginTop: 4,
+    marginTop: spacing.xs,
     fontSize: 30,
     fontWeight: '800',
     color: colors.primary,
   },
   questionText: {
-    marginTop: 4,
+    marginTop: spacing.xs,
     fontSize: 18,
     lineHeight: 26,
     color: colors.text,
   },
   muted: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
@@ -411,9 +428,9 @@ const styles = StyleSheet.create({
     color: colors.text,
   },
   resultCard: {
-    marginTop: 24,
-    borderRadius: 16,
-    padding: 20,
+    marginTop: spacing.xl,
+    borderRadius: radii.card,
+    padding: spacing.lg,
     borderWidth: 1,
     backgroundColor: colors.card,
     borderColor: colors.border,
@@ -424,7 +441,7 @@ const styles = StyleSheet.create({
     color: colors.text,
   },
   resultText: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     fontSize: 15,
     lineHeight: 22,
     color: colors.muted,
@@ -433,52 +450,68 @@ const styles = StyleSheet.create({
     fontSize: 56,
   },
   congratsTitle: {
-    marginTop: 12,
+    marginTop: spacing.md,
     fontSize: 26,
     fontWeight: '800',
     color: colors.text,
     textAlign: 'center',
   },
   congratsText: {
-    marginTop: 16,
+    marginTop: spacing.ml,
     fontSize: 16,
     color: colors.muted,
   },
   levelBadge: {
-    marginTop: 8,
+    marginTop: spacing.sm,
     backgroundColor: colors.primary,
-    borderRadius: 16,
-    paddingVertical: 12,
-    paddingHorizontal: 32,
+    borderRadius: radii.card,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.xxl,
   },
   levelBadgeText: {
     fontSize: 34,
     fontWeight: '800',
-    color: '#FFFFFF',
+    color: colors.onPrimary,
   },
   congratsHint: {
-    marginTop: 16,
-    marginBottom: 8,
+    marginTop: spacing.ml,
+    marginBottom: spacing.sm,
     fontSize: 15,
     color: colors.muted,
     textAlign: 'center',
   },
-  primaryButton: {
-    marginTop: 20,
-    backgroundColor: colors.primary,
-    borderRadius: 14,
-    paddingVertical: 15,
-    paddingHorizontal: 28,
-    alignItems: 'center',
-    alignSelf: 'stretch',
-  },
-  primaryButtonPressed: {
-    backgroundColor: colors.primaryDark,
-  },
-  primaryButtonText: {
-    color: '#FFFFFF',
-    fontSize: 17,
-    fontWeight: '600',
+  levelExplainText: {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    color: colors.muted,
     textAlign: 'center',
   },
-});
+  answersCard: {
+    marginTop: spacing.lg,
+    alignSelf: 'stretch',
+    backgroundColor: colors.card,
+    borderRadius: radii.card,
+    padding: spacing.ml,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  answersTitle: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  answerLine: {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    color: colors.text,
+  },
+  introLine: {
+    marginTop: 10,
+    fontSize: 16,
+    lineHeight: 23,
+    color: colors.text,
+  },
+  primaryAction: {
+    marginTop: spacing.lg,
+  },
+}));

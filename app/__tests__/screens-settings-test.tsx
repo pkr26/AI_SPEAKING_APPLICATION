@@ -8,19 +8,31 @@ import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
 import { ApiError } from '../src/lib/api';
 import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
+import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, layout } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
+
+// Under jest no I18nProvider is mounted, so the screens fall back to English;
+// assert against the same typed catalog the screens render from.
+const t = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('en', key, params);
 
 interface MockKeyboardAvoidingViewProps {
   behavior?: 'height' | 'position' | 'padding';
   children?: React.ReactNode;
+  keyboardVerticalOffset?: number;
   style?: unknown;
 }
 
-function MockKeyboardAvoidingView({ behavior, children, style }: MockKeyboardAvoidingViewProps) {
+function MockKeyboardAvoidingView({
+  behavior,
+  children,
+  keyboardVerticalOffset,
+  style,
+}: MockKeyboardAvoidingViewProps) {
   return React.createElement(
     'KeyboardAvoidingView',
-    { behavior, style, testID: 'keyboard-avoiding-view' },
+    { behavior, keyboardVerticalOffset, style, testID: 'keyboard-avoiding-view' },
     children,
   );
 }
@@ -28,6 +40,14 @@ function MockKeyboardAvoidingView({ behavior, children, style }: MockKeyboardAvo
 jest.mock('react-native/Libraries/Components/Keyboard/KeyboardAvoidingView', () => ({
   __esModule: true,
   default: MockKeyboardAvoidingView,
+}));
+
+// Both settings screens sit under a visible navigation header; keyboard
+// avoidance must offset by its measured height.
+const MOCK_HEADER_HEIGHT = 64;
+
+jest.mock('expo-router/react-navigation', () => ({
+  useHeaderHeight: () => MOCK_HEADER_HEIGHT,
 }));
 
 // ----- expo-router mock -----
@@ -122,6 +142,27 @@ function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
 
+/**
+ * The RN jest preset mocks TextInput as a class component whose prototype
+ * shares one focus() jest.fn across every instance. Walk from the queried
+ * host element up to that class instance and shadow focus() per instance so
+ * return-key chaining can assert which field received focus.
+ */
+function spyOnTextInputFocus(element: TestInstance): jest.Mock {
+  type Fiber = { stateNode: unknown; return: Fiber | null };
+  let fiber = (element as unknown as { unstable_fiber: Fiber | null }).unstable_fiber;
+  while (fiber) {
+    const stateNode = fiber.stateNode as { focus?: unknown } | null;
+    if (stateNode && typeof stateNode.focus === 'function') {
+      const spy = jest.fn();
+      Object.defineProperty(stateNode, 'focus', { configurable: true, value: spy });
+      return spy;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('TextInput instance not found');
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -193,26 +234,26 @@ afterEach(() => {
 // ----- change password -----
 
 async function fillChangePassword(current: string, next: string, confirm: string) {
-  await fireEvent.changeText(screen.getByPlaceholderText('Your current password'), current);
+  await fireEvent.changeText(screen.getByPlaceholderText(t('cp.currentPlaceholder')), current);
   await fireEvent.changeText(
-    screen.getByPlaceholderText('At least 8 characters, with a letter and a number'),
+    screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
     next,
   );
-  await fireEvent.changeText(screen.getByPlaceholderText('Repeat the new password'), confirm);
+  await fireEvent.changeText(screen.getByPlaceholderText(t('cp.confirmPlaceholder')), confirm);
 }
 
 function updateButton() {
-  return screen.getByRole('button', { name: 'Update Password' });
+  return screen.getByRole('button', { name: t('cp.submit') });
 }
 
 describe('change password screen', () => {
   it('keeps Update disabled until all fields validate', async () => {
     await renderScreen(<ChangePasswordScreen />);
-    expect(screen.getByLabelText('Current password').props.value).toBe('');
-    expect(screen.getByLabelText('New password').props.value).toBe('');
-    expect(screen.getByLabelText('Confirm new password').props.value).toBe('');
-    expect(screen.queryByText('Password must be at least 8 characters.')).toBeNull();
-    expect(screen.queryByText('Passwords do not match.')).toBeNull();
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.value).toBe('');
+    expect(screen.getByLabelText(t('cp.newLabel')).props.value).toBe('');
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.value).toBe('');
+    expect(screen.queryByText(t('password.tooShort'))).toBeNull();
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
     expect(flattenedStyle(updateButton())).toMatchObject({
       alignItems: 'center',
       backgroundColor: colors.primary,
@@ -222,7 +263,7 @@ describe('change password screen', () => {
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
-    expect(screen.queryByText('Passwords do not match.')).toBeNull();
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
     expect(updateButton().props.accessibilityState.disabled).toBe(false);
     expect(flattenedStyle(updateButton()).opacity).toBeUndefined();
     await expectPressFeedback(
@@ -236,7 +277,7 @@ describe('change password screen', () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', '');
 
-    expect(screen.queryByText('Passwords do not match.')).toBeNull();
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
     expect(updateButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
     expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
   });
@@ -249,7 +290,93 @@ describe('change password screen', () => {
       await renderScreen(<ChangePasswordScreen />);
 
       expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
+      expect(screen.getByTestId('keyboard-avoiding-view').props.keyboardVerticalOffset).toBe(
+        MOCK_HEADER_HEIGHT,
+      );
     });
+  });
+
+  it('chains the three password fields and submits from the confirmation field', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    const newFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.newLabel')));
+    const confirmFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.confirmLabel')));
+
+    await fireEvent(screen.getByLabelText(t('cp.currentLabel')), 'submitEditing');
+    expect(newFocus).toHaveBeenCalledTimes(1);
+
+    await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'submitEditing');
+    expect(confirmFocus).toHaveBeenCalledTimes(1);
+
+    await fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'submitEditing');
+    await waitFor(() =>
+      expect(mockAuthValue.changePassword).toHaveBeenCalledWith('oldpass1', 'newpass1'),
+    );
+  });
+
+  it('marks the focused password field with a two-pixel accent border', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    await fireEvent(screen.getByLabelText(t('cp.currentLabel')), 'focus');
+    expect(flattenedStyle(screen.getByLabelText(t('cp.currentLabel')))).toMatchObject({
+      borderWidth: 2,
+      borderColor: colors.primary,
+    });
+    // Only one field carries the focus treatment at a time.
+    expect(flattenedStyle(screen.getByLabelText(t('cp.newLabel')))).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+    });
+    await fireEvent(screen.getByLabelText(t('cp.currentLabel')), 'blur');
+
+    for (const label of [t('cp.currentLabel'), t('cp.newLabel'), t('cp.confirmLabel')]) {
+      const input = () => screen.getByLabelText(label);
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 1,
+        borderColor: colors.inputBorder,
+      });
+
+      await fireEvent(input(), 'focus');
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 2,
+        borderColor: colors.primary,
+      });
+
+      await fireEvent(input(), 'blur');
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 1,
+        borderColor: colors.inputBorder,
+      });
+    }
+  });
+
+  it('toggles visibility per password field without affecting the others', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    const labels = [t('cp.currentLabel'), t('cp.newLabel'), t('cp.confirmLabel')];
+    for (const label of labels) {
+      expect(screen.getByLabelText(label).props.secureTextEntry).toBe(true);
+    }
+
+    // One Show toggle per field, in render order.
+    const showToggles = screen.getAllByRole('button', { name: t('common.showPassword') });
+    expect(showToggles).toHaveLength(3);
+
+    await fireEvent.press(showToggles[1]);
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.secureTextEntry).toBe(true);
+    expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
+    expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
+    expect(screen.getAllByRole('button', { name: t('common.showPassword') })).toHaveLength(3);
+
+    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[0]);
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
+
+    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[1]);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
   });
 
   it('does not submit valid replacement fields without the current password', async () => {
@@ -264,21 +391,24 @@ describe('change password screen', () => {
   it('configures every password field as private with the shared input limit', async () => {
     await renderScreen(<ChangePasswordScreen />);
 
-    for (const label of ['Current password', 'New password', 'Confirm new password']) {
+    for (const label of [t('cp.currentLabel'), t('cp.newLabel'), t('cp.confirmLabel')]) {
       expect(screen.getByLabelText(label).props).toMatchObject({
         secureTextEntry: true,
         maxLength: MAX_PASSWORD_UTF8_BYTES,
       });
     }
-    expect(screen.getByLabelText('Current password').props.textContentType).toBe('password');
-    expect(screen.getByLabelText('New password').props.textContentType).toBe('newPassword');
-    expect(screen.getByLabelText('Confirm new password').props.textContentType).toBe('newPassword');
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.textContentType).toBe('password');
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.autoComplete).toBe('password');
+    expect(screen.getByLabelText(t('cp.newLabel')).props.textContentType).toBe('newPassword');
+    expect(screen.getByLabelText(t('cp.newLabel')).props.autoComplete).toBe('new-password');
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.textContentType).toBe('newPassword');
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.autoComplete).toBe('new-password');
   });
 
   it('shows a mismatch error when confirmation differs', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
-    expect(screen.getByText('Passwords do not match.').props.accessibilityLiveRegion).toBe(
+    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe(
       'polite',
     );
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
@@ -288,13 +418,13 @@ describe('change password screen', () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'short', 'short');
     expect(
-      screen.getByText('Password must be at least 8 characters.').props.accessibilityLiveRegion,
+      screen.getByText(t('password.tooShort')).props.accessibilityLiveRegion,
     ).toBe('polite');
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'abcdefgh', 'abcdefgh');
     expect(
-      screen.getByText('Password must include at least one letter and one number.'),
+      screen.getByText(t('password.needsLetterAndNumber')),
     ).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
@@ -302,7 +432,7 @@ describe('change password screen', () => {
   it('rejects current passwords over the UTF-8 byte limit', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('a'.repeat(73), 'newpass1', 'newpass1');
-    expect(screen.getByText('Password must be at most 72 UTF-8 bytes.')).toBeTruthy();
+    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -316,13 +446,13 @@ describe('change password screen', () => {
     );
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
-        'Password updated',
-        'Your password has been changed.',
+        t('cp.updatedTitle'),
+        t('cp.updatedBody'),
         expect.any(Array),
       ),
     );
 
-    await pressAlertButton('OK');
+    await pressAlertButton(t('common.ok'));
     expect(mockRouter.back).toHaveBeenCalled();
   });
 
@@ -336,7 +466,7 @@ describe('change password screen', () => {
 
     try {
       const busyButton = await screen.findByRole('button', {
-        name: 'Updating…',
+        name: t('cp.submitBusy'),
       });
       expect(busyButton.props.accessibilityState).toEqual({
         disabled: true,
@@ -358,7 +488,7 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(await screen.findByText('Current password is incorrect.')).toBeTruthy();
+    expect(await screen.findByText(t('cp.wrongCurrent'))).toBeTruthy();
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
@@ -368,7 +498,7 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
+    expect(await screen.findByText(t('error.tooMany'))).toBeTruthy();
   });
 
   it('maps other API errors through userMessageForError', async () => {
@@ -378,7 +508,7 @@ describe('change password screen', () => {
     await fireEvent.press(updateButton());
 
     expect(
-      await screen.findByText('The service is temporarily unavailable. Please try again later.'),
+      await screen.findByText(t('error.serverBusy')),
     ).toBeTruthy();
   });
 
@@ -392,14 +522,14 @@ describe('change password screen', () => {
     await fireEvent.press(updateButton());
 
     expect(
-      await screen.findByText('Could not change your password. Please try again.'),
+      await screen.findByText(t('cp.failed')),
     ).toBeTruthy();
     expect(updateButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(updateButton());
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
-        'Password updated',
+        t('cp.updatedTitle'),
         expect.any(String),
         expect.any(Array),
       ),
@@ -411,20 +541,20 @@ describe('change password screen', () => {
 // ----- delete account -----
 
 async function typePassword(password: string) {
-  await fireEvent.changeText(screen.getByPlaceholderText('Your password'), password);
+  await fireEvent.changeText(screen.getByPlaceholderText(t('da.passwordPlaceholder')), password);
 }
 
 function deleteButton() {
-  return screen.getByRole('button', { name: 'Delete My Account' });
+  return screen.getByRole('button', { name: t('da.submit') });
 }
 
 describe('delete account screen', () => {
   it('renders the permanence warning and keeps delete disabled initially', async () => {
     await renderScreen(<DeleteAccountScreen />);
     expect(
-      flattenedStyle(screen.getByRole('header', { name: 'This action is permanent' })),
+      flattenedStyle(screen.getByRole('header', { name: t('da.warningTitle') })),
     ).toMatchObject({ color: colors.danger });
-    const warningCard = screen.getByRole('header', { name: 'This action is permanent' }).parent;
+    const warningCard = screen.getByRole('header', { name: t('da.warningTitle') }).parent;
     if (!warningCard) throw new Error('Permanence warning has no rendered card');
     expect(flattenedStyle(warningCard)).toMatchObject({
       backgroundColor: colors.dangerLight,
@@ -440,9 +570,11 @@ describe('delete account screen', () => {
       opacity: 0.5,
     });
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
-    expect(screen.getByLabelText('Confirm your password').props).toMatchObject({
+    expect(screen.getByLabelText(t('da.passwordLabel')).props).toMatchObject({
       secureTextEntry: true,
+      autoComplete: 'password',
       textContentType: 'password',
+      returnKeyType: 'done',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
     });
   });
@@ -455,13 +587,63 @@ describe('delete account screen', () => {
       await renderScreen(<DeleteAccountScreen />);
 
       expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
+      expect(screen.getByTestId('keyboard-avoiding-view').props.keyboardVerticalOffset).toBe(
+        MOCK_HEADER_HEIGHT,
+      );
     });
+  });
+
+  it('asks for the delete confirmation when submitting from the keyboard', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+
+    await fireEvent(screen.getByLabelText(t('da.passwordLabel')), 'submitEditing');
+
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('da.confirmTitle'),
+      t('da.confirmBody'),
+      expect.any(Array),
+    );
+    expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
+  });
+
+  it('marks the focused password field with a two-pixel accent border', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    const passwordInput = () => screen.getByLabelText(t('da.passwordLabel'));
+
+    expect(flattenedStyle(passwordInput())).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+    });
+
+    await fireEvent(passwordInput(), 'focus');
+    expect(flattenedStyle(passwordInput())).toMatchObject({
+      borderWidth: 2,
+      borderColor: colors.primary,
+    });
+
+    await fireEvent(passwordInput(), 'blur');
+    expect(flattenedStyle(passwordInput())).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+    });
+  });
+
+  it('reveals and hides the password from the accessible toggle', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    expect(screen.getByLabelText(t('da.passwordLabel')).props.secureTextEntry).toBe(true);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
+    expect(screen.getByLabelText(t('da.passwordLabel')).props.secureTextEntry).toBe(false);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
+    expect(screen.getByLabelText(t('da.passwordLabel')).props.secureTextEntry).toBe(true);
   });
 
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('a'.repeat(73));
-    expect(screen.getByText('Password must be at most 72 UTF-8 bytes.')).toBeTruthy();
+    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
     expect(deleteButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -477,11 +659,11 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
 
     expect(alertSpy).toHaveBeenCalledWith(
-      'Delete your account?',
-      'This permanently deletes your account and all progress. This cannot be undone.',
+      t('da.confirmTitle'),
+      t('da.confirmBody'),
       [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Delete', style: 'destructive', onPress: expect.any(Function) },
+        { text: t('common.cancel'), style: 'cancel' },
+        { text: t('da.confirmDelete'), style: 'destructive', onPress: expect.any(Function) },
       ],
     );
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
@@ -493,19 +675,19 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />, queryClient);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
     await waitFor(() => expect(mockAuthValue.deleteAccount).toHaveBeenCalledWith('password1'));
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
-        'Account deleted',
-        'Your account and all its data have been deleted.',
+        t('da.deletedTitle'),
+        t('da.deletedBody'),
         expect.any(Array),
       ),
     );
     expect(clearSpy).toHaveBeenCalled();
 
-    await pressAlertButton('OK');
+    await pressAlertButton(t('common.ok'));
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
@@ -515,10 +697,10 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    const pressPromise = pressAlertButton('Delete');
+    const pressPromise = pressAlertButton(t('da.confirmDelete'));
 
     try {
-      const busyButton = await screen.findByRole('button', { name: 'Deleting…' });
+      const busyButton = await screen.findByRole('button', { name: t('da.submitBusy') });
       expect(busyButton.props.accessibilityState).toEqual({ disabled: true, busy: true });
     } finally {
       try {
@@ -529,7 +711,7 @@ describe('delete account screen', () => {
     }
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
-        'Account deleted',
+        t('da.deletedTitle'),
         expect.any(String),
         expect.any(Array),
       ),
@@ -541,9 +723,9 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
-    expect(await screen.findByText('Incorrect password.')).toBeTruthy();
+    expect(await screen.findByText(t('da.wrongPassword'))).toBeTruthy();
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
@@ -552,9 +734,9 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
-    expect(await screen.findByText('Too many attempts, please try again later.')).toBeTruthy();
+    expect(await screen.findByText(t('error.tooMany'))).toBeTruthy();
   });
 
   it('maps delete service failures to safe shared copy', async () => {
@@ -562,10 +744,10 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
     expect(
-      await screen.findByText('The service is temporarily unavailable. Please try again later.'),
+      await screen.findByText(t('error.serverBusy')),
     ).toBeTruthy();
   });
 
@@ -574,12 +756,10 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
     expect(
-      await screen.findByText(
-        'Your account was deleted, but local session cleanup failed. Restart the app before signing in again.',
-      ),
+      await screen.findByText(t('auth.accountDeletedCleanupFailed')),
     ).toBeTruthy();
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
@@ -592,18 +772,18 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
 
     expect(
-      await screen.findByText('Could not delete your account. Please try again.'),
+      await screen.findByText(t('da.failed')),
     ).toBeTruthy();
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(deleteButton());
-    await pressAlertButton('Delete');
+    await pressAlertButton(t('da.confirmDelete'));
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
-        'Account deleted',
+        t('da.deletedTitle'),
         expect.any(String),
         expect.any(Array),
       ),

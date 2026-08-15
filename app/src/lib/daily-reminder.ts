@@ -1,7 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
-import { translate } from './i18n';
+import { translate, translateFor, type MessageKey, type UiLanguage } from './i18n';
 
 /**
  * Local daily practice reminder (no remote push). The scheduled notification
@@ -67,9 +67,17 @@ export async function getDailyReminder(): Promise<DailyReminder | null> {
  * notification at `hour`:00 local time. Returns 'denied' when the learner
  * refused notification permission; the toggle then stays off with an
  * explanation instead of an error.
+ *
+ * `language` overrides the notification copy language: the module-level active
+ * language only updates on the render after a language change, so Settings
+ * passes the just-chosen language when re-scheduling.
  */
-export async function enableDailyReminder(hour: number): Promise<'enabled' | 'denied'> {
+export async function enableDailyReminder(
+  hour: number,
+  language?: UiLanguage,
+): Promise<'enabled' | 'denied'> {
   if (!isReminderHour(hour)) throw new Error('Invalid reminder hour');
+  const tr = (key: MessageKey) => (language ? translateFor(language, key) : translate(key));
   const Notifications = notifications();
   let { granted } = await Notifications.getPermissionsAsync();
   if (!granted) {
@@ -78,7 +86,7 @@ export async function enableDailyReminder(hour: number): Promise<'enabled' | 'de
   if (!granted) return 'denied';
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
-      name: translate('reminder.toggleLabel'),
+      name: tr('reminder.toggleLabel'),
       importance: Notifications.AndroidImportance.DEFAULT,
     });
   }
@@ -86,8 +94,8 @@ export async function enableDailyReminder(hour: number): Promise<'enabled' | 'de
   await Notifications.cancelAllScheduledNotificationsAsync();
   await Notifications.scheduleNotificationAsync({
     content: {
-      title: translate('reminder.notificationTitle'),
-      body: translate('reminder.notificationBody'),
+      title: tr('reminder.notificationTitle'),
+      body: tr('reminder.notificationBody'),
     },
     trigger: {
       type: Notifications.SchedulableTriggerInputTypes.DAILY,

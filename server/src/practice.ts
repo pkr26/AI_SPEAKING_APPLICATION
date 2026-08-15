@@ -137,6 +137,33 @@ async function pickRetentionQuestion(
 }
 
 /**
+ * Dead-end fallback: a learner who skipped EVERY word at their level empties
+ * all three buckets (new/revision exclude parked words; retention needs a
+ * mastered word) for the rest of the 7-day park. Serve the skipped learning
+ * word whose park expires soonest so GET /practice/question always has an
+ * answer instead of hard-500ing for up to SKIP_DAYS days.
+ */
+async function pickSkippedFallbackQuestion(
+  userId: string,
+  level: string,
+  db: Queryable,
+  excludeQuestionId?: string,
+): Promise<QuestionJson | undefined> {
+  const { rows } = await db.query<QuestionJson>(
+    `SELECT ${QUESTION_COLUMNS}
+     FROM practice_progress pp
+     JOIN questions q ON q.id = pp.question_id
+     WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'learning'
+       AND pp.skipped_until > now()
+       AND ($3::uuid IS NULL OR q.id <> $3)
+     ORDER BY pp.skipped_until ASC, random()
+     LIMIT 1`,
+    [userId, level, excludeQuestionId ?? null],
+  );
+  return rows[0];
+}
+
+/**
  * Whether the user's most recent practice attempt was a revision (the word had
  * earlier practice attempts) or a new word. Drives the interleave: a session
  * opens with revision, then new and revision alternate. Undefined when the
@@ -164,7 +191,9 @@ async function lastAttemptWasRevision(userId: string, db: Queryable): Promise<bo
  * Pick the next practice question: revision of still-learning words interleaved
  * with new words (session opens with revision when one is due, then buckets
  * alternate; an empty bucket defers to the other). When everything is
- * mastered, mastered words cycle back as retention revisions.
+ * mastered, mastered words cycle back as retention revisions. A level whose
+ * words are ALL parked by skips falls back to the soonest-unparking skipped
+ * learning word, so skipping every word never dead-ends the session.
  */
 export async function pickPracticeNext(
   userId: string,
@@ -185,6 +214,8 @@ export async function pickPracticeNext(
   if (secondPick) return { question: secondPick, kind: secondKind };
   const retention = await pickRetentionQuestion(userId, level, db, excludeQuestionId);
   if (retention) return { question: retention, kind: 'revision' };
+  const skipped = await pickSkippedFallbackQuestion(userId, level, db, excludeQuestionId);
+  if (skipped) return { question: skipped, kind: 'revision' };
   return undefined;
 }
 
@@ -368,9 +399,10 @@ async function storePracticeResult(
     );
 
     // Level promotion: mastering this word may complete the level. The
-    // level-guarded UPDATE serializes rival promotions on the user row — the
-    // loser re-evaluates against the already-promoted level, matches zero
-    // rows, and reports no levelUp. C2 never promotes (no next level).
+    // level-guarded UPDATE serializes rival promotions on the user row so the
+    // level advances exactly once; the loser matches zero rows and echoes the
+    // promotion after re-reading the level (below). C2 never promotes (no
+    // next level).
     let effectiveLevel = level;
     let levelUp: { from: string; to: string } | undefined;
     if (justMastered) {
@@ -386,6 +418,23 @@ async function storePracticeResult(
           if (promoted.rowCount === 1) {
             levelUp = { from: level, to: nextLevel };
             effectiveLevel = nextLevel;
+          } else {
+            // A rival transaction won the promotion (its commit released the
+            // user-row lock this UPDATE waited on; the stale level guard then
+            // matched 0 rows). This attempt still mastered the word that
+            // crossed the threshold, so re-read the level and echo the
+            // levelUp — answering from the OLD level would serve one
+            // stale-level question and swallow the promotion the learner
+            // just earned.
+            const current = await client.query<{ cefr_level: string | null }>(
+              'SELECT cefr_level FROM users WHERE id = $1',
+              [userId],
+            );
+            const currentLevel = current.rows[0]?.cefr_level;
+            if (currentLevel && currentLevel !== level) {
+              levelUp = { from: level, to: currentLevel };
+              effectiveLevel = currentLevel;
+            }
           }
         }
       }
@@ -699,6 +748,7 @@ export function createPracticeRouter(limiters: Limiters) {
       runAssessmentSubmission<PracticeClaim, AssessResult>(req, res, {
         context: 'practice',
         bodySchema: submission.bodySchema,
+        respendAssessmentBudget: submission.respendAssessmentBudget,
         questionMissingError: () => new HttpError(404, 'Question not found'),
         requireQuestionAtUserLevel: true,
         claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id),
@@ -773,6 +823,7 @@ export function createPracticeRouter(limiters: Limiters) {
       runAssessmentSubmission<PracticeClaim, NativeAssessResult>(req, res, {
         context: 'practice-native',
         bodySchema: submission.bodySchema,
+        respendAssessmentBudget: submission.respendAssessmentBudget,
         questionMissingError: () => new HttpError(404, 'Question not found'),
         requireQuestionAtUserLevel: true,
         // Same per-question serialization as English practice: without a
@@ -787,7 +838,7 @@ export function createPracticeRouter(limiters: Limiters) {
             user.id,
             options,
           ),
-        persist: async (user, question, _claim, result, requestId, requestClaimId) => {
+        persist: async (user, question, claim, result, requestId, requestClaimId) => {
           const feedback =
             result.understood || result.transcript === ''
               ? result.feedback
@@ -802,6 +853,25 @@ export function createPracticeRouter(limiters: Limiters) {
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
+            // Same claim-ownership re-check as both English persist paths: a
+            // worker whose claim lease expired and was replaced must fail 409
+            // here instead of completing a duplicate paid result.
+            const owned = await client.query(
+              `SELECT 1 FROM practice_inflight
+               WHERE user_id = $1 AND question_id = $2 AND claim_id = $3
+               FOR UPDATE`,
+              [user.id, question.id, claim.claimId],
+            );
+            if (owned.rowCount !== 1) {
+              throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+            }
+            // Clear the claim inside the persist transaction (like the
+            // English paths) so the response can never reach the client while
+            // its own inflight row is still visible.
+            await client.query(
+              'DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3',
+              [user.id, question.id, claim.claimId],
+            );
             await completeAssessmentRequest(client, user.id, requestId, requestClaimId, response);
             await client.query('COMMIT');
           } catch (err) {

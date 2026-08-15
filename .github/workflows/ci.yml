@@ -98,6 +98,9 @@ jobs:
           ASSESS_IP_DAILY_CAP: "100000"
           RATE_LIMIT_GLOBAL_MAX: "100000"
           RATE_LIMIT_AUTH_MAX: "100000"
+          RATE_LIMIT_FORGOT_EMAIL_MAX: "100000"
+          RATE_LIMIT_LOGIN_ACCOUNT_MAX: "100000"
+          RATE_LIMIT_PASSWORD_MAX: "100000"
           RATE_LIMIT_REGISTER_MAX: "100000"
           RATE_LIMIT_ASSESS_MAX: "100000"
           RATE_LIMIT_UPLOAD_GRANT_MAX: "100000"
@@ -105,6 +108,19 @@ jobs:
   server-docker:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18.4-alpine@sha256:9a8afca54e7861fd90fab5fdf4c42477a6b1cb7d293595148e674e0a3181de15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -113,9 +129,55 @@ jobs:
       # every change instead of at release time.
       - name: Build server image
         run: docker build --file server/Dockerfile --tag ai-english-server:ci server
-      - name: Exercise container liveness healthcheck command
+      # Actually exercise the HEALTHCHECK: boot the image detached and require
+      # Docker to report it healthy. Boot gating refuses traffic until the
+      # release schema and question catalog exist, so provision the service's
+      # default database with the image's own compiled migration/catalog
+      # commands first. NODE_ENV=development permits MOCK_AI and the local
+      # upload fallback; the baked-in production mode rejects MOCK_AI and
+      # requires S3_BUCKET.
+      - name: Exercise container healthcheck
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
+          JWT_SECRET: ci-jwt-secret-0123456789abcdef0123456789abcdef
         run: |
-          docker run --rm --entrypoint node ai-english-server:ci --version
+          set -euo pipefail
+          trap 'docker rm -f ai-english-healthcheck >/dev/null 2>&1 || true' EXIT
+          docker run --rm --network host -e DATABASE_URL ai-english-server:ci \
+            sh -c "node dist/db/run.js migrate && node dist/db/run.js catalog"
+          docker run --detach --name ai-english-healthcheck --network host \
+            -e NODE_ENV=development \
+            -e DATABASE_URL \
+            -e JWT_SECRET \
+            -e MOCK_AI=true \
+            -e PORT=4000 \
+            ai-english-server:ci
+          healthy=""
+          status=""
+          for attempt in $(seq 1 30); do
+            container_state=$(docker inspect --format '{{.State.Status}}' ai-english-healthcheck)
+            if [ "$container_state" != "running" ]; then
+              echo "container exited before becoming healthy (state: $container_state)"
+              docker logs ai-english-healthcheck || true
+              exit 1
+            fi
+            echo "poll $attempt: $(docker inspect --format '{{json .State.Health}}' ai-english-healthcheck)"
+            status=$(docker inspect --format '{{.State.Health.Status}}' ai-english-healthcheck)
+            if [ "$status" = "healthy" ]; then
+              healthy=1
+              break
+            fi
+            if [ "$status" = "unhealthy" ]; then
+              break
+            fi
+            sleep 2
+          done
+          if [ -z "$healthy" ]; then
+            echo "container did not become healthy within ~60s (last status: ${status:-unknown})"
+            docker logs ai-english-healthcheck || true
+            exit 1
+          fi
+          curl --fail --silent http://127.0.0.1:4000/health > /dev/null
 
   app:
     runs-on: ubuntu-24.04

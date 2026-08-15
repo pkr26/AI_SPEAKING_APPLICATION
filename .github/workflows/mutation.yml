@@ -2,7 +2,7 @@ name: mutation
 
 on:
   schedule:
-    # Weekly: the full server mutation campaign is far too slow for every push.
+    # Weekly: the full mutation campaigns are far too slow for every push.
     - cron: "17 3 * * 6"
   workflow_dispatch:
 
@@ -68,9 +68,41 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_english_mutation_test
       - name: Upload mutation reports
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: server-mutation-report
           path: server/reports/mutation/
+          if-no-files-found: warn
+          retention-days: 30
+
+  app:
+    runs-on: ubuntu-24.04
+    # Jest-runner Stryker at concurrency 2 with no database dependency; give
+    # the campaign the full job budget and report whatever it produced.
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      # Advisory only: a below-threshold score should surface in the report
+      # artifact for review, not block the scheduled run from uploading it.
+      - name: Run app mutation campaign
+        continue-on-error: true
+        run: npm run mutation
+      - name: Upload mutation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-mutation-report
+          path: app/reports/mutation/
           if-no-files-found: warn
           retention-days: 30

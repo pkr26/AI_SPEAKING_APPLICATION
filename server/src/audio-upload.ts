@@ -341,7 +341,7 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     if (!object.Body) throw new HttpError(400, 'audio upload not found or expired');
     if (typeof object.ContentLength === 'number' && object.ContentLength > MAX_AUDIO_BYTES) {
       releaseUnreadObjectBody(object.Body);
-      throw new HttpError(413, 'Audio file is too large');
+      throw new HttpError(413, 'Audio file is too large', 'AUDIO_TOO_LARGE');
     }
 
     const sizeCap = createAudioSizeCap();

@@ -15,12 +15,22 @@ describe('app identity configuration', () => {
     expect(expo.android.package).toBe('com.aienglish.coach');
   });
 
-  it('configures the splash screen with a contained icon on white', () => {
-    expect(expo.splash).toEqual({
-      image: './assets/splash-icon.png',
-      resizeMode: 'contain',
-      backgroundColor: '#FFFFFF',
-    });
+  it('configures the splash screen plugin with a contained icon and a dark variant', () => {
+    // SDK 57: the top-level `splash` key is invalid; the expo-splash-screen
+    // config plugin owns splash configuration.
+    expect('splash' in expo).toBe(false);
+    expect(expo.plugins).toContainEqual([
+      'expo-splash-screen',
+      {
+        image: './assets/splash-icon.png',
+        resizeMode: 'contain',
+        backgroundColor: '#FFFFFF',
+        dark: {
+          image: './assets/splash-icon.png',
+          backgroundColor: '#0F1417',
+        },
+      },
+    ]);
   });
 
   it('keeps the existing icons and follows the OS color scheme', () => {

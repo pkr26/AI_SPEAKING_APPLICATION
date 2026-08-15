@@ -1864,7 +1864,9 @@ describe('Recorder', () => {
         stage: 'prepared',
       });
       expect(markPendingAssessmentStage).toHaveBeenCalledWith(REQUEST_ID, 'direct-posting');
-      expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4', OWNER_ID);
+      expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4', OWNER_ID, {
+        signal: expect.any(AbortSignal),
+      });
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
@@ -4514,6 +4516,165 @@ describe('Recorder', () => {
       },
     );
 
+    describe('upload-gone re-upload', () => {
+      const REUPLOAD_KEY = `audio-uploads/${OWNER_ID}/550e8400-e29b-41d4-a716-446655440007.m4a`;
+      const S3_GRANT = {
+        mode: 's3' as const,
+        uploadUrl: 'https://s3.example.com/upload',
+        uploadFields: { key: S3_AUDIO_KEY },
+        audioKey: S3_AUDIO_KEY,
+        contentType: 'audio/mp4',
+        expiresIn: 300,
+        maxBytes: 25 * 1024 * 1024,
+      };
+      const REUPLOAD_GRANT = {
+        ...S3_GRANT,
+        uploadFields: { key: REUPLOAD_KEY },
+        audioKey: REUPLOAD_KEY,
+      };
+
+      /** Six absent status reads open the resubmission window (3 strikes, 10 s). */
+      function mockAbsentStatusReads() {
+        for (let i = 0; i < 6; i++) {
+          asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+        }
+      }
+
+      function mockTombstoneAfterSubmit() {
+        asMock(loadPendingAssessment)
+          .mockResolvedValueOnce(null)
+          .mockResolvedValueOnce(null)
+          .mockResolvedValue(pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }));
+      }
+
+      function assessmentPostCalls() {
+        return asMock(apiFetch).mock.calls.filter(
+          ([path, init]) => path === ENDPOINT && (init as { method?: string }).method === 'POST',
+        );
+      }
+
+      it('re-uploads the surviving recording with the same requestId under a fresh key and completes', async () => {
+        jest.useFakeTimers();
+        asMock(apiRequestAudioUpload)
+          .mockResolvedValueOnce(S3_GRANT)
+          .mockResolvedValueOnce(REUPLOAD_GRANT);
+        mockTombstoneAfterSubmit();
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockAbsentStatusReads();
+        asMock(apiFetch)
+          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'))
+          .mockRejectedValueOnce(new ApiError(404, 'not submitted'))
+          .mockResolvedValueOnce({ ok: true });
+        const { props } = await renderRecorder();
+        await recordAndStop();
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await advancePolls(7);
+        await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+
+        // One fresh grant + one fresh S3 POST for the same logical submission.
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(2);
+        expect(markPendingAssessmentStage).toHaveBeenCalledWith(
+          REQUEST_ID,
+          's3-granted',
+          REUPLOAD_KEY,
+        );
+        expect(apiPostPresignedAudio).toHaveBeenLastCalledWith(
+          REUPLOAD_GRANT.uploadUrl,
+          REUPLOAD_GRANT.uploadFields,
+          RECORDING_URI,
+          'audio/mp4',
+          REUPLOAD_GRANT.maxBytes,
+          {},
+        );
+        // Initial POST + resubmission with the dead key + resubmission with the
+        // fresh key — all carrying the SAME durable requestId.
+        const posts = assessmentPostCalls();
+        expect(posts).toHaveLength(3);
+        const postBodies = posts.map(
+          ([, init]) =>
+            (init as { body: { questionId: string; requestId: string; audioKey: string } }).body,
+        );
+        for (const body of postBodies) {
+          expect(body.requestId).toBe(REQUEST_ID);
+          expect(body.questionId).toBe(QUESTION_ID);
+        }
+        expect(postBodies[1].audioKey).toBe(S3_AUDIO_KEY);
+        expect(postBodies[2].audioKey).toBe(REUPLOAD_KEY);
+        expect(props.onError).not.toHaveBeenCalled();
+        expect(deletedRecordingUris()).toContain(RECORDING_URI);
+        expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      });
+
+      it('stays bounded and turns terminal when the resubmission with the fresh key is also rejected', async () => {
+        jest.useFakeTimers();
+        asMock(apiRequestAudioUpload)
+          .mockResolvedValueOnce(S3_GRANT)
+          .mockResolvedValueOnce(REUPLOAD_GRANT);
+        mockTombstoneAfterSubmit();
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockAbsentStatusReads();
+        asMock(apiFetch)
+          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'))
+          .mockRejectedValueOnce(new ApiError(404, 'not submitted'))
+          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'));
+        const { props } = await renderRecorder();
+        await recordAndStop();
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await advancePolls(7);
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone')),
+        );
+
+        // Exactly one automatic re-upload per recovery cycle: no third grant,
+        // no further POSTs, no endless polling after the terminal decision.
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(2);
+        expect(apiFetch).toHaveBeenCalledTimes(10);
+        expect(assessmentPostCalls()).toHaveLength(3);
+        expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+        expect(props.onResult).not.toHaveBeenCalled();
+        await advancePolls(3);
+        expect(apiFetch).toHaveBeenCalledTimes(10);
+      });
+
+      it('keeps the terminal behavior when the local recording no longer exists', async () => {
+        jest.useFakeTimers();
+        asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
+        mockTombstoneAfterSubmit();
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockAbsentStatusReads();
+        asMock(apiFetch).mockRejectedValueOnce(
+          new ApiError(400, 'audio upload not found or expired'),
+        );
+        const { props } = await renderRecorder();
+        await recordAndStop();
+        // The OS evicted the cached recording: there is nothing to re-upload.
+        asMock(File).mockImplementation((uri: string) => ({
+          uri,
+          exists: false,
+          delete: jest.fn(),
+          arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
+        }));
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await advancePolls(6);
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone')),
+        );
+
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1);
+        expect(apiPostPresignedAudio).toHaveBeenCalledTimes(1);
+        expect(apiFetch).toHaveBeenCalledTimes(8);
+        expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+        expect(props.onResult).not.toHaveBeenCalled();
+        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      });
+    });
+
     it('still checks for a durable result when recovery starts after the five-minute processing lease', async () => {
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ createdAt: Date.now() - 6 * 60_000 }),
@@ -5206,6 +5367,71 @@ describe('Recorder', () => {
       );
       expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
       expect(props.onResult).not.toHaveBeenCalled();
+    });
+
+    it('cancel during the upload-grant request returns the take promptly for review', async () => {
+      asMock(apiRequestAudioUpload).mockImplementation(
+        (_type: unknown, _owner: unknown, { signal }: { signal: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new ApiError(0, 'aborted')), {
+              once: true,
+            });
+          }),
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1));
+
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      await waitFor(() => expect(screen.getByText(recordedStatusText('0:05'))).toBeTruthy());
+
+      // The grant request is not the assessment POST: nothing was claimed
+      // server-side, so the handoff is forgotten and the take survives.
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(apiUploadAudio).not.toHaveBeenCalled();
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+    });
+
+    it('cancel during the 503 capacity-retry wait defers to recovery without waiting it out', async () => {
+      // A 30 s Retry-After would pin the old plain setTimeout; the abort-aware
+      // wait must wake on cancel immediately (real timers prove promptness).
+      asMock(apiUploadAudio)
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 30))
+        .mockReturnValue(new Promise(() => undefined));
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { ok: 'recovered' },
+      });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      const cancelledAt = Date.now();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      await waitFor(() =>
+        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'recovered' } }),
+      );
+
+      expect(Date.now() - cancelledAt).toBeLessThan(5_000);
+      // The earlier POST may have committed: recovery resolves the durable
+      // request and the same audio is never submitted a second time.
+      expect(apiUploadAudio).toHaveBeenCalledTimes(1);
+      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
+        timeoutMs: 5000,
+      });
     });
 
     it('ignores a cancel press once the take is back in review', async () => {

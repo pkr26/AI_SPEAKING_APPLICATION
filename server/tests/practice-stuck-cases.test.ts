@@ -352,5 +352,111 @@ describe('practice stuck cases', () => {
       expect(r.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
       expect(nativeMock).not.toHaveBeenCalled();
     });
+
+    it('fails 409 when the claim was replaced mid-assessment, keeping the request retryable', async () => {
+      const { token, userId, level } = await freshUser();
+      const questionId = await someQuestion(level);
+      const requestId = randomUUID();
+      const send = () =>
+        request(a)
+          .post('/practice/attempt/native')
+          .set('Authorization', `Bearer ${token}`)
+          .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+            filename: 'answer.m4a',
+            contentType: 'audio/mp4',
+          })
+          .field('questionId', questionId)
+          .field('requestId', requestId);
+
+      // Mid-assessment, this worker's claim lease is replaced by a rival
+      // claim (claim_id no longer matches) — exactly the expired-lease race
+      // both English persist paths already guard against.
+      nativeMock.mockImplementationOnce(async () => {
+        await pool.query('UPDATE practice_inflight SET claim_id = $1 WHERE user_id = $2 AND question_id = $3', [
+          randomUUID(),
+          userId,
+          questionId,
+        ]);
+        return {
+          understood: true,
+          transcript: 'మీరు అర్థం చేసుకున్నారు.',
+          modelAnswer: 'A simple model answer in English.',
+          feedback: 'Your answer shows you understood the question.',
+        };
+      });
+
+      const r = await send();
+      expect(r.status).toBe(409);
+      expect(r.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+
+      // The rival claim finishes; the abandoned requestId stays retryable and
+      // completes normally (the duplicate paid result was never persisted).
+      await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
+      const retry = await send();
+      expect(retry.status).toBe(200);
+      expect(retry.body.mode).toBe('native');
+      expect(nativeMock).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('all-skipped dead end', () => {
+    async function parkAllBut(userId: string, level: string, exceptId?: string) {
+      await pool.query(
+        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
+         SELECT $1, id, 'learning', 0, 0, now() + interval '7 days'
+         FROM questions WHERE cefr_level = $2 AND ($3::uuid IS NULL OR id <> $3)`,
+        [userId, level, exceptId ?? null],
+      );
+    }
+
+    it('serves the soonest-unparking skipped word instead of hard-500ing', async () => {
+      const { token, userId, level } = await freshUser();
+      const { rows } = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id', [
+        level,
+      ]);
+      const soonest = rows[0].id;
+      await parkAllBut(userId, level, soonest);
+      await pool.query(
+        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
+         VALUES ($1, $2, 'learning', 0, 0, now() + interval '1 day')`,
+        [userId, soonest],
+      );
+
+      const r = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+
+      expect(r.status).toBe(200);
+      expect(r.body.question.id).toBe(soonest);
+      expect(r.body.kind).toBe('revision');
+      expect(r.body.progress.learningCount).toBe(rows.length);
+    });
+
+    it('re-skipping the fallback word parks it again and serves the next soonest-unparking one', async () => {
+      const { token, userId, level } = await freshUser();
+      const { rows } = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id', [
+        level,
+      ]);
+      // Staggered parks: the word unparking in 1 day is served first, then 2...
+      await pool.query(
+        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
+         SELECT $1, id, 'learning', 0, 0,
+                now() + row_number() OVER (ORDER BY id) * interval '1 day'
+         FROM questions WHERE cefr_level = $2`,
+        [userId, level],
+      );
+
+      const first = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      expect(first.status).toBe(200);
+      expect(first.body.question.id).toBe(rows[0].id);
+
+      const skip = await request(a)
+        .post('/practice/skip')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId: rows[0].id });
+      expect(skip.status).toBe(204);
+
+      const second = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      expect(second.status).toBe(200);
+      expect(second.body.question.id).toBe(rows[1].id);
+    });
   });
 });

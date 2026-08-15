@@ -308,6 +308,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
       runAssessmentSubmission<DiagnosticClaim, AssessResult>(req, res, {
         context: 'diagnostic',
         bodySchema: submission.bodySchema,
+        respendAssessmentBudget: submission.respendAssessmentBudget,
         // A questionId that matches no catalog row can never be the served
         // question, so it shares the mismatch contract instead of a 404.
         questionMissingError: () => new HttpError(409, 'Question mismatch', 'QUESTION_MISMATCH'),

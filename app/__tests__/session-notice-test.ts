@@ -1,10 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 
 import { translateFor } from '../src/lib/i18n';
-import {
-  consumeSessionExpiredNotice,
-  markSessionExpiredNotice,
-} from '../src/lib/session-notice';
+import { consumeSessionExpiredNotice, markSessionExpiredNotice } from '../src/lib/session-notice';
 
 jest.mock('expo-secure-store', () => ({
   WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'device-only',

@@ -69,7 +69,7 @@ describe('database content seeding', () => {
   });
 });
 
-describe('migration 010 invariants', () => {
+describe('migration 010/011 invariants', () => {
   it('restricts question deletion while attempts reference it (no cascade data loss)', async () => {
     const email = `restrict_${randomUUID()}@example.com`;
     const user = await pool.query<{ id: string }>(
@@ -113,9 +113,13 @@ describe('migration 010 invariants', () => {
     );
     expect(inserted.rows[0]).toEqual({ srs_interval_index: 0, due_now: true, skipped_until: null });
 
+    // Migration 011 tightened the ladder bound to the real 5-step schedule.
+    await expect(
+      pool.query(`UPDATE practice_progress SET srs_interval_index = 5 WHERE user_id = $1`, [userId]),
+    ).rejects.toMatchObject({ code: '23514' }); // check_violation: index clamps at 4
     await expect(
       pool.query(`UPDATE practice_progress SET srs_interval_index = 9 WHERE user_id = $1`, [userId]),
-    ).rejects.toMatchObject({ code: '23514' }); // check_violation: index clamps at 8
+    ).rejects.toMatchObject({ code: '23514' }); // check_violation: index clamps at 4
     await expect(
       pool.query(`UPDATE practice_progress SET attempt_count = -1 WHERE user_id = $1`, [userId]),
     ).rejects.toMatchObject({ code: '23514' }); // relaxed to >= 0, not unbounded

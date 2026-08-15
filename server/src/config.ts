@@ -221,6 +221,36 @@ const envSchema = z
         message: 'is required when MAIL_MODE=webhook',
       });
     }
+    // In production, 'log' mode would write live password-reset tokens to the
+    // info log and deliver no mail at all; a plaintext webhook URL would POST
+    // the same account-takeover tokens in cleartext. Loopback http stays
+    // allowed for co-located relays that never leave the host.
+    if (env.NODE_ENV === 'production' && env.MAIL_MODE !== 'webhook') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['MAIL_MODE'],
+        message: "must be 'webhook' in production; 'log' writes live reset tokens to logs and delivers no mail",
+      });
+    }
+    if (env.NODE_ENV === 'production' && env.MAIL_WEBHOOK_URL) {
+      try {
+        const webhookUrl = new URL(env.MAIL_WEBHOOK_URL);
+        const isLoopback =
+          webhookUrl.hostname === 'localhost' ||
+          webhookUrl.hostname.endsWith('.localhost') ||
+          webhookUrl.hostname.startsWith('127.') ||
+          webhookUrl.hostname === '[::1]';
+        if (webhookUrl.protocol !== 'https:' && !(webhookUrl.protocol === 'http:' && isLoopback)) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['MAIL_WEBHOOK_URL'],
+            message: 'must be an https URL in production (http is allowed only for loopback hosts)',
+          });
+        }
+      } catch {
+        // The field-level URL issue is more specific.
+      }
+    }
     if (!env.MOCK_AI && !env.OPENAI_API_KEY) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,

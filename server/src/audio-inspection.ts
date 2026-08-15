@@ -540,13 +540,21 @@ export async function verifyAudioDuration(filePath: string): Promise<true> {
     duration = await inspectDecodedDuration(filePath);
   } catch (error) {
     if (error instanceof InspectionError && error.kind === 'unavailable') {
-      throw new HttpError(503, 'Audio inspection is temporarily unavailable');
+      // The inspector itself is broken (ffmpeg/ffprobe lost at runtime) — an
+      // operator-side fault, not client backpressure: deliberately no retry
+      // hint, because a short client retry cannot restore a missing binary.
+      throw new HttpError(503, 'Audio inspection is temporarily unavailable', 'PROVIDER_FAILED');
     }
     // A 10s probe/decode budget exhausted on a saturated host (or a
     // pathological input) is transient backpressure, not a bad file: answer
     // with a retryable 503 instead of blaming the recording with a 415.
     if (error instanceof InspectionError && error.kind === 'timeout') {
-      throw new HttpError(503, 'Audio inspection timed out; please try again', { retryAfterSeconds: 5 });
+      throw new HttpError(
+        503,
+        'Audio inspection timed out; please try again',
+        { retryAfterSeconds: 5 },
+        'CAPACITY_BUSY',
+      );
     }
     throw new HttpError(415, 'Invalid or unsupported audio file', 'AUDIO_UNREADABLE');
   } finally {

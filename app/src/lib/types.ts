@@ -580,6 +580,10 @@ function parseHistoryItem(value: unknown): HistoryItem {
     (value.context !== 'diagnostic' && value.context !== 'practice') ||
     !isNumber(value.attemptNo) ||
     !Number.isInteger(value.attemptNo) ||
+    // attemptNo ≤ 3 also bounds diagnostic history items; that stays safe only
+    // because the server's diagnostic binary search converges within 3
+    // questions (server MAX_QUESTIONS = 5, 6 CEFR levels). Revisit this bound
+    // if either of those changes.
     value.attemptNo < 1 ||
     value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
     !isScore(value.score) ||

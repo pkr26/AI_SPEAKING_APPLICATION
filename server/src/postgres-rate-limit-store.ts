@@ -87,6 +87,26 @@ export class PostgresRateLimitStore implements Store {
     }
   }
 
+  // Conditional re-spend (mirror of the window-guarded decrement): used by the
+  // assess abort guard to take back the hit express-rate-limit refunded when
+  // the client disconnected after paid capacity was committed. A plain
+  // increment would start a FRESH window (hits=1) when the abort lands after
+  // the window expired while the library refund was skipped — over-charging
+  // the aborting user into the next window. Same fail-safe contract as
+  // decrement: callers fire-and-forget, so errors are logged, never thrown.
+  async incrementWithinWindow(key: string): Promise<void> {
+    try {
+      await pool.query(
+        `UPDATE rate_limit_windows
+         SET hits = LEAST(hits + 1, 2147483647)
+         WHERE namespace = $1 AND key_hash = $2 AND reset_at > clock_timestamp()`,
+        [this.namespace, this.hash(key)],
+      );
+    } catch (err) {
+      logger.warn({ err, namespace: this.namespace }, 'rate-limit re-spend failed');
+    }
+  }
+
   async resetKey(key: string): Promise<void> {
     try {
       await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [

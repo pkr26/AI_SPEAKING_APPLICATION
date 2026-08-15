@@ -6,6 +6,8 @@ import { Alert, Platform, StyleSheet } from 'react-native';
 
 import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
+import PrivacyPolicyScreen from '../src/app/settings/privacy';
+import TermsScreen from '../src/app/settings/terms';
 import { ApiError } from '../src/lib/api';
 import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
@@ -235,10 +237,7 @@ afterEach(() => {
 
 async function fillChangePassword(current: string, next: string, confirm: string) {
   await fireEvent.changeText(screen.getByPlaceholderText(t('cp.currentPlaceholder')), current);
-  await fireEvent.changeText(
-    screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
-    next,
-  );
+  await fireEvent.changeText(screen.getByPlaceholderText(t('signup.passwordPlaceholder')), next);
   await fireEvent.changeText(screen.getByPlaceholderText(t('cp.confirmPlaceholder')), confirm);
 }
 
@@ -408,24 +407,18 @@ describe('change password screen', () => {
   it('shows a mismatch error when confirmation differs', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
-    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe(
-      'polite',
-    );
+    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe('polite');
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
   it('enforces the password policy on the new password', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'short', 'short');
-    expect(
-      screen.getByText(t('password.tooShort')).props.accessibilityLiveRegion,
-    ).toBe('polite');
+    expect(screen.getByText(t('password.tooShort')).props.accessibilityLiveRegion).toBe('polite');
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
 
     await fillChangePassword('oldpass1', 'abcdefgh', 'abcdefgh');
-    expect(
-      screen.getByText(t('password.needsLetterAndNumber')),
-    ).toBeTruthy();
+    expect(screen.getByText(t('password.needsLetterAndNumber'))).toBeTruthy();
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -507,9 +500,7 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(
-      await screen.findByText(t('error.serverBusy')),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
   });
 
   it('falls back to generic copy for non-API errors', async () => {
@@ -521,9 +512,7 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(
-      await screen.findByText(t('cp.failed')),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('cp.failed'))).toBeTruthy();
     expect(updateButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(updateButton());
@@ -658,14 +647,10 @@ describe('delete account screen', () => {
     );
     await fireEvent.press(deleteButton());
 
-    expect(alertSpy).toHaveBeenCalledWith(
-      t('da.confirmTitle'),
-      t('da.confirmBody'),
-      [
-        { text: t('common.cancel'), style: 'cancel' },
-        { text: t('da.confirmDelete'), style: 'destructive', onPress: expect.any(Function) },
-      ],
-    );
+    expect(alertSpy).toHaveBeenCalledWith(t('da.confirmTitle'), t('da.confirmBody'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      { text: t('da.confirmDelete'), style: 'destructive', onPress: expect.any(Function) },
+    ]);
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
 
@@ -746,9 +731,7 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
     await pressAlertButton(t('da.confirmDelete'));
 
-    expect(
-      await screen.findByText(t('error.serverBusy')),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
   });
 
   it('surfaces local cleanup failures after deletion', async () => {
@@ -758,9 +741,7 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
     await pressAlertButton(t('da.confirmDelete'));
 
-    expect(
-      await screen.findByText(t('auth.accountDeletedCleanupFailed')),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('auth.accountDeletedCleanupFailed'))).toBeTruthy();
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
@@ -774,9 +755,7 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
     await pressAlertButton(t('da.confirmDelete'));
 
-    expect(
-      await screen.findByText(t('da.failed')),
-    ).toBeTruthy();
+    expect(await screen.findByText(t('da.failed'))).toBeTruthy();
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(deleteButton());
@@ -789,5 +768,29 @@ describe('delete account screen', () => {
       ),
     );
     expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('legal screens', () => {
+  it('renders the privacy policy header, placeholder note, and all paragraphs', async () => {
+    await renderScreen(<PrivacyPolicyScreen />);
+
+    const title = screen.getByRole('header', { name: t('header.privacy') });
+    expect(flattenedStyle(title)).toMatchObject({ color: colors.text });
+    expect(screen.getByText(t('legal.placeholderNote'))).toBeTruthy();
+    expect(screen.getByText(t('privacy.p1'))).toBeTruthy();
+    expect(screen.getByText(t('privacy.p2'))).toBeTruthy();
+    expect(screen.getByText(t('privacy.p3'))).toBeTruthy();
+  });
+
+  it('renders the terms header, placeholder note, and all paragraphs', async () => {
+    await renderScreen(<TermsScreen />);
+
+    const title = screen.getByRole('header', { name: t('header.terms') });
+    expect(flattenedStyle(title)).toMatchObject({ color: colors.text });
+    expect(screen.getByText(t('legal.placeholderNote'))).toBeTruthy();
+    expect(screen.getByText(t('terms.p1'))).toBeTruthy();
+    expect(screen.getByText(t('terms.p2'))).toBeTruthy();
+    expect(screen.getByText(t('terms.p3'))).toBeTruthy();
   });
 });

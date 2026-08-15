@@ -1,4 +1,5 @@
 import { pool } from './db';
+import { logger } from './logger';
 
 /**
  * Database janitors delete in bounded ctid batches so a large backlog can
@@ -35,10 +36,14 @@ export async function runExclusiveBatchedDelete(lockName: string, batchDeleteSql
       } catch (unlockError) {
         // A client that may still hold the advisory lock must not return to
         // the pool; destroying the connection releases the lock server-side.
-        clientError =
+        // Log before poisoning so a stuck-lock scenario is visible instead of
+        // the tick silently reporting success.
+        const err =
           unlockError instanceof Error
             ? unlockError
             : new Error('janitor advisory unlock failed', { cause: unlockError });
+        logger.warn({ err, lockName }, 'janitor advisory unlock failed; poisoning the pool client');
+        clientError = err;
       }
     }
   } finally {

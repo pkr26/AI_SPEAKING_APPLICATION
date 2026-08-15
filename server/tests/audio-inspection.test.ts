@@ -281,6 +281,7 @@ describe('verifyAudioDuration', () => {
     ).rejects.toMatchObject({
       status: 503,
       message: 'Audio inspection is temporarily unavailable',
+      code: 'PROVIDER_FAILED',
     });
   });
 
@@ -295,6 +296,7 @@ describe('verifyAudioDuration', () => {
       status: 503,
       message: 'Audio inspection timed out; please try again',
       extra: { retryAfterSeconds: 5 },
+      code: 'CAPACITY_BUSY',
     });
   }, 25_000);
 

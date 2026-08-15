@@ -1,15 +1,20 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 import express from 'express';
 import request from 'supertest';
 import { ipKeyGenerator } from 'express-rate-limit';
+import { buildAssessmentSubmissionChain, runAssessmentSubmission } from '../src/assessment-pipeline';
 import { config } from '../src/config';
 import { JANITOR_BATCH_SIZE } from '../src/janitor';
 import { logger } from '../src/logger';
-import { AuthedRequest, errorHandler } from '../src/middleware';
+import { AuthedRequest, errorHandler, HttpError, UserRow, validate } from '../src/middleware';
 import { buildLimiters, normalizeLoginEmail } from '../src/rate-limit';
 import { cleanupRateLimitWindows, PostgresRateLimitStore } from '../src/postgres-rate-limit-store';
-import { pool } from './helpers';
+import { fakeM4aBuffer, pool } from './helpers';
 
 const saved = { ...config.rateLimit };
 
@@ -453,9 +458,7 @@ describe('rate limiters', () => {
     }
 
     it('re-spends both assessment counters when a client aborts after the capacity reservation', async () => {
-      const increment = vi
-        .spyOn(PostgresRateLimitStore.prototype, 'increment')
-        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
         const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
@@ -463,22 +466,20 @@ describe('rate limiters', () => {
         const next = vi.fn();
         limiters.assessAbortGuard(req, res as never, next);
         expect(next).toHaveBeenCalledOnce();
-        expect(increment).not.toHaveBeenCalled();
+        expect(resp).not.toHaveBeenCalled();
 
         res.emit('close');
-        await vi.waitFor(() => expect(increment).toHaveBeenCalledTimes(2));
-        const keys = increment.mock.calls.map(([key]) => key);
+        await vi.waitFor(() => expect(resp).toHaveBeenCalledTimes(2));
+        const keys = resp.mock.calls.map(([key]) => key);
         expect(keys).toContain('user:user-1');
         expect(keys).toContain(ipKeyGenerator('127.0.0.1'));
       } finally {
-        increment.mockRestore();
+        resp.mockRestore();
       }
     });
 
     it('leaves the close-path refund alone when no paid work was reserved', async () => {
-      const increment = vi
-        .spyOn(PostgresRateLimitStore.prototype, 'increment')
-        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
         const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
@@ -486,16 +487,14 @@ describe('rate limiters', () => {
         limiters.assessAbortGuard(req, res as never, vi.fn());
         res.emit('close');
         await new Promise((resolve) => setImmediate(resolve));
-        expect(increment).not.toHaveBeenCalled();
+        expect(resp).not.toHaveBeenCalled();
       } finally {
-        increment.mockRestore();
+        resp.mockRestore();
       }
     });
 
     it('ignores a close that follows a normally finished response', async () => {
-      const increment = vi
-        .spyOn(PostgresRateLimitStore.prototype, 'increment')
-        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
         const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
@@ -503,9 +502,9 @@ describe('rate limiters', () => {
         limiters.assessAbortGuard(req, res as never, vi.fn());
         res.emit('close');
         await new Promise((resolve) => setImmediate(resolve));
-        expect(increment).not.toHaveBeenCalled();
+        expect(resp).not.toHaveBeenCalled();
       } finally {
-        increment.mockRestore();
+        resp.mockRestore();
       }
     });
   });
@@ -543,6 +542,49 @@ describe('rate limiters', () => {
       "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-window-guard'",
     );
     expect(Number(rows[0].hits)).toBe(1);
+  });
+
+  it('conditional re-spend tops up a live window but never opens a fresh one', async () => {
+    const store = new PostgresRateLimitStore('store-respend-guard', 60_000);
+    await store.increment('learner');
+
+    // Live window: the abort re-spend takes the refunded hit back.
+    await store.incrementWithinWindow('learner');
+    const live = await pool.query<{ hits: number }>(
+      "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-respend-guard'",
+    );
+    expect(Number(live.rows[0].hits)).toBe(2);
+
+    // Expired window: the library refund was skipped too, so the re-spend is
+    // a no-op — a plain increment would instead open a fresh window (hits=1)
+    // and over-charge the aborting user into it.
+    await pool.query(
+      "UPDATE rate_limit_windows SET reset_at = now() - interval '1 second' WHERE namespace = 'store-respend-guard'",
+    );
+    await store.incrementWithinWindow('learner');
+    const { rows } = await pool.query<{ hits: number; reset_at: string }>(
+      "SELECT hits, reset_at FROM rate_limit_windows WHERE namespace = 'store-respend-guard'",
+    );
+    expect(rows).toHaveLength(1);
+    expect(Number(rows[0].hits)).toBe(2);
+    expect(new Date(rows[0].reset_at).getTime()).toBeLessThan(Date.now());
+  });
+
+  it('never lets a re-spend failure escape (abort-guard re-spends fire-and-forget)', async () => {
+    const store = new PostgresRateLimitStore('store-respend-fail-safe', 60_000);
+    const failure = new Error('database unavailable');
+    const query = vi.spyOn(pool, 'query').mockRejectedValue(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(store.incrementWithinWindow('learner')).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledWith(
+        { err: failure, namespace: 'store-respend-fail-safe' },
+        'rate-limit re-spend failed',
+      );
+    } finally {
+      warn.mockRestore();
+      query.mockRestore();
+    }
   });
 
   it('isolates identical client keys between limiter namespaces', async () => {
@@ -599,5 +641,89 @@ describe('rate limiters', () => {
     } finally {
       rival.release();
     }
+  });
+});
+
+describe('assessment reservation after client disconnect', () => {
+  // The pipeline's onCapacityReserved hook must re-spend both assessment
+  // budget hits when the capacity reservation commits after the response has
+  // already closed: express-rate-limit's close handler has refunded them while
+  // the abort guard saw no reservation flag, and 'close' never fires twice.
+
+  async function submissionHarness({ closed }: { closed: boolean }) {
+    const limiters = buildLimiters();
+    const chain = buildAssessmentSubmissionChain(limiters);
+    const respend = vi.fn();
+    const { rows: userRows } = await pool.query<UserRow>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('Respend Test', $1, 'not-used', 'te') RETURNING *`,
+      [`respend_${randomUUID()}@example.com`],
+    );
+    const user = userRows[0];
+    const { rows: questionRows } = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    const audioPath = path.join(os.tmpdir(), `respend-${process.pid}-${randomUUID()}.m4a`);
+    await fs.writeFile(audioPath, fakeM4aBuffer());
+
+    const req = {
+      user,
+      ip: '127.0.0.1',
+      body: { questionId: questionRows[0].id, requestId: randomUUID() },
+      file: { path: audioPath },
+      socket: { destroyed: false },
+    } as unknown as AuthedRequest;
+    const res = new EventEmitter() as EventEmitter & {
+      locals: Record<string, unknown>;
+      writableEnded: boolean;
+      closed: boolean;
+      destroyed: boolean;
+      json: ReturnType<typeof vi.fn>;
+    };
+    res.locals = {};
+    res.writableEnded = false;
+    res.closed = closed;
+    res.destroyed = false;
+    res.json = vi.fn();
+
+    try {
+      // validated() only serves bodies parsed by the validate() middleware.
+      await new Promise<void>((resolve, reject) =>
+        validate({ body: chain.bodySchema })(req as never, res as never, (err?: unknown) =>
+          err ? reject(err) : resolve(),
+        ),
+      );
+
+      await runAssessmentSubmission<{ claimId: string }, { ok: boolean }>(req, res as never, {
+        context: 'practice',
+        bodySchema: chain.bodySchema,
+        respendAssessmentBudget: respend,
+        questionMissingError: () => new HttpError(404, 'Question not found'),
+        requireQuestionAtUserLevel: false,
+        claimAttempt: async () => ({ claimId: randomUUID() }),
+        assess: async (_audioPath, _user, _question, _claim, options) => {
+          options.onCapacityReserved?.();
+          return { ok: true };
+        },
+        persist: async () => ({ ok: true }),
+        clearClaim: async () => {},
+      });
+    } finally {
+      // The in-flight idempotency claim row cascades away with the user.
+      await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+    }
+    return { req, res, respend };
+  }
+
+  it('re-spends both hits when capacity commits after the response closed', async () => {
+    const { req, res, respend } = await submissionHarness({ closed: true });
+    expect(res.locals.assessmentCapacityReserved).toBe(true);
+    expect(respend).toHaveBeenCalledOnce();
+    expect(respend).toHaveBeenCalledWith(req);
+    expect(res.json).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('does not re-spend when the client is still connected at reservation time', async () => {
+    const { res, respend } = await submissionHarness({ closed: false });
+    expect(res.locals.assessmentCapacityReserved).toBe(true);
+    expect(respend).not.toHaveBeenCalled();
   });
 });

@@ -65,6 +65,12 @@ const MANAGED_KEYS = [
 
 const VALID_SECRET = 'a-realistic-signing-secret-with-32-plus-characters';
 
+// Production boots only with real mail delivery configured (F-5 guard).
+const PRODUCTION_MAIL = {
+  MAIL_MODE: 'webhook',
+  MAIL_WEBHOOK_URL: 'https://relay.example/hooks/mail',
+} as const;
+
 function baseEnv(overrides: Record<string, string>): Record<string, string> {
   return {
     DATABASE_URL: 'postgres://localhost:5432/ai_english_test',
@@ -271,7 +277,10 @@ describe('config env validation', () => {
   });
 
   it('enforces production invariants: no mock AI, no placeholder secret, S3 required', async () => {
-    await expectInvalid(baseEnv({ NODE_ENV: 'production', MOCK_AI: 'true' }), 'must be false in production');
+    await expectInvalid(
+      baseEnv({ NODE_ENV: 'production', MOCK_AI: 'true', ...PRODUCTION_MAIL }),
+      'must be false in production',
+    );
     await expectInvalid(
       baseEnv({
         NODE_ENV: 'production',
@@ -279,11 +288,18 @@ describe('config env validation', () => {
         OPENAI_API_KEY: 'sk-real',
         JWT_SECRET: 'this-is-a-test-secret-with-enough-length',
         S3_BUCKET: 'audio-bucket',
+        ...PRODUCTION_MAIL,
       }),
       'looks like a placeholder',
     );
     await expectInvalid(
-      baseEnv({ NODE_ENV: 'production', MOCK_AI: 'false', OPENAI_API_KEY: 'sk-real', S3_BUCKET: '' }),
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        S3_BUCKET: '',
+        ...PRODUCTION_MAIL,
+      }),
       'S3_BUCKET',
     );
     await expectInvalid(
@@ -293,6 +309,7 @@ describe('config env validation', () => {
         OPENAI_API_KEY: 'sk-real',
         JWT_SECRET: 'this is a test secret with enough length',
         S3_BUCKET: 'audio-bucket',
+        ...PRODUCTION_MAIL,
       }),
       'looks like a placeholder',
     );
@@ -303,6 +320,7 @@ describe('config env validation', () => {
         OPENAI_API_KEY: 'sk-real',
         S3_BUCKET: 'audio-bucket',
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+        ...PRODUCTION_MAIL,
       }),
     );
     expect(prod.isProduction).toBe(true);
@@ -323,6 +341,7 @@ describe('config env validation', () => {
         OPENAI_API_KEY: 'sk-real',
         S3_BUCKET: 'audio-bucket',
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=require',
+        ...PRODUCTION_MAIL,
       }),
       'sslmode=verify-full',
     );
@@ -338,6 +357,7 @@ describe('config env validation', () => {
         JWT_SECRET: 'prefix-testsecret-suffix-with-enough-length',
         S3_BUCKET: 'audio-bucket',
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+        ...PRODUCTION_MAIL,
       }),
       'looks like a placeholder',
     );
@@ -350,6 +370,7 @@ describe('config env validation', () => {
       OPENAI_API_KEY: 'sk-real',
       S3_BUCKET: 'audio-bucket',
       DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+      ...PRODUCTION_MAIL,
     };
 
     // All-same-character and short repeating cycles pass the length check but
@@ -477,6 +498,44 @@ describe('config env validation', () => {
     );
   });
 
+  it('requires webhook mode with an https relay in production, allowing only loopback http', async () => {
+    const production = {
+      NODE_ENV: 'production',
+      MOCK_AI: 'false',
+      OPENAI_API_KEY: 'sk-real',
+      S3_BUCKET: 'audio-bucket',
+      DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+    };
+
+    // Log mode in production: reset tokens would sit in info logs, undelivered.
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production }),
+      'MAIL_MODE',
+      "must be 'webhook' in production; 'log' writes live reset tokens to logs and delivers no mail",
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, MAIL_MODE: 'log' }),
+      'MAIL_MODE',
+      "must be 'webhook' in production; 'log' writes live reset tokens to logs and delivers no mail",
+    );
+
+    // Plaintext relay URLs would POST account-takeover tokens in cleartext.
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: 'http://relay.example/mail' }),
+      'MAIL_WEBHOOK_URL',
+      'must be an https URL in production (http is allowed only for loopback hosts)',
+    );
+
+    // Co-located relays that never leave the host may stay on plaintext http.
+    for (const loopback of ['http://127.0.0.1:8080/mail', 'http://localhost:8080/mail', 'http://[::1]:8080/mail']) {
+      const config = await loadConfig(baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: loopback }));
+      expect(config.mail).toEqual({ mode: 'webhook', webhookUrl: loopback });
+    }
+
+    const accepted = await loadConfig(baseEnv({ ...production, ...PRODUCTION_MAIL }));
+    expect(accepted.mail).toEqual({ mode: 'webhook', webhookUrl: 'https://relay.example/hooks/mail' });
+  });
+
   it('rejects an unusable grading model, drain budget, or client version pin', async () => {
     await expectInvalid(baseEnv({ GRADING_MODEL: '   ' }), 'GRADING_MODEL');
     await expectInvalid(baseEnv({ SHUTDOWN_DRAIN_MS: '9999' }), 'SHUTDOWN_DRAIN_MS');
@@ -511,6 +570,7 @@ describe('config env validation', () => {
       OPENAI_API_KEY: 'sk-real',
       S3_BUCKET: 'audio-bucket',
       DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+      ...PRODUCTION_MAIL,
     };
 
     await expectSingleInvalidIssue(

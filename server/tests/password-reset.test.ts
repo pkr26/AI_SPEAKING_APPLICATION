@@ -335,6 +335,66 @@ describe('webhook mail mode', () => {
     );
     expect(rows).toHaveLength(1);
   });
+
+  it('still answers 204 when the webhook rejects with a non-2xx status', async () => {
+    const server = createServer((_req, res) => {
+      res.statusCode = 500;
+      res.end('relay broken');
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    config.mail.mode = 'webhook';
+    config.mail.webhookUrl = `http://127.0.0.1:${port}/hooks/mail`;
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation((() => logger) as never);
+    try {
+      const { body: reg } = await registerUser(a);
+
+      const r = await request(a).post('/auth/forgot-password').send({ email: reg.email });
+
+      expect(r.status).toBe(204);
+      await vi.waitFor(() => {
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ to: reg.email, subject: 'Your password reset code', status: 500 }),
+          'mail webhook rejected',
+        );
+      });
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('still answers 204 when the webhook hangs past the 5s delivery timeout', async () => {
+    // Never answers: the mailer's AbortSignal.timeout(5s) must cut it off.
+    const server = createServer(() => {});
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as AddressInfo;
+    config.mail.mode = 'webhook';
+    config.mail.webhookUrl = `http://127.0.0.1:${port}/hooks/mail`;
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation((() => logger) as never);
+    try {
+      const { body: reg } = await registerUser(a);
+
+      // sendMail is fire-and-forget: the 204 does not wait out the timeout.
+      const r = await request(a).post('/auth/forgot-password').send({ email: reg.email });
+      expect(r.status).toBe(204);
+
+      await vi.waitFor(
+        () => {
+          expect(errorSpy).toHaveBeenCalledWith(
+            expect.objectContaining({ to: reg.email, subject: 'Your password reset code' }),
+            'mail webhook delivery failed',
+          );
+        },
+        { timeout: 10_000 },
+      );
+      expect(String(errorSpy.mock.calls[0][0] && (errorSpy.mock.calls[0][0] as { err?: Error }).err)).toMatch(
+        /TimeoutError|AbortError/,
+      );
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  }, 20_000);
 });
 
 describe('password reset token janitor', () => {

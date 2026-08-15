@@ -365,6 +365,18 @@ function authHeader(token: string | null): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+/**
+ * Every API request identifies its build so the server's MIN_CLIENT_VERSION
+ * gate (426 CLIENT_UPGRADE_REQUIRED) can actually retire old versions. When
+ * expoConfig carries no version (should not happen in built clients), the
+ * header is omitted rather than sent as the literal string "undefined".
+ * Direct-to-S3 uploads never get this header — they go to AWS, not our API.
+ */
+function clientVersionHeader(): Record<string, string> {
+  const version = Constants.expoConfig?.version;
+  return typeof version === 'string' && version.length > 0 ? { 'X-Client-Version': version } : {};
+}
+
 async function fetchWithTimeout(
   input: string,
   init: RequestInit,
@@ -426,6 +438,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
       method: options.method ?? 'GET',
       headers: {
         'Content-Type': 'application/json',
+        ...clientVersionHeader(),
         ...authHeader(token),
       },
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -542,7 +555,7 @@ export async function apiUploadAudio<T>(
     {
       method: 'POST',
       // Do not set Content-Type manually; fetch adds the multipart boundary.
-      headers: { ...authHeader(token) },
+      headers: { ...clientVersionHeader(), ...authHeader(token) },
       body: form,
     },
     options.timeoutMs ?? AUDIO_TIMEOUT_MS,
@@ -569,10 +582,12 @@ export async function apiUploadAudio<T>(
 export async function apiRequestAudioUpload(
   contentType: string,
   ownerId: string,
+  options: { signal?: AbortSignal } = {},
 ): Promise<AudioUploadGrant> {
   const raw = await apiFetch<unknown>('/uploads/audio-url', {
     method: 'POST',
     body: { contentType },
+    signal: options.signal,
   });
   const grant = parseAudioUploadGrant(raw);
   if (grant.mode === 's3') {
@@ -764,7 +779,8 @@ export async function apiRestartDiagnostic(): Promise<void> {
 }
 
 // The export walker refuses to loop forever on a server that keeps handing
-// out cursors; 500 pages ≥ 500k attempt rows, far beyond any real account.
+// out cursors; the server caps each page at 100 rows, so 500 pages bound the
+// walk at 50k attempt rows — far beyond any real account.
 const EXPORT_MAX_PAGES = 500;
 
 /**

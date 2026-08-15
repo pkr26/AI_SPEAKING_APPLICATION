@@ -287,7 +287,11 @@ export default function FeedbackScreen() {
               <DecorativeEmoji style={styles.emoji}>💪</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
                 {t('feedback.retryTitle', {
-                  attempt: result.attemptNo,
+                  // The practice-screen attempt chip counts the UPCOMING try
+                  // (max + 1 - attemptsLeft); name the same referent here so
+                  // both surfaces agree on which "try N of 3" they mean. In
+                  // the retry variant attemptsLeft ≥ 1, so attemptNo + 1 ≤ max.
+                  attempt: result.attemptNo + 1,
                   max: PRACTICE_MAX_ATTEMPTS,
                 })}
               </Text>
@@ -369,7 +373,9 @@ export default function FeedbackScreen() {
           <Button title={t('feedback.nextQuestion')} onPress={goToNextQuestion} />
         )}
 
-        {variant === 'native' && <Button title={t('feedback.tryInEnglish')} onPress={tryInEnglish} />}
+        {variant === 'native' && (
+          <Button title={t('feedback.tryInEnglish')} onPress={tryInEnglish} />
+        )}
 
         {variant === 'native-nospeech' && (
           <Button title={t('feedback.tryAgainNative')} onPress={backToPractice} />

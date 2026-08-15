@@ -282,6 +282,10 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
   // backpressure, not an application fault: shed the request with 503 +
   // Retry-After so clients back off, never a raw 500. Proven under a
   // 1000-user signup burst, where these surfaced on every route.
+  // WARNING: this string-matches pg-pool's exact error message
+  // ('timeout exceeded when trying to connect'); a pg upgrade that rewords it
+  // silently degrades the shed to a 500 — re-check on every pg bump (pinned
+  // by middleware tests today).
   if (err instanceof Error && err.message === 'timeout exceeded when trying to connect') {
     logger.warn({ requestId: req.id }, 'database pool saturated; shedding request');
     shedRequestsTotal.inc({ reason: 'pool_saturated' });

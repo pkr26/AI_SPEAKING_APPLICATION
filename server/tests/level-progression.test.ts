@@ -158,8 +158,14 @@ describe('CEFR level progression', () => {
 
     expect(ra.status).toBe(200);
     expect(rb.status).toBe(200);
-    const levelUps = [ra.body.levelUp, rb.body.levelUp].filter(Boolean);
-    expect(levelUps).toEqual([{ from: 'A1', to: 'A2' }]);
+    // The promotion commits exactly once, but BOTH attempts crossed the
+    // threshold: the loser of the guarded UPDATE re-reads the promoted level
+    // and echoes the same levelUp (and answers from the NEW level) instead of
+    // serving one stale-level question.
+    expect(ra.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    expect(rb.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    expect(ra.body.next.question.cefrLevel).toBe('A2');
+    expect(rb.body.next.question.cefrLevel).toBe('A2');
     // The user row was promoted exactly one step, never A1 -> A2 -> B1.
     expect(await userLevel(userId)).toBe('A2');
   });

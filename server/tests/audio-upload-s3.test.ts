@@ -702,6 +702,7 @@ describe('S3 object download boundaries', () => {
     await expect(resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never)).rejects.toMatchObject({
       status: 413,
       message: 'Audio file is too large',
+      code: 'AUDIO_TOO_LARGE',
     });
     expect(bodyRead).toBe(false);
     expect(destroy).toHaveBeenCalledOnce();

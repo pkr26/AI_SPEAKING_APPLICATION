@@ -266,17 +266,22 @@ async function callProvider<T>(
     inFlightAssessmentControllers.add(controller);
     const deadline = setTimeout(() => controller.abort(), config.openaiTimeoutMs);
     deadline.unref();
+    // Held in a local so an abort/early failure can never leak the fd: the
+    // SDK's own body-stream cleanup is version-dependent, so the inner
+    // finally destroys the stream explicitly (double-destroy is guarded).
+    let uploadStream: fs.ReadStream | undefined;
     try {
-      const transcription = await timeProviderCall('transcription', controller, () =>
-        client.audio.transcriptions.create(
+      const transcription = await timeProviderCall('transcription', controller, () => {
+        uploadStream = fs.createReadStream(audioPath);
+        return client.audio.transcriptions.create(
           {
-            file: fs.createReadStream(audioPath),
+            file: uploadStream,
             model: 'whisper-1',
             language: spec.transcriptionLanguage,
           },
           { signal: controller.signal },
-        ),
-      );
+        );
+      });
       const transcript = transcription.text.trim();
       if (!transcript) {
         return spec.emptyTranscriptResult();
@@ -335,6 +340,7 @@ async function callProvider<T>(
     } finally {
       clearTimeout(deadline);
       inFlightAssessmentControllers.delete(controller);
+      if (uploadStream && !uploadStream.destroyed) uploadStream.destroy();
     }
   } finally {
     releaseAiSlot();

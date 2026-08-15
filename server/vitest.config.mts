@@ -15,10 +15,13 @@ export default defineConfig({
       provider: 'v8',
       reporter: ['text', 'json-summary'],
       thresholds: {
-        statements: 75,
-        branches: 60,
-        functions: 75,
-        lines: 75,
+        // Ratcheted to just below the measured global actuals (97.24/94.44/
+        // 97.95/97.62 on 2026-08-15); ~1.5 points of headroom for routine
+        // churn. Raise only after measuring again.
+        statements: 96,
+        branches: 93,
+        functions: 96,
+        lines: 96,
       },
       exclude: ['dist/**', 'db/seed-data.ts', 'db/generate-seed.ts'],
     },

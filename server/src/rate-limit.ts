@@ -1,7 +1,6 @@
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
 import type { RequestHandler } from 'express';
 import { config } from './config';
-import { logger } from './logger';
 import { AuthedRequest } from './middleware';
 import { PostgresRateLimitStore } from './postgres-rate-limit-store';
 
@@ -248,23 +247,28 @@ export function buildLimiters() {
   // (its requestWasSuccessful predicate is only consulted on 'finish'). That
   // refund is legitimate before paid work — but once the daily-capacity
   // reservation has committed, the paid pipeline runs to completion whether or
-  // not the caller stays connected, so an abort must keep both hits. Mounted
-  // after the two assessment limiters, this re-spends the pair of hits the
-  // close handler is about to return. Both counter ops are single atomic
-  // upserts/decrements on the same row, so the refund and the re-spend net to
-  // zero in either completion order; failures here fail open (log only) rather
-  // than taking the request down with a dead client.
+  // not the caller stays connected, so an abort must keep both hits. Re-spend
+  // is window-guarded (incrementWithinWindow): an abort landing after the
+  // window rolled over got no refund, so nothing is taken back either. Both
+  // counter ops are single atomic updates on the same row, so the refund and
+  // the re-spend net to zero in either completion order; failures fail open
+  // (log only, inside the store) rather than taking the request down with a
+  // dead client. Exposed on the limiter set so the assessment pipeline can
+  // make the same decision when the reservation commits AFTER the response
+  // already closed (the guard's close listener has fired by then and will not
+  // fire again).
+  const respendAssessmentBudget = (req: AuthedRequest): void => {
+    const user = req.user;
+    void assessStore.incrementWithinWindow(user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? ''));
+    void assessIpDailyStore.incrementWithinWindow(ipKeyGenerator(req.ip ?? ''));
+  };
+
+  // Mounted after the two assessment limiters, this re-spends the pair of
+  // hits the close handler is about to return.
   const assessAbortGuard: RequestHandler = (req, res, next) => {
     res.on('close', () => {
       if (res.writableEnded || !res.locals.assessmentCapacityReserved) return;
-      const user = (req as AuthedRequest).user;
-      const keys: Array<[PostgresRateLimitStore, string]> = [
-        [assessStore, user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '')],
-        [assessIpDailyStore, ipKeyGenerator(req.ip ?? '')],
-      ];
-      for (const [store, key] of keys) {
-        void store.increment(key).catch((err) => logger.warn({ err }, 'assessment budget re-spend failed'));
-      }
+      respendAssessmentBudget(req as AuthedRequest);
     });
     next();
   };
@@ -299,6 +303,7 @@ export function buildLimiters() {
     assess,
     assessIpDaily,
     assessAbortGuard,
+    respendAssessmentBudget,
     uploadGrant,
   };
 }

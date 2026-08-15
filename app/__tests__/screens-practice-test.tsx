@@ -1608,7 +1608,7 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(
-      screen.getByText(t('feedback.retryTitle', { attempt: 2, max: PRACTICE_MAX_ATTEMPTS })),
+      screen.getByText(t('feedback.retryTitle', { attempt: 3, max: PRACTICE_MAX_ATTEMPTS })),
     ).toBeTruthy();
     expect(screen.getByText(t('feedback.retryBodyOne'))).toBeTruthy();
     expect(screen.getByText(t('feedback.scoreLine', { score: 40 }))).toBeTruthy();
@@ -1625,7 +1625,7 @@ describe('practice feedback screen', () => {
     expect(
       flattenedStyle(
         screen.getByRole('header', {
-          name: t('feedback.retryTitle', { attempt: 2, max: PRACTICE_MAX_ATTEMPTS }),
+          name: t('feedback.retryTitle', { attempt: 3, max: PRACTICE_MAX_ATTEMPTS }),
         }),
       ),
     ).toMatchObject({ color: colors.warning, textAlign: 'center' });
@@ -1659,7 +1659,7 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(
-      screen.getByText(t('feedback.retryTitle', { attempt: 1, max: PRACTICE_MAX_ATTEMPTS })),
+      screen.getByText(t('feedback.retryTitle', { attempt: 2, max: PRACTICE_MAX_ATTEMPTS })),
     ).toBeTruthy();
     expect(screen.getByText(t('feedback.retryBodyMany', { count: 2 }))).toBeTruthy();
     expect(screen.getByText(t('feedback.weHeard'))).toBeTruthy();

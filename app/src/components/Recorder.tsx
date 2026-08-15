@@ -85,8 +85,34 @@ const RECOVERY_POLL_MS = 2_000;
 const NOT_FOUND_CONFIRMATIONS = 3;
 const MAX_S3_RESUBMISSIONS = 3;
 const S3_RESUBMIT_BASE_BACKOFF_MS = 5_000;
+/** Automatic re-uploads of the surviving local recording per recovery cycle. */
+const MAX_S3_REUPLOADS = 1;
 const UPLOAD_STAGE_LISTENING_MS = 8_000;
 const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
+
+/**
+ * Capacity-retry backoff that stays responsive to cancel: resolves after `ms`
+ * or rejects with an AbortError as soon as the signal fires, whichever comes
+ * first. Without this the cancel button would appear dead for up to
+ * CAPACITY_RETRY_MAX_DELAY_MS of plain setTimeout.
+ */
+function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const rejectAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('The operation was aborted.', 'AbortError'));
+    };
+    if (signal.aborted) {
+      rejectAbort();
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', rejectAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', rejectAbort, { once: true });
+  });
+}
 const WAIT_TICK_MS = 1_000;
 const METER_SEGMENT_COUNT = 6;
 const METER_RANGE_DB = 60;
@@ -508,6 +534,41 @@ export default function Recorder<T>({
       let firstStatusRead = true;
       let s3ResubmissionAttempts = 0;
       let nextS3ResubmissionAt = 0;
+      let s3Reuploads = 0;
+      let currentAudioKey = pending.audioKey;
+
+      /**
+       * Re-runs the upload grant + S3 POST for the surviving local recording
+       * under a FRESH audioKey but the SAME durable requestId, then points the
+       * resubmission loop at the new object. Needed because the server deletes
+       * the submitted object even when it abandons the claim for a retryable
+       * provider failure, so the persisted key is dead. Same ordering as the
+       * submit flow: the new handoff is persisted before the upload I/O.
+       */
+      const reuploadRecording = async (uri: string, requestId: string): Promise<boolean> => {
+        try {
+          const descriptor = await resolveAudioFileDescriptor(uri);
+          if (!isCurrent()) return false;
+          const grant = await apiRequestAudioUpload(descriptor.type, ownerId);
+          if (!isCurrent() || grant.mode !== 's3') return false;
+          if (!(await markPendingAssessmentStage(requestId, 's3-granted', grant.audioKey))) {
+            return false;
+          }
+          if (!isCurrent()) return false;
+          await apiPostPresignedAudio(
+            grant.uploadUrl,
+            grant.uploadFields,
+            uri,
+            grant.contentType,
+            grant.maxBytes,
+            {},
+          );
+          currentAudioKey = grant.audioKey;
+          return true;
+        } catch {
+          return false;
+        }
+      };
       while (firstStatusRead || Date.now() <= recoveryDeadline) {
         firstStatusRead = false;
         try {
@@ -632,7 +693,7 @@ export default function Recorder<T>({
               s3ResubmissionAttempts < MAX_S3_RESUBMISSIONS &&
               Date.now() >= nextS3ResubmissionAt &&
               pending.stage === 's3-granted' &&
-              pending.audioKey
+              currentAudioKey
             ) {
               s3ResubmissionAttempts += 1;
               try {
@@ -641,7 +702,7 @@ export default function Recorder<T>({
                   body: {
                     questionId: pending.questionId,
                     requestId: pending.requestId,
-                    audioKey: pending.audioKey,
+                    audioKey: currentAudioKey,
                   },
                   timeoutMs: AUDIO_TIMEOUT_MS,
                 });
@@ -686,6 +747,32 @@ export default function Recorder<T>({
                 // read instead of polling an abandoned row for the full lease.
                 if (retryError instanceof ApiError && retryError.status === 409) {
                   resubmissionConflictPending = true;
+                }
+                // The "audio upload not found or expired" 400 means the server
+                // abandoned the claim (retryable provider failure) but still
+                // deleted the submitted object: the persisted key is dead while
+                // the requestId stays retryable. When the local recording
+                // survives, re-upload it once per recovery cycle under a fresh
+                // key and let the next poll resubmit instead of failing
+                // terminally. Other 400s (DIAGNOSTIC_DONE, genuine validation
+                // drift) skip the re-upload via the code check.
+                if (
+                  retryError instanceof ApiError &&
+                  retryError.status === 400 &&
+                  (retryError.code === undefined || retryError.code === 'VALIDATION_FAILED') &&
+                  s3Reuploads < MAX_S3_REUPLOADS
+                ) {
+                  const uri = activeUriRef.current;
+                  if (uri !== null && routeMatches && new File(uri).exists) {
+                    if (await reuploadRecording(uri, pending.requestId)) {
+                      if (!isCurrent()) return;
+                      s3Reuploads += 1;
+                      // The fresh object is in place; resubmit it on the next
+                      // poll instead of failing terminally.
+                      continue;
+                    }
+                    if (!isCurrent()) return;
+                  }
                 }
                 if (
                   retryError instanceof ApiError &&
@@ -776,9 +863,11 @@ export default function Recorder<T>({
 
   useEffect(() => {
     let active = true;
-    void AccessibilityInfo.isReduceMotionEnabled().then((enabled) => {
-      if (active) setReduceMotion(enabled);
-    });
+    void AccessibilityInfo.isReduceMotionEnabled()
+      .then((enabled) => {
+        if (active) setReduceMotion(enabled);
+      })
+      .catch(() => undefined);
     const subscription = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
     return () => {
       active = false;
@@ -1132,7 +1221,9 @@ export default function Recorder<T>({
       // recovery flow below is identical for both paths.
       const descriptor = await resolveAudioFileDescriptor(uri);
       if (!isCurrentSubmission()) return;
-      const grant = await apiRequestAudioUpload(descriptor.type, ownerId);
+      const grant = await apiRequestAudioUpload(descriptor.type, ownerId, {
+        signal: controller.signal,
+      });
       if (!isCurrentSubmission()) return;
       let raw: unknown;
       // The 503 backpressure contract (assess semaphore, database pool shed)
@@ -1175,7 +1266,7 @@ export default function Recorder<T>({
               CAPACITY_RETRY_MAX_DELAY_MS,
               Math.max(1_000, Math.round((error.retryAfterSeconds ?? 5) * 1_000)),
             );
-            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            await sleepAbortable(delayMs, controller.signal);
             if (!isCurrentSubmission()) throw error;
           }
         }

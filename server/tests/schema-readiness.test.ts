@@ -64,7 +64,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('010_password_reset_srs_and_ops.sql');
+    expect(manifest.at(-1)?.name).toBe('011_srs_check_and_question_fk_restrict.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -74,7 +74,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '010_password_reset_srs_and_ops.sql',
+      latestMigration: '011_srs_check_and_question_fk_restrict.sql',
     });
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
     expect(query.mock.calls[2]?.[0]).toContain('FROM questions');
@@ -113,7 +113,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: exactMinimum });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '010_password_reset_srs_and_ops.sql',
+      latestMigration: '011_srs_check_and_question_fk_restrict.sql',
     });
   });
 

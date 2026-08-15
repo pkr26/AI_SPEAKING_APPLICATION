@@ -50,6 +50,14 @@ export interface AssessmentSubmissionChain {
   middleware: RequestHandler[];
   /** The exact schema instance validate() parsed, for validated() reads. */
   bodySchema: SubmissionBodySchema;
+  /**
+   * Re-spend both assessment-budget hits for a request whose client aborted
+   * after paid capacity was committed. The runner needs it when the capacity
+   * reservation lands after the response already closed — by then the abort
+   * guard's close listener has run (refund issued, flag unset) and will never
+   * fire again.
+   */
+  respendAssessmentBudget: (req: AuthedRequest) => void;
 }
 
 /**
@@ -72,6 +80,7 @@ export function buildAssessmentSubmissionChain(
   const bodySchema = config.s3.bucket ? submissionJsonBodySchema : submissionBodySchema;
   return {
     bodySchema,
+    respendAssessmentBudget: limiters.respendAssessmentBudget,
     middleware: [
       ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
       ...eligibility,
@@ -88,6 +97,8 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
   context: AssessmentContext;
   /** The chain's schema instance, so the runner reads the validated body. */
   bodySchema: SubmissionBodySchema;
+  /** The chain's abort re-spend, invoked when capacity commits after close. */
+  respendAssessmentBudget: (req: AuthedRequest) => void;
   /** Per-route error for a questionId that matches no catalog row. */
   questionMissingError: () => HttpError;
   /** Practice routes reject questions outside the learner's level with 403. */
@@ -185,7 +196,17 @@ export async function runAssessmentSubmission<Claim, Result>(
       const result = await hooks.assess(audioFile.path, user, question, claim, {
         // Once the capacity reservation commits, the assessment limiters
         // must not refund this request even if it later fails (>=400).
-        onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true),
+        onCapacityReserved: () => {
+          res.locals.assessmentCapacityReserved = true;
+          // Close-before-commit ordering: the client already disconnected, so
+          // express-rate-limit's close handler has refunded both hits while
+          // the abort guard saw no reservation flag and stayed silent — and
+          // 'close' never fires twice. Re-spend the pair now that paid
+          // capacity is consumed (fail-open inside the store).
+          if (res.closed || res.destroyed || req.socket.destroyed) {
+            hooks.respendAssessmentBudget(req);
+          }
+        },
       });
       const response = await hooks.persist(user, question, claim, result, requestId, requestClaim.claimId);
       completed = true;

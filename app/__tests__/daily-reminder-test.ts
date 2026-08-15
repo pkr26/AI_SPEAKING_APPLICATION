@@ -116,6 +116,21 @@ describe('enableDailyReminder', () => {
     );
   });
 
+  it('schedules the notification copy in an explicitly passed language', async () => {
+    // Settings re-schedules right after a language change, before the provider
+    // syncs the module-level active language — the copy must follow the
+    // explicit language, not the stale active one.
+    await expect(enableDailyReminder(19, 'hi')).resolves.toBe('enabled');
+
+    expect(mockScheduleNotificationAsync).toHaveBeenCalledWith({
+      content: {
+        title: dictionaries.hi['reminder.notificationTitle'],
+        body: dictionaries.hi['reminder.notificationBody'],
+      },
+      trigger: { type: 'daily', hour: 19, minute: 0 },
+    });
+  });
+
   it('skips the permission prompt when permission is already granted', async () => {
     await enableDailyReminder(7);
     expect(mockRequestPermissionsAsync).not.toHaveBeenCalled();

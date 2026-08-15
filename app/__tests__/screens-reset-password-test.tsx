@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { Text, type TextProps } from 'react-native';
+import { StyleSheet, Text, type TextProps } from 'react-native';
+import type { TestInstance } from 'test-renderer';
 
 import ForgotPasswordScreen from '../src/app/(auth)/forgot-password';
 import LoginScreen from '../src/app/(auth)/login';
@@ -9,6 +10,7 @@ import { ApiError, apiForgotPassword, apiResetPassword } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
+import { colors } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
@@ -93,6 +95,31 @@ const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
   replace: jest.Mock;
 };
+
+function flattenedStyle(node: TestInstance): Record<string, unknown> {
+  return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+/**
+ * The RN jest preset mocks TextInput as a class component whose prototype
+ * shares one focus() jest.fn across every instance. Walk from the queried
+ * host element up to that class instance and shadow focus() per instance so
+ * return-key chaining can assert which field received focus.
+ */
+function spyOnTextInputFocus(element: TestInstance): jest.Mock {
+  type Fiber = { stateNode: unknown; return: Fiber | null };
+  let fiber = (element as unknown as { unstable_fiber: Fiber | null }).unstable_fiber;
+  while (fiber) {
+    const stateNode = fiber.stateNode as { focus?: unknown } | null;
+    if (stateNode && typeof stateNode.focus === 'function') {
+      const spy = jest.fn();
+      Object.defineProperty(stateNode, 'focus', { configurable: true, value: spy });
+      return spy;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('TextInput instance not found');
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -223,6 +250,53 @@ describe('reset-password screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
+  });
+
+  it('chains email to code to password and submits from the password field', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillValidForm();
+    const codeFocus = spyOnTextInputFocus(screen.getByLabelText(t('reset.codeLabel')));
+    const passwordFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.newLabel')));
+
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'submitEditing');
+    expect(codeFocus).toHaveBeenCalledTimes(1);
+
+    await fireEvent(screen.getByLabelText(t('reset.codeLabel')), 'submitEditing');
+    expect(passwordFocus).toHaveBeenCalledTimes(1);
+
+    await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'submitEditing');
+    await waitFor(() =>
+      expect(mockReset).toHaveBeenCalledWith(
+        'ada@example.com',
+        '0123456789abcdef0123456789abcdef',
+        'NewPass123',
+      ),
+    );
+  });
+
+  it('marks the focused field with a two-pixel accent border', async () => {
+    await render(<ResetPasswordScreen />);
+
+    for (const label of [t('login.emailLabel'), t('reset.codeLabel'), t('cp.newLabel')]) {
+      const input = () => screen.getByLabelText(label);
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 1,
+        borderColor: colors.inputBorder,
+      });
+
+      await fireEvent(input(), 'focus');
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 2,
+        borderColor: colors.primary,
+      });
+
+      await fireEvent(input(), 'blur');
+      expect(flattenedStyle(input())).toMatchObject({
+        borderWidth: 1,
+        borderColor: colors.inputBorder,
+      });
+    }
   });
 
   it('resets the password and returns to login with the success banner', async () => {

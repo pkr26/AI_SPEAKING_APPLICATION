@@ -127,9 +127,9 @@ describe('theme palette', () => {
   it('meets 3:1 for dark form-field borders on the dark input fill', () => {
     // The light value (#9CA3AF on white, ~2.5:1) is a pre-existing compromise
     // pinned by design; the dark palette must not repeat it.
-    expect(contrastRatio(darkColors.inputBorder, darkColors.inputBackground)).toBeGreaterThanOrEqual(
-      3,
-    );
+    expect(
+      contrastRatio(darkColors.inputBorder, darkColors.inputBackground),
+    ).toBeGreaterThanOrEqual(3);
   });
 
   it('provides responsive, touch-safe design tokens', () => {

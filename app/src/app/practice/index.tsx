@@ -190,7 +190,11 @@ export default function PracticeScreen() {
               {t('practiceIntro.tries', { count: PRACTICE_MAX_ATTEMPTS })}
             </Text>
             <Text style={styles.introLine}>{t('practiceIntro.silence')}</Text>
-            <Button title={t('practiceIntro.dismiss')} onPress={dismissIntro} style={styles.retryButton} />
+            <Button
+              title={t('practiceIntro.dismiss')}
+              onPress={dismissIntro}
+              style={styles.retryButton}
+            />
           </View>
         )}
 

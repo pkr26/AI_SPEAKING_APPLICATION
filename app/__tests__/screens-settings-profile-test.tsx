@@ -17,11 +17,16 @@ import {
   enableDailyReminder,
   getDailyReminder,
 } from '../src/lib/daily-reminder';
-import { translateFor, type MessageKey } from '../src/lib/i18n';
+import { deviceLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import type { User } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
+
+// The screen renders reminder times via formatReminderHour in the active UI
+// language (the device language under jest, no provider wraps these renders).
+const reminderTimeText = (hour: number) =>
+  t('reminder.timeLabel', { time: formatReminderHour(hour, deviceLanguage()) });
 
 jest.mock('expo-router', () => ({
   router: { push: jest.fn(), replace: jest.fn(), back: jest.fn(), dismissTo: jest.fn() },
@@ -29,6 +34,7 @@ jest.mock('expo-router', () => ({
 }));
 
 const mockWrite = jest.fn();
+const mockDelete = jest.fn();
 let lastFileUri: string | null = null;
 
 jest.mock('expo-file-system', () => ({
@@ -36,7 +42,7 @@ jest.mock('expo-file-system', () => ({
   File: jest.fn().mockImplementation((...segments: unknown[]) => {
     const uri = `file://${(segments as string[]).join('/')}`;
     lastFileUri = uri;
-    return { uri, write: mockWrite };
+    return { uri, write: mockWrite, delete: mockDelete };
   }),
 }));
 
@@ -165,10 +171,19 @@ afterEach(async () => {
 });
 
 describe('formatReminderHour', () => {
-  it('zero-pads the hour into HH:00', () => {
-    expect(formatReminderHour(0)).toBe('00:00');
-    expect(formatReminderHour(9)).toBe('09:00');
-    expect(formatReminderHour(19)).toBe('19:00');
+  it('renders the hour locale-aware in the given UI language', () => {
+    // en uses 12-hour clock; zh prefixes the hour with 时-like formatting.
+    expect(formatReminderHour(19, 'en')).toBe(
+      new Intl.DateTimeFormat('en', { hour: 'numeric' }).format(new Date(2020, 0, 1, 19, 0)),
+    );
+    expect(formatReminderHour(19, 'zh')).toBe(
+      new Intl.DateTimeFormat('zh', { hour: 'numeric' }).format(new Date(2020, 0, 1, 19, 0)),
+    );
+    expect(formatReminderHour(19, 'en')).not.toBe('19:00');
+  });
+
+  it('falls back to zero-padded HH:00 when Intl rejects the language tag', () => {
+    expect(formatReminderHour(9, '123456789' as never)).toBe('09:00');
   });
 });
 
@@ -254,6 +269,38 @@ describe('settings profile card', () => {
     expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
     // Help content is served in the account language and must refetch.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['question-help'] });
+    // No reminder is enabled: nothing to re-schedule.
+    expect(mockEnableReminder).not.toHaveBeenCalled();
+  });
+
+  it('re-schedules an enabled daily reminder in the new language', async () => {
+    mockGetReminder.mockResolvedValue({ hour: 19 });
+    const updated = { ...USER, nativeLanguage: 'hi' as const };
+    mockUpdateProfile.mockResolvedValue(updated);
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+    });
+
+    expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
+    // The reminder copy must follow the new language immediately; the explicit
+    // language argument covers the render lag of the module-level active one.
+    expect(mockEnableReminder).toHaveBeenCalledWith(19, 'hi');
+  });
+
+  it('does not surface a language error when the reminder re-schedule fails', async () => {
+    mockGetReminder.mockResolvedValue({ hour: 19 });
+    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockEnableReminder.mockRejectedValue(new Error('os error'));
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+    });
+
+    expect(mockAuthValue.setUser).toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
   });
 
   it('does not PATCH when tapping the already-selected language', async () => {
@@ -291,6 +338,36 @@ describe('data export', () => {
       mimeType: 'application/json',
       dialogTitle: t('settings.export'),
     });
+    // The export embeds PII: the cache file is deleted once the share sheet closes.
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes the export file even when the share sheet fails', async () => {
+    mockExportData.mockResolvedValue({ user: USER, attempts: [] });
+    mockShareAsync.mockRejectedValue(new Error('share cancelled'));
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    });
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reports the share outcome when export-file cleanup fails', async () => {
+    mockExportData.mockResolvedValue({ user: USER, attempts: [] });
+    mockDelete.mockImplementation(() => {
+      throw new Error('locked');
+    });
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    });
+
+    expect(mockShareAsync).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(t('settings.exportFailed'))).toBeNull();
   });
 
   it('explains when sharing is unavailable instead of exporting', async () => {
@@ -332,7 +409,7 @@ describe('daily reminder controls', () => {
 
     expect(mockEnableReminder).toHaveBeenCalledWith(19);
     expect(toggle().props.accessibilityState).toMatchObject({ checked: true });
-    expect(screen.getByText(t('reminder.timeLabel', { time: '19:00' }))).toBeTruthy();
+    expect(screen.getByText(reminderTimeText(19))).toBeTruthy();
   });
 
   it('keeps the toggle off with an explanation when permission is denied', async () => {
@@ -347,26 +424,26 @@ describe('daily reminder controls', () => {
     expect(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
     ).toMatchObject({ checked: false });
-    expect(screen.queryByText(t('reminder.timeLabel', { time: '19:00' }))).toBeNull();
+    expect(screen.queryByText(reminderTimeText(19))).toBeNull();
   });
 
   it('restores a stored reminder and reschedules on hour changes with wrap-around', async () => {
     mockGetReminder.mockResolvedValue({ hour: 0 });
     await renderSettings();
 
-    expect(screen.getByText(t('reminder.timeLabel', { time: '00:00' }))).toBeTruthy();
+    expect(screen.getByText(reminderTimeText(0))).toBeTruthy();
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('reminder.earlier') }));
     });
     expect(mockEnableReminder).toHaveBeenCalledWith(23);
-    expect(screen.getByText(t('reminder.timeLabel', { time: '23:00' }))).toBeTruthy();
+    expect(screen.getByText(reminderTimeText(23))).toBeTruthy();
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('reminder.later') }));
     });
     expect(mockEnableReminder).toHaveBeenLastCalledWith(0);
-    expect(screen.getByText(t('reminder.timeLabel', { time: '00:00' }))).toBeTruthy();
+    expect(screen.getByText(reminderTimeText(0))).toBeTruthy();
   });
 
   it('disables the reminder and hides the time picker', async () => {
@@ -381,7 +458,7 @@ describe('daily reminder controls', () => {
     expect(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
     ).toMatchObject({ checked: false });
-    expect(screen.queryByText(t('reminder.timeLabel', { time: '08:00' }))).toBeNull();
+    expect(screen.queryByText(reminderTimeText(8))).toBeNull();
   });
 
   it('shows the reminder error when the OS scheduling fails', async () => {

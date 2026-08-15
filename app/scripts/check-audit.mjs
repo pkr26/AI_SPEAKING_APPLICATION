@@ -8,8 +8,12 @@ import { spawnSync } from 'node:child_process';
 // (an optional peer elsewhere in the graph), so npm audit --omit=dev still
 // counts it as one extra node affected by the same reviewed react-native
 // advisories — no new advisory IDs.
+// expo-sharing and expo-splash-screen now also resolve their own
+// @expo/config-plugins → xcode → uuid chain (the same reviewed uuid
+// advisory), adding two more moderate nodes in the same upstream transitive
+// graph — still no new advisory IDs.
 const reviewedAdvisories = new Set([1119441, 1138808, 1138809]);
-const reviewedMaximums = { moderate: 7, high: 15, total: 22 };
+const reviewedMaximums = { moderate: 9, high: 15, total: 24 };
 
 const result = spawnSync('npm', ['audit', '--omit=dev', '--json'], {
   encoding: 'utf8',

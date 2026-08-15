@@ -18,6 +18,7 @@ declare const require: (id: string) => unknown;
 
 const mockHostUri: { value: string | undefined } = { value: undefined };
 const mockExpoConfigMissing: { value: boolean } = { value: false };
+const mockVersion: { value: string | undefined } = { value: undefined };
 const mockPlatform: { OS: string } = { OS: 'ios' };
 const mockSecureData = new Map<string, string>();
 const mockArrayBuffer = jest.fn(
@@ -35,7 +36,9 @@ const mockFileUpload = jest.fn(async (_url: string, _options: { signal?: AbortSi
 
 jest.mock('expo-constants', () => ({
   get expoConfig() {
-    return mockExpoConfigMissing.value ? undefined : { hostUri: mockHostUri.value };
+    return mockExpoConfigMissing.value
+      ? undefined
+      : { hostUri: mockHostUri.value, version: mockVersion.value };
   },
 }));
 
@@ -188,6 +191,7 @@ afterEach(async () => {
   setDev(true);
   mockHostUri.value = undefined;
   mockExpoConfigMissing.value = false;
+  mockVersion.value = undefined;
   mockPlatform.OS = 'ios';
   mockSecureData.clear();
   fetchMock.mockReset();
@@ -538,6 +542,28 @@ describe('apiFetch', () => {
     expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
     expect(init.body).toBeUndefined();
     expect(init.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it('sends X-Client-Version so the server MIN_CLIENT_VERSION gate can engage', async () => {
+    mockVersion.value = '1.0.0';
+    fetchMock.mockResolvedValue(fakeResponse());
+
+    await api.apiFetch('/me');
+
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      'X-Client-Version': '1.0.0',
+    });
+  });
+
+  it('omits X-Client-Version rather than sending "undefined" when no version is configured', async () => {
+    fetchMock.mockResolvedValue(fakeResponse());
+
+    await api.apiFetch('/me');
+
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+    });
   });
 
   it('serializes the body as JSON', async () => {
@@ -1119,6 +1145,15 @@ describe('apiUploadAudio', () => {
     expect(fetchMock.mock.calls[0][1].headers).toEqual({});
   });
 
+  it('sends X-Client-Version on multipart uploads when a version is configured', async () => {
+    mockVersion.value = '1.0.0';
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ ok: true }) }));
+
+    await api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {});
+
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({ 'X-Client-Version': '1.0.0' });
+  });
+
   it('uploads a fetched blob on web', async () => {
     mockPlatform.OS = 'web';
     const blob = new Blob(['audio-bytes'], { type: 'audio/webm' });
@@ -1269,6 +1304,19 @@ describe('apiRequestAudioUpload', () => {
     await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).resolves.toEqual({
       mode: 'direct',
     });
+  });
+
+  it('forwards the caller abort signal to the grant request', async () => {
+    fetchUntilAborted();
+    const controller = new AbortController();
+
+    const pending = catchAsync(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { signal: controller.signal }),
+    );
+    controller.abort();
+
+    const error = await pending;
+    expect(error).toMatchObject({ name: 'AbortError' });
   });
 
   it('compares a signed content type with the normalized requested value', async () => {
@@ -1743,6 +1791,27 @@ describe('apiPostPresignedAudio', () => {
         maxBytes,
       ),
     ).rejects.toMatchObject({ status: 403 });
+  });
+
+  it('never sends X-Client-Version to S3 — presigned POSTs go to AWS, not our API', async () => {
+    mockVersion.value = '1.0.0';
+    mockPlatform.OS = 'web';
+    const body = { size: 5 } as Blob;
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body })
+      .mockResolvedValueOnce(fakeResponse({ ok: true, status: 204 }));
+
+    await api.apiPostPresignedAudio(
+      uploadUrl,
+      { ...uploadFields, 'Content-Type': 'audio/webm' },
+      'blob:https://app/audio-1',
+      'audio/webm',
+      maxBytes,
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe(uploadUrl);
+    expect(fetchMock.mock.calls[1][1].headers).toBeUndefined();
   });
 
   it.each([

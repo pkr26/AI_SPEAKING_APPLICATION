@@ -3,7 +3,15 @@ import { File, Paths } from 'expo-file-system';
 import { router } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import {
+  ActivityIndicator,
+  Alert,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 
 import Button from '../../components/Button';
 import {
@@ -19,7 +27,7 @@ import {
   enableDailyReminder,
   getDailyReminder,
 } from '../../lib/daily-reminder';
-import { useT } from '../../lib/i18n';
+import { useT, useI18n, type UiLanguage } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
 
@@ -30,8 +38,15 @@ const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
   { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
 ];
 
-export function formatReminderHour(hour: number): string {
-  return `${hour.toString().padStart(2, '0')}:00`;
+export function formatReminderHour(hour: number, language: UiLanguage = 'en'): string {
+  try {
+    return new Intl.DateTimeFormat(language, { hour: 'numeric' }).format(
+      new Date(2020, 0, 1, hour, 0),
+    );
+  } catch {
+    // Intl unavailable or unknown tag: fall back to zero-padded 24-hour HH:00.
+    return `${hour.toString().padStart(2, '0')}:00`;
+  }
 }
 
 interface ReminderState {
@@ -48,6 +63,7 @@ interface ReminderState {
 export default function SettingsScreen() {
   const { user, setUser, logout } = useAuth();
   const t = useT();
+  const { language } = useI18n();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
@@ -122,6 +138,18 @@ export default function SettingsScreen() {
       setUser(updated);
       // Question help and native-mode content are keyed by language.
       void queryClient.invalidateQueries({ queryKey: ['question-help'] });
+      // The scheduled reminder copy was baked in the old language. Re-schedule
+      // it in the new one — explicitly, because the module-level active
+      // language only updates on the render after setUser. Best effort: the
+      // language change already succeeded, so a failed re-schedule must not
+      // surface as a language error.
+      if (reminder?.enabled) {
+        try {
+          await enableDailyReminder(reminder.hour, code);
+        } catch {
+          // The reminder keeps its previous language until the next toggle.
+        }
+      }
     } catch (error) {
       setLanguageError(userMessageForError(error, t('settings.updateFailed')));
     } finally {
@@ -141,10 +169,20 @@ export default function SettingsScreen() {
       const data = await apiExportUserData();
       const file = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
       file.write(JSON.stringify(data, null, 2));
-      await Sharing.shareAsync(file.uri, {
-        mimeType: 'application/json',
-        dialogTitle: t('settings.export'),
-      });
+      try {
+        await Sharing.shareAsync(file.uri, {
+          mimeType: 'application/json',
+          dialogTitle: t('settings.export'),
+        });
+      } finally {
+        // The export contains PII; never leave it in the app cache once the
+        // share sheet is done. Cleanup failure must not mask the share outcome.
+        try {
+          file.delete();
+        } catch {
+          // The OS cache eviction will reclaim it eventually.
+        }
+      }
     } catch (error) {
       setExportError(userMessageForError(error, t('settings.exportFailed')));
     } finally {
@@ -375,7 +413,7 @@ export default function SettingsScreen() {
                   <Text style={styles.hourButtonText}>−</Text>
                 </Pressable>
                 <Text style={styles.reminderTimeText}>
-                  {t('reminder.timeLabel', { time: formatReminderHour(reminder.hour) })}
+                  {t('reminder.timeLabel', { time: formatReminderHour(reminder.hour, language) })}
                 </Text>
                 <Pressable
                   accessibilityRole="button"

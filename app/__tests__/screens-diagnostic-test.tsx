@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert, StyleSheet } from 'react-native';
+import { Alert, BackHandler, StyleSheet } from 'react-native';
 
 import DiagnosticScreen from '../src/app/diagnostic';
 import { ApiError, apiFetch, userMessageForError } from '../src/lib/api';
@@ -17,16 +17,27 @@ import {
 
 // ----- expo-router mock -----
 
-jest.mock('expo-router', () => ({
-  router: {
-    push: jest.fn(),
-    replace: jest.fn(),
-    back: jest.fn(),
-    dismissTo: jest.fn(),
-  },
-  useLocalSearchParams: () => ({}),
-  useFocusEffect: jest.fn(),
-}));
+// Focus is simulated by invoking the effect on mount and its cleanup on
+// unmount, re-running when the callback identity changes (as expo-router does
+// while a screen stays focused).
+jest.mock('expo-router', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  return {
+    router: {
+      push: jest.fn(),
+      replace: jest.fn(),
+      back: jest.fn(),
+      dismissTo: jest.fn(),
+    },
+    useLocalSearchParams: () => ({}),
+    useFocusEffect: (callback: () => void | (() => void)) => {
+      ReactActual.useEffect(() => {
+        const cleanup = callback();
+        return typeof cleanup === 'function' ? cleanup : undefined;
+      }, [callback]);
+    },
+  };
+});
 
 // ----- Recorder stub (captures props; internals tested elsewhere) -----
 
@@ -38,6 +49,7 @@ interface CapturedRecorderProps {
   onResult: (data: DiagnosticAnswerResult) => void;
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
+  onInteractionLockChange?: (locked: boolean) => void;
 }
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
@@ -143,6 +155,13 @@ function nextPayload(question: Question, asked: number) {
 // ----- helpers -----
 
 let alertSpy: jest.SpyInstance;
+let backHandlers: (() => boolean)[];
+let backSubscriptionRemove: jest.Mock;
+
+function pressHardwareBack(): boolean {
+  if (backHandlers.length === 0) throw new Error('No hardware back handler registered');
+  return backHandlers[backHandlers.length - 1]();
+}
 
 const queryClients: QueryClient[] = [];
 
@@ -236,6 +255,12 @@ beforeEach(() => {
   mockRecorderProps = null;
   mockAuthValue = makeAuth();
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+  backHandlers = [];
+  backSubscriptionRemove = jest.fn();
+  jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
+    backHandlers.push(handler as () => boolean);
+    return { remove: backSubscriptionRemove };
+  });
 });
 
 afterEach(async () => {
@@ -644,6 +669,42 @@ describe('diagnostic screen', () => {
     expect(mockRecorderProps?.questionId).toBe(QUESTION_1.id);
   });
 
+  it('keeps the unacknowledged answer card when a background refetch advances server state', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const { queryClient } = await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 90,
+        transcript: 'An answer.',
+        feedback: 'Great answer.',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+    expect(screen.getByText('Answer received')).toBeTruthy();
+
+    // The 5-minute-stale query refetches on focus and resolves with the
+    // advanced server state (answer committed, next question current). The
+    // card must survive until the learner continues; advance() applies the
+    // next question locally.
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_2, 1));
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['diagnostic-next'] });
+      // Let the refetch settle and the batched query notification fire.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Answer received')).toBeTruthy();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+
+    // Continuing still advances locally from the acknowledged result.
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
+    await waitFor(() => expect(mockRecorderProps?.questionId).toBe(QUESTION_2.id));
+  });
+
   it('shows the completion view immediately when the test is already done', async () => {
     mockApiFetch.mockResolvedValue({ done: true, level: 'A2' });
     await renderScreen();
@@ -766,5 +827,47 @@ describe('diagnostic screen', () => {
       ),
     );
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('locks account actions while a recording or submission is active', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    const account = screen.getByRole('button', { name: 'Account & privacy' });
+    expect(account.props.accessibilityState).toEqual({ disabled: true });
+    expect(flattenedStyle(account)).toMatchObject({ opacity: 0.5 });
+    await fireEvent.press(account);
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    const logout = screen.getByRole('button', { name: 'Log out' });
+    expect(logout.props.accessibilityState).toEqual({ disabled: true });
+    expect(flattenedStyle(logout)).toMatchObject({ opacity: 0.5 });
+    await fireEvent.press(logout);
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: 'Account & privacy' })).opacity,
+    ).toBeUndefined();
+    await fireEvent.press(screen.getByRole('button', { name: 'Account & privacy' }));
+    expect(alertSpy).toHaveBeenCalledWith('Account & privacy', undefined, expect.any(Array));
+  });
+
+  it('consumes the Android hardware back press so the diagnostic is never popped', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(BackHandler.addEventListener).toHaveBeenCalledWith(
+      'hardwareBackPress',
+      expect.any(Function),
+    );
+    expect(pressHardwareBack()).toBe(true);
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+
+    await rendered.unmount();
+    expect(backSubscriptionRemove).toHaveBeenCalled();
   });
 });

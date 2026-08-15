@@ -537,6 +537,12 @@ export async function verifyAudioDuration(filePath: string): Promise<true> {
     if (error instanceof InspectionError && error.kind === 'unavailable') {
       throw new HttpError(503, 'Audio inspection is temporarily unavailable');
     }
+    // A 10s probe/decode budget exhausted on a saturated host (or a
+    // pathological input) is transient backpressure, not a bad file: answer
+    // with a retryable 503 instead of blaming the recording with a 415.
+    if (error instanceof InspectionError && error.kind === 'timeout') {
+      throw new HttpError(503, 'Audio inspection timed out; please try again', { retryAfterSeconds: 5 });
+    }
     throw new HttpError(415, 'Invalid or unsupported audio file');
   } finally {
     releaseSlot();

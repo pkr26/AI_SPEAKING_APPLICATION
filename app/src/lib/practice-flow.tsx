@@ -1,7 +1,14 @@
+import type { QueryClient } from '@tanstack/react-query';
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import { useAuth } from './auth';
-import type { PracticeAnswerMode, PracticeOutcome } from './types';
+import {
+  isNativeOutcome,
+  type PracticeAnswerMode,
+  type PracticeOutcome,
+  type PracticeQuestionPayload,
+  type User,
+} from './types';
 
 interface PracticeFeedback {
   questionId: string;
@@ -41,6 +48,38 @@ function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) 
   );
 
   return <PracticeFlowContext.Provider value={value}>{children}</PracticeFlowContext.Provider>;
+}
+
+/**
+ * A real scored miss moves a new word into revision on the server. The cached
+ * practice question is pinned (staleTime: Infinity) until feedback advances
+ * it, so every screen that submits an English attempt must mirror that
+ * transition locally or the kind badge and revision counter go stale. Native
+ * answers and silence never count as attempts.
+ */
+export function applyFailedAttemptToQuestionCache(
+  queryClient: QueryClient,
+  user: User,
+  questionId: string,
+  result: PracticeOutcome,
+): void {
+  if (isNativeOutcome(result) || result.noSpeech || result.passed) return;
+  queryClient.setQueryData<PracticeQuestionPayload>(
+    ['practice-question', user.id, user.cefrLevel],
+    (current) => {
+      if (!current || current.question.id !== questionId || current.kind !== 'new') {
+        return current;
+      }
+      return {
+        ...current,
+        kind: 'revision',
+        progress: {
+          ...current.progress,
+          learningCount: current.progress.learningCount + 1,
+        },
+      };
+    },
+  );
 }
 
 export function usePracticeFlow(): PracticeFlowValue {

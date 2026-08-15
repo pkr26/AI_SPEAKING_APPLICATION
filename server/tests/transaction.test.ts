@@ -185,7 +185,7 @@ describe('diagnostic transaction rollback precedence', () => {
       .mockResolvedValueOnce(diagnosticClient as never);
     const pass: RequestHandler = (_req, _res, next) => next();
     const direct = express();
-    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass } as Limiters));
+    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass, assessAbortGuard: pass } as Limiters));
     direct.use(errorHandler);
 
     const response = await request(direct)
@@ -242,7 +242,7 @@ describe('diagnostic transaction rollback precedence', () => {
     vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
     const pass: RequestHandler = (_req, _res, next) => next();
     const direct = express();
-    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass } as Limiters));
+    direct.use('/diagnostic', createDiagnosticRouter({ assess: pass, assessIpDaily: pass, assessAbortGuard: pass } as Limiters));
     direct.use(errorHandler);
 
     const response = await request(direct).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);

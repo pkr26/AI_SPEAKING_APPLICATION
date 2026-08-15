@@ -476,6 +476,7 @@ export function createPracticeRouter(limiters: Limiters) {
     requireCompletedDiagnostic,
     limiters.assess,
     limiters.assessIpDaily,
+    limiters.assessAbortGuard,
     ...(config.s3.bucket
       ? [validate({ body: attemptJsonBodySchema })]
       : [uploadAudio, validate({ body: attemptBodySchema })]),
@@ -531,6 +532,9 @@ export function createPracticeRouter(limiters: Limiters) {
               questionText: q.question_text,
             },
             user.id,
+            // Once the capacity reservation commits, the assessment limiters
+            // must not refund this request even if it later fails (>=400).
+            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
           );
 
           let response: Record<string, unknown>;
@@ -610,6 +614,7 @@ export function createPracticeRouter(limiters: Limiters) {
     requireCompletedDiagnostic,
     limiters.assess,
     limiters.assessIpDaily,
+    limiters.assessAbortGuard,
     ...(config.s3.bucket
       ? [validate({ body: attemptJsonBodySchema })]
       : [uploadAudio, validate({ body: attemptBodySchema })]),
@@ -641,6 +646,7 @@ export function createPracticeRouter(limiters: Limiters) {
         }
         ownSubmittedPresignedAudio(res);
 
+        let claim: PracticeClaim | undefined;
         let completed = false;
         try {
           if (config.s3.bucket) await resolvePresignedAudio(req, res);
@@ -649,6 +655,10 @@ export function createPracticeRouter(limiters: Limiters) {
           }
           await verifyAudioMagicBytes(req.file.path);
           if (!config.mockAi) await verifyAudioDuration(req.file.path);
+          // Same per-question serialization as English practice: without a
+          // claim, concurrent native submissions with distinct requestIds each
+          // trigger their own paid provider calls for one question.
+          claim = await claimPracticeAttempt(user.id, q.id);
           const result = await assessNativeComprehension(
             req.file.path,
             {
@@ -658,6 +668,7 @@ export function createPracticeRouter(limiters: Limiters) {
             },
             user.native_language as NativeLanguage,
             user.id,
+            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
           );
           const feedback =
             result.understood || result.transcript === ''
@@ -684,6 +695,7 @@ export function createPracticeRouter(limiters: Limiters) {
           responded = true;
           return res.json(response);
         } finally {
+          if (claim) await clearPracticeClaim(user.id, q.id, claim.claimId);
           if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
         }
       } finally {

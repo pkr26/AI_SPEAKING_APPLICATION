@@ -24,6 +24,7 @@ import {
   assessSpeaking,
   assertDailyAssessmentCapacity,
   AssessQuestion,
+  cleanupAssessmentUsage,
 } from '../src/assess';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
@@ -194,7 +195,7 @@ describe('assertDailyAssessmentCapacity', () => {
     }
   });
 
-  it('purges reservations older than 24h before counting', async () => {
+  it('excludes reservations older than 24h from the count; the janitor purges them', async () => {
     const snap = snapshotConfig();
     await pool.query('DELETE FROM assessment_usage');
     try {
@@ -207,7 +208,15 @@ describe('assertDailyAssessmentCapacity', () => {
         'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
         [userId],
       );
-      expect(rows[0].n).toBe(1); // only the fresh reservation remains
+      // The hot path never sweeps: the stale row survives beside the fresh
+      // reservation until the janitor removes it.
+      expect(rows[0].n).toBe(2);
+      await expect(cleanupAssessmentUsage()).resolves.toBe(1);
+      const { rows: after } = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+        [userId],
+      );
+      expect(after[0].n).toBe(1); // only the fresh reservation remains
     } finally {
       restoreConfig(snap);
     }
@@ -236,7 +245,7 @@ describe('assertDailyAssessmentCapacity', () => {
         ['BEGIN'],
         ["SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))"],
         ["SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))", [userId]],
-        ["DELETE FROM assessment_usage WHERE created_at <= now() - interval '1 day'"],
+        [expect.stringContaining('count(*)::int AS global_n'), [userId]],
         ['ROLLBACK'],
       ]);
       expect(client.release).toHaveBeenCalledOnce();

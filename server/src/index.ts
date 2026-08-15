@@ -1,6 +1,7 @@
 import { createServer } from 'http';
 import { config } from './config';
 import { createApp } from './app';
+import { cleanupAssessmentUsage } from './assess';
 import { pool } from './db';
 import { logger } from './logger';
 import { cleanupAssessmentRequests } from './idempotency';
@@ -55,6 +56,12 @@ const janitorDefinitions: JanitorDefinition[] = [
     intervalMs: DATABASE_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed expired rate-limit counters',
     failureMessage: 'rate-limit janitor failed',
+  },
+  {
+    cleanup: cleanupAssessmentUsage,
+    intervalMs: DATABASE_JANITOR_INTERVAL_MS,
+    successMessage: 'janitor removed expired assessment reservations',
+    failureMessage: 'assessment usage janitor failed',
   },
 ];
 
@@ -128,11 +135,34 @@ function shutdown(signal: string) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+/**
+ * Operational guardrail: a pool that can consume every server connection locks
+ * out readiness probes, migrations, and admin clients (observed as
+ * `FATAL: too many clients` during a 1000-user load run with DB_POOL_MAX=100
+ * against a stock max_connections=100 server). Loud but never fatal: managed
+ * PostgreSQL and poolers can legitimately report surprising numbers.
+ */
+async function warnIfPoolOversized(): Promise<void> {
+  try {
+    const { rows } = await pool.query<{ max_connections: string }>('SHOW max_connections');
+    const maxConnections = Number(rows[0]?.max_connections);
+    if (Number.isInteger(maxConnections) && maxConnections > 0 && config.dbPoolMax > maxConnections - 3) {
+      logger.error(
+        { dbPoolMax: config.dbPoolMax, maxConnections },
+        'DB_POOL_MAX leaves fewer than 3 database connections for admin, migration, and readiness clients; reduce DB_POOL_MAX or raise max_connections',
+      );
+    }
+  } catch (err) {
+    logger.warn({ err }, 'could not verify DB_POOL_MAX against server max_connections');
+  }
+}
+
 // Refuse traffic until the release schema and required media inspector are
 // ready. The same dependency checks back /ready for post-start drift/failure.
 Promise.all([assertDatabaseSchemaCurrent(), assertAudioInspectorAvailable({ force: true })])
-  .then(() => {
+  .then(async () => {
     if (shuttingDown) return;
+    await warnIfPoolOversized();
     startJanitors();
     server.listen(config.port, () => {
       logger.info({ port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv }, 'AI English API listening');

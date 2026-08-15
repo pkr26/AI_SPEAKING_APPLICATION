@@ -175,6 +175,7 @@ describe('practice stuck cases', () => {
         expect.objectContaining({ cefrLevel: level }),
         'te',
         userId,
+        expect.objectContaining({ onCapacityReserved: expect.any(Function) }),
       );
 
       const counts = await pool.query<{ attempts: number; progress: number }>(

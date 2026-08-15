@@ -892,7 +892,10 @@ describe('Recorder', () => {
 
     it('cleans up and restores audio mode when stopping the native recording fails', async () => {
       mockRecorder.stop.mockImplementation(async () => {
+        // The recorder still reports recording, so the take was never
+        // finalized and must be discarded.
         mockRecorder.uri = RECORDING_URI;
+        mockRecorder.isRecording = true;
         throw new Error('native stop failure');
       });
       const { props } = await renderRecorder();
@@ -912,6 +915,57 @@ describe('Recorder', () => {
         allowsBackgroundRecording: false,
         shouldPlayInBackground: false,
       });
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('keeps the finalized take when the tapped stop rejects after a native auto-stop', async () => {
+      mockRecorder.stop.mockImplementation(async () => {
+        // The 2:00 auto-stop finalized the file before the tap's stop call
+        // reached the native recorder; the rejection must not destroy it.
+        mockRecorder.uri = RECORDING_URI;
+        mockRecorder.isRecording = false;
+        throw new Error('recorder already stopped');
+      });
+      const { props } = await renderRecorder();
+      await startRecording();
+      mockRecorderState.durationMillis = 121_000;
+
+      await fireEvent.press(screen.getByLabelText('Stop recording'));
+      await waitFor(() => expect(screen.getByText('Submit Answer')).toBeTruthy());
+
+      expect(screen.getByText('Recorded 2:00 — ready to submit')).toBeTruthy();
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(setAudioModeAsync).toHaveBeenLastCalledWith({
+        allowsRecording: false,
+        allowsBackgroundRecording: false,
+        shouldPlayInBackground: false,
+      });
+    });
+
+    it('discards a rejected stop whose recording file no longer exists', async () => {
+      asMock(File).mockImplementation((uri: string) => ({
+        uri,
+        exists: false,
+        delete: jest.fn(),
+        arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
+      }));
+      mockRecorder.stop.mockImplementation(async () => {
+        mockRecorder.uri = RECORDING_URI;
+        throw new Error('native stop failure');
+      });
+      const { props } = await renderRecorder();
+      await startRecording();
+      mockRecorderState.durationMillis = 5_000;
+
+      await fireEvent.press(screen.getByLabelText('Stop recording'));
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          'Could not save the recording. Please record your answer again.',
+        ),
+      );
+
+      expect(screen.queryByText('Submit Answer')).toBeNull();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
@@ -1124,6 +1178,69 @@ describe('Recorder', () => {
       await flushAct();
 
       expect(screen.getByText('Recorded 2:00 — ready to submit')).toBeTruthy();
+    });
+
+    it.each([
+      [999, false],
+      [1000, true],
+    ])(
+      'treats a mic press %ims after a native auto-stop as a re-record=%s',
+      async (elapsed, restarts) => {
+        // A stop tap can land just after the 2:00 auto-stop flips the phase
+        // to recorded; within the grace window it must not destroy the take.
+        const autoStoppedAt = 1_700_000_000_000;
+        jest.useFakeTimers({ now: autoStoppedAt });
+        asMock(AccessibilityInfo.isReduceMotionEnabled).mockResolvedValue(true);
+        const { view, props } = await renderRecorder();
+        await startRecording();
+
+        mockRecorderState = {
+          ...mockRecorderState,
+          isRecording: true,
+          durationMillis: 119_000,
+        };
+        await view.rerender(<Recorder {...props} />);
+        await flushAct();
+
+        mockRecorder.uri = RECORDING_URI;
+        mockRecorderState = {
+          isRecording: false,
+          durationMillis: 120_000,
+          url: null,
+          mediaServicesDidReset: false,
+        };
+        await view.rerender(<Recorder {...props} />);
+        await flushAct();
+        expect(screen.getByText('Recorded 2:00 — ready to submit')).toBeTruthy();
+
+        jest.setSystemTime(autoStoppedAt + elapsed);
+        await fireEvent.press(screen.getByLabelText('Start recording'));
+        await flushAct();
+
+        if (restarts) {
+          expect(mockRecorder.record).toHaveBeenCalledTimes(2);
+          expect(screen.getByLabelText('Stop recording')).toBeTruthy();
+        } else {
+          expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+          expect(screen.getByText('Recorded 2:00 — ready to submit')).toBeTruthy();
+          expect(screen.getByText('Submit Answer')).toBeTruthy();
+          expect(deletedRecordingUris()).toEqual([]);
+        }
+      },
+    );
+
+    it('re-records immediately from the mic after a user-tapped stop', async () => {
+      // The grace window guards only native auto-stops; a take the learner
+      // stopped deliberately can be re-recorded without waiting.
+      jest.useFakeTimers({ now: 1_700_000_000_000 });
+      asMock(AccessibilityInfo.isReduceMotionEnabled).mockResolvedValue(true);
+      await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByLabelText('Start recording'));
+      await waitFor(() => expect(screen.getByLabelText('Stop recording')).toBeTruthy());
+
+      expect(mockRecorder.record).toHaveBeenCalledTimes(2);
     });
 
     it('submits the recorder-state URL when native auto-stop has no recorder URI', async () => {
@@ -1737,6 +1854,56 @@ describe('Recorder', () => {
       expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
       expect(deletedRecordingUris()).toContain(RECORDING_URI);
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('resubmits the same requestId after a 503, honoring the Retry-After delay', async () => {
+      asMock(apiUploadAudio)
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1))
+        .mockResolvedValueOnce({ ok: true });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      const submittedAt = Date.now();
+      await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }), {
+        timeout: 4_000,
+      });
+
+      expect(Date.now() - submittedAt).toBeGreaterThanOrEqual(999);
+      expect(apiUploadAudio).toHaveBeenCalledTimes(2);
+      for (const call of asMock(apiUploadAudio).mock.calls) {
+        expect(call[2]).toEqual({ questionId: QUESTION_ID, requestId: REQUEST_ID });
+      }
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('falls back to recovery with the same requestId when 503 backpressure outlasts the retry budget', async () => {
+      jest.useFakeTimers();
+      asMock(apiUploadAudio).mockRejectedValue(new ApiError(503, 'capacity busy', 1));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: 'Submit Answer' }));
+      // 1 initial attempt + 3 capacity retries, one second apart.
+      for (let i = 0; i < 3; i++) {
+        await act(async () => {
+          jest.advanceTimersByTime(1_000);
+          await flushMicrotasks();
+        });
+      }
+      await flushAct();
+
+      expect(apiUploadAudio).toHaveBeenCalledTimes(4);
+      for (const call of asMock(apiUploadAudio).mock.calls) {
+        expect(call[2]).toEqual({ questionId: QUESTION_ID, requestId: REQUEST_ID });
+      }
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          'We could not confirm whether your answer was saved. If it does not appear, please record it again.',
+        ),
+      );
+      expect(props.onResult).not.toHaveBeenCalled();
     });
 
     it('uses distinct request ids for sequential completed answers', async () => {
@@ -4298,6 +4465,36 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(8);
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 81 } });
       expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it('resolves terminally when a 409 resubmission is followed by another absent status read', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+      );
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      asMock(apiFetch)
+        .mockRejectedValueOnce(new ApiError(409, 'question mismatch'))
+        // The row a genuine in-flight claim would have produced never appears:
+        // the next read is still absent, so the conflict is terminal.
+        .mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      const { props } = await renderRecorder();
+
+      await advancePolls(8);
+
+      expect(apiFetch).toHaveBeenCalledTimes(8);
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(props.onError).toHaveBeenCalledWith(
+        'This answer was already submitted or the question has moved on. Your learning state has been refreshed.',
+      );
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+
+      // Resolved: no further polling until the five-minute lease.
+      await advancePolls(3);
+      expect(apiFetch).toHaveBeenCalledTimes(8);
     });
 
     it.each([400, 403, 404, 413, 415, 422])(

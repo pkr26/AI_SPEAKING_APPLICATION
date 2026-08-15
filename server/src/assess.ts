@@ -101,9 +101,12 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
     await client.query('BEGIN');
     // Serialize the short global budget check first, then this user's check.
     // Provider I/O never runs while either lock or database client is held.
+    // The critical section must stay cheap: every paid assessment cluster-wide
+    // waits on the global lock, so expired rows are excluded by predicate here
+    // and physically removed by the hourly janitor (cleanupAssessmentUsage),
+    // never by a sweep inside this hot path.
     await client.query("SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))");
     await client.query("SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))", [userId]);
-    await client.query("DELETE FROM assessment_usage WHERE created_at <= now() - interval '1 day'");
     const { rows } = await client.query<{
       global_n: number;
       global_oldest: string | null;
@@ -115,7 +118,8 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
          min(created_at) AS global_oldest,
          count(*) FILTER (WHERE user_id = $1)::int AS user_n,
          min(created_at) FILTER (WHERE user_id = $1) AS user_oldest
-       FROM assessment_usage`,
+       FROM assessment_usage
+       WHERE created_at > now() - interval '1 day'`,
       [userId],
     );
     const { global_n: globalN, global_oldest: globalOldest, user_n: userN, user_oldest: userOldest } = rows[0];
@@ -139,17 +143,43 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
 }
 
 /**
+ * Janitor: physically remove reservations that have aged out of the rolling
+ * 24-hour window. The capacity check excludes them by predicate, so this only
+ * bounds table growth and is never part of the assessment hot path.
+ */
+export async function cleanupAssessmentUsage(): Promise<number> {
+  const removed = await pool.query("DELETE FROM assessment_usage WHERE created_at <= now() - interval '1 day'");
+  return removed.rowCount ?? 0;
+}
+
+export interface AssessOptions {
+  /**
+   * Invoked once the daily-capacity reservation has committed — the point
+   * after which the request has consumed budget (and, outside mock mode, is
+   * about to spend provider money). Routes use it to keep the request-rate
+   * limiters from refunding responses that already spent that budget.
+   */
+  onCapacityReserved?: () => void;
+}
+
+/**
  * Transcribe the recorded answer with Whisper and grade it with GPT-4o-mini,
  * acting as a CEFR speaking examiner. With MOCK_AI=true everything is
  * simulated locally and no OpenAI call is made.
  */
-export async function assessSpeaking(audioPath: string, q: AssessQuestion, userId: string): Promise<AssessResult> {
+export async function assessSpeaking(
+  audioPath: string,
+  q: AssessQuestion,
+  userId: string,
+  options: AssessOptions = {},
+): Promise<AssessResult> {
   acquireAiSlot();
   try {
     // Reserve quota only after an AI slot is available. Capacity rejections do
     // not consume a learner's daily allowance, while every provider attempt
     // still receives an atomic, cross-instance reservation before it starts.
     await assertDailyAssessmentCapacity(userId);
+    options.onCapacityReserved?.();
     if (config.mockAi) {
       const score = 40 + Math.floor(Math.random() * 56); // 40-95 inclusive
       return {
@@ -259,12 +289,14 @@ export async function assessNativeComprehension(
   q: AssessQuestion,
   nativeLanguage: NativeLanguage,
   userId: string,
+  options: AssessOptions = {},
 ): Promise<NativeAssessResult> {
   acquireAiSlot();
   try {
     // Same paid-pipeline discipline as assessSpeaking: capacity is reserved
     // atomically once an AI slot is available, before any provider call.
     await assertDailyAssessmentCapacity(userId);
+    options.onCapacityReserved?.();
     if (config.mockAi) {
       return {
         understood: true,

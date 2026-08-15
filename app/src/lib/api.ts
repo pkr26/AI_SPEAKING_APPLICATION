@@ -71,11 +71,14 @@ export const API_URL = resolveBaseUrl();
 
 export class ApiError extends Error {
   readonly status: number;
+  /** Bounded server-supplied retry delay from the 503 backpressure contract. */
+  readonly retryAfterSeconds?: number;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, retryAfterSeconds?: number) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -184,9 +187,31 @@ async function tokenForRequest(): Promise<string | null> {
   return tokenSnapshotReady ? tokenSnapshot : getToken();
 }
 
-function throwForStatus(res: Response): never {
-  // Do not forward server or upstream-provider error bodies into the UI.
-  throw new ApiError(res.status, `Request failed with status ${res.status}`);
+function parseRetryAfterSecondsHeader(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const seconds = Number(header);
+  return Number.isFinite(seconds) && seconds > 0 && seconds <= 120 ? seconds : undefined;
+}
+
+async function throwForStatus(res: Response): Promise<never> {
+  // Do not forward server or upstream-provider error bodies into the UI. The
+  // single exception is the bounded, non-sensitive retryAfterSeconds number
+  // that drives the 503 backpressure contract (assess semaphore, pool shed).
+  let retryAfterSeconds: number | undefined;
+  if (res.status === 503) {
+    retryAfterSeconds = parseRetryAfterSecondsHeader(res.headers.get('Retry-After'));
+    if (retryAfterSeconds === undefined) {
+      const body: unknown = await res.json().catch(() => undefined);
+      const value =
+        body && typeof body === 'object'
+          ? (body as { retryAfterSeconds?: unknown }).retryAfterSeconds
+          : undefined;
+      if (typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 120) {
+        retryAfterSeconds = value;
+      }
+    }
+  }
+  throw new ApiError(res.status, `Request failed with status ${res.status}`, retryAfterSeconds);
 }
 
 function authHeader(token: string | null): Record<string, string> {
@@ -263,7 +288,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, options.expireSessionOn401 !== false);
-    throwForStatus(res);
+    await throwForStatus(res);
   }
   if (res.status === 204) return undefined as T;
   try {
@@ -273,10 +298,31 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
   }
 }
 
-export function audioFileDescriptor(audioUri: string): {
+// Browser MediaRecorder output varies by engine — Safari emits MP4/AAC while
+// Chrome emits WebM — and blob: URLs carry no extension. Name/type pairs the
+// server allowlist accepts, keyed by the recorded Blob's base MIME type.
+const WEB_BLOB_DESCRIPTORS: Record<string, { name: string; type: string }> = {
+  'audio/mp4': { name: 'audio.m4a', type: 'audio/mp4' },
+  'audio/m4a': { name: 'audio.m4a', type: 'audio/m4a' },
+  'audio/x-m4a': { name: 'audio.m4a', type: 'audio/x-m4a' },
+  'audio/webm': { name: 'audio.webm', type: 'audio/webm' },
+  'audio/wav': { name: 'audio.wav', type: 'audio/wav' },
+  'audio/ogg': { name: 'audio.ogg', type: 'audio/ogg' },
+  'audio/mpeg': { name: 'audio.mp3', type: 'audio/mpeg' },
+};
+
+export function audioFileDescriptor(
+  audioUri: string,
+  blobType?: string,
+): {
   name: string;
   type: string;
 } {
+  if (blobType) {
+    // MediaRecorder may append codec parameters (audio/webm;codecs=opus).
+    const descriptor = WEB_BLOB_DESCRIPTORS[blobType.split(';', 1)[0].trim().toLowerCase()];
+    if (descriptor) return descriptor;
+  }
   const path = audioUri.split(/[?#]/, 1)[0].toLowerCase();
   if (Platform.OS === 'web' || path.endsWith('.webm')) {
     return { name: 'audio.webm', type: 'audio/webm' };
@@ -293,6 +339,26 @@ export function audioFileDescriptor(audioUri: string): {
   return { name: 'audio.m4a', type: 'audio/mp4' };
 }
 
+/**
+ * Resolves the descriptor an upload grant is requested with. On web the
+ * recorded Blob is the only source of truth for the container MediaRecorder
+ * chose; native recordings are described by their file URI alone.
+ */
+export async function resolveAudioFileDescriptor(audioUri: string): Promise<{
+  name: string;
+  type: string;
+}> {
+  if (Platform.OS !== 'web') return audioFileDescriptor(audioUri);
+  try {
+    const blob = await (await fetch(audioUri)).blob();
+    return audioFileDescriptor(audioUri, blob.type);
+  } catch {
+    // A lost blob is reported as a definite failure by the upload step; the
+    // grant request itself must not fail on it.
+    return audioFileDescriptor(audioUri);
+  }
+}
+
 export async function apiUploadAudio<T>(
   path: string,
   audioUri: string,
@@ -301,12 +367,14 @@ export async function apiUploadAudio<T>(
 ): Promise<T> {
   const token = await tokenForRequest();
   const form = new FormData();
-  const descriptor = audioFileDescriptor(audioUri);
   if (Platform.OS === 'web') {
     const audioResponse = await fetch(audioUri);
     const blob = await audioResponse.blob();
-    form.append('audio', blob, descriptor.name);
+    // The recorded Blob names the upload so Safari's MP4 output is not
+    // declared as WebM and rejected by the server allowlist.
+    form.append('audio', blob, audioFileDescriptor(audioUri, blob.type).name);
   } else {
+    const descriptor = audioFileDescriptor(audioUri);
     // Mirror the presigned-upload check: if the OS evicted the cached
     // recording, fail as a definite local 400 instead of an ambiguous network
     // error that would trigger minutes of pointless recovery polling.
@@ -335,7 +403,7 @@ export async function apiUploadAudio<T>(
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, true);
-    throwForStatus(res);
+    await throwForStatus(res);
   }
   try {
     return (await res.json()) as T;
@@ -452,21 +520,26 @@ export async function apiPostPresignedAudio(
     options.timeoutMs ?? AUDIO_TIMEOUT_MS,
     options.signal,
   );
-  if (!audioResponse.ok) throwForStatus(audioResponse);
+  if (!audioResponse.ok) await throwForStatus(audioResponse);
   const body = await audioResponse.blob();
-  if (body.size === 0 || body.size > maxBytes) {
+  if (body.size === 0) {
+    // A lost or evicted blob is the web analogue of the missing native file:
+    // a definite local failure that means "record again", not "record less".
+    throw new ApiError(400, 'The recording is unavailable');
+  }
+  if (body.size > maxBytes) {
     throw new ApiError(413, 'The recording is too large');
   }
   const form = new FormData();
   for (const [key, value] of Object.entries(uploadFields)) {
     form.append(key, value);
   }
-  form.append('file', body, audioFileDescriptor(audioUri).name);
+  form.append('file', body, audioFileDescriptor(audioUri, body.type).name);
   const res = await fetchWithTimeout(
     uploadUrl,
     { method: 'POST', body: form },
     options.timeoutMs ?? AUDIO_TIMEOUT_MS,
     options.signal,
   );
-  if (!res.ok) throwForStatus(res);
+  if (!res.ok) await throwForStatus(res);
 }

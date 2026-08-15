@@ -1,5 +1,7 @@
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import type { RequestHandler } from 'express';
 import { config } from './config';
+import { logger } from './logger';
 import { AuthedRequest } from './middleware';
 import { PostgresRateLimitStore } from './postgres-rate-limit-store';
 
@@ -123,25 +125,35 @@ export function buildLimiters() {
     limit: 60,
   });
 
+  // Failed responses are refunded ONLY when the request never reached paid
+  // work: schema-invalid and otherwise-rejected submissions must not spend the
+  // budget, but a provider 502/504 thrown after the capacity reservation (and
+  // outside mock mode, after paid provider calls) must keep its hit — without
+  // this, a client stuck in a provider-failure loop is never rate-limited.
+  // Routes set the flag via assessSpeaking's onCapacityReserved hook.
+  const assessmentSpentPaidWork = (_req: unknown, res: { statusCode: number; locals: Record<string, unknown> }) =>
+    res.statusCode < 400 || res.locals.assessmentCapacityReserved === true;
+
   // Assessment endpoints are expensive (upload + AI) — per-user, not per-IP,
   // so shared networks don't let one user exhaust another's budget. Failed
-  // (>=400) requests are refunded on response finish: schema-invalid and other
-  // rejected submissions never reach paid work, so they must not spend the
-  // budget. The store's decrement is window-guarded and fail-safe (the same
+  // (>=400) requests that never reached paid work are refunded on response
+  // finish. The store's decrement is window-guarded and fail-safe (the same
   // refund path the login limiter already relies on).
+  const assessStore = new PostgresRateLimitStore(
+    `assess:${config.rateLimit.assessWindowMs}:${config.rateLimit.assessMax}`,
+    config.rateLimit.assessWindowMs,
+  );
   const assess = rateLimit({
     ...common,
     windowMs: config.rateLimit.assessWindowMs,
     limit: config.rateLimit.assessMax,
-    store: new PostgresRateLimitStore(
-      `assess:${config.rateLimit.assessWindowMs}:${config.rateLimit.assessMax}`,
-      config.rateLimit.assessWindowMs,
-    ),
+    store: assessStore,
     keyGenerator: (req) => {
       const user = (req as AuthedRequest).user;
       return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
     },
     skipFailedRequests: true,
+    requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Assessment rate limit reached, please slow down' },
   });
 
@@ -151,17 +163,48 @@ export function buildLimiters() {
   // daily budget follows the source IP across accounts; its default is
   // deliberately several times the per-user daily cap so ordinary
   // households/schools behind one NAT keep working. Failed (>=400) requests
-  // are refunded so one account's rejected submissions cannot deny the shared
-  // network budget to every other account behind the same NAT.
+  // that never reached paid work are refunded so one account's rejected
+  // submissions cannot deny the shared network budget to every other account
+  // behind the same NAT.
+  const assessIpDailyStore = new PostgresRateLimitStore(
+    `assess-ip-daily:${config.assessIpDailyCap}`,
+    24 * 60 * 60 * 1000,
+  );
   const assessIpDaily = rateLimit({
     ...common,
     windowMs: 24 * 60 * 60 * 1000,
     limit: config.assessIpDailyCap,
-    store: new PostgresRateLimitStore(`assess-ip-daily:${config.assessIpDailyCap}`, 24 * 60 * 60 * 1000),
+    store: assessIpDailyStore,
     keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
     skipFailedRequests: true,
+    requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Daily assessment limit reached for this network' },
   });
+
+  // express-rate-limit refunds an aborted request unconditionally on 'close'
+  // (its requestWasSuccessful predicate is only consulted on 'finish'). That
+  // refund is legitimate before paid work — but once the daily-capacity
+  // reservation has committed, the paid pipeline runs to completion whether or
+  // not the caller stays connected, so an abort must keep both hits. Mounted
+  // after the two assessment limiters, this re-spends the pair of hits the
+  // close handler is about to return. Both counter ops are single atomic
+  // upserts/decrements on the same row, so the refund and the re-spend net to
+  // zero in either completion order; failures here fail open (log only) rather
+  // than taking the request down with a dead client.
+  const assessAbortGuard: RequestHandler = (req, res, next) => {
+    res.on('close', () => {
+      if (res.writableEnded || !res.locals.assessmentCapacityReserved) return;
+      const user = (req as AuthedRequest).user;
+      const keys: Array<[PostgresRateLimitStore, string]> = [
+        [assessStore, user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '')],
+        [assessIpDailyStore, ipKeyGenerator(req.ip ?? '')],
+      ];
+      for (const [store, key] of keys) {
+        void store.increment(key).catch((err) => logger.warn({ err }, 'assessment budget re-spend failed'));
+      }
+    });
+    next();
+  };
 
   // Issuing an S3 upload grant has its own shared per-user budget. It must not
   // consume the paid assessment budget before the assessment is submitted,
@@ -181,7 +224,18 @@ export function buildLimiters() {
     message: { error: 'Audio upload grant rate limit reached, please try again later' },
   });
 
-  return { global, auth, loginAccount, passwordAccount, readiness, register, assess, assessIpDaily, uploadGrant };
+  return {
+    global,
+    auth,
+    loginAccount,
+    passwordAccount,
+    readiness,
+    register,
+    assess,
+    assessIpDaily,
+    assessAbortGuard,
+    uploadGrant,
+  };
 }
 
 export type Limiters = ReturnType<typeof buildLimiters>;

@@ -14,6 +14,7 @@ import { AUDIO_TYPES, uploadsDir } from '../src/upload';
 const files: string[] = [];
 const runFile = promisify(execFile);
 const configuredFfmpegPath = config.ffmpegPath;
+const configuredFfprobePath = config.ffprobePath;
 const supportedAudioFixtures = [
   ['M4A', 'supported.m4a', 'aac', undefined],
   ['MP4', 'supported.mp4', 'aac', undefined],
@@ -110,6 +111,7 @@ async function generatedAudio(
 
 afterEach(async () => {
   config.ffmpegPath = configuredFfmpegPath;
+  config.ffprobePath = configuredFfprobePath;
   await Promise.all(files.splice(0).map((file) => fs.rm(file, { force: true })));
 });
 
@@ -281,6 +283,20 @@ describe('verifyAudioDuration', () => {
       message: 'Audio inspection is temporarily unavailable',
     });
   });
+
+  it('maps an exhausted inspection wall clock to a retryable 503, never a file-blaming 415', async () => {
+    // A probe that never answers burns the fixed 10s inspection budget; the
+    // child is SIGKILLed when the timeout settles.
+    const hangingProbe = path.join(uploadsDir, `${process.pid}-hanging-ffprobe`);
+    files.push(hangingProbe);
+    await fs.writeFile(hangingProbe, '#!/bin/sh\nexec sleep 30\n', { mode: 0o700 });
+    config.ffprobePath = hangingProbe;
+    await expect(verifyAudioDuration(await fixture('valid-for-timeout.wav', pcmWav(1)))).rejects.toMatchObject({
+      status: 503,
+      message: 'Audio inspection timed out; please try again',
+      extra: { retryAfterSeconds: 5 },
+    });
+  }, 25_000);
 
   it('rejects extensions outside the fixed demuxer allowlist', async () => {
     await expect(verifyAudioDuration(await fixture('valid-audio.bin', pcmWav(1)))).rejects.toMatchObject({

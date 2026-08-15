@@ -309,11 +309,39 @@ describe('auth: infrastructure failures', () => {
   it('reports an authenticated database failure as 500, not an invalid-token 401', async () => {
     const a = app();
     const { res } = await registerUser(a);
-    const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(new Error('database unavailable'));
+    // Fail only the requireAuth user lookup: the rate-limit counters run their
+    // own queries first, and a failure there is 503 backpressure, not this 500.
+    const original = pool.query.bind(pool);
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...rest: unknown[]) => {
+      if (typeof text === 'string' && text.includes('FROM users WHERE id')) {
+        return Promise.reject(new Error('database unavailable'));
+      }
+      return (original as (...args: unknown[]) => unknown)(text, ...rest);
+    }) as never);
     try {
       const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${res.body.token}`);
       expect(me.status).toBe(500);
       expect(me.body.error).toBe('Internal server error');
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  it('sheds a saturated-pool failure as 503 with Retry-After, never a 500', async () => {
+    const a = app();
+    const { res } = await registerUser(a);
+    const original = pool.query.bind(pool);
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...rest: unknown[]) => {
+      if (typeof text === 'string' && text.includes('FROM users WHERE id')) {
+        return Promise.reject(new Error('timeout exceeded when trying to connect'));
+      }
+      return (original as (...args: unknown[]) => unknown)(text, ...rest);
+    }) as never);
+    try {
+      const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${res.body.token}`);
+      expect(me.status).toBe(503);
+      expect(me.body).toEqual({ error: 'Server is busy, please try again shortly', retryAfterSeconds: 5 });
+      expect(me.headers['retry-after']).toBe('5');
     } finally {
       query.mockRestore();
     }

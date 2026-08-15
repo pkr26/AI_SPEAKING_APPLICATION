@@ -15,7 +15,7 @@ import Recorder from '../../components/Recorder';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { firstParam, isUuid } from '../../lib/params';
-import { usePracticeFlow } from '../../lib/practice-flow';
+import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
 import {
   parseAttemptResult,
@@ -23,6 +23,7 @@ import {
   parseNativeAttemptResult,
   type PracticeOutcome,
 } from '../../lib/types';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 /**
  * Practice Mode: deliberately minimal — only the prompt word, the question,
@@ -53,8 +54,13 @@ export default function AttemptScreen() {
   const promptWord = helpQuery.data?.promptWord;
   const questionText = helpQuery.data?.questionText;
 
+  // Hardware back is a normal exit here, except while a recording, upload, or
+  // recovery is active — popping then would let blur cleanup discard the take.
+  useHardwareBack(() => recorderLocked);
+
   const handleResult = (result: PracticeOutcome) => {
-    if (!validQuestionId) return;
+    if (!user || !validQuestionId) return;
+    applyFailedAttemptToQuestionCache(queryClient, user, validQuestionId, result);
     showFeedback(validQuestionId, result);
     router.push('/practice/feedback');
   };

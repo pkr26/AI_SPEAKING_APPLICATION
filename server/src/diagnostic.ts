@@ -291,6 +291,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
     ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
     limiters.assess,
     limiters.assessIpDaily,
+    limiters.assessAbortGuard,
     ...(config.s3.bucket
       ? [validate({ body: answerJsonBodySchema })]
       : [uploadAudio, validate({ body: answerBodySchema })]),
@@ -349,6 +350,9 @@ export function createDiagnosticRouter(limiters: Limiters) {
               questionText: claim.question.question_text,
             },
             user.id,
+            // Once the capacity reservation commits, the assessment limiters
+            // must not refund this request even if it later fails (>=400).
+            { onCapacityReserved: () => void (res.locals.assessmentCapacityReserved = true) },
           );
           const body = await finalizeDiagnosticAnswer(
             user.id,

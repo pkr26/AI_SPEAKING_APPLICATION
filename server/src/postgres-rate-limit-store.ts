@@ -3,6 +3,7 @@ import type { ClientRateLimitInfo, Store } from 'express-rate-limit';
 import { config } from './config';
 import { pool } from './db';
 import { logger } from './logger';
+import { HttpError } from './middleware';
 
 interface CounterRow {
   hits: number;
@@ -30,8 +31,10 @@ export class PostgresRateLimitStore implements Store {
   }
 
   async increment(key: string): Promise<ClientRateLimitInfo> {
-    const { rows } = await pool.query<CounterRow>(
-      `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
+    let rows: CounterRow[];
+    try {
+      ({ rows } = await pool.query<CounterRow>(
+        `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
        VALUES ($1, $2, 1, clock_timestamp() + ($3::double precision * interval '1 millisecond'))
        ON CONFLICT (namespace, key_hash) DO UPDATE
        SET hits = CASE
@@ -44,8 +47,15 @@ export class PostgresRateLimitStore implements Store {
              ELSE rate_limit_windows.reset_at
            END
        RETURNING hits::int, reset_at`,
-      [this.namespace, this.hash(key), this.windowMs],
-    );
+        [this.namespace, this.hash(key), this.windowMs],
+      ));
+    } catch (err) {
+      // Without its counter the limiter cannot admit the request safely, but a
+      // database brownout here is backpressure, not an application fault: fail
+      // closed as a retryable 503 instead of an unhandled 500.
+      logger.warn({ err, namespace: this.namespace }, 'rate-limit increment failed; shedding request');
+      throw new HttpError(503, 'Server is busy, please try again shortly', { retryAfterSeconds: 5 });
+    }
     const row = rows[0];
     if (!row) throw new Error('rate limit counter was not returned');
     return {

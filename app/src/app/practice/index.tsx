@@ -15,16 +15,15 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import Recorder from '../../components/Recorder';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
-import { usePracticeFlow } from '../../lib/practice-flow';
+import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
 import {
-  isNativeOutcome,
   parseAttemptResult,
   parseNativeAttemptResult,
   parsePracticeQuestion,
   type PracticeOutcome,
-  type PracticeQuestionPayload,
 } from '../../lib/types';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function PracticeScreen() {
   const { user, logout } = useAuth();
@@ -46,26 +45,14 @@ export default function PracticeScreen() {
   const question = questionQuery.data?.question;
   const kind = questionQuery.data?.kind;
   const progress = questionQuery.data?.progress;
+
+  // Practice is the root of the practice stack: Android hardware back would
+  // pop it and let blur cleanup discard an active recording.
+  useHardwareBack(() => true);
+
   const handleResult = (result: PracticeOutcome) => {
     if (!user || !question) return;
-    if (!isNativeOutcome(result) && !result.noSpeech && !result.passed) {
-      queryClient.setQueryData<PracticeQuestionPayload>(
-        ['practice-question', user.id, user.cefrLevel],
-        (current) => {
-          if (!current || current.question.id !== question.id || current.kind !== 'new') {
-            return current;
-          }
-          return {
-            ...current,
-            kind: 'revision',
-            progress: {
-              ...current.progress,
-              learningCount: current.progress.learningCount + 1,
-            },
-          };
-        },
-      );
-    }
+    applyFailedAttemptToQuestionCache(queryClient, user, question.id, result);
     showFeedback(question.id, result);
     router.push('/practice/feedback');
   };
@@ -157,8 +144,17 @@ export default function PracticeScreen() {
             <Pressable
               accessibilityRole="button"
               accessibilityLabel="Help for this question"
+              accessibilityHint={
+                recorderLocked ? 'Finish the current recording before opening help.' : undefined
+              }
+              accessibilityState={{ disabled: recorderLocked }}
+              disabled={recorderLocked}
               hitSlop={4}
-              style={({ pressed }) => [styles.helpButton, pressed && styles.helpButtonPressed]}
+              style={({ pressed }) => [
+                styles.helpButton,
+                recorderLocked && styles.controlDisabled,
+                pressed && styles.helpButtonPressed,
+              ]}
               onPress={() =>
                 router.push({
                   pathname: '/practice/help',
@@ -251,16 +247,26 @@ export default function PracticeScreen() {
       <View style={[styles.footerRow, { paddingBottom: Math.max(insets.bottom, 10) }]}>
         <Pressable
           accessibilityRole="button"
+          accessibilityHint={
+            recorderLocked ? 'Finish the current recording before opening settings.' : undefined
+          }
+          accessibilityState={{ disabled: recorderLocked }}
+          disabled={recorderLocked}
           hitSlop={4}
-          style={styles.footerButton}
+          style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
           onPress={openSettingsMenu}
         >
           <Text style={styles.footerButtonText}>Settings</Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
+          accessibilityHint={
+            recorderLocked ? 'Finish the current recording before logging out.' : undefined
+          }
+          accessibilityState={{ disabled: recorderLocked }}
+          disabled={recorderLocked}
           hitSlop={4}
-          style={styles.footerButton}
+          style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
           onPress={() => void handleLogout()}
         >
           <Text style={styles.footerButtonText}>Log out</Text>
@@ -400,6 +406,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.primaryLight,
   },
   modeToggleDisabled: {
+    opacity: 0.5,
+  },
+  controlDisabled: {
     opacity: 0.5,
   },
   modeToggleText: {

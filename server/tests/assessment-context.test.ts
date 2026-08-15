@@ -50,6 +50,7 @@ describe('assessment prompt context', () => {
         questionText: next.body.question.questionText,
       },
       userId,
+      expect.objectContaining({ onCapacityReserved: expect.any(Function) }),
     );
     const assessedPath = assessMock.mock.calls[0][0] as string;
     await expect(fs.stat(assessedPath)).rejects.toMatchObject({ code: 'ENOENT' });
@@ -85,6 +86,7 @@ describe('assessment prompt context', () => {
       expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/),
       { cefrLevel: q.cefr_level, promptWord: q.prompt_word, questionText: q.question_text },
       userId,
+      expect.objectContaining({ onCapacityReserved: expect.any(Function) }),
     );
     const assessedPath = assessMock.mock.calls[0][0] as string;
     await expect(fs.stat(assessedPath)).rejects.toMatchObject({ code: 'ENOENT' });

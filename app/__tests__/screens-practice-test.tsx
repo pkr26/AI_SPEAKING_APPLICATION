@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert, StyleSheet } from 'react-native';
+import { Alert, BackHandler, StyleSheet } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import AttemptScreen from '../src/app/practice/attempt';
@@ -28,16 +28,27 @@ import {
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
-jest.mock('expo-router', () => ({
-  router: {
-    push: jest.fn(),
-    replace: jest.fn(),
-    back: jest.fn(),
-    dismissTo: jest.fn(),
-  },
-  useLocalSearchParams: () => mockSearchParams,
-  useFocusEffect: jest.fn(),
-}));
+// Focus is simulated by invoking the effect on mount and its cleanup on
+// unmount, re-running when the callback identity changes (as expo-router does
+// while a screen stays focused).
+jest.mock('expo-router', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  return {
+    router: {
+      push: jest.fn(),
+      replace: jest.fn(),
+      back: jest.fn(),
+      dismissTo: jest.fn(),
+    },
+    useLocalSearchParams: () => mockSearchParams,
+    useFocusEffect: (callback: () => void | (() => void)) => {
+      ReactActual.useEffect(() => {
+        const cleanup = callback();
+        return typeof cleanup === 'function' ? cleanup : undefined;
+      }, [callback]);
+    },
+  };
+});
 
 // ----- Recorder stub -----
 
@@ -124,6 +135,7 @@ function makePracticeFlow(overrides: Partial<PracticeFlowValue> = {}): PracticeF
 }
 
 jest.mock('../src/lib/practice-flow', () => ({
+  ...jest.requireActual('../src/lib/practice-flow'),
   usePracticeFlow: () => mockPracticeFlow,
 }));
 
@@ -201,6 +213,13 @@ const PASSED_RESULT: AttemptResult = {
 // ----- helpers -----
 
 let alertSpy: jest.SpyInstance;
+let backHandlers: (() => boolean)[];
+let backSubscriptionRemove: jest.Mock;
+
+function pressHardwareBack(): boolean {
+  if (backHandlers.length === 0) throw new Error('No hardware back handler registered');
+  return backHandlers[backHandlers.length - 1]();
+}
 
 const queryClients: QueryClient[] = [];
 
@@ -286,6 +305,12 @@ beforeEach(() => {
   mockAuthValue = makeAuth();
   mockPracticeFlow = makePracticeFlow();
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+  backHandlers = [];
+  backSubscriptionRemove = jest.fn();
+  jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
+    backHandlers.push(handler as () => boolean);
+    return { remove: backSubscriptionRemove };
+  });
 });
 
 afterEach(async () => {
@@ -422,6 +447,57 @@ describe('practice home screen', () => {
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
+  it('locks help and footer actions while a recording or submission is active', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    const help = screen.getByLabelText('Help for this question');
+    expect(help.props.accessibilityState).toEqual({ disabled: true });
+    expect(flattenedStyle(help)).toMatchObject({ opacity: 0.5 });
+    await fireEvent.press(help);
+    expect(mockRouter.push).not.toHaveBeenCalled();
+
+    const settings = screen.getByRole('button', { name: 'Settings' });
+    expect(settings.props.accessibilityState).toEqual({ disabled: true });
+    expect(flattenedStyle(settings)).toMatchObject({ opacity: 0.5 });
+    await fireEvent.press(settings);
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    const logout = screen.getByRole('button', { name: 'Log out' });
+    expect(logout.props.accessibilityState).toEqual({ disabled: true });
+    expect(flattenedStyle(logout)).toMatchObject({ opacity: 0.5 });
+    await fireEvent.press(logout);
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(flattenedStyle(screen.getByLabelText('Help for this question')).opacity).toBeUndefined();
+    await fireEvent.press(screen.getByLabelText('Help for this question'));
+    expect(mockRouter.push).toHaveBeenCalledWith({
+      pathname: '/practice/help',
+      params: { questionId: QUESTION.id },
+    });
+  });
+
+  it('consumes the Android hardware back press so the practice root is never popped', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const view = await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(BackHandler.addEventListener).toHaveBeenCalledWith(
+      'hardwareBackPress',
+      expect.any(Function),
+    );
+    expect(pressHardwareBack()).toBe(true);
+    expect(mockRouter.back).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await view.unmount();
+    expect(backSubscriptionRemove).toHaveBeenCalled();
   });
 
   it('does not load or mount a recorder without an authenticated user', async () => {
@@ -769,6 +845,21 @@ describe('practice attempt screen', () => {
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
   });
 
+  it('blocks the Android hardware back press only while a recording or submission is active', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(pressHardwareBack()).toBe(false);
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(pressHardwareBack()).toBe(true);
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(pressHardwareBack()).toBe(false);
+  });
+
   it('does not load help or mount a recorder without an authenticated user', async () => {
     mockAuthValue = makeAuth({ user: null });
     mockSearchParams = { questionId: QUESTION.id };
@@ -809,6 +900,62 @@ describe('practice attempt screen', () => {
     await act(async () => recorderProps().onResult(PASSED_RESULT));
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('updates a cached new word to revision after a real scored miss', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
+    await renderScreen(<AttemptScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'I tried to answer.',
+      feedback: 'Add more detail.',
+    };
+
+    await act(async () => recorderProps().onResult(miss));
+
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
+      ...PRACTICE_QUESTION,
+      kind: 'revision',
+      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
+    });
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, miss);
+    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('does not double-count a scored miss for a word already in revision', async () => {
+    const revision = {
+      ...PRACTICE_QUESTION,
+      kind: 'revision' as const,
+    };
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(['practice-question', USER.id, USER.cefrLevel], revision);
+    await renderScreen(<AttemptScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 2,
+      attemptsLeft: 1,
+      score: 50,
+      transcript: 'I tried again.',
+      feedback: 'Add another supporting detail.',
+    };
+
+    await act(async () => recorderProps().onResult(miss));
+
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual(
+      revision,
+    );
   });
 
   it('surfaces attempt recorder errors through an alert', async () => {
@@ -1099,7 +1246,8 @@ describe('practice feedback screen', () => {
     expect(screen.getByText("We couldn't hear you")).toBeTruthy();
     expect(
       screen.getByText(
-        "Don't worry — this didn't count as an attempt. Hold the button and speak clearly, or get help first.",
+        "Don't worry — this didn't count as an attempt. Tap the record button, speak clearly, " +
+          'then tap it again to stop — or get help first.',
       ),
     ).toBeTruthy();
     expect(screen.getByText('We could not detect any speech.')).toBeTruthy();
@@ -1283,6 +1431,163 @@ describe('practice feedback screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+  });
+
+  it('advances via the seeded next question when hardware back follows a pass', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const queryClient = makeQueryClient();
+    await renderScreen(<FeedbackScreen />, queryClient);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual(
+      NEXT_PRACTICE_QUESTION,
+    );
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('invalidates the practice question when hardware back ends the final attempt', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          passed: false,
+          mastered: false,
+          attemptNo: 3,
+          attemptsLeft: 0,
+          score: 30,
+          transcript: 'last try',
+          feedback: 'Regular feedback.',
+        },
+      },
+    });
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(<FeedbackScreen />, queryClient);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ['practice-question', USER.id, USER.cefrLevel],
+    });
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it.each([
+    [
+      'a retry result',
+      {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 40,
+        transcript: 'I tried to answer.',
+        feedback: 'Keep practicing.',
+      } satisfies AttemptResult,
+    ],
+    [
+      'a nospeech result',
+      {
+        passed: false,
+        mastered: false,
+        noSpeech: true,
+        attemptNo: 1,
+        attemptsLeft: 3,
+        score: 0,
+        transcript: '',
+        feedback: 'We could not detect any speech.',
+      } satisfies AttemptResult,
+    ],
+  ])('treats hardware back as the free retry for %s', async (_label, result) => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.back).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('treats hardware back as Try in English on the native variant', async () => {
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: true,
+      transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+      modelAnswer: 'She showed courage at work.',
+      feedback: 'You understood the question.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: nativeResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('keeps native mode when hardware back follows native silence', async () => {
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: false,
+      transcript: '',
+      modelAnswer: '',
+      feedback: 'We could not detect any speech.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      answerMode: 'native',
+      feedback: { questionId: QUESTION.id, result: nativeResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('routes hardware back to practice when there is no result to show', async () => {
+    await renderScreen(<FeedbackScreen />);
+
+    let consumed = false;
+    await act(async () => {
+      consumed = pressHardwareBack();
+    });
+
+    expect(consumed).toBe(true);
+    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
     expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
   });
 });

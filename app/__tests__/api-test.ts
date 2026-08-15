@@ -698,6 +698,77 @@ describe('audioFileDescriptor', () => {
       type: 'audio/webm',
     });
   });
+
+  it.each([
+    ['audio/mp4', { name: 'audio.m4a', type: 'audio/mp4' }],
+    ['audio/m4a', { name: 'audio.m4a', type: 'audio/m4a' }],
+    ['audio/x-m4a', { name: 'audio.m4a', type: 'audio/x-m4a' }],
+    ['audio/webm', { name: 'audio.webm', type: 'audio/webm' }],
+    ['audio/wav', { name: 'audio.wav', type: 'audio/wav' }],
+    ['audio/ogg', { name: 'audio.ogg', type: 'audio/ogg' }],
+    ['audio/mpeg', { name: 'audio.mp3', type: 'audio/mpeg' }],
+    ['audio/webm;codecs=opus', { name: 'audio.webm', type: 'audio/webm' }],
+    [' Audio/MP4 ; codecs="mp4a.40.2"', { name: 'audio.m4a', type: 'audio/mp4' }],
+  ])('maps the recorded blob type %s to %o', (blobType, expected) => {
+    mockPlatform.OS = 'web';
+    expect(api.audioFileDescriptor('blob:https://app/audio-1', blobType)).toEqual(expected);
+  });
+
+  it.each([
+    ['an empty blob type', ''],
+    ['an unrecognized blob type', 'video/mp4'],
+  ])('keeps the web default for %s', (_case, blobType) => {
+    mockPlatform.OS = 'web';
+    expect(api.audioFileDescriptor('blob:https://app/audio-1', blobType)).toEqual({
+      name: 'audio.webm',
+      type: 'audio/webm',
+    });
+  });
+});
+
+describe('resolveAudioFileDescriptor', () => {
+  it('describes a native recording from its file URI without reading a blob', async () => {
+    await expect(api.resolveAudioFileDescriptor('file:///rec/a.m4a')).resolves.toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('describes a web recording by its recorded blob type', async () => {
+    mockPlatform.OS = 'web';
+    fetchMock.mockResolvedValueOnce({
+      blob: async () => new Blob(['audio'], { type: 'audio/mp4' }),
+    } as unknown as Response);
+
+    await expect(api.resolveAudioFileDescriptor('blob:https://app/audio-1')).resolves.toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+    });
+    expect(fetchMock).toHaveBeenCalledWith('blob:https://app/audio-1');
+  });
+
+  it('keeps the web default when the blob reports no type', async () => {
+    mockPlatform.OS = 'web';
+    fetchMock.mockResolvedValueOnce({
+      blob: async () => new Blob(['audio']),
+    } as unknown as Response);
+
+    await expect(api.resolveAudioFileDescriptor('blob:https://app/audio-1')).resolves.toEqual({
+      name: 'audio.webm',
+      type: 'audio/webm',
+    });
+  });
+
+  it('keeps the web default when the blob cannot be read', async () => {
+    mockPlatform.OS = 'web';
+    fetchMock.mockRejectedValueOnce(new TypeError('blob revoked'));
+
+    await expect(api.resolveAudioFileDescriptor('blob:https://app/audio-1')).resolves.toEqual({
+      name: 'audio.webm',
+      type: 'audio/webm',
+    });
+  });
 });
 
 describe('apiUploadAudio', () => {
@@ -760,6 +831,25 @@ describe('apiUploadAudio', () => {
       name: 'audio',
       value: blob,
       filename: 'audio.webm',
+    });
+  });
+
+  it('names a Safari MP4 web recording by its recorded blob type', async () => {
+    mockPlatform.OS = 'web';
+    const blob = new Blob(['audio-bytes'], { type: 'audio/mp4' });
+    fetchMock
+      .mockResolvedValueOnce({
+        blob: async () => blob,
+      } as unknown as Response)
+      .mockResolvedValueOnce(fakeResponse({ json: async () => ({ ok: true }) }));
+
+    await api.apiUploadAudio('/practice/attempt', 'blob:https://app/audio-1', {});
+
+    const form = fetchMock.mock.calls[1][1].body as unknown as MockFormData;
+    expect(form.entries[0]).toEqual({
+      name: 'audio',
+      value: blob,
+      filename: 'audio.m4a',
     });
   });
 
@@ -1238,12 +1328,26 @@ describe('apiPostPresignedAudio', () => {
     expect(mockFileUpload).not.toHaveBeenCalled();
   });
 
-  it.each([
-    ['an empty browser recording', 0],
-    ['an oversized browser recording', maxBytes + 1],
-  ])('rejects %s before posting the signed form', async (_case, size) => {
+  it('reports a lost browser recording as unavailable, not too large', async () => {
     mockPlatform.OS = 'web';
-    const body = { size } as Blob;
+    const body = { size: 0 } as Blob;
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body });
+
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        { ...uploadFields, 'Content-Type': 'audio/webm' },
+        'blob:https://app/audio-1',
+        'audio/webm',
+        maxBytes,
+      ),
+    ).rejects.toMatchObject({ status: 400, message: 'The recording is unavailable' });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an oversized browser recording before posting the signed form', async () => {
+    mockPlatform.OS = 'web';
+    const body = { size: maxBytes + 1 } as Blob;
     fetchMock.mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body });
 
     await expect(
@@ -1256,6 +1360,29 @@ describe('apiPostPresignedAudio', () => {
       ),
     ).rejects.toMatchObject({ status: 413, message: 'The recording is too large' });
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('names a Safari MP4 web recording by its blob type in the signed form', async () => {
+    mockPlatform.OS = 'web';
+    const blob = new Blob(['web-audio'], { type: 'audio/mp4;codecs=mp4a.40.2' });
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        blob: async () => blob,
+      } as unknown as Response)
+      .mockResolvedValueOnce(fakeResponse());
+
+    await api.apiPostPresignedAudio(
+      uploadUrl,
+      uploadFields,
+      'blob:https://app/audio-1',
+      'audio/mp4',
+      maxBytes,
+    );
+
+    const form = fetchMock.mock.calls[1][1].body as unknown as MockFormData;
+    expect(form.entries[3]).toEqual({ name: 'file', value: blob, filename: 'audio.m4a' });
   });
 
   it('accepts a browser recording at the exact signed size limit', async () => {

@@ -1,10 +1,20 @@
+import { QueryClient } from '@tanstack/react-query';
 import { act, render, screen } from '@testing-library/react-native';
 import { useEffect } from 'react';
 import { Text } from 'react-native';
 
 import { useAuth } from '../src/lib/auth';
-import { PracticeFlowProvider, usePracticeFlow } from '../src/lib/practice-flow';
-import type { AttemptResult } from '../src/lib/types';
+import {
+  applyFailedAttemptToQuestionCache,
+  PracticeFlowProvider,
+  usePracticeFlow,
+} from '../src/lib/practice-flow';
+import type {
+  AttemptResult,
+  NativeAttemptResult,
+  PracticeQuestionPayload,
+  User,
+} from '../src/lib/types';
 
 // React 19 requires this opt-in before act() can track async updates.
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -175,5 +185,121 @@ describe('PracticeFlowProvider', () => {
       'usePracticeFlow must be used within PracticeFlowProvider',
     );
     consoleSpy.mockRestore();
+  });
+});
+
+describe('applyFailedAttemptToQuestionCache', () => {
+  const USER: User = {
+    id: '550e8400-e29b-41d4-a716-446655440000',
+    name: 'Ada Lovelace',
+    email: 'ada@example.com',
+    nativeLanguage: 'te',
+    cefrLevel: 'B1',
+    diagnosticCompleted: true,
+  };
+
+  const QUERY_KEY = ['practice-question', USER.id, USER.cefrLevel];
+
+  const PAYLOAD: PracticeQuestionPayload = {
+    question: {
+      id: '550e8400-e29b-41d4-a716-446655440001',
+      cefrLevel: 'B1',
+      promptWord: 'courage',
+      questionText: 'Describe a time you showed courage.',
+    },
+    kind: 'new',
+    progress: { masteredCount: 2, learningCount: 1, totalAtLevel: 8 },
+  };
+
+  const MISS: AttemptResult = {
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    score: 45,
+    transcript: 'I tried to answer.',
+    feedback: 'Add more detail.',
+  };
+
+  const queryClients: QueryClient[] = [];
+
+  function seededClient(current: PracticeQuestionPayload = PAYLOAD): QueryClient {
+    const queryClient = new QueryClient();
+    queryClient.setQueryData(QUERY_KEY, current);
+    queryClients.push(queryClient);
+    return queryClient;
+  }
+
+  afterEach(() => {
+    // Cancel cache-gc timers so the jest process can exit promptly.
+    for (const queryClient of queryClients) queryClient.clear();
+    queryClients.length = 0;
+  });
+
+  it('moves a cached new word into revision after a real scored miss', () => {
+    const queryClient = seededClient();
+
+    applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, MISS);
+
+    expect(queryClient.getQueryData(QUERY_KEY)).toEqual({
+      ...PAYLOAD,
+      kind: 'revision',
+      progress: { ...PAYLOAD.progress, learningCount: 2 },
+    });
+  });
+
+  it('does not double-count a word already in revision', () => {
+    const revision = { ...PAYLOAD, kind: 'revision' as const };
+    const queryClient = seededClient(revision);
+
+    applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, MISS);
+
+    expect(queryClient.getQueryData(QUERY_KEY)).toEqual(revision);
+  });
+
+  it('ignores a miss reported for a different cached question', () => {
+    const queryClient = seededClient();
+
+    applyFailedAttemptToQuestionCache(
+      queryClient,
+      USER,
+      '550e8400-e29b-41d4-a716-446655440002',
+      MISS,
+    );
+
+    expect(queryClient.getQueryData(QUERY_KEY)).toEqual(PAYLOAD);
+  });
+
+  it.each([
+    ['silence', { ...MISS, noSpeech: true, score: 0, transcript: '' } satisfies AttemptResult],
+    [
+      'a passed attempt',
+      { ...MISS, passed: true, attemptsLeft: undefined } satisfies AttemptResult,
+    ],
+    [
+      'a native-mode answer',
+      {
+        mode: 'native',
+        understood: false,
+        transcript: 'నేను రైలులో ప్రయాణిస్తాను.',
+        modelAnswer: 'She showed courage at work.',
+        feedback: 'That answer was about travel, not courage.',
+      } satisfies NativeAttemptResult,
+    ],
+  ])('leaves the cache untouched for %s', (_case, result) => {
+    const queryClient = seededClient();
+
+    applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, result);
+
+    expect(queryClient.getQueryData(QUERY_KEY)).toEqual(PAYLOAD);
+  });
+
+  it('does nothing when no question payload is cached', () => {
+    const queryClient = new QueryClient();
+    queryClients.push(queryClient);
+
+    applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, MISS);
+
+    expect(queryClient.getQueryData(QUERY_KEY)).toBeUndefined();
   });
 });

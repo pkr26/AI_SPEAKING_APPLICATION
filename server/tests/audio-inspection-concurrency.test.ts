@@ -443,8 +443,13 @@ describe('audio inspection concurrency', () => {
 
   it('kills a timed-out decoder, settles immediately, and releases its slot', async () => {
     vi.useFakeTimers();
+    // A burned inspection wall clock is transient backpressure (retryable
+    // 503), not a verdict on the recording.
     const timedOut = await startInspection();
-    const rejection = expect(timedOut.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    const rejection = expect(timedOut.result).resolves.toMatchObject({
+      status: 'rejected',
+      reason: { status: 503, extra: { retryAfterSeconds: 5 } },
+    });
 
     await vi.advanceTimersByTimeAsync(10_000);
     await rejection;

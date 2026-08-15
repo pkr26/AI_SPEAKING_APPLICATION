@@ -22,6 +22,7 @@ import {
   type DiagnosticAnswerResult,
   type Question,
 } from '../lib/types';
+import { useHardwareBack } from '../lib/use-hardware-back';
 
 export default function DiagnosticScreen() {
   const { user, setUser, logout, sessionVersion } = useAuth();
@@ -38,6 +39,18 @@ export default function DiagnosticScreen() {
   const [result, setResult] = useState<DiagnosticAnswerResult | null>(null);
   const [level, setLevel] = useState<CefrLevel | null>(null);
   const [stateIdentity, setStateIdentity] = useState(identityKey);
+  const [recorderLocked, setRecorderLocked] = useState(false);
+  // Mirrors the on-screen answer card for the /next effect below (effects must
+  // not depend on `result`, or clearing it would reapply the stale question).
+  const resultRef = useRef<DiagnosticAnswerResult | null>(null);
+  useEffect(() => {
+    resultRef.current = result;
+  }, [result]);
+
+  // The diagnostic is a root-like screen: Android hardware back would pop it
+  // mid-test, and the stale question then costs a 409 mismatch and minutes of
+  // recovery lock on re-entry.
+  useHardwareBack(() => true);
 
   useLayoutEffect(() => {
     // Local diagnostic progress is sensitive account data and is not stored in
@@ -63,6 +76,11 @@ export default function DiagnosticScreen() {
   useEffect(() => {
     const data = nextQuery.data;
     if (!data || !userId) return;
+    if (resultRef.current) return;
+    // An unacknowledged answer card outranks a background refetch: the stale
+    // /next response (pre-answer state) must not skip the learner past the
+    // result they have not acknowledged. advance() applies the next question
+    // locally when they continue.
     setStateIdentity(identityKey);
     setResult(null);
     if (data.done) {
@@ -222,14 +240,34 @@ export default function DiagnosticScreen() {
       <View style={styles.accountActions}>
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [styles.accountButton, pressed && styles.accountButtonPressed]}
+          accessibilityHint={
+            recorderLocked
+              ? 'Finish the current recording before managing your account.'
+              : undefined
+          }
+          accessibilityState={{ disabled: recorderLocked }}
+          disabled={recorderLocked}
+          style={({ pressed }) => [
+            styles.accountButton,
+            recorderLocked && styles.accountButtonDisabled,
+            pressed && styles.accountButtonPressed,
+          ]}
           onPress={openAccountMenu}
         >
           <Text style={styles.accountButtonText}>Account & privacy</Text>
         </Pressable>
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [styles.accountButton, pressed && styles.accountButtonPressed]}
+          accessibilityHint={
+            recorderLocked ? 'Finish the current recording before logging out.' : undefined
+          }
+          accessibilityState={{ disabled: recorderLocked }}
+          disabled={recorderLocked}
+          style={({ pressed }) => [
+            styles.accountButton,
+            recorderLocked && styles.accountButtonDisabled,
+            pressed && styles.accountButtonPressed,
+          ]}
           onPress={() => void handleLogout()}
         >
           <Text style={styles.accountButtonText}>Log out</Text>
@@ -274,6 +312,7 @@ export default function DiagnosticScreen() {
           onResult={handleResult}
           onError={handleError}
           onRecoveryUnresolved={handleRecoveryUnresolved}
+          onInteractionLockChange={setRecorderLocked}
         />
       )}
     </ScrollView>
@@ -317,6 +356,9 @@ const styles = StyleSheet.create({
   },
   accountButtonPressed: {
     backgroundColor: colors.card,
+  },
+  accountButtonDisabled: {
+    opacity: 0.5,
   },
   accountActions: {
     alignSelf: 'flex-start',

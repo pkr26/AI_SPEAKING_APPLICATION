@@ -17,6 +17,8 @@
     "start": "node dist/src/index.js",
     "smoke": "node scripts/smoke.mjs",
     "smoke:concurrent": "node scripts/concurrent-smoke.mjs",
+    "smoke:load1000": "node scripts/load-1000.mjs",
+    "verify:load1000": "node scripts/verify-1000.mjs",
     "test": "vitest run --coverage",
     "test:quick": "vitest run",
     "mutation": "npm run mutation:code && npm run mutation:catalog",

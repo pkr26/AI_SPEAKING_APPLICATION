@@ -291,4 +291,31 @@ describe('errorHandler', () => {
   it('keeps a stable HttpError identity for routing and diagnostics', () => {
     expect(new HttpError(418, 'teapot').name).toBe('HttpError');
   });
+
+  it('drops the error response quietly when the client is already gone', () => {
+    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      const res = {
+        writableEnded: false,
+        destroyed: false,
+        end: vi.fn(),
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn(),
+        set: vi.fn(),
+      } as unknown as express.Response;
+      const req = { socket: { destroyed: true }, id: 'req-gone' } as unknown as express.Request;
+      errorHandler(new Error('ENOENT from the temp-file close race'), req, res, vi.fn());
+      expect(info).toHaveBeenCalledWith(
+        { err: expect.any(Error), requestId: 'req-gone' },
+        'client gone before error response; dropping it',
+      );
+      expect(error).not.toHaveBeenCalled();
+      expect(res.end).toHaveBeenCalledOnce();
+      expect(res.status).not.toHaveBeenCalled();
+    } finally {
+      info.mockRestore();
+      error.mockRestore();
+    }
+  });
 });

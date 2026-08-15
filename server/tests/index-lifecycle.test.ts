@@ -28,12 +28,15 @@ const runtime = vi.hoisted(() => {
     createServer: vi.fn(() => server),
     createApp: vi.fn(() => vi.fn()),
     poolEnd: vi.fn(async (): Promise<void> => undefined),
+    poolQuery: vi.fn(async () => ({ rows: [{ max_connections: '100' }] })),
     cleanupUploads: vi.fn(async () => 0),
     cleanupRequests: vi.fn(async () => 0),
     cleanupRateLimits: vi.fn(async () => 0),
+    cleanupUsage: vi.fn(async () => 0),
     assertSchema: vi.fn(async (): Promise<void> => undefined),
     assertAudio: vi.fn(async (): Promise<void> => undefined),
     trustProxy: false as false | number,
+    dbPoolMax: 20,
   };
 });
 
@@ -49,13 +52,17 @@ vi.mock('../src/config', () => ({
     get trustProxy() {
       return runtime.trustProxy;
     },
+    get dbPoolMax() {
+      return runtime.dbPoolMax;
+    },
   },
 }));
-vi.mock('../src/db', () => ({ pool: { end: runtime.poolEnd } }));
+vi.mock('../src/db', () => ({ pool: { end: runtime.poolEnd, query: runtime.poolQuery } }));
 vi.mock('../src/logger', () => ({ logger: runtime.logger }));
 vi.mock('../src/upload', () => ({ cleanupOldUploads: runtime.cleanupUploads }));
 vi.mock('../src/idempotency', () => ({ cleanupAssessmentRequests: runtime.cleanupRequests }));
 vi.mock('../src/postgres-rate-limit-store', () => ({ cleanupRateLimitWindows: runtime.cleanupRateLimits }));
+vi.mock('../src/assess', () => ({ cleanupAssessmentUsage: runtime.cleanupUsage }));
 vi.mock('../src/schema-readiness', () => ({ assertDatabaseSchemaCurrent: runtime.assertSchema }));
 vi.mock('../src/audio-inspection', () => ({ assertAudioInspectorAvailable: runtime.assertAudio }));
 
@@ -73,6 +80,8 @@ beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
   runtime.trustProxy = false;
+  runtime.dbPoolMax = 20;
+  runtime.poolQuery.mockResolvedValue({ rows: [{ max_connections: '100' }] });
   runtime.server.listening = false;
   runtime.server.listen.mockImplementation((_: number, callback?: () => void) => {
     runtime.server.listening = true;
@@ -88,6 +97,7 @@ beforeEach(() => {
   runtime.cleanupUploads.mockResolvedValue(0);
   runtime.cleanupRequests.mockResolvedValue(0);
   runtime.cleanupRateLimits.mockResolvedValue(0);
+  runtime.cleanupUsage.mockResolvedValue(0);
   runtime.assertSchema.mockResolvedValue(undefined);
   runtime.assertAudio.mockResolvedValue(undefined);
   originalSigtermListeners = new Set(process.listeners('SIGTERM'));
@@ -135,13 +145,44 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
 
+  it('errors at boot when DB_POOL_MAX would starve the server, and stays quiet with headroom', async () => {
+    runtime.dbPoolMax = 100;
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.logger.error).toHaveBeenCalledWith(
+      { dbPoolMax: 100, maxConnections: 100 },
+      'DB_POOL_MAX leaves fewer than 3 database connections for admin, migration, and readiness clients; reduce DB_POOL_MAX or raise max_connections',
+    );
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+
+    // A pool that leaves at least three server connections boots without the error.
+    runtime.dbPoolMax = 20;
+    runtime.logger.error.mockClear();
+    runtime.server.listen.mockClear();
+    vi.resetModules();
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(
+      runtime.logger.error.mock.calls.filter(([, message]) => String(message).includes('DB_POOL_MAX')),
+    ).toHaveLength(0);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
   it('contains every boot janitor rejection and reports it without blocking startup', async () => {
     const uploadError = new Error('upload cleanup failed');
     const replayError = new Error('replay cleanup failed');
     const rateLimitError = new Error('rate-limit cleanup failed');
+    const usageError = new Error('usage cleanup failed');
     runtime.cleanupUploads.mockRejectedValueOnce(uploadError);
     runtime.cleanupRequests.mockRejectedValueOnce(replayError);
     runtime.cleanupRateLimits.mockRejectedValueOnce(rateLimitError);
+    runtime.cleanupUsage.mockRejectedValueOnce(usageError);
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
 
     await import('../src/index');
@@ -151,6 +192,7 @@ describe('server lifecycle failure handling', () => {
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: uploadError }, 'upload janitor failed');
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: replayError }, 'assessment replay janitor failed');
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: rateLimitError }, 'rate-limit janitor failed');
+      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: usageError }, 'assessment usage janitor failed');
     });
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
@@ -161,6 +203,7 @@ describe('server lifecycle failure handling', () => {
     runtime.cleanupUploads.mockResolvedValueOnce(2);
     runtime.cleanupRequests.mockResolvedValueOnce(3);
     runtime.cleanupRateLimits.mockResolvedValueOnce(4);
+    runtime.cleanupUsage.mockResolvedValueOnce(5);
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
 
     await import('../src/index');
@@ -168,6 +211,10 @@ describe('server lifecycle failure handling', () => {
       expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 2 }, 'janitor removed stale uploads');
       expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 3 }, 'janitor removed expired assessment replays');
       expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 4 }, 'janitor removed expired rate-limit counters');
+      expect(runtime.logger.info).toHaveBeenCalledWith(
+        { removed: 5 },
+        'janitor removed expired assessment reservations',
+      );
     });
 
     runtime.logger.info.mockClear();
@@ -198,19 +245,25 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.cleanupUploads).not.toHaveBeenCalled();
     expect(runtime.cleanupRequests).not.toHaveBeenCalled();
     expect(runtime.cleanupRateLimits).not.toHaveBeenCalled();
+    expect(runtime.cleanupUsage).not.toHaveBeenCalled();
     expect(setIntervalSpy).not.toHaveBeenCalled();
 
     releaseSchema();
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
+    // One extra tick: the awaited DB_POOL_MAX vs max_connections guard now runs
+    // between the dependency checks and listen().
+    await Promise.resolve();
 
     expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function));
     expect(runtime.cleanupUploads).toHaveBeenCalledOnce();
     expect(runtime.cleanupRequests).toHaveBeenCalledOnce();
     expect(runtime.cleanupRateLimits).toHaveBeenCalledOnce();
+    expect(runtime.cleanupUsage).toHaveBeenCalledOnce();
     expect(setIntervalSpy.mock.calls.map(([, delay]) => delay)).toEqual([
       15 * 60 * 1000,
+      60 * 60 * 1000,
       60 * 60 * 1000,
       60 * 60 * 1000,
     ]);
@@ -219,23 +272,26 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.cleanupUploads).toHaveBeenCalledTimes(5);
     expect(runtime.cleanupRequests).toHaveBeenCalledTimes(2);
     expect(runtime.cleanupRateLimits).toHaveBeenCalledTimes(2);
+    expect(runtime.cleanupUsage).toHaveBeenCalledTimes(2);
 
     addedSignalListener('SIGTERM')('SIGTERM');
     await Promise.resolve();
     await Promise.resolve();
     expect(exit).toHaveBeenCalledWith(0);
-    expect(clearIntervalSpy).toHaveBeenCalledTimes(3);
+    expect(clearIntervalSpy).toHaveBeenCalledTimes(4);
 
     const callsAfterShutdown = [
       runtime.cleanupUploads.mock.calls.length,
       runtime.cleanupRequests.mock.calls.length,
       runtime.cleanupRateLimits.mock.calls.length,
+      runtime.cleanupUsage.mock.calls.length,
     ];
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
     expect([
       runtime.cleanupUploads.mock.calls.length,
       runtime.cleanupRequests.mock.calls.length,
       runtime.cleanupRateLimits.mock.calls.length,
+      runtime.cleanupUsage.mock.calls.length,
     ]).toEqual(callsAfterShutdown);
   });
 

@@ -120,8 +120,29 @@ export const validate =
   };
 
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction) {
+  // The client disconnected (or the response otherwise ended) before this
+  // error surfaced: nobody will read the status, and writing to a dead socket
+  // risks secondary stream errors. Log compactly instead of the ERROR-level
+  // "unhandled error" noise an abandoned upload otherwise produces (e.g. the
+  // temp-file close listener deletes the audio out from under the handler).
+  // Detect via the socket: `req.destroyed` is NOT safe here — it flips true
+  // once a multipart body has been fully consumed (stream auto-destroy).
+  if (res.writableEnded || res.destroyed || req.socket.destroyed) {
+    logger.info({ err, requestId: req.id }, 'client gone before error response; dropping it');
+    if (!res.writableEnded && !res.destroyed) res.end();
+    return;
+  }
   if (err instanceof HttpError) {
     return res.status(err.status).json({ error: err.message, ...err.extra });
+  }
+  // A saturated pg pool (pg-pool's acquisition timeout) is transient
+  // backpressure, not an application fault: shed the request with 503 +
+  // Retry-After so clients back off, never a raw 500. Proven under a
+  // 1000-user signup burst, where these surfaced on every route.
+  if (err instanceof Error && err.message === 'timeout exceeded when trying to connect') {
+    logger.warn({ requestId: req.id }, 'database pool saturated; shedding request');
+    res.set('Retry-After', '5');
+    return res.status(503).json({ error: 'Server is busy, please try again shortly', retryAfterSeconds: 5 });
   }
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {

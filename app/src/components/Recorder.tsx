@@ -29,7 +29,7 @@ import {
   apiRequestAudioUpload,
   apiUploadAudio,
   AUDIO_TIMEOUT_MS,
-  audioFileDescriptor,
+  resolveAudioFileDescriptor,
   userMessageForError,
 } from '../lib/api';
 import {
@@ -65,9 +65,12 @@ interface RecorderProps<T> {
 let activeRecoveryOwner: symbol | null = null;
 
 const MAX_RECORDING_SECONDS = 120;
+const AUTO_STOP_TAP_GRACE_MS = 1_000;
 const RECOVERY_LEASE_MS = 5 * 60_000;
 const RECOVERY_RECORD_TTL_MS = 25 * 60 * 60_000;
 const RECOVERY_REQUEST_TIMEOUT_MS = 5_000;
+const MAX_CAPACITY_RETRIES = 3;
+const CAPACITY_RETRY_MAX_DELAY_MS = 30_000;
 const RECOVERY_POLL_MS = 2_000;
 const NOT_FOUND_CONFIRMATIONS = 3;
 const MAX_S3_RESUBMISSIONS = 3;
@@ -113,6 +116,16 @@ function deleteRecording(uri: string | null): void {
   }
 }
 
+function recordingFileExists(uri: string): boolean {
+  // Web blob URIs carry no file metadata; only native URIs can be verified.
+  if (!uri.startsWith('file:')) return true;
+  try {
+    return new File(uri).exists;
+  } catch {
+    return false;
+  }
+}
+
 /** Shared recorder for diagnostic and practice assessment. */
 export default function Recorder<T>({
   ownerId,
@@ -145,6 +158,7 @@ export default function Recorder<T>({
   const lifecycleEpochRef = useRef(0);
   const recordingStartedAtRef = useRef<number | null>(null);
   const hasObservedRecordingRef = useRef(false);
+  const autoStoppedAtRef = useRef<number | null>(null);
   const previousIdentityRef = useRef({ ownerId, endpoint, questionId });
   const requestIdRef = useRef<string | null>(null);
   const recoveringRef = useRef(false);
@@ -247,6 +261,7 @@ export default function Recorder<T>({
       discardRecording(candidateUri);
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
+      autoStoppedAtRef.current = null;
       operationRef.current = false;
       if (mountedRef.current) setRecordedDurationMillis(0);
       updatePhase('idle');
@@ -424,6 +439,7 @@ export default function Recorder<T>({
       };
 
       let notFoundCount = 0;
+      let resubmissionConflictPending = false;
       const recoveryStartedAt = Date.now();
       // Every restart gets one bounded reconciliation window. `createdAt`
       // describes the original handoff, not the current recovery attempt; an
@@ -445,6 +461,7 @@ export default function Recorder<T>({
           );
           if (!isCurrent()) return;
           notFoundCount = 0;
+          resubmissionConflictPending = false;
           if (!status || typeof status !== 'object' || !('status' in status)) {
             await finishUnresolved(
               'The server returned an invalid recovery response. Your learning state has been refreshed.',
@@ -559,6 +576,16 @@ export default function Recorder<T>({
           if (!isCurrent()) return;
           if (error instanceof ApiError && error.status === 404) {
             notFoundCount += 1;
+            if (resubmissionConflictPending) {
+              // The 409 was never this request's own in-flight row — that row
+              // would have answered this status read. Its claim was abandoned:
+              // the question moved on, or another session owns it.
+              await finishUnresolved(
+                'This answer was already submitted or the question has moved on. Your learning state has been refreshed.',
+                true,
+              );
+              return;
+            }
             const absenceConfirmed =
               notFoundCount >= NOT_FOUND_CONFIRMATIONS && Date.now() - recoveryStartedAt >= 10_000;
             // A lone 404 can race the original assessment POST before its
@@ -624,6 +651,16 @@ export default function Recorder<T>({
               } catch (retryError) {
                 if (!isCurrent()) return;
                 if (retryError instanceof ApiError && retryError.status === 401) return;
+                // A 409 here is genuinely ambiguous: either this requestId's
+                // idempotency row appeared between the 404 absence checks and
+                // is still processing (the next status read will answer
+                // 'processing'/'completed'), or its claim was abandoned —
+                // another session owns the question, or the diagnostic moved
+                // on — and the next read stays 404. Defer the decision to that
+                // read instead of polling an abandoned row for the full lease.
+                if (retryError instanceof ApiError && retryError.status === 409) {
+                  resubmissionConflictPending = true;
+                }
                 if (
                   retryError instanceof ApiError &&
                   [400, 403, 404, 413, 415, 422].includes(retryError.status)
@@ -794,6 +831,7 @@ export default function Recorder<T>({
           : 0;
         activeUriRef.current = uri;
         recordingStartedAtRef.current = null;
+        autoStoppedAtRef.current = Date.now();
         setRecordedDurationMillis(
           Math.min(
             MAX_RECORDING_SECONDS * 1000,
@@ -884,6 +922,7 @@ export default function Recorder<T>({
       }
       recordingStartedAtRef.current = Date.now();
       hasObservedRecordingRef.current = false;
+      autoStoppedAtRef.current = null;
       recorder.record({ forDuration: MAX_RECORDING_SECONDS });
       updatePhase('recording');
     } catch {
@@ -915,11 +954,11 @@ export default function Recorder<T>({
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
+    const durationBeforeStop = Math.max(
+      recorderState.durationMillis ?? 0,
+      recordingStartedAtRef.current ? Date.now() - recordingStartedAtRef.current : 0,
+    );
     try {
-      const durationBeforeStop = Math.max(
-        recorderState.durationMillis ?? 0,
-        recordingStartedAtRef.current ? Date.now() - recordingStartedAtRef.current : 0,
-      );
       await stopNativeRecording();
       const uri = recorder.uri;
       if (!isCurrentLifecycle()) {
@@ -940,14 +979,30 @@ export default function Recorder<T>({
       setRecordedDurationMillis(durationBeforeStop);
       updatePhase('recorded');
     } catch {
-      discardRecording(recorder.uri);
+      // recorder.stop() can reject when the 2:00 auto-stop already finalized
+      // this take natively. A completed file is a valid answer; keep it, and
+      // only discard when no saved recording actually exists.
+      const uri = recorder.uri;
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
-      updatePhase('idle');
-      if (isCurrentLifecycle()) {
-        callbacksRef.current.onError(
-          'Could not save the recording. Please record your answer again.',
-        );
+      if (
+        uri &&
+        !recorder.isRecording &&
+        recordingFileExists(uri) &&
+        durationBeforeStop >= 500 &&
+        isCurrentLifecycle()
+      ) {
+        activeUriRef.current = uri;
+        setRecordedDurationMillis(Math.min(MAX_RECORDING_SECONDS * 1000, durationBeforeStop));
+        updatePhase('recorded');
+      } else {
+        discardRecording(uri);
+        updatePhase('idle');
+        if (isCurrentLifecycle()) {
+          callbacksRef.current.onError(
+            'Could not save the recording. Please record your answer again.',
+          );
+        }
       }
     } finally {
       await restoreAudioMode().catch(() => undefined);
@@ -1025,10 +1080,52 @@ export default function Recorder<T>({
       // direct multipart to the API in local dev. The assessment requestId is
       // claimed by the answer endpoint either way, so the idempotency and
       // recovery flow below is identical for both paths.
-      const descriptor = audioFileDescriptor(uri);
+      const descriptor = await resolveAudioFileDescriptor(uri);
+      if (!isCurrentSubmission()) return;
       const grant = await apiRequestAudioUpload(descriptor.type, ownerId);
       if (!isCurrentSubmission()) return;
       let raw: unknown;
+      // The 503 backpressure contract (assess semaphore, database pool shed)
+      // asks clients to retry the SAME logical submission after Retry-After.
+      // The idempotency row is abandoned on a 503, so resubmitting this
+      // requestId is safe; anything else falls through to recovery as before.
+      const postAssessment = async (): Promise<unknown> => {
+        let capacityRetries = 0;
+        for (;;) {
+          try {
+            if (grant.mode === 's3') {
+              return await apiFetch<unknown>(endpoint, {
+                method: 'POST',
+                body: { questionId, requestId, audioKey: grant.audioKey },
+                signal: controller.signal,
+                timeoutMs: AUDIO_TIMEOUT_MS,
+              });
+            }
+            return await apiUploadAudio<unknown>(
+              endpoint,
+              uri,
+              { questionId, requestId },
+              { signal: controller.signal },
+            );
+          } catch (error) {
+            if (
+              controller.signal.aborted ||
+              !(error instanceof ApiError) ||
+              error.status !== 503 ||
+              capacityRetries >= MAX_CAPACITY_RETRIES
+            ) {
+              throw error;
+            }
+            capacityRetries += 1;
+            const delayMs = Math.min(
+              CAPACITY_RETRY_MAX_DELAY_MS,
+              Math.max(1_000, Math.round((error.retryAfterSeconds ?? 5) * 1_000)),
+            );
+            await new Promise((resolve) => setTimeout(resolve, delayMs));
+            if (!isCurrentSubmission()) throw error;
+          }
+        }
+      };
       if (grant.mode === 's3') {
         if (!(await markPendingAssessmentStage(requestId, 's3-granted', grant.audioKey))) {
           // The tombstone vanished before anything was uploaded. Keep the
@@ -1052,12 +1149,7 @@ export default function Recorder<T>({
           { signal: controller.signal },
         );
         if (!isCurrentSubmission()) return;
-        raw = await apiFetch<unknown>(endpoint, {
-          method: 'POST',
-          body: { questionId, requestId, audioKey: grant.audioKey },
-          signal: controller.signal,
-          timeoutMs: AUDIO_TIMEOUT_MS,
-        });
+        raw = await postAssessment();
       } else {
         if (!(await markPendingAssessmentStage(requestId, 'direct-posting'))) {
           // Same vanished-tombstone handling as the S3 branch above.
@@ -1070,12 +1162,7 @@ export default function Recorder<T>({
           return;
         }
         if (!isCurrentSubmission()) return;
-        raw = await apiUploadAudio<unknown>(
-          endpoint,
-          uri,
-          { questionId, requestId },
-          { signal: controller.signal },
-        );
+        raw = await postAssessment();
       }
       if (!isCurrentSubmission()) {
         recoverAfterUpload = true;
@@ -1166,6 +1253,22 @@ export default function Recorder<T>({
   };
 
   const isRecording = phase === 'recording';
+
+  const handleMicPress = () => {
+    if (isRecording) return stopRecording();
+    // The 2:00 native auto-stop can flip the phase to 'recorded' just as the
+    // learner taps to stop; treating that tap as a re-record would destroy
+    // the take they just captured. Ignore mic presses briefly after an
+    // auto-stop; the explicit Re-record action stays available.
+    if (
+      autoStoppedAtRef.current !== null &&
+      Date.now() - autoStoppedAtRef.current < AUTO_STOP_TAP_GRACE_MS
+    ) {
+      return Promise.resolve();
+    }
+    return startRecording();
+  };
+
   const busy = phase === 'uploading' || phase === 'recovering';
   const elapsed = formatElapsed(
     phase === 'recorded' ? recordedDurationMillis : (recorderState.durationMillis ?? 0),
@@ -1212,7 +1315,7 @@ export default function Recorder<T>({
           accessibilityLabel={isRecording ? 'Stop recording' : 'Start recording'}
           accessibilityState={{ disabled: busy }}
           disabled={busy}
-          onPress={isRecording ? stopRecording : startRecording}
+          onPress={handleMicPress}
           style={({ pressed }) => [
             styles.recordButton,
             isRecording && styles.recordButtonActive,

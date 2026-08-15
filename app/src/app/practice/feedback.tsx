@@ -8,6 +8,7 @@ import { useAuth } from '../../lib/auth';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
 import { isNativeOutcome, type NativeLanguage } from '../../lib/types';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 type Variant =
   'native' | 'native-nospeech' | 'nospeech' | 'mastered' | 'passed' | 'retry' | 'final';
@@ -36,37 +37,21 @@ export default function FeedbackScreen() {
   const result = feedback?.result ?? null;
   const questionId = feedback?.questionId ?? null;
 
-  if (!result) {
-    return (
-      <View style={styles.center}>
-        <Text accessibilityRole="header" style={styles.title}>
-          No result to show
-        </Text>
-        <Text style={styles.body}>Something went wrong displaying this feedback.</Text>
-        <Pressable
-          accessibilityRole="button"
-          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
-          onPress={() => router.replace('/practice')}
-        >
-          <Text style={styles.primaryButtonText}>Back to Practice</Text>
-        </Pressable>
-      </View>
-    );
-  }
-
-  const variant: Variant = isNativeOutcome(result)
-    ? result.transcript === ''
-      ? 'native-nospeech'
-      : 'native'
-    : result.noSpeech
-      ? 'nospeech'
-      : result.passed
-        ? result.mastered
-          ? 'mastered'
-          : 'passed'
-        : (result.attemptsLeft ?? 0) > 0
-          ? 'retry'
-          : 'final';
+  const variant: Variant | null = !result
+    ? null
+    : isNativeOutcome(result)
+      ? result.transcript === ''
+        ? 'native-nospeech'
+        : 'native'
+      : result.noSpeech
+        ? 'nospeech'
+        : result.passed
+          ? result.mastered
+            ? 'mastered'
+            : 'passed'
+          : (result.attemptsLeft ?? 0) > 0
+            ? 'retry'
+            : 'final';
 
   const backToPractice = () => {
     clearFeedback();
@@ -84,7 +69,7 @@ export default function FeedbackScreen() {
   };
 
   const goToNextQuestion = () => {
-    if (!user) return;
+    if (!user || !result) return;
     if (!isNativeOutcome(result) && result.next) {
       queryClient.setQueryData(['practice-question', user.id, user.cefrLevel], result.next);
     } else {
@@ -102,6 +87,42 @@ export default function FeedbackScreen() {
     router.dismissTo('/practice');
     router.push({ pathname: '/practice/help', params: { questionId } });
   };
+
+  // Android hardware back would pop this screen without advancing the cached
+  // question, re-issuing the last assessed question. Route it through the
+  // same handler as each variant's primary on-screen action.
+  useHardwareBack(() => {
+    if (variant === 'retry' || variant === 'nospeech') {
+      retry();
+    } else if (variant === 'native') {
+      tryInEnglish();
+    } else if (variant === 'native-nospeech') {
+      backToPractice();
+    } else if (variant) {
+      goToNextQuestion();
+    } else {
+      router.replace('/practice');
+    }
+    return true;
+  });
+
+  if (!result) {
+    return (
+      <View style={styles.center}>
+        <Text accessibilityRole="header" style={styles.title}>
+          No result to show
+        </Text>
+        <Text style={styles.body}>Something went wrong displaying this feedback.</Text>
+        <Pressable
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+          onPress={() => router.replace('/practice')}
+        >
+          <Text style={styles.primaryButtonText}>Back to Practice</Text>
+        </Pressable>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.container}>
@@ -147,8 +168,8 @@ export default function FeedbackScreen() {
               We couldn&apos;t hear you
             </Text>
             <Text style={styles.subtitle}>
-              Don&apos;t worry — this didn&apos;t count as an attempt. Hold the button and speak
-              clearly, or get help first.
+              Don&apos;t worry — this didn&apos;t count as an attempt. Tap the record button, speak
+              clearly, then tap it again to stop — or get help first.
             </Text>
           </>
         )}

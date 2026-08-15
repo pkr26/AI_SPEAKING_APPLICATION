@@ -41,10 +41,16 @@ export async function claimAssessmentRequest(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Only this claim's own expired row can block the insert below, so the
+    // delete is scoped to it. An unscoped sweep here would scan and row-lock
+    // every stale row cluster-wide on the hottest path; the hourly janitor
+    // (cleanupAssessmentRequests) owns the global sweep.
     await client.query(
       `DELETE FROM assessment_requests
-       WHERE (status = 'processing' AND started_at < now() - interval '5 minutes')
-          OR (status = 'completed' AND completed_at < now() - interval '1 day')`,
+       WHERE user_id = $1 AND request_id = $2
+         AND ((status = 'processing' AND started_at < now() - interval '5 minutes')
+           OR (status = 'completed' AND completed_at < now() - interval '1 day'))`,
+      [userId, requestId],
     );
     const requestClaimId = randomUUID();
     const inserted = await client.query(

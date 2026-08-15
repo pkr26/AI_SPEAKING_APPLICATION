@@ -1,6 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { EventEmitter } from 'node:events';
 import express from 'express';
 import request from 'supertest';
+import { ipKeyGenerator } from 'express-rate-limit';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
@@ -325,6 +327,25 @@ describe('rate limiters', () => {
     }
   });
 
+  it('sheds an increment database failure as retryable 503 backpressure, never a 500', async () => {
+    const namespace = 'store-increment-brownout';
+    const store = new PostgresRateLimitStore(namespace, 60_000);
+    const failure = new Error('timeout exceeded when trying to connect');
+    const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      await expect(store.increment('learner')).rejects.toMatchObject({
+        status: 503,
+        message: 'Server is busy, please try again shortly',
+        extra: { retryAfterSeconds: 5 },
+      });
+      expect(warn).toHaveBeenCalledWith({ err: failure, namespace }, 'rate-limit increment failed; shedding request');
+    } finally {
+      warn.mockRestore();
+      query.mockRestore();
+    }
+  });
+
   it('never lets a refund failure escape (express-rate-limit decrements fire-and-forget)', async () => {
     const store = new PostgresRateLimitStore('store-fail-safe', 60_000);
     const query = vi.spyOn(pool, 'query').mockRejectedValue(new Error('database unavailable'));
@@ -334,6 +355,75 @@ describe('rate limiters', () => {
     } finally {
       query.mockRestore();
     }
+  });
+
+  describe('assessAbortGuard', () => {
+    function fakeResponse(locals: Record<string, unknown>, writableEnded = false) {
+      const res = new EventEmitter() as EventEmitter & {
+        locals: Record<string, unknown>;
+        writableEnded: boolean;
+      };
+      res.locals = locals;
+      res.writableEnded = writableEnded;
+      return res;
+    }
+
+    it('re-spends both assessment counters when a client aborts after the capacity reservation', async () => {
+      const increment = vi
+        .spyOn(PostgresRateLimitStore.prototype, 'increment')
+        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const res = fakeResponse({ assessmentCapacityReserved: true });
+        const next = vi.fn();
+        limiters.assessAbortGuard(req, res as never, next);
+        expect(next).toHaveBeenCalledOnce();
+        expect(increment).not.toHaveBeenCalled();
+
+        res.emit('close');
+        await vi.waitFor(() => expect(increment).toHaveBeenCalledTimes(2));
+        const keys = increment.mock.calls.map(([key]) => key);
+        expect(keys).toContain('user:user-1');
+        expect(keys).toContain(ipKeyGenerator('127.0.0.1'));
+      } finally {
+        increment.mockRestore();
+      }
+    });
+
+    it('leaves the close-path refund alone when no paid work was reserved', async () => {
+      const increment = vi
+        .spyOn(PostgresRateLimitStore.prototype, 'increment')
+        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const res = fakeResponse({});
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+        res.emit('close');
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(increment).not.toHaveBeenCalled();
+      } finally {
+        increment.mockRestore();
+      }
+    });
+
+    it('ignores a close that follows a normally finished response', async () => {
+      const increment = vi
+        .spyOn(PostgresRateLimitStore.prototype, 'increment')
+        .mockResolvedValue({ totalHits: 1, resetTime: new Date() });
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const res = fakeResponse({ assessmentCapacityReserved: true }, true);
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+        res.emit('close');
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(increment).not.toHaveBeenCalled();
+      } finally {
+        increment.mockRestore();
+      }
+    });
   });
 
   it('logs exact diagnostic context when fail-safe store cleanup fails', async () => {

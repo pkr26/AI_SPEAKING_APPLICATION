@@ -228,6 +228,14 @@ ok(
   JSON.stringify(r.body),
 );
 ok(
+  'practice/question returns kind + progress',
+  (r.body.kind === 'new' || r.body.kind === 'revision') &&
+    typeof r.body.progress?.masteredCount === 'number' &&
+    typeof r.body.progress?.learningCount === 'number' &&
+    typeof r.body.progress?.totalAtLevel === 'number',
+  JSON.stringify(r.body),
+);
+ok(
   'practice/question is no-store',
   (r.headers.get('cache-control') || '').includes('no-store'),
   r.headers.get('cache-control'),
@@ -296,7 +304,8 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
   );
   if (r.body.passed) {
     sawPass = true;
-    ok('pass response has nextQuestion', questionShape(r.body.nextQuestion), JSON.stringify(r.body));
+    ok('pass response has mastered flag', typeof r.body.mastered === 'boolean', JSON.stringify(r.body));
+    ok('pass response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
   } else if (r.body.attemptsLeft === 0) {
     sawFinal = true;
     ok('final-fail response has attemptNo 3', r.body.attemptNo === 3, JSON.stringify(r.body));
@@ -308,11 +317,11 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
         r.body.finalFeedback.includes("Let's move on!"),
       JSON.stringify(r.body),
     );
-    ok('final-fail response has nextQuestion', questionShape(r.body.nextQuestion), JSON.stringify(r.body));
+    ok('final-fail response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
   } else {
     ok(
       `fail response attemptNo ${r.body.attemptNo} has attemptsLeft ${3 - r.body.attemptNo}`,
-      r.body.attemptsLeft === 3 - r.body.attemptNo && !('nextQuestion' in r.body),
+      r.body.attemptsLeft === 3 - r.body.attemptNo && !('next' in r.body),
       JSON.stringify(r.body),
     );
   }
@@ -324,6 +333,19 @@ r = await req('POST', '/practice/attempt', { token, form: audioForm(practiceQ.id
 ok(
   'attemptNo resets to 1 after a pass or a 3rd failure',
   r.status === 200 && r.body.attemptNo === 1,
+  JSON.stringify(r.body),
+);
+
+// Native-language mode: comprehension only, never writes mastery.
+r = await req('POST', '/practice/attempt/native', { token, form: audioForm(practiceQ.id) });
+ok(
+  'native attempt returns comprehension result',
+  r.status === 200 &&
+    r.body.mode === 'native' &&
+    typeof r.body.understood === 'boolean' &&
+    typeof r.body.transcript === 'string' &&
+    typeof r.body.modelAnswer === 'string' &&
+    typeof r.body.feedback === 'string',
   JSON.stringify(r.body),
 );
 

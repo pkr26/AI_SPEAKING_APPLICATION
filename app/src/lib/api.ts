@@ -3,7 +3,12 @@ import { File, UploadType } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
-import { ContractError, parseAudioUploadGrant, type AudioUploadGrant } from './types';
+import {
+  audioKeyBelongsToOwner,
+  ContractError,
+  parseAudioUploadGrant,
+  type AudioUploadGrant,
+} from './types';
 
 const TOKEN_KEY = 'auth_token';
 const TOKEN_KEYCHAIN_SERVICE = 'ai-english-coach.auth-token';
@@ -346,14 +351,22 @@ export async function apiUploadAudio<T>(
  * short-lived, size-constrained S3 POST grant; in local dev it answers `direct` and the
  * caller falls back to multipart upload (`apiUploadAudio`).
  */
-export async function apiRequestAudioUpload(contentType: string): Promise<AudioUploadGrant> {
+export async function apiRequestAudioUpload(
+  contentType: string,
+  ownerId: string,
+): Promise<AudioUploadGrant> {
   const raw = await apiFetch<unknown>('/uploads/audio-url', {
     method: 'POST',
     body: { contentType },
   });
   const grant = parseAudioUploadGrant(raw);
-  if (grant.mode === 's3' && grant.contentType !== contentType.trim().toLowerCase()) {
-    throw new ContractError();
+  if (grant.mode === 's3') {
+    if (
+      grant.contentType !== contentType.trim().toLowerCase() ||
+      !audioKeyBelongsToOwner(grant.audioKey, ownerId)
+    ) {
+      throw new ContractError();
+    }
   }
   return grant;
 }

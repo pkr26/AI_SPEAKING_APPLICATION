@@ -1,8 +1,10 @@
 import * as SecureStore from 'expo-secure-store';
 
 import { isUuid } from './params';
+import { audioKeyBelongsToOwner } from './types';
 
-export type AssessmentEndpoint = '/diagnostic/answer' | '/practice/attempt';
+export type AssessmentEndpoint =
+  '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
 
 export interface PendingAssessment {
   ownerId: string;
@@ -24,21 +26,6 @@ let memoryValue: PendingAssessment | null = null;
 let memoryLoaded = false;
 let storageQueue: Promise<void> = Promise.resolve();
 
-function isOwnedAudioKey(ownerId: string, audioKey: string): boolean {
-  const [prefix, keyOwnerId, filename, extra] = audioKey.split('/');
-  return (
-    extra === undefined &&
-    prefix === 'audio-uploads' &&
-    keyOwnerId === ownerId &&
-    // Server-issuable key extensions: mirrors AUDIO_CONTENT_TYPE_TO_EXT in
-    // types.ts (the server derives .m4a for MP4-family and .ogg for Ogg-family
-    // content types, so .mp4/.oga keys are never issued).
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
-      filename ?? '',
-    )
-  );
-}
-
 function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   const result = storageQueue.then(operation, operation);
   storageQueue = result.then(
@@ -55,7 +42,9 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
     !isUuid(candidate.ownerId) ||
     !isUuid(candidate.questionId) ||
     !isUuid(candidate.requestId) ||
-    (candidate.endpoint !== '/diagnostic/answer' && candidate.endpoint !== '/practice/attempt') ||
+    (candidate.endpoint !== '/diagnostic/answer' &&
+      candidate.endpoint !== '/practice/attempt' &&
+      candidate.endpoint !== '/practice/attempt/native') ||
     typeof candidate.createdAt !== 'number' ||
     !Number.isFinite(candidate.createdAt) ||
     candidate.createdAt <= 0
@@ -84,7 +73,7 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
   if (
     stage === 's3-granted' &&
     (typeof candidate.audioKey !== 'string' ||
-      !isOwnedAudioKey(candidate.ownerId, candidate.audioKey))
+      !audioKeyBelongsToOwner(candidate.audioKey, candidate.ownerId))
   ) {
     return null;
   }

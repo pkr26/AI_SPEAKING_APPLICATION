@@ -51,21 +51,42 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const level = await completeDiagnostic(a, token);
-    const questions = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1', [level]);
+    const questions = await pool.query<{ id: string; promptWord: string }>(
+      'SELECT id, prompt_word AS "promptWord" FROM questions WHERE cefr_level = $1',
+      [level],
+    );
     const movedQuestionIds = questions.rows.map(({ id }) => id);
+    const originalPromptWords = questions.rows.map(({ promptWord }) => promptWord);
+    expect(movedQuestionIds.length).toBeGreaterThan(0);
     const temporaryLevel = level === 'A1' ? 'A2' : 'A1';
+    const temporaryPromptPrefix = `empty-level-test-${randomUUID()}-`;
+    let catalogMoved = false;
 
-    await pool.query('UPDATE questions SET cefr_level = $1 WHERE id = ANY($2::uuid[])', [
-      temporaryLevel,
-      movedQuestionIds,
-    ]);
     try {
+      const moved = await pool.query(
+        `UPDATE questions
+         SET cefr_level = $1, prompt_word = $2::text || id::text
+         WHERE id = ANY($3::uuid[])`,
+        [temporaryLevel, temporaryPromptPrefix, movedQuestionIds],
+      );
+      catalogMoved = true;
+      expect(moved.rowCount).toBe(movedQuestionIds.length);
+
       const response = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'No questions available for this level' });
     } finally {
-      await pool.query('UPDATE questions SET cefr_level = $1 WHERE id = ANY($2::uuid[])', [level, movedQuestionIds]);
+      if (catalogMoved) {
+        const restored = await pool.query(
+          `UPDATE questions q
+           SET cefr_level = $1, prompt_word = original.prompt_word
+           FROM unnest($2::uuid[], $3::text[]) AS original(id, prompt_word)
+           WHERE q.id = original.id`,
+          [level, movedQuestionIds, originalPromptWords],
+        );
+        expect(restored.rowCount).toBe(movedQuestionIds.length);
+      }
     }
   });
 
@@ -556,6 +577,31 @@ describe('practice', () => {
       [userId],
     );
     expect(counts.rows[0]).toEqual({ attempts: 1, usage: 1 });
+  });
+
+  it('POST /attempt/native returns a mock comprehension result without touching mastery', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token;
+    const userId = res.body.user.id as string;
+    await completeDiagnostic(a, token);
+    const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+
+    const r = await answerForm(
+      request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+      q.body.question.id,
+    );
+
+    expect(r.status).toBe(200);
+    expect(r.body.mode).toBe('native');
+    expect(r.body.understood).toBe(true);
+    expect(r.body.modelAnswer).toContain('MOCK_AI');
+    const counts = await pool.query<{ attempts: number; progress: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS attempts,
+         (SELECT count(*)::int FROM practice_progress WHERE user_id = $1) AS progress`,
+      [userId],
+    );
+    expect(counts.rows[0]).toEqual({ attempts: 0, progress: 0 });
   });
 
   it('atomically enforces daily quota across different parallel questions', async () => {

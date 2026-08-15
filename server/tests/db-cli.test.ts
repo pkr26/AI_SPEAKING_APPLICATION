@@ -68,7 +68,7 @@ describe('database CLI entrypoints', () => {
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(
-        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"`,
+        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"`,
       );
     }
   });
@@ -93,7 +93,7 @@ describe('database CLI entrypoints', () => {
 
       expect(result.error).toBeUndefined();
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain('wrote db/seed.sql with 36 questions');
+      expect(result.stdout).toContain('wrote db/seed.sql with 600 questions');
       expect(fs.readFileSync(seedPath, 'utf8')).toBe(before);
     } finally {
       if (fs.readFileSync(seedPath, 'utf8') !== before) fs.writeFileSync(seedPath, before, 'utf8');

@@ -20,7 +20,7 @@ describe('question seed generator', () => {
     const committedSql = fs.readFileSync(path.join(__dirname, '../db/seed.sql'), 'utf8');
 
     expect(renderSeedSql()).toBe(committedSql);
-    expect(questions).toHaveLength(36);
+    expect(questions).toHaveLength(600);
     expect(
       Object.fromEntries(
         ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].map((level) => [
@@ -28,7 +28,7 @@ describe('question seed generator', () => {
           questions.filter(({ cefrLevel }) => cefrLevel === level).length,
         ]),
       ),
-    ).toEqual({ A1: 6, A2: 6, B1: 6, B2: 6, C1: 6, C2: 6 });
+    ).toEqual({ A1: 100, A2: 100, B1: 100, B2: 100, C1: 100, C2: 100 });
   });
 
   it('accepts content exactly at every documented length cap', () => {
@@ -36,30 +36,41 @@ describe('question seed generator', () => {
     const first = authored[0]!;
     first.promptWord = 'p'.repeat(100);
     first.questionText = 'q'.repeat(1_000);
-    first.translations.te.word = 'w'.repeat(500);
-    first.translations.te.question = 't'.repeat(4_000);
-    first.translations.te.examples[0] = {
-      en: 'e'.repeat(4_000),
-      native: 'n'.repeat(4_000),
-    };
+    first.translations.te.word = `త${'w'.repeat(499)}`;
+    first.translations.te.question = `త${'t'.repeat(3_999)}`;
+    for (const lang of ['te', 'hi', 'es', 'zh'] as const) {
+      first.translations[lang].examples[0]!.en = 'e'.repeat(4_000);
+    }
+    first.translations.te.examples[0]!.native = `త${'n'.repeat(3_999)}`;
 
     expect(() => renderSeedSql(authored)).not.toThrow();
   });
 
   it('rejects a missing CEFR level and duplicate natural key', () => {
     const missingLevel = copyQuestions().filter(({ cefrLevel }) => cefrLevel !== 'C2');
-    expect(() => renderSeedSql(missingLevel)).toThrow('expected exactly 6 questions for each CEFR level');
+    expect(() => renderSeedSql(missingLevel)).toThrow('expected exactly 100 questions for each CEFR level');
 
     const unevenLevels = copyQuestions();
     unevenLevels[0]!.cefrLevel = 'A2';
-    expect(() => renderSeedSql(unevenLevels)).toThrow('expected exactly 6 questions for each CEFR level');
+    expect(() => renderSeedSql(unevenLevels)).toThrow('expected exactly 100 questions for each CEFR level');
 
     const duplicate = copyQuestions();
     duplicate[1]!.promptWord = duplicate[0]!.promptWord;
     expect(() => renderSeedSql(duplicate)).toThrow('duplicate question key');
+
+    const visuallyDuplicate = copyQuestions();
+    visuallyDuplicate[1]!.promptWord = duplicate[0]!.promptWord.toUpperCase();
+    expect(() => renderSeedSql(visuallyDuplicate)).toThrow('duplicate question key');
   });
 
-  it('rejects a 37th question at an unsupported Z9 level', () => {
+  it('rejects a question duplicated under another prompt or level', () => {
+    const authored = copyQuestions();
+    authored[1]!.questionText = authored[0]!.questionText.toUpperCase();
+
+    expect(() => renderSeedSql(authored)).toThrow('duplicate question text');
+  });
+
+  it('rejects a 601st question at an unsupported Z9 level', () => {
     const authored = copyQuestions();
     const outOfRange = {
       ...structuredClone(authored[0]!),
@@ -67,7 +78,9 @@ describe('question seed generator', () => {
       promptWord: 'out-of-range-level',
     };
 
-    expect(() => renderSeedSql([...authored, outOfRange])).toThrow('expected exactly 6 questions for each CEFR level');
+    expect(() => renderSeedSql([...authored, outOfRange])).toThrow(
+      'expected exactly 100 questions for each CEFR level',
+    );
   });
 
   it.each([
@@ -148,11 +161,51 @@ describe('question seed generator', () => {
     expect(() => renderSeedSql(authored)).toThrow(expectedMessage);
   });
 
+  it('rejects English examples that drift between language translations', () => {
+    const authored = copyQuestions();
+    authored[0]!.translations.zh.examples[1]!.en += ' Changed.';
+
+    expect(() => renderSeedSql(authored)).toThrow('inconsistent English examples in zh');
+  });
+
+  it('rejects an example copied without translation', () => {
+    const authored = copyQuestions();
+    authored[0]!.translations.hi.examples[0]!.native = authored[0]!.translations.hi.examples[0]!.en;
+
+    expect(() => renderSeedSql(authored)).toThrow('untranslated example in hi');
+  });
+
+  it('requires the expected native script in Telugu, Hindi, and Chinese content', () => {
+    const translatedWord = copyQuestions();
+    translatedWord[0]!.translations.te.word = 'Spanish only';
+    expect(() => renderSeedSql(translatedWord)).toThrow('incomplete te translation');
+
+    const translatedQuestion = copyQuestions();
+    translatedQuestion[0]!.translations.hi.question = 'Spanish only';
+    expect(() => renderSeedSql(translatedQuestion)).toThrow('incomplete hi translation');
+
+    const translatedExample = copyQuestions();
+    translatedExample[0]!.translations.zh.examples[0]!.native = 'Spanish only';
+    expect(() => renderSeedSql(translatedExample)).toThrow('empty example in zh');
+  });
+
   it.each([
     [
       'blank English prompt',
       (authored: QuestionSeed[]) => {
         authored[0]!.promptWord = '   ';
+      },
+    ],
+    [
+      'padded English prompt',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.promptWord = ` ${authored[0]!.promptWord}`;
+      },
+    ],
+    [
+      'an invisible English prompt character',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.promptWord += '\u200b';
       },
     ],
     [
@@ -168,6 +221,18 @@ describe('question seed generator', () => {
       },
     ],
     [
+      'padded English question',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.questionText += ' ';
+      },
+    ],
+    [
+      'a NUL in the English question',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.questionText += '\u0000';
+      },
+    ],
+    [
       'oversized English question',
       (authored: QuestionSeed[]) => {
         authored[0]!.questionText = 'x'.repeat(1_001);
@@ -177,6 +242,20 @@ describe('question seed generator', () => {
     const authored = copyQuestions();
     corrupt(authored);
     expect(() => renderSeedSql(authored)).toThrow('invalid English content');
+  });
+
+  it('rejects unsafe controls in localized catalog text while allowing native joiners', () => {
+    const unsafe = copyQuestions();
+    unsafe[0]!.translations.te.examples[0]!.native += '\u0000';
+    expect(() => renderSeedSql(unsafe)).toThrow('empty example in te');
+
+    const hidden = copyQuestions();
+    hidden[0]!.translations.te.word += '\u180e';
+    expect(() => renderSeedSql(hidden)).toThrow('incomplete te translation');
+
+    const legitimateJoiner = copyQuestions();
+    legitimateJoiner[0]!.translations.te.word += '\u200c';
+    expect(() => renderSeedSql(legitimateJoiner)).not.toThrow();
   });
 
   it('escapes apostrophes in SQL values without changing JSON content', () => {
@@ -201,7 +280,7 @@ describe('question seed generator', () => {
     try {
       writeSeedSql(outputPath, questions, log);
       expect(fs.readFileSync(outputPath, 'utf8')).toBe(renderSeedSql());
-      expect(log).toHaveBeenCalledWith('wrote db/seed.sql with 36 questions');
+      expect(log).toHaveBeenCalledWith('wrote db/seed.sql with 600 questions');
     } finally {
       fs.rmSync(directory, { recursive: true, force: true });
     }

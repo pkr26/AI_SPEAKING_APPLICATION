@@ -49,11 +49,12 @@ jobs:
       - run: npm ci
       - name: Verify media inspector dependency
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
+          if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
             sudo apt-get update
             sudo apt-get install --yes ffmpeg
           fi
           ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
@@ -63,7 +64,7 @@ jobs:
       - run: npm test
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_english_test
-      - name: End-to-end API smoke test
+      - name: End-to-end API smoke tests
         run: |
           npm start > smoke-server.log 2>&1 &
           server_pid=$!
@@ -79,10 +80,17 @@ jobs:
             sleep 1
           done
           npm run smoke
+          npm run smoke:concurrent
         env:
+          AI_MAX_CONCURRENCY: "10"
           ASSESS_DAILY_CAP: "100000"
           ASSESS_GLOBAL_DAILY_CAP: "100000"
+          ASSESS_IP_DAILY_CAP: "100000"
+          RATE_LIMIT_GLOBAL_MAX: "100000"
+          RATE_LIMIT_AUTH_MAX: "100000"
+          RATE_LIMIT_REGISTER_MAX: "100000"
           RATE_LIMIT_ASSESS_MAX: "100000"
+          RATE_LIMIT_UPLOAD_GRANT_MAX: "100000"
 
   app:
     runs-on: ubuntu-24.04

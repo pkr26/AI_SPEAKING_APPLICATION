@@ -191,6 +191,20 @@ describe('pending assessment edge cases', () => {
     expect(parsePendingAssessment(value)).toBeNull();
   });
 
+  it.each(['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const)(
+    'accepts the server assessment endpoint %s',
+    (endpoint) => {
+      expect(parsePendingAssessment({ ...pending, endpoint })).toEqual({ ...pending, endpoint });
+    },
+  );
+
+  it.each(['/practice/answer', '/practice/attempt/phonetic', '/attempt', ''])(
+    'rejects the unknown assessment endpoint %p',
+    (endpoint) => {
+      expect(parsePendingAssessment({ ...pending, endpoint })).toBeNull();
+    },
+  );
+
   it('upgrades a legacy pending delivery marker', () => {
     const { stage: _stage, ...legacy } = pending;
     expect(parsePendingAssessment({ ...legacy, delivery: 'pending' })).toEqual(pending);

@@ -13,10 +13,10 @@ An AI-powered English practice coach for native speakers of **Telugu, Hindi, Spa
 
 - **Auth** — email/password sign-up & login (JWT); native language chosen at sign-up.
 - **Diagnostic Test** — binary search over CEFR levels (≤5 recorded answers) places new users at the right level before they can practice.
-- **Practice Question Screen** — prompt word, question, record button, help (?) button.
-- **Help Screen** — word/question plus 3 example sentences, each in English and the user's native language; "Start Practice" enters Practice Mode.
-- **Practice Mode** — word, question, record button only (no help, no translations).
-- **Attempts** — max 3 per question: pass → next question; fail 3× → final feedback → next question.
+- **Practice Question Screen** — prompt word, question, new/revision status, mastery progress, record button, help (?) button, and English/native-language answer mode.
+- **Help Screen** — word/question plus 3 example sentences, each in English and the user's native language; "Start Practice" preserves the selected answer mode.
+- **Practice Mode** — word, question, answer-mode control, and record button only (no translations or examples).
+- **Mastery and retries** — an English score of 75+ masters a word permanently; lower-scoring words return as revision. A learner gets up to 3 scored attempts, while silence is a free retry. Native-language answers check comprehension and provide a model English answer without changing mastery.
 
 ## Prerequisites
 
@@ -35,7 +35,7 @@ cd server
 npm ci
 cp .env.example .env
 # Set JWT_SECRET in .env, for example with: openssl rand -hex 32
-npm run db:setup   # creates the ai_english database, applies schema, seeds 36 CEFR questions × 4 languages
+npm run db:setup   # creates the ai_english database, applies schema, seeds 600 CEFR questions × 4 languages
 npm run dev        # starts the API on http://localhost:4000
 ```
 
@@ -65,8 +65,8 @@ EXPO_PUBLIC_API_URL=http://<your-LAN-IP>:4000 npx expo start
 
 1. Sign up (pick your native language) → you're taken straight to the **Diagnostic Test**.
 2. Answer the spoken questions → your CEFR level is assigned.
-3. **Practice**: read the prompt word + question, tap **?** for bilingual help and example sentences, **Start Practice**, record your answer.
-4. Pass → next question. Fail → retry (up to 3 attempts) → final feedback → next question.
+3. **Practice**: read the prompt word + question, choose English or your native language, and optionally tap **?** for bilingual help and examples before recording.
+4. English: score 75+ to master the word; lower scores keep it in revision, with at most 3 scored tries before moving on. Silence is free. Native mode checks understanding, shows a model English answer, and leaves mastery unchanged.
 
 ## API overview (server, port 4000)
 
@@ -80,6 +80,7 @@ EXPO_PUBLIC_API_URL=http://<your-LAN-IP>:4000 npx expo start
 | `GET /practice/question`                                                          | Next practice question at user's level                                                 |
 | `GET /practice/question/:id/help`                                                 | Bilingual help content (ETag + private caching)                                        |
 | `POST /practice/attempt`                                                          | Assess a recording; enforces 3-attempt rule                                            |
+| `POST /practice/attempt/native`                                                   | Check native-language comprehension; never changes English mastery                     |
 | `GET /health` · `GET /ready`                                                      | Liveness / migration, question-inventory, database, and FFmpeg readiness               |
 
 See `server/.env.example` for all configuration knobs and `app/README.md` for the app.
@@ -93,7 +94,7 @@ assessment. Development/test deployments without `S3_BUCKET` return
 
 ## Server production hardening
 
-- **Migrations** — schema lives in `server/db/migrations/`; applied filenames and checksums are tracked in `schema_migrations`, and an advisory lock serializes deploys. `npm run db:setup` is for initial/local setup. Production deploys run `npm run db:migrate:prod`; question content is updated separately with the idempotent `npm run db:seed:prod`, which preserves question IDs and user progress.
+- **Migrations** — schema lives in `server/db/migrations/`; applied filenames and checksums are tracked in `schema_migrations`, and an advisory lock serializes deploys. `npm run db:setup` is for initial/local setup. Production deploys run `npm run db:migrate:prod`, then publish reviewed question content with the idempotent `npm run db:catalog:prod`, which preserves question IDs and user progress.
 - **Config** — validated with zod at boot (`src/config.ts`); the server refuses to start without a real `JWT_SECRET` (≥32 chars) or `DATABASE_URL`. Runtime PostgreSQL statements and lock waits have bounded deadlines.
 - **Logging & shutdown** — structured logs via pino with per-request IDs (`x-request-id` honored); graceful SIGTERM/SIGINT shutdown (HTTP → pool → exit, 10s force timer).
 - **Security headers / TLS** — `helmet` defaults including HSTS. TLS is expected to terminate at the reverse proxy/load balancer in front of this service; set `TRUST_PROXY` to the exact number of trusted proxy hops so client IPs are correct.
@@ -147,7 +148,7 @@ The API has no server-side session store. Assessment claims, quotas, and securit
 1. **HTTPS only** — terminate TLS at your proxy/LB (nginx, CloudFront, ALB); set `TRUST_PROXY` to the exact proxy-hop count (never blanket `true`); HSTS is already on via helmet. Never expose the API over plain HTTP.
 2. **Secrets and transport** — inject `JWT_SECRET` (≥32 random chars), `DATABASE_URL`, and `OPENAI_API_KEY` via your platform's secret manager. Never commit `.env`. Set `MOCK_AI=false`. The production PostgreSQL URL must use `sslmode=verify-full` with a trusted server certificate; the API refuses weaker database transport.
 3. **Audio storage (S3)** — production requires `S3_BUCKET` (boot fails without it): the app uploads recordings through a short-lived, size-constrained presigned POST grant from `POST /uploads/audio-url`, and the API downloads each submitted object for assessment, then deletes it. Create a private bucket (block all public access), set `S3_REGION`, and grant the API identity only `s3:PutObject`, `s3:GetObject`, `s3:DeleteObject` on `arn:aws:s3:::<bucket>/audio-uploads/*` — prefer an IAM task/instance role over `S3_ACCESS_KEY_ID`/`S3_SECRET_ACCESS_KEY`. Static credentials must be supplied as a complete pair; temporary credentials also set `S3_SESSION_TOKEN`. Configure a short S3 lifecycle expiration on the `audio-uploads/` prefix as a backstop for clients that upload but never submit an assessment, including requests rejected by an upstream/global limit before the API can read their object key. The native client does not require bucket CORS; reassess CORS if browser uploads are ever supported.
-4. **Database** — use a managed, currently supported PostgreSQL 17/18 release. For an existing database, back up and verify a restore first, run the read-only `npm run db:preflight:prod`, then run exactly one `npm run db:migrate:prod` job from the built image before starting the new application version. Preflight is an upgrade check and expects the existing tables; for a fresh production database, run `db:migrate:prod` and then `db:seed:prod` before starting the API. The API refuses to listen, and `/ready` returns 503, unless packaged migration names/checksums, the required runtime table, and at least two published questions per CEFR level are present. For the first rollout containing migration `006_assessment_request_claims.sql`, drain any older replicas that already use the migration-005 table before migrating; those binaries do not write the new ownership column. A fresh deployment that applies 005 and 006 together is safe. Do not use `db:setup` in a deploy. On later releases, run `db:seed:prod` only when intentionally publishing reviewed question-content changes. Size the pool: `DB_POOL_MAX` × number of API replicas should stay under the Postgres `max_connections` budget (e.g. 20 × 4 replicas = 80).
+4. **Database** — use a managed, currently supported PostgreSQL 17/18 release. For an existing database, back up and verify a restore first, run the read-only `npm run db:preflight:prod`, then run exactly one `npm run db:migrate:prod` job followed by one `npm run db:catalog:prod` job from the built image before starting the new application version. Preflight is an upgrade check and expects the existing tables; the same migrate-then-catalog sequence initializes a fresh production database. The API refuses to listen, and `/ready` returns 503, unless packaged migration names/checksums, the required runtime table, and at least 100 published questions per CEFR level are present. Drain older replicas before the first rollout containing migration `006_assessment_request_claims.sql` (older binaries do not write the ownership column) or `008_practice_progress.sql` (older binaries do not maintain mastery rows); a fresh deployment applying the migrations before any API starts is safe. Do not use `db:setup` in a deploy. On later releases, run `db:catalog:prod` only when intentionally publishing reviewed question-content changes. Size the pool: `DB_POOL_MAX` × number of API replicas should stay under the Postgres `max_connections` budget (e.g. 20 × 4 replicas = 80).
 5. **Multi-instance rate limiting** — migration `007_distributed_rate_limits.sql` provides the shared PostgreSQL fixed-window store. Monitor counter-table growth and database latency, and retain an upstream WAF/load-balancer limit for volumetric attacks that should not reach the application or database.
 6. **Container** — build `server/Dockerfile`, run ≥2 replicas behind the LB, point `/health` and `/ready` at your orchestrator's probes.
 7. **Backups & retention** — enable automated Postgres backups; submitted audio is deleted after assessment, the local janitor removes crash leftovers older than one hour, and the S3 lifecycle rule expires abandoned objects. Replay responses expire after 24 hours. `attempts` transcripts currently grow unbounded, so define and implement archival/deletion windows in the consumer privacy policy before launch.

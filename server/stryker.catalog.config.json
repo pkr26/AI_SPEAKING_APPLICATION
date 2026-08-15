@@ -5,7 +5,7 @@
     "configFile": "vitest.catalog-mutation.config.mts",
     "related": false
   },
-  "mutate": ["db/seed-data.ts"],
+  "mutate": ["db/seed-data.ts", "db/seed-data/**/*.ts"],
   "ignorePatterns": ["/.env", "/.env.*", "/coverage", "/dist", "/uploads", "/reports", "/.stryker-tmp"],
   "ignoreStatic": false,
   "coverageAnalysis": "perTest",

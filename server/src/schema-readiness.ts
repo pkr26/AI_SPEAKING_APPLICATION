@@ -7,6 +7,7 @@ import { pool } from './db';
 const MIGRATIONS_DIR = path.join(__dirname, '..', 'db', 'migrations');
 const REQUIRED_RUNTIME_TABLE = 'public.rate_limit_windows';
 const REQUIRED_CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
+const REQUIRED_QUESTIONS_PER_LEVEL = 100;
 
 export interface MigrationManifestEntry {
   name: string;
@@ -85,8 +86,8 @@ export async function assertDatabaseSchemaCurrent(
       )
       .map((row) => [row.cefr_level, row.count]),
   );
-  if (REQUIRED_CEFR_LEVELS.some((level) => (questionCounts.get(level) ?? 0) < 2)) {
-    throw new Error('Question inventory is incomplete; every CEFR level requires at least two questions');
+  if (REQUIRED_CEFR_LEVELS.some((level) => (questionCounts.get(level) ?? 0) < REQUIRED_QUESTIONS_PER_LEVEL)) {
+    throw new Error('Question inventory is incomplete; every CEFR level requires at least 100 questions');
   }
 
   return { latestMigration: latest.name };

@@ -34,7 +34,7 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     const first = await attempt();
     expect(first.status).toBe(200);
     expect(first.body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
-    expect(first.body.nextQuestion).toBeUndefined();
+    expect(first.body.next).toBeUndefined();
     expect(first.body.finalFeedback).toBeUndefined();
 
     const second = await attempt();
@@ -43,8 +43,8 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     const third = await attempt();
     expect(third.body).toMatchObject({ passed: false, attemptNo: 3, attemptsLeft: 0 });
     expect(third.body.finalFeedback).toContain('final feedback');
-    expect(third.body.nextQuestion).toBeDefined();
-    expect(third.body.nextQuestion.id).not.toBe(questionId);
+    expect(third.body.next).toBeDefined();
+    expect(third.body.next.question.id).not.toBe(questionId);
 
     // attempt_no 3 is NOT < MAX_ATTEMPTS: the next attempt restarts at 1.
     const fourth = await attempt();
@@ -63,8 +63,8 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     vi.spyOn(Math, 'random').mockReturnValue(PASS_SCORE);
     const passed = await attempt();
     expect(passed.body).toMatchObject({ passed: true, attemptNo: 2 });
-    expect(passed.body.nextQuestion).toBeDefined();
-    expect(passed.body.nextQuestion.id).not.toBe(questionId);
+    expect(passed.body.next).toBeDefined();
+    expect(passed.body.next.question.id).not.toBe(questionId);
     expect(passed.body.attemptsLeft).toBeUndefined();
     expect(passed.body.finalFeedback).toBeUndefined();
 
@@ -99,7 +99,7 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
 
     expect(final.status).toBe(200);
     expect(final.body).toMatchObject({ attemptNo: 3, attemptsLeft: 0 });
-    expect(final.body.nextQuestion.id).not.toBe(current.id);
+    expect(final.body.next.question.id).not.toBe(current.id);
   });
 });
 

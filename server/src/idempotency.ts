@@ -3,7 +3,7 @@ import { pool } from './db';
 import { HttpError } from './middleware';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
-export type AssessmentContext = 'diagnostic' | 'practice';
+export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
 
 interface RequestRow {
   context: AssessmentContext;

@@ -22,6 +22,7 @@ import {
   AppState,
   Linking,
   StyleSheet,
+  Text,
   type AppStateStatus,
   type EmitterSubscription,
 } from 'react-native';
@@ -295,14 +296,18 @@ async function renderRecorder(
   overrides: {
     ownerId?: string;
     questionId?: string;
-    endpoint?: '/diagnostic/answer' | '/practice/attempt';
+    endpoint?: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
     parseResult?: (data: unknown) => { parsed: unknown };
+    onInteractionLockChange?: (locked: boolean) => void;
+    onRecoveryEndpointMismatch?: (
+      endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+    ) => boolean;
   } = {},
 ) {
   const props = {
     ownerId: OWNER_ID,
     questionId: QUESTION_ID,
-    endpoint: ENDPOINT as '/diagnostic/answer' | '/practice/attempt',
+    endpoint: ENDPOINT as '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
     parseResult: jest.fn((data: unknown) => ({ parsed: data })),
     onResult: jest.fn(),
     onError: jest.fn(),
@@ -312,6 +317,59 @@ async function renderRecorder(
   const view = await render(<Recorder {...props} />);
   await flushAct();
   return { view, props };
+}
+
+type PracticeAnswerMode = 'english' | 'native';
+type HarnessResult = { parser: PracticeAnswerMode; response: unknown };
+
+function RecoveryModeHarness({
+  initialMode,
+  parseEnglish,
+  parseNative,
+  onModeChange,
+  onResult,
+  onError,
+  onRecoveryUnresolved,
+}: {
+  initialMode: PracticeAnswerMode;
+  parseEnglish: (data: unknown) => HarnessResult;
+  parseNative: (data: unknown) => HarnessResult;
+  onModeChange: (mode: PracticeAnswerMode) => void;
+  onResult: (data: HarnessResult) => void;
+  onError: (message: string) => void;
+  onRecoveryUnresolved: () => void;
+}) {
+  const [mode, setMode] = React.useState<PracticeAnswerMode>(initialMode);
+  const nativeMode = mode === 'native';
+
+  return (
+    <>
+      <Text testID="recovery-harness-mode">{mode}</Text>
+      <Recorder
+        key={mode}
+        ownerId={OWNER_ID}
+        questionId={QUESTION_ID}
+        endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
+        parseResult={nativeMode ? parseNative : parseEnglish}
+        onResult={onResult}
+        onError={onError}
+        onRecoveryUnresolved={onRecoveryUnresolved}
+        onRecoveryEndpointMismatch={(savedEndpoint) => {
+          let savedMode: PracticeAnswerMode;
+          if (savedEndpoint === '/practice/attempt/native') {
+            savedMode = 'native';
+          } else if (savedEndpoint === '/practice/attempt') {
+            savedMode = 'english';
+          } else {
+            return false;
+          }
+          onModeChange(savedMode);
+          setMode(savedMode);
+          return true;
+        }}
+      />
+    </>
+  );
 }
 
 async function startRecording(): Promise<void> {
@@ -448,6 +506,18 @@ describe('Recorder', () => {
         screen.getByText('Your recording is uploaded only after you choose Submit Answer.'),
       ).toBeTruthy();
       expect(screen.queryByText(/Microphone access is needed/)).toBeNull();
+    });
+
+    it('reports when mode-changing interactions must be locked and releases them on unmount', async () => {
+      const onInteractionLockChange = jest.fn();
+      const { view } = await renderRecorder({ onInteractionLockChange });
+
+      expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
+      await startRecording();
+      await waitFor(() => expect(onInteractionLockChange).toHaveBeenLastCalledWith(true));
+
+      await view.unmount();
+      expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
     });
 
     it('renders semantic record-button feedback and the active pulse treatment', async () => {
@@ -1656,7 +1726,7 @@ describe('Recorder', () => {
         stage: 'prepared',
       });
       expect(markPendingAssessmentStage).toHaveBeenCalledWith(REQUEST_ID, 'direct-posting');
-      expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4');
+      expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4', OWNER_ID);
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
@@ -2910,6 +2980,192 @@ describe('Recorder', () => {
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { level: 'B1' } });
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
       expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+    });
+
+    it('delivers a completed native-practice recovery only with its isolated context', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/practice/attempt/native' }),
+      );
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice-native',
+        questionId: QUESTION_ID,
+        response: { mode: 'native', understood: true },
+      });
+      const { props } = await renderRecorder({ endpoint: '/practice/attempt/native' });
+
+      expect(props.parseResult).toHaveBeenCalledWith({ mode: 'native', understood: true });
+      expect(props.onResult).toHaveBeenCalledWith({
+        parsed: { mode: 'native', understood: true },
+      });
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+    });
+
+    it('restores a saved native endpoint before polling it with the English parser', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/practice/attempt/native' }),
+      );
+      const onRecoveryEndpointMismatch = jest.fn(() => true);
+
+      const { props } = await renderRecorder({ onRecoveryEndpointMismatch });
+
+      expect(onRecoveryEndpointMismatch).toHaveBeenCalledWith('/practice/attempt/native');
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(props.parseResult).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it.each([
+      [
+        'a saved native endpoint when initially rendered in English',
+        'english',
+        'native',
+        '/practice/attempt/native',
+        'practice-native',
+        { mode: 'native', understood: true },
+      ],
+      [
+        'a saved English endpoint when initially rendered in native mode',
+        'native',
+        'english',
+        '/practice/attempt',
+        'practice',
+        { mode: 'english', score: 88 },
+      ],
+    ] as const)(
+      'changes mode, remounts, and recovers %s with only its matching parser',
+      async (_case, initialMode, savedMode, savedEndpoint, context, response) => {
+        const firstStorageRead = deferred<PendingAssessment | null>();
+        const savedPending = pendingRecord({ endpoint: savedEndpoint });
+        asMock(loadPendingAssessment)
+          .mockReturnValueOnce(firstStorageRead.promise)
+          .mockResolvedValue(savedPending);
+        asMock(apiFetch).mockResolvedValue({
+          status: 'completed',
+          context,
+          questionId: QUESTION_ID,
+          response,
+        });
+        const parseEnglish = jest.fn((data: unknown): HarnessResult => ({
+          parser: 'english',
+          response: data,
+        }));
+        const parseNative = jest.fn((data: unknown): HarnessResult => ({
+          parser: 'native',
+          response: data,
+        }));
+        const onModeChange = jest.fn();
+        const onResult = jest.fn();
+        const onError = jest.fn();
+        const onRecoveryUnresolved = jest.fn();
+
+        await render(
+          <RecoveryModeHarness
+            initialMode={initialMode}
+            parseEnglish={parseEnglish}
+            parseNative={parseNative}
+            onModeChange={onModeChange}
+            onResult={onResult}
+            onError={onError}
+            onRecoveryUnresolved={onRecoveryUnresolved}
+          />,
+        );
+        await flushAct();
+
+        expect(screen.getByTestId('recovery-harness-mode').props.children).toBe(initialMode);
+        expect(loadPendingAssessment).toHaveBeenCalledTimes(1);
+        expect(apiFetch).not.toHaveBeenCalled();
+
+        await act(async () => {
+          firstStorageRead.resolve(savedPending);
+          await flushMicrotasks();
+        });
+
+        await waitFor(() =>
+          expect(screen.getByTestId('recovery-harness-mode').props.children).toBe(savedMode),
+        );
+        await waitFor(() => expect(onResult).toHaveBeenCalledTimes(1));
+
+        const matchingParser = savedMode === 'native' ? parseNative : parseEnglish;
+        const wrongParser = savedMode === 'native' ? parseEnglish : parseNative;
+        expect(onModeChange).toHaveBeenCalledTimes(1);
+        expect(onModeChange).toHaveBeenCalledWith(savedMode);
+        // The key change removes the first Recorder's listener and mounts a
+        // second instance, which re-reads storage before making the sole poll.
+        expect(appStateSubscriptionRemove).toHaveBeenCalledTimes(1);
+        expect(appStateHandlers).toHaveLength(2);
+        expect(loadPendingAssessment).toHaveBeenCalledTimes(2);
+        expect(apiFetch).toHaveBeenCalledTimes(1);
+        expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
+          timeoutMs: 5000,
+        });
+        expect(asMock(apiFetch).mock.invocationCallOrder[0]).toBeGreaterThan(
+          appStateSubscriptionRemove.mock.invocationCallOrder[0],
+        );
+        expect(matchingParser).toHaveBeenCalledTimes(1);
+        expect(matchingParser).toHaveBeenCalledWith(response);
+        expect(wrongParser).not.toHaveBeenCalled();
+        expect(onResult).toHaveBeenCalledWith({ parser: savedMode, response });
+        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledTimes(1);
+        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+        expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
+        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        expect(onError).not.toHaveBeenCalled();
+        expect(onRecoveryUnresolved).not.toHaveBeenCalled();
+      },
+    );
+
+    it('keeps the existing reconciliation path when a screen cannot restore the saved endpoint', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/practice/attempt/native' }),
+      );
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice-native',
+        questionId: QUESTION_ID,
+        response: { mode: 'native', understood: true },
+      });
+      const onRecoveryEndpointMismatch = jest.fn(() => false);
+
+      const { props } = await renderRecorder({ onRecoveryEndpointMismatch });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          'Your interrupted assessment was saved. Your current learning state has been refreshed.',
+        ),
+      );
+      expect(onRecoveryEndpointMismatch).toHaveBeenCalledWith('/practice/attempt/native');
+      expect(props.parseResult).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+    });
+
+    it('rejects an English-practice replay for a native-practice handoff', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/practice/attempt/native' }),
+      );
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { mode: 'native', understood: true },
+      });
+      const { props } = await renderRecorder({ endpoint: '/practice/attempt/native' });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          'The server returned inconsistent recovery data. Your learning state has been refreshed.',
+        ),
+      );
+      expect(props.parseResult).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
     });
 
     it.each(['returns false', 'rejects'] as const)(

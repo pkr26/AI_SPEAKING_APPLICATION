@@ -1,6 +1,7 @@
 // Database setup: create the database if missing, apply pending migrations
 // from db/migrations/ (tracked in schema_migrations), then seed idempotently.
-// Production deploys should run only compiled migrations via: npm run db:migrate:prod
+// Production deploys run compiled migrations, then explicitly publish the
+// reviewed catalog (neither command creates a database).
 //
 // The exported functions are also reused by the test-suite global setup.
 import { createHash } from 'crypto';
@@ -180,7 +181,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
   return applied;
 }
 
-/** Idempotently insert/update the 36 questions without changing their IDs. */
+/** Idempotently insert/update the 600 questions without changing their IDs. */
 export async function seed(dbUrl: string, log: (msg: string) => void = console.log): Promise<void> {
   const client = databaseClient(dbUrl);
   await client.connect();
@@ -245,16 +246,18 @@ export async function setupDatabase(
   await steps.seed(dbUrl, log);
 }
 
-export type DatabaseCommand = 'migrate' | 'seed' | 'setup';
+export type DatabaseCommand = 'migrate' | 'catalog' | 'seed' | 'setup';
 
 export interface DatabaseCommandActions {
   migrate: typeof migrate;
+  catalog: typeof seed;
   seed: typeof seed;
   setup: typeof setupDatabase;
 }
 
 const defaultCommandActions: DatabaseCommandActions = {
   migrate,
+  catalog: seed,
   seed,
   setup: setupDatabase,
 };
@@ -269,13 +272,20 @@ export async function runDatabaseCommand(
     await actions.migrate(databaseUrl);
     return;
   }
+  if (command === 'catalog') {
+    // Safe production publication: unlike setup this neither creates a
+    // database nor changes schema, and seed.sql only upserts stable natural
+    // keys while the shared deployment lock excludes migrations.
+    await actions.catalog(databaseUrl);
+    return;
+  }
   if (command === 'seed' || command === 'setup') {
     // Local bootstrap only: deploys apply compiled migrations via
     // `npm run db:migrate:prod` and must never reseed or recreate a
     // production database by operator mistake.
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
-        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"`,
+        `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"`,
       );
     }
     if (command === 'seed') {
@@ -285,7 +295,7 @@ export async function runDatabaseCommand(
     await actions.setup(databaseUrl);
     return;
   }
-  throw new Error(`unknown database command "${command}" (expected "setup", "migrate", or "seed")`);
+  throw new Error(`unknown database command "${command}" (expected "setup", "migrate", "catalog", or "seed")`);
 }
 
 // Stryker disable all: command dispatch is unit-tested and this process

@@ -56,6 +56,10 @@ interface RecorderProps<T> {
   onError: (message: string) => void;
   /** Refreshes canonical server state when feedback cannot be reconstructed. */
   onRecoveryUnresolved: () => void;
+  /** Locks controls that would discard or retarget the current recording. */
+  onInteractionLockChange?: (locked: boolean) => void;
+  /** Lets a screen restore the endpoint saved with an interrupted submission. */
+  onRecoveryEndpointMismatch?: (endpoint: AssessmentEndpoint) => boolean;
 }
 
 let activeRecoveryOwner: symbol | null = null;
@@ -118,6 +122,8 @@ export default function Recorder<T>({
   onResult,
   onError,
   onRecoveryUnresolved,
+  onInteractionLockChange,
+  onRecoveryEndpointMismatch,
 }: RecorderProps<T>) {
   const recorder = useAudioRecorder(SPEECH_RECORDING_OPTIONS);
   const recorderState = useAudioRecorderState(recorder, 200);
@@ -146,6 +152,7 @@ export default function Recorder<T>({
   const instanceIdRef = useRef(Symbol('recorder-recovery'));
   const callbacksRef = useRef({
     onError,
+    onRecoveryEndpointMismatch,
     onRecoveryUnresolved,
     onResult,
     parseResult,
@@ -155,15 +162,27 @@ export default function Recorder<T>({
   useLayoutEffect(() => {
     callbacksRef.current = {
       onError,
+      onRecoveryEndpointMismatch,
       onRecoveryUnresolved,
       onResult,
       parseResult,
     };
-  }, [onError, onRecoveryUnresolved, onResult, parseResult]);
+  }, [onError, onRecoveryEndpointMismatch, onRecoveryUnresolved, onResult, parseResult]);
 
   useLayoutEffect(() => {
     identityRef.current = { ownerId, endpoint, questionId };
   }, [endpoint, ownerId, questionId]);
+
+  useLayoutEffect(() => {
+    onInteractionLockChange?.(phase !== 'idle');
+  }, [onInteractionLockChange, phase]);
+
+  useEffect(
+    () => () => {
+      onInteractionLockChange?.(false);
+    },
+    [onInteractionLockChange],
+  );
 
   const updatePhase = useCallback((next: Phase) => {
     phaseRef.current = next;
@@ -313,6 +332,19 @@ export default function Recorder<T>({
       return;
     }
 
+    // The answer mode is session-scoped, while the interrupted handoff is
+    // durable. Restore the saved practice endpoint before taking ownership so
+    // the remounted Recorder uses the matching parser and can display the
+    // replay instead of discarding a valid response as a route mismatch.
+    if (
+      pending.ownerId === ownerId &&
+      pending.questionId === questionId &&
+      pending.endpoint !== endpoint &&
+      callbacksRef.current.onRecoveryEndpointMismatch?.(pending.endpoint)
+    ) {
+      return;
+    }
+
     activeRecoveryOwner = instanceId;
     recoveringRef.current = true;
     operationRef.current = true;
@@ -421,7 +453,11 @@ export default function Recorder<T>({
             return;
           }
           const expectedContext =
-            pending.endpoint === '/diagnostic/answer' ? 'diagnostic' : 'practice';
+            pending.endpoint === '/diagnostic/answer'
+              ? 'diagnostic'
+              : pending.endpoint === '/practice/attempt/native'
+                ? 'practice-native'
+                : 'practice';
           if (
             !('context' in status) ||
             status.context !== expectedContext ||
@@ -990,7 +1026,7 @@ export default function Recorder<T>({
       // claimed by the answer endpoint either way, so the idempotency and
       // recovery flow below is identical for both paths.
       const descriptor = audioFileDescriptor(uri);
-      const grant = await apiRequestAudioUpload(descriptor.type);
+      const grant = await apiRequestAudioUpload(descriptor.type, ownerId);
       if (!isCurrentSubmission()) return;
       let raw: unknown;
       if (grant.mode === 's3') {

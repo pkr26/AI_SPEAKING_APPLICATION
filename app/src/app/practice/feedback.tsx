@@ -7,21 +7,34 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useAuth } from '../../lib/auth';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
+import { isNativeOutcome, type NativeLanguage } from '../../lib/types';
 
-type Variant = 'passed' | 'retry' | 'final';
+type Variant =
+  'native' | 'native-nospeech' | 'nospeech' | 'mastered' | 'passed' | 'retry' | 'final';
+
+const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
+  te: 'te-IN',
+  hi: 'hi-IN',
+  es: 'es-ES',
+  zh: 'zh-Hans',
+};
 
 /**
- * Attempt feedback. Three variants driven by the in-memory attempt result:
- *  - passed: celebratory + Next Question
- *  - retry:  failed with attempts left + Try Again (same question)
- *  - final:  out of attempts, final feedback + Next Question
+ * Attempt feedback. Variants driven by the in-memory outcome:
+ *  - native:   mother-tongue answer — comprehension result + model English answer
+ *  - nospeech: silence — free retry, links to help and native mode
+ *  - mastered: passed at >= 75 — word mastered
+ *  - passed:   passed below mastery — word returns in revision
+ *  - retry:    failed with attempts left + Try Again (same question)
+ *  - final:    out of attempts, final feedback + Next Question
  */
 export default function FeedbackScreen() {
   const insets = useSafeAreaInsets();
   const { user } = useAuth();
   const queryClient = useQueryClient();
-  const { feedback, clearFeedback } = usePracticeFlow();
+  const { feedback, clearFeedback, setAnswerMode } = usePracticeFlow();
   const result = feedback?.result ?? null;
+  const questionId = feedback?.questionId ?? null;
 
   if (!result) {
     return (
@@ -41,15 +54,39 @@ export default function FeedbackScreen() {
     );
   }
 
-  const attemptsLeft = result.attemptsLeft ?? 0;
-  const variant: Variant = result.passed ? 'passed' : attemptsLeft > 0 ? 'retry' : 'final';
+  const variant: Variant = isNativeOutcome(result)
+    ? result.transcript === ''
+      ? 'native-nospeech'
+      : 'native'
+    : result.noSpeech
+      ? 'nospeech'
+      : result.passed
+        ? result.mastered
+          ? 'mastered'
+          : 'passed'
+        : (result.attemptsLeft ?? 0) > 0
+          ? 'retry'
+          : 'final';
+
+  const backToPractice = () => {
+    clearFeedback();
+    router.dismissTo('/practice');
+  };
+
+  const tryInEnglish = () => {
+    setAnswerMode('english');
+    backToPractice();
+  };
+
+  const retry = () => {
+    clearFeedback();
+    router.back();
+  };
 
   const goToNextQuestion = () => {
     if (!user) return;
-    if (result.nextQuestion) {
-      queryClient.setQueryData(['practice-question', user.id, user.cefrLevel], {
-        question: result.nextQuestion,
-      });
+    if (!isNativeOutcome(result) && result.next) {
+      queryClient.setQueryData(['practice-question', user.id, user.cefrLevel], result.next);
     } else {
       void queryClient.invalidateQueries({
         queryKey: ['practice-question', user.id, user.cefrLevel],
@@ -59,6 +96,13 @@ export default function FeedbackScreen() {
     router.dismissTo('/practice');
   };
 
+  const openHelp = () => {
+    if (!questionId) return;
+    clearFeedback();
+    router.dismissTo('/practice');
+    router.push({ pathname: '/practice/help', params: { questionId } });
+  };
+
   return (
     <View style={styles.container}>
       <ScrollView
@@ -66,25 +110,80 @@ export default function FeedbackScreen() {
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.content}
       >
+        {variant === 'native' && isNativeOutcome(result) && (
+          <>
+            <Text style={styles.emoji}>{result.understood ? '🌏' : '🧩'}</Text>
+            <Text
+              accessibilityRole="header"
+              style={[styles.title, { color: result.understood ? colors.success : colors.warning }]}
+            >
+              {result.understood ? 'You understood the question!' : 'Not quite on topic'}
+            </Text>
+            <Text style={styles.subtitle}>
+              {result.understood
+                ? 'Your answer made sense. Now try saying it in English!'
+                : 'Your answer missed the question. Check the example and try again.'}
+            </Text>
+          </>
+        )}
+
+        {variant === 'native-nospeech' && (
+          <>
+            <Text style={styles.emoji}>🎤</Text>
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
+              We couldn&apos;t hear you
+            </Text>
+            <Text style={styles.subtitle}>
+              Your English practice progress was not changed. Speak clearly and try again in your
+              language.
+            </Text>
+          </>
+        )}
+
+        {variant === 'nospeech' && (
+          <>
+            <Text style={styles.emoji}>🎤</Text>
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
+              We couldn&apos;t hear you
+            </Text>
+            <Text style={styles.subtitle}>
+              Don&apos;t worry — this didn&apos;t count as an attempt. Hold the button and speak
+              clearly, or get help first.
+            </Text>
+          </>
+        )}
+
+        {variant === 'mastered' && (
+          <>
+            <Text style={styles.emoji}>🏆</Text>
+            <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
+              Word mastered!
+            </Text>
+            <Text style={styles.subtitle}>You scored 75 or above — this word is yours.</Text>
+          </>
+        )}
+
         {variant === 'passed' && (
           <>
             <Text style={styles.emoji}>🎉</Text>
             <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
               Great job!
             </Text>
-            <Text style={styles.subtitle}>You passed this question.</Text>
+            <Text style={styles.subtitle}>
+              You passed! A score of 75 or above masters a word that is still in learning.
+            </Text>
           </>
         )}
 
-        {variant === 'retry' && (
+        {variant === 'retry' && !isNativeOutcome(result) && (
           <>
             <Text style={styles.emoji}>💪</Text>
             <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
               Not quite — attempt {result.attemptNo} of 3
             </Text>
             <Text style={styles.subtitle}>
-              {attemptsLeft} {attemptsLeft === 1 ? 'attempt' : 'attempts'} left. Review the feedback
-              and try again.
+              {result.attemptsLeft} {result.attemptsLeft === 1 ? 'attempt' : 'attempts'} left.
+              Review the feedback and try again.
             </Text>
           </>
         )}
@@ -96,21 +195,32 @@ export default function FeedbackScreen() {
               Out of attempts
             </Text>
             <Text style={styles.subtitle}>
-              Here&apos;s what to work on before the next question.
+              Here&apos;s what to work on. You&apos;ll see this word again in future practice.
             </Text>
           </>
         )}
 
         <View style={styles.card}>
-          <View style={styles.scoreRow}>
-            <Text style={styles.cardLabel}>Score</Text>
-            <Text style={styles.scoreValue}>{result.score}</Text>
-          </View>
+          {!isNativeOutcome(result) && variant !== 'nospeech' && (
+            <View style={styles.scoreRow}>
+              <Text style={styles.cardLabel}>Score</Text>
+              <Text style={styles.scoreValue}>{result.score}</Text>
+            </View>
+          )}
 
           {!!result.transcript && (
             <>
               <Text style={styles.cardLabel}>We heard</Text>
-              <Text style={styles.transcript}>“{result.transcript}”</Text>
+              <Text
+                accessibilityLanguage={
+                  isNativeOutcome(result) && user
+                    ? NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage]
+                    : 'en-US'
+                }
+                style={styles.transcript}
+              >
+                “{result.transcript}”
+              </Text>
             </>
           )}
 
@@ -118,21 +228,32 @@ export default function FeedbackScreen() {
             {variant === 'final' ? 'Final feedback' : 'Feedback'}
           </Text>
           <Text style={styles.body}>
-            {variant === 'final' && result.finalFeedback ? result.finalFeedback : result.feedback}
+            {variant === 'final' && !isNativeOutcome(result) && result.finalFeedback
+              ? result.finalFeedback
+              : result.feedback}
           </Text>
+
+          {variant === 'native' && isNativeOutcome(result) && !!result.modelAnswer && (
+            <>
+              <Text style={styles.cardLabel}>Say it in English</Text>
+              <Text style={styles.modelAnswer}>{result.modelAnswer}</Text>
+            </>
+          )}
         </View>
       </ScrollView>
 
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-        {variant === 'retry' ? (
+        {variant === 'retry' && (
           <Pressable
             accessibilityRole="button"
             style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
-            onPress={() => router.back()}
+            onPress={retry}
           >
             <Text style={styles.primaryButtonText}>Try Again</Text>
           </Pressable>
-        ) : (
+        )}
+
+        {(variant === 'mastered' || variant === 'passed' || variant === 'final') && (
           <Pressable
             accessibilityRole="button"
             style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
@@ -140,6 +261,51 @@ export default function FeedbackScreen() {
           >
             <Text style={styles.primaryButtonText}>Next Question</Text>
           </Pressable>
+        )}
+
+        {variant === 'native' && (
+          <Pressable
+            accessibilityRole="button"
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+            onPress={tryInEnglish}
+          >
+            <Text style={styles.primaryButtonText}>Try in English</Text>
+          </Pressable>
+        )}
+
+        {variant === 'native-nospeech' && (
+          <Pressable
+            accessibilityRole="button"
+            style={({ pressed }) => [styles.primaryButton, pressed && styles.primaryButtonPressed]}
+            onPress={backToPractice}
+          >
+            <Text style={styles.primaryButtonText}>Try Again in My Language</Text>
+          </Pressable>
+        )}
+
+        {variant === 'nospeech' && (
+          <View style={styles.buttonColumn}>
+            <Pressable
+              accessibilityRole="button"
+              style={({ pressed }) => [
+                styles.primaryButton,
+                pressed && styles.primaryButtonPressed,
+              ]}
+              onPress={retry}
+            >
+              <Text style={styles.primaryButtonText}>Try Again</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              style={({ pressed }) => [
+                styles.secondaryButton,
+                pressed && styles.secondaryButtonPressed,
+              ]}
+              onPress={openHelp}
+            >
+              <Text style={styles.secondaryButtonText}>See translation &amp; examples</Text>
+            </Pressable>
+          </View>
         )}
       </View>
     </View>
@@ -216,6 +382,13 @@ const styles = StyleSheet.create({
     lineHeight: 23,
     color: colors.text,
   },
+  modelAnswer: {
+    marginTop: 4,
+    fontSize: 16,
+    lineHeight: 24,
+    color: colors.primary,
+    fontWeight: '600',
+  },
   body: {
     marginTop: 4,
     fontSize: 16,
@@ -227,6 +400,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
+  },
+  buttonColumn: {
+    gap: 10,
   },
   primaryButton: {
     backgroundColor: colors.primary,
@@ -240,6 +416,21 @@ const styles = StyleSheet.create({
   primaryButtonText: {
     color: '#FFFFFF',
     fontSize: 17,
+    fontWeight: '600',
+  },
+  secondaryButton: {
+    borderRadius: 14,
+    paddingVertical: 13,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  secondaryButtonPressed: {
+    backgroundColor: colors.primaryLight,
+  },
+  secondaryButtonText: {
+    color: colors.primary,
+    fontSize: 15,
     fontWeight: '600',
   },
 });

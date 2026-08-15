@@ -409,14 +409,38 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
   });
 }
 
-function runAudioInspectorAvailabilityCheck(): Promise<void> {
+type MediaToolIdentity = 'ffmpeg' | 'ffprobe';
+
+interface MediaToolAvailabilityCheck {
+  executable: string;
+  identity: MediaToolIdentity;
+  label: 'FFmpeg' | 'FFprobe';
+}
+
+function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToolAvailabilityCheck): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(config.ffmpegPath, ['-hide_banner', '-version'], {
-      env: INSPECTOR_ENV,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-      shell: false,
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(executable, ['-hide_banner', '-version'], {
+        env: INSPECTOR_ENV,
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        shell: false,
+      });
+    } catch {
+      // Do not expose a configured path (which can contain deployment details)
+      // or a native spawn diagnostic through startup/readiness errors.
+      reject(new Error(`${label} is unavailable`));
+      return;
+    }
+    const versionStream = child.stdout;
+    if (!versionStream) {
+      // stdio is explicitly piped above. Treat a violated runtime invariant as
+      // dependency failure instead of accepting a tool we could not identify.
+      if (!child.killed) child.kill('SIGKILL');
+      reject(new Error(`${label} availability check returned unexpected output`));
+      return;
+    }
     let settled = false;
     let versionOutput = '';
     let versionBytes = 0;
@@ -428,30 +452,54 @@ function runAudioInspectorAvailabilityCheck(): Promise<void> {
       if (error) reject(error);
       else resolve();
     };
-    const timeout = setTimeout(() => finish(new Error('FFmpeg availability check timed out')), AVAILABILITY_TIMEOUT_MS);
+    const timeout = setTimeout(
+      () => finish(new Error(`${label} availability check timed out`)),
+      AVAILABILITY_TIMEOUT_MS,
+    );
     timeout.unref();
-    child.stdout.on('data', (chunk: Buffer) => {
+    versionStream.on('data', (chunk: Buffer) => {
       versionBytes += chunk.length;
       if (versionBytes > MAX_VERSION_BYTES) {
-        finish(new Error('FFmpeg availability check returned unexpected output'));
+        finish(new Error(`${label} availability check returned unexpected output`));
         return;
       }
       versionOutput += chunk.toString('utf8');
     });
-    child.once('error', () => finish(new Error('FFmpeg is unavailable')));
+    child.once('error', () => finish(new Error(`${label} is unavailable`)));
     child.once('close', (code) => {
       // The configured executable must identify itself at the very beginning
       // of its bounded stdout. A later, injected-looking line is insufficient.
-      if (code === 0 && /^ffmpeg version[\t ]+\S/.test(versionOutput)) finish();
-      else finish(new Error('FFmpeg is unavailable'));
+      const identifiesExpectedTool =
+        identity === 'ffmpeg'
+          ? /^ffmpeg version[\t ]+\S/.test(versionOutput)
+          : /^ffprobe version[\t ]+\S/.test(versionOutput);
+      if (code === 0 && identifiesExpectedTool) finish();
+      else finish(new Error(`${label} is unavailable`));
     });
+  });
+}
+
+async function runAudioInspectorAvailabilityCheck(): Promise<void> {
+  // Validate in the same order used for an assessment: ffprobe gates the
+  // container before FFmpeg decodes it. Both configured commands must prove
+  // their identity before startup/readiness succeeds.
+  await runMediaToolAvailabilityCheck({
+    executable: config.ffprobePath,
+    identity: 'ffprobe',
+    label: 'FFprobe',
+  });
+  await runMediaToolAvailabilityCheck({
+    executable: config.ffmpegPath,
+    identity: 'ffmpeg',
+    label: 'FFmpeg',
   });
 }
 
 /**
  * Fail-fast dependency check used at startup and by readiness. Concurrent
- * callers share one native process; short result TTLs prevent ordinary probes
- * from repeatedly spawning FFmpeg while still detecting runtime loss quickly.
+ * callers share one bounded dependency-check sequence; short result TTLs
+ * prevent ordinary probes from repeatedly spawning native tools while still
+ * detecting runtime loss quickly.
  */
 export function assertAudioInspectorAvailable({ force = false }: { force?: boolean } = {}): Promise<void> {
   const now = Date.now();
@@ -465,7 +513,8 @@ export function assertAudioInspectorAvailable({ force = false }: { force?: boole
       availabilityCache = { expiresAt: Date.now() + AVAILABILITY_SUCCESS_TTL_MS };
     })
     .catch((error: unknown) => {
-      const availabilityError = error instanceof Error ? error : new Error('FFmpeg is unavailable');
+      const availabilityError =
+        error instanceof Error ? error : new Error('Audio inspection dependencies are unavailable');
       availabilityCache = {
         expiresAt: Date.now() + AVAILABILITY_FAILURE_TTL_MS,
         error: availabilityError,

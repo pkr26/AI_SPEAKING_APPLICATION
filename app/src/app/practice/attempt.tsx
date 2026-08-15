@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -17,7 +17,12 @@ import { useAuth } from '../../lib/auth';
 import { firstParam, isUuid } from '../../lib/params';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
-import { parseAttemptResult, parseHelpContent, type AttemptResult } from '../../lib/types';
+import {
+  parseAttemptResult,
+  parseHelpContent,
+  parseNativeAttemptResult,
+  type PracticeOutcome,
+} from '../../lib/types';
 
 /**
  * Practice Mode: deliberately minimal — only the prompt word, the question,
@@ -26,10 +31,12 @@ import { parseAttemptResult, parseHelpContent, type AttemptResult } from '../../
 export default function AttemptScreen() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
-  const { showFeedback } = usePracticeFlow();
+  const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
+  const [recorderLocked, setRecorderLocked] = useState(false);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
   const validQuestionId = isUuid(questionId) ? questionId : null;
+  const nativeMode = answerMode === 'native';
 
   const helpQuery = useQuery({
     queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
@@ -46,7 +53,7 @@ export default function AttemptScreen() {
   const promptWord = helpQuery.data?.promptWord;
   const questionText = helpQuery.data?.questionText;
 
-  const handleResult = (result: AttemptResult) => {
+  const handleResult = (result: PracticeOutcome) => {
     if (!validQuestionId) return;
     showFeedback(validQuestionId, result);
     router.push('/practice/feedback');
@@ -133,12 +140,35 @@ export default function AttemptScreen() {
         <Text style={styles.questionText}>{questionText}</Text>
       </View>
 
+      <Pressable
+        accessibilityRole="switch"
+        accessibilityLabel="Answer in my language"
+        accessibilityHint={
+          recorderLocked
+            ? 'Finish the current recording before changing answer language.'
+            : undefined
+        }
+        accessibilityState={{ checked: nativeMode, disabled: recorderLocked }}
+        disabled={recorderLocked}
+        style={({ pressed }) => [
+          styles.modeToggle,
+          recorderLocked && styles.modeToggleDisabled,
+          pressed && styles.modeTogglePressed,
+        ]}
+        onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
+      >
+        <Text style={styles.modeToggleText}>
+          {nativeMode ? 'Answering in your language — tap for English' : 'Answer in my language'}
+        </Text>
+      </Pressable>
+
       <View style={styles.recorderArea}>
         <Recorder
+          key={nativeMode ? 'native' : 'english'}
           ownerId={user.id}
           questionId={validQuestionId}
-          endpoint="/practice/attempt"
-          parseResult={parseAttemptResult}
+          endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
+          parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
           onResult={handleResult}
           onError={handleError}
           onRecoveryUnresolved={() => {
@@ -147,6 +177,18 @@ export default function AttemptScreen() {
             });
             router.replace('/practice');
           }}
+          onRecoveryEndpointMismatch={(savedEndpoint) => {
+            if (savedEndpoint === '/practice/attempt/native') {
+              setAnswerMode('native');
+              return true;
+            }
+            if (savedEndpoint === '/practice/attempt') {
+              setAnswerMode('english');
+              return true;
+            }
+            return false;
+          }}
+          onInteractionLockChange={setRecorderLocked}
         />
       </View>
     </ScrollView>
@@ -213,6 +255,26 @@ const styles = StyleSheet.create({
     fontSize: 18,
     lineHeight: 26,
     color: colors.text,
+  },
+  modeToggle: {
+    alignSelf: 'center',
+    marginTop: 16,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  modeTogglePressed: {
+    backgroundColor: colors.primaryLight,
+  },
+  modeToggleDisabled: {
+    opacity: 0.5,
+  },
+  modeToggleText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: colors.primary,
   },
   recorderArea: {
     flex: 1,

@@ -366,8 +366,11 @@ describe('diagnostic failure cleanup', () => {
     const triggerName = `test_hide_next_level_${randomUUID().replaceAll('-', '')}`;
     const functionName = `${triggerName}_fn`;
     const random = vi.spyOn(Math, 'random').mockReturnValue(0.9999);
-    const nextLevelQuestions = await pool.query<{ id: string }>("SELECT id FROM questions WHERE cefr_level = 'C1'");
+    const nextLevelQuestions = await pool.query<{ id: string; prompt_word: string }>(
+      "SELECT id, prompt_word FROM questions WHERE cefr_level = 'C1'",
+    );
     const nextLevelQuestionIds = nextLevelQuestions.rows.map(({ id }) => id);
+    const nextLevelPromptWords = nextLevelQuestions.rows.map(({ prompt_word }) => prompt_word);
     expect(nextLevelQuestionIds.length).toBeGreaterThan(0);
 
     try {
@@ -378,7 +381,9 @@ describe('diagnostic failure cleanup', () => {
               CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
               BEGIN
                 IF NEW.context = 'diagnostic' AND NEW.user_id = '${userId}'::uuid THEN
-                  UPDATE questions SET cefr_level = 'C2' WHERE cefr_level = 'C1';
+                  UPDATE questions
+                  SET cefr_level = 'C2', prompt_word = 'test-' || id::text
+                  WHERE cefr_level = 'C1';
                 END IF;
                 RETURN NEW;
               END $$
@@ -396,8 +401,13 @@ describe('diagnostic failure cleanup', () => {
           { text: `DROP TRIGGER IF EXISTS ${triggerName} ON attempts` },
           { text: `DROP FUNCTION IF EXISTS ${functionName}()` },
           {
-            text: `UPDATE questions SET cefr_level = 'C1' WHERE id = ANY($1::uuid[])`,
-            values: [nextLevelQuestionIds],
+            text: `
+              UPDATE questions q
+              SET cefr_level = 'C1', prompt_word = restored.prompt_word
+              FROM unnest($1::uuid[], $2::text[]) AS restored(id, prompt_word)
+              WHERE q.id = restored.id
+            `,
+            values: [nextLevelQuestionIds, nextLevelPromptWords],
           },
         ],
         async () => {
@@ -419,21 +429,33 @@ describe('diagnostic question availability', () => {
   it('returns the stable error when the initial diagnostic level has no questions', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const questions = await pool.query<{ id: string }>("SELECT id FROM questions WHERE cefr_level = 'B1'");
+    const questions = await pool.query<{ id: string; prompt_word: string }>(
+      "SELECT id, prompt_word FROM questions WHERE cefr_level = 'B1'",
+    );
     const questionIds = questions.rows.map(({ id }) => id);
+    const promptWords = questions.rows.map(({ prompt_word }) => prompt_word);
     expect(questionIds.length).toBeGreaterThan(0);
 
     await withTemporaryDatabaseArtifacts(
       [
         {
-          text: `UPDATE questions SET cefr_level = 'C2' WHERE id = ANY($1::uuid[])`,
+          text: `
+            UPDATE questions
+            SET cefr_level = 'C2', prompt_word = 'test-' || id::text
+            WHERE id = ANY($1::uuid[])
+          `,
           values: [questionIds],
         },
       ],
       [
         {
-          text: `UPDATE questions SET cefr_level = 'B1' WHERE id = ANY($1::uuid[])`,
-          values: [questionIds],
+          text: `
+            UPDATE questions q
+            SET cefr_level = 'B1', prompt_word = restored.prompt_word
+            FROM unnest($1::uuid[], $2::text[]) AS restored(id, prompt_word)
+            WHERE q.id = restored.id
+          `,
+          values: [questionIds, promptWords],
         },
       ],
       async () => {

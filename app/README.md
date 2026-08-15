@@ -74,10 +74,10 @@ src/
     (auth)/             login + signup (native-language picker)
     diagnostic.tsx      CEFR diagnostic test flow
     practice/
-      index.tsx         practice question + Recorder + help (?) + log out
+      index.tsx         mastery/revision question + answer mode + Recorder + help
       help.tsx          translations + example sentences for a question
-      attempt.tsx       minimal practice mode (word + question + Recorder)
-      feedback.tsx      pass / retry / final-fail variants
+      attempt.tsx       minimal practice mode; preserves English/native answer mode
+      feedback.tsx      mastery, retry, silence, final, and native-result variants
     settings/
       change-password.tsx password rotation
       delete-account.tsx  destructive account-deletion confirmation
@@ -107,3 +107,8 @@ users. Device-only secure storage records the owner, question, request, upload
 stage, and user-scoped S3 key when applicable, allowing the app to reconcile an
 interrupted handoff through authenticated `GET /assessments/:requestId`; the
 server replay expires after 24 hours.
+
+English practice responses report whether the word was mastered (score 75+),
+and silence is returned as an explicit free-retry result. Native-language
+practice uses `POST /practice/attempt/native`; it checks comprehension and
+returns a model English answer but does not create an attempt or change mastery.

@@ -437,21 +437,25 @@ describe('database deployment runner', () => {
     expect(log).toHaveBeenCalledWith('questions per level: []');
   });
 
-  it.each(['migrate', 'seed', 'setup'] as const)('dispatches the %s database command exactly once', async (command) => {
-    const actions = {
-      migrate: vi.fn(async () => []),
-      seed: vi.fn(async () => undefined),
-      setup: vi.fn(async () => undefined),
-    } as unknown as DatabaseCommandActions;
+  it.each(['migrate', 'catalog', 'seed', 'setup'] as const)(
+    'dispatches the %s database command exactly once',
+    async (command) => {
+      const actions = {
+        migrate: vi.fn(async () => []),
+        catalog: vi.fn(async () => undefined),
+        seed: vi.fn(async () => undefined),
+        setup: vi.fn(async () => undefined),
+      } as unknown as DatabaseCommandActions;
 
-    await runDatabaseCommand('postgres://localhost:5432/command_test', command, actions);
+      await runDatabaseCommand('postgres://localhost:5432/command_test', command, actions);
 
-    expect(actions[command]).toHaveBeenCalledOnce();
-    expect(actions[command]).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
-    for (const other of ['migrate', 'seed', 'setup'] as const) {
-      if (other !== command) expect(actions[other]).not.toHaveBeenCalled();
-    }
-  });
+      expect(actions[command]).toHaveBeenCalledOnce();
+      expect(actions[command]).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
+      for (const other of ['migrate', 'catalog', 'seed', 'setup'] as const) {
+        if (other !== command) expect(actions[other]).not.toHaveBeenCalled();
+      }
+    },
+  );
 
   it('uses the real default command actions when no dispatch seam is supplied', async () => {
     const client = provideClient(async (sql) => {
@@ -477,6 +481,7 @@ describe('database deployment runner', () => {
   it('defaults the database command to setup and rejects missing or unknown inputs before dispatch', async () => {
     const actions = {
       migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
       seed: vi.fn(async () => undefined),
       setup: vi.fn(async () => undefined),
     } as unknown as DatabaseCommandActions;
@@ -486,16 +491,18 @@ describe('database deployment runner', () => {
 
     await expect(runDatabaseCommand(undefined, 'setup', actions)).rejects.toThrow('DATABASE_URL is required');
     await expect(runDatabaseCommand('postgres://localhost:5432/command_test', 'drop', actions)).rejects.toThrow(
-      'unknown database command "drop" (expected "setup", "migrate", or "seed")',
+      'unknown database command "drop" (expected "setup", "migrate", "catalog", or "seed")',
     );
     expect(actions.migrate).not.toHaveBeenCalled();
+    expect(actions.catalog).not.toHaveBeenCalled();
     expect(actions.seed).not.toHaveBeenCalled();
     expect(actions.setup).toHaveBeenCalledOnce();
   });
 
-  it('refuses setup and seed in production while migrate stays allowed', async () => {
+  it('refuses setup and seed in production while migrate and catalog stay allowed', async () => {
     const actions = {
       migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
       seed: vi.fn(async () => undefined),
       setup: vi.fn(async () => undefined),
     } as unknown as DatabaseCommandActions;
@@ -504,10 +511,10 @@ describe('database deployment runner', () => {
 
     try {
       await expect(runDatabaseCommand('postgres://localhost:5432/command_test', 'setup', actions)).rejects.toThrow(
-        'refusing to run "setup" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"',
+        'refusing to run "setup" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"',
       );
       await expect(runDatabaseCommand('postgres://localhost:5432/command_test', 'seed', actions)).rejects.toThrow(
-        'refusing to run "seed" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod"',
+        'refusing to run "seed" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"',
       );
       expect(actions.setup).not.toHaveBeenCalled();
       expect(actions.seed).not.toHaveBeenCalled();
@@ -518,6 +525,11 @@ describe('database deployment runner', () => {
       ).resolves.toBeUndefined();
       expect(actions.migrate).toHaveBeenCalledOnce();
       expect(actions.migrate).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
+      await expect(
+        runDatabaseCommand('postgres://localhost:5432/command_test', 'catalog', actions),
+      ).resolves.toBeUndefined();
+      expect(actions.catalog).toHaveBeenCalledOnce();
+      expect(actions.catalog).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
     } finally {
       process.env.NODE_ENV = previousNodeEnv;
     }

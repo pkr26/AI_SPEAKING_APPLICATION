@@ -6,7 +6,8 @@ import {
   parseDiagnosticAnswerResult,
   parseDiagnosticNext,
   parseHelpContent,
-  parseQuestionResponse,
+  parseNativeAttemptResult,
+  parsePracticeQuestion,
   parseUser,
   parseUserResponse,
 } from '../src/lib/types';
@@ -25,6 +26,18 @@ const question = {
   cefrLevel: 'B1',
   promptWord: 'travel',
   questionText: 'Where would you like to travel?',
+} as const;
+
+const practiceProgress = {
+  masteredCount: 2,
+  learningCount: 1,
+  totalAtLevel: 8,
+} as const;
+
+const practicePayload = {
+  question,
+  kind: 'new',
+  progress: practiceProgress,
 } as const;
 
 function expectContractError(run: () => unknown): void {
@@ -88,14 +101,14 @@ describe('identity contract parsers', () => {
     expectContractError(() => parseAuthResponse(Object.assign([], { token: 'jwt', user })));
     expectContractError(() => parseUserResponse(null));
     expectContractError(() => parseUserResponse(Object.assign([], { user })));
-    expectContractError(() => parseQuestionResponse(null));
-    expectContractError(() => parseQuestionResponse(Object.assign([], { question })));
+    expectContractError(() => parsePracticeQuestion(null));
+    expectContractError(() => parsePracticeQuestion(Object.assign([], practicePayload)));
   });
 });
 
 describe('question and diagnostic contract parsers', () => {
-  it('accepts valid question and both diagnostic-next variants', () => {
-    expect(parseQuestionResponse({ question })).toEqual({ question });
+  it('accepts a valid practice question payload and both diagnostic-next variants', () => {
+    expect(parsePracticeQuestion(practicePayload)).toEqual(practicePayload);
     expect(
       parseDiagnosticNext({
         done: false,
@@ -114,9 +127,9 @@ describe('question and diagnostic contract parsers', () => {
   });
 
   it('rejects missing, non-finite, and wrong-type diagnostic fields', () => {
-    expectContractError(() => parseQuestionResponse({ question: {} }));
+    expectContractError(() => parsePracticeQuestion({ ...practicePayload, question: {} }));
     expectContractError(() =>
-      parseQuestionResponse({ question: { ...question, cefrLevel: 'B9' } }),
+      parsePracticeQuestion({ ...practicePayload, question: { ...question, cefrLevel: 'B9' } }),
     );
     expectContractError(() => parseDiagnosticNext({ done: true }));
     expectContractError(() =>
@@ -257,13 +270,14 @@ describe('practice contract parsers', () => {
 
     const attempt = {
       passed: false,
+      mastered: false,
       attemptNo: 3,
       attemptsLeft: 0,
-      score: 60,
+      score: 59,
       transcript: 'Spain.',
       feedback: 'Add more detail.',
       finalFeedback: 'Use a full sentence.',
-      nextQuestion: question,
+      next: practicePayload,
     };
     expect(parseAttemptResult(attempt)).toEqual(attempt);
   });
@@ -296,15 +310,17 @@ describe('practice contract parsers', () => {
   it('rejects array and wrong-boolean attempt envelopes that otherwise satisfy the contract', () => {
     const passedAttempt = {
       passed: true,
+      mastered: true,
       attemptNo: 1,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
-      nextQuestion: question,
+      next: practicePayload,
     } as const;
 
     expectContractError(() => parseAttemptResult(Object.assign([], passedAttempt)));
     expectContractError(() => parseAttemptResult({ ...passedAttempt, passed: 'yes' }));
+    expectContractError(() => parseAttemptResult({ ...passedAttempt, mastered: 'yes' }));
   });
 
   it('rejects malformed nested help examples and practice edge values', () => {
@@ -329,6 +345,7 @@ describe('practice contract parsers', () => {
     expectContractError(() =>
       parseAttemptResult({
         passed: false,
+        mastered: false,
         attemptNo: 1,
         attemptsLeft: Number.POSITIVE_INFINITY,
         score: 50,
@@ -339,6 +356,7 @@ describe('practice contract parsers', () => {
     expectContractError(() =>
       parseAttemptResult({
         passed: false,
+        mastered: false,
         attemptNo: 0,
         score: 50,
         transcript: '',
@@ -348,6 +366,7 @@ describe('practice contract parsers', () => {
     expectContractError(() =>
       parseAttemptResult({
         passed: false,
+        mastered: false,
         attemptNo: 1,
         score: -1,
         transcript: '',
@@ -357,13 +376,179 @@ describe('practice contract parsers', () => {
     expectContractError(() =>
       parseAttemptResult({
         passed: false,
+        mastered: false,
         attemptNo: 1,
         score: 50,
         transcript: '',
         feedback: 'Try again.',
-        nextQuestion: [],
+        next: [],
       }),
     );
+  });
+});
+
+describe('practice question payload parser', () => {
+  it('accepts new and revision payloads at the progress count boundaries', () => {
+    expect(parsePracticeQuestion(practicePayload)).toEqual(practicePayload);
+    const revision = {
+      question,
+      kind: 'revision',
+      progress: { masteredCount: 0, learningCount: 5, totalAtLevel: 5 },
+    } as const;
+    expect(parsePracticeQuestion(revision)).toEqual(revision);
+    const maxed = {
+      question,
+      kind: 'new',
+      progress: { masteredCount: 100_000, learningCount: 0, totalAtLevel: 100_000 },
+    } as const;
+    expect(parsePracticeQuestion(maxed)).toEqual(maxed);
+  });
+
+  it.each([
+    ['a bogus kind', { ...practicePayload, kind: 'repeat' }],
+    ['an uppercase kind', { ...practicePayload, kind: 'NEW' }],
+    ['a missing kind', { question, progress: practiceProgress }],
+    ['a missing progress', { question, kind: 'new' }],
+    ['a null progress', { ...practicePayload, progress: null }],
+    ['an array progress', { ...practicePayload, progress: Object.assign([], practiceProgress) }],
+    [
+      'more mastered and learning words than the level holds',
+      { ...practicePayload, progress: { masteredCount: 3, learningCount: 3, totalAtLevel: 5 } },
+    ],
+    [
+      'an empty level',
+      { ...practicePayload, progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0 } },
+    ],
+    [
+      'a negative mastered count',
+      { ...practicePayload, progress: { masteredCount: -1, learningCount: 0, totalAtLevel: 1 } },
+    ],
+    [
+      'a fractional learning count',
+      { ...practicePayload, progress: { masteredCount: 0, learningCount: 1.5, totalAtLevel: 2 } },
+    ],
+    [
+      'a count beyond the server bound',
+      {
+        ...practicePayload,
+        progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 100_001 },
+      },
+    ],
+  ])('rejects a practice question payload with %s', (_label, value) => {
+    expectContractError(() => parsePracticeQuestion(value));
+  });
+});
+
+describe('native attempt result parser', () => {
+  const native = {
+    mode: 'native',
+    understood: true,
+    transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    modelAnswer: 'She showed courage at work.',
+    feedback: 'You understood the question.',
+  } as const;
+
+  it('accepts understood, missed, and silent native results', () => {
+    expect(parseNativeAttemptResult(native)).toEqual(native);
+    const missed = {
+      mode: 'native',
+      understood: false,
+      transcript: 'నేను రైలులో ప్రయాణిస్తాను.',
+      modelAnswer: 'She showed courage at work.',
+      feedback: 'That answer was about something else.',
+    } as const;
+    expect(parseNativeAttemptResult(missed)).toEqual(missed);
+    const silent = {
+      mode: 'native',
+      understood: false,
+      transcript: '',
+      modelAnswer: '',
+      feedback: 'We could not hear any speech.',
+    } as const;
+    expect(parseNativeAttemptResult(silent)).toEqual(silent);
+  });
+
+  it('accepts the native string-length boundaries', () => {
+    const bounded = {
+      ...native,
+      transcript: 'x'.repeat(12_000),
+      modelAnswer: 'x'.repeat(800),
+      feedback: 'x'.repeat(800),
+    };
+    expect(parseNativeAttemptResult(bounded)).toEqual(bounded);
+  });
+
+  it.each([
+    ['the wrong mode', { ...native, mode: 'english' }],
+    ['a missing mode', { understood: true, transcript: '', modelAnswer: '', feedback: 'Good.' }],
+    ['a non-boolean understood flag', { ...native, understood: 'yes' }],
+    ['an empty feedback', { ...native, feedback: '' }],
+    ['a blank feedback', { ...native, feedback: '   ' }],
+    ['an overlong feedback', { ...native, feedback: 'x'.repeat(801) }],
+    ['an overlong model answer', { ...native, modelAnswer: 'x'.repeat(801) }],
+    ['an overlong transcript', { ...native, transcript: 'x'.repeat(12_001) }],
+    ['a non-string model answer', { ...native, modelAnswer: 42 }],
+    ['silence marked understood', { ...native, transcript: '', modelAnswer: '' }],
+    ['silence with a model answer', { ...native, understood: false, transcript: '' }],
+    [
+      'speech without a model answer',
+      { ...native, understood: false, transcript: 'A spoken answer.', modelAnswer: '' },
+    ],
+    [
+      'whitespace-only speech',
+      { ...native, understood: false, transcript: '   ', modelAnswer: 'An answer.' },
+    ],
+  ])('rejects a native attempt result with %s', (_label, value) => {
+    expectContractError(() => parseNativeAttemptResult(value));
+  });
+
+  it('rejects null and array native envelopes', () => {
+    expectContractError(() => parseNativeAttemptResult(null));
+    expectContractError(() => parseNativeAttemptResult(Object.assign([], native)));
+  });
+});
+
+describe('no-speech attempt variant', () => {
+  it.each([
+    [1, 3],
+    [2, 2],
+    [3, 1],
+  ] as const)(
+    'accepts silence on attempt %i as a free retry with %i attempts left',
+    (attemptNo, attemptsLeft) => {
+      const silent = {
+        passed: false,
+        mastered: false,
+        noSpeech: true,
+        attemptNo,
+        attemptsLeft,
+        score: 0,
+        transcript: '',
+        feedback: 'We could not hear any speech.',
+      };
+      expect(parseAttemptResult(silent)).toEqual(silent);
+    },
+  );
+
+  it('rejects silence that carries scored-attempt fields', () => {
+    const silent = {
+      passed: false,
+      mastered: false,
+      noSpeech: true,
+      attemptNo: 2,
+      attemptsLeft: 2,
+      score: 0,
+      transcript: '',
+      feedback: 'We could not hear any speech.',
+    };
+    expectContractError(() => parseAttemptResult({ ...silent, next: practicePayload }));
+    expectContractError(() => parseAttemptResult({ ...silent, finalFeedback: 'Final words.' }));
+    expectContractError(() => parseAttemptResult({ ...silent, transcript: 'a few words' }));
+    expectContractError(() => parseAttemptResult({ ...silent, score: 1 }));
+    expectContractError(() => parseAttemptResult({ ...silent, attemptsLeft: 1 }));
+    expectContractError(() => parseAttemptResult({ ...silent, passed: true }));
+    expectContractError(() => parseAttemptResult({ ...silent, mastered: true }));
+    expectContractError(() => parseAttemptResult({ ...silent, noSpeech: false }));
   });
 });
 
@@ -548,20 +733,22 @@ describe('help and attempt detail boundaries', () => {
   it('enforces attempt number and attempts-left bounds', () => {
     const final = {
       passed: false,
+      mastered: false,
       attemptNo: 3,
       attemptsLeft: 0,
       score: 50,
-      transcript: '',
+      transcript: 'A short final answer.',
       feedback: 'Try again.',
       finalFeedback: 'Use a complete sentence next time.',
-      nextQuestion: question,
+      next: practicePayload,
     };
     const firstRetry = {
       passed: false,
+      mastered: false,
       attemptNo: 1,
       attemptsLeft: 2,
       score: 50,
-      transcript: '',
+      transcript: 'A short answer.',
       feedback: 'Try again.',
     };
     expect(parseAttemptResult(final)).toEqual(final);
@@ -578,20 +765,22 @@ describe('help and attempt detail boundaries', () => {
   it('enforces passed, retry, and final response shapes', () => {
     const passed = {
       passed: true,
+      mastered: true,
       attemptNo: 1,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
-      nextQuestion: question,
+      next: practicePayload,
     };
     expect(parseAttemptResult(passed)).toEqual(passed);
     expectContractError(() => parseAttemptResult({ ...passed, attemptNo: 0 }));
     expectContractError(() => parseAttemptResult({ ...passed, finalFeedback: 'Solid progress.' }));
     expectContractError(() => parseAttemptResult({ ...passed, attemptsLeft: 2 }));
-    expectContractError(() => parseAttemptResult({ ...passed, nextQuestion: undefined }));
+    expectContractError(() => parseAttemptResult({ ...passed, next: undefined }));
 
     const retry = {
       passed: false,
+      mastered: false,
       attemptNo: 2,
       attemptsLeft: 1,
       score: 45,
@@ -603,18 +792,67 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() =>
       parseAttemptResult({ ...retry, finalFeedback: 'Only final failures include this.' }),
     );
-    expectContractError(() => parseAttemptResult({ ...retry, nextQuestion: question }));
+    expectContractError(() => parseAttemptResult({ ...retry, next: practicePayload }));
 
     const final = {
       ...retry,
       attemptNo: 3,
       attemptsLeft: 0,
       finalFeedback: 'Review the example and continue.',
-      nextQuestion: question,
+      next: practicePayload,
     };
     expect(parseAttemptResult(final)).toEqual(final);
     expectContractError(() => parseAttemptResult({ ...final, finalFeedback: '   ' }));
-    expectContractError(() => parseAttemptResult({ ...final, nextQuestion: undefined }));
+    expectContractError(() => parseAttemptResult({ ...final, next: undefined }));
+  });
+
+  it.each([
+    ['a passing score marked failed', { passed: false, mastered: false, score: 60 }],
+    ['a failing score marked passed', { passed: true, mastered: false, score: 59 }],
+    ['a mastery score not marked mastered', { passed: true, mastered: false, score: 75 }],
+    ['a sub-mastery score marked mastered', { passed: true, mastered: true, score: 74 }],
+  ])('rejects %s', (_label, flags) => {
+    expectContractError(() =>
+      parseAttemptResult({
+        attemptNo: 1,
+        transcript: 'A complete answer.',
+        feedback: 'Feedback.',
+        next: practicePayload,
+        ...flags,
+      }),
+    );
+  });
+
+  it('requires the mastered flag on every scored attempt variant', () => {
+    const base = {
+      attemptNo: 1,
+      score: 90,
+      transcript: 'An answer.',
+      feedback: 'Great.',
+    };
+    expectContractError(() => parseAttemptResult({ ...base, passed: true, next: practicePayload }));
+    expectContractError(() => parseAttemptResult({ ...base, passed: false, attemptsLeft: 2 }));
+    expectContractError(() =>
+      parseAttemptResult({
+        ...base,
+        passed: false,
+        attemptNo: 3,
+        attemptsLeft: 0,
+        finalFeedback: 'Review the example and continue.',
+        next: practicePayload,
+      }),
+    );
+    expectContractError(() =>
+      parseAttemptResult({
+        passed: false,
+        noSpeech: true,
+        attemptNo: 1,
+        attemptsLeft: 3,
+        score: 0,
+        transcript: '',
+        feedback: 'We could not hear any speech.',
+      }),
+    );
   });
 
   it('rejects response strings and collections beyond server contract bounds', () => {
@@ -625,7 +863,8 @@ describe('help and attempt detail boundaries', () => {
       email: `${'e'.repeat(242)}@example.com`,
     });
     expect(
-      parseQuestionResponse({
+      parsePracticeQuestion({
+        ...practicePayload,
         question: {
           ...question,
           promptWord: 'x'.repeat(100),
@@ -657,7 +896,8 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() => parseUser({ ...user, name: 'x'.repeat(101) }));
     expectContractError(() => parseUser({ ...user, email: 'x'.repeat(255) }));
     expectContractError(() =>
-      parseQuestionResponse({
+      parsePracticeQuestion({
+        ...practicePayload,
         question: { ...question, questionText: 'x'.repeat(1_001) },
       }),
     );
@@ -702,23 +942,25 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() =>
       parseAttemptResult({
         passed: false,
+        mastered: false,
         attemptNo: 3,
         attemptsLeft: 0,
         score: 50,
-        transcript: '',
+        transcript: 'A final answer.',
         feedback: 'Try again.',
         finalFeedback: 'x'.repeat(4_001),
-        nextQuestion: question,
+        next: practicePayload,
       }),
     );
 
     const boundedAttempt = {
       passed: true,
+      mastered: true,
       attemptNo: 1,
       score: 80,
       transcript: 'x'.repeat(12_000),
       feedback: 'x'.repeat(800),
-      nextQuestion: question,
+      next: practicePayload,
     };
     expect(parseAttemptResult(boundedAttempt)).toEqual(boundedAttempt);
     expectContractError(() =>
@@ -844,7 +1086,9 @@ describe('audio upload grant parser', () => {
       'https://bucket.s3.us-east-1.amazonaws.com/',
       'https://bucket.s3.amazonaws.com/',
       'https://BUCKET.S3.US-EAST-1.AMAZONAWS.COM/',
-      'https://amazonaws.com/',
+      'https://bucket.s3.dualstack.us-east-1.amazonaws.com/',
+      'https://s3.us-east-1.amazonaws.com/bucket',
+      'https://bucket.s3-us-east-1.amazonaws.com/',
     ]) {
       expect(parseAudioUploadGrant({ ...s3, uploadUrl })).toMatchObject({ uploadUrl });
     }
@@ -852,6 +1096,10 @@ describe('audio upload grant parser', () => {
 
   it.each([
     'https://attacker.example/collect',
+    'https://amazonaws.com/',
+    'https://execute-api.us-east-1.amazonaws.com/',
+    'https://ec2.us-east-1.amazonaws.com/',
+    'https://bucket.s3-website-us-east-1.amazonaws.com/',
     'https://amazonaws.com.evil.com/',
     'https://evilamazonaws.com/',
     'https://notamazonaws.com.attacker.tld/',

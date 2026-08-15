@@ -13,7 +13,16 @@ import { ApiError, apiFetch } from '../src/lib/api';
 import { LogoutCleanupError, useAuth } from '../src/lib/auth';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
 import { colors, layout } from '../src/lib/theme';
-import { parseAttemptResult, type AttemptResult, type Question, type User } from '../src/lib/types';
+import {
+  parseAttemptResult,
+  parseNativeAttemptResult,
+  type AttemptResult,
+  type NativeAttemptResult,
+  type PracticeOutcome,
+  type PracticeQuestionPayload,
+  type Question,
+  type User,
+} from '../src/lib/types';
 
 // ----- expo-router mock -----
 
@@ -36,10 +45,14 @@ interface CapturedRecorderProps {
   ownerId: string;
   questionId: string;
   endpoint: string;
-  parseResult: (data: unknown) => AttemptResult;
-  onResult: (data: AttemptResult) => void;
+  parseResult: (data: unknown) => PracticeOutcome;
+  onResult: (data: PracticeOutcome) => void;
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
+  onInteractionLockChange?: (locked: boolean) => void;
+  onRecoveryEndpointMismatch?: (
+    endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+  ) => boolean;
 }
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
@@ -101,7 +114,9 @@ let mockPracticeFlow: PracticeFlowValue;
 
 function makePracticeFlow(overrides: Partial<PracticeFlowValue> = {}): PracticeFlowValue {
   return {
+    answerMode: 'english',
     feedback: null,
+    setAnswerMode: jest.fn(),
     showFeedback: jest.fn(),
     clearFeedback: jest.fn(),
     ...overrides,
@@ -161,13 +176,26 @@ const HELP_CONTENT = {
   ],
 };
 
+const PRACTICE_QUESTION: PracticeQuestionPayload = {
+  question: QUESTION,
+  kind: 'new',
+  progress: { masteredCount: 2, learningCount: 1, totalAtLevel: 8 },
+};
+
+const NEXT_PRACTICE_QUESTION: PracticeQuestionPayload = {
+  question: NEXT_QUESTION,
+  kind: 'new',
+  progress: { masteredCount: 3, learningCount: 1, totalAtLevel: 8 },
+};
+
 const PASSED_RESULT: AttemptResult = {
   passed: true,
+  mastered: false,
   attemptNo: 1,
-  score: 92,
+  score: 72,
   transcript: 'I enjoy reading.',
   feedback: 'Nice work.',
-  nextQuestion: NEXT_QUESTION,
+  next: NEXT_PRACTICE_QUESTION,
 };
 
 // ----- helpers -----
@@ -287,7 +315,7 @@ describe('practice home screen', () => {
   });
 
   it('renders the question and wires the recorder', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     const queryClient = makeQueryClient();
     await renderScreen(<PracticeScreen />, queryClient);
 
@@ -320,6 +348,82 @@ describe('practice home screen', () => {
     ).toEqual(expect.objectContaining({ enabled: true, retry: false, staleTime: Infinity }));
   });
 
+  it('shows the new-word badge and progress line for a fresh word', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+
+    expect(await screen.findByText('New word')).toBeTruthy();
+    expect(screen.getByText('2 of 8 words mastered · 1 in revision')).toBeTruthy();
+  });
+
+  it('shows the revision badge and hides a zero revision count', async () => {
+    mockApiFetch.mockResolvedValue({
+      question: QUESTION,
+      kind: 'revision',
+      progress: { masteredCount: 4, learningCount: 0, totalAtLevel: 12 },
+    });
+    await renderScreen(<PracticeScreen />);
+
+    expect(await screen.findByText('Revision')).toBeTruthy();
+    expect(screen.getByText('4 of 12 words mastered')).toBeTruthy();
+    expect(screen.queryByText(/in revision/)).toBeNull();
+  });
+
+  it('starts in English and requests native mode from the language toggle', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(screen.getByText('Answer in my language')).toBeTruthy();
+    expect(recorderProps().endpoint).toBe('/practice/attempt');
+    expect(recorderProps().parseResult).toBe(parseAttemptResult);
+    expect(
+      screen.getByRole('switch', { name: 'Answer in my language' }).props.accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
+
+    await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt/native')).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('native');
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/diagnostic/answer')).toBe(false);
+  });
+
+  it('wires native mode to its isolated endpoint and can request English mode', async () => {
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(screen.getByText('Answering in your language — tap for English')).toBeTruthy();
+    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
+    expect(recorderProps().parseResult).toBe(parseNativeAttemptResult);
+    expect(
+      screen.getByRole('switch', { name: 'Answer in my language' }).props.accessibilityState,
+    ).toEqual({ checked: true, disabled: false });
+    await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
+
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
+  });
+
+  it('locks the language switch while a recording or submission is active', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    const toggle = screen.getByRole('switch', { name: 'Answer in my language' });
+    expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
+    await fireEvent.press(toggle);
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
   it('does not load or mount a recorder without an authenticated user', async () => {
     mockAuthValue = makeAuth({ user: null });
 
@@ -331,7 +435,7 @@ describe('practice home screen', () => {
   });
 
   it('forwards recorder results to the practice flow and feedback route', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -340,8 +444,62 @@ describe('practice home screen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
+  it('updates a cached new word to revision after a real scored miss', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const queryClient = makeQueryClient();
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'I tried to answer.',
+      feedback: 'Add more detail.',
+    };
+
+    await act(async () => recorderProps().onResult(miss));
+
+    await waitFor(() => expect(screen.getByText('Revision')).toBeTruthy());
+    expect(screen.getByText('2 of 8 words mastered · 2 in revision')).toBeTruthy();
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
+      ...PRACTICE_QUESTION,
+      kind: 'revision',
+      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
+    });
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, miss);
+    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('does not double-count a scored miss for a word already in revision', async () => {
+    const revision = {
+      ...PRACTICE_QUESTION,
+      kind: 'revision' as const,
+    };
+    mockApiFetch.mockResolvedValue(revision);
+    const queryClient = makeQueryClient();
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 2,
+      attemptsLeft: 1,
+      score: 50,
+      transcript: 'I tried again.',
+      feedback: 'Add another supporting detail.',
+    };
+
+    await act(async () => recorderProps().onResult(miss));
+
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual(
+      revision,
+    );
+  });
+
   it('surfaces recorder errors through an alert', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -350,7 +508,7 @@ describe('practice home screen', () => {
   });
 
   it('refetches the question when recorder recovery is unresolved', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -366,7 +524,7 @@ describe('practice home screen', () => {
     const queryClient = makeQueryClient();
     const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
     mockApiFetch
-      .mockResolvedValueOnce({ question: QUESTION })
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
       .mockRejectedValueOnce(new Error('background refresh failed'));
     await renderScreen(<PracticeScreen />, queryClient);
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
@@ -383,7 +541,7 @@ describe('practice home screen', () => {
   });
 
   it('navigates to help for the current question', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -439,7 +597,7 @@ describe('practice home screen', () => {
   });
 
   it('opens the settings menu and navigates to settings screens', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -458,7 +616,7 @@ describe('practice home screen', () => {
   });
 
   it('logs out and returns to the gate', async () => {
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -471,7 +629,7 @@ describe('practice home screen', () => {
     mockAuthValue = makeAuth({
       logout: jest.fn().mockRejectedValue(new LogoutCleanupError()),
     });
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -486,7 +644,7 @@ describe('practice home screen', () => {
     mockAuthValue = makeAuth({
       logout: jest.fn().mockRejectedValue(new Error('offline')),
     });
-    mockApiFetch.mockResolvedValue({ question: QUESTION });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -557,6 +715,58 @@ describe('practice attempt screen', () => {
     ).toEqual(expect.objectContaining({ enabled: true, retry: false }));
     // Practice Mode deliberately hides translations and examples.
     expect(screen.queryByText('ధైర్యం')).toBeNull();
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt/native')).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
+  it('preserves native mode when practice is entered from help', async () => {
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    expect(screen.getByText('Answering in your language — tap for English')).toBeTruthy();
+    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
+    expect(recorderProps().parseResult).toBe(parseNativeAttemptResult);
+    expect(
+      screen.getByRole('switch', { name: 'Answer in my language' }).props.accessibilityState,
+    ).toEqual({ checked: true, disabled: false });
+
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: true,
+      transcript: 'నాకు ప్రయాణం ఇష్టం.',
+      modelAnswer: 'I enjoy travelling because I discover new places.',
+      feedback: 'Your answer was on topic.',
+    };
+    await act(async () => recorderProps().onResult(nativeResult));
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, nativeResult);
+    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+
+    await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
+
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/diagnostic/answer')).toBe(false);
+  });
+
+  it('locks the help-entry language switch during recording and submission', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    const toggle = screen.getByRole('switch', { name: 'Answer in my language' });
+    expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
+    await fireEvent.press(toggle);
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await fireEvent.press(screen.getByRole('switch', { name: 'Answer in my language' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
   });
 
   it('does not load help or mount a recorder without an authenticated user', async () => {
@@ -702,8 +912,12 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />, queryClient);
 
     expect(screen.getByText('Great job!')).toBeTruthy();
-    expect(screen.getByText('You passed this question.')).toBeTruthy();
-    expect(screen.getByText('92')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'You passed! A score of 75 or above masters a word that is still in learning.',
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('72')).toBeTruthy();
     expect(screen.getByText('We heard')).toBeTruthy();
     expect(screen.getByText('“I enjoy reading.”')).toBeTruthy();
     expect(screen.getByText('Feedback')).toBeTruthy();
@@ -722,11 +936,196 @@ describe('practice feedback screen', () => {
     );
 
     await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
-    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
-      question: NEXT_QUESTION,
-    });
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual(
+      NEXT_PRACTICE_QUESTION,
+    );
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('renders the mastered variant and seeds the next question', async () => {
+    const masteredResult: AttemptResult = {
+      passed: true,
+      mastered: true,
+      attemptNo: 1,
+      score: 88,
+      transcript: 'I spoke up at work.',
+      feedback: 'Confident and clear.',
+      next: NEXT_PRACTICE_QUESTION,
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: masteredResult },
+    });
+    const queryClient = makeQueryClient();
+    await renderScreen(<FeedbackScreen />, queryClient);
+
+    expect(screen.getByText('Word mastered!')).toBeTruthy();
+    expect(screen.getByText('You scored 75 or above — this word is yours.')).toBeTruthy();
+    expect(screen.getByText('88')).toBeTruthy();
+    expect(screen.getByText('Confident and clear.')).toBeTruthy();
+    expect(screen.queryByText('Great job!')).toBeNull();
+    expect(screen.queryByText(/Not quite/)).toBeNull();
+    expect(flattenedStyle(screen.getByRole('header', { name: 'Word mastered!' }))).toMatchObject({
+      color: colors.success,
+      textAlign: 'center',
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Next Question' }));
+    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual(
+      NEXT_PRACTICE_QUESTION,
+    );
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('renders the native variant with the model answer when understood', async () => {
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: true,
+      transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+      modelAnswer: 'She showed courage at work.',
+      feedback: 'You understood the question.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: nativeResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText('You understood the question!')).toBeTruthy();
+    expect(screen.getByText('Your answer made sense. Now try saying it in English!')).toBeTruthy();
+    expect(screen.getByText('We heard')).toBeTruthy();
+    expect(screen.getByText('“ఆమె పనిలో ధైర్యం చూపింది.”')).toBeTruthy();
+    expect(screen.getByText('Feedback')).toBeTruthy();
+    expect(screen.getByText('You understood the question.')).toBeTruthy();
+    expect(screen.getByText('Say it in English')).toBeTruthy();
+    expect(screen.getByText('She showed courage at work.')).toBeTruthy();
+    expect(screen.getByText('“ఆమె పనిలో ధైర్యం చూపింది.”').props.accessibilityLanguage).toBe(
+      'te-IN',
+    );
+    // Native results carry no score and never advance the word queue.
+    expect(screen.queryByText('Score')).toBeNull();
+    expect(screen.queryByText('Next Question')).toBeNull();
+    expect(screen.queryByText('Try Again')).toBeNull();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: 'You understood the question!' })),
+    ).toMatchObject({
+      color: colors.success,
+      textAlign: 'center',
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Try in English' }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('renders the native variant with a model answer when the answer missed the question', async () => {
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: false,
+      transcript: 'నేను రైలులో ప్రయాణిస్తాను.',
+      modelAnswer: 'She showed courage at work.',
+      feedback: 'That answer was about travel, not courage.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: nativeResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText('Not quite on topic')).toBeTruthy();
+    expect(
+      screen.getByText('Your answer missed the question. Check the example and try again.'),
+    ).toBeTruthy();
+    expect(screen.getByText('That answer was about travel, not courage.')).toBeTruthy();
+    expect(screen.getByText('Say it in English')).toBeTruthy();
+    expect(screen.getByText('She showed courage at work.')).toBeTruthy();
+    expect(screen.queryByText('You understood the question!')).toBeNull();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: 'Not quite on topic' })),
+    ).toMatchObject({
+      color: colors.warning,
+      textAlign: 'center',
+    });
+    expect(screen.getByRole('button', { name: 'Try in English' })).toBeTruthy();
+  });
+
+  it('renders native silence as a free retry that preserves native mode', async () => {
+    const nativeResult: NativeAttemptResult = {
+      mode: 'native',
+      understood: false,
+      transcript: '',
+      modelAnswer: '',
+      feedback: 'We could not detect any speech.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      answerMode: 'native',
+      feedback: { questionId: QUESTION.id, result: nativeResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText("We couldn't hear you")).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Your English practice progress was not changed. Speak clearly and try again in your language.',
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('We could not detect any speech.')).toBeTruthy();
+    expect(screen.queryByText('We heard')).toBeNull();
+    expect(screen.queryByText('Say it in English')).toBeNull();
+    expect(screen.queryByText('Score')).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Try Again in My Language' }));
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('renders the nospeech variant with Try Again and help actions', async () => {
+    const noSpeechResult: AttemptResult = {
+      passed: false,
+      mastered: false,
+      noSpeech: true,
+      attemptNo: 1,
+      attemptsLeft: 3,
+      score: 0,
+      transcript: '',
+      feedback: 'We could not detect any speech.',
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: noSpeechResult },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText("We couldn't hear you")).toBeTruthy();
+    expect(
+      screen.getByText(
+        "Don't worry — this didn't count as an attempt. Hold the button and speak clearly, or get help first.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('We could not detect any speech.')).toBeTruthy();
+    // Silence carries no score or transcript and does not advance the queue.
+    expect(screen.queryByText('Score')).toBeNull();
+    expect(screen.queryByText('We heard')).toBeNull();
+    expect(screen.queryByText('Next Question')).toBeNull();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: "We couldn't hear you" })),
+    ).toMatchObject({
+      color: colors.warning,
+      textAlign: 'center',
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.back).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await fireEvent.press(screen.getByRole('button', { name: 'See translation & examples' }));
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+    expect(mockRouter.push).toHaveBeenCalledWith({
+      pathname: '/practice/help',
+      params: { questionId: QUESTION.id },
+    });
   });
 
   it('keeps feedback actions above a larger device safe-area inset', async () => {
@@ -739,7 +1138,7 @@ describe('practice feedback screen', () => {
   });
 
   it('invalidates the practice question when no next question is provided', async () => {
-    const { nextQuestion: _next, ...result } = PASSED_RESULT;
+    const { next: _next, ...result } = PASSED_RESULT;
     mockPracticeFlow = makePracticeFlow({
       feedback: { questionId: QUESTION.id, result },
     });
@@ -760,10 +1159,11 @@ describe('practice feedback screen', () => {
         questionId: QUESTION.id,
         result: {
           passed: false,
+          mastered: false,
           attemptNo: 2,
           attemptsLeft: 1,
           score: 40,
-          transcript: '',
+          transcript: 'I tried to answer.',
           feedback: 'Keep practicing.',
         },
       },
@@ -773,8 +1173,7 @@ describe('practice feedback screen', () => {
     expect(screen.getByText('Not quite — attempt 2 of 3')).toBeTruthy();
     expect(screen.getByText(/1 attempt left\. Review the feedback and try again\./)).toBeTruthy();
     expect(screen.getByText('40')).toBeTruthy();
-    // Empty transcripts are hidden.
-    expect(screen.queryByText('We heard')).toBeNull();
+    expect(screen.getByText('We heard')).toBeTruthy();
     expect(screen.getByText('Keep practicing.')).toBeTruthy();
     expect(screen.queryByText('Great job!')).toBeNull();
     expect(screen.queryByText('Out of attempts')).toBeNull();
@@ -789,6 +1188,7 @@ describe('practice feedback screen', () => {
     );
 
     await fireEvent.press(screen.getByRole('button', { name: 'Try Again' }));
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.back).toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });
@@ -799,6 +1199,7 @@ describe('practice feedback screen', () => {
         questionId: QUESTION.id,
         result: {
           passed: false,
+          mastered: false,
           attemptNo: 1,
           attemptsLeft: 2,
           score: 55,
@@ -820,6 +1221,7 @@ describe('practice feedback screen', () => {
         questionId: QUESTION.id,
         result: {
           passed: false,
+          mastered: false,
           attemptNo: 3,
           attemptsLeft: 0,
           score: 30,
@@ -832,7 +1234,9 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText('Out of attempts')).toBeTruthy();
-    expect(screen.getByText("Here's what to work on before the next question.")).toBeTruthy();
+    expect(
+      screen.getByText("Here's what to work on. You'll see this word again in future practice."),
+    ).toBeTruthy();
     expect(screen.getByText('Final feedback')).toBeTruthy();
     expect(screen.getByText('Final words.')).toBeTruthy();
     expect(screen.queryByText('Regular feedback.')).toBeNull();

@@ -1,16 +1,18 @@
 import React, { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 import { useAuth } from './auth';
-import type { AttemptResult } from './types';
+import type { PracticeAnswerMode, PracticeOutcome } from './types';
 
 interface PracticeFeedback {
   questionId: string;
-  result: AttemptResult;
+  result: PracticeOutcome;
 }
 
 interface PracticeFlowValue {
+  answerMode: PracticeAnswerMode;
   feedback: PracticeFeedback | null;
-  showFeedback: (questionId: string, result: AttemptResult) => void;
+  setAnswerMode: (mode: PracticeAnswerMode) => void;
+  showFeedback: (questionId: string, result: PracticeOutcome) => void;
   clearFeedback: () => void;
 }
 
@@ -25,16 +27,17 @@ export function PracticeFlowProvider({ children }: { children: React.ReactNode }
 }
 
 function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) {
+  const [answerMode, setAnswerMode] = useState<PracticeAnswerMode>('english');
   const [feedback, setFeedback] = useState<PracticeFeedback | null>(null);
 
-  const showFeedback = useCallback((questionId: string, result: AttemptResult) => {
+  const showFeedback = useCallback((questionId: string, result: PracticeOutcome) => {
     setFeedback({ questionId, result });
   }, []);
   const clearFeedback = useCallback(() => setFeedback(null), []);
 
   const value = useMemo(
-    () => ({ feedback, showFeedback, clearFeedback }),
-    [feedback, showFeedback, clearFeedback],
+    () => ({ answerMode, feedback, setAnswerMode, showFeedback, clearFeedback }),
+    [answerMode, feedback, showFeedback, clearFeedback],
   );
 
   return <PracticeFlowContext.Provider value={value}>{children}</PracticeFlowContext.Provider>;

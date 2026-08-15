@@ -64,7 +64,7 @@ describe('database content seeding', () => {
       question_text: 'Talk about your family. Who is in your family?',
       attempts: 1,
       states: 1,
-      questions: 36,
+      questions: 600,
     });
   });
 });

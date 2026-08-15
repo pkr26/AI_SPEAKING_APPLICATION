@@ -43,15 +43,49 @@ export interface HelpContent {
   examples: { en: string; native: string }[];
 }
 
+export type PracticeKind = 'revision' | 'new';
+export type PracticeAnswerMode = 'english' | 'native';
+
+export const PRACTICE_PASS_SCORE = 60;
+export const PRACTICE_MASTER_SCORE = 75;
+
+export interface PracticeProgress {
+  masteredCount: number;
+  learningCount: number;
+  totalAtLevel: number;
+}
+
+export interface PracticeQuestionPayload {
+  question: Question;
+  kind: PracticeKind;
+  progress: PracticeProgress;
+}
+
 export interface AttemptResult {
   passed: boolean;
+  mastered: boolean;
   attemptNo: number;
   attemptsLeft?: number;
+  noSpeech?: boolean;
   score: number;
   transcript: string;
   feedback: string;
   finalFeedback?: string;
-  nextQuestion?: Question;
+  next?: PracticeQuestionPayload;
+}
+
+export interface NativeAttemptResult {
+  mode: 'native';
+  understood: boolean;
+  transcript: string;
+  modelAnswer: string;
+  feedback: string;
+}
+
+export type PracticeOutcome = AttemptResult | NativeAttemptResult;
+
+export function isNativeOutcome(result: PracticeOutcome): result is NativeAttemptResult {
+  return 'mode' in result && result.mode === 'native';
 }
 
 export class ContractError extends Error {
@@ -152,9 +186,36 @@ export function parseUserResponse(value: unknown): { user: User } {
   return { user: parseUser(value.user) };
 }
 
-export function parseQuestionResponse(value: unknown): { question: Question } {
-  if (!isRecord(value)) throw new ContractError();
-  return { question: parseWith(value.question, isQuestion) };
+function isPracticeKind(value: unknown): value is PracticeKind {
+  return value === 'revision' || value === 'new';
+}
+
+function isCount(value: unknown): value is number {
+  return isNumber(value) && Number.isInteger(value) && value >= 0 && value <= 100_000;
+}
+
+function isPracticeProgress(value: unknown): value is PracticeProgress {
+  return (
+    isRecord(value) &&
+    isCount(value.masteredCount) &&
+    isCount(value.learningCount) &&
+    isCount(value.totalAtLevel) &&
+    value.totalAtLevel >= 1 &&
+    value.masteredCount + value.learningCount <= value.totalAtLevel
+  );
+}
+
+function isPracticeQuestionPayload(value: unknown): value is PracticeQuestionPayload {
+  return (
+    isRecord(value) &&
+    isPracticeKind(value.kind) &&
+    isPracticeProgress(value.progress) &&
+    isQuestion(value.question)
+  );
+}
+
+export function parsePracticeQuestion(value: unknown): PracticeQuestionPayload {
+  return parseWith(value, isPracticeQuestionPayload);
 }
 
 export function parseDiagnosticNext(value: unknown): DiagnosticNext {
@@ -258,6 +319,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   if (
     !isRecord(value) ||
     typeof value.passed !== 'boolean' ||
+    typeof value.mastered !== 'boolean' ||
     !isNumber(value.attemptNo) ||
     !Number.isInteger(value.attemptNo) ||
     value.attemptNo < 1 ||
@@ -270,20 +332,56 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   }
   const result: AttemptResult = {
     passed: value.passed,
+    mastered: value.mastered,
     attemptNo: value.attemptNo,
     score: value.score,
     transcript: value.transcript,
     feedback: value.feedback,
   };
+
+  // These flags are derived by the server, not independent model output.
+  // Reject an impossible combination instead of rendering misleading mastery
+  // state from a corrupted or incompatible response.
+  if (
+    value.passed !== value.score >= PRACTICE_PASS_SCORE ||
+    value.mastered !== value.score >= PRACTICE_MASTER_SCORE
+  ) {
+    throw new ContractError();
+  }
+
+  // Silence is a free retry: nothing was scored and the attempt counter did
+  // not advance, so attemptsLeft reflects one more attempt than a real miss.
+  if (value.noSpeech !== undefined) {
+    if (
+      value.noSpeech !== true ||
+      value.passed ||
+      value.mastered ||
+      value.score !== 0 ||
+      value.transcript !== '' ||
+      value.finalFeedback !== undefined ||
+      value.next !== undefined ||
+      value.attemptsLeft !== 3 - (value.attemptNo - 1)
+    ) {
+      throw new ContractError();
+    }
+    result.noSpeech = true;
+    result.attemptsLeft = value.attemptsLeft as number;
+    return result;
+  }
+
+  // The server turns an empty Whisper transcript into the explicit free-retry
+  // variant above. A scored response can therefore never have no transcript.
+  if (!isNonEmptyString(value.transcript)) throw new ContractError();
+
   if (value.passed) {
     if (
       value.attemptsLeft !== undefined ||
       value.finalFeedback !== undefined ||
-      value.nextQuestion === undefined
+      value.next === undefined
     ) {
       throw new ContractError();
     }
-    result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
+    result.next = parseWith(value.next, isPracticeQuestionPayload);
     return result;
   }
 
@@ -292,7 +390,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     if (
       value.attemptsLeft !== expectedAttemptsLeft ||
       value.finalFeedback !== undefined ||
-      value.nextQuestion !== undefined
+      value.next !== undefined
     ) {
       throw new ContractError();
     }
@@ -303,14 +401,43 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   if (
     value.attemptsLeft !== 0 ||
     !isBoundedNonEmptyString(value.finalFeedback, 4_000) ||
-    value.nextQuestion === undefined
+    value.next === undefined
   ) {
     throw new ContractError();
   }
   result.attemptsLeft = 0;
   result.finalFeedback = value.finalFeedback;
-  result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
+  result.next = parseWith(value.next, isPracticeQuestionPayload);
   return result;
+}
+
+export function parseNativeAttemptResult(value: unknown): NativeAttemptResult {
+  if (
+    !isRecord(value) ||
+    value.mode !== 'native' ||
+    typeof value.understood !== 'boolean' ||
+    !isBoundedString(value.transcript, 12_000) ||
+    !isBoundedString(value.modelAnswer, 800) ||
+    !isBoundedNonEmptyString(value.feedback, 800)
+  ) {
+    throw new ContractError();
+  }
+  const noSpeech = value.transcript === '';
+  if (
+    (noSpeech && (value.understood || value.modelAnswer !== '')) ||
+    (!noSpeech &&
+      (!isBoundedNonEmptyString(value.transcript, 12_000) ||
+        !isBoundedNonEmptyString(value.modelAnswer, 800)))
+  ) {
+    throw new ContractError();
+  }
+  return {
+    mode: 'native',
+    understood: value.understood,
+    transcript: value.transcript,
+    modelAnswer: value.modelAnswer,
+    feedback: value.feedback,
+  };
 }
 
 export type AudioUploadGrant =
@@ -356,7 +483,14 @@ const AUDIO_CONTENT_TYPE_TO_EXT: Readonly<Record<string, string>> = {
 // would need this pin relaxed to their own hostnames.
 function isAwsS3Hostname(hostname: string): boolean {
   const host = hostname.toLowerCase();
-  return host === 'amazonaws.com' || host.endsWith('.amazonaws.com');
+  const suffix = '.amazonaws.com';
+  if (!host.endsWith(suffix)) return false;
+  const endpoint = host.slice(0, -suffix.length);
+  const region = '[a-z]{2}(?:-[a-z0-9]+)+-[0-9]';
+  const bucket = '[a-z0-9](?:[a-z0-9.-]{1,61}[a-z0-9])?';
+  return new RegExp(`^(?:${bucket}\\.)?s3(?:\\.(?:dualstack\\.)?${region}|-${region})?$`).test(
+    endpoint,
+  );
 }
 
 function safeUploadUrl(value: string): boolean {
@@ -380,6 +514,10 @@ function safeAudioKey(value: string): boolean {
   return /^audio-uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
     value,
   );
+}
+
+export function audioKeyBelongsToOwner(audioKey: string, ownerId: string): boolean {
+  return safeAudioKey(audioKey) && audioKey.split('/')[1]?.toLowerCase() === ownerId.toLowerCase();
 }
 
 function parseUploadFields(value: unknown): Record<string, string> | null {

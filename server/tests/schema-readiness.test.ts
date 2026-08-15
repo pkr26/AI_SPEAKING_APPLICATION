@@ -19,7 +19,7 @@ function successfulMigrationRows() {
 
 const completeQuestionInventory = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].map((cefr_level) => ({
   cefr_level,
-  count: 6,
+  count: 100,
 }));
 
 describe('database schema readiness', () => {
@@ -64,7 +64,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('007_distributed_rate_limits.sql');
+    expect(manifest.at(-1)?.name).toBe('009_native_practice_request_context.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -74,7 +74,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '007_distributed_rate_limits.sql',
+      latestMigration: '009_native_practice_request_context.sql',
     });
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
     expect(query.mock.calls[2]?.[0]).toContain('FROM questions');
@@ -104,8 +104,8 @@ describe('database schema readiness', () => {
     }
   });
 
-  it('accepts the exact two-question runtime boundary for every CEFR level', async () => {
-    const exactMinimum = completeQuestionInventory.map((row) => ({ ...row, count: 2 }));
+  it('accepts the exact 100-question runtime boundary for every CEFR level', async () => {
+    const exactMinimum = completeQuestionInventory.map((row) => ({ ...row, count: 100 }));
     const query = vi
       .fn()
       .mockResolvedValueOnce({ rows: successfulMigrationRows() })
@@ -113,7 +113,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: exactMinimum });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '007_distributed_rate_limits.sql',
+      latestMigration: '009_native_practice_request_context.sql',
     });
   });
 
@@ -136,9 +136,9 @@ describe('database schema readiness', () => {
     for (const rows of [
       [],
       completeQuestionInventory.slice(0, -1),
-      [{ cefr_level: 'A1', count: 1 }],
+      [{ cefr_level: 'A1', count: 99 }],
       completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, cefr_level: null } : row)),
-      completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '6' } : row)),
+      completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '100' } : row)),
     ]) {
       const query = vi
         .fn()
@@ -151,8 +151,8 @@ describe('database schema readiness', () => {
     }
   });
 
-  it('rejects a string count of six even when every CEFR inventory row is present', async () => {
-    const rows = completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '6' } : row));
+  it('rejects a string count of 100 even when every CEFR inventory row is present', async () => {
+    const rows = completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '100' } : row));
     const query = vi
       .fn()
       .mockResolvedValueOnce({ rows: successfulMigrationRows() })

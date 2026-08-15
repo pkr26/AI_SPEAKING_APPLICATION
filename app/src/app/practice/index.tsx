@@ -1,6 +1,6 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { router } from 'expo-router';
-import React from 'react';
+import React, { useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -17,25 +17,55 @@ import { apiFetch, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { colors, layout } from '../../lib/theme';
-import { parseAttemptResult, parseQuestionResponse, type AttemptResult } from '../../lib/types';
+import {
+  isNativeOutcome,
+  parseAttemptResult,
+  parseNativeAttemptResult,
+  parsePracticeQuestion,
+  type PracticeOutcome,
+  type PracticeQuestionPayload,
+} from '../../lib/types';
 
 export default function PracticeScreen() {
   const { user, logout } = useAuth();
-  const { showFeedback } = usePracticeFlow();
+  const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
+  const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
+  const [recorderLocked, setRecorderLocked] = useState(false);
+  const nativeMode = answerMode === 'native';
 
   const questionQuery = useQuery({
     queryKey: ['practice-question', user?.id, user?.cefrLevel],
     queryFn: async ({ signal }) =>
-      parseQuestionResponse(await apiFetch<unknown>('/practice/question', { signal })),
+      parsePracticeQuestion(await apiFetch<unknown>('/practice/question', { signal })),
     enabled: !!user,
     retry: false,
     // Keep the assigned question stable until feedback explicitly advances it.
     staleTime: Infinity,
   });
   const question = questionQuery.data?.question;
-  const handleResult = (result: AttemptResult) => {
-    if (!question) return;
+  const kind = questionQuery.data?.kind;
+  const progress = questionQuery.data?.progress;
+  const handleResult = (result: PracticeOutcome) => {
+    if (!user || !question) return;
+    if (!isNativeOutcome(result) && !result.noSpeech && !result.passed) {
+      queryClient.setQueryData<PracticeQuestionPayload>(
+        ['practice-question', user.id, user.cefrLevel],
+        (current) => {
+          if (!current || current.question.id !== question.id || current.kind !== 'new') {
+            return current;
+          }
+          return {
+            ...current,
+            kind: 'revision',
+            progress: {
+              ...current.progress,
+              learningCount: current.progress.learningCount + 1,
+            },
+          };
+        },
+      );
+    }
     showFeedback(question.id, result);
     router.push('/practice/feedback');
   };
@@ -140,9 +170,24 @@ export default function PracticeScreen() {
             </Pressable>
 
             <View style={styles.card}>
-              <View style={styles.levelBadge}>
-                <Text style={styles.levelBadgeText}>{question.cefrLevel}</Text>
+              <View style={styles.badgeRow}>
+                <View style={styles.levelBadge}>
+                  <Text style={styles.levelBadgeText}>{question.cefrLevel}</Text>
+                </View>
+                {kind && (
+                  <View style={[styles.kindBadge, kind === 'revision' && styles.kindBadgeRevision]}>
+                    <Text style={styles.kindBadgeText}>
+                      {kind === 'revision' ? 'Revision' : 'New word'}
+                    </Text>
+                  </View>
+                )}
               </View>
+              {progress && (
+                <Text style={styles.progressLine}>
+                  {progress.masteredCount} of {progress.totalAtLevel} words mastered
+                  {progress.learningCount > 0 ? ` · ${progress.learningCount} in revision` : ''}
+                </Text>
+              )}
               <Text style={styles.cardLabel}>Prompt word</Text>
               <Text accessibilityRole="header" style={styles.promptWord}>
                 {question.promptWord}
@@ -151,15 +196,52 @@ export default function PracticeScreen() {
               <Text style={styles.questionText}>{question.questionText}</Text>
             </View>
 
+            <Pressable
+              accessibilityRole="switch"
+              accessibilityLabel="Answer in my language"
+              accessibilityHint={
+                recorderLocked
+                  ? 'Finish the current recording before changing answer language.'
+                  : undefined
+              }
+              accessibilityState={{ checked: nativeMode, disabled: recorderLocked }}
+              disabled={recorderLocked}
+              style={({ pressed }) => [
+                styles.modeToggle,
+                recorderLocked && styles.modeToggleDisabled,
+                pressed && styles.modeTogglePressed,
+              ]}
+              onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
+            >
+              <Text style={styles.modeToggleText}>
+                {nativeMode
+                  ? 'Answering in your language — tap for English'
+                  : 'Answer in my language'}
+              </Text>
+            </Pressable>
+
             <View style={styles.recorderArea}>
               <Recorder
+                key={nativeMode ? 'native' : 'english'}
                 ownerId={user.id}
                 questionId={question.id}
-                endpoint="/practice/attempt"
-                parseResult={parseAttemptResult}
+                endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
+                parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
                 onResult={handleResult}
                 onError={handleError}
                 onRecoveryUnresolved={() => void questionQuery.refetch()}
+                onRecoveryEndpointMismatch={(savedEndpoint) => {
+                  if (savedEndpoint === '/practice/attempt/native') {
+                    setAnswerMode('native');
+                    return true;
+                  }
+                  if (savedEndpoint === '/practice/attempt') {
+                    setAnswerMode('english');
+                    return true;
+                  }
+                  return false;
+                }}
+                onInteractionLockChange={setRecorderLocked}
               />
             </View>
           </>
@@ -278,6 +360,51 @@ const styles = StyleSheet.create({
   levelBadgeText: {
     fontSize: 12,
     fontWeight: '700',
+    color: colors.primary,
+  },
+  badgeRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 4,
+  },
+  kindBadge: {
+    backgroundColor: colors.success,
+    borderRadius: 8,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
+  },
+  kindBadgeRevision: {
+    backgroundColor: colors.warning,
+  },
+  kindBadgeText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  progressLine: {
+    fontSize: 13,
+    color: colors.muted,
+    marginBottom: 4,
+  },
+  modeToggle: {
+    alignSelf: 'center',
+    marginTop: 12,
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  modeTogglePressed: {
+    backgroundColor: colors.primaryLight,
+  },
+  modeToggleDisabled: {
+    opacity: 0.5,
+  },
+  modeToggleText: {
+    fontSize: 14,
+    fontWeight: '600',
     color: colors.primary,
   },
   cardLabel: {

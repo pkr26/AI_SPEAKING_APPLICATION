@@ -837,8 +837,8 @@ describe('apiUploadAudio', () => {
 });
 
 describe('apiRequestAudioUpload', () => {
-  const audioKey =
-    'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.m4a';
+  const ownerId = '550e8400-e29b-41d4-a716-446655440000';
+  const audioKey = `audio-uploads/${ownerId}/550e8400-e29b-41d4-a716-446655440002.m4a`;
   const uploadFields = {
     key: audioKey,
     'Content-Type': 'audio/mp4',
@@ -857,7 +857,7 @@ describe('apiRequestAudioUpload', () => {
     };
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => grant }));
 
-    const result = await api.apiRequestAudioUpload('audio/mp4');
+    const result = await api.apiRequestAudioUpload('audio/mp4', ownerId);
 
     expect(result).toEqual(grant);
     const [input, init] = fetchMock.mock.calls[0];
@@ -869,7 +869,9 @@ describe('apiRequestAudioUpload', () => {
   it('accepts the direct-upload fallback without applying S3-only checks', async () => {
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ mode: 'direct' }) }));
 
-    await expect(api.apiRequestAudioUpload('audio/mp4')).resolves.toEqual({ mode: 'direct' });
+    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).resolves.toEqual({
+      mode: 'direct',
+    });
   });
 
   it('compares a signed content type with the normalized requested value', async () => {
@@ -884,13 +886,13 @@ describe('apiRequestAudioUpload', () => {
     };
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => grant }));
 
-    await expect(api.apiRequestAudioUpload('  AUDIO/MP4  ')).resolves.toEqual(grant);
+    await expect(api.apiRequestAudioUpload('  AUDIO/MP4  ', ownerId)).resolves.toEqual(grant);
   });
 
   it('rejects a malformed grant as a contract error', async () => {
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ mode: 'carrier-pigeon' }) }));
 
-    await expect(api.apiRequestAudioUpload('audio/mp4')).rejects.toThrow(ContractError);
+    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
   });
 
   it('rejects a signed content type that differs from the requested recording', async () => {
@@ -911,7 +913,27 @@ describe('apiRequestAudioUpload', () => {
       }),
     );
 
-    await expect(api.apiRequestAudioUpload('audio/mp4')).rejects.toThrow(ContractError);
+    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
+  });
+
+  it('rejects an otherwise valid grant whose object key belongs to another user', async () => {
+    const otherKey =
+      'audio-uploads/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440002.m4a';
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          mode: 's3',
+          uploadUrl: 'https://bucket.s3.amazonaws.com/',
+          uploadFields: { ...uploadFields, key: otherKey },
+          audioKey: otherKey,
+          contentType: 'audio/mp4',
+          expiresIn: 900,
+          maxBytes: 25 * 1024 * 1024,
+        }),
+      }),
+    );
+
+    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
   });
 });
 

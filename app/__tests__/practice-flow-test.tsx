@@ -17,6 +17,7 @@ const mockedUseAuth = jest.mocked(useAuth);
 
 const RESULT: AttemptResult = {
   passed: true,
+  mastered: true,
   attemptNo: 1,
   score: 88,
   transcript: 'she sells seashells',
@@ -67,6 +68,7 @@ describe('PracticeFlowProvider', () => {
   it('stores feedback and replaces it on a subsequent showFeedback', async () => {
     await render(tree());
 
+    expect(flow!.answerMode).toBe('english');
     expect(flow!.feedback).toBeNull();
     expect(feedbackText()).toBe('none');
 
@@ -81,6 +83,20 @@ describe('PracticeFlowProvider', () => {
     });
     expect(flow!.feedback).toEqual({ questionId: 'q-2', result: RESULT });
     expect(feedbackText()).toBe('q-2');
+  });
+
+  it('stores the selected answer mode', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.setAnswerMode('native');
+    });
+    expect(flow!.answerMode).toBe('native');
+
+    await act(async () => {
+      flow!.setAnswerMode('english');
+    });
+    expect(flow!.answerMode).toBe('english');
   });
 
   it('clears stored feedback', async () => {
@@ -103,8 +119,10 @@ describe('PracticeFlowProvider', () => {
 
     await act(async () => {
       flow!.showFeedback('q-1', RESULT);
+      flow!.setAnswerMode('native');
     });
     expect(feedbackText()).toBe('q-1');
+    expect(flow!.answerMode).toBe('native');
 
     // A re-render with the same session keeps the feedback.
     await rerender(tree());
@@ -114,6 +132,7 @@ describe('PracticeFlowProvider', () => {
     await rerender(tree());
 
     expect(flow!.feedback).toBeNull();
+    expect(flow!.answerMode).toBe('english');
     expect(feedbackText()).toBe('none');
   });
 

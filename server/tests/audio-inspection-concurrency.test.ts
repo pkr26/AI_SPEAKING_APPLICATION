@@ -456,8 +456,9 @@ describe('audio inspection concurrency', () => {
 
 describe('audio inspector readiness coalescing', () => {
   it('coalesces concurrent probes, caches success, and allows startup to force a fresh check', async () => {
-    const first = new FakeChild();
-    spawnMock.mockReturnValueOnce(first);
+    const firstProbe = new FakeChild();
+    const firstDecoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(firstProbe).mockReturnValueOnce(firstDecoder);
     const concurrent = [
       assertAudioInspectorAvailable({ force: true }),
       assertAudioInspectorAvailable(),
@@ -469,7 +470,7 @@ describe('audio inspector readiness coalescing', () => {
       string[],
       { env: NodeJS.ProcessEnv; shell: boolean; stdio: unknown[]; windowsHide: boolean },
     ];
-    expect(executable).toBe(config.ffmpegPath);
+    expect(executable).toBe(config.ffprobePath);
     expect(args).toEqual(['-hide_banner', '-version']);
     expect(options).toEqual({
       env: buildAudioInspectorEnvironment(process.env),
@@ -477,19 +478,38 @@ describe('audio inspector readiness coalescing', () => {
       windowsHide: true,
       shell: false,
     });
-    first.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
-    first.emit('close', 0);
+    firstProbe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    firstProbe.emit('close', 0);
+    await Promise.resolve();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    expect(spawnMock.mock.calls[1]).toEqual([
+      config.ffmpegPath,
+      ['-hide_banner', '-version'],
+      {
+        env: buildAudioInspectorEnvironment(process.env),
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        shell: false,
+      },
+    ]);
+    firstDecoder.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    firstDecoder.emit('close', 0);
     await expect(Promise.all(concurrent)).resolves.toEqual([undefined, undefined, undefined]);
 
     await expect(assertAudioInspectorAvailable()).resolves.toBeUndefined();
-    expect(spawnMock).toHaveBeenCalledOnce();
-
-    const forced = new FakeChild();
-    spawnMock.mockReturnValueOnce(forced);
-    const forcedCheck = assertAudioInspectorAvailable({ force: true });
     expect(spawnMock).toHaveBeenCalledTimes(2);
-    forced.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
-    forced.emit('close', 0);
+
+    const forcedProbe = new FakeChild();
+    const forcedDecoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(forcedProbe).mockReturnValueOnce(forcedDecoder);
+    const forcedCheck = assertAudioInspectorAvailable({ force: true });
+    expect(spawnMock).toHaveBeenCalledTimes(3);
+    forcedProbe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    forcedProbe.emit('close', 0);
+    await Promise.resolve();
+    expect(spawnMock).toHaveBeenCalledTimes(4);
+    forcedDecoder.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    forcedDecoder.emit('close', 0);
     await expect(forcedCheck).resolves.toBeUndefined();
   });
 
@@ -504,7 +524,7 @@ describe('audio inspector readiness coalescing', () => {
     expect(results.every(({ status }) => status === 'rejected')).toBe(true);
     expect(spawnMock).toHaveBeenCalledOnce();
 
-    await expect(assertAudioInspectorAvailable()).rejects.toThrow('FFmpeg is unavailable');
+    await expect(assertAudioInspectorAvailable()).rejects.toThrow('FFprobe is unavailable');
     expect(spawnMock).toHaveBeenCalledOnce();
   });
 
@@ -512,37 +532,45 @@ describe('audio inspector readiness coalescing', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2030-01-01T00:00:00Z'));
 
-    const success = new FakeChild();
-    spawnMock.mockReturnValueOnce(success);
+    const successProbe = new FakeChild();
+    const successDecoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(successProbe).mockReturnValueOnce(successDecoder);
     const successCheck = assertAudioInspectorAvailable({ force: true });
-    success.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
-    success.emit('close', 0);
+    successProbe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    successProbe.emit('close', 0);
+    await Promise.resolve();
+    successDecoder.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    successDecoder.emit('close', 0);
     await successCheck;
 
     await vi.advanceTimersByTimeAsync(29_999);
     await expect(assertAudioInspectorAvailable()).resolves.toBeUndefined();
-    expect(spawnMock).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
 
     await vi.advanceTimersByTimeAsync(1);
     const failed = new FakeChild();
     spawnMock.mockReturnValueOnce(failed);
     const failedCheck = assertAudioInspectorAvailable();
     failed.emit('error', new Error('missing'));
-    await expect(failedCheck).rejects.toThrow('FFmpeg is unavailable');
-    expect(spawnMock).toHaveBeenCalledTimes(2);
+    await expect(failedCheck).rejects.toThrow('FFprobe is unavailable');
+    expect(spawnMock).toHaveBeenCalledTimes(3);
 
     await vi.advanceTimersByTimeAsync(1_999);
-    await expect(assertAudioInspectorAvailable()).rejects.toThrow('FFmpeg is unavailable');
-    expect(spawnMock).toHaveBeenCalledTimes(2);
+    await expect(assertAudioInspectorAvailable()).rejects.toThrow('FFprobe is unavailable');
+    expect(spawnMock).toHaveBeenCalledTimes(3);
 
     await vi.advanceTimersByTimeAsync(1);
-    const recovered = new FakeChild();
-    spawnMock.mockReturnValueOnce(recovered);
+    const recoveredProbe = new FakeChild();
+    const recoveredDecoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(recoveredProbe).mockReturnValueOnce(recoveredDecoder);
     const recoveredCheck = assertAudioInspectorAvailable();
-    recovered.stdout.emit('data', Buffer.from('ffmpeg version recovered\n'));
-    recovered.emit('close', 0);
+    recoveredProbe.stdout.emit('data', Buffer.from('ffprobe version recovered\n'));
+    recoveredProbe.emit('close', 0);
+    await Promise.resolve();
+    recoveredDecoder.stdout.emit('data', Buffer.from('ffmpeg version recovered\n'));
+    recoveredDecoder.emit('close', 0);
     await expect(recoveredCheck).resolves.toBeUndefined();
-    expect(spawnMock).toHaveBeenCalledTimes(3);
+    expect(spawnMock).toHaveBeenCalledTimes(5);
   });
 
   it('kills and rejects a readiness probe at the exact two-second deadline', async () => {
@@ -561,7 +589,7 @@ describe('audio inspector readiness coalescing', () => {
 
     await expect(outcome).resolves.toMatchObject({
       status: 'rejected',
-      reason: expect.objectContaining({ message: 'FFmpeg availability check timed out' }),
+      reason: expect.objectContaining({ message: 'FFprobe availability check timed out' }),
     });
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
@@ -572,19 +600,23 @@ describe('audio inspector readiness coalescing', () => {
       throw nonErrorFailure;
     });
 
-    await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow('FFmpeg is unavailable');
+    await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow('FFprobe is unavailable');
   });
 
   it('does not signal a readiness child that is already marked as killed while settling', async () => {
-    const child = new FakeChild();
-    child.killed = true;
-    spawnMock.mockReturnValueOnce(child);
+    const probe = new FakeChild();
+    const decoder = new FakeChild();
+    probe.killed = true;
+    spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(decoder);
     const check = assertAudioInspectorAvailable({ force: true });
-    child.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
-    child.emit('close', 0);
+    probe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    probe.emit('close', 0);
+    await Promise.resolve();
+    decoder.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    decoder.emit('close', 0);
 
     await expect(check).resolves.toBeUndefined();
-    expect(child.kill).not.toHaveBeenCalled();
+    expect(probe.kill).not.toHaveBeenCalled();
   });
 
   it('ignores repeated readiness output after the first settlement', async () => {
@@ -594,7 +626,7 @@ describe('audio inspector readiness coalescing', () => {
       spawnMock.mockReturnValueOnce(child);
       const check = assertAudioInspectorAvailable({ force: true });
       child.stdout.emit('data', Buffer.alloc(16 * 1024 + 1));
-      await expect(check).rejects.toThrow('FFmpeg availability check returned unexpected output');
+      await expect(check).rejects.toThrow('FFprobe availability check returned unexpected output');
       expect(child.kill).toHaveBeenCalledTimes(1);
       const clearCallsAfterSettlement = clearTimeoutSpy.mock.calls.length;
 
@@ -608,8 +640,8 @@ describe('audio inspector readiness coalescing', () => {
   });
 
   it.each([
-    ['a successful exit without an FFmpeg version', Buffer.from('not the expected tool\n'), 0],
-    ['an unsuccessful exit with an FFmpeg version', Buffer.from('ffmpeg version test-build\n'), 1],
+    ['a successful exit without an FFprobe version', Buffer.from('not the expected tool\n'), 0],
+    ['an unsuccessful exit with an FFprobe version', Buffer.from('ffprobe version test-build\n'), 1],
     ['oversized version output', Buffer.alloc(16 * 1024 + 1, 0x78), 0],
   ])('rejects %s', async (_caseName, output, exitCode) => {
     const child = new FakeChild();
@@ -621,14 +653,18 @@ describe('audio inspector readiness coalescing', () => {
   });
 
   it('accepts exactly 16 KiB of valid version output and rejects the first cumulative byte beyond it', async () => {
-    const prefix = Buffer.from('ffmpeg version test-build\n');
+    const prefix = Buffer.from('ffprobe version test-build\n');
     const exactOutput = Buffer.concat([prefix, Buffer.alloc(16 * 1024 - prefix.length, 0x78)]);
     const exact = new FakeChild();
-    spawnMock.mockReturnValueOnce(exact);
+    const decoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(exact).mockReturnValueOnce(decoder);
     const exactCheck = assertAudioInspectorAvailable({ force: true });
     exact.stdout.emit('data', exactOutput.subarray(0, 9_000));
     exact.stdout.emit('data', exactOutput.subarray(9_000));
     exact.emit('close', 0);
+    await Promise.resolve();
+    decoder.stdout.emit('data', Buffer.from('ffmpeg version test-build\n'));
+    decoder.emit('close', 0);
     await expect(exactCheck).resolves.toBeUndefined();
 
     const oversized = new FakeChild();
@@ -636,30 +672,58 @@ describe('audio inspector readiness coalescing', () => {
     const oversizedCheck = assertAudioInspectorAvailable({ force: true });
     oversized.stdout.emit('data', exactOutput.subarray(0, 9_000));
     oversized.stdout.emit('data', Buffer.concat([exactOutput.subarray(9_000), Buffer.from('x')]));
-    await expect(oversizedCheck).rejects.toThrow('FFmpeg availability check returned unexpected output');
+    await expect(oversizedCheck).rejects.toThrow('FFprobe availability check returned unexpected output');
     expect(oversized.kill).toHaveBeenCalledWith('SIGKILL');
   });
 
-  it('accepts multiple horizontal separators in the FFmpeg identity line', async () => {
-    const child = new FakeChild();
-    spawnMock.mockReturnValueOnce(child);
+  it('accepts multiple horizontal separators in each expected identity line', async () => {
+    const probe = new FakeChild();
+    const decoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(decoder);
     const check = assertAudioInspectorAvailable({ force: true });
-    child.stdout.emit('data', Buffer.from('ffmpeg version   test-build\n'));
-    child.emit('close', 0);
+    probe.stdout.emit('data', Buffer.from('ffprobe version   test-build\n'));
+    probe.emit('close', 0);
+    await Promise.resolve();
+    decoder.stdout.emit('data', Buffer.from('ffmpeg version   test-build\n'));
+    decoder.emit('close', 0);
 
     await expect(check).resolves.toBeUndefined();
   });
 
   it.each([
-    ['an identity line after unrelated output', 'not ffmpeg\nffmpeg version test-build\n'],
-    ['a version label without a build identifier', 'ffmpeg version\n'],
-    ['a lookalike plural label', 'ffmpeg versions test-build\n'],
+    ['an identity line after unrelated output', 'not ffprobe\nffprobe version test-build\n'],
+    ['a version label without a build identifier', 'ffprobe version\n'],
+    ['a lookalike plural label', 'ffprobe versions test-build\n'],
   ])('rejects %s', async (_caseName, output) => {
     const child = new FakeChild();
     spawnMock.mockReturnValueOnce(child);
     const check = assertAudioInspectorAvailable({ force: true });
     child.stdout.emit('data', Buffer.from(output));
     child.emit('close', 0);
-    await expect(check).rejects.toThrow('FFmpeg is unavailable');
+    await expect(check).rejects.toThrow('FFprobe is unavailable');
+  });
+
+  it('fails closed on an FFmpeg lookalike without leaking its configured path', async () => {
+    const savedPath = config.ffmpegPath;
+    const configuredPath = '/deployment/private/media-tools/ffmpeg';
+    config.ffmpegPath = configuredPath;
+    try {
+      const probe = new FakeChild();
+      const lookalike = new FakeChild();
+      spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(lookalike);
+      const check = assertAudioInspectorAvailable({ force: true });
+      probe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+      probe.emit('close', 0);
+      await Promise.resolve();
+      expect(spawnMock.mock.calls[1]?.[0]).toBe(configuredPath);
+      lookalike.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+      lookalike.emit('close', 0);
+
+      const error = await check.catch((reason: unknown) => reason);
+      expect(error).toEqual(expect.objectContaining({ message: 'FFmpeg is unavailable' }));
+      expect(String(error)).not.toContain(configuredPath);
+    } finally {
+      config.ffmpegPath = savedPath;
+    }
   });
 });

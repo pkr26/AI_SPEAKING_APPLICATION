@@ -114,7 +114,7 @@ function assertTestDefinition(test, label) {
   if (test.location !== undefined) assertLocation(test.location, `${label}.location`, true);
 }
 
-function assertMutant(mutant, label) {
+export function assertMutant(mutant, label) {
   if (!isRecord(mutant)) throw new Error(`${label} must be an object`);
   if (typeof mutant.id !== 'string' || mutant.id.length === 0) {
     throw new Error(`${label}.id must be a non-empty string`);
@@ -229,7 +229,7 @@ function emptyStatusCounts() {
   return Object.fromEntries(mutantStatuses.map((status) => [status, 0]));
 }
 
-function summarizeMutants(mutants) {
+export function summarizeMutants(mutants) {
   const statusCounts = emptyStatusCounts();
   let staticMutants = 0;
   for (const mutant of mutants) {

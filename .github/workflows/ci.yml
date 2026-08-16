@@ -68,6 +68,9 @@ jobs:
       - run: npm run format:check
       - run: npm run lint
       - run: npm run typecheck
+      # Push-time guard for the mutation campaign itself: lane manifest
+      # exhaustiveness, strict-gate merging, and the catalog report gate.
+      - run: npm run test:mutation-tooling
       - run: npm run build
       - run: npm audit --audit-level=high
       - run: npm run db:setup

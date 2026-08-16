@@ -147,6 +147,20 @@ export const codeMutationLanes = Object.freeze({
   ),
 });
 
+/**
+ * Test files that deliberately run in the ordinary vitest suite but in no
+ * mutation lane. Every entry must state why; the manifest validation rejects
+ * any on-disk test file that is neither assigned to a lane nor listed here,
+ * so a new test file can never silently skip the mutation campaign.
+ */
+export const intentionallyUnassignedTestFiles = Object.freeze({
+  'tests/index.test.ts':
+    'In-process bootstrap integration test: it imports src/index directly, binds the real configured port, and ' +
+    'ends the shared pool. Inside a reused Stryker vitest worker a shutdown-breaking mutant would leak the bound ' +
+    'port and poison later mutant runs with bootstrap errors. The index lane already kills every src/index.ts ' +
+    'mutant via the fully mocked tests/index-lifecycle.test.ts.',
+});
+
 export const codeMutationLaneNames = Object.freeze(Object.keys(codeMutationLanes));
 export const expectedCodeMutationFiles = Object.freeze(
   Object.values(codeMutationLanes)
@@ -188,7 +202,10 @@ function difference(first, second) {
  * or accidentally assigned twice. Stryker only warns for unmatched testFiles
  * globs, so this validation is a required preflight for the campaign.
  */
-export async function assertMutationLaneManifest({ serverDir = defaultServerDirectory } = {}) {
+export async function assertMutationLaneManifest({
+  serverDir = defaultServerDirectory,
+  unassignedTestFiles = intentionallyUnassignedTestFiles,
+} = {}) {
   const sourceFiles = await recursivelyListTypeScriptFiles(path.join(serverDir, 'src'), 'src');
   const databaseFiles = (await recursivelyListTypeScriptFiles(path.join(serverDir, 'db'), 'db')).filter(
     (fileName) => fileName !== 'db/seed-data.ts' && !fileName.startsWith('db/seed-data/'),
@@ -233,12 +250,49 @@ export async function assertMutationLaneManifest({ serverDir = defaultServerDire
       }
     }
   }
+
+  const onDiskTestFiles = (await recursivelyListTypeScriptFiles(path.join(serverDir, 'tests'), 'tests')).filter(
+    (fileName) => fileName.endsWith('.test.ts'),
+  );
+  const assignedTestFiles = new Set(Object.values(codeMutationLanes).flatMap(({ testFiles }) => testFiles));
+  const excludedTestFiles = Object.keys(unassignedTestFiles);
+  for (const fileName of excludedTestFiles) {
+    if (typeof unassignedTestFiles[fileName] !== 'string' || unassignedTestFiles[fileName].trim() === '') {
+      throw new Error(`Intentionally unassigned test file must document a reason: ${fileName}`);
+    }
+  }
+  const excludedTestFileSet = new Set(excludedTestFiles);
+  const unaccountedTestFiles = onDiskTestFiles.filter(
+    (fileName) => !assignedTestFiles.has(fileName) && !excludedTestFileSet.has(fileName),
+  );
+  const staleExclusions = difference(excludedTestFiles, onDiskTestFiles);
+  const contradictoryExclusions = excludedTestFiles.filter((fileName) => assignedTestFiles.has(fileName));
+
+  if (unaccountedTestFiles.length || staleExclusions.length || contradictoryExclusions.length) {
+    throw new Error(
+      [
+        'Mutation lane manifest does not account for every backend test file.',
+        unaccountedTestFiles.length
+          ? `Test files in no lane and not documented as intentionally unassigned: ${unaccountedTestFiles.join(', ')}`
+          : undefined,
+        staleExclusions.length
+          ? `Intentionally unassigned test files missing on disk: ${staleExclusions.join(', ')}`
+          : undefined,
+        contradictoryExclusions.length
+          ? `Test files both assigned to a lane and marked intentionally unassigned: ${contradictoryExclusions.join(', ')}`
+          : undefined,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+    );
+  }
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   await assertMutationLaneManifest();
   console.log(
     `Mutation manifest is exhaustive: ${codeMutationLaneNames.length} lanes cover ` +
-      `${expectedCodeMutationFiles.length} executable TypeScript files.`,
+      `${expectedCodeMutationFiles.length} executable TypeScript files, and every tests/*.test.ts file is ` +
+      `either assigned to a lane or documented in intentionallyUnassignedTestFiles.`,
   );
 }

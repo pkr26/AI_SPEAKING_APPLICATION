@@ -10,6 +10,12 @@ import { randomUUID } from 'node:crypto';
 const BASE = process.env.BASE_URL || 'http://localhost:4000';
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
 
+// Fail-closed assertion budget: the exact number of ok() calls that run
+// exactly once per successful run (everything outside the diagnostic-answer
+// and practice-attempt loops, excluding the final tally check itself).
+// UPDATE THIS COUNT whenever checks are intentionally added or removed.
+const EXPECTED_DETERMINISTIC_ASSERTIONS = 52;
+
 let passed = 0;
 function ok(name, cond, extra = '') {
   if (!cond) {
@@ -172,7 +178,11 @@ ok(
 
 let diagResult = null;
 let firstAnswerRequestId = null;
+// Every iteration asserts exactly twice: the score-fields check, then either
+// the done check (break) or the nextQuestion check.
+let diagAnswers = 0;
 for (let i = 1; i <= 5; i++) {
+  diagAnswers++;
   const answerRequestId = randomUUID();
   if (i === 1) firstAnswerRequestId = answerRequestId;
   r = await req('POST', '/diagnostic/answer', { token, form: audioForm(question.id, answerRequestId) });
@@ -290,6 +300,9 @@ ok(
 let sawPass = false;
 let sawFinal = false;
 let attempts = 0;
+let passIterations = 0; // 3 ok() calls each: base + mastered flag + next payload
+let finalIterations = 0; // 4 ok() calls each: base + attemptNo 3 + finalFeedback + next payload
+let ordinaryFailIterations = 0; // 2 ok() calls each: base + attemptsLeft
 for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
   attempts++;
   r = await req('POST', '/practice/attempt', { token, form: audioForm(practiceQ.id) });
@@ -304,10 +317,12 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
   );
   if (r.body.passed) {
     sawPass = true;
+    passIterations++;
     ok('pass response has mastered flag', typeof r.body.mastered === 'boolean', JSON.stringify(r.body));
     ok('pass response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
   } else if (r.body.attemptsLeft === 0) {
     sawFinal = true;
+    finalIterations++;
     ok('final-fail response has attemptNo 3', r.body.attemptNo === 3, JSON.stringify(r.body));
     ok(
       'final-fail response has finalFeedback with model-answer hint',
@@ -319,6 +334,7 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
     );
     ok('final-fail response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
   } else {
+    ordinaryFailIterations++;
     ok(
       `fail response attemptNo ${r.body.attemptNo} has attemptsLeft ${3 - r.body.attemptNo}`,
       r.body.attemptsLeft === 3 - r.body.attemptNo && !('next' in r.body),
@@ -401,6 +417,22 @@ ok('delete account returns 204', r.status === 204, `got ${r.status}`);
 
 r = await req('GET', '/auth/me', { token: deleteToken });
 ok('token rejected after account deletion', r.status === 401, `got ${r.status}`);
+
+// ---------- fail-closed assertion tally ----------
+// If a whole section were skipped or short-circuited, `passed` would fall
+// short of the expected total and this check turns the run red. The ok()
+// below compares before incrementing itself, so EXPECTED_DETERMINISTIC_ASSERTIONS
+// excludes this tally check.
+const expectedVariableAssertions =
+  2 * diagAnswers + 3 * passIterations + 4 * finalIterations + 2 * ordinaryFailIterations;
+const expectedTotalAssertions = EXPECTED_DETERMINISTIC_ASSERTIONS + expectedVariableAssertions;
+ok(
+  'assertion tally matches expected count',
+  passed === expectedTotalAssertions,
+  `passed=${passed} expected=${expectedTotalAssertions} ` +
+    `(deterministic=${EXPECTED_DETERMINISTIC_ASSERTIONS}, variable=${expectedVariableAssertions}: ` +
+    `diagAnswers=${diagAnswers}, pass=${passIterations}, final=${finalIterations}, ordinaryFail=${ordinaryFailIterations})`,
+);
 
 console.log(
   `\nAll smoke checks passed (${passed} assertions). Assigned level: ${assignedLevel}. Practice attempts looped: ${attempts}.`,

@@ -66,6 +66,38 @@ if (!Number.isSafeInteger(REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS < 1_000 || R
   throw new Error('REQUEST_TIMEOUT_MS must be an integer from 1000 to 120000');
 }
 
+// Fail-closed assertion accounting. Every check() call site is either fixed
+// (runs exactly once per run, once per user, or once per fixed barrier phase)
+// or diagnostic-wave-dependent (MOCK_AI scores are random 40-95, so the wave
+// count and per-wave pending users vary run to run). Before printing success
+// the run recomputes the exact expected total from these pinned constants and
+// hard-fails on any mismatch, so a silently skipped phase or per-user block
+// can never report a passing run.
+//
+// Fixed portion, 496 = 4 (health/ready) + 3 (post-register isolation)
+//   + 8 (serial mock-AI safety probe: 2 upload grant + 6 diagnostic answer)
+//   + 3 (post-diagnostic invariants) + 3 (final barrier-phase invariants)
+//   + 15 (one dispatch-spread check per fixed barrier phase)
+//   + 46 per user x 10 users (register 4, initial diagnostic 3, practice
+//     question 4, localized help 4, English grant 2, English attempt 8,
+//     English progress 3, native grant 2, native attempt 2, native status 2,
+//     native replay 3, post-native progress 2, data export 5, delete 1,
+//     revoked token 1).
+// The conditional sites stay deterministic because both branches assert
+// exactly once each: submitDiagnosticAnswer (done vs nextQuestion) and the
+// English attempt (passed vs failed). cleanupPlannedRegistration never calls
+// check(), so cleanup contributes zero assertions.
+const EXPECTED_FIXED_ASSERTIONS = 496;
+// Each executed diagnostic wave adds 1 attempts-bound check plus 2 barrier
+// dispatch-spread checks (upload-grant phase + assessment phase)...
+const ASSERTIONS_PER_DIAGNOSTIC_WAVE = 3;
+// ...and each pending user in a wave adds 2 upload-grant checks plus 6
+// diagnostic-answer checks (validateMockAssessment 5 + one branch check).
+const ASSERTIONS_PER_DIAGNOSTIC_WAVE_ATTEMPT = 8;
+// 15 fixed barrier phases, plus grant + assessment phases per diagnostic wave.
+const EXPECTED_FIXED_PHASES = 15;
+const PHASES_PER_DIAGNOSTIC_WAVE = 2;
+
 let assertionCount = 0;
 const phaseStats = [];
 const plannedRegistrations = [];
@@ -481,9 +513,13 @@ async function main() {
   await submitDiagnosticAnswer(createdUsers[0], 'serial mock-AI safety probe');
   console.log('ok: MOCK_AI safety marker observed before concurrent assessments');
 
+  let diagnosticWaveCount = 0;
+  let diagnosticWaveAttemptCount = 0;
   for (let wave = 1; wave <= 5; wave++) {
     const pending = createdUsers.filter((user) => user.currentQuestion);
     if (pending.length === 0) break;
+    diagnosticWaveCount++;
+    diagnosticWaveAttemptCount += pending.length;
     check(
       `diagnostic wave ${wave} does not exceed five attempts per user`,
       pending.every((user) => user.diagnosticAttempts < 5),
@@ -730,8 +766,33 @@ async function main() {
     tenUserPhases.every((phase) => phase.dispatchSpreadMs <= MAX_BARRIER_DISPATCH_SPREAD_MS),
   );
 
+  // Fail closed: recompute the exact expected totals from the pinned
+  // accounting and refuse to print success on any mismatch. These comparisons
+  // deliberately throw directly instead of calling check(), so validating the
+  // counter never perturbs the counter being validated.
+  const expectedPhases = EXPECTED_FIXED_PHASES + PHASES_PER_DIAGNOSTIC_WAVE * diagnosticWaveCount;
+  if (phaseStats.length !== expectedPhases) {
+    throw new Error(
+      `phase count failed closed: expected exactly ${expectedPhases} barrier phases ` +
+        `(${EXPECTED_FIXED_PHASES} fixed + ${PHASES_PER_DIAGNOSTIC_WAVE} x ${diagnosticWaveCount} diagnostic waves), ` +
+        `recorded ${phaseStats.length}; a phase was skipped or added without updating the pinned accounting`,
+    );
+  }
+  const expectedAssertions =
+    EXPECTED_FIXED_ASSERTIONS +
+    ASSERTIONS_PER_DIAGNOSTIC_WAVE * diagnosticWaveCount +
+    ASSERTIONS_PER_DIAGNOSTIC_WAVE_ATTEMPT * diagnosticWaveAttemptCount;
+  if (assertionCount !== expectedAssertions) {
+    throw new Error(
+      `assertion count failed closed: expected exactly ${expectedAssertions} assertions ` +
+        `(${EXPECTED_FIXED_ASSERTIONS} fixed + ${ASSERTIONS_PER_DIAGNOSTIC_WAVE} x ${diagnosticWaveCount} diagnostic waves ` +
+        `+ ${ASSERTIONS_PER_DIAGNOSTIC_WAVE_ATTEMPT} x ${diagnosticWaveAttemptCount} wave attempts), ` +
+        `recorded ${assertionCount}; a check() block was skipped or added without updating the pinned accounting`,
+    );
+  }
+
   console.log(
-    `\nAll 10-user client-barrier smoke checks passed (${assertionCount} assertions across ${phaseStats.length} phases).`,
+    `\nAll 10-user client-barrier smoke checks passed (${assertionCount} assertions across ${phaseStats.length} phases, exactly matching the pinned fail-closed accounting).`,
   );
   console.log('Phase timing summary:');
   for (const phase of phaseStats) {

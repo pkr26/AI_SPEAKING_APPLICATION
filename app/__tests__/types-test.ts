@@ -1,6 +1,8 @@
 import {
+  audioKeyBelongsToOwner,
   CEFR_LEVELS,
   ContractError,
+  isNativeOutcome,
   parseAttemptResult,
   parseAudioUploadGrant,
   parseAuthResponse,
@@ -417,6 +419,12 @@ describe('practice question payload parser', () => {
       progress: { masteredCount: 100_000, learningCount: 0, totalAtLevel: 100_000 },
     } as const;
     expect(parsePracticeQuestion(maxed)).toEqual(maxed);
+    const singleWordLevel = {
+      question,
+      kind: 'new',
+      progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 1 },
+    } as const;
+    expect(parsePracticeQuestion(singleWordLevel)).toEqual(singleWordLevel);
   });
 
   it.each([
@@ -520,6 +528,37 @@ describe('native attempt result parser', () => {
   it('rejects null and array native envelopes', () => {
     expectContractError(() => parseNativeAttemptResult(null));
     expectContractError(() => parseNativeAttemptResult(Object.assign([], native)));
+  });
+});
+
+describe('practice outcome discriminant', () => {
+  const nativeOutcome = {
+    mode: 'native',
+    understood: true,
+    transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    modelAnswer: 'She showed courage at work.',
+    feedback: 'You understood the question.',
+  } as const;
+
+  const englishOutcome = {
+    passed: true,
+    mastered: true,
+    attemptNo: 1,
+    score: 90,
+    transcript: 'An answer.',
+    feedback: 'Great.',
+  };
+
+  it('routes only a native-mode outcome to the native renderer', () => {
+    expect(isNativeOutcome(nativeOutcome)).toBe(true);
+    expect(isNativeOutcome(englishOutcome)).toBe(false);
+  });
+
+  it('routes an outcome carrying some other mode to the English renderer', () => {
+    // A future or corrupted server mode must not be treated as the native
+    // variant just because the discriminant field is present.
+    const otherModeOutcome = { ...englishOutcome, mode: 'english' };
+    expect(isNativeOutcome(otherModeOutcome)).toBe(false);
   });
 });
 
@@ -838,6 +877,42 @@ describe('help and attempt detail boundaries', () => {
     );
   });
 
+  it('accepts the exact pass and mastery score boundaries', () => {
+    const passedAtPassScore = {
+      passed: true,
+      mastered: false,
+      attemptNo: 1,
+      score: PRACTICE_PASS_SCORE,
+      transcript: 'A complete answer.',
+      feedback: 'Feedback.',
+      next: practicePayload,
+    };
+    expect(parseAttemptResult(passedAtPassScore)).toEqual(passedAtPassScore);
+
+    const masteredAtMasterScore = {
+      ...passedAtPassScore,
+      mastered: true,
+      score: PRACTICE_MASTER_SCORE,
+    };
+    expect(parseAttemptResult(masteredAtMasterScore)).toEqual(masteredAtMasterScore);
+  });
+
+  it('rejects a scored attempt that carries no spoken transcript', () => {
+    // Only the explicit no-speech variant may omit the transcript; a scored
+    // attempt without one would render an empty answer as if it were spoken.
+    const retry = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 40,
+      transcript: '',
+      feedback: 'Add detail.',
+    };
+    expectContractError(() => parseAttemptResult(retry));
+    expectContractError(() => parseAttemptResult({ ...retry, transcript: '   ' }));
+  });
+
   it('requires the mastered flag on every scored attempt variant', () => {
     const base = {
       attemptNo: 1,
@@ -1121,6 +1196,9 @@ describe('audio upload grant parser', () => {
     'https://amazonaws.com./',
     'http://amazonaws.com/',
     'http://bucket.s3.us-east-1.amazonaws.com/',
+    // A lookalike registrable domain exactly as long as '.amazonaws.com', so
+    // trimming that suffix blindly would leave a well-formed S3 endpoint.
+    'https://bucket.s3.us-east-1.attackers.com/',
   ])('rejects the non-AWS or cleartext upload destination %s', (uploadUrl) => {
     expectContractError(() => parseAudioUploadGrant({ ...s3, uploadUrl }));
   });
@@ -1135,6 +1213,13 @@ describe('audio upload grant parser', () => {
   it('requires the complete, anchored per-user S3 key shape', () => {
     expectContractError(() => parseAudioUploadGrant(withAudioKey(`junk/${audioKey}`)));
     expectContractError(() => parseAudioUploadGrant(withAudioKey(`${audioKey}/junk`)));
+    // Trailing segments must not ride in behind a well-formed prefix, even when
+    // the whole key still ends in an allowlisted extension.
+    expectContractError(() =>
+      parseAudioUploadGrant(
+        withAudioKey(`${audioKey}/../../550e8400-e29b-41d4-a716-446655440009/steal.m4a`),
+      ),
+    );
     const invalidVersion = audioKey.replace('550e8400-e29b-41d4-a716', '550e8400-e29b-01d4-a716');
     const invalidVariant = audioKey.replace('550e8400-e29b-41d4-a716', '550e8400-e29b-41d4-c716');
     expectContractError(() => parseAudioUploadGrant(withAudioKey(invalidVersion)));
@@ -1269,6 +1354,37 @@ describe('audio upload grant parser', () => {
   });
 });
 
+describe('audio key ownership', () => {
+  const ownerId = '550e8400-e29b-41d4-a716-446655440000';
+  const otherOwnerId = '550e8400-e29b-41d4-a716-446655440009';
+  const recordingId = '550e8400-e29b-41d4-a716-446655440002';
+  const ownedKey = `audio-uploads/${ownerId}/${recordingId}.m4a`;
+
+  it('accepts an owned key whichever side carries uppercase hex', () => {
+    expect(audioKeyBelongsToOwner(ownedKey, ownerId)).toBe(true);
+    expect(audioKeyBelongsToOwner(ownedKey.toUpperCase(), ownerId)).toBe(true);
+    expect(audioKeyBelongsToOwner(ownedKey, ownerId.toUpperCase())).toBe(true);
+  });
+
+  it('rejects a well-formed key stored under another account', () => {
+    expect(
+      audioKeyBelongsToOwner(`audio-uploads/${otherOwnerId}/${recordingId}.m4a`, ownerId),
+    ).toBe(false);
+  });
+
+  it.each([
+    ['a foreign prefix', `uploads/${ownerId}/${recordingId}.m4a`],
+    ['a non-uuid recording id', `audio-uploads/${ownerId}/recording.m4a`],
+    ['a disallowed extension', `audio-uploads/${ownerId}/${recordingId}.exe`],
+    [
+      'a traversal suffix',
+      `audio-uploads/${ownerId}/${recordingId}.m4a/../../${otherOwnerId}/steal.m4a`,
+    ],
+  ])('rejects %s even though the owner segment matches', (_label, key) => {
+    expect(audioKeyBelongsToOwner(key, ownerId)).toBe(false);
+  });
+});
+
 // ----- Level-up, SRS dueCount, stats, history, and export parsers -----
 
 describe('levelUp attempt variant', () => {
@@ -1350,6 +1466,17 @@ describe('levelUp attempt variant', () => {
     ['an unknown target level', { from: 'B1', to: 'Z9' }],
     ['a non-record value', 'B1->B2'],
   ])('rejects a level-up with %s', (_label, levelUp) => {
+    expectContractError(() => parseAttemptResult({ ...promotedAttempt, levelUp }));
+  });
+
+  // The next-question cross-check cannot stand in for the ladder check when the
+  // promotion already targets the level the next question is served from.
+  it.each([
+    ['a two-level jump', { from: 'A2', to: 'B2' }],
+    ['no movement', { from: 'B2', to: 'B2' }],
+    ['a demotion', { from: 'C1', to: 'B2' }],
+    ['an array envelope', Object.assign([], { from: 'B1', to: 'B2' })],
+  ])('rejects a level-up onto the served level with %s', (_label, levelUp) => {
     expectContractError(() => parseAttemptResult({ ...promotedAttempt, levelUp }));
   });
 
@@ -1437,6 +1564,29 @@ describe('practice stats parser', () => {
     expect(parsePracticeStats({ ...stats, someFutureField: 1 })).toEqual(stats);
   });
 
+  it('accepts progress counts sitting exactly on their consistency bounds', () => {
+    const singleWordLevel = {
+      ...stats,
+      progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 1, dueCount: 1 },
+    };
+    expect(parsePracticeStats(singleWordLevel)).toEqual(singleWordLevel);
+
+    const everyWordStartedAndDue = {
+      ...stats,
+      progress: { masteredCount: 3, learningCount: 2, totalAtLevel: 5, dueCount: 5 },
+    };
+    expect(parsePracticeStats(everyWordStartedAndDue)).toEqual(everyWordStartedAndDue);
+  });
+
+  it('rejects a level that holds no words at all', () => {
+    expectContractError(() =>
+      parsePracticeStats({
+        ...stats,
+        progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      }),
+    );
+  });
+
   it.each([
     ['a non-record value', 'stats'],
     ['an unknown level', { ...stats, level: 'Z9' }],
@@ -1515,6 +1665,22 @@ describe('practice history parser', () => {
     expectContractError(() => parsePracticeHistory({ items, nextCursor: null }));
   });
 
+  it('accepts a page holding exactly the server maximum', () => {
+    const items = Array.from({ length: 50 }, (_value, index) => ({
+      ...item,
+      id: `550e8400-e29b-41d4-a716-4466554400${(index + 10).toString().padStart(2, '0')}`,
+    }));
+    expect(parsePracticeHistory({ items, nextCursor: cursor }).items).toEqual(items);
+  });
+
+  it.each([1, PRACTICE_MAX_ATTEMPTS])(
+    'accepts a history item on attempt-number boundary %i',
+    (attemptNo) => {
+      const page = { items: [{ ...item, attemptNo }], nextCursor: null };
+      expect(parsePracticeHistory(page)).toEqual(page);
+    },
+  );
+
   it.each([
     ['a non-uuid id', { ...item, id: 'row-1' }],
     ['a non-uuid questionId', { ...item, questionId: 'question-1' }],
@@ -1561,6 +1727,20 @@ describe('user data export page parser', () => {
       attempts: [],
       nextCursor: null,
     });
+  });
+
+  it('accepts a full export page and rejects one row beyond the server maximum', () => {
+    const attempts = Array.from({ length: 1_000 }, (_value, index) => ({ id: index }));
+    expect(parseUserDataPage({ user: exportUser, attempts, nextCursor: cursor }).attempts).toEqual(
+      attempts,
+    );
+    expectContractError(() =>
+      parseUserDataPage({
+        user: exportUser,
+        attempts: [...attempts, { id: 1_000 }],
+        nextCursor: cursor,
+      }),
+    );
   });
 
   it.each([

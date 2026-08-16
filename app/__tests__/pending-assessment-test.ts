@@ -86,6 +86,34 @@ describe('durable assessment handoff', () => {
     }
   });
 
+  it('drops a stale S3 key when the stage falls back to a direct post', async () => {
+    // The caller may pass an audioKey with either stage; only s3-granted may
+    // keep one, otherwise a dead object key would outlive its grant.
+    await savePendingAssessment({ ...pending, stage: 's3-granted', audioKey });
+
+    await expect(
+      markPendingAssessmentStage(pending.requestId, 'direct-posting', audioKey),
+    ).resolves.toBe(true);
+
+    expect(await loadPendingAssessment()).toEqual({ ...pending, stage: 'direct-posting' });
+  });
+
+  it('replaces the stored S3 key when a fresh grant supersedes it', async () => {
+    const supersedingKey =
+      'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440004.m4a';
+    await savePendingAssessment({ ...pending, stage: 's3-granted', audioKey });
+
+    await expect(
+      markPendingAssessmentStage(pending.requestId, 's3-granted', supersedingKey),
+    ).resolves.toBe(true);
+
+    expect(await loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 's3-granted',
+      audioKey: supersedingKey,
+    });
+  });
+
   it('persists the S3 key before upload and removes it when reconciling', async () => {
     await savePendingAssessment({ ...pending, stage: 'prepared' });
 

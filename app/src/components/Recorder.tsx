@@ -763,7 +763,12 @@ export default function Recorder<T>({
                   s3Reuploads < MAX_S3_REUPLOADS
                 ) {
                   const uri = activeUriRef.current;
-                  if (uri !== null && routeMatches && new File(uri).exists) {
+                  // recordingFileExists, not a bare `new File(uri).exists`: this
+                  // runs inside catch (retryError), so a throw here escapes the
+                  // retry loop and rejects recoverPending(), which the caller
+                  // invokes as `void recoverPending()` — an unhandled rejection
+                  // that strands the recorder in `recovering` with no message.
+                  if (uri !== null && routeMatches && recordingFileExists(uri)) {
                     if (await reuploadRecording(uri, pending.requestId)) {
                       if (!isCurrent()) return;
                       s3Reuploads += 1;

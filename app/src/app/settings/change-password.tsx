@@ -47,8 +47,10 @@ export default function ChangePasswordScreen() {
   const confirmPasswordRef = useRef<TextInput>(null);
 
   const newPasswordError = newPassword.length > 0 ? passwordPolicyError(newPassword, t) : null;
-  const currentPasswordError =
-    currentPassword.length > 0 ? comparablePasswordError(currentPassword, t) : null;
+  // No length guard, unlike newPasswordError above: passwordPolicyError reports
+  // "too short" for an empty string, but comparablePasswordError only enforces
+  // the 72-byte bcrypt ceiling and so already returns null for one.
+  const currentPasswordError = comparablePasswordError(currentPassword, t);
   const confirmError =
     confirmPassword.length > 0 && confirmPassword !== newPassword ? t('cp.mismatch') : null;
 

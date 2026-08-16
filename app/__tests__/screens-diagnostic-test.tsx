@@ -8,7 +8,7 @@ import DiagnosticScreen from '../src/app/diagnostic';
 import { ApiError, apiFetch, userMessageForError } from '../src/lib/api';
 import { LogoutCleanupError, type useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
-import { colors, layout } from '../src/lib/theme';
+import { colors, layout, radii, spacing } from '../src/lib/theme';
 import {
   parseDiagnosticAnswerResult,
   type DiagnosticAnswerResult,
@@ -209,6 +209,27 @@ function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
 
+/** The host view a control is laid out in (card, account row, level badge). */
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
+/**
+ * ScrollView renders as the host `RCTScrollView`, which keeps
+ * `contentContainerStyle` as a prop instead of applying it to a child view.
+ */
+function scrollView(): TestInstance {
+  const [node] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
+  if (!node) throw new Error('No ScrollView rendered');
+  return node;
+}
+
+function scrollContentStyle(): SemanticStyle {
+  return StyleSheet.flatten(scrollView().props.contentContainerStyle) ?? {};
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -294,6 +315,9 @@ describe('diagnostic screen', () => {
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText(t('diag.progress', { current: 1, max: 5 }))).toBeTruthy();
     expect(screen.getByText(t('header.diagnostic'))).toBeTruthy();
+    // Both halves of the prompt card are named for the learner.
+    expect(screen.getByText(t('label.word'))).toBeTruthy();
+    expect(screen.getByText(t('label.question'))).toBeTruthy();
 
     expect(recorderProps()).toMatchObject({
       ownerId: USER.id,
@@ -643,6 +667,8 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(t('diag.levelIntro'))).toBeTruthy();
     expect(screen.getByText('B2')).toBeTruthy();
     expect(screen.getByText(t('cefr.B2'))).toBeTruthy();
+    // The reveal closes by telling the learner what the level is used for.
+    expect(screen.getByText(t('diag.levelHint'))).toBeTruthy();
     // The per-answer reveal lists this session's answers with pass marks.
     expect(screen.getByText(t('diag.answersTitle'))).toBeTruthy();
     expect(
@@ -763,6 +789,85 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(mockRecorderProps?.questionId).toBe(QUESTION_1.id);
+  });
+
+  it('never renders a question view around a question the server has taken away', async () => {
+    // Acknowledgement handlers close over the result they were rendered for, so
+    // a queued double tap replays them against whatever state arrives later.
+    // Neither replay may leave the screen half-built. A resumed test is used so
+    // the intro is never started, which keeps the intro branch reachable.
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 2));
+    const { queryClient } = await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    // A finished result that never carried a level: acknowledging it clears the
+    // level rather than badging an empty one, so the question stays put.
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 70,
+        transcript: 'first answer',
+        feedback: 'first feedback',
+        done: true,
+      }),
+    );
+    const replayFinish = capturedPressHandler(t('diag.seeLevel'));
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(screen.queryByText(t('diag.completeTitle'))).toBeNull();
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 80,
+        transcript: 'second answer',
+        feedback: 'second feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+    const replayContinue = capturedPressHandler(t('diag.nextQuestion'));
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
+
+    // The server finishes the test underneath the learner, dropping both the
+    // question and the progress it was counted against.
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2' });
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['diagnostic-next'] });
+      // Let the refetch settle and the batched query notification fire.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
+
+    // Replaying the level-less acknowledgement now drops the revealed level
+    // with no question left to fall back to: the screen empties instead of
+    // framing a prompt card around a missing question.
+    await act(async () => {
+      await replayFinish();
+    });
+
+    expect(screen.toJSON()).toBeNull();
+    expect(screen.queryByText(t('diag.completeTitle'))).toBeNull();
+    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
+    expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
+
+    // Replaying the older continue action restores its question, but the count
+    // the server dropped is gone: the screen reads as a fresh test and opens on
+    // the intro again instead of counting against progress it no longer has.
+    await act(async () => {
+      await replayContinue();
+    });
+
+    expect(screen.getByText(t('diag.introTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('diag.introCount', { count: 5 }))).toBeNull();
+    await startFreshTest();
+
+    expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
+    expect(screen.getByText(t('header.diagnostic'))).toBeTruthy();
+    for (const current of [1, 2, 3, 4, 5]) {
+      expect(screen.queryByText(t('diag.progress', { current, max: 5 }))).toBeNull();
+    }
   });
 
   it('keeps the unacknowledged answer card when a background refetch advances server state', async () => {
@@ -935,19 +1040,29 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await act(async () => recorderProps().onInteractionLockChange?.(true));
+    // Every locked control explains why it is locked, not just that it is.
+    const hint = t('hint.finishRecordingFirst');
     const account = screen.getByRole('button', { name: t('header.settings') });
     expect(account.props.accessibilityState).toEqual({ disabled: true, busy: false });
+    expect(account.props.accessibilityHint).toBe(hint);
     expect(flattenedStyle(account)).toMatchObject({ opacity: 0.5 });
     await fireEvent.press(account);
     expect(mockRouter.push).not.toHaveBeenCalled();
 
     const logout = screen.getByRole('button', { name: t('common.logOut') });
     expect(logout.props.accessibilityState).toEqual({ disabled: true, busy: false });
+    expect(logout.props.accessibilityHint).toBe(hint);
     expect(flattenedStyle(logout)).toMatchObject({ opacity: 0.5 });
     await fireEvent.press(logout);
     expect(mockAuthValue.logout).not.toHaveBeenCalled();
 
     await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint,
+    ).toBeUndefined();
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('header.settings') })).opacity,
     ).toBeUndefined();
@@ -969,5 +1084,303 @@ describe('diagnostic screen', () => {
 
     await rendered.unmount();
     expect(backSubscriptionRemove).toHaveBeenCalled();
+  });
+});
+
+describe('diagnostic presentation', () => {
+  /** The full-bleed, vertically centred slot the pre-question states sit in. */
+  const CENTERED_STATE = {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+    backgroundColor: colors.background,
+  };
+
+  const MUTED_BODY = {
+    marginTop: spacing.md,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  const CARD = {
+    marginTop: spacing.lg,
+    backgroundColor: colors.card,
+    borderRadius: radii.card,
+    padding: spacing.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+  };
+
+  const CARD_LABEL = {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: spacing.md,
+  };
+
+  /** Shared by the intro card headline and the saved-answer headline. */
+  const CARD_TITLE = {
+    fontSize: 20,
+    fontWeight: '800',
+    color: colors.text,
+  };
+
+  const INTRO_LINE = {
+    marginTop: 10,
+    fontSize: 16,
+    lineHeight: 23,
+    color: colors.text,
+  };
+
+  /** Full-width brand CTA, spaced off the card it closes. */
+  const PRIMARY_ACTION = {
+    minHeight: layout.minimumTarget,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    borderRadius: radii.button,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.xl,
+    backgroundColor: colors.primary,
+    alignSelf: 'stretch',
+    marginTop: spacing.lg,
+  };
+
+  it('centres the preparing state on the page tokens', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen();
+
+    const preparing = screen.getByText(t('diag.preparing'));
+    expect(flattenedStyle(preparing)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(preparing))).toEqual(CENTERED_STATE);
+  });
+
+  it('centres the load failure on the page tokens', async () => {
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen();
+
+    const title = await screen.findByText(t('diag.loadFailedTitle'));
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(title))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
+    expect(flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') }))).toEqual(
+      PRIMARY_ACTION,
+    );
+  });
+
+  it('lays the intro card out on the shared page tokens', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    const introTitle = await screen.findByText(t('diag.introTitle'));
+
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      padding: layout.screenPadding,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(screen.getByText(t('header.diagnostic')))).toEqual({
+      fontSize: 26,
+      fontWeight: '800',
+      color: colors.text,
+    });
+    // The account actions wrap onto a second line rather than stretching.
+    expect(
+      flattenedStyle(parentOf(screen.getByRole('button', { name: t('header.settings') }))),
+    ).toEqual({
+      alignSelf: 'flex-start',
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: spacing.sm,
+      marginTop: spacing.md,
+    });
+    expect(flattenedStyle(introTitle)).toEqual(CARD_TITLE);
+    expect(flattenedStyle(parentOf(introTitle))).toEqual(CARD);
+    for (const line of [
+      t('diag.introWhat'),
+      t('diag.introCount', { count: 5 }),
+      t('diag.introRecorded'),
+      t('diag.introSpeakEnglish'),
+    ]) {
+      expect(flattenedStyle(screen.getByText(line))).toEqual(INTRO_LINE);
+    }
+    expect(flattenedStyle(screen.getByRole('button', { name: t('diag.introStart') }))).toEqual(
+      PRIMARY_ACTION,
+    );
+  });
+
+  it('renders the question card and its progress line from the tokens', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    expect(flattenedStyle(screen.getByText(t('diag.progress', { current: 1, max: 5 })))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 14,
+      color: colors.muted,
+    });
+    const promptWord = screen.getByText('courage');
+    expect(flattenedStyle(promptWord)).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 30,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(promptWord))).toEqual(CARD);
+    expect(flattenedStyle(screen.getByText('Describe a time you showed courage.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 18,
+      lineHeight: 26,
+      color: colors.text,
+    });
+    // Both halves of the card are named for the learner.
+    expect(flattenedStyle(screen.getByText(t('label.word')))).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+  });
+
+  it('renders the saved-answer card from the tokens', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 88,
+        transcript: 'An answer.',
+        feedback: 'Great answer.',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+
+    const savedTitle = screen.getByText(t('diag.answerSavedTitle'));
+    expect(flattenedStyle(savedTitle)).toEqual(CARD_TITLE);
+    expect(flattenedStyle(parentOf(savedTitle))).toEqual({
+      marginTop: spacing.xl,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      backgroundColor: colors.card,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(screen.getByText(t('diag.answerSavedBody')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.muted,
+    });
+    expect(flattenedStyle(screen.getByRole('button', { name: t('diag.nextQuestion') }))).toEqual(
+      PRIMARY_ACTION,
+    );
+  });
+
+  it('lays the completion reveal out on the page tokens', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
+    await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 91,
+        transcript: 'transcript',
+        feedback: 'feedback',
+        done: true,
+        level: 'B2',
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+    await screen.findByText(t('diag.completeTitle'));
+
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(screen.getByText('🎉', { includeHiddenElements: true }))).toEqual({
+      fontSize: 56,
+    });
+    expect(flattenedStyle(screen.getByText(t('diag.completeTitle')))).toEqual({
+      marginTop: spacing.md,
+      fontSize: 26,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('diag.levelIntro')))).toEqual({
+      marginTop: spacing.ml,
+      fontSize: 16,
+      color: colors.muted,
+    });
+
+    const levelBadgeText = screen.getByText('B2');
+    expect(flattenedStyle(levelBadgeText)).toEqual({
+      fontSize: 34,
+      fontWeight: '800',
+      color: colors.onPrimary,
+    });
+    expect(flattenedStyle(parentOf(levelBadgeText))).toEqual({
+      marginTop: spacing.sm,
+      backgroundColor: colors.primary,
+      borderRadius: radii.card,
+      paddingVertical: spacing.md,
+      paddingHorizontal: spacing.xxl,
+    });
+    expect(flattenedStyle(screen.getByText(t('cefr.B2')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+
+    const answersTitle = screen.getByText(t('diag.answersTitle'));
+    expect(flattenedStyle(answersTitle)).toEqual({
+      fontSize: 15,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    // The reveal card stretches across the centred column it sits in.
+    expect(flattenedStyle(parentOf(answersTitle))).toEqual({
+      marginTop: spacing.lg,
+      alignSelf: 'stretch',
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.ml,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(
+      flattenedStyle(screen.getByText(t('diag.answerLine', { number: 1, score: 91, mark: '✓' }))),
+    ).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      color: colors.text,
+    });
+
+    expect(flattenedStyle(screen.getByText(t('diag.levelHint')))).toEqual({
+      marginTop: spacing.ml,
+      marginBottom: spacing.sm,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByRole('button', { name: t('diag.startPracticing') }))).toEqual(
+      PRIMARY_ACTION,
+    );
   });
 });

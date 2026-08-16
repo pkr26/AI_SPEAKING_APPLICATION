@@ -43,3 +43,8 @@ coverage/
 # generated native folders
 /ios
 /android
+
+# mutation testing
+.stryker-tmp/
+.stryker-*-tmp/
+reports/

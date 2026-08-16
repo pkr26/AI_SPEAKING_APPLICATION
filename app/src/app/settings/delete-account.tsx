@@ -38,7 +38,9 @@ export default function DeleteAccountScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const passwordError = password.length > 0 ? comparablePasswordError(password, t) : null;
+  // No length guard: comparablePasswordError only enforces the 72-byte bcrypt
+  // ceiling, so it already returns null for an empty password.
+  const passwordError = comparablePasswordError(password, t);
   const canSubmit = password.length > 0 && passwordError === null && !busy;
 
   const performDelete = async () => {

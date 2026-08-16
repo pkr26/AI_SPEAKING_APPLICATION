@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert, BackHandler, StyleSheet } from 'react-native';
+import { Alert, BackHandler, StyleSheet, useColorScheme, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import * as Haptics from 'expo-haptics';
@@ -15,7 +15,7 @@ import { ApiError, apiFetch, apiSkipPracticeWord } from '../src/lib/api';
 import { LogoutCleanupError, useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
-import { colors, layout } from '../src/lib/theme';
+import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import {
   parseAttemptResult,
   parseNativeAttemptResult,
@@ -34,6 +34,17 @@ import {
 // assert against the same typed catalog the screens render from.
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
+
+const asMock = (fn: unknown) => fn as jest.Mock;
+
+// ----- color scheme -----
+
+// Practice screens render in the light palette unless a test flips the OS
+// scheme; the dark palette carries its own elevation and fill decisions.
+jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
+  __esModule: true,
+  default: jest.fn(() => 'light'),
+}));
 
 // ----- expo-router mock -----
 
@@ -91,9 +102,13 @@ interface CapturedRecorderProps {
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
 
+// A host node stands in for the real recorder so tests can reach the slot the
+// screens reserve for it (`styles.recorderArea`) the same way a user's eye does.
 function MockRecorder(props: CapturedRecorderProps) {
-  mockRecorderProps = props;
-  return null;
+  React.useEffect(() => {
+    mockRecorderProps = props;
+  });
+  return <View testID="recorder" />;
 }
 
 jest.mock('../src/components/Recorder', () => ({
@@ -271,9 +286,8 @@ function makeQueryClient() {
   return client;
 }
 
-function renderScreen(ui: React.ReactElement, queryClient?: QueryClient, bottomInset = 0) {
-  const client = queryClient ?? makeQueryClient();
-  return render(
+function withProviders(ui: React.ReactElement, client: QueryClient, bottomInset: number) {
+  return (
     <SafeAreaProvider
       initialMetrics={{
         frame: { x: 0, y: 0, width: 390, height: 844 },
@@ -281,8 +295,23 @@ function renderScreen(ui: React.ReactElement, queryClient?: QueryClient, bottomI
       }}
     >
       <QueryClientProvider client={client}>{ui}</QueryClientProvider>
-    </SafeAreaProvider>,
+    </SafeAreaProvider>
   );
+}
+
+function renderScreen(ui: React.ReactElement, queryClient?: QueryClient, bottomInset = 0) {
+  return render(withProviders(ui, queryClient ?? makeQueryClient(), bottomInset));
+}
+
+/**
+ * Renders a screen and hands back a re-render that keeps the same providers and
+ * the same mounted instance, so a test can change what the mocked hooks return
+ * — a switched account, a fresh outcome — without a remount papering over it.
+ */
+async function renderRerenderable(ui: React.ReactElement, queryClient?: QueryClient) {
+  const client = queryClient ?? makeQueryClient();
+  const view = await render(withProviders(ui, client, 0));
+  return (next: React.ReactElement) => view.rerender(withProviders(next, client, 0));
 }
 
 function recorderProps(): CapturedRecorderProps {
@@ -322,6 +351,37 @@ async function expectPressFeedback(
   });
 }
 
+/** The host view a control is laid out in (card, badge row, bar, footer). */
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
+/**
+ * ScrollView renders as the host `RCTScrollView`, which keeps
+ * `contentContainerStyle` as a prop instead of applying it to a child view.
+ */
+function scrollView(): TestInstance {
+  const [node] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
+  if (!node) throw new Error('No ScrollView rendered');
+  return node;
+}
+
+function scrollContentStyle(): SemanticStyle {
+  return StyleSheet.flatten(scrollView().props.contentContainerStyle) ?? {};
+}
+
+/** The full-bleed backdrop the scrolling content sits on. */
+function screenContainerStyle(): SemanticStyle {
+  return flattenedStyle(parentOf(scrollView()));
+}
+
+/** The reserved slot the recorder is mounted into. */
+function recorderAreaStyle(): SemanticStyle {
+  return flattenedStyle(parentOf(screen.getByTestId('recorder')));
+}
+
 function buttonContainerPaddingBottom(name: string): unknown {
   const parent = screen.getByRole('button', { name }).parent;
   if (!parent) throw new Error(`Button "${name}" has no container`);
@@ -330,6 +390,9 @@ function buttonContainerPaddingBottom(name: string): unknown {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // Module factory mocks outlive clearAllMocks; re-arm the light default.
+  asMock(useColorScheme).mockReset();
+  asMock(useColorScheme).mockReturnValue('light');
   mockApiFetch.mockReset();
   mockSkipWord.mockReset();
   mockRecorderProps = null;
@@ -692,10 +755,16 @@ describe('practice home screen', () => {
     mockAuthValue = makeAuth({ user: null });
 
     await renderScreen(<PracticeScreen />);
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
 
     expect(mockApiFetch).not.toHaveBeenCalled();
     expect(mockRecorderProps).toBeNull();
     expect(screen.queryByText(t('practice.loadingQuestion'))).toBeNull();
+    // The stored explainer flag is keyed by account: with no account there is
+    // no key to read, so the effect must not reach storage at all.
+    expect(mockPracticeIntro.hasSeenPracticeIntro).not.toHaveBeenCalled();
   });
 
   it('forwards recorder results to the practice flow and feedback route', async () => {
@@ -920,6 +989,9 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />);
 
     expect(screen.getByText(t('help.invalidLinkTitle'))).toBeTruthy();
+    // Practice Mode sends the learner back a different way than help does.
+    expect(screen.getByText(t('attempt.invalidLinkBody'))).toBeTruthy();
+    expect(screen.queryByText(t('help.invalidLinkBody'))).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { backgroundColor: colors.primary },
@@ -935,6 +1007,8 @@ describe('practice attempt screen', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<AttemptScreen />);
     expect(screen.getByText(t('attempt.loading'))).toBeTruthy();
+    // The spinner itself is labelled, so the wait is announced without sight.
+    expect(screen.getByLabelText(t('attempt.loading'))).toBeTruthy();
   });
 
   it('renders the question and wires the recorder for the attempt endpoint', async () => {
@@ -1018,11 +1092,17 @@ describe('practice attempt screen', () => {
     await act(async () => recorderProps().onInteractionLockChange?.(true));
     const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
     expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
+    // The lock is explained, not just enforced, and it is visible as dimming.
+    expect(toggle.props.accessibilityHint).toBe(t('hint.finishRecordingFirst'));
+    expect(flattenedStyle(toggle)).toMatchObject({ opacity: 0.5 });
     await fireEvent.press(toggle);
     expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
 
     await act(async () => recorderProps().onInteractionLockChange?.(false));
-    await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
+    const unlocked = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
+    expect(unlocked.props.accessibilityHint).toBeUndefined();
+    expect(flattenedStyle(unlocked).opacity).toBeUndefined();
+    await fireEvent.press(unlocked);
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
   });
 
@@ -1309,6 +1389,7 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText(t('feedback.noResultTitle'))).toBeTruthy();
+    expect(screen.getByText(t('feedback.noResultBody'))).toBeTruthy();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { alignItems: 'center', backgroundColor: colors.primary },
@@ -1342,6 +1423,12 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText(/Not quite/)).toBeNull();
     expect(screen.queryByText(t('feedback.finalTitle'))).toBeNull();
     expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
+    // A scored English pass owns the bottom bar alone: the native-answer
+    // actions belong to native outcomes only.
+    expect(screen.queryByText(t('feedback.tryInEnglish'))).toBeNull();
+    expect(screen.queryByText(t('feedback.tryAgainNative'))).toBeNull();
+    // Only mastery and a promotion earn the physical cheer.
+    expect(jest.mocked(Haptics.notificationAsync)).not.toHaveBeenCalled();
     expect(
       flattenedStyle(screen.getByRole('header', { name: t('feedback.passedTitle') })),
     ).toMatchObject({
@@ -1497,6 +1584,18 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText(t('feedback.weHeard'))).toBeNull();
     expect(screen.queryByText(t('feedback.sayInEnglish'))).toBeNull();
     expect(screen.queryByText(/\/ 100/)).toBeNull();
+    // Silence is not a judged answer: neither native verdict may appear.
+    expect(screen.queryByText(t('feedback.nativeUnderstoodTitle'))).toBeNull();
+    expect(screen.queryByText(t('feedback.nativeMissedTitle'))).toBeNull();
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: t('feedback.noSpeechTitle') })),
+    ).toEqual({
+      marginTop: spacing.md,
+      fontSize: 24,
+      fontWeight: '800',
+      textAlign: 'center',
+      color: colors.warning,
+    });
 
     await fireEvent.press(screen.getByRole('button', { name: t('feedback.tryAgainNative') }));
     expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
@@ -1867,7 +1966,9 @@ describe('practice feedback screen', () => {
       answerMode: 'native',
       feedback: { questionId: QUESTION.id, result: nativeResult },
     });
-    await renderScreen(<FeedbackScreen />);
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(<FeedbackScreen />, queryClient);
 
     let consumed = false;
     await act(async () => {
@@ -1878,6 +1979,11 @@ describe('practice feedback screen', () => {
     expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+    // Silence never consumed the word, so the queue must not be advanced or
+    // re-fetched behind the learner's back.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({
+      queryKey: ['practice-question', USER.id, USER.cefrLevel],
+    });
   });
 
   it('routes hardware back to practice when there is no result to show', async () => {
@@ -2058,6 +2164,9 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
 
     expect(screen.getByText(t('help.invalidLinkTitle'))).toBeTruthy();
+    // Help sends the learner back through the question they came from.
+    expect(screen.getByText(t('help.invalidLinkBody'))).toBeTruthy();
+    expect(screen.queryByText(t('attempt.invalidLinkBody'))).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { alignItems: 'center', backgroundColor: colors.primary },
@@ -2073,6 +2182,8 @@ describe('practice help screen', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<HelpScreen />);
     expect(screen.getByText(t('help.loading'))).toBeTruthy();
+    // The spinner itself is labelled, so the wait is announced without sight.
+    expect(screen.getByLabelText(t('help.loading'))).toBeTruthy();
   });
 
   it('renders the word, question, and bilingual examples', async () => {
@@ -2277,6 +2388,10 @@ describe('inline rate-limit notice', () => {
     await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
     expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
 
+    // Releasing the lock is not a new take: the wait line has to survive it.
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
+
     await act(async () => recorderProps().onInteractionLockChange?.(true));
     expect(screen.queryByText(WAIT_MESSAGE)).toBeNull();
   });
@@ -2288,6 +2403,9 @@ describe('inline rate-limit notice', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
+    expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
 
     await act(async () => recorderProps().onInteractionLockChange?.(true));
@@ -2342,6 +2460,20 @@ describe('level-up celebration', () => {
     expect(rocket.props.accessibilityElementsHidden).toBe(true);
     expect(rocket.props.importantForAccessibility).toBe('no-hide-descendants');
     expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledWith('success');
+    expect(flattenedStyle(screen.getByRole('header', { name: t('levelUp.title') }))).toEqual({
+      marginTop: spacing.md,
+      fontSize: 24,
+      fontWeight: '800',
+      textAlign: 'center',
+      color: colors.success,
+    });
+    expect(flattenedStyle(screen.getByText(t('levelUp.body', { level: 'B2' })))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 20,
+      fontWeight: '800',
+      color: colors.primary,
+      textAlign: 'center',
+    });
   });
 
   it('applies the new level before continuing to the next question', async () => {
@@ -2411,5 +2543,1199 @@ describe('home stats freshness', () => {
 
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
     expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['practice-history'] });
+  });
+});
+
+describe('practice explainer across accounts', () => {
+  const OTHER_USER: User = {
+    ...USER,
+    id: '550e8400-e29b-41d4-a716-4466554400aa',
+    name: 'Grace Hopper',
+  };
+
+  function seedQuestionFor(user: User) {
+    const client = makeQueryClient();
+    client.setQueryData(['practice-question', user.id, user.cefrLevel], PRACTICE_QUESTION);
+    return client;
+  }
+
+  it('re-reads the stored flag for a new account and never shows one learner the other’s card', async () => {
+    // The first learner has not seen the explainer; the second learner's read
+    // never settles, so anything on screen for them came from stale state.
+    mockPracticeIntro.hasSeenPracticeIntro
+      .mockResolvedValueOnce(false)
+      .mockReturnValueOnce(new Promise<boolean>(() => undefined));
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(
+      <PracticeScreen />,
+      seedQuestionFor(OTHER_USER),
+    );
+    expect(await screen.findByText(t('practiceIntro.title'))).toBeTruthy();
+
+    mockAuthValue = makeAuth({ user: OTHER_USER });
+    await act(async () => {
+      await rerenderScreen(<PracticeScreen />);
+    });
+
+    expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(mockPracticeIntro.hasSeenPracticeIntro).toHaveBeenLastCalledWith(OTHER_USER.id);
+    expect(screen.queryByText(t('practiceIntro.title'))).toBeNull();
+  });
+
+  it('ignores an explainer read that lands after the learner switched accounts', async () => {
+    let settleFirstRead: ((seen: boolean) => void) | undefined;
+    mockPracticeIntro.hasSeenPracticeIntro
+      .mockReturnValueOnce(
+        new Promise<boolean>((resolve) => {
+          settleFirstRead = resolve;
+        }),
+      )
+      .mockResolvedValueOnce(false);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(
+      <PracticeScreen />,
+      seedQuestionFor(OTHER_USER),
+    );
+    await screen.findByText('Describe a time you showed courage.');
+
+    mockAuthValue = makeAuth({ user: OTHER_USER });
+    await act(async () => {
+      await rerenderScreen(<PracticeScreen />);
+    });
+    expect(await screen.findByText(t('practiceIntro.title'))).toBeTruthy();
+
+    // The first account's read finally resolves with the opposite answer: it
+    // belongs to a learner who is no longer here and must be dropped.
+    await act(async () => {
+      settleFirstRead?.(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText(t('practiceIntro.title'))).toBeTruthy();
+  });
+});
+
+describe('skip word busy state', () => {
+  it('reports the skip as busy until it settles, then hands the control back', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockResolvedValueOnce(NEXT_PRACTICE_QUESTION);
+    let settleSkip: (() => void) | undefined;
+    mockSkipWord.mockReturnValue(
+      new Promise<void>((resolve) => {
+        settleSkip = () => resolve();
+      }),
+    );
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const skip = () => screen.getByRole('button', { name: t('practice.skipWord') });
+
+    expect(skip().props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(flattenedStyle(skip()).opacity).toBeUndefined();
+
+    await fireEvent.press(skip());
+    expect(skip().props.accessibilityState).toEqual({ disabled: true, busy: true });
+    expect(flattenedStyle(skip())).toMatchObject({ opacity: 0.5 });
+
+    await act(async () => {
+      settleSkip?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await waitFor(() =>
+      expect(skip().props.accessibilityState).toEqual({ disabled: false, busy: false }),
+    );
+    expect(flattenedStyle(skip()).opacity).toBeUndefined();
+  });
+
+  it('hands the control back after a failed skip and uses the skip fallback copy', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockRejectedValue(new Error('private network detail'));
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(alertSpy).toHaveBeenCalledWith(t('practice.skipFailedTitle'), t('practice.skipFailed'));
+    expect(
+      screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+  });
+});
+
+describe('practice home presentation', () => {
+  async function renderLoadedHome(payload: PracticeQuestionPayload = PRACTICE_QUESTION) {
+    mockApiFetch.mockResolvedValue(payload);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(payload.question.questionText);
+  }
+
+  const CARD_LABEL = {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: spacing.md,
+  };
+
+  const CENTERED_STATE = {
+    flex: 1,
+    minHeight: 320,
+    alignItems: 'center',
+    justifyContent: 'center',
+  };
+
+  const MUTED_BODY = {
+    marginTop: spacing.md,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  it('lays the screen out on the shared page tokens', async () => {
+    await renderLoadedHome();
+
+    expect(screenContainerStyle()).toEqual({ flex: 1, backgroundColor: colors.background });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      padding: layout.screenPadding,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name })))).toEqual({
+      fontSize: 15,
+      color: colors.muted,
+      marginBottom: spacing.md,
+    });
+    // The recorder gets a reserved, vertically centred slot so the layout does
+    // not jump between its idle, recording, and uploading heights.
+    expect(recorderAreaStyle()).toEqual({ minHeight: 330, justifyContent: 'center' });
+  });
+
+  it('renders the question card, its labels, and the progress lines from the tokens', async () => {
+    await renderLoadedHome();
+
+    const promptWord = screen.getByText('courage');
+    expect(flattenedStyle(promptWord)).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 30,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(promptWord))).toEqual({
+      marginTop: spacing.sm,
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(screen.getByText(QUESTION.questionText))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 18,
+      lineHeight: 26,
+      color: colors.text,
+    });
+    // Both halves of the card are named for the learner.
+    expect(flattenedStyle(screen.getByText(t('label.word')))).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText(t('cefr.B1')))).toEqual({
+      fontSize: 13,
+      color: colors.muted,
+      marginBottom: spacing.xs,
+    });
+    expect(
+      flattenedStyle(
+        screen.getByText(
+          t('practice.progressLine', { mastered: 2, total: 8 }) +
+            t('practice.progressLearning', { count: 1 }),
+        ),
+      ),
+    ).toEqual({ fontSize: 13, color: colors.muted, marginBottom: spacing.xs });
+  });
+
+  it('tints the badge row for a brand-new word', async () => {
+    await renderLoadedHome();
+
+    const levelBadgeText = screen.getByText('B1');
+    expect(flattenedStyle(levelBadgeText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(levelBadgeText))).toEqual({
+      alignSelf: 'flex-start',
+      backgroundColor: colors.primaryLight,
+      borderRadius: radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+      marginBottom: spacing.xs,
+    });
+    expect(flattenedStyle(parentOf(parentOf(levelBadgeText)))).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
+      marginBottom: spacing.xs,
+    });
+
+    const newBadgeText = screen.getByText(t('practice.newWord'));
+    expect(flattenedStyle(newBadgeText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.onSuccess,
+    });
+    expect(flattenedStyle(parentOf(newBadgeText))).toEqual({
+      backgroundColor: colors.success,
+      borderRadius: radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+    });
+  });
+
+  it('swaps the badge to the warning palette for a word under review', async () => {
+    await renderLoadedHome({
+      question: QUESTION,
+      kind: 'revision',
+      progress: { masteredCount: 4, learningCount: 0, totalAtLevel: 12 },
+    });
+
+    const revisionText = screen.getByText(t('practice.revision'));
+    expect(flattenedStyle(revisionText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.onWarning,
+    });
+    expect(flattenedStyle(parentOf(revisionText))).toEqual({
+      backgroundColor: colors.warning,
+      borderRadius: radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+    });
+  });
+
+  it('renders the attempt chip in the primary chip palette', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      attemptStatus: { questionId: QUESTION.id, attemptsLeft: 2 },
+    });
+    await renderLoadedHome();
+
+    const chipText = screen.getByText(
+      t('practice.attemptChip', { current: 2, max: PRACTICE_MAX_ATTEMPTS }),
+    );
+    expect(flattenedStyle(chipText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(chipText))).toEqual({
+      backgroundColor: colors.primaryLight,
+      borderRadius: radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+    });
+  });
+
+  it('renders the first-visit explainer as a primary-tinted card', async () => {
+    mockPracticeIntro.hasSeenPracticeIntro.mockResolvedValue(false);
+    await renderLoadedHome();
+
+    const title = await screen.findByText(t('practiceIntro.title'));
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 17,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      marginBottom: spacing.md,
+      backgroundColor: colors.primaryLight,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.primary,
+    });
+    expect(flattenedStyle(screen.getByText(t('practiceIntro.silence')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.text,
+    });
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('practiceIntro.dismiss') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('renders the help affordance as an elevated primary circle', async () => {
+    await renderLoadedHome();
+
+    expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel')))).toEqual({
+      alignSelf: 'flex-end',
+      width: layout.minimumTarget,
+      height: layout.minimumTarget,
+      borderRadius: radii.pill,
+      backgroundColor: colors.primary,
+      alignItems: 'center',
+      justifyContent: 'center',
+      shadowColor: colors.shadow,
+      shadowOpacity: 0.15,
+      shadowRadius: 6,
+      shadowOffset: { width: 0, height: 3 },
+      elevation: 4,
+    });
+    expect(flattenedStyle(screen.getByText('?'))).toEqual({
+      color: colors.onPrimary,
+      fontSize: 20,
+      fontWeight: '800',
+    });
+  });
+
+  it('deepens the help-button shadow in the dark palette', async () => {
+    asMock(useColorScheme).mockReturnValue('dark');
+    await renderLoadedHome();
+
+    // A 0.15 shadow disappears on a dark surface; dark mode raises it.
+    expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel')))).toMatchObject({
+      backgroundColor: darkColors.primary,
+      shadowColor: darkColors.shadow,
+      shadowOpacity: 0.4,
+    });
+    expect(screenContainerStyle()).toMatchObject({ backgroundColor: darkColors.background });
+  });
+
+  it('keeps each badge ink paired with its own fill in the dark palette', async () => {
+    // The light palette paints every on-fill ink white, so only the dark
+    // palette can show whether the review badge really takes its own ink.
+    expect(darkColors.onSuccess).not.toBe(darkColors.onWarning);
+    asMock(useColorScheme).mockReturnValue('dark');
+    await renderLoadedHome();
+
+    const newBadgeText = screen.getByText(t('practice.newWord'));
+    expect(flattenedStyle(newBadgeText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: darkColors.onSuccess,
+    });
+    expect(flattenedStyle(parentOf(newBadgeText))).toMatchObject({
+      backgroundColor: darkColors.success,
+    });
+
+    mockApiFetch.mockReset();
+    mockApiFetch.mockResolvedValue({
+      question: QUESTION,
+      kind: 'revision',
+      progress: { masteredCount: 4, learningCount: 0, totalAtLevel: 12 },
+    });
+    await renderScreen(<PracticeScreen />);
+    const revisionText = await screen.findByText(t('practice.revision'));
+    expect(flattenedStyle(revisionText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: darkColors.onWarning,
+    });
+    expect(flattenedStyle(parentOf(revisionText))).toMatchObject({
+      backgroundColor: darkColors.warning,
+    });
+  });
+
+  it('keeps the switch, skip, and footer controls on the token scale', async () => {
+    await renderLoadedHome();
+
+    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
+    expect(flattenedStyle(toggle)).toEqual({
+      alignSelf: 'center',
+      marginTop: spacing.md,
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingVertical: spacing.sm,
+      paddingHorizontal: spacing.ml,
+      borderRadius: radii.pill,
+      borderWidth: 1,
+      borderColor: colors.primary,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.answerInMyLanguage')))).toEqual({
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.primary,
+    });
+
+    expect(flattenedStyle(screen.getByRole('button', { name: t('practice.skipWord') }))).toEqual({
+      alignSelf: 'center',
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingHorizontal: spacing.ml,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.skipWord')))).toEqual({
+      fontSize: 14,
+      color: colors.muted,
+      textDecorationLine: 'underline',
+    });
+
+    const settings = screen.getByRole('button', { name: t('practice.settings') });
+    expect(flattenedStyle(settings)).toEqual({
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingHorizontal: spacing.ml,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.settings')))).toEqual({
+      fontSize: 14,
+      color: colors.muted,
+      textDecorationLine: 'underline',
+    });
+    expect(flattenedStyle(parentOf(settings))).toEqual({
+      minHeight: 56,
+      flexDirection: 'row',
+      justifyContent: 'center',
+      gap: spacing.xl,
+      paddingTop: spacing.xs,
+      paddingHorizontal: spacing.ml,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      backgroundColor: colors.card,
+      paddingBottom: 10,
+    });
+  });
+
+  it('explains every locked control while the recorder holds a take', async () => {
+    await renderLoadedHome();
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+
+    const hint = t('hint.finishRecordingFirst');
+    expect(screen.getByLabelText(t('practice.helpLabel')).props.accessibilityHint).toBe(hint);
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityHint,
+    ).toBe(hint);
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
+    ).toBe(hint);
+    expect(screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint).toBe(
+      hint,
+    );
+    expect(
+      flattenedStyle(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') })),
+    ).toMatchObject({ opacity: 0.5 });
+
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    expect(screen.getByLabelText(t('practice.helpLabel')).props.accessibilityHint).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      flattenedStyle(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }))
+        .opacity,
+    ).toBeUndefined();
+  });
+
+  it('centres the loading state and labels its spinner', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<PracticeScreen />);
+
+    const loading = screen.getByText(t('practice.loadingQuestion'));
+    expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
+    expect(screen.getByLabelText(t('practice.loadingQuestion'))).toBeTruthy();
+  });
+
+  it('centres the load failure and spaces its retry action', async () => {
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<PracticeScreen />);
+
+    const title = await screen.findByRole('header', { name: t('practice.loadFailedTitle') });
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(title))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('renders the inline wait notice as a danger-tinted card', async () => {
+    await renderLoadedHome();
+    const wait = `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`;
+    await act(async () => recorderProps().onRateLimited?.(wait));
+
+    const notice = screen.getByRole('alert');
+    expect(flattenedStyle(notice)).toEqual({
+      color: colors.danger,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(parentOf(notice))).toEqual({
+      marginTop: spacing.md,
+      backgroundColor: colors.dangerLight,
+      borderColor: colors.danger,
+      borderWidth: 1,
+      borderRadius: radii.input,
+      padding: spacing.md,
+    });
+  });
+});
+
+describe('practice attempt presentation', () => {
+  async function renderLoadedAttempt() {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+  }
+
+  const CENTERED_STATE = {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+    backgroundColor: colors.background,
+  };
+
+  const MUTED_BODY = {
+    marginTop: spacing.md,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  it('lays Practice Mode out on the shared page tokens', async () => {
+    await renderLoadedAttempt();
+
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      padding: layout.screenPadding,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+      backgroundColor: colors.background,
+    });
+    // Practice Mode gives the recorder the rest of the screen instead of a
+    // fixed slot: there is nothing below it to protect from reflow.
+    expect(recorderAreaStyle()).toEqual({ flex: 1, justifyContent: 'center' });
+  });
+
+  it('renders the stripped-back question card from the tokens', async () => {
+    await renderLoadedAttempt();
+
+    const promptWord = screen.getByText('courage');
+    expect(flattenedStyle(promptWord)).toEqual({
+      fontSize: 30,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(promptWord))).toEqual({
+      marginTop: spacing.sm,
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(screen.getByText(QUESTION.questionText))).toEqual({
+      marginTop: 10,
+      fontSize: 18,
+      lineHeight: 26,
+      color: colors.text,
+    });
+  });
+
+  it('renders the attempt chip above the word', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      attemptStatus: { questionId: QUESTION.id, attemptsLeft: 2 },
+    });
+    await renderLoadedAttempt();
+
+    const chipText = screen.getByText(
+      t('practice.attemptChip', { current: 2, max: PRACTICE_MAX_ATTEMPTS }),
+    );
+    expect(flattenedStyle(chipText)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(chipText))).toEqual({
+      alignSelf: 'flex-start',
+      backgroundColor: colors.primaryLight,
+      borderRadius: radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+      marginBottom: spacing.xs,
+    });
+  });
+
+  it('keeps the language switch on the token scale and tints it when pressed', async () => {
+    await renderLoadedAttempt();
+
+    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
+    expect(flattenedStyle(toggle)).toEqual({
+      alignSelf: 'center',
+      marginTop: spacing.ml,
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingVertical: spacing.sm,
+      paddingHorizontal: spacing.ml,
+      borderRadius: radii.pill,
+      borderWidth: 1,
+      borderColor: colors.primary,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.answerInMyLanguage')))).toEqual({
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.primary,
+    });
+    await expectPressFeedback(
+      () => screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
+      { borderColor: colors.primary },
+      { backgroundColor: colors.primaryLight },
+    );
+  });
+
+  it('centres the loading, failure, and broken-link states', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<AttemptScreen />);
+
+    const loading = screen.getByText(t('attempt.loading'));
+    expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
+
+    mockApiFetch.mockReset();
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<AttemptScreen />);
+
+    const failureTitle = await screen.findByRole('header', {
+      name: t('attempt.loadFailedTitle'),
+    });
+    expect(flattenedStyle(failureTitle)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(failureTitle))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+
+    mockSearchParams = { questionId: 'not-a-uuid' };
+    await renderScreen(<AttemptScreen />);
+
+    const brokenLinkTitle = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
+    expect(flattenedStyle(parentOf(brokenLinkTitle))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('attempt.invalidLinkBody')))).toEqual(MUTED_BODY);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('renders the inline wait notice as a danger-tinted card', async () => {
+    await renderLoadedAttempt();
+    const wait = `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`;
+    await act(async () => recorderProps().onRateLimited?.(wait));
+
+    const notice = screen.getByRole('alert');
+    expect(flattenedStyle(notice)).toEqual({
+      color: colors.danger,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(parentOf(notice))).toEqual({
+      marginTop: spacing.md,
+      backgroundColor: colors.dangerLight,
+      borderColor: colors.danger,
+      borderWidth: 1,
+      borderRadius: radii.input,
+      padding: spacing.md,
+    });
+  });
+});
+
+describe('practice help presentation', () => {
+  async function renderLoadedHelp() {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<HelpScreen />);
+    await screen.findByText(t('label.word'));
+  }
+
+  const CENTERED_STATE = {
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+  };
+
+  const MUTED_BODY = {
+    marginTop: spacing.md,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  it('lays the help sheet out on the shared page tokens', async () => {
+    await renderLoadedHelp();
+
+    expect(screenContainerStyle()).toEqual({ flex: 1, backgroundColor: colors.background });
+    expect(scrollContentStyle()).toEqual({
+      padding: layout.screenPadding,
+      paddingBottom: spacing.xxl,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(
+      flattenedStyle(parentOf(screen.getByRole('button', { name: t('help.startPractice') }))),
+    ).toEqual({
+      padding: spacing.ml,
+      backgroundColor: colors.card,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      paddingBottom: 16,
+    });
+  });
+
+  it('renders each section as a card with a label, English, and native text', async () => {
+    await renderLoadedHelp();
+
+    const sectionLabel = screen.getByText(t('label.word'));
+    expect(flattenedStyle(sectionLabel)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.muted,
+      textTransform: 'uppercase',
+      letterSpacing: 0.8,
+      marginBottom: spacing.sm,
+    });
+    expect(flattenedStyle(parentOf(sectionLabel))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginBottom: 14,
+    });
+    expect(flattenedStyle(screen.getByText('courage'))).toEqual({
+      fontSize: 28,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(screen.getByText('Describe a time you showed courage.'))).toEqual({
+      fontSize: 17,
+      lineHeight: 24,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText('ధైర్యం'))).toEqual({
+      marginTop: 6,
+      fontSize: 16,
+      lineHeight: 23,
+      color: colors.muted,
+    });
+  });
+
+  it('separates each example with a rule and a numbered accent line', async () => {
+    await renderLoadedHelp();
+
+    const exampleNumber = screen.getByText(t('help.exampleNumber', { number: 1 }));
+    expect(flattenedStyle(exampleNumber)).toEqual({
+      fontSize: 13,
+      fontWeight: '700',
+      color: colors.primary,
+      marginBottom: spacing.xs,
+    });
+    expect(flattenedStyle(parentOf(exampleNumber))).toEqual({
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      paddingTop: spacing.md,
+      marginTop: spacing.md,
+    });
+  });
+
+  it('centres the loading, failure, and broken-link states', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<HelpScreen />);
+
+    const loading = screen.getByText(t('help.loading'));
+    expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
+
+    mockApiFetch.mockReset();
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<HelpScreen />);
+
+    const failureTitle = await screen.findByRole('header', { name: t('help.loadFailedTitle') });
+    expect(flattenedStyle(failureTitle)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(failureTitle))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+
+    mockSearchParams = { questionId: 'not-a-uuid' };
+    await renderScreen(<HelpScreen />);
+
+    const brokenLinkTitle = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
+    expect(flattenedStyle(parentOf(brokenLinkTitle))).toEqual(CENTERED_STATE);
+    expect(flattenedStyle(screen.getByText(t('help.invalidLinkBody')))).toEqual(MUTED_BODY);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
+    ).toMatchObject({ marginTop: spacing.lg });
+  });
+});
+
+describe('feedback outcome wiring', () => {
+  const NATIVE_RESULT: NativeAttemptResult = {
+    mode: 'native',
+    understood: true,
+    transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    modelAnswer: 'She showed courage at work.',
+    feedback: 'You understood the question.',
+  };
+
+  const NO_SPEECH_RESULT: AttemptResult = {
+    passed: false,
+    mastered: false,
+    noSpeech: true,
+    attemptNo: 1,
+    attemptsLeft: 3,
+    score: 0,
+    transcript: '',
+    feedback: 'We could not detect any speech.',
+  };
+
+  it.each([
+    ['hi', 'hi-IN'],
+    ['es', 'es-ES'],
+    ['zh', 'zh-Hans'],
+  ] as const)('reads a %s learner’s own answer back in their language', async (language, tag) => {
+    mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: language } });
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: NATIVE_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText('“ఆమె పనిలో ధైర్యం చూపింది.”').props.accessibilityLanguage).toBe(tag);
+  });
+
+  it('reads an English answer back as English, whatever the learner speaks', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    // USER speaks Telugu, but this transcript is the learner's English.
+    expect(screen.getByText('“I enjoy reading.”').props.accessibilityLanguage).toBe('en-US');
+  });
+
+  it('never celebrates a promotion that arrives with a failed attempt', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          passed: false,
+          mastered: false,
+          attemptNo: 3,
+          attemptsLeft: 0,
+          score: 30,
+          transcript: 'last try',
+          feedback: 'Regular feedback.',
+          levelUp: { from: 'B1', to: 'B2' },
+        },
+      },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText(t('feedback.finalTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('levelUp.title'))).toBeNull();
+    expect(screen.queryByText(t('levelUp.body', { level: 'B2' }))).toBeNull();
+    expect(screen.queryByText(t('levelUp.progress', { from: 'B1', to: 'B2' }))).toBeNull();
+  });
+
+  it('keeps the model English answer hidden when the native answer was silence', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          mode: 'native',
+          understood: false,
+          transcript: '',
+          modelAnswer: 'She showed courage at work.',
+          feedback: 'We could not detect any speech.',
+        },
+      },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    // Nothing was said, so there is nothing to translate back: showing the
+    // answer here would hand it over for free.
+    expect(screen.getByText(t('feedback.noSpeechTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('feedback.sayInEnglish'))).toBeNull();
+    expect(screen.queryByText('She showed courage at work.')).toBeNull();
+  });
+
+  it('does not open help for a card that has no question behind it', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: '', result: NO_SPEECH_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.seeHelp') }));
+
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+  });
+
+  it('celebrates the outcome the card is showing now, not the one it mounted with', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          passed: false,
+          mastered: false,
+          attemptNo: 1,
+          attemptsLeft: 2,
+          score: 40,
+          transcript: 'I tried.',
+          feedback: 'Keep going.',
+        },
+      },
+    });
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    expect(jest.mocked(Haptics.notificationAsync)).not.toHaveBeenCalled();
+
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: { ...PASSED_RESULT, mastered: true, score: 88 },
+      },
+    });
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+
+    expect(screen.getByText(t('feedback.masteredTitle'))).toBeTruthy();
+    expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledWith('success');
+  });
+
+  it('marks home stats stale when a scored outcome replaces a native one', async () => {
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: NATIVE_RESULT },
+    });
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />, queryClient);
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
+
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['practice-history'] });
+  });
+});
+
+describe('practice feedback presentation', () => {
+  const SUBTITLE = {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  it('lays the feedback card out on the shared page tokens', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screenContainerStyle()).toEqual({ flex: 1, backgroundColor: colors.background });
+    expect(scrollContentStyle()).toEqual({
+      padding: spacing.xl,
+      alignItems: 'center',
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+
+    const header = screen.getByRole('header', { name: t('feedback.passedTitle') });
+    expect(flattenedStyle(header)).toEqual({
+      marginTop: spacing.md,
+      fontSize: 24,
+      fontWeight: '800',
+      textAlign: 'center',
+      color: colors.success,
+    });
+    expect(flattenedStyle(parentOf(header))).toEqual({
+      alignSelf: 'stretch',
+      alignItems: 'center',
+    });
+    expect(flattenedStyle(screen.getByText('🎉', { includeHiddenElements: true }))).toEqual({
+      fontSize: 52,
+      marginTop: spacing.md,
+    });
+    expect(
+      flattenedStyle(screen.getByText(t('feedback.passedBody', { score: PRACTICE_MASTER_SCORE }))),
+    ).toEqual(SUBTITLE);
+    expect(flattenedStyle(screen.getByText(t('feedback.scoreLine', { score: 72 })))).toEqual({
+      marginTop: spacing.ml,
+      fontSize: 28,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(
+      flattenedStyle(
+        screen.getByText(
+          t('feedback.scoreMeaning', {
+            pass: PRACTICE_PASS_SCORE,
+            master: PRACTICE_MASTER_SCORE,
+          }),
+        ),
+      ),
+    ).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 13,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+  });
+
+  it('renders the transcript and feedback card from the tokens', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    const cardLabel = screen.getByText(t('feedback.weHeard'));
+    expect(flattenedStyle(cardLabel)).toEqual({
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.muted,
+      textTransform: 'uppercase',
+      letterSpacing: 0.8,
+      marginTop: 14,
+    });
+    expect(flattenedStyle(parentOf(cardLabel))).toEqual({
+      marginTop: spacing.xl,
+      alignSelf: 'stretch',
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    // The learner's own words are set apart in italics.
+    expect(flattenedStyle(screen.getByText('“I enjoy reading.”'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      fontStyle: 'italic',
+      lineHeight: 23,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText('Nice work.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      lineHeight: 24,
+      color: colors.text,
+    });
+    expect(
+      flattenedStyle(parentOf(screen.getByRole('button', { name: t('feedback.nextQuestion') }))),
+    ).toEqual({
+      padding: spacing.ml,
+      backgroundColor: colors.card,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      paddingBottom: 16,
+    });
+  });
+
+  it('accents the model English answer under the native verdict', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          mode: 'native',
+          understood: true,
+          transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+          modelAnswer: 'She showed courage at work.',
+          feedback: 'You understood the question.',
+        },
+      },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(flattenedStyle(screen.getByText('She showed courage at work.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      lineHeight: 24,
+      color: colors.primary,
+      fontWeight: '600',
+    });
+    expect(flattenedStyle(screen.getByText(t('feedback.nativeUnderstoodBody')))).toEqual(SUBTITLE);
+  });
+
+  it('stacks the two silence actions in a spaced column', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: {
+        questionId: QUESTION.id,
+        result: {
+          passed: false,
+          mastered: false,
+          noSpeech: true,
+          attemptNo: 1,
+          attemptsLeft: 3,
+          score: 0,
+          transcript: '',
+          feedback: 'We could not detect any speech.',
+        },
+      },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    const column = parentOf(screen.getByRole('button', { name: t('common.tryAgain') }));
+    expect(flattenedStyle(column)).toEqual({ gap: 10 });
+    expect(flattenedStyle(parentOf(column))).toEqual({
+      padding: spacing.ml,
+      backgroundColor: colors.card,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      paddingBottom: 16,
+    });
+  });
+
+  it('centres the empty-feedback state and spaces its way out', async () => {
+    await renderScreen(<FeedbackScreen />);
+
+    const title = screen.getByRole('header', { name: t('feedback.noResultTitle') });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(screen.getByText(t('feedback.noResultBody')))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      lineHeight: 24,
+      color: colors.text,
+    });
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
+    ).toMatchObject({ marginTop: spacing.lg });
   });
 });

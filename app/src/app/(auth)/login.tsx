@@ -53,7 +53,10 @@ export default function LoginScreen() {
     };
   }, []);
 
-  const passwordError = password.length > 0 ? comparablePasswordError(password) : null;
+  // No length guard: unlike signup's policy check, comparablePasswordError only
+  // reports the 72-byte bcrypt ceiling, so it already returns null for an empty
+  // password. Guarding it was dead code.
+  const passwordError = comparablePasswordError(password);
   const canSubmit =
     email.trim().length > 0 &&
     email.trim().length <= MAX_EMAIL_LENGTH &&

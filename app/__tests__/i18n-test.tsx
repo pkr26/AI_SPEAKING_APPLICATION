@@ -19,7 +19,12 @@ import {
   type UiLanguage,
 } from '../src/lib/i18n';
 
-const EN_KEYS = Object.keys(dictionaries.en).sort();
+// Resolved per test rather than at module load: a catalog broken badly enough
+// that `dictionaries.en` is missing must fail a test, not crash the file before
+// jest can attribute the failure to anything.
+function enKeys(): string[] {
+  return Object.keys(dictionaries.en).sort();
+}
 
 function placeholderNames(template: string): string[] {
   return [...new Set([...template.matchAll(/\{(\w+)\}/g)].map((match) => match[1]))].sort();
@@ -39,7 +44,7 @@ describe('catalog completeness', () => {
   it.each(SUPPORTED_UI_LANGUAGES.map((language) => [language]))(
     '%s has no missing and no extra keys',
     (language) => {
-      expect(Object.keys(dictionaries[language]).sort()).toEqual(EN_KEYS);
+      expect(Object.keys(dictionaries[language]).sort()).toEqual(enKeys());
     },
   );
 
@@ -55,7 +60,7 @@ describe('catalog completeness', () => {
   it.each(SUPPORTED_UI_LANGUAGES.map((language) => [language]))(
     '%s keeps every {placeholder} of the English source',
     (language) => {
-      for (const key of EN_KEYS as MessageKey[]) {
+      for (const key of enKeys() as MessageKey[]) {
         expect({ key, placeholders: placeholderNames(dictionaries[language][key]) }).toEqual({
           key,
           placeholders: placeholderNames(dictionaries.en[key]),
@@ -170,18 +175,80 @@ describe('languageForLocale', () => {
     ['fr-FR', 'en'],
     ['', 'en'],
     ['tel', 'en'],
+    // Padded tags reach us from OS locale APIs; they must still match.
+    ['  es  ', 'es'],
+    ['\thi-IN\n', 'hi'],
   ] as [string, UiLanguage][])('maps %s to %s', (locale, expected) => {
     expect(languageForLocale(locale)).toBe(expected);
   });
 });
 
 describe('deviceLanguage', () => {
+  const realDateTimeFormat = Intl.DateTimeFormat;
+
+  afterEach(() => {
+    Intl.DateTimeFormat = realDateTimeFormat;
+  });
+
+  /**
+   * `deviceLanguage` memoises into module state, so each case needs its own
+   * copy of the module. `resolvedOptions` is stubbed rather than the whole
+   * Intl object so the rest of the module behaves normally.
+   */
+  function deviceLanguageWith(
+    resolvedOptions: () => { locale?: unknown },
+  ): typeof import('../src/lib/i18n') {
+    Intl.DateTimeFormat = (() => ({ resolvedOptions })) as unknown as typeof Intl.DateTimeFormat;
+    let isolated: typeof import('../src/lib/i18n') | undefined;
+    jest.isolateModules(() => {
+      isolated = jest.requireActual('../src/lib/i18n');
+    });
+    if (!isolated) throw new Error('Failed to load an isolated i18n module');
+    return isolated;
+  }
+
   it('maps the jest locale to a supported language and caches it', () => {
     const first = deviceLanguage();
     expect(SUPPORTED_UI_LANGUAGES).toContain(first);
     expect(deviceLanguage()).toBe(first);
     // Under jest the Intl locale is an English variant.
     expect(first).toBe('en');
+  });
+
+  it('maps a non-English device locale onto its supported language', () => {
+    const isolated = deviceLanguageWith(() => ({ locale: 'es-ES' }));
+    expect(isolated.deviceLanguage()).toBe('es');
+  });
+
+  it('answers from the cache instead of re-reading the locale', () => {
+    const isolated = deviceLanguageWith(() => ({ locale: 'es-ES' }));
+    expect(isolated.deviceLanguage()).toBe('es');
+
+    // The OS locale changes underneath us; the memoised answer must win.
+    Intl.DateTimeFormat = (() => ({
+      resolvedOptions: () => ({ locale: 'hi-IN' }),
+    })) as unknown as typeof Intl.DateTimeFormat;
+    expect(isolated.deviceLanguage()).toBe('es');
+  });
+
+  it('falls back to English when the platform reports a non-string locale', () => {
+    const isolated = deviceLanguageWith(() => ({ locale: 42 }));
+    expect(isolated.deviceLanguage()).toBe('en');
+  });
+
+  it('ignores a locale that only looks like a string', () => {
+    // A boxed String (what some Intl polyfills hand back) has working trim and
+    // toLowerCase, so it would map to a language if the typeof guard were
+    // dropped. The guard exists to keep detection on real primitives.
+    const isolated = deviceLanguageWith(() => ({ locale: Object('es-ES') }));
+    expect(isolated.deviceLanguage()).toBe('en');
+  });
+
+  it('falls back to English when reading the locale throws', () => {
+    const isolated = deviceLanguageWith(() => {
+      throw new Error('no locale information on this platform');
+    });
+    expect(isolated.deviceLanguage()).toBe('en');
   });
 });
 

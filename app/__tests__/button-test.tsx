@@ -30,6 +30,9 @@ describe('shared Button', () => {
       backgroundColor: colors.primary,
       borderRadius: radii.button,
       minHeight: layout.minimumTarget,
+      // Spinner and label sit on one row, gap apart, centred on both axes.
+      flexDirection: 'row',
+      gap: spacing.sm,
       alignItems: 'center',
       justifyContent: 'center',
       paddingVertical: spacing.md,
@@ -39,6 +42,8 @@ describe('shared Button', () => {
       color: colors.onPrimary,
       fontSize: 17,
       fontWeight: '600',
+      // Labels stay centred when a caller stretches the button.
+      textAlign: 'center',
     });
 
     await fireEvent(button('Continue'), 'responderGrant', responderEvent());

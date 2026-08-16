@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen } from '@testing-library/react-native';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
@@ -7,14 +7,18 @@ import type { TestInstance } from 'test-renderer';
 import HomeScreen from '../src/app/home';
 import { apiGetPracticeStats, ApiError } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
-import { translateFor, type MessageKey } from '../src/lib/i18n';
+import { I18nProvider, setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
-import { colors } from '../src/lib/theme';
+import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { PracticeStats, User } from '../src/lib/types';
 
 // Under jest no I18nProvider is mounted, so the screen falls back to English.
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
+
+/** The same copy as a Telugu account sees it. */
+const te = (key: MessageKey, params?: Record<string, string | number>) =>
+  translateFor('te', key, params);
 
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
@@ -133,8 +137,46 @@ function renderHome(queryClient?: QueryClient) {
   );
 }
 
-function flattenedStyle(node: TestInstance): Record<string, unknown> {
+/** Renders inside the real provider, so the screen translates like a te account. */
+function renderHomeInTelugu() {
+  return render(
+    <QueryClientProvider client={makeQueryClient()}>
+      <I18nProvider userLanguage="te">
+        <HomeScreen />
+      </I18nProvider>
+    </QueryClientProvider>,
+  );
+}
+
+type SemanticStyle = Record<string, unknown>;
+
+function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+/** The host view a text, chip, or row is laid out in. */
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
+/**
+ * ScrollView renders as the host `RCTScrollView`, which keeps
+ * `contentContainerStyle` as a prop instead of applying it to a child view.
+ */
+function scrollContentStyle(): SemanticStyle {
+  const [node] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
+  if (!node) throw new Error('No ScrollView rendered');
+  return StyleSheet.flatten(node.props.contentContainerStyle) ?? {};
+}
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
 }
 
 beforeEach(() => {
@@ -155,6 +197,9 @@ afterEach(async () => {
   });
   for (const client of queryClients) client.clear();
   queryClients.length = 0;
+  // Mounting the provider syncs the module-level language; every other test
+  // renders without one and must still fall back to English.
+  setActiveLanguage('en');
 });
 
 describe('home screen', () => {
@@ -182,6 +227,17 @@ describe('home screen', () => {
     expect(mockGetStats).toHaveBeenCalledTimes(2);
   });
 
+  it('shows the generic load-failure copy for a failure the API cannot classify', async () => {
+    mockGetStats.mockRejectedValue(new Error('socket hang up: 10.0.0.7:8443'));
+    await renderHome();
+
+    expect(await screen.findByText(t('home.loadFailed'))).toBeTruthy();
+    // Transport detail never reaches the learner, and the spinner is gone:
+    // the error state replaces the loading state rather than joining it.
+    expect(screen.queryByText(/socket hang up/)).toBeNull();
+    expect(screen.queryByText(t('home.loading'))).toBeNull();
+  });
+
   it('renders level, mastery progress, streak, due chip, and today line from stats', async () => {
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
@@ -207,6 +263,48 @@ describe('home screen', () => {
     expect(screen.getByText(t('home.dueChip', { count: 4 }))).toBeTruthy();
     expect(screen.queryByText(t('home.dueNone'))).toBeNull();
     expect(screen.getByText(t('home.practicedToday', { count: 3 }))).toBeTruthy();
+    // Loaded stats replace the loading state instead of rendering beside it.
+    expect(screen.queryByText(t('home.loading'))).toBeNull();
+  });
+
+  it('paints from the shared per-user stats cache entry without waiting for a fetch', async () => {
+    // Practice invalidates ['practice-stats'] after every attempt and Settings
+    // drops it on logout, so Home has to sit on exactly that entry, keyed by
+    // the signed-in user rather than shared across accounts.
+    const client = makeQueryClient();
+    client.setQueryData(['practice-stats', USER.id], STATS);
+    mockGetStats.mockReturnValue(new Promise(() => undefined));
+    await renderHome(client);
+
+    expect(screen.getByText('B1')).toBeTruthy();
+    expect(screen.getByText(t('home.dueChip', { count: 4 }))).toBeTruthy();
+    expect(screen.queryByText(t('home.loading'))).toBeNull();
+  });
+
+  it('shows the level from stats, not the account level it may have outgrown', async () => {
+    // A level-up mid-session leaves user.cefrLevel stale until the next
+    // profile read; the freshly fetched stats are the authority on screen.
+    mockGetStats.mockResolvedValue({ ...STATS, level: 'B2' });
+    await renderHome();
+
+    expect(await screen.findByText('B2')).toBeTruthy();
+    expect(screen.getByText(t('cefr.B2'))).toBeTruthy();
+    // 'B1' is the account's stale level; it must not reach the screen.
+    expect(screen.queryByText('B1')).toBeNull();
+  });
+
+  it('drops the revision suffix from the mastery line when nothing is in revision', async () => {
+    mockGetStats.mockResolvedValue({
+      ...STATS,
+      progress: { ...STATS.progress, learningCount: 0 },
+    });
+    await renderHome();
+
+    // Exact match: the line is the progress sentence and nothing else — no
+    // trailing " · 0 to review", and no placeholder text in its place.
+    expect(
+      await screen.findByText(t('practice.progressLine', { mastered: 3, total: 10 })),
+    ).toBeTruthy();
   });
 
   it('fills the mastery bar proportionally with the success token', async () => {
@@ -242,6 +340,17 @@ describe('home screen', () => {
 
     expect(await screen.findByText(t('home.streakOne'))).toBeTruthy();
     expect(screen.getByText(t('home.practicedOnceToday'))).toBeTruthy();
+  });
+
+  it('takes the singular streak branch in a language that inflects it', async () => {
+    // English collapses the two: "1 day streak" is also what the {count}
+    // template produces. Telugu marks the plural (రోజు vs రోజుల), so only a
+    // localized render can prove the one-day branch is the one taken.
+    mockGetStats.mockResolvedValue({ ...STATS, streakDays: 1 });
+    await renderHomeInTelugu();
+
+    expect(await screen.findByText(te('home.streakOne'))).toBeTruthy();
+    expect(screen.queryByText(te('home.streakMany', { count: 1 }))).toBeNull();
   });
 
   it('navigates to practice, history, and settings', async () => {
@@ -311,5 +420,244 @@ describe('home screen', () => {
 
     expect(mockGetStats).not.toHaveBeenCalled();
     expect(screen.queryByText(t('home.loading'))).toBeNull();
+  });
+});
+
+describe('home screen presentation', () => {
+  const CARD_LABEL = {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: spacing.md,
+  };
+
+  const CENTERED_STATE = {
+    flex: 1,
+    minHeight: 240,
+    alignItems: 'center',
+    justifyContent: 'center',
+  };
+
+  const MUTED_BODY = {
+    marginTop: spacing.md,
+    fontSize: 15,
+    color: colors.muted,
+    textAlign: 'center',
+  };
+
+  const SUMMARY_DISMISS = {
+    marginTop: spacing.md,
+    minHeight: layout.minimumTarget,
+    justifyContent: 'center',
+    alignSelf: 'flex-start',
+    paddingHorizontal: spacing.lg,
+    borderRadius: radii.input,
+    borderWidth: 1,
+    borderColor: colors.success,
+  };
+
+  async function renderLoadedHome(stats: PracticeStats = STATS) {
+    mockGetStats.mockResolvedValue(stats);
+    await renderHome();
+    await screen.findByText(t('home.masteryLabel'));
+  }
+
+  it('lays the screen out on the shared page tokens', async () => {
+    await renderLoadedHome();
+
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      padding: layout.screenPadding,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name })))).toEqual({
+      fontSize: 15,
+      color: colors.muted,
+      marginBottom: spacing.md,
+    });
+    // The CTA keeps its own gap from the card above it.
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
+    ).toMatchObject({ marginTop: spacing.xl });
+    // History and Settings sit side by side, centred, under the CTA.
+    expect(
+      flattenedStyle(parentOf(screen.getByRole('button', { name: t('header.history') }))),
+    ).toEqual({
+      marginTop: spacing.lg,
+      flexDirection: 'row',
+      justifyContent: 'center',
+      gap: spacing.xl,
+    });
+  });
+
+  it('centres the loading state and names the spinner for screen readers', async () => {
+    mockGetStats.mockReturnValue(new Promise(() => undefined));
+    await renderHome();
+
+    const spinner = screen.getByLabelText(t('home.loading'));
+    expect(spinner.props.size).toBe('large');
+    expect(spinner.props.color).toBe(colors.primary);
+
+    const message = screen.getByText(t('home.loading'));
+    expect(message.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(message)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(message))).toEqual(CENTERED_STATE);
+  });
+
+  it('centres the error state and its retry action', async () => {
+    mockGetStats.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderHome();
+
+    const title = await screen.findByRole('header', { name: t('home.loadFailedTitle') });
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+    });
+
+    const message = screen.getByText(t('error.serverBusy'));
+    expect(message.props.accessibilityLiveRegion).toBe('assertive');
+    expect(flattenedStyle(message)).toEqual(MUTED_BODY);
+    expect(flattenedStyle(parentOf(message))).toEqual(CENTERED_STATE);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({ marginTop: spacing.xl });
+  });
+
+  it('renders the stats card, its labels, and the due chip on the shared tokens', async () => {
+    await renderLoadedHome();
+
+    const levelLabel = screen.getByText(t('home.levelLabel'));
+    const masteryLabel = screen.getByText(t('home.masteryLabel'));
+    expect(flattenedStyle(levelLabel)).toEqual(CARD_LABEL);
+    expect(flattenedStyle(masteryLabel)).toEqual(CARD_LABEL);
+    // The mastery label sits directly in the card; the level label sits one
+    // level deeper, in the row that keeps the due chip on the opposite edge.
+    expect(flattenedStyle(parentOf(masteryLabel))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: layout.screenPadding,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(parentOf(parentOf(levelLabel)))).toEqual({
+      flexDirection: 'row',
+      justifyContent: 'space-between',
+      alignItems: 'flex-start',
+      gap: spacing.sm,
+    });
+
+    expect(flattenedStyle(screen.getByText('B1'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 30,
+      fontWeight: '800',
+      color: colors.primary,
+    });
+    expect(flattenedStyle(screen.getByText(t('cefr.B1')))).toEqual({
+      marginTop: 2,
+      fontSize: 13,
+      color: colors.muted,
+    });
+    expect(flattenedStyle(screen.getByText(t('home.dueChip', { count: 4 })))).toEqual({
+      fontSize: 13,
+      fontWeight: '700',
+      color: colors.primary,
+    });
+  });
+
+  it('renders the mastery bar, streak row, and today line on the shared tokens', async () => {
+    await renderLoadedHome();
+
+    const bar = screen.getByRole('progressbar', { name: t('home.masteryLabel') });
+    expect(flattenedStyle(bar)).toEqual({
+      marginTop: spacing.sm,
+      height: 12,
+      borderRadius: radii.pill,
+      backgroundColor: colors.border,
+      // The fill is clipped to the rounded track instead of overflowing it.
+      overflow: 'hidden',
+    });
+    // The fill spans the track's full height, so only its width reads as progress.
+    expect(flattenedStyle(bar.children[0] as TestInstance)).toEqual({
+      width: '30%',
+      height: '100%',
+      borderRadius: radii.pill,
+      backgroundColor: colors.success,
+    });
+
+    expect(
+      flattenedStyle(
+        screen.getByText(
+          t('practice.progressLine', { mastered: 3, total: 10 }) +
+            t('practice.progressLearning', { count: 2 }),
+        ),
+      ),
+    ).toEqual({ marginTop: spacing.sm, fontSize: 14, color: colors.text });
+
+    const flame = screen.getByText('🔥', { includeHiddenElements: true });
+    expect(flattenedStyle(flame)).toEqual({ fontSize: 22 });
+    expect(flattenedStyle(parentOf(flame))).toEqual({
+      marginTop: spacing.lg,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
+    });
+    expect(flattenedStyle(screen.getByText(t('home.streakMany', { count: 5 })))).toEqual({
+      fontSize: 16,
+      fontWeight: '700',
+      color: colors.text,
+      // A long streak line wraps beside the flame instead of pushing it out.
+      flexShrink: 1,
+    });
+    expect(flattenedStyle(screen.getByText(t('home.practicedToday', { count: 3 })))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 14,
+      color: colors.muted,
+    });
+  });
+
+  it('renders the session summary card and tints its dismiss control while pressed', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      sessionTally: { attempts: 5, passed: 3, mastered: 2, levelUps: 1 },
+    });
+    await renderLoadedHome();
+
+    const title = screen.getByText(t('summary.title'));
+    expect(flattenedStyle(title)).toEqual({ fontSize: 17, fontWeight: '700', color: colors.text });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      marginBottom: spacing.md,
+      backgroundColor: colors.successLight,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.success,
+    });
+    expect(flattenedStyle(screen.getByText(t('summary.attempts', { count: 5 })))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText(t('summary.dismiss')))).toEqual({
+      color: colors.success,
+      fontSize: 15,
+      fontWeight: '700',
+    });
+
+    const dismiss = () => screen.getByRole('button', { name: t('summary.dismiss') });
+    // At rest the dismiss control is an unfilled, touch-sized outline button.
+    expect(flattenedStyle(dismiss())).toEqual(SUMMARY_DISMISS);
+    await fireEvent(dismiss(), 'responderGrant', responderEvent());
+    expect(flattenedStyle(dismiss())).toEqual({
+      ...SUMMARY_DISMISS,
+      backgroundColor: colors.card,
+    });
+    await fireEvent(dismiss(), 'responderTerminate', responderEvent());
+    await waitFor(() => expect(flattenedStyle(dismiss()).backgroundColor).toBeUndefined());
   });
 });

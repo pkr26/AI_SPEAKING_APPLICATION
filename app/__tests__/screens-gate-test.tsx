@@ -7,7 +7,7 @@ import {
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { AppState, type AppStateStatus, StyleSheet, Text } from 'react-native';
+import { AppState, type AppStateStatus, StyleSheet, Text, useColorScheme } from 'react-native';
 import { router } from 'expo-router';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -18,8 +18,19 @@ import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { useAuth } from '../src/lib/auth';
 import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
-import { colors, layout } from '../src/lib/theme';
+import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
+
+const asMock = (fn: unknown) => fn as jest.Mock;
+
+// ----- color scheme -----
+
+// Every screen here renders in the light palette unless a test flips the OS
+// scheme; dark mode re-inks the status bar and the whole navigation chrome.
+jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
+  __esModule: true,
+  default: jest.fn(() => 'light'),
+}));
 
 // Screens rendered without an I18nProvider (Gate, NotFound, ErrorBoundary)
 // translate with the module-level language, which beforeEach pins to English.
@@ -69,7 +80,16 @@ jest.mock('expo-router', () => ({
   useFocusEffect: jest.fn(),
 }));
 
-jest.mock('expo-status-bar', () => ({ StatusBar: () => null }));
+// ----- expo-status-bar mock (captures the requested status-bar ink) -----
+
+const capturedStatusBarProps: { style?: string }[] = [];
+
+function MockStatusBar(props: { style?: string }) {
+  capturedStatusBarProps.push(props);
+  return null;
+}
+
+jest.mock('expo-status-bar', () => ({ StatusBar: MockStatusBar }));
 
 // The real SafeAreaProvider stays empty in jest until native insets arrive;
 // RootLayout mounts its own provider, so substitute a passthrough.
@@ -189,6 +209,13 @@ function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
 
+/** The laid-out container a piece of copy sits in (card, then screen). */
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -230,10 +257,12 @@ beforeEach(() => {
   // RootLayout renders with a 'te' user sync the module-level language via the
   // real I18nProvider's effect; pin it back so every test starts in English.
   setActiveLanguage('en');
+  asMock(useColorScheme).mockReturnValue('light');
   mockApiFetch.mockReset();
   capturedStackProps.length = 0;
   capturedScreenProps.length = 0;
   capturedProtectedProps.length = 0;
+  capturedStatusBarProps.length = 0;
   rootQueryClient = undefined;
   mockAuthValue = makeAuth();
 });
@@ -315,6 +344,36 @@ describe('root layout route guards', () => {
     );
   });
 
+  it('inks the status bar and the whole stack chrome from the light palette', async () => {
+    await render(<RootLayout />);
+
+    // Light surfaces need dark status-bar glyphs to stay legible.
+    expect(capturedStatusBarProps.map((props) => props.style)).toEqual(['dark']);
+    expect(capturedStackProps).toHaveLength(1);
+    expect(capturedStackProps[0].screenOptions).toEqual({
+      headerTintColor: colors.text,
+      headerStyle: { backgroundColor: colors.background },
+      headerShadowVisible: false,
+      contentStyle: { backgroundColor: colors.background },
+    });
+  });
+
+  it('inks the status bar and the whole stack chrome from the dark palette', async () => {
+    asMock(useColorScheme).mockReturnValue('dark');
+    await render(<RootLayout />);
+
+    // Dark surfaces need light status-bar glyphs; the two palettes must not
+    // share a single hard-coded value.
+    expect(capturedStatusBarProps.map((props) => props.style)).toEqual(['light']);
+    expect(capturedStackProps).toHaveLength(1);
+    expect(capturedStackProps[0].screenOptions).toEqual({
+      headerTintColor: darkColors.text,
+      headerStyle: { backgroundColor: darkColors.background },
+      headerShadowVisible: false,
+      contentStyle: { backgroundColor: darkColors.background },
+    });
+  });
+
   it('closes every protected group while the session is restoring', async () => {
     mockAuthValue = makeAuth({ isRestoring: true, token: null, user: null });
     await render(<RootLayout />);
@@ -381,6 +440,34 @@ describe('root layout route guards', () => {
       expect(optionsFor(name)).toEqual(
         expect.objectContaining({ headerBackVisible: false, gestureEnabled: false }),
       );
+    }
+  });
+
+  it('pins the complete option set of every back-locked route, home included', async () => {
+    await render(<RootLayout />);
+    const optionsFor = (name: string) =>
+      capturedScreenProps.find((props) => props?.name === name)?.options;
+
+    // `home` is the post-diagnostic landing screen: leaving it by back or swipe
+    // would strand the user on the assessment they already finished.
+    const locked = [
+      ['diagnostic', 'header.diagnostic'],
+      ['home', 'header.home'],
+      ['practice/index', 'header.practice'],
+      ['practice/feedback', 'header.feedback'],
+    ] as const;
+    for (const [name, key] of locked) {
+      expect(optionsFor(name)).toEqual({
+        title: translateFor('te', key),
+        headerBackVisible: false,
+        gestureEnabled: false,
+      });
+    }
+
+    // Routes the user may leave freely keep the default back affordances.
+    for (const name of ['practice/help', 'practice/attempt', 'history', 'settings/index']) {
+      expect(optionsFor(name)).not.toHaveProperty('headerBackVisible');
+      expect(optionsFor(name)).not.toHaveProperty('gestureEnabled');
     }
   });
 
@@ -468,6 +555,8 @@ describe('root fallback screens', () => {
         backgroundColor: colors.primary,
         justifyContent: 'center',
         minHeight: layout.minimumTarget,
+        // The call-site override that separates the CTA from the body copy.
+        marginTop: spacing.xl,
       },
       { backgroundColor: colors.primaryDark },
     );
@@ -475,21 +564,101 @@ describe('root fallback screens', () => {
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
+  it('lays the route-crash card out as a centered themed card', async () => {
+    await render(<ErrorBoundary error={new Error('sensitive stack details')} retry={jest.fn()} />);
+
+    const title = screen.getByRole('header', { name: t('boundary.title') });
+    const card = parentOf(title);
+
+    expect(flattenedStyle(parentOf(card))).toEqual({
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(card)).toEqual({
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radii.card,
+      backgroundColor: colors.card,
+      padding: spacing.xl,
+      alignItems: 'center',
+    });
+    expect(flattenedStyle(title)).toEqual({
+      color: colors.text,
+      fontSize: 24,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByRole('alert'))).toEqual({
+      marginTop: 10,
+      color: colors.muted,
+      fontSize: 16,
+      lineHeight: 23,
+      textAlign: 'center',
+    });
+  });
+
   it('returns an invalid deep link to the protected entry gate', async () => {
     await render(<NotFoundScreen />);
 
     expect(screen.getByRole('header', { name: t('notFound.title') })).toBeTruthy();
+    // The body explains that the link is dead — without it the screen is a
+    // bare title with a button.
+    expect(screen.getByText(t('notFound.body'))).toBeTruthy();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('notFound.goHome') }),
       {
         backgroundColor: colors.primary,
         justifyContent: 'center',
         minHeight: layout.minimumTarget,
+        marginTop: spacing.xl,
       },
       { backgroundColor: colors.primaryDark },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('notFound.goHome') }));
     expect(router.replace).toHaveBeenCalledWith('/');
+  });
+
+  it('lays the dead-link screen out as a centered themed card', async () => {
+    await render(<NotFoundScreen />);
+
+    const title = screen.getByRole('header', { name: t('notFound.title') });
+    const card = parentOf(title);
+
+    expect(flattenedStyle(parentOf(card))).toEqual({
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(card)).toEqual({
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignItems: 'center',
+      borderWidth: 1,
+      borderColor: colors.border,
+      borderRadius: radii.card,
+      backgroundColor: colors.card,
+      padding: spacing.xl,
+    });
+    expect(flattenedStyle(title)).toEqual({
+      color: colors.text,
+      fontSize: 24,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('notFound.body')))).toEqual({
+      marginTop: 10,
+      color: colors.muted,
+      fontSize: 16,
+      lineHeight: 23,
+      textAlign: 'center',
+    });
   });
 });
 
@@ -552,11 +721,68 @@ describe('index gate', () => {
       {
         backgroundColor: colors.danger,
         minHeight: layout.minimumTarget,
+        // Sits closer to the retry CTA above it than a full section gap.
+        marginTop: spacing.ml,
       },
       { backgroundColor: colors.danger, opacity: 0.85 },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('gate.resetSession') }));
     expect(resetStoredSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('centers the session-error copy and spaces its two recovery actions', async () => {
+    mockAuthValue = makeAuth({
+      restoreError: 'Secure session storage is temporarily unavailable.',
+    });
+    await renderGate();
+
+    const title = screen.getByRole('header', { name: t('gate.sessionErrorTitle') });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+      marginBottom: spacing.sm,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByRole('alert'))).toEqual({
+      marginTop: spacing.md,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({ marginTop: spacing.xl });
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('gate.resetSession') })),
+    ).toMatchObject({ marginTop: spacing.ml });
+  });
+
+  it('centers the loading state on the same themed screen', async () => {
+    mockAuthValue = makeAuth({ isRestoring: true });
+    await renderGate();
+
+    const label = screen.getByText(t('gate.restoring'));
+    expect(flattenedStyle(parentOf(label))).toEqual({
+      flex: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: spacing.xl,
+      backgroundColor: colors.background,
+    });
+    expect(flattenedStyle(label)).toEqual({
+      marginTop: spacing.md,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
   });
 
   it('redirects to login when there is no token', async () => {

@@ -11,7 +11,7 @@ import TermsScreen from '../src/app/settings/terms';
 import { ApiError } from '../src/lib/api';
 import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
-import { colors, layout } from '../src/lib/theme';
+import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 // Under jest no I18nProvider is mounted, so the screens fall back to English;
@@ -143,6 +143,95 @@ type SemanticStyle = Record<string, unknown>;
 function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
+
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
+/**
+ * ScrollView renders as the host `RCTScrollView`, which keeps
+ * `contentContainerStyle` as a prop instead of applying it to a child view.
+ */
+function scrollContentStyle(): SemanticStyle {
+  const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  if (!scrollView) throw new Error('No ScrollView rendered');
+  return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
+}
+
+/** The card shell shared by the change-password and delete-account forms. */
+const FORM_CARD_STYLE: SemanticStyle = {
+  backgroundColor: colors.card,
+  borderRadius: radii.card,
+  padding: spacing.lg,
+  width: '100%',
+  maxWidth: layout.formMaxWidth,
+  alignSelf: 'center',
+  borderWidth: 1,
+  borderColor: colors.border,
+};
+
+/** Field caption above every password input on both settings forms. */
+const FIELD_LABEL_STYLE: SemanticStyle = {
+  fontSize: 14,
+  fontWeight: '600',
+  color: colors.text,
+  marginBottom: 6,
+  marginTop: spacing.md,
+};
+
+/** The row that positions the Show/Hide control over the password field. */
+const INPUT_ROW_STYLE: SemanticStyle = {
+  position: 'relative',
+  justifyContent: 'center',
+};
+
+/** A password input, including the right-hand gutter kept clear for Show. */
+const PASSWORD_INPUT_STYLE: SemanticStyle = {
+  borderWidth: 1,
+  borderColor: colors.inputBorder,
+  borderRadius: radii.input,
+  paddingHorizontal: 14,
+  paddingVertical: spacing.md,
+  fontSize: 16,
+  color: colors.text,
+  backgroundColor: colors.inputBackground,
+  paddingRight: 64,
+};
+
+/** The Show/Hide pressable, sized to the minimum accessible target. */
+const INPUT_ACTION_STYLE: SemanticStyle = {
+  position: 'absolute',
+  right: 4,
+  minHeight: layout.minimumTarget,
+  minWidth: layout.minimumTarget,
+  justifyContent: 'center',
+  alignItems: 'center',
+  paddingHorizontal: spacing.sm,
+};
+
+/** The Show/Hide caption itself. */
+const INPUT_ACTION_TEXT_STYLE: SemanticStyle = {
+  color: colors.primary,
+  fontSize: 14,
+  fontWeight: '600',
+};
+
+/** Inline, per-field validation copy. */
+const FIELD_ERROR_STYLE: SemanticStyle = {
+  marginTop: 6,
+  color: colors.danger,
+  fontSize: 13,
+};
+
+/** Form-level failure copy announced as an alert. */
+const FORM_ERROR_STYLE: SemanticStyle = {
+  marginTop: 14,
+  color: colors.danger,
+  fontSize: 14,
+  textAlign: 'center',
+};
 
 /**
  * The RN jest preset mocks TextInput as a class component whose prototype
@@ -279,6 +368,74 @@ describe('change password screen', () => {
     expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
     expect(updateButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
     expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+  });
+
+  it('captions every field and reveal control with visible copy', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    expect(screen.getByText(t('cp.currentLabel'))).toBeTruthy();
+    expect(screen.getByText(t('cp.newLabel'))).toBeTruthy();
+    expect(screen.getByText(t('cp.confirmLabel'))).toBeTruthy();
+    // One reveal control per field, all resting on Show.
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(3);
+    expect(screen.queryByText(t('common.hide'))).toBeNull();
+
+    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[1]);
+    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+  });
+
+  it('lays out the change-password form on the shared token scale', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    expect(flattenedStyle(screen.getByTestId('keyboard-avoiding-view'))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: spacing.xl });
+    expect(flattenedStyle(parentOf(screen.getByText(t('cp.currentLabel'))))).toEqual(
+      FORM_CARD_STYLE,
+    );
+    for (const key of ['cp.currentLabel', 'cp.newLabel', 'cp.confirmLabel'] as const) {
+      expect(flattenedStyle(screen.getByText(t(key)))).toEqual(FIELD_LABEL_STYLE);
+    }
+    expect(flattenedStyle(updateButton())).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('overlays a reveal control inside every password field', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    for (const key of ['cp.currentLabel', 'cp.newLabel', 'cp.confirmLabel'] as const) {
+      const input = screen.getByLabelText(t(key));
+      expect(flattenedStyle(parentOf(input))).toEqual(INPUT_ROW_STYLE);
+      // Each field reserves room on the right so its text never runs under Show.
+      expect(flattenedStyle(input)).toEqual(PASSWORD_INPUT_STYLE);
+    }
+    for (const toggle of screen.getAllByRole('button', { name: t('common.showPassword') })) {
+      expect(flattenedStyle(toggle)).toEqual(INPUT_ACTION_STYLE);
+    }
+    for (const caption of screen.getAllByText(t('common.show'))) {
+      expect(flattenedStyle(caption)).toEqual(INPUT_ACTION_TEXT_STYLE);
+    }
+  });
+
+  it('ignores a keyboard submit until every field validates', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    const submitFromKeyboard = () =>
+      fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'submitEditing');
+
+    await submitFromKeyboard();
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
+    await submitFromKeyboard();
+    await fillChangePassword('', 'newpass1', 'newpass1');
+    await submitFromKeyboard();
+    await fillChangePassword('a'.repeat(73), 'newpass1', 'newpass1');
+    await submitFromKeyboard();
+    await fillChangePassword('oldpass1', 'short', 'short');
+    await submitFromKeyboard();
+
+    expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -425,7 +582,9 @@ describe('change password screen', () => {
   it('rejects current passwords over the UTF-8 byte limit', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('a'.repeat(73), 'newpass1', 'newpass1');
-    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
+    const fieldError = screen.getByText(t('password.tooLong'));
+    expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(fieldError)).toEqual(FIELD_ERROR_STYLE);
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -481,7 +640,9 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
 
-    expect(await screen.findByText(t('cp.wrongCurrent'))).toBeTruthy();
+    const alert = await screen.findByText(t('cp.wrongCurrent'));
+    expect(alert.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(alert)).toEqual(FORM_ERROR_STYLE);
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
@@ -540,17 +701,28 @@ function deleteButton() {
 describe('delete account screen', () => {
   it('renders the permanence warning and keeps delete disabled initially', async () => {
     await renderScreen(<DeleteAccountScreen />);
-    expect(
-      flattenedStyle(screen.getByRole('header', { name: t('da.warningTitle') })),
-    ).toMatchObject({ color: colors.danger });
-    const warningCard = screen.getByRole('header', { name: t('da.warningTitle') }).parent;
-    if (!warningCard) throw new Error('Permanence warning has no rendered card');
-    expect(flattenedStyle(warningCard)).toMatchObject({
+    expect(flattenedStyle(screen.getByRole('header', { name: t('da.warningTitle') }))).toEqual({
+      fontSize: 17,
+      fontWeight: '700',
+      color: colors.danger,
+    });
+    const warningBody = screen.getByText(t('da.warningBody'));
+    expect(flattenedStyle(warningBody)).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.text,
+    });
+    expect(flattenedStyle(parentOf(warningBody))).toEqual({
       backgroundColor: colors.dangerLight,
-      borderColor: colors.danger,
-      alignSelf: 'center',
-      maxWidth: layout.formMaxWidth,
+      borderRadius: radii.card,
+      padding: spacing.lg,
       width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'center',
+      borderWidth: 1,
+      borderColor: colors.danger,
+      marginBottom: spacing.ml,
     });
     expect(flattenedStyle(deleteButton())).toMatchObject({
       alignItems: 'center',
@@ -566,6 +738,58 @@ describe('delete account screen', () => {
       returnKeyType: 'done',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
     });
+  });
+
+  it('captions the password field and its reveal control with visible copy', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    expect(screen.getByText(t('da.passwordLabel'))).toBeTruthy();
+    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.queryByText(t('common.hide'))).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
+    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.queryByText(t('common.show'))).toBeNull();
+  });
+
+  it('lays out the delete-account screen on the shared token scale', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    expect(flattenedStyle(screen.getByTestId('keyboard-avoiding-view'))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: spacing.xl });
+    const passwordLabel = screen.getByText(t('da.passwordLabel'));
+    expect(flattenedStyle(parentOf(passwordLabel))).toEqual(FORM_CARD_STYLE);
+    expect(flattenedStyle(passwordLabel)).toEqual(FIELD_LABEL_STYLE);
+    expect(flattenedStyle(deleteButton())).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('overlays the reveal control inside the password field', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    const input = screen.getByLabelText(t('da.passwordLabel'));
+    expect(flattenedStyle(parentOf(input))).toEqual(INPUT_ROW_STYLE);
+    // The field reserves room on the right so the text never runs under Show.
+    expect(flattenedStyle(input)).toEqual(PASSWORD_INPUT_STYLE);
+    expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual(
+      INPUT_ACTION_STYLE,
+    );
+    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual(INPUT_ACTION_TEXT_STYLE);
+  });
+
+  it('never opens the destructive confirmation while the password is unusable', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    const submitFromKeyboard = () =>
+      fireEvent(screen.getByLabelText(t('da.passwordLabel')), 'submitEditing');
+
+    await submitFromKeyboard();
+    await typePassword('a'.repeat(73));
+    await submitFromKeyboard();
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -632,7 +856,9 @@ describe('delete account screen', () => {
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('a'.repeat(73));
-    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
+    const fieldError = screen.getByText(t('password.tooLong'));
+    expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(fieldError)).toEqual(FIELD_ERROR_STYLE);
     expect(deleteButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -710,7 +936,9 @@ describe('delete account screen', () => {
     await fireEvent.press(deleteButton());
     await pressAlertButton(t('da.confirmDelete'));
 
-    expect(await screen.findByText(t('da.wrongPassword'))).toBeTruthy();
+    const alert = await screen.findByText(t('da.wrongPassword'));
+    expect(alert.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(alert)).toEqual(FORM_ERROR_STYLE);
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
@@ -771,6 +999,50 @@ describe('delete account screen', () => {
   });
 });
 
+/**
+ * Privacy and terms share one static reading layout: a centred measure, a
+ * primary-tinted placeholder note, and evenly spaced body paragraphs.
+ */
+function expectLegalLayout(headerKey: MessageKey, paragraphKeys: readonly MessageKey[]): void {
+  expect(scrollContentStyle()).toEqual({
+    flexGrow: 1,
+    padding: layout.screenPadding,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
+    backgroundColor: colors.background,
+  });
+  expect(flattenedStyle(screen.getByRole('header', { name: t(headerKey) }))).toEqual({
+    fontSize: 24,
+    fontWeight: '800',
+    color: colors.text,
+  });
+
+  const note = screen.getByText(t('legal.placeholderNote'));
+  expect(flattenedStyle(parentOf(note))).toEqual({
+    marginTop: spacing.md,
+    backgroundColor: colors.primaryLight,
+    borderColor: colors.primary,
+    borderWidth: 1,
+    borderRadius: radii.input,
+    padding: spacing.md,
+  });
+  expect(flattenedStyle(note)).toEqual({
+    fontSize: 14,
+    lineHeight: 20,
+    color: colors.primaryDark,
+  });
+
+  for (const key of paragraphKeys) {
+    expect(flattenedStyle(screen.getByText(t(key)))).toEqual({
+      marginTop: spacing.lg,
+      fontSize: 16,
+      lineHeight: 24,
+      color: colors.text,
+    });
+  }
+}
+
 describe('legal screens', () => {
   it('renders the privacy policy header, placeholder note, and all paragraphs', async () => {
     await renderScreen(<PrivacyPolicyScreen />);
@@ -792,5 +1064,17 @@ describe('legal screens', () => {
     expect(screen.getByText(t('terms.p1'))).toBeTruthy();
     expect(screen.getByText(t('terms.p2'))).toBeTruthy();
     expect(screen.getByText(t('terms.p3'))).toBeTruthy();
+  });
+
+  it('lays out the privacy policy on the shared reading measure', async () => {
+    await renderScreen(<PrivacyPolicyScreen />);
+
+    expectLegalLayout('header.privacy', ['privacy.p1', 'privacy.p2', 'privacy.p3']);
+  });
+
+  it('lays out the terms on the shared reading measure', async () => {
+    await renderScreen(<TermsScreen />);
+
+    expectLegalLayout('header.terms', ['terms.p1', 'terms.p2', 'terms.p3']);
   });
 });

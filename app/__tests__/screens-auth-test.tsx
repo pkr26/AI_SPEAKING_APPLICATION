@@ -14,7 +14,7 @@ import {
 } from '../src/lib/auth';
 import { translateFor, type MessageKey, type UiLanguage } from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
-import { colors } from '../src/lib/theme';
+import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 // No I18nProvider is mounted in these tests, so screens render in English
@@ -182,6 +182,23 @@ function textNode(node: TestInstance, text: string): TestInstance {
   return match;
 }
 
+/** The host view a control is laid out in (form card, input row, footer row). */
+function parentOf(node: TestInstance): TestInstance {
+  const parent = node.parent;
+  if (!parent) throw new Error('Element is not laid out inside a parent view');
+  return parent;
+}
+
+/**
+ * ScrollView renders as the host `RCTScrollView`, which keeps
+ * `contentContainerStyle` as a prop instead of applying it to a child view.
+ */
+function scrollContentStyle(): SemanticStyle {
+  const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  if (!scrollView) throw new Error('No ScrollView rendered');
+  return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
+}
+
 /**
  * The RN jest preset mocks TextInput as a class component whose prototype
  * shares one focus() jest.fn across every instance. Walk from the queried
@@ -234,10 +251,130 @@ describe('login screen', () => {
     await render(<LoginScreen />);
     expect(screen.getByText(t('login.title'))).toBeTruthy();
     expect(screen.getByText(t('login.subtitle'))).toBeTruthy();
+    expect(screen.getByText(t('login.emailLabel'))).toBeTruthy();
     expect(screen.getByPlaceholderText(t('login.emailPlaceholder')).props.value).toBe('');
+    expect(screen.getByText(t('login.passwordLabel'))).toBeTruthy();
     expect(screen.getByPlaceholderText(t('login.passwordPlaceholder')).props.value).toBe('');
+    // An untouched password carries no inline error.
+    expect(screen.queryByText(t('password.tooLong'))).toBeNull();
+    expect(screen.queryByText(t('reset.doneBanner'))).toBeNull();
     expect(screen.getByText(t('login.footerPrompt'))).toBeTruthy();
+    expect(screen.getByRole('link', { name: t('login.forgot') }).props.href).toBe(
+      '/forgot-password',
+    );
     expect(screen.getByRole('link', { name: t('login.footerLink') }).props.href).toBe('/signup');
+  });
+
+  it('lays out the login screen on the shared token scale', async () => {
+    await render(<LoginScreen />);
+
+    expect(flattenedStyle(screen.getByTestId('keyboard-avoiding-view'))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      justifyContent: 'center',
+      padding: spacing.xl,
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(screen.getByRole('header', { name: t('login.title') }))).toEqual({
+      fontSize: 32,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('login.subtitle')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 16,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+
+    const emailLabel = screen.getByText(t('login.emailLabel'));
+    expect(flattenedStyle(parentOf(emailLabel))).toEqual({
+      marginTop: 36,
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(emailLabel)).toEqual({
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.text,
+      marginBottom: 6,
+      marginTop: spacing.md,
+    });
+  });
+
+  it('overlays the password reveal control inside the password field', async () => {
+    await render(<LoginScreen />);
+    const passwordInput = screen.getByLabelText(t('login.passwordLabel'));
+
+    expect(flattenedStyle(parentOf(passwordInput))).toEqual({
+      position: 'relative',
+      justifyContent: 'center',
+    });
+    // The field reserves room on the right so the text never runs under Show.
+    expect(flattenedStyle(passwordInput)).toEqual({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+      borderRadius: radii.input,
+      paddingHorizontal: 14,
+      paddingVertical: spacing.md,
+      fontSize: 16,
+      color: colors.text,
+      backgroundColor: colors.inputBackground,
+      paddingRight: 64,
+    });
+    expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
+      position: 'absolute',
+      right: 4,
+      minHeight: layout.minimumTarget,
+      minWidth: layout.minimumTarget,
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: spacing.sm,
+    });
+    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+      color: colors.primary,
+      fontSize: 14,
+      fontWeight: '600',
+    });
+  });
+
+  it('spaces the submit button, forgot link, and signup footer', async () => {
+    await render(<LoginScreen />);
+
+    expect(flattenedStyle(logInButton())).toMatchObject({ marginTop: spacing.lg });
+    expect(flattenedStyle(screen.getByRole('link', { name: t('login.forgot') }))).toEqual({
+      marginTop: spacing.ml,
+      paddingVertical: spacing.md,
+      fontSize: 15,
+      color: colors.primary,
+      fontWeight: '600',
+      textAlign: 'center',
+    });
+
+    const footerText = screen.getByText(t('login.footerPrompt'));
+    expect(flattenedStyle(parentOf(footerText))).toEqual({
+      marginTop: spacing.xl,
+      minHeight: layout.minimumTarget,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+    expect(flattenedStyle(footerText)).toEqual({ fontSize: 15, color: colors.muted });
+    expect(flattenedStyle(screen.getByRole('link', { name: t('login.footerLink') }))).toEqual({
+      paddingVertical: spacing.md,
+      fontSize: 15,
+      color: colors.primary,
+      fontWeight: '600',
+    });
   });
 
   it.each([
@@ -293,8 +430,36 @@ describe('login screen', () => {
     await fillLogin('a'.repeat(MAX_EMAIL_LENGTH), 'password1');
     expect(logInButton().props.accessibilityState.disabled).toBe(false);
 
+    // Surrounding whitespace is trimmed before the limit is measured, so a
+    // padded address that fits exactly still submits.
+    await fillLogin(`  ${'a'.repeat(MAX_EMAIL_LENGTH)}  `, 'password1');
+    expect(logInButton().props.accessibilityState.disabled).toBe(false);
+
     await fillLogin('a'.repeat(MAX_EMAIL_LENGTH + 1), 'password1');
     expect(logInButton().props.accessibilityState.disabled).toBe(true);
+  });
+
+  it('ignores a return-key submit while the login form is incomplete', async () => {
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', '');
+
+    await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
+
+    expect(mockAuthValue.login).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('login.submitBusy'))).toBeNull();
+  });
+
+  it('keeps the email return key harmless once the screen is gone', async () => {
+    const view = await render(<LoginScreen />);
+    const submitFromEmail = screen.getByLabelText(t('login.emailLabel')).props
+      .onSubmitEditing as () => void;
+    const focusSpy = spyOnTextInputFocus(screen.getByLabelText(t('login.passwordLabel')));
+    await view.unmount();
+
+    // The password ref is detached on unmount, so chaining must not reach it.
+    expect(submitFromEmail).not.toThrow();
+    expect(focusSpy).not.toHaveBeenCalled();
   });
 
   it('configures login fields for email entry and password privacy', async () => {
@@ -389,7 +554,40 @@ describe('login screen', () => {
 
     const banner = await screen.findByText(t('auth.sessionExpired'));
     expect(banner.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(banner)).toEqual({
+      marginTop: spacing.lg,
+      backgroundColor: colors.primaryLight,
+      borderColor: colors.primary,
+      borderWidth: 1,
+      borderRadius: radii.input,
+      padding: spacing.md,
+      color: colors.primaryDark,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
     expect(mockedConsumeSessionExpiredNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows the password-reset success banner after the reset redirect', async () => {
+    mockSearchParams = { notice: 'reset' };
+    await render(<LoginScreen />);
+
+    const banner = screen.getByText(t('reset.doneBanner'));
+    expect(banner.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(banner)).toEqual({
+      marginTop: spacing.lg,
+      backgroundColor: colors.successLight,
+      borderColor: colors.success,
+      borderWidth: 1,
+      borderRadius: radii.input,
+      padding: spacing.md,
+      color: colors.success,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
+    expect(screen.queryByText(t('auth.sessionExpired'))).toBeNull();
   });
 
   it('shows no signed-out banner without a stored notice', async () => {
@@ -402,7 +600,13 @@ describe('login screen', () => {
   it('rejects passwords over the UTF-8 byte limit client-side', async () => {
     await render(<LoginScreen />);
     await fillLogin('ada@example.com', 'a'.repeat(73));
-    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
+    const fieldError = screen.getByText(t('password.tooLong'));
+    expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(fieldError)).toEqual({
+      marginTop: 6,
+      color: colors.danger,
+      fontSize: 13,
+    });
     expect(logInButton().props.accessibilityState.disabled).toBe(true);
     expect(mockAuthValue.login).not.toHaveBeenCalled();
   });
@@ -448,7 +652,14 @@ describe('login screen', () => {
     await fillLogin('ada@example.com', 'password1');
     await fireEvent.press(logInButton());
 
-    expect(await screen.findByText(t('error.wrongCredentials'))).toBeTruthy();
+    const alert = await screen.findByText(t('error.wrongCredentials'));
+    expect(alert.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(alert)).toEqual({
+      marginTop: 14,
+      color: colors.danger,
+      fontSize: 14,
+      textAlign: 'center',
+    });
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
@@ -521,13 +732,125 @@ describe('signup screen', () => {
     expect(screen.getByLabelText('Hindi, हिन्दी')).toBeTruthy();
     expect(screen.getByLabelText('Spanish, Español')).toBeTruthy();
     expect(screen.getByLabelText('Chinese (Simplified), 简体中文')).toBeTruthy();
+    expect(screen.getByText(t('signup.nameLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe('');
+    expect(screen.getByText(t('login.emailLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('login.emailLabel')).props.value).toBe('');
+    expect(screen.getByText(t('login.passwordLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('login.passwordLabel')).props.value).toBe('');
     expect(screen.getByText(t('signup.languageLabel'))).toBeTruthy();
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.getByText(t('signup.footerPrompt'))).toBeTruthy();
     expect(screen.getByRole('link', { name: t('signup.footerLink') }).props.href).toBe('/login');
+  });
+
+  it('lays out the signup screen on the shared token scale', async () => {
+    await render(<SignupScreen />);
+
+    expect(flattenedStyle(screen.getByTestId('keyboard-avoiding-view'))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      justifyContent: 'center',
+      padding: spacing.xl,
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(screen.getByRole('header', { name: t('signup.title') }))).toEqual({
+      fontSize: 28,
+      fontWeight: '800',
+      color: colors.text,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('signup.subtitle')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+
+    const nameLabel = screen.getByText(t('signup.nameLabel'));
+    expect(flattenedStyle(parentOf(nameLabel))).toEqual({
+      marginTop: 28,
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(nameLabel)).toEqual({
+      fontSize: 14,
+      fontWeight: '600',
+      color: colors.text,
+      marginBottom: 6,
+      marginTop: spacing.md,
+    });
+  });
+
+  it('overlays the password reveal control inside the signup password field', async () => {
+    await render(<SignupScreen />);
+    const passwordInput = screen.getByLabelText(t('login.passwordLabel'));
+
+    expect(flattenedStyle(parentOf(passwordInput))).toEqual({
+      position: 'relative',
+      justifyContent: 'center',
+    });
+    // The field reserves room on the right so the text never runs under Show.
+    expect(flattenedStyle(passwordInput)).toEqual({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+      borderRadius: radii.input,
+      paddingHorizontal: 14,
+      paddingVertical: spacing.md,
+      fontSize: 16,
+      color: colors.text,
+      backgroundColor: colors.inputBackground,
+      paddingRight: 64,
+    });
+    expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
+      position: 'absolute',
+      right: 4,
+      minHeight: layout.minimumTarget,
+      minWidth: layout.minimumTarget,
+      justifyContent: 'center',
+      alignItems: 'center',
+      paddingHorizontal: spacing.sm,
+    });
+    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+      color: colors.primary,
+      fontSize: 14,
+      fontWeight: '600',
+    });
+  });
+
+  it('wraps the language chips in a row and spaces the submit and login footer', async () => {
+    await render(<SignupScreen />);
+
+    expect(flattenedStyle(parentOf(screen.getByLabelText('Telugu, తెలుగు')))).toEqual({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: 10,
+    });
+    expect(flattenedStyle(signUpButton())).toMatchObject({ marginTop: spacing.lg });
+
+    const footerText = screen.getByText(t('signup.footerPrompt'));
+    expect(flattenedStyle(parentOf(footerText))).toEqual({
+      marginTop: spacing.xl,
+      minHeight: layout.minimumTarget,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+    expect(flattenedStyle(footerText)).toEqual({ fontSize: 15, color: colors.muted });
+    expect(flattenedStyle(screen.getByRole('link', { name: t('signup.footerLink') }))).toEqual({
+      paddingVertical: spacing.md,
+      fontSize: 15,
+      color: colors.primary,
+      fontWeight: '600',
+    });
   });
 
   it.each([
@@ -584,10 +907,16 @@ describe('signup screen', () => {
       borderColor: colors.border,
       flexBasis: '47%',
     });
-    expect(flattenedStyle(textNode(telugu, 'తెలుగు'))).toMatchObject({
+    expect(flattenedStyle(textNode(telugu, 'తెలుగు'))).toEqual({
+      fontSize: 17,
+      fontWeight: '700',
       color: colors.text,
     });
-    expect(flattenedStyle(textNode(telugu, 'Telugu'))).toMatchObject({ color: colors.muted });
+    expect(flattenedStyle(textNode(telugu, 'Telugu'))).toEqual({
+      marginTop: 2,
+      fontSize: 13,
+      color: colors.muted,
+    });
 
     await fireEvent.press(telugu);
     const selectedTelugu = screen.getByLabelText('Telugu, తెలుగు');
@@ -628,6 +957,15 @@ describe('signup screen', () => {
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
 
     await fillSignup('n'.repeat(MAX_NAME_LENGTH), 'e'.repeat(MAX_EMAIL_LENGTH), 'password1', 'te');
+    expect(signUpButton('te').props.accessibilityState.disabled).toBe(false);
+
+    // Both limits are measured after trimming, so padded exact-limit values pass.
+    await fillSignup(
+      `  ${'n'.repeat(MAX_NAME_LENGTH)}  `,
+      `  ${'e'.repeat(MAX_EMAIL_LENGTH)}  `,
+      'password1',
+      'te',
+    );
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(false);
 
     await fillSignup('n'.repeat(MAX_NAME_LENGTH + 1), 'ada@example.com', 'password1', 'te');
@@ -695,6 +1033,47 @@ describe('signup screen', () => {
     );
   });
 
+  it('ignores a return-key submit until the form and a language are complete', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+
+    // Every field is filled, but no language has been chosen yet.
+    await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+
+    // A chosen language alone is not enough once the name is blanked out.
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(translateFor('te', 'signup.namePlaceholder')),
+      '   ',
+    );
+    await fireEvent(
+      screen.getByLabelText(translateFor('te', 'login.passwordLabel')),
+      'submitEditing',
+    );
+
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(screen.queryByText(translateFor('te', 'signup.submitBusy'))).toBeNull();
+  });
+
+  it('keeps the name and email return keys harmless once the screen is gone', async () => {
+    const view = await render(<SignupScreen />);
+    const submitFromName = screen.getByLabelText(t('signup.nameLabel')).props
+      .onSubmitEditing as () => void;
+    const submitFromEmail = screen.getByLabelText(t('login.emailLabel')).props
+      .onSubmitEditing as () => void;
+    const emailFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.emailLabel')));
+    const passwordFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.passwordLabel')));
+    await view.unmount();
+
+    // Both refs are detached on unmount, so neither chain may reach through.
+    expect(submitFromName).not.toThrow();
+    expect(submitFromEmail).not.toThrow();
+    expect(emailFocus).not.toHaveBeenCalled();
+    expect(passwordFocus).not.toHaveBeenCalled();
+  });
+
   it('marks the focused signup field with a two-pixel accent border', async () => {
     await render(<SignupScreen />);
 
@@ -723,11 +1102,15 @@ describe('signup screen', () => {
     await render(<SignupScreen />);
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
 
+    expect(screen.getByText(t('common.show'))).toBeTruthy();
+
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByText(t('common.hide'))).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
+    expect(screen.getByText(t('common.show'))).toBeTruthy();
   });
 
   it('rejects names over the maximum length client-side', async () => {
@@ -741,7 +1124,13 @@ describe('signup screen', () => {
   it('shows the length policy error for short passwords', async () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'abc1');
-    expect(screen.getByText(t('password.tooShort'))).toBeTruthy();
+    const fieldError = screen.getByText(t('password.tooShort'));
+    expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(fieldError)).toEqual({
+      marginTop: 6,
+      color: colors.danger,
+      fontSize: 13,
+    });
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
   });
 
@@ -867,7 +1256,14 @@ describe('signup screen', () => {
     await fireEvent.press(signUpButton('te'));
 
     // The screen translator follows the previewed language.
-    expect(await screen.findByText(translateFor('te', 'error.emailTaken'))).toBeTruthy();
+    const alert = await screen.findByText(translateFor('te', 'error.emailTaken'));
+    expect(alert.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(alert)).toEqual({
+      marginTop: 14,
+      color: colors.danger,
+      fontSize: 14,
+      textAlign: 'center',
+    });
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 

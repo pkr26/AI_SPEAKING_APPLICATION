@@ -1,4 +1,5 @@
 import * as SecureStore from 'expo-secure-store';
+import { Platform } from 'react-native';
 
 import {
   cancelDailyReminderQuietly,
@@ -45,6 +46,16 @@ const STORAGE_OPTIONS = expect.objectContaining({
   keychainService: 'ai-english-coach.daily-reminder',
 });
 
+async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
+  const originalOS = Object.getOwnPropertyDescriptor(Platform, 'OS');
+  Object.defineProperty(Platform, 'OS', { configurable: true, value: os });
+  try {
+    await run();
+  } finally {
+    if (originalOS) Object.defineProperty(Platform, 'OS', originalOS);
+  }
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   getItemAsync.mockImplementation(async () => null);
@@ -72,6 +83,9 @@ describe('reminder hour validation', () => {
     expect(parseDailyReminder(['hour'])).toBeNull();
     expect(parseDailyReminder('8')).toBeNull();
     expect(parseDailyReminder(null)).toBeNull();
+    // Only an object-shaped payload is a stored preference: an hour carried on
+    // anything else (a callable, say) is not one, however well-formed it looks.
+    expect(parseDailyReminder(Object.assign(() => undefined, { hour: 8 }))).toBeNull();
   });
 });
 
@@ -113,6 +127,44 @@ describe('enableDailyReminder', () => {
       'daily_reminder_v1',
       JSON.stringify({ hour: 19 }),
       STORAGE_OPTIONS,
+    );
+    // Notification channels are Android-only (on iOS the call just logs and
+    // resolves to null), so iOS neither creates one nor names one in the
+    // trigger asserted above.
+    expect(mockSetNotificationChannelAsync).not.toHaveBeenCalled();
+  });
+
+  it('creates the Android channel and pins the Android schedule to it', async () => {
+    await withPlatformOS('android', async () => {
+      await expect(enableDailyReminder(19)).resolves.toBe('enabled');
+    });
+
+    // The channel must exist before a notification names it, and it is named
+    // in the learner's language so the system settings entry is readable.
+    expect(mockSetNotificationChannelAsync).toHaveBeenCalledWith('daily-reminder', {
+      name: dictionaries.en['reminder.toggleLabel'],
+      importance: 3, // AndroidImportance.DEFAULT
+    });
+    expect(mockSetNotificationChannelAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      mockScheduleNotificationAsync.mock.invocationCallOrder[0],
+    );
+    expect(mockScheduleNotificationAsync).toHaveBeenCalledWith({
+      content: {
+        title: dictionaries.en['reminder.notificationTitle'],
+        body: dictionaries.en['reminder.notificationBody'],
+      },
+      trigger: { type: 'daily', hour: 19, minute: 0, channelId: 'daily-reminder' },
+    });
+  });
+
+  it('names the Android channel in an explicitly passed language', async () => {
+    await withPlatformOS('android', async () => {
+      await expect(enableDailyReminder(7, 'hi')).resolves.toBe('enabled');
+    });
+
+    expect(mockSetNotificationChannelAsync).toHaveBeenCalledWith(
+      'daily-reminder',
+      expect.objectContaining({ name: dictionaries.hi['reminder.toggleLabel'] }),
     );
   });
 
@@ -163,6 +215,30 @@ describe('enableDailyReminder', () => {
     });
     await expect(enableDailyReminder(7)).rejects.toThrow('os error');
     expect(setItemAsync).not.toHaveBeenCalled();
+  });
+});
+
+describe('enableDailyReminder failure leaves no lying preference', () => {
+  it('forgets the stored preference when scheduling throws', async () => {
+    // The previous schedule is cancelled before the new one is created, so a
+    // surviving "on" preference would show the toggle on while the OS has
+    // nothing scheduled and the learner is never reminded again.
+    const failure = new Error('scheduling unavailable');
+    mockScheduleNotificationAsync.mockRejectedValueOnce(failure);
+
+    await expect(enableDailyReminder(9)).rejects.toBe(failure);
+
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(deleteItemAsync).toHaveBeenCalledWith('daily_reminder_v1', STORAGE_OPTIONS);
+    expect(setItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('still reports the scheduling failure when forgetting the preference also fails', async () => {
+    const failure = new Error('scheduling unavailable');
+    mockScheduleNotificationAsync.mockRejectedValueOnce(failure);
+    deleteItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(enableDailyReminder(9)).rejects.toBe(failure);
   });
 });
 

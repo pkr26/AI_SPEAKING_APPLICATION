@@ -38,9 +38,50 @@ npm run doctor
 npm run audit:ci
 ```
 
-`npm ci` installs the pinned Stryker 9.6.1 toolchain. `npm run mutation`
-mutates every production `.ts` and `.tsx` file and writes HTML plus JSON reports
-to `reports/mutation/`.
+`npm ci` installs the pinned Stryker 9.6.1 toolchain.
+
+### Mutation campaign
+
+`npm run mutation` mutates every production `.ts`/`.tsx` file. It fails unless
+every mutant is Killed, Timeout, Ignored, or a survivor somebody has proven
+unkillable and written down. Stryker's own score ignores CompileError,
+RuntimeError, and Pending mutants and has no notion of a reviewed exemption, so
+the merged report is re-checked against that stricter rule and Stryker's own
+break threshold is disabled.
+
+Equivalent mutants — ones no test could ever kill, such as a `typeof` guard that
+exists only to narrow a type — are recorded in `scripts/mutation-equivalents.mjs`
+with the reasoning for each. Entries match on file, mutator, replacement, and the
+mutated source text, never on line numbers. The gate fails both on a survivor
+that matches no entry _and_ on an entry that matches nothing, so an exemption
+cannot outlive the code it excused. Prefer a `// Stryker disable` comment when
+every mutant on the target line is unkillable (see `src/app/(auth)/login.tsx`);
+use the list when killable and unkillable mutants share a line, because Stryker's
+directives cannot separate them.
+
+The campaign runs as lanes rather than one Stryker invocation.
+`scripts/mutation-lanes.mjs` assigns each source file to exactly one lane and
+names the test files that own it; the manifest fails closed when a source or
+test file is added, renamed, or assigned twice, so new code cannot silently skip
+the campaign. `scripts/run-mutation.mjs` runs the lanes, then
+`scripts/merge-mutation-reports.mjs` validates each lane report against the
+manifest and merges them into `reports/mutation/app.{json,html}` plus
+`app-summary.json`. `npm run test:mutation-tooling` covers that tooling itself.
+
+Two settings in `stryker.lane.config.mjs` are load-bearing and explained in
+full there: each lane pins jest's `testMatch` (Stryker's `testFiles` only
+reaches the dry run, not the mutant runs), and `coverageAnalysis` is `all`
+rather than `perTest` because module-level memoisation — `createThemedStyles`,
+the i18n device-language cache, the API token snapshot — makes "which tests
+executed the mutated line" the wrong question.
+
+Useful knobs:
+
+```bash
+npm run mutation:lanes:verify          # manifest only, no mutants
+node scripts/run-mutation.mjs ui types # re-run named lanes, then re-merge
+MUTATION_PARALLEL_LANES=3 MUTATION_CONCURRENCY=2 npm run mutation
+```
 
 The backend must be running on port 4000.
 

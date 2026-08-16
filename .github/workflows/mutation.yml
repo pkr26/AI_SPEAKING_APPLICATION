@@ -124,10 +124,10 @@ jobs:
           cache: npm
           cache-dependency-path: app/package-lock.json
       - run: npm ci
-      # Advisory only: a below-threshold score should surface in the report
-      # artifact for review, not block the scheduled run from uploading it.
+      # Enforced. Every mutant must be Killed, Timeout, or a survivor recorded in
+      # scripts/mutation-equivalents.mjs with the reasoning for why no test can
+      # kill it. The report artifact still uploads on failure (if: always()).
       - name: Run app mutation campaign
-        continue-on-error: true
         run: npm run mutation
       - name: Upload mutation reports
         if: always()

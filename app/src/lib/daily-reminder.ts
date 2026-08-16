@@ -92,18 +92,28 @@ export async function enableDailyReminder(
   }
   // Replace any previous schedule: this app owns exactly one local notification.
   await Notifications.cancelAllScheduledNotificationsAsync();
-  await Notifications.scheduleNotificationAsync({
-    content: {
-      title: tr('reminder.notificationTitle'),
-      body: tr('reminder.notificationBody'),
-    },
-    trigger: {
-      type: Notifications.SchedulableTriggerInputTypes.DAILY,
-      hour,
-      minute: 0,
-      ...(Platform.OS === 'android' ? { channelId: ANDROID_CHANNEL_ID } : {}),
-    },
-  });
+  try {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: tr('reminder.notificationTitle'),
+        body: tr('reminder.notificationBody'),
+      },
+      trigger: {
+        type: Notifications.SchedulableTriggerInputTypes.DAILY,
+        hour,
+        minute: 0,
+        ...(Platform.OS === 'android' ? { channelId: ANDROID_CHANNEL_ID } : {}),
+      },
+    });
+  } catch (error) {
+    // The old schedule is already cancelled, so a stored "on" preference would
+    // now be a lie: the learner would see the toggle on and never be reminded
+    // again. Forget it before surfacing the failure so the persisted state
+    // matches what the OS will actually do. Best effort — the scheduling
+    // failure is the one worth reporting.
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
+    throw error;
+  }
   await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ hour }), STORAGE_OPTIONS);
   return 'enabled';
 }

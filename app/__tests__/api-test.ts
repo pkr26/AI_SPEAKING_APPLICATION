@@ -448,20 +448,41 @@ describe('userMessageForError', () => {
   });
 
   describe('error-code mapping', () => {
+    // Declaration order mirrors API_ERROR_CODES so the completeness check below
+    // reads as a diff when the server contract gains or drops a code.
     const codeCases: readonly [ApiErrorCode, MessageKey][] = [
       ['VALIDATION_FAILED', 'error.validation'],
       ['INVALID_CREDENTIALS', 'error.wrongCredentials'],
       ['EMAIL_TAKEN', 'error.emailTaken'],
+      ['UNAUTHENTICATED', 'error.loginAgain'],
       ['TOKEN_REVOKED', 'error.loginAgain'],
+      ['FORBIDDEN', 'error.forbidden'],
+      ['NOT_FOUND', 'error.notFound'],
       ['QUESTION_MISMATCH', 'error.questionChanged'],
+      ['DIAGNOSTIC_DONE', 'error.diagnosticDone'],
+      ['REQUEST_IN_FLIGHT', 'error.stillChecking'],
+      ['REQUEST_ID_REUSED', 'error.alreadySent'],
+      ['ASSESSMENT_IN_PROGRESS', 'error.stillChecking'],
+      ['STATE_CHANGED', 'error.stateChanged'],
       ['RATE_LIMITED', 'error.tooMany'],
       ['DAILY_LIMIT', 'error.dailyLimit'],
+      ['NETWORK_DAILY_LIMIT', 'error.networkDailyLimit'],
       ['CAPACITY_BUSY', 'error.busy'],
+      ['POOL_SATURATED', 'error.busy'],
+      ['AUDIO_INVALID', 'error.audioInvalid'],
+      ['AUDIO_TOO_LARGE', 'error.tooLarge'],
       ['AUDIO_TOO_LONG', 'error.audioTooLong'],
+      ['AUDIO_UNREADABLE', 'error.audioUnreadable'],
+      ['PROVIDER_FAILED', 'error.checkFailed'],
       ['PROVIDER_TIMEOUT', 'error.timeout'],
+      ['RESET_INVALID', 'error.resetInvalid'],
       ['CLIENT_UPGRADE_REQUIRED', 'error.upgradeRequired'],
       ['INTERNAL', 'error.internal'],
     ];
+
+    it('covers every advertised error code', () => {
+      expect(codeCases.map(([code]) => code)).toEqual([...api.API_ERROR_CODES]);
+    });
 
     it.each(codeCases)('maps code %s to the %s catalog message', (code, key) => {
       const error = new api.ApiError(400, 'internal', undefined, { code });
@@ -556,14 +577,50 @@ describe('apiFetch', () => {
     });
   });
 
-  it('omits X-Client-Version rather than sending "undefined" when no version is configured', async () => {
+  it.each([
+    ['no version is configured', undefined],
+    ['the configured version is empty', ''],
+  ])(
+    'omits the X-Client-Version key entirely when %s',
+    async (_case, version: string | undefined) => {
+      mockVersion.value = version;
+      fetchMock.mockResolvedValue(fakeResponse());
+
+      await api.apiFetch('/me');
+
+      // toStrictEqual, not toEqual: an `X-Client-Version: undefined` entry would
+      // still reach the transport and be serialized as the literal "undefined".
+      expect(fetchMock.mock.calls[0][1].headers).toStrictEqual({
+        'Content-Type': 'application/json',
+      });
+    },
+  );
+
+  it('still sends requests when Expo exposes no config at all', async () => {
+    mockExpoConfigMissing.value = true;
     fetchMock.mockResolvedValue(fakeResponse());
 
-    await api.apiFetch('/me');
+    await expect(api.apiFetch('/me')).resolves.toEqual({});
 
-    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+    expect(fetchMock.mock.calls[0][1].headers).toStrictEqual({
       'Content-Type': 'application/json',
     });
+  });
+
+  it.each([
+    ['the default JSON timeout', undefined, 20_000],
+    ['a caller-selected timeout', 1_234, 1_234],
+  ])('arms %s for the request', async (_label, timeoutMs: number | undefined, expectedDelay) => {
+    fetchMock.mockResolvedValue(fakeResponse());
+    const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+    try {
+      await api.apiFetch('/me', timeoutMs === undefined ? {} : { timeoutMs });
+
+      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([expectedDelay]);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
   });
 
   it('serializes the body as JSON', async () => {
@@ -825,6 +882,22 @@ describe('error response parsing', () => {
     expect(api.userMessageForError(error, 'Fallback')).toBe('Fallback');
   });
 
+  it.each([
+    ['a number', 429],
+    ['an object', { name: 'RATE_LIMITED' }],
+    ['an array of codes', ['RATE_LIMITED']],
+  ])('ignores a non-string body code (%s)', async (_case, code) => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ ok: false, status: 400, json: async () => ({ code }) }),
+    );
+
+    const error = (await catchAsync(api.apiFetch('/attempt'))) as ApiErrorInstance;
+
+    expect(error).toBeInstanceOf(api.ApiError);
+    expect(error.code).toBeUndefined();
+    expect(api.userMessageForError(error, 'Fallback')).toBe('Fallback');
+  });
+
   it('swallows an unparseable error body and keeps the status ApiError', async () => {
     fetchMock.mockResolvedValue(
       fakeResponse({
@@ -956,6 +1029,61 @@ describe('error response parsing', () => {
         expect(error.retryAfterSeconds).toBe(expected);
       },
     );
+
+    // JSON can carry a quoted delay, a boolean, or an overflowing 1e999
+    // literal; only a finite JSON number may become a wait line.
+    it.each([
+      ['the string "30"', '30'],
+      ['the boolean true', true],
+      ['an infinite number', Number.POSITIVE_INFINITY],
+    ])('ignores a 503 body retryAfterSeconds carrying %s', async (_case, seconds) => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 503,
+          json: async () => ({ retryAfterSeconds: seconds }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/busy'))) as ApiErrorInstance;
+
+      expect(error.retryAfterSeconds).toBeUndefined();
+      expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.serverBusy'));
+    });
+
+    it.each([
+      ['the string "24"', '24'],
+      ['the boolean true', true],
+      ['an infinite number', Number.POSITIVE_INFINITY],
+    ])('ignores a 429 body retryAfterHours carrying %s', async (_case, hours) => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, json: async () => ({ retryAfterHours: hours }) }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.retryAfterHours).toBeUndefined();
+      expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.tooMany'));
+    });
+
+    it.each([
+      [
+        'cannot be parsed',
+        async () => {
+          throw new SyntaxError('Unexpected token');
+        },
+      ],
+      ['is not an object', async () => 'service unavailable'],
+    ])('still yields a plain retry-free ApiError when a 503 body %s', async (_case, json) => {
+      fetchMock.mockResolvedValue(fakeResponse({ ok: false, status: 503, json }));
+
+      const error = (await catchAsync(api.apiFetch('/busy'))) as ApiErrorInstance;
+
+      expect(error).toBeInstanceOf(api.ApiError);
+      expect(error).toMatchObject({ status: 503, message: 'Request failed with status 503' });
+      expect(error.retryAfterSeconds).toBeUndefined();
+      expect(error.retryAfterHours).toBeUndefined();
+    });
 
     it('ignores retry hints on statuses outside the 429/503 contract', async () => {
       fetchMock.mockResolvedValue(
@@ -1359,6 +1487,26 @@ describe('apiRequestAudioUpload', () => {
     );
 
     await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
+  });
+
+  it('rejects a self-consistent grant signed for a content type nobody asked for', async () => {
+    // Everything below parses: only the requested-vs-granted comparison in
+    // apiRequestAudioUpload can catch a grant for the wrong container.
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          mode: 's3',
+          uploadUrl: 'https://bucket.s3.amazonaws.com/',
+          uploadFields,
+          audioKey,
+          contentType: 'audio/mp4',
+          expiresIn: 900,
+          maxBytes: 25 * 1024 * 1024,
+        }),
+      }),
+    );
+
+    await expect(api.apiRequestAudioUpload('audio/webm', ownerId)).rejects.toThrow(ContractError);
   });
 
   it('rejects an otherwise valid grant whose object key belongs to another user', async () => {
@@ -2104,6 +2252,7 @@ describe('typed endpoint helpers', () => {
     await api.apiResetPassword('ada@example.com', 'abcdef123456', 'NewPass123');
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('http://localhost:4000/auth/reset-password');
+    expect(init.method).toBe('POST');
     expect(init.body).toBe(
       JSON.stringify({
         email: 'ada@example.com',
@@ -2199,6 +2348,55 @@ describe('typed endpoint helpers', () => {
       2,
       `http://localhost:4000/auth/me/data?cursor=${cursor}`,
       expect.anything(),
+    );
+  });
+
+  // A screen that unmounts mid-request must be able to cancel the read, so the
+  // caller signal has to reach fetch rather than being dropped at the helper.
+  it.each([
+    ['apiGetPracticeStats', (signal: AbortSignal) => api.apiGetPracticeStats(signal)],
+    [
+      'apiGetPracticeHistory',
+      (signal: AbortSignal) => api.apiGetPracticeHistory(undefined, signal),
+    ],
+    ['apiExportUserData', (signal: AbortSignal) => api.apiExportUserData(signal)],
+  ])('%s forwards the caller abort signal to the request', async (_name, call) => {
+    const controller = new AbortController();
+    const reason = new Error('screen left');
+    controller.abort(reason);
+    fetchMock.mockRejectedValue(new Error('aborted by platform'));
+
+    const error = await catchAsync(call(controller.signal));
+
+    // An unforwarded signal would be laundered into a generic status 0 ApiError.
+    expect(error).not.toBeInstanceOf(api.ApiError);
+    expect((error as Error).message).toBe('aborted by platform');
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
+  });
+
+  it('apiExportUserData stops walking at the page cap instead of trusting the server', async () => {
+    // Distinct cursors forever: only the page bound can end this walk.
+    const exportCursor = (page: number) =>
+      `550e8400-e29b-41d4-a716-${String(page).padStart(12, '0')}`;
+    let calls = 0;
+    fetchMock.mockImplementation(async () => {
+      calls += 1;
+      if (calls > 600) throw new Error('the export walk never stopped');
+      return fakeResponse({
+        json: async () => ({
+          user: PROFILE_USER,
+          attempts: [{ id: `a${calls}` }],
+          nextCursor: exportCursor(calls),
+        }),
+      });
+    });
+
+    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    // EXPORT_MAX_PAGES pages are fetched, and not one page more.
+    expect(fetchMock).toHaveBeenCalledTimes(500);
+    expect(fetchMock.mock.calls[499][0]).toBe(
+      `http://localhost:4000/auth/me/data?cursor=${exportCursor(499)}`,
     );
   });
 

@@ -46,7 +46,9 @@
     "format:check": "prettier --check .",
     "test": "jest --runInBand --coverage",
     "test:quick": "jest --runInBand",
-    "mutation": "stryker run",
+    "mutation": "npm run test:mutation-tooling && node scripts/run-mutation.mjs",
+    "mutation:lanes:verify": "node scripts/mutation-lanes.mjs",
+    "test:mutation-tooling": "node --test scripts/test-mutation-lanes.mjs scripts/test-merge-mutation-reports.mjs",
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "audit:ci": "node scripts/check-audit.mjs"
@@ -83,7 +85,7 @@
     },
     "testPathIgnorePatterns": [
       "/node_modules/",
-      "/.stryker-tmp/"
+      "/\\.stryker-[^/]*tmp/"
     ]
   },
   "engines": {

@@ -204,6 +204,12 @@ jobs:
       - run: npm run lint
       - run: npm run typecheck
       - run: npm test
+      # The weekly mutation campaign is the only thing that exercises the lane
+      # manifest and report merge, so verify that tooling on every push: a
+      # manifest that no longer accounts for a file should fail here, not six
+      # days later.
+      - run: npm run test:mutation-tooling
+      - run: npm run mutation:lanes:verify
       - name: Export production JavaScript bundles
         run: |
           npx expo export --platform ios --output-dir "$RUNNER_TEMP/expo-export-ios" --clear

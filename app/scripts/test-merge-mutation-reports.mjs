@@ -1,0 +1,455 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import {
+  assertMutant,
+  createMutationReportHtml,
+  mergeMutationReportData,
+  resolvedStatuses,
+  summarizeMutants,
+  unresolvedStatusSummary,
+} from './merge-mutation-reports.mjs';
+import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
+
+const location = (line) => ({ start: { line, column: 1 }, end: { line, column: 9 } });
+
+function mutant(id, status, extra = {}) {
+  return {
+    id,
+    mutatorName: 'BooleanLiteral',
+    status,
+    location: location(Number(id) + 1),
+    ...extra,
+  };
+}
+
+function laneReport({ files, testFiles, overrides = {} }) {
+  return {
+    schemaVersion: '2.0',
+    thresholds: { high: 100, low: 100, break: 100 },
+    projectRoot: '/repo/app',
+    framework: { name: 'StrykerJS', version: '9.6.1' },
+    files: Object.fromEntries(
+      Object.entries(files).map(([name, mutants]) => [
+        name,
+        { language: 'typescript', source: `// ${name}`, mutants },
+      ]),
+    ),
+    testFiles: Object.fromEntries(
+      Object.entries(testFiles).map(([name, tests]) => [name, { source: `// ${name}`, tests }]),
+    ),
+    ...overrides,
+  };
+}
+
+const twoLaneManifest = {
+  lanes: {
+    first: { mutate: ['src/a.ts'], testFiles: ['__tests__/shared-test.ts'] },
+    second: {
+      mutate: ['src/b.ts'],
+      testFiles: ['__tests__/shared-test.ts', '__tests__/second-test.ts'],
+    },
+  },
+  laneNames: ['first', 'second'],
+  expectedFiles: ['src/a.ts', 'src/b.ts'],
+  // The real allowlist describes real source; fixtures supply their own.
+  equivalences: [],
+};
+
+function twoLaneReports() {
+  return {
+    first: laneReport({
+      files: {
+        'src/a.ts': [
+          mutant('0', 'Killed', { coveredBy: ['0', '1'], killedBy: ['1'], static: false }),
+        ],
+      },
+      testFiles: {
+        '__tests__/shared-test.ts': [
+          { id: '0', name: 'shared one', location: location(3) },
+          { id: '1', name: 'shared two', location: location(7) },
+        ],
+      },
+    }),
+    second: laneReport({
+      files: {
+        'src/b.ts': [
+          mutant('0', 'Survived', { coveredBy: ['5'], static: true }),
+          mutant('1', 'Killed', { coveredBy: ['5', '6'], killedBy: ['6'] }),
+        ],
+      },
+      testFiles: {
+        // Same file, same tests as the first lane: they must fold into one identity.
+        '__tests__/shared-test.ts': [
+          { id: '5', name: 'shared one', location: location(3) },
+          { id: '9', name: 'shared two', location: location(7) },
+        ],
+        '__tests__/second-test.ts': [{ id: '6', name: 'second only', location: location(2) }],
+      },
+    }),
+  };
+}
+
+test('merging renumbers mutants and rewrites every test reference', () => {
+  const { report, summary } = mergeMutationReportData({
+    reportsByLane: twoLaneReports(),
+    ...twoLaneManifest,
+  });
+
+  assert.deepEqual(Object.keys(report.files), ['src/a.ts', 'src/b.ts']);
+  assert.deepEqual(
+    Object.values(report.files).flatMap((file) => file.mutants.map((each) => each.id)),
+    ['0', '1', '2'],
+    'mutant IDs are globally unique after the merge',
+  );
+
+  const testsByName = new Map(
+    Object.entries(report.testFiles).flatMap(([fileName, file]) =>
+      file.tests.map((each) => [`${fileName}:${each.name}`, each.id]),
+    ),
+  );
+  assert.equal(testsByName.size, 3, 'the shared test file is folded, not duplicated');
+
+  const [aMutant] = report.files['src/a.ts'].mutants;
+  assert.deepEqual(aMutant.killedBy, [testsByName.get('__tests__/shared-test.ts:shared two')]);
+  const [survivor, killed] = report.files['src/b.ts'].mutants;
+  assert.deepEqual(survivor.coveredBy, [testsByName.get('__tests__/shared-test.ts:shared one')]);
+  assert.deepEqual(killed.killedBy, [testsByName.get('__tests__/second-test.ts:second only')]);
+
+  assert.equal(summary.mutantCount, 3);
+  assert.equal(summary.testCount, 3);
+  assert.equal(summary.laneCount, 2);
+  assert.equal(summary.staticMutants, 1);
+  assert.equal(summary.dynamicMutants, 2);
+  assert.equal(summary.strictMutationGatePassed, false);
+  assert.equal(summary.mutationScore, (2 / 3) * 100);
+  assert.deepEqual(
+    summary.lanes.map((each) => [each.name, each.mutantCount, each.statusCounts.Survived]),
+    [
+      ['first', 1, 0],
+      ['second', 2, 1],
+    ],
+  );
+});
+
+test('a campaign with nothing left unresolved passes the strict gate', () => {
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].status = 'Killed';
+  reports.second.files['src/b.ts'].mutants[0].killedBy = ['5'];
+  const { summary } = mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest });
+  assert.equal(summary.strictMutationGatePassed, true);
+  assert.equal(summary.mutationScore, 100);
+  assert.equal(unresolvedStatusSummary(summary.statusCounts), '');
+});
+
+test('a survivor explained by a reviewed equivalence entry passes the gate', () => {
+  const equivalences = [
+    {
+      file: 'src/b.ts',
+      mutator: 'BooleanLiteral',
+      original: '// src/b.ts',
+      replacements: ['true'],
+      reason: 'fixture: proven unkillable',
+    },
+  ];
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].replacement = 'true';
+  const { summary } = mergeMutationReportData({
+    reportsByLane: reports,
+    ...twoLaneManifest,
+    equivalences,
+  });
+  assert.equal(summary.strictMutationGatePassed, true);
+  assert.equal(summary.acceptedEquivalents, 1);
+  assert.deepEqual(summary.unexplainedSurvivors, []);
+  // Stryker's own score still counts it as survived; only our gate forgives it.
+  assert.equal(summary.statusCounts.Survived, 1);
+});
+
+test('a survivor nobody explained fails the gate and is named', () => {
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].replacement = 'true';
+  const { summary } = mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest });
+  assert.equal(summary.strictMutationGatePassed, false);
+  assert.equal(summary.unexplainedSurvivors.length, 1);
+  assert.equal(summary.unexplainedSurvivors[0].file, 'src/b.ts');
+  assert.equal(summary.unexplainedSurvivors[0].mutatorName, 'BooleanLiteral');
+});
+
+test('an Ignored mutant nobody explained fails the gate', () => {
+  // Regression: a `// Stryker disable all` comment whose `restore` did not take
+  // effect silenced 157 mutants in login.tsx, and the campaign still reported
+  // 100%. Ignoring a mutant is a claim, and the claim has to be written down.
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].status = 'Ignored';
+  const { summary } = mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest });
+  assert.equal(summary.strictMutationGatePassed, false);
+  assert.equal(summary.unexplainedSurvivors.length, 1);
+  assert.equal(summary.unexplainedSurvivors[0].status, 'Ignored');
+  assert.match(unresolvedStatusSummary(summary.statusCounts), /Ignored=1/);
+});
+
+test('an equivalence entry that matches nothing fails the gate', () => {
+  const equivalences = [
+    {
+      file: 'src/a.ts',
+      mutator: 'BooleanLiteral',
+      original: 'code that no longer exists',
+      replacements: ['true'],
+      reason: 'fixture: stale exemption',
+    },
+  ];
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].status = 'Killed';
+  reports.second.files['src/b.ts'].mutants[0].killedBy = ['5'];
+  const { summary } = mergeMutationReportData({
+    reportsByLane: reports,
+    ...twoLaneManifest,
+    equivalences,
+  });
+  assert.equal(summary.strictMutationGatePassed, false, 'a stale exemption must not pass silently');
+  assert.equal(summary.staleEquivalenceEntries.length, 1);
+  assert.equal(summary.staleEquivalenceEntries[0].original, 'code that no longer exists');
+});
+
+test('an entry must excuse exactly the number of mutants it declares', () => {
+  // Spans are whole source lines, so one entry can straddle several mutants of
+  // the same mutator and replacement. If a sibling that is killed today starts
+  // surviving, it must not slip in behind an existing exemption.
+  const entry = {
+    file: 'src/a.ts',
+    mutator: 'ConditionalExpression',
+    original: 'if (a && b) return;',
+    replacements: ['true'],
+    count: 1,
+    reason: 'fixture',
+  };
+  const survivor = {
+    file: 'src/a.ts',
+    status: 'Survived',
+    mutatorName: 'ConditionalExpression',
+    replacement: 'true',
+    original: 'if (a && b) return;',
+    line: 1,
+  };
+
+  const one = applyEquivalenceAllowlist([survivor], [entry]);
+  assert.equal(one.accepted.length, 1);
+  assert.deepEqual(one.staleEntries, [], 'the declared count is met exactly');
+
+  const two = applyEquivalenceAllowlist([survivor, { ...survivor, line: 1 }], [entry]);
+  assert.equal(two.staleEntries.length, 1, 'a second mutant behind one exemption must be flagged');
+  assert.equal(two.staleEntries[0].matched, 2);
+  assert.equal(two.staleEntries[0].expected, 1);
+
+  const none = applyEquivalenceAllowlist([], [entry]);
+  assert.equal(none.staleEntries.length, 1, 'an exemption matching nothing must be flagged');
+  assert.equal(none.staleEntries[0].matched, 0);
+});
+
+test('an entry may pin the lines it covers when the node text repeats', () => {
+  // `if (!isCurrent()) return;` occurs 19 times in Recorder.tsx and exactly two
+  // are unkillable, so text alone would excuse the seventeen that are killed.
+  const entry = {
+    file: 'src/components/Recorder.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'if (!isCurrent()) return;',
+    replacements: ['false'],
+    lines: [477, 487],
+    count: 2,
+    reason: 'fixture',
+  };
+  const at = (line) => ({
+    file: 'src/components/Recorder.tsx',
+    status: 'Survived',
+    mutatorName: 'ConditionalExpression',
+    replacement: 'false',
+    original: 'if (!isCurrent()) return;',
+    line,
+  });
+
+  const covered = applyEquivalenceAllowlist([at(477), at(487)], [entry]);
+  assert.equal(covered.accepted.length, 2);
+  assert.deepEqual(covered.staleEntries, []);
+
+  const elsewhere = applyEquivalenceAllowlist([at(477), at(487), at(1211)], [entry]);
+  assert.equal(elsewhere.unexplained.length, 1, 'a sibling on another line is not excused');
+  assert.equal(elsewhere.unexplained[0].line, 1211);
+});
+
+test('equivalence matching ignores line numbers and reflowed whitespace', () => {
+  const survivors = [
+    {
+      file: 'src/a.ts',
+      status: 'Survived',
+      mutatorName: 'LogicalOperator',
+      replacement: 'a   ||   b',
+      original: 'const x =\n  a &&\n  b;',
+      line: 999,
+    },
+  ];
+  const { accepted, unexplained, staleEntries } = applyEquivalenceAllowlist(survivors, [
+    {
+      file: 'src/a.ts',
+      mutator: 'LogicalOperator',
+      original: 'const x = a && b;',
+      replacements: ['a || b'],
+      reason: 'fixture',
+    },
+  ]);
+  assert.equal(accepted.length, 1);
+  assert.equal(accepted[0].reason, 'fixture');
+  assert.deepEqual(unexplained, []);
+  assert.deepEqual(staleEntries, []);
+});
+
+test('every checked-in equivalence entry is complete and reviewable', () => {
+  assert.ok(equivalentMutants.length > 0);
+  for (const entry of equivalentMutants) {
+    assert.match(entry.file, /^src\//, 'file must be a repo-relative source path');
+    assert.ok(entry.mutator.length > 0, `${entry.file} entry has no mutator`);
+    assert.ok(entry.originals.length > 0, `${entry.file} entry names no source span`);
+    assert.ok(Object.isFrozen(entry.originals), `${entry.file} source spans must be frozen`);
+    for (const original of entry.originals) {
+      assert.ok(original.trim().length > 0, `${entry.file} entry has an empty source span`);
+    }
+    assert.ok(entry.replacements.length > 0, `${entry.file} entry lists no replacement`);
+    assert.ok(
+      entry.reason.trim().length >= 40,
+      `${entry.file} [${entry.mutator}] must explain WHY no test can kill it`,
+    );
+    assert.ok(Object.isFrozen(entry), 'entries must be frozen');
+  }
+});
+
+test('the strict gate rejects statuses that Stryker excludes from its own score', () => {
+  for (const status of [
+    'Survived',
+    'NoCoverage',
+    'CompileError',
+    'RuntimeError',
+    'Pending',
+    // Ignored counts too: a leaking `// Stryker disable` comment silently
+    // excluded 157 real mutants once, and the campaign still read as 100%.
+    'Ignored',
+  ]) {
+    const summary = summarizeMutants([mutant('0', 'Killed'), mutant('1', status)]);
+    assert.equal(summary.strictMutationGatePassed, false, `${status} must not pass the gate`);
+    assert.match(unresolvedStatusSummary(summary.statusCounts), new RegExp(`${status}=1`));
+  }
+  for (const status of resolvedStatuses) {
+    assert.equal(summarizeMutants([mutant('0', status)]).strictMutationGatePassed, true);
+  }
+});
+
+test('Ignored mutants are excluded from the score rather than counted as kills', () => {
+  const summary = summarizeMutants([mutant('0', 'Killed'), mutant('1', 'Ignored')]);
+  assert.equal(summary.mutantCount, 2);
+  assert.equal(summary.mutationScore, 100);
+  assert.equal(summary.statusCounts.Ignored, 1);
+});
+
+test('a lane report whose files disagree with the manifest is rejected', () => {
+  const reports = twoLaneReports();
+  reports.first.files['src/unexpected.ts'] = { language: 'typescript', source: '', mutants: [] };
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /Source files in lane first.*Unexpected: src\/unexpected\.ts/s,
+  );
+});
+
+test('a lane report missing one of its test files is rejected', () => {
+  const reports = twoLaneReports();
+  delete reports.second.testFiles['__tests__/second-test.ts'];
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /Test files in lane second.*Missing: __tests__\/second-test\.ts/s,
+  );
+});
+
+test('a missing lane report is rejected rather than silently skipped', () => {
+  const reports = twoLaneReports();
+  delete reports.second;
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /Mutation lane reports.*Missing: second/s,
+  );
+});
+
+test('reports produced by different Stryker versions are rejected', () => {
+  const reports = twoLaneReports();
+  reports.second.framework = { name: 'StrykerJS', version: '9.0.0' };
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /metadata framework differs between lanes first and second/,
+  );
+});
+
+test('a repeated mutant ID inside one lane is rejected', () => {
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[1].id = '0';
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /repeats mutant ID 0/,
+  );
+});
+
+test('a mutant referencing an unknown test ID is rejected', () => {
+  const reports = twoLaneReports();
+  reports.first.files['src/a.ts'].mutants[0].coveredBy = ['404'];
+  assert.throws(
+    () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
+    /references unknown test ID 404/,
+  );
+});
+
+test('an unknown mutant status is rejected', () => {
+  assert.throws(
+    () => assertMutant(mutant('0', 'Probably fine'), 'fixture'),
+    /fixture\.status is invalid/,
+  );
+  assert.throws(
+    () => assertMutant({ ...mutant('0', 'Killed'), location: {} }, 'fixture'),
+    /fixture\.location\.start/,
+  );
+  assert.throws(() => assertMutant({ ...mutant('0', 'Killed'), id: '' }, 'fixture'), /fixture\.id/);
+});
+
+test('the merged config advertises the whole campaign, not the first lane', () => {
+  const reports = twoLaneReports();
+  for (const [laneName, report] of Object.entries(reports)) {
+    report.config = {
+      mutate: ['whatever'],
+      tempDirName: `.stryker-${laneName}-tmp`,
+      jsonReporter: {},
+      concurrency: 3,
+    };
+  }
+  const { report } = mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest });
+  assert.deepEqual(report.config.mutate, ['src/a.ts', 'src/b.ts']);
+  assert.deepEqual(report.config.mutationLanes, ['first', 'second']);
+  assert.equal(report.config.concurrency, 3);
+  assert.ok(
+    !('tempDirName' in report.config),
+    'the per-lane sandbox name is meaningless once merged',
+  );
+  assert.ok(!('jsonReporter' in report.config));
+});
+
+test('the HTML report neutralises sequences that would break out of the script tag', async () => {
+  const html = await createMutationReportHtml({
+    files: { 'src/a.ts': { language: 'typescript', source: '</script><img src=x>', mutants: [] } },
+    testFiles: {},
+    schemaVersion: '2.0',
+    thresholds: { high: 100, low: 100, break: 100 },
+  });
+  const embedded = html.slice(html.indexOf('app.report = '));
+  assert.ok(!embedded.includes('</script><img'), 'the closing tag must be escaped');
+  assert.match(embedded, /\\u003c\/script>/);
+  assert.ok(
+    !embedded.includes('\u2028'),
+    'a raw line separator is invalid inside a JS string literal',
+  );
+  assert.ok(!embedded.includes('\u2029'));
+  assert.ok(html.includes(' '), 'ordinary spaces must survive escaping');
+});

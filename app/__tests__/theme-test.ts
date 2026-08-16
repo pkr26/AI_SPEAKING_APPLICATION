@@ -1,5 +1,25 @@
-import { colors, darkColors, layout, lightColors, radii, spacing } from '../src/lib/theme';
-import type { ThemeColors } from '../src/lib/theme';
+import { render, screen } from '@testing-library/react-native';
+import React from 'react';
+import { Text } from 'react-native';
+
+import {
+  colors,
+  createThemedStyles,
+  darkColors,
+  layout,
+  lightColors,
+  radii,
+  spacing,
+  useTheme,
+} from '../src/lib/theme';
+import type { ColorScheme, Theme, ThemeColors } from '../src/lib/theme';
+
+const mockUseColorScheme = jest.fn<ColorScheme | null, []>();
+
+jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
+  __esModule: true,
+  default: () => mockUseColorScheme(),
+}));
 
 /** WCAG 2.1 relative luminance of a #RRGGBB hex color. */
 function relativeLuminance(hex: string): number {
@@ -130,6 +150,68 @@ describe('theme palette', () => {
     expect(
       contrastRatio(darkColors.inputBorder, darkColors.inputBackground),
     ).toBeGreaterThanOrEqual(3);
+  });
+
+  describe('useTheme', () => {
+    // A probe component, built without JSX so this stays a plain .ts file.
+    let seen: Theme | undefined;
+
+    function Probe(): React.ReactElement {
+      const theme = useTheme();
+      seen = theme;
+      return React.createElement(Text, null, theme.scheme);
+    }
+
+    async function renderProbe(scheme: ColorScheme | null): Promise<Theme> {
+      mockUseColorScheme.mockReturnValue(scheme);
+      await render(React.createElement(Probe));
+      if (!seen) throw new Error('probe did not render');
+      return seen;
+    }
+
+    it('resolves the light scheme and its palette', async () => {
+      const theme = await renderProbe('light');
+      expect(theme.scheme).toBe('light');
+      expect(screen.getByText('light')).toBeTruthy();
+      expect(theme.colors).toBe(lightColors);
+    });
+
+    it('resolves the dark scheme and its palette', async () => {
+      const theme = await renderProbe('dark');
+      expect(theme.scheme).toBe('dark');
+      expect(screen.getByText('dark')).toBeTruthy();
+      expect(theme.colors).toBe(darkColors);
+    });
+
+    it('falls back to light when the OS reports no scheme', async () => {
+      const theme = await renderProbe(null);
+      expect(theme.scheme).toBe('light');
+      expect(theme.colors).toBe(lightColors);
+    });
+
+    it('hands back one referentially stable theme per scheme', async () => {
+      const first = await renderProbe('dark');
+      const second = await renderProbe('dark');
+      expect(second).toBe(first);
+      expect(await renderProbe('light')).not.toBe(first);
+    });
+
+    it('caches themed styles per scheme rather than across them', async () => {
+      // scheme is the cache key, so two schemes must not share a StyleSheet.
+      const themedStyles = createThemedStyles(({ colors: palette }) => ({
+        box: { backgroundColor: palette.background },
+      }));
+      const lightTheme = await renderProbe('light');
+      const darkTheme = await renderProbe('dark');
+
+      const lightStyles = themedStyles(lightTheme);
+      const darkStyles = themedStyles(darkTheme);
+
+      expect(themedStyles(lightTheme)).toBe(lightStyles);
+      expect(darkStyles).not.toBe(lightStyles);
+      expect(lightStyles.box).toEqual({ backgroundColor: lightColors.background });
+      expect(darkStyles.box).toEqual({ backgroundColor: darkColors.background });
+    });
   });
 
   it('provides responsive, touch-safe design tokens', () => {

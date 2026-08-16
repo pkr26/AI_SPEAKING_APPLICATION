@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { File, Paths } from 'expo-file-system';
 import { router } from 'expo-router';
 import * as Sharing from 'expo-sharing';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -88,6 +88,14 @@ export default function SettingsScreen() {
   const [retakeBusy, setRetakeBusy] = useState(false);
   const [retakeError, setRetakeError] = useState<string | null>(null);
 
+  // Re-entrancy latches. Each `disabled={xBusy}` prop and the handler it gates
+  // read the same render's state, so a second press landing before React has
+  // re-rendered would still see `false` and fire the request twice. A ref
+  // updates synchronously, which is what these guards were always meant to do.
+  const exportBusyRef = useRef(false);
+  const reminderBusyRef = useRef(false);
+  const retakeBusyRef = useRef(false);
+
   useEffect(() => {
     let active = true;
     void getDailyReminder().then((stored) => {
@@ -158,7 +166,8 @@ export default function SettingsScreen() {
   };
 
   const exportData = async () => {
-    if (exportBusy) return;
+    if (exportBusyRef.current) return;
+    exportBusyRef.current = true;
     setExportBusy(true);
     setExportError(null);
     try {
@@ -186,12 +195,14 @@ export default function SettingsScreen() {
     } catch (error) {
       setExportError(userMessageForError(error, t('settings.exportFailed')));
     } finally {
+      exportBusyRef.current = false;
       setExportBusy(false);
     }
   };
 
   const applyReminder = async (next: ReminderState) => {
-    if (reminderBusy) return;
+    if (reminderBusyRef.current) return;
+    reminderBusyRef.current = true;
     setReminderBusy(true);
     setReminderError(null);
     try {
@@ -212,6 +223,7 @@ export default function SettingsScreen() {
     } catch {
       setReminderError(t('reminder.failed'));
     } finally {
+      reminderBusyRef.current = false;
       setReminderBusy(false);
     }
   };
@@ -234,7 +246,8 @@ export default function SettingsScreen() {
   };
 
   const retakeTest = async () => {
-    if (retakeBusy) return;
+    if (retakeBusyRef.current) return;
+    retakeBusyRef.current = true;
     setRetakeBusy(true);
     setRetakeError(null);
     try {
@@ -250,6 +263,7 @@ export default function SettingsScreen() {
     } catch (error) {
       setRetakeError(userMessageForError(error, t('retake.failed')));
     } finally {
+      retakeBusyRef.current = false;
       setRetakeBusy(false);
     }
   };

@@ -125,15 +125,19 @@ function text(testID: string): string {
   return String(screen.getByTestId(testID).props.children);
 }
 
-function renderTree(queryClient: QueryClient) {
-  return render(
+function tree(queryClient: QueryClient) {
+  return (
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
         <Capture />
         <SessionDisplay />
       </AuthProvider>
-    </QueryClientProvider>,
+    </QueryClientProvider>
   );
+}
+
+function renderTree(queryClient: QueryClient) {
+  return render(tree(queryClient));
 }
 
 async function renderAuth(storedToken: string | null = null) {
@@ -152,6 +156,32 @@ async function renderLoggedIn(token = 'tok-1') {
     await auth!.login('a@example.com', 'secret1');
   });
   return rendered;
+}
+
+/**
+ * Hands the provider a different QueryClient and returns a spy on the cache
+ * that is live afterwards. Every session callback must clear the cache the tree
+ * currently reads from: a callback that captured the abandoned client would
+ * leave the previous user's cached answers readable by the next one.
+ */
+async function replaceQueryClient(
+  rendered: Awaited<ReturnType<typeof renderTree>>,
+  restoredToken: string | null,
+) {
+  const replacement = new QueryClient();
+  const replacementClear = jest.spyOn(replacement, 'clear');
+  mockedGetToken.mockResolvedValue(restoredToken);
+
+  await act(async () => {
+    await rendered.rerender(tree(replacement));
+  });
+
+  // The provider re-reads the persisted session for the new cache.
+  await waitFor(() => expect(replacementClear).toHaveBeenCalledTimes(1));
+  await waitFor(() => expect(text('isRestoring')).toBe('false'));
+  expect(text('token')).toBe(restoredToken ?? 'null');
+  replacementClear.mockClear();
+  return replacementClear;
 }
 
 function registeredUnauthorizedHandler(): (rejectedToken: string) => void {
@@ -653,6 +683,27 @@ describe('expireSession via the unauthorized handler', () => {
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
     expect(mockedMarkSessionExpiredNotice).not.toHaveBeenCalled();
+  });
+
+  it('never deletes stored credentials unconditionally when no token is in memory', async () => {
+    await renderAuth(null);
+    const failure = new ApiError(401, 'Request failed with status 401');
+    mockedApiFetch.mockImplementation((async () => {
+      throw failure;
+    }) as unknown as typeof apiFetch);
+
+    // A 401 on credential confirmation expires a session that never held a
+    // token, so the expiry has nothing of its own to remove.
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
+    expect(mockedMarkSessionExpiredNotice).toHaveBeenCalledTimes(1);
+    // Only the user's explicit reset may issue the unconditional delete; a 401
+    // must never wipe an entry this provider does not own.
+    expect(mockedClearToken).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
   });
 
   it('ignores a rejection that arrives during an account transition', async () => {
@@ -1178,6 +1229,255 @@ describe('epoch race guards', () => {
     cleanup.resolve();
     await expect(login).rejects.toThrow('The account operation was cancelled.');
     expect(mockedSaveToken).not.toHaveBeenCalled();
+  });
+
+  // The following five tests pin that the session epoch only ever moves
+  // forward. Every identity change must land on a value no earlier epoch has
+  // held, otherwise two changes cancel out and a superseded restore or token
+  // write is mistaken for the current one.
+  it('ignores a restore that lands after a 401 expired the session that raced it', async () => {
+    const stored = deferred<string | null>();
+    mockedGetToken.mockReturnValue(stored.promise);
+    await renderTree(new QueryClient());
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-login');
+    });
+    expect(text('token')).toBe('null');
+
+    await act(async () => {
+      stored.resolve('tok-stored');
+      await stored.promise;
+    });
+
+    // A rejected session must not be resurrected by the launch-time read.
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('2');
+  });
+
+  it('ignores a restore that lands after the stored session was explicitly wiped', async () => {
+    const stored = deferred<string | null>();
+    mockedGetToken.mockReturnValue(stored.promise);
+    await renderTree(new QueryClient());
+
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+    expect(mockedClearToken).toHaveBeenCalledWith();
+
+    await act(async () => {
+      stored.resolve('tok-stored');
+      await stored.promise;
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('sessionVersion')).toBe('2');
+  });
+
+  it('ignores a restore that lands after the account was deleted', async () => {
+    const stored = deferred<string | null>();
+    mockedGetToken.mockReturnValue(stored.promise);
+    await renderTree(new QueryClient());
+
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    await act(async () => {
+      await auth!.deleteAccount('secret1');
+    });
+
+    await act(async () => {
+      stored.resolve('tok-stored');
+      await stored.promise;
+    });
+
+    // The deleted account's token must not come back from secure storage.
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('1');
+  });
+
+  it('rolls back a token write that lands after a wipe and a restore retry', async () => {
+    await renderAuth(null);
+    const write = deferred<void>();
+    mockedSaveToken.mockReturnValueOnce(write.promise);
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-late'));
+
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockedSaveToken).toHaveBeenCalledWith('tok-late'));
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+    await act(async () => {
+      auth!.retrySessionRestore();
+    });
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+
+    await act(async () => {
+      write.resolve();
+      await expect(login).rejects.toThrow('The account operation was cancelled.');
+    });
+
+    expect(mockedClearToken).toHaveBeenLastCalledWith('tok-late');
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+  });
+
+  it('rolls back a token write that lands after a wipe and unmount', async () => {
+    const rendered = await renderAuth(null);
+    const write = deferred<void>();
+    mockedSaveToken.mockReturnValueOnce(write.promise);
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-late'));
+
+    let login!: Promise<User>;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockedSaveToken).toHaveBeenCalledWith('tok-late'));
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+    await rendered.unmount();
+
+    write.resolve();
+    await expect(login).rejects.toThrow('The account operation was cancelled.');
+    expect(mockedClearToken).toHaveBeenLastCalledWith('tok-late');
+  });
+});
+
+describe('per-user cache isolation when the query client is replaced', () => {
+  async function loggedOutWithReplacedClient() {
+    const rendered = await renderAuth(null);
+    const live = await replaceQueryClient(rendered, null);
+    rendered.clearSpy.mockClear();
+    return { abandoned: rendered.clearSpy, live };
+  }
+
+  async function loggedInWithReplacedClient() {
+    const rendered = await renderLoggedIn();
+    const live = await replaceQueryClient(rendered, 'tok-1');
+    rendered.clearSpy.mockClear();
+    return { abandoned: rendered.clearSpy, live };
+  }
+
+  it('clears the live cache when a login establishes a session', async () => {
+    const { abandoned, live } = await loggedOutWithReplacedClient();
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
+
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('tok-login');
+  });
+
+  it('clears the live cache when a registration establishes a session', async () => {
+    const { abandoned, live } = await loggedOutWithReplacedClient();
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-registered'));
+
+    await act(async () => {
+      await auth!.register('Test User', 'a@example.com', 'secret1', 'hi');
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('tok-registered');
+  });
+
+  it('clears the live cache when a password rotation establishes a session', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-rotated'));
+
+    await act(async () => {
+      await auth!.changePassword('secret1', 'secret2');
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('tok-rotated');
+  });
+
+  it('clears the live cache when logout resets the session', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await auth!.logout();
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
+  });
+
+  it('clears the live cache when the account is deleted', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await auth!.deleteAccount('secret1');
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
+  });
+
+  it('clears the live cache when the server rejects the active token', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
+  });
+
+  it('clears the live cache when credential verification expires the session', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+    const failure = new ApiError(401, 'Request failed with status 401');
+    mockedApiFetch.mockImplementation((async () => {
+      throw failure;
+    }) as unknown as typeof apiFetch);
+
+    await act(async () => {
+      await expect(auth!.changePassword('secret1', 'secret2')).rejects.toBe(failure);
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
+  });
+
+  it('clears the live cache when the stored session is reset', async () => {
+    const { abandoned, live } = await loggedInWithReplacedClient();
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+
+    expect(live).toHaveBeenCalledTimes(1);
+    expect(abandoned).not.toHaveBeenCalled();
+    expect(text('token')).toBe('null');
   });
 });
 

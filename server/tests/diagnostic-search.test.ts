@@ -159,6 +159,9 @@ describe('diagnostic adaptive binary search', () => {
       next.question.id,
     );
     expect(r.status).toBe(409);
-    expect(r.body.error).toBe('An assessment is already in progress');
+    expect(r.body).toEqual({
+      error: 'An assessment is already in progress',
+      code: 'ASSESSMENT_IN_PROGRESS',
+    });
   });
 });

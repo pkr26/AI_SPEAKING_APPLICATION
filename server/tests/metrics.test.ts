@@ -327,11 +327,17 @@ describe('provider call metrics', () => {
     try {
       openaiMocks.transcribe.mockRejectedValue(new Error('socket hangup'));
       await expect(assessSpeaking(audioPath, QUESTION, userId)).rejects.toMatchObject({ status: 502 });
+      expect(await counterValue(providerCallErrors, { kind: 'transcription', outcome: 'error' })).toBe(errorBefore + 1);
+      expect(await counterValue(providerCallErrors, { kind: 'transcription', outcome: 'timeout' })).toBe(timeoutBefore);
 
       openaiMocks.transcribe.mockRejectedValue(
         Object.assign(new Error('timed out'), { name: 'APIConnectionTimeoutError' }),
       );
       await expect(assessSpeaking(audioPath, QUESTION, userId)).rejects.toMatchObject({ status: 504 });
+      expect(await counterValue(providerCallErrors, { kind: 'transcription', outcome: 'error' })).toBe(errorBefore + 1);
+      expect(await counterValue(providerCallErrors, { kind: 'transcription', outcome: 'timeout' })).toBe(
+        timeoutBefore + 1,
+      );
     } finally {
       warn.mockRestore();
       config.mockAi = savedMockAi;

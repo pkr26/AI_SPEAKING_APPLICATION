@@ -12,7 +12,10 @@ vi.mock('../src/assess', async (importOriginal) => {
 
 import { answerForm, app, pool, registerUser } from './helpers';
 
+let a: ReturnType<typeof app>;
+
 beforeEach(() => {
+  a = app();
   speakMock.mockReset();
   nativeMock.mockReset();
 });
@@ -31,8 +34,6 @@ function mockScore(score: number) {
 }
 
 describe('practice SRS scheduling and skip', () => {
-  const a = app();
-
   /** Fresh learner placed at `level` directly (no diagnostic budget spent). */
   async function freshUserAt(level = 'A1') {
     const { res } = await registerUser(a);

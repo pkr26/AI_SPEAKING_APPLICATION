@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import request from 'supertest';
 import fs from 'fs/promises';
@@ -15,9 +15,13 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('practice', () => {
-  const a = app();
+let a: ReturnType<typeof app>;
 
+beforeEach(() => {
+  a = app();
+});
+
+describe('practice', () => {
   it('GET /question returns 403 before the diagnostic is completed', async () => {
     const { res } = await registerUser(a);
     const r = await request(a).get('/practice/question').set('Authorization', `Bearer ${res.body.token}`);
@@ -120,11 +124,45 @@ describe('practice', () => {
     const cached = await request(a)
       .get(`/practice/question/${questionId}/help`)
       .set('Authorization', `Bearer ${token}`)
-      .set('If-None-Match', etag);
+      .set('If-None-Match', etag)
+      .set('Cache-Control', 'no-cache');
     expect(cached.status).toBe(304);
+
+    const weak = await request(a)
+      .get(`/practice/question/${questionId}/help`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('If-None-Match', `W/${etag}`)
+      .set('Cache-Control', 'no-cache');
+    expect(weak.status).toBe(304);
+
+    const listed = await request(a)
+      .get(`/practice/question/${questionId}/help`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('If-None-Match', `"stale",   W/${etag}  , "later"`)
+      .set('Cache-Control', 'no-cache');
+    expect(listed.status).toBe(304);
+
+    const wildcard = await request(a)
+      .get(`/practice/question/${questionId}/help`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('If-None-Match', '*')
+      .set('Cache-Control', 'no-cache');
+    expect(wildcard.status).toBe(304);
+
+    const stale = await request(a)
+      .get(`/practice/question/${questionId}/help`)
+      .set('Authorization', `Bearer ${token}`)
+      .set('If-None-Match', '"stale"')
+      .set('Cache-Control', 'no-cache');
+    expect(stale.status).toBe(200);
+    expect(stale.body).toEqual(help.body);
 
     const bad = await request(a).get('/practice/question/not-a-uuid/help').set('Authorization', `Bearer ${token}`);
     expect(bad.status).toBe(400);
+    expect(bad.body).toEqual({
+      error: 'id: question id must be a valid UUID',
+      code: 'VALIDATION_FAILED',
+    });
 
     const missing = await request(a)
       .get('/practice/question/00000000-0000-0000-0000-000000000000/help')
@@ -203,6 +241,20 @@ describe('practice', () => {
       'not-a-uuid',
     );
     expect(r.status).toBe(400);
+  });
+
+  it('POST /attempt returns the exact missing-question contract', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    await completeDiagnostic(a, token);
+
+    const missing = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      '00000000-0000-0000-0000-000000000000',
+    );
+
+    expect(missing.status).toBe(404);
+    expect(missing.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
   });
 
   it('cleans uploaded audio when multipart field validation fails', async () => {
@@ -780,8 +832,6 @@ describe('practice', () => {
 });
 
 describe('health', () => {
-  const a = app();
-
   it('GET /health returns 200', async () => {
     const r = await request(a).get('/health');
     expect(r.status).toBe(200);

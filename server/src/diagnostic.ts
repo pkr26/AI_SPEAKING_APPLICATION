@@ -66,13 +66,6 @@ async function questionById(client: PoolClient, questionId: string): Promise<Que
   return rows[0];
 }
 
-// Restart resets the learner's level, so the client must confirm explicitly.
-const restartBodySchema = z.object({
-  confirm: z.literal(true, {
-    errorMap: () => ({ message: 'must be true to restart the diagnostic' }),
-  }),
-});
-
 interface DiagnosticClaim {
   claimId: string;
   question: QuestionRow;
@@ -176,7 +169,9 @@ async function finalizeDiagnosticAnswer(
     };
 
     if (done) {
-      const level = LEVELS[Math.max(0, Math.min(LEVELS.length - 1, high))];
+      // diagnostic_state.high_idx is constrained to [-1, 5] and only moves
+      // downward here, so only the all-failed -1 boundary needs clamping.
+      const level = LEVELS[Math.max(0, high)];
       await client.query(
         `UPDATE diagnostic_state
          SET low_idx = $1, high_idx = $2, questions_asked = $3,
@@ -216,6 +211,14 @@ async function finalizeDiagnosticAnswer(
 }
 
 export function createDiagnosticRouter(limiters: Limiters) {
+  // Restart resets the learner's level, so the client must confirm explicitly.
+  // Construct this with the router so every freshly built app gets the exact
+  // validation contract instead of sharing module-initialization state.
+  const restartBodySchema = z.object({
+    confirm: z.literal(true, {
+      errorMap: () => ({ message: 'must be true to restart the diagnostic' }),
+    }),
+  });
   const router = Router();
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');

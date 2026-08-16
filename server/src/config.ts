@@ -1,15 +1,15 @@
 import dotenv from 'dotenv';
+import { isIP } from 'node:net';
 import { z } from 'zod';
 
 dotenv.config();
 
-const bool = (defaultValue: boolean) =>
-  z
-    .enum(['true', 'false', '1', '0'], {
-      errorMap: () => ({ message: "must be one of 'true', 'false', '1', or '0'" }),
-    })
-    .optional()
-    .transform((v) => (v === undefined ? defaultValue : v === 'true' || v === '1'));
+const bool = z
+  .enum(['true', 'false', '1', '0'], {
+    errorMap: () => ({ message: "must be one of 'true', 'false', '1', or '0'" }),
+  })
+  .optional()
+  .transform((v) => v === 'true' || v === '1');
 
 const trustProxyHops = z
   .string()
@@ -38,16 +38,11 @@ const envSchema = z
       .trim()
       .min(1, 'DATABASE_URL is required')
       .refine((value) => {
-        try {
-          const url = new URL(value);
-          return (
-            (url.protocol === 'postgres:' || url.protocol === 'postgresql:') &&
-            !!url.hostname &&
-            url.pathname.length > 1
-          );
-        } catch {
-          return false;
-        }
+        if (!URL.canParse(value)) return false;
+        const url = new URL(value);
+        return (
+          (url.protocol === 'postgres:' || url.protocol === 'postgresql:') && !!url.hostname && url.pathname.length > 1
+        );
       }, 'must be a PostgreSQL URL with a host and database name'),
     JWT_SECRET: z
       .string({ required_error: 'JWT_SECRET is required (no default — set a real secret)' })
@@ -80,7 +75,7 @@ const envSchema = z
     // Prometheus endpoint gate. Off by default: GET /metrics exposes
     // operational detail (routes, latencies, provider error rates) and must
     // only be scraped from a private network when enabled (404 when off).
-    METRICS_ENABLED: bool(false),
+    METRICS_ENABLED: bool,
     // Oldest app version the API still answers ("1.2.3"); empty disables the
     // X-Client-Version gate. Response contracts are additive-only, so this is
     // for retiring clients that predate a required behavior, not routine use.
@@ -108,12 +103,9 @@ const envSchema = z
       .default('')
       .refine((value) => {
         if (value === '') return true;
-        try {
-          const url = new URL(value);
-          return url.protocol === 'http:' || url.protocol === 'https:';
-        } catch {
-          return false;
-        }
+        if (!URL.canParse(value)) return false;
+        const url = new URL(value);
+        return url.protocol === 'http:' || url.protocol === 'https:';
       }, 'must be an http(s) URL (or empty when MAIL_MODE=log)'),
     RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce
       .number()
@@ -185,7 +177,7 @@ const envSchema = z
       .max(86_400_000)
       .default(60 * 60 * 1000),
     RATE_LIMIT_UPLOAD_GRANT_MAX: z.coerce.number().int().min(1).max(100_000).default(40),
-    MOCK_AI: bool(false),
+    MOCK_AI: bool,
     OPENAI_API_KEY: z.string().default(''),
     // Audio ingress: empty S3_BUCKET keeps the local multipart-to-disk flow for
     // dev/test; production must store uploads in S3 via presigned POST grants.
@@ -235,12 +227,13 @@ const envSchema = z
     if (env.NODE_ENV === 'production' && env.MAIL_WEBHOOK_URL) {
       try {
         const webhookUrl = new URL(env.MAIL_WEBHOOK_URL);
+        const isIpv4Loopback = isIP(webhookUrl.hostname) === 4 && webhookUrl.hostname.split('.', 1)[0] === '127';
         const isLoopback =
           webhookUrl.hostname === 'localhost' ||
           webhookUrl.hostname.endsWith('.localhost') ||
-          webhookUrl.hostname.startsWith('127.') ||
+          isIpv4Loopback ||
           webhookUrl.hostname === '[::1]';
-        if (webhookUrl.protocol !== 'https:' && !(webhookUrl.protocol === 'http:' && isLoopback)) {
+        if (webhookUrl.protocol === 'http:' && !isLoopback) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ['MAIL_WEBHOOK_URL'],
@@ -329,8 +322,12 @@ const envSchema = z
   });
 
 const parsed = envSchema.safeParse(process.env);
+export function formatConfigProblems(issues: ReadonlyArray<{ path: Array<string | number>; message: string }>): string {
+  return issues.map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`).join('\n');
+}
+
 if (!parsed.success) {
-  const problems = parsed.error.issues.map((i) => `  - ${i.path.join('.') || '(root)'}: ${i.message}`).join('\n');
+  const problems = formatConfigProblems(parsed.error.issues);
   // Config is loaded before the logger exists; stderr + exit is the intended fail-fast.
   console.error(`Invalid environment configuration:\n${problems}`);
   process.exit(1);

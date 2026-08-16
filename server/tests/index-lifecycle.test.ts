@@ -184,6 +184,46 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
 
+  it.each([
+    ['a positive non-integer server value', '10.5', 20],
+    ['a zero server value', '0', 20],
+    ['the exact three-connection reserve boundary', '100', 97],
+  ])('does not report pool starvation for %s', async (_caseName, serverMaximum, dbPoolMax) => {
+    runtime.poolQuery.mockResolvedValueOnce({ rows: [{ max_connections: serverMaximum }] });
+    runtime.dbPoolMax = dbPoolMax;
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    expect(
+      runtime.logger.error.mock.calls.filter(([, message]) => String(message).includes('DB_POOL_MAX')),
+    ).toHaveLength(0);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it.each([
+    ['a missing SHOW row', undefined],
+    ['a failed SHOW query', new Error('SHOW max_connections failed')],
+  ])('warns and still starts when the pool-size check encounters %s', async (_caseName, failure) => {
+    if (failure) runtime.poolQuery.mockRejectedValueOnce(failure);
+    else runtime.poolQuery.mockResolvedValueOnce({ rows: [] });
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    expect(runtime.logger.warn).toHaveBeenCalledWith(
+      { err: failure ?? expect.any(TypeError) },
+      'could not verify DB_POOL_MAX against server max_connections',
+    );
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
   it('contains every boot janitor rejection and reports it without blocking startup', async () => {
     const uploadError = new Error('upload cleanup failed');
     const replayError = new Error('replay cleanup failed');
@@ -395,7 +435,37 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.logger.error).not.toHaveBeenCalledWith({ err: undefined }, 'error closing HTTP server');
     releaseSchema();
     await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.poolQuery).not.toHaveBeenCalled();
     expect(runtime.server.listen).not.toHaveBeenCalled();
+  });
+
+  it('does not resume startup when shutdown occurs during the pool-size guard', async () => {
+    let releasePoolQuery!: () => void;
+    runtime.poolQuery.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releasePoolQuery = () => resolve({ rows: [{ max_connections: '100' }] });
+        }),
+    );
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.poolQuery).toHaveBeenCalledWith('SHOW max_connections'));
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+
+    releasePoolQuery();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(runtime.server.listen).not.toHaveBeenCalled();
+    expect(runtime.cleanupUploads).not.toHaveBeenCalled();
+    expect(runtime.cleanupRequests).not.toHaveBeenCalled();
+    expect(runtime.cleanupRateLimits).not.toHaveBeenCalled();
+    expect(runtime.cleanupUsage).not.toHaveBeenCalled();
+    expect(runtime.cleanupResetTokens).not.toHaveBeenCalled();
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
   });
 
   it('ignores a startup dependency rejection after an early shutdown has completed', async () => {

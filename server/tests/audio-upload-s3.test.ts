@@ -39,6 +39,7 @@ vi.mock('@aws-sdk/s3-presigned-post', () => ({
 
 import { config } from '../src/config';
 import {
+  completeSubmittedPresignedAudioReplay,
   createAudioSizeCap,
   discardPresignedAudio,
   discardSubmittedPresignedAudio,
@@ -49,7 +50,7 @@ import {
 } from '../src/audio-upload';
 import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
-import { uploadsDir } from '../src/upload';
+import { ownSubmittedAudioFile, uploadsDir } from '../src/upload';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 // Switch the whole app into S3 ingress mode (must precede createApp()).
@@ -221,6 +222,13 @@ describe('submitted S3 cleanup lifecycle', () => {
     const res = {} as Parameters<typeof preserveSubmittedPresignedAudio>[0];
 
     expect(() => preserveSubmittedPresignedAudio(res)).not.toThrow();
+  });
+
+  it('ignores replay completion and finalization when no submitted-audio cleanup was registered', async () => {
+    const res = {} as Parameters<typeof completeSubmittedPresignedAudioReplay>[0];
+
+    expect(() => completeSubmittedPresignedAudioReplay(res)).not.toThrow();
+    await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
   });
 
   it('honors an explicit preservation request without querying ownership or deleting', async () => {
@@ -548,7 +556,7 @@ describe('S3 object download boundaries', () => {
   it('accepts the exact stream cap and rejects the first byte beyond it', async () => {
     await expect(consumeSizeCap([Buffer.from('ab'), Buffer.from('cd')], 4)).resolves.toEqual(Buffer.from('abcd'));
     await expect(consumeSizeCap([Buffer.from('abcd'), Buffer.from('e')], 4)).rejects.toEqual(
-      expect.objectContaining({ status: 413, message: 'Audio file is too large' }),
+      expect.objectContaining({ status: 413, message: 'Audio file is too large', code: 'AUDIO_TOO_LARGE' }),
     );
   });
 
@@ -761,6 +769,35 @@ describe('S3 object download boundaries', () => {
     }
   });
 
+  it('keeps an owned private download through client close until the assessment runner unwinds', async () => {
+    const req = directS3Request(randomUUID());
+    const res = new EventEmitter();
+    const unlink = vi.spyOn(fsSync, 'unlink');
+    sendMock.mockResolvedValue({ Body: Readable.from(fakeM4aBuffer()) });
+    ownSubmittedAudioFile(res as never);
+
+    let file: { path: string } | undefined;
+    try {
+      file = await resolvePresignedAudio(req, res as never);
+      res.emit('close');
+
+      await expect(fs.stat(file.path)).resolves.toBeTruthy();
+      expect(unlink.mock.calls.filter(([filePath]) => filePath === file!.path)).toHaveLength(0);
+
+      // A normal finish remains a fallback; the real pipeline's outer finally
+      // removes the file before it writes its successful response.
+      res.emit('finish');
+      await vi.waitFor(async () => {
+        await expect(fs.stat(file!.path)).rejects.toMatchObject({ code: 'ENOENT' });
+      });
+      expect(unlink.mock.calls.filter(([filePath]) => filePath === file!.path)).toHaveLength(1);
+    } finally {
+      res.emit('finish');
+      if (file?.path) await fs.rm(file.path, { force: true });
+      unlink.mockRestore();
+    }
+  });
+
   it('cancels an unread non-Node body when oversized metadata is rejected', async () => {
     const cancel = vi.fn().mockResolvedValue(undefined);
     sendMock.mockResolvedValue({ Body: { cancel }, ContentLength: MAX_AUDIO_BYTES + 1 });
@@ -875,6 +912,7 @@ describe('S3 object download boundaries', () => {
       await expect(resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never)).rejects.toMatchObject({
         status: 502,
         message: 'Audio storage unavailable; please try again',
+        code: 'PROVIDER_FAILED',
       });
       expect(warn).toHaveBeenCalledWith({ err: fetchError, userId }, 'failed to fetch audio from S3');
     } finally {
@@ -936,6 +974,122 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     expect(replay.body).toEqual(first.body);
     expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
   });
+
+  it('deletes newly submitted audio after the client disconnects during a completed replay', async () => {
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    const replayBody = { score: 91, done: false };
+    await pool.query(
+      `INSERT INTO assessment_requests
+           (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at)
+         VALUES ($1, $2, $3, 'diagnostic', $4, 'completed', $5::jsonb, now())`,
+      [userId, requestId, randomUUID(), questionId, JSON.stringify(replayBody)],
+    );
+    sendMock.mockResolvedValue({});
+
+    // Hold the replay row so the live request can be disconnected at a
+    // deterministic point inside claimAssessmentRequest. pg_blocking_pids
+    // below proves the route, rather than an unrelated request phase, is
+    // waiting on this exact transaction before the socket is aborted.
+    const lockClient = await pool.connect();
+    const server = createServer(a);
+    let lockTransactionOpen = false;
+    let responseFinished = false;
+    let responseWritableFinishedOnClose: boolean | undefined;
+    let abortClient: (() => void) | undefined;
+    let clientOutcome: Promise<'fulfilled' | 'rejected'> | undefined;
+
+    try {
+      const lockBackend = await lockClient.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
+      const lockBackendPid = lockBackend.rows[0].pid;
+      await lockClient.query('BEGIN');
+      lockTransactionOpen = true;
+      await lockClient.query(
+        `SELECT 1
+           FROM assessment_requests
+           WHERE user_id = $1 AND request_id = $2
+           FOR UPDATE`,
+        [userId, requestId],
+      );
+
+      server.prependListener('request', (incoming, outgoing) => {
+        if (incoming.url === '/diagnostic/answer') {
+          outgoing.once('finish', () => {
+            responseFinished = true;
+          });
+          outgoing.once('close', () => {
+            responseWritableFinishedOnClose = outgoing.writableFinished;
+          });
+        }
+      });
+      await new Promise<void>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', resolve);
+      });
+      const address = server.address();
+      if (!address || typeof address === 'string') {
+        throw new Error('test server did not bind to a TCP port');
+      }
+
+      const clientRequest = request(`http://127.0.0.1:${address.port}`)
+        .post('/diagnostic/answer')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Content-Type', 'application/json')
+        .send(JSON.stringify({ questionId, requestId, audioKey }));
+      abortClient = () => clientRequest.abort();
+      clientOutcome = clientRequest.then(
+        () => 'fulfilled' as const,
+        () => 'rejected' as const,
+      );
+
+      await vi.waitFor(
+        async () => {
+          const blockedClaim = await pool.query<{ pid: number }>(
+            `SELECT pid
+               FROM pg_stat_activity
+               WHERE datname = current_database()
+                 AND $1::integer = ANY(pg_blocking_pids(pid))
+                 AND query LIKE '%assessment_requests%'
+               LIMIT 1`,
+            [lockBackendPid],
+          );
+          expect(blockedClaim.rows[0]?.pid).toEqual(expect.any(Number));
+        },
+        { timeout: 5_000 },
+      );
+
+      clientRequest.abort();
+      await vi.waitFor(() => expect(responseWritableFinishedOnClose).toBe(false), { timeout: 5_000 });
+      expect(responseFinished).toBe(false);
+      expect(sendMock).not.toHaveBeenCalled();
+
+      await lockClient.query('COMMIT');
+      lockTransactionOpen = false;
+      await expect(clientOutcome).resolves.toBe('rejected');
+
+      // `close` already fired without a finished response, so only the
+      // completed-replay route finally can discard this object now.
+      await vi.waitFor(() => expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']), {
+        timeout: 5_000,
+      });
+      expect(sendMock.mock.calls[0][0].input.Key).toBe(audioKey);
+      expect(responseFinished).toBe(false);
+    } finally {
+      abortClient?.();
+      if (lockTransactionOpen) {
+        await lockClient.query('ROLLBACK').catch(() => undefined);
+      }
+      await clientOutcome?.catch(() => undefined);
+      lockClient.release();
+      if (server.listening) {
+        await new Promise<void>((resolve, reject) => {
+          server.close((error) => (error ? reject(error) : resolve()));
+        });
+      }
+    }
+  }, 15_000);
 
   it('does not let a losing processing retry delete the object while its owner is reading it', async () => {
     const a = app();
@@ -1233,6 +1387,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
     expect(res.status).toBe(502);
+    expect(res.body).toEqual({ error: 'Audio storage unavailable; please try again', code: 'PROVIDER_FAILED' });
   });
 
   it('aborts a hung S3 GetObject request at the configured deadline', async () => {

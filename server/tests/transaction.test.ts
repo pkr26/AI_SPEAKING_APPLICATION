@@ -289,4 +289,142 @@ describe('diagnostic transaction rollback precedence', () => {
     expect(client.release).toHaveBeenCalledOnce();
     expect(client.release).toHaveBeenCalledWith(rollbackError);
   });
+
+  it('keeps the diagnostic restart error when rollback also fails and poisons the lease', async () => {
+    const user: UserRow = {
+      id: randomUUID(),
+      name: 'Restart Rollback',
+      email: 'restart-rollback@example.com',
+      password_hash: 'not-used',
+      native_language: 'te',
+      cefr_level: 'B1',
+      diagnostic_completed: true,
+      token_version: 1,
+      created_at: new Date().toISOString(),
+    };
+    const token = jwt.sign({ sub: user.id, tv: user.token_version }, config.jwtSecret, {
+      algorithm: 'HS256',
+      expiresIn: '1h',
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    const primaryError = new HttpError(409, 'restart state changed', 'STATE_CHANGED');
+    const rollbackError = new Error('restart rollback failed');
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN') return { rows: [] };
+        if (text === 'ROLLBACK') throw rollbackError;
+        if (text.includes('SELECT * FROM diagnostic_state')) throw primaryError;
+        throw new Error(`unexpected restart query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    vi.spyOn(pool, 'query').mockResolvedValue({ rows: [user] } as never);
+    vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const pass: RequestHandler = (_req, _res, next) => next();
+    const direct = express();
+    direct.use(express.json());
+    direct.use(
+      '/diagnostic',
+      createDiagnosticRouter({
+        assess: pass,
+        assessIpDaily: pass,
+        assessAbortGuard: pass,
+        diagnosticRestart: pass,
+      } as Limiters),
+    );
+    direct.use(errorHandler);
+
+    const response = await request(direct)
+      .post('/diagnostic/restart')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ confirm: true });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'restart state changed', code: 'STATE_CHANGED' });
+    expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+      'BEGIN',
+      expect.stringContaining('SELECT * FROM diagnostic_state'),
+      'ROLLBACK',
+    ]);
+    expect(client.release).toHaveBeenCalledOnce();
+    expect(client.release).toHaveBeenCalledWith(rollbackError);
+  });
+
+  it('commits and releases a successful diagnostic restart transaction', async () => {
+    const user: UserRow = {
+      id: randomUUID(),
+      name: 'Restart Success',
+      email: 'restart-success@example.com',
+      password_hash: 'not-used',
+      native_language: 'te',
+      cefr_level: 'B1',
+      diagnostic_completed: true,
+      token_version: 1,
+      created_at: new Date().toISOString(),
+    };
+    const token = jwt.sign({ sub: user.id, tv: user.token_version }, config.jwtSecret, {
+      algorithm: 'HS256',
+      expiresIn: '1h',
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: null };
+        if (text === 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE') {
+          return {
+            rows: [
+              {
+                user_id: user.id,
+                low_idx: 0,
+                high_idx: 5,
+                questions_asked: 5,
+                current_question_id: null,
+                processing_question_id: null,
+                processing_claim_id: null,
+              },
+            ],
+            rowCount: 1,
+          };
+        }
+        if (text.includes('UPDATE diagnostic_state') || text.includes('UPDATE users')) {
+          return { rows: [], rowCount: 1 };
+        }
+        throw new Error(`unexpected successful restart query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    vi.spyOn(pool, 'query').mockResolvedValue({ rows: [user], rowCount: 1 } as never);
+    vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const pass: RequestHandler = (_req, _res, next) => next();
+    const direct = express();
+    direct.use(express.json());
+    direct.use(
+      '/diagnostic',
+      createDiagnosticRouter({
+        assess: pass,
+        assessIpDaily: pass,
+        assessAbortGuard: pass,
+        diagnosticRestart: pass,
+      } as Limiters),
+    );
+    direct.use(errorHandler);
+
+    const response = await request(direct)
+      .post('/diagnostic/restart')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ confirm: true });
+
+    expect(response.status).toBe(204);
+    expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+      'BEGIN',
+      'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE',
+      expect.stringContaining('UPDATE diagnostic_state'),
+      expect.stringContaining('UPDATE users'),
+      'COMMIT',
+    ]);
+    expect(client.release).toHaveBeenCalledOnce();
+    expect(client.release).toHaveBeenCalledWith(undefined);
+  });
 });

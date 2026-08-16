@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
-import { RequestHandler } from 'express';
+import { RequestHandler, Response } from 'express';
 import multer from 'multer';
 import path from 'path';
 import { pipeline } from 'stream';
@@ -26,9 +26,25 @@ export const AUDIO_TYPES: Readonly<Record<string, readonly string[]>> = {
 
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES);
 
+// Once the assessment runner takes responsibility for an uploaded file it may
+// intentionally keep working after the client disconnects (for example, after
+// a paid-capacity reservation commits). Response-level `close` cleanup must
+// then defer to the runner's outer finally or it can unlink the file while the
+// provider is still about to read it. A WeakSet avoids extending the response
+// lifetime.
+const ownedSubmittedAudioResponses = new WeakSet<Response>();
+
+export function ownSubmittedAudioFile(res: Response): void {
+  ownedSubmittedAudioResponses.add(res);
+}
+
+export function submittedAudioFileIsOwned(res: Response): boolean {
+  return ownedSubmittedAudioResponses.has(res);
+}
+
 const privateDiskStorage: multer.StorageEngine = {
   _handleFile: (_req, file, cb) => {
-    const originalExt = path.extname(file.originalname || '').toLowerCase();
+    const originalExt = path.extname(file.originalname).toLowerCase();
     const ext = AUDIO_EXTS.includes(originalExt) ? originalExt : '.m4a';
     const filename = `${randomUUID()}${ext}`;
     const filePath = path.join(uploadsDir, filename);
@@ -68,8 +84,8 @@ export const upload = multer({
     headerPairs: 50,
   },
   fileFilter: (_req, file, cb) => {
-    const ext = path.extname(file.originalname || '').toLowerCase();
-    const mime = file.mimetype?.toLowerCase();
+    const ext = path.extname(file.originalname).toLowerCase();
+    const mime = file.mimetype.toLowerCase();
     if (ext in AUDIO_TYPES && mime && AUDIO_TYPES[ext].includes(mime)) {
       return cb(null, true);
     }
@@ -78,6 +94,14 @@ export const upload = multer({
 });
 
 const singleAudio = upload.single('audio');
+
+function unlinkUploadedFile(filePath: string): void {
+  try {
+    fs.unlinkSync(filePath);
+  } catch {
+    // Cleanup is best-effort here; the boot janitor is the final fallback.
+  }
+}
 
 /**
  * Store one audio upload with private permissions and delete it when the
@@ -88,19 +112,8 @@ export const uploadAudio: RequestHandler = (req, res, next) => {
   singleAudio(req, res, (err) => {
     const file = req.file;
 
-    const unlink = () => {
-      if (!file?.path) return;
-      try {
-        fs.unlinkSync(file.path);
-      } catch (unlinkErr) {
-        if ((unlinkErr as NodeJS.ErrnoException).code !== 'ENOENT') {
-          // Cleanup is best-effort here; the boot janitor is the final fallback.
-        }
-      }
-    };
-
     if (err) {
-      unlink();
+      if (file) unlinkUploadedFile(file.path);
       if (err instanceof multer.MulterError || err instanceof HttpError) {
         return next(err);
       }
@@ -113,10 +126,11 @@ export const uploadAudio: RequestHandler = (req, res, next) => {
     }
 
     if (file) {
+      const filePath = file.path;
       try {
-        fs.chmodSync(file.path, 0o600);
+        fs.chmodSync(filePath, 0o600);
       } catch (chmodErr) {
-        unlink();
+        unlinkUploadedFile(filePath);
         return next(chmodErr);
       }
 
@@ -124,10 +138,12 @@ export const uploadAudio: RequestHandler = (req, res, next) => {
       const cleanupOnce = () => {
         if (cleaned) return;
         cleaned = true;
-        unlink();
+        unlinkUploadedFile(filePath);
       };
       res.once('finish', cleanupOnce);
-      res.once('close', cleanupOnce);
+      res.once('close', () => {
+        if (!submittedAudioFileIsOwned(res)) cleanupOnce();
+      });
     }
 
     return next();
@@ -199,8 +215,13 @@ export async function cleanupOldUploadsInDirectory(directory: string, maxAgeMs: 
   }
   for (const name of entries) {
     const full = path.join(directory, name);
-    const stat = await fsPromises.stat(full).catch(() => null);
-    if (stat && stat.isFile() && stat.mtimeMs < cutoff) {
+    let stat: Awaited<ReturnType<typeof fsPromises.stat>>;
+    try {
+      stat = await fsPromises.stat(full);
+    } catch {
+      continue;
+    }
+    if (stat.isFile() && stat.mtimeMs < cutoff) {
       try {
         await fsPromises.unlink(full);
         removed++;

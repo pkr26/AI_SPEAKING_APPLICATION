@@ -34,6 +34,8 @@ const RESET_TOKEN_TTL_MINUTES = 30;
 // One uniform message for every reset failure (unknown email, missing row,
 // expired, already used, wrong code): distinct errors would enumerate accounts.
 const RESET_INVALID_MESSAGE = 'Reset code is invalid or expired';
+const authenticationStateChanged = () =>
+  new HttpError(409, 'Authentication state changed; please try again', 'STATE_CHANGED');
 
 export function toUserJson(row: UserRow) {
   return {
@@ -297,9 +299,10 @@ export function createAuthRouter(limiters: Limiters) {
       if (!stored) throw invalidReset();
       const storedHash = Buffer.from(stored.token_hash, 'hex');
       const presentedHash = createHash('sha256').update(token).digest();
-      // Both sides are 32-byte SHA-256 digests, so the comparison is
+      // Migration 010 constrains stored hashes to 64 lowercase hex characters,
+      // so both buffers are exactly 32-byte SHA-256 digests. The comparison is
       // constant-time regardless of how much of the code an attacker guessed.
-      if (storedHash.length !== presentedHash.length || !timingSafeEqual(storedHash, presentedHash)) {
+      if (!timingSafeEqual(storedHash, presentedHash)) {
         throw invalidReset();
       }
 
@@ -374,12 +377,18 @@ export function createAuthRouter(limiters: Limiters) {
         throw new HttpError(401, 'Current password is incorrect', 'INVALID_CREDENTIALS');
       }
       const passwordHash = await bcrypt.hash(newPassword, BCRYPT_COST);
-      // Bumping token_version invalidates every previously issued token.
-      const { rows } = await pool.query<UserRow>(
-        'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2 RETURNING *',
-        [passwordHash, user.id],
+      // Bind the write to the exact credential snapshot that was verified.
+      // A concurrent password reset/change/logout must win instead of being
+      // overwritten by this now-stale request.
+      const updatedResult = await pool.query<UserRow>(
+        `UPDATE users
+         SET password_hash = $1, token_version = token_version + 1
+         WHERE id = $2 AND password_hash = $3 AND token_version = $4
+         RETURNING *`,
+        [passwordHash, user.id, user.password_hash, user.token_version],
       );
-      const updated = rows[0];
+      if (updatedResult.rowCount !== 1) throw authenticationStateChanged();
+      const updated = updatedResult.rows[0];
       res.json({ token: signToken(updated), user: toUserJson(updated) });
     }),
   );
@@ -399,7 +408,14 @@ export function createAuthRouter(limiters: Limiters) {
         throw new HttpError(401, 'Password is incorrect', 'INVALID_CREDENTIALS');
       }
       // attempts / diagnostic_state rows are removed by ON DELETE CASCADE.
-      await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
+      // As with password changes, delete only the credential snapshot that was
+      // confirmed above; never delete an account after another request has
+      // already changed or revoked that authentication state.
+      const deleted = await pool.query(
+        'DELETE FROM users WHERE id = $1 AND password_hash = $2 AND token_version = $3',
+        [user.id, user.password_hash, user.token_version],
+      );
+      if (deleted.rowCount !== 1) throw authenticationStateChanged();
       res.status(204).end();
     }),
   );

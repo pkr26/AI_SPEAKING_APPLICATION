@@ -87,7 +87,7 @@ describe('diagnostic', () => {
 
     const r = await answerForm(request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`), otherId);
     expect(r.status).toBe(409);
-    expect(r.body.error).toBe('Question mismatch');
+    expect(r.body).toEqual({ error: 'Question mismatch', code: 'QUESTION_MISMATCH' });
   });
 
   it('POST /answer with an unknown but valid question UUID returns 409, not 500', async () => {
@@ -97,7 +97,7 @@ describe('diagnostic', () => {
       '00000000-0000-0000-0000-000000000000',
     );
     expect(reply.status).toBe(409);
-    expect(reply.body.error).toBe('Question mismatch');
+    expect(reply.body).toEqual({ error: 'Question mismatch', code: 'QUESTION_MISMATCH' });
   });
 
   it('serializes parallel answers with one durable claim', async () => {

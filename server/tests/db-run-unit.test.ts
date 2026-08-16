@@ -299,6 +299,20 @@ describe('database deployment runner', () => {
     expect(client.end).toHaveBeenCalledOnce();
   });
 
+  it('propagates a disconnect failure after an otherwise successful no-op migration', async () => {
+    const disconnectError = new Error('migration disconnect failed');
+    const client = provideClient(async (sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      return { rows: [] };
+    });
+    client.end.mockRejectedValueOnce(disconnectError);
+
+    await expect(migrate('postgres://localhost/release_test')).rejects.toBe(disconnectError);
+    expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
   it('preserves a migration failure when rollback, unlock, and disconnect also fail', async () => {
     const migrationError = new Error('migration SQL failed');
     let transactionStarted = false;
@@ -364,6 +378,30 @@ describe('database deployment runner', () => {
     expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
     expect(log).toHaveBeenCalledWith(`questions per level: ${JSON.stringify(counts)}`);
     expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('preserves the first cleanup failure after a successful seed while attempting every cleanup', async () => {
+    const unlockError = new Error('seed unlock failed');
+    const disconnectError = new Error('seed disconnect failed');
+    const cleanupCalls: string[] = [];
+    const client = provideClient(async (sql) => {
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      if (sql.includes('pg_advisory_unlock')) {
+        cleanupCalls.push('unlock');
+        throw unlockError;
+      }
+      if (sql.startsWith('SELECT cefr_level')) return { rows: [] };
+      return { rows: [] };
+    });
+    client.end.mockImplementationOnce(async () => {
+      cleanupCalls.push('disconnect');
+      throw disconnectError;
+    });
+
+    await expect(seed('postgres://localhost/release_test')).rejects.toBe(unlockError);
+    expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
+    expect(client.end).toHaveBeenCalledOnce();
+    expect(cleanupCalls).toEqual(['unlock', 'disconnect']);
   });
 
   it('fails a seed cleanly when another deployment owns the advisory lock', async () => {

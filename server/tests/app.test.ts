@@ -177,6 +177,11 @@ describe('app wiring', () => {
       ).get('/ready');
 
       expect(response.status).toBe(503);
+      expect(response.body).toEqual({
+        ok: false,
+        error: 'required service dependency unavailable',
+        code: 'INTERNAL',
+      });
       expect(error).toHaveBeenCalledWith({ err: failure }, 'readiness dependency check failed');
     } finally {
       error.mockRestore();

@@ -4,8 +4,6 @@ import path from 'path';
 
 import { pool } from './db';
 
-const MIGRATIONS_DIR = path.join(__dirname, '..', 'db', 'migrations');
-const REQUIRED_RUNTIME_TABLE = 'public.rate_limit_windows';
 const REQUIRED_CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
 const REQUIRED_QUESTIONS_PER_LEVEL = 100;
 
@@ -22,7 +20,7 @@ export function migrationManifestFromDirectory(migrationsDirectory: string): rea
     .filter((name) => name.endsWith('.sql'))
     .sort()
     .map((name) => {
-      const sql = fs.readFileSync(path.join(migrationsDirectory, name), 'utf8');
+      const sql = fs.readFileSync(path.join(migrationsDirectory, name));
       return Object.freeze({
         name,
         checksum: createHash('sha256').update(sql).digest('hex'),
@@ -37,17 +35,19 @@ export function migrationManifestFromDirectory(migrationsDirectory: string): rea
 }
 
 export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
-  return migrationManifestFromDirectory(MIGRATIONS_DIR);
+  return migrationManifestFromDirectory(path.join(__dirname, '..', 'db', 'migrations'));
 }
 
-const queryPool: SchemaQuery = async (text, values) => pool.query(text, values ? [...values] : undefined);
+async function queryPool(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
+  return pool.query(text, [...values]);
+}
 
 export async function assertDatabaseSchemaCurrent(
   query: SchemaQuery = queryPool,
 ): Promise<{ latestMigration: string }> {
   const expected = expectedMigrationManifest();
-  const latest = expected.at(-1);
-  if (!latest) throw new Error('No expected database migration was found');
+  // migrationManifestFromDirectory rejects an empty release manifest.
+  const latest = expected.at(-1)!;
 
   const migrationResult = await query('SELECT name, checksum FROM schema_migrations ORDER BY name');
   const actual = migrationResult.rows as Array<{
@@ -57,16 +57,20 @@ export async function assertDatabaseSchemaCurrent(
 
   const manifestMatches =
     actual.length === expected.length &&
-    expected.every((entry, index) => actual[index]?.name === entry.name && actual[index]?.checksum === entry.checksum);
+    expected.every((entry, index) => {
+      const row = actual[index];
+      return row !== undefined && row.name === entry.name && row.checksum === entry.checksum;
+    });
 
   if (!manifestMatches) {
     throw new Error(`Database migrations do not match this release through ${latest.name}`);
   }
 
-  const tableResult = await query('SELECT to_regclass($1)::text AS table_name', [REQUIRED_RUNTIME_TABLE]);
+  const requiredRuntimeTable = 'public.rate_limit_windows';
+  const tableResult = await query('SELECT to_regclass($1)::text AS table_name', [requiredRuntimeTable]);
   const requiredTable = tableResult.rows[0] as { table_name?: unknown } | undefined;
   if (typeof requiredTable?.table_name !== 'string') {
-    throw new Error(`Required database table ${REQUIRED_RUNTIME_TABLE} is missing`);
+    throw new Error(`Required database table ${requiredRuntimeTable} is missing`);
   }
 
   // Practice completion promises a different next question. Treat the
@@ -79,14 +83,16 @@ export async function assertDatabaseSchemaCurrent(
      ORDER BY cefr_level`,
   );
   const questionCounts = new Map(
-    (questionResult.rows as Array<{ cefr_level?: unknown; count?: unknown }>)
-      .filter(
-        (row): row is { cefr_level: string; count: number } =>
-          typeof row.cefr_level === 'string' && typeof row.count === 'number',
-      )
-      .map((row) => [row.cefr_level, row.count]),
+    (questionResult.rows as Array<{ cefr_level?: unknown; count?: unknown }>).map(
+      (row) => [row.cefr_level, row.count] as const,
+    ),
   );
-  if (REQUIRED_CEFR_LEVELS.some((level) => (questionCounts.get(level) ?? 0) < REQUIRED_QUESTIONS_PER_LEVEL)) {
+  if (
+    REQUIRED_CEFR_LEVELS.some((level) => {
+      const count = questionCounts.get(level);
+      return typeof count !== 'number' || count < REQUIRED_QUESTIONS_PER_LEVEL;
+    })
+  ) {
     throw new Error('Question inventory is incomplete; every CEFR level requires at least 100 questions');
   }
 

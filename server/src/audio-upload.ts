@@ -12,7 +12,7 @@ import { isAssessmentRequestProcessing } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
-import { AUDIO_TYPES, MAX_AUDIO_BYTES, uploadsDir } from './upload';
+import { AUDIO_TYPES, MAX_AUDIO_BYTES, submittedAudioFileIsOwned, uploadsDir } from './upload';
 
 export { MAX_AUDIO_BYTES } from './upload';
 const KEY_PREFIX = 'audio-uploads';
@@ -23,7 +23,6 @@ interface SubmittedAudioCleanup {
   userId: string;
   audioKey: string;
   requestId?: string;
-  discarded: boolean;
   preserve: boolean;
   finalizing?: Promise<void>;
 }
@@ -32,22 +31,15 @@ type AudioCleanupResponse = Response & {
   [SUBMITTED_AUDIO_CLEANUP]?: SubmittedAudioCleanup;
 };
 
-// Canonical extension per content type (first allowlisted extension wins, so
-// e.g. audio/mp4 maps to .m4a). Used to build S3 keys for presigned uploads.
-// The map has no prototype: lookups like `__proto__`/`constructor` must miss
-// instead of resolving inherited Object members into a truthy "extension".
-const CONTENT_TYPE_TO_EXT: Readonly<Record<string, string>> = (() => {
-  const map: Record<string, string> = Object.create(null);
-  for (const [ext, mimes] of Object.entries(AUDIO_TYPES)) {
-    for (const mime of mimes) {
-      if (!(mime in map)) map[mime] = ext.slice(1);
-    }
-  }
-  return map;
-})();
-
+// Return the canonical extension for a content type. The first allowlisted
+// extension wins, so e.g. audio/mp4 maps to .m4a. Looking directly through the
+// allowlist also makes inherited Object member names ordinary misses.
 export function contentTypeToExt(contentType: string): string | undefined {
-  return CONTENT_TYPE_TO_EXT[contentType.trim().toLowerCase()];
+  const normalizedContentType = contentType.trim().toLowerCase();
+  for (const [ext, mimes] of Object.entries(AUDIO_TYPES)) {
+    if (mimes.includes(normalizedContentType)) return ext.slice(1);
+  }
+  return undefined;
 }
 
 /**
@@ -124,11 +116,10 @@ function getS3(): S3Client {
   return s3Client;
 }
 
-const audioUrlBodySchema = z.object({
-  contentType: z.string().max(128),
-});
-
 export function createAudioUploadRouter(limiters: Limiters) {
+  const audioUrlBodySchema = z.object({
+    contentType: z.string().max(128),
+  });
   const router = Router();
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -228,13 +219,12 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
   const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
   if (!cleanup) return Promise.resolve();
   if (cleanup.finalizing) return cleanup.finalizing;
-  if (cleanup.discarded || cleanup.preserve) return Promise.resolve();
+  if (cleanup.preserve) return Promise.resolve();
 
   cleanup.finalizing = (async () => {
     // A pre-route conflict is not definitive: an owner may be processing even
     // before it can insert the shared claim under DB-pool saturation.
     if (res.statusCode === 409 || res.statusCode === 429) {
-      cleanup.preserve = true;
       return;
     }
     // A duplicate can be stopped before claimAssessmentRequest (for example by
@@ -242,18 +232,15 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
     if (cleanup.requestId) {
       try {
         if (await isAssessmentRequestProcessing(cleanup.userId, cleanup.requestId)) {
-          cleanup.preserve = true;
           return;
         }
       } catch (err) {
         // Fail closed for data safety: retain transient audio when ownership
         // cannot be established. The required bucket lifecycle bounds storage.
-        cleanup.preserve = true;
         logger.warn({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
         return;
       }
     }
-    cleanup.discarded = true;
     await discardPresignedAudio(cleanup.userId, cleanup.audioKey);
   })();
   return cleanup.finalizing;
@@ -266,19 +253,20 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
  */
 export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next) => {
   const req = rawReq as AuthedRequest;
-  const audioKey = (req.body as { audioKey?: unknown } | undefined)?.audioKey;
-  if (typeof audioKey !== 'string' || !req.user || !isOwnedAudioKey(req.user.id, audioKey)) {
+  const body = req.body as { audioKey?: unknown; requestId?: unknown } | undefined;
+  if (!body || !req.user) {
+    return next();
+  }
+  const audioKey = body.audioKey;
+  if (typeof audioKey !== 'string' || !isOwnedAudioKey(req.user.id, audioKey)) {
     return next();
   }
 
-  const rawRequestId = (req.body as { requestId?: unknown } | undefined)?.requestId;
-  const requestId =
-    typeof rawRequestId === 'string' && z.string().uuid().safeParse(rawRequestId).success ? rawRequestId : undefined;
+  const requestId = z.string().uuid().optional().catch(undefined).parse(body.requestId);
   (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP] = {
     userId: req.user.id,
     audioKey,
     requestId,
-    discarded: false,
     preserve: false,
   };
   // Finalize on a microtask so synchronous finish listeners can mark a
@@ -332,7 +320,9 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
   // cleanup covers missing, oversized, malformed, replayed, and provider-error
   // responses without issuing duplicate DeleteObject requests.
   res.once('finish', cleanup);
-  res.once('close', cleanup);
+  res.once('close', () => {
+    if (!submittedAudioFileIsOwned(res)) cleanup();
+  });
 
   try {
     const object = await getS3().send(new GetObjectCommand({ Bucket: config.s3.bucket, Key: audioKey }), {

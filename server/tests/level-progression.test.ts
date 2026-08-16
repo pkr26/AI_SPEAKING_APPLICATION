@@ -1,3 +1,5 @@
+import { randomUUID } from 'crypto';
+import type { PoolClient } from 'pg';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 
@@ -10,7 +12,7 @@ vi.mock('../src/assess', async (importOriginal) => {
 });
 
 import { config } from '../src/config';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 beforeEach(() => {
   speakMock.mockReset();
@@ -28,6 +30,48 @@ function mockScore(score: number) {
     passed: score >= 60,
     feedback: `scored ${score}`,
   });
+}
+
+interface ObservedQuery {
+  text: string;
+  values: unknown[] | undefined;
+}
+
+async function observeExplicitLeaseQueries<T>(
+  action: () => Promise<T>,
+): Promise<{ result: T; queries: ObservedQuery[] }> {
+  const originalConnect = pool.connect.bind(pool);
+  const queries: ObservedQuery[] = [];
+  const connect = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+    if (typeof callback === 'function') return originalConnect(callback as never);
+    return originalConnect().then((client: PoolClient) => {
+      const mutable = client as unknown as {
+        query: (...args: unknown[]) => unknown;
+        release: (error?: Error | boolean) => void;
+      };
+      const actualQuery = mutable.query;
+      const actualRelease = mutable.release;
+      mutable.query = (query: unknown, ...args: unknown[]) => {
+        const text = typeof query === 'string' ? query : (query as { text?: unknown } | null)?.text;
+        if (typeof text === 'string') {
+          queries.push({ text, values: Array.isArray(args[0]) ? (args[0] as unknown[]) : undefined });
+        }
+        return actualQuery.call(client, query, ...args);
+      };
+      mutable.release = (error?: Error | boolean) => {
+        mutable.query = actualQuery;
+        mutable.release = actualRelease;
+        actualRelease.call(client, error);
+      };
+      return client;
+    });
+  }) as typeof pool.connect);
+
+  try {
+    return { result: await action(), queries };
+  } finally {
+    connect.mockRestore();
+  }
 }
 
 describe('CEFR level progression', () => {
@@ -66,6 +110,14 @@ describe('CEFR level progression', () => {
   const attempt = (token: string, questionId: string) =>
     answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
 
+  const fixedAttempt = (token: string, questionId: string, requestId: string) =>
+    request(a)
+      .post('/practice/attempt')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+      .field('questionId', questionId)
+      .field('requestId', requestId);
+
   it('promotes at exactly ceil(0.85 * totalAtLevel) mastered words, answering from the NEW level', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
@@ -92,6 +144,32 @@ describe('CEFR level progression', () => {
 
     const nextQuestion = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(nextQuestion.body.question.cefrLevel).toBe('A2');
+  });
+
+  it('replays the exact threshold-crossing response after that response changes the user level', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const threshold = Math.ceil(0.85 * ids.length);
+    await seedMastered(userId, ids.slice(0, threshold - 1));
+    const target = ids[threshold - 1];
+    const requestId = randomUUID();
+
+    mockScore(90);
+    const first = await fixedAttempt(token, target, requestId);
+    const replay = await fixedAttempt(token, target, requestId);
+
+    expect(first.status).toBe(200);
+    expect(first.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(speakMock).toHaveBeenCalledOnce();
+    const persisted = await pool.query<{ attempts: number; requests: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND question_id = $2) AS attempts,
+         (SELECT count(*)::int FROM assessment_requests WHERE user_id = $1 AND request_id = $3) AS requests`,
+      [userId, target, requestId],
+    );
+    expect(persisted.rows[0]).toEqual({ attempts: 1, requests: 1 });
   });
 
   it('does not promote one mastery below the threshold', async () => {
@@ -154,20 +232,184 @@ describe('CEFR level progression', () => {
     const [targetA, targetB] = [ids[threshold - 1], ids[threshold]];
 
     mockScore(90);
-    const [ra, rb] = await Promise.all([attempt(token, targetA), attempt(token, targetB)]);
+    const { result, queries } = await observeExplicitLeaseQueries(() =>
+      Promise.all([attempt(token, targetA), attempt(token, targetB)]),
+    );
+    const [ra, rb] = result;
 
     expect(ra.status).toBe(200);
     expect(rb.status).toBe(200);
-    // The promotion commits exactly once, but BOTH attempts crossed the
-    // threshold: the loser of the guarded UPDATE re-reads the promoted level
-    // and echoes the same levelUp (and answers from the NEW level) instead of
-    // serving one stale-level question.
+    // The promotion commits exactly once, and the waiter observes that new
+    // level from the parent-row lock instead of running a redundant old-level
+    // mastery aggregate or a guaranteed-zero guarded UPDATE.
     expect(ra.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
     expect(rb.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
     expect(ra.body.next.question.cefrLevel).toBe('A2');
     expect(rb.body.next.question.cefrLevel).toBe('A2');
+    const oldLevelMasterySnapshots = queries.filter(
+      ({ text, values }) => text.includes("count(*) FILTER (WHERE pp.status = 'mastered')") && values?.[1] === 'A1',
+    );
+    expect(oldLevelMasterySnapshots).toHaveLength(1);
+    expect(queries.filter(({ text }) => text.startsWith('UPDATE users SET cefr_level = $1'))).toHaveLength(1);
     // The user row was promoted exactly one step, never A1 -> A2 -> B1.
     expect(await userLevel(userId)).toBe('A2');
+  });
+
+  it('does not miss the threshold when two different words are mastered concurrently', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const threshold = Math.ceil(0.85 * ids.length);
+    await seedMastered(userId, ids.slice(0, threshold - 2));
+    const [targetA, targetB] = [ids[threshold - 2], ids[threshold - 1]];
+
+    const assessment = {
+      transcript: 'a scored answer',
+      score: 90,
+      passed: true,
+      feedback: 'scored 90',
+    };
+    const release: Array<(value: typeof assessment) => void> = [];
+    speakMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release.push(resolve);
+          if (release.length === 2) {
+            for (const resolveAssessment of release) resolveAssessment(assessment);
+          }
+        }),
+    );
+
+    const [ra, rb] = await Promise.all([attempt(token, targetA), attempt(token, targetB)]);
+
+    expect(ra.status).toBe(200);
+    expect(rb.status).toBe(200);
+    expect([ra.body.levelUp, rb.body.levelUp]).toContainEqual({ from: 'A1', to: 'A2' });
+    expect([ra.body.next.question.cefrLevel, rb.body.next.question.cefrLevel]).toContain('A2');
+    expect(await userLevel(userId)).toBe('A2');
+    const progress = await pool.query<{ mastered: number }>(
+      `SELECT count(*)::int AS mastered
+       FROM practice_progress pp
+       JOIN questions q ON q.id = pp.question_id
+       WHERE pp.user_id = $1 AND q.cefr_level = 'A1' AND pp.status = 'mastered'`,
+      [userId],
+    );
+    expect(progress.rows[0].mastered).toBe(threshold);
+  });
+
+  it('answers a non-mastering result from the new level when it waits behind a promotion', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const threshold = Math.ceil(0.85 * ids.length);
+    await seedMastered(userId, ids.slice(0, threshold - 1));
+    const [promotingQuestion, waitingQuestion] = [ids[threshold - 1], ids[threshold]];
+
+    type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
+    let releasePromoter!: (result: Assessment) => void;
+    let releaseWaiter!: (result: Assessment) => void;
+    speakMock
+      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)))
+      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseWaiter = resolve)));
+
+    const promoterPromise = Promise.resolve(attempt(token, promotingQuestion));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(1));
+    const waiterPromise = Promise.resolve(attempt(token, waitingQuestion));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(2));
+
+    releasePromoter({ transcript: 'mastered', score: 90, passed: true, feedback: 'great' });
+    const promoted = await promoterPromise;
+    expect(promoted.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    expect(await userLevel(userId)).toBe('A2');
+
+    releaseWaiter({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
+    const waited = await waiterPromise;
+    expect(waited.status).toBe(200);
+    expect(waited.body).toMatchObject({ mastered: false, levelUp: { from: 'A1', to: 'A2' } });
+    expect(waited.body.attemptsLeft).toBeUndefined();
+    expect(waited.body.finalFeedback).toBeUndefined();
+    expect(waited.body.next.question.cefrLevel).toBe('A2');
+    expect(await userLevel(userId)).toBe('A2');
+  });
+
+  it('does not offer an invalid old-level retry when a miss waits behind a promotion', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const threshold = Math.ceil(0.85 * ids.length);
+    await seedMastered(userId, ids.slice(0, threshold - 1));
+    const [promotingQuestion, waitingQuestion] = [ids[threshold - 1], ids[threshold]];
+
+    type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
+    let releasePromoter!: (result: Assessment) => void;
+    let releaseWaiter!: (result: Assessment) => void;
+    speakMock
+      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)))
+      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseWaiter = resolve)));
+
+    const promoterPromise = Promise.resolve(attempt(token, promotingQuestion));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(1));
+    const waiterPromise = Promise.resolve(attempt(token, waitingQuestion));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(2));
+
+    releasePromoter({ transcript: 'mastered', score: 90, passed: true, feedback: 'great' });
+    expect((await promoterPromise).body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    releaseWaiter({ transcript: 'missed', score: 45, passed: false, feedback: 'try again' });
+    const waited = await waiterPromise;
+
+    expect(waited.status).toBe(200);
+    expect(waited.body).toMatchObject({
+      passed: false,
+      mastered: false,
+      attemptsLeft: 0,
+      levelUp: { from: 'A1', to: 'A2' },
+    });
+    expect(waited.body.finalFeedback).toContain('Continue with the next question');
+    expect(waited.body.next.question.cefrLevel).toBe('A2');
+  });
+
+  it('rejects an in-flight scored result when diagnostic state was reset before persistence', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const [questionId] = await levelQuestionIds('A1');
+    type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
+    let releaseAssessment!: (result: Assessment) => void;
+    speakMock.mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseAssessment = resolve)));
+
+    const attemptPromise = Promise.resolve(attempt(token, questionId));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    await pool.query('UPDATE users SET diagnostic_completed = false, cefr_level = NULL WHERE id = $1', [userId]);
+    releaseAssessment({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
+    const response = await attemptPromise;
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Assessment state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+    const persisted = await pool.query<{ attempts: number; progress: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND question_id = $2) AS attempts,
+         (SELECT count(*)::int FROM practice_progress WHERE user_id = $1 AND question_id = $2) AS progress`,
+      [userId, questionId],
+    );
+    expect(persisted.rows[0]).toEqual({ attempts: 0, progress: 0 });
+  });
+
+  it('returns the exact state-changed contract when the learner is deleted before persistence', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const [questionId] = await levelQuestionIds('A1');
+    type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
+    let releaseAssessment!: (result: Assessment) => void;
+    speakMock.mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseAssessment = resolve)));
+
+    const attemptPromise = Promise.resolve(attempt(token, questionId));
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    releaseAssessment({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
+    const response = await attemptPromise;
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'Assessment state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
   });
 });
 
@@ -175,17 +417,23 @@ describe('POST /diagnostic/restart', () => {
   const a = app();
 
   it('rejects a missing or false confirm with the validation contract', async () => {
-    const { res } = await registerUser(a);
+    // Build this router inside the test so the schema and route wiring are
+    // exercised under the active mutation, not only during suite discovery.
+    const validationApp = app();
+    const { res } = await registerUser(validationApp);
     const token = res.body.token as string;
 
-    const missing = await request(a).post('/diagnostic/restart').set('Authorization', `Bearer ${token}`).send({});
+    const missing = await request(validationApp)
+      .post('/diagnostic/restart')
+      .set('Authorization', `Bearer ${token}`)
+      .send({});
     expect(missing.status).toBe(400);
     expect(missing.body).toEqual({
       error: 'confirm: must be true to restart the diagnostic',
       code: 'VALIDATION_FAILED',
     });
 
-    const explicit = await request(a)
+    const explicit = await request(validationApp)
       .post('/diagnostic/restart')
       .set('Authorization', `Bearer ${token}`)
       .send({ confirm: false });

@@ -151,6 +151,11 @@ describe('audio inspection concurrency', () => {
       'default=nokey=1:noprint_wrappers=1',
     ]);
     expect(probeArgs).not.toContain(filePath);
+    expect(probeOptions).toMatchObject({
+      env: buildAudioInspectorEnvironment(process.env),
+      shell: false,
+      windowsHide: true,
+    });
     expect(probeOptions.stdio).toEqual(['ignore', 'pipe', 'pipe', expect.any(Number)]);
 
     const [executable, args, options] = spawnMock.mock.calls[1] as [
@@ -222,6 +227,7 @@ describe('audio inspection concurrency', () => {
       status: 503,
       message: 'Audio inspection capacity busy',
       extra: { retryAfterSeconds: 2 },
+      code: 'CAPACITY_BUSY',
     });
     expect(spawnMock).toHaveBeenCalledTimes(2);
 
@@ -235,7 +241,11 @@ describe('audio inspection concurrency', () => {
     spawnMock.mockImplementationOnce(() => {
       throw new Error('spawn failed');
     });
-    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 503 });
+    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+      status: 503,
+      message: 'Audio inspection is temporarily unavailable',
+      code: 'PROVIDER_FAILED',
+    });
     await proveNextSlotIsUsable();
   });
 
@@ -280,6 +290,124 @@ describe('audio inspection concurrency', () => {
     await proveNextSlotIsUsable();
   });
 
+  it('accepts a single multi-digit stream index', async () => {
+    const probe = new FakeChild();
+    const decoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(decoder);
+    activeChildren.push(probe, decoder);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+
+    completeProbe(probe, '12\n');
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+    expect(spawnMock).toHaveBeenCalledTimes(2);
+    completeSuccessfully(decoder);
+
+    await expect(result).resolves.toEqual({ status: 'fulfilled', value: true });
+  });
+
+  it.each(['prefix0\n', '0suffix\n'])(
+    'requires the single stream index to consume the entire listing: %j',
+    async (listing) => {
+      const probe = new FakeChild();
+      const decoder = new FakeChild();
+      spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(decoder);
+      activeChildren.push(probe, decoder);
+      const result = verifyAudioDuration(filePath).then(
+        (value) => ({ status: 'fulfilled' as const, value }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+
+      completeProbe(probe, listing);
+      for (let i = 0; i < 10; i += 1) await Promise.resolve();
+      if (spawnMock.mock.calls.length === 2) completeSuccessfully(decoder);
+
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: { status: 415, code: 'AUDIO_UNREADABLE' },
+      });
+    },
+  );
+
+  it('kills a probe only after its exact 4 KiB stream-listing cap is exceeded', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+
+    probe.stdout.emit('data', Buffer.from('0\n'.repeat((4 * 1024) / 2)));
+    expect(probe.kill).not.toHaveBeenCalled();
+    probe.stdout.emit('data', Buffer.from('x'));
+
+    await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(probe.kill).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledOnce();
+  });
+
+  it('kills a probe only after its exact 64 KiB diagnostic cap is exceeded', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+
+    probe.stderr.emit('data', Buffer.alloc(64 * 1024));
+    expect(probe.kill).not.toHaveBeenCalled();
+    probe.stderr.emit('data', Buffer.alloc(1));
+
+    await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(probe.kill).toHaveBeenCalledOnce();
+    expect(spawnMock).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a nonzero probe exit even when it printed one valid stream', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+
+    probe.stdout.emit('data', Buffer.from('0\n'));
+    probe.emit('close', 1);
+
+    await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+    expect(spawnMock).toHaveBeenCalledOnce();
+  });
+
+  it('ignores repeated probe events after an output-cap settlement', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+    try {
+      probe.stdout.emit('data', Buffer.alloc(4 * 1024 + 1));
+      await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 415 } });
+      const clearCalls = clearTimeoutSpy.mock.calls.length;
+
+      probe.stderr.emit('data', Buffer.alloc(64 * 1024 + 1));
+      probe.emit('error', new Error('late'));
+      probe.emit('close', 0);
+
+      expect(clearTimeoutSpy).toHaveBeenCalledTimes(clearCalls);
+      expect(probe.kill).toHaveBeenCalledOnce();
+    } finally {
+      clearTimeoutSpy.mockRestore();
+    }
+  });
+
   it('maps a prober process error to unavailable without decoding', async () => {
     const probe = new FakeChild();
     spawnMock.mockReturnValueOnce(probe);
@@ -292,6 +420,25 @@ describe('audio inspection concurrency', () => {
     await expect(result).resolves.toMatchObject({ status: 'rejected', reason: { status: 503 } });
     expect(spawnMock).toHaveBeenCalledOnce();
     await proveNextSlotIsUsable();
+  });
+
+  it('does not signal a probe already marked as killed while settling', async () => {
+    const probe = new FakeChild();
+    probe.killed = true;
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+
+    probe.emit('error', new Error('missing ffprobe'));
+
+    await expect(result).resolves.toMatchObject({
+      status: 'rejected',
+      reason: { status: 503, code: 'PROVIDER_FAILED' },
+    });
+    expect(probe.kill).not.toHaveBeenCalled();
   });
 
   it('releases the slot after a nonzero decoder exit', async () => {
@@ -307,6 +454,22 @@ describe('audio inspection concurrency', () => {
     filePath = path.join(uploadsDir, `${randomUUID()}.m4a`);
     await fs.rename(originalPath, filePath);
     const inspection = await startInspection();
+    const [, probeArgs] = spawnMock.mock.calls[0] as [string, string[]];
+    const probeFormatIndex = probeArgs.indexOf('-format_whitelist');
+    expect(probeArgs.slice(probeFormatIndex, probeFormatIndex + 12)).toEqual([
+      '-format_whitelist',
+      'mov',
+      '-enable_drefs',
+      '0',
+      '-use_absolute_path',
+      '0',
+      '-ignore_editlist',
+      '1',
+      '-fd',
+      '3',
+      '-i',
+      'fd:',
+    ]);
     // The decoder is the second spawn (the ffprobe stream count runs first).
     const [, args] = spawnMock.mock.calls[1] as [string, string[]];
     const formatIndex = args.indexOf('-format_whitelist');
@@ -341,6 +504,77 @@ describe('audio inspection concurrency', () => {
     } finally {
       await fs.rmdir(filePath);
       await fs.writeFile(filePath, 'private test media', { mode: 0o600 });
+    }
+    await proveNextSlotIsUsable();
+  });
+
+  it('closes a descriptor and refuses to spawn when the post-open object is not a regular file', async () => {
+    const fstat = vi.spyOn(nodeFs, 'fstatSync').mockReturnValueOnce({ isFile: () => false } as nodeFs.Stats);
+    const close = vi.spyOn(nodeFs, 'closeSync');
+    try {
+      await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({ status: 415 });
+      expect(close).toHaveBeenCalledOnce();
+      expect(spawnMock).not.toHaveBeenCalled();
+    } finally {
+      fstat.mockRestore();
+      close.mockRestore();
+    }
+  });
+
+  it('maps a failure while opening the decoder stage to invalid media and releases the slot', async () => {
+    const lstat = vi
+      .spyOn(nodeFs, 'lstatSync')
+      .mockReturnValueOnce({ isFile: () => true } as nodeFs.Stats)
+      .mockImplementationOnce(() => {
+        throw new Error('decoder open failed');
+      });
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+    try {
+      completeProbe(probe);
+
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: { status: 415, code: 'AUDIO_UNREADABLE' },
+      });
+      expect(spawnMock).toHaveBeenCalledOnce();
+    } finally {
+      lstat.mockRestore();
+    }
+    await proveNextSlotIsUsable();
+  });
+
+  it('closes the decoder descriptor and maps a synchronous decoder spawn failure to unavailable', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe).mockImplementationOnce(() => {
+      throw new Error('decoder spawn failed');
+    });
+    activeChildren.push(probe);
+    const close = vi.spyOn(nodeFs, 'closeSync');
+    const result = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+    try {
+      completeProbe(probe);
+
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: {
+          status: 503,
+          message: 'Audio inspection is temporarily unavailable',
+          code: 'PROVIDER_FAILED',
+        },
+      });
+      expect(spawnMock).toHaveBeenCalledTimes(2);
+      expect(close).toHaveBeenCalledTimes(2);
+    } finally {
+      close.mockRestore();
     }
     await proveNextSlotIsUsable();
   });
@@ -608,6 +842,26 @@ describe('audio inspector readiness coalescing', () => {
     await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow('FFprobe is unavailable');
   });
 
+  it.each([false, true])(
+    'fails closed when readiness stdout is missing (already killed: %s)',
+    async (alreadyKilled) => {
+      const child = new FakeChild();
+      Object.defineProperty(child, 'stdout', { configurable: true, value: null });
+      child.killed = alreadyKilled;
+      spawnMock.mockReturnValueOnce(child);
+
+      await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow(
+        'FFprobe availability check returned unexpected output',
+      );
+      if (alreadyKilled) {
+        expect(child.kill).not.toHaveBeenCalled();
+      } else {
+        expect(child.kill).toHaveBeenCalledOnce();
+        expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+      }
+    },
+  );
+
   it('does not signal a readiness child that is already marked as killed while settling', async () => {
     const probe = new FakeChild();
     const decoder = new FakeChild();
@@ -646,7 +900,6 @@ describe('audio inspector readiness coalescing', () => {
 
   it.each([
     ['a successful exit without an FFprobe version', Buffer.from('not the expected tool\n'), 0],
-    ['an unsuccessful exit with an FFprobe version', Buffer.from('ffprobe version test-build\n'), 1],
     ['oversized version output', Buffer.alloc(16 * 1024 + 1, 0x78), 0],
   ])('rejects %s', async (_caseName, output, exitCode) => {
     const child = new FakeChild();
@@ -655,6 +908,18 @@ describe('audio inspector readiness coalescing', () => {
     child.stdout.emit('data', output);
     child.emit('close', exitCode);
     await expect(check).rejects.toThrow();
+  });
+
+  it('rejects a nonzero FFprobe exit before starting the FFmpeg availability check', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    const check = assertAudioInspectorAvailable({ force: true });
+
+    probe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    probe.emit('close', 1);
+
+    await expect(check).rejects.toThrow(/^FFprobe is unavailable$/);
+    expect(spawnMock).toHaveBeenCalledOnce();
   });
 
   it('accepts exactly 16 KiB of valid version output and rejects the first cumulative byte beyond it', async () => {
@@ -706,6 +971,20 @@ describe('audio inspector readiness coalescing', () => {
     child.stdout.emit('data', Buffer.from(output));
     child.emit('close', 0);
     await expect(check).rejects.toThrow('FFprobe is unavailable');
+  });
+
+  it('rejects an FFmpeg identity line that is not anchored at the start of output', async () => {
+    const probe = new FakeChild();
+    const decoder = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe).mockReturnValueOnce(decoder);
+    const check = assertAudioInspectorAvailable({ force: true });
+    probe.stdout.emit('data', Buffer.from('ffprobe version test-build\n'));
+    probe.emit('close', 0);
+    await Promise.resolve();
+    decoder.stdout.emit('data', Buffer.from('unrelated output\nffmpeg version test-build\n'));
+    decoder.emit('close', 0);
+
+    await expect(check).rejects.toThrow('FFmpeg is unavailable');
   });
 
   it('fails closed on an FFmpeg lookalike without leaking its configured path', async () => {

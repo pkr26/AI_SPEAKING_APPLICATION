@@ -27,7 +27,6 @@ export const PASS_SCORE = 60;
  * practice_progress.srs_interval_index; the index clamps at the last entry.
  */
 export const SRS_INTERVALS_DAYS = [1, 3, 7, 21, 60] as const;
-const MAX_SRS_INTERVAL_INDEX = SRS_INTERVALS_DAYS.length - 1;
 /** A skipped word stays out of new/revision selection for this long. */
 const SKIP_DAYS = 7;
 
@@ -63,7 +62,9 @@ interface Queryable {
   query<T>(text: string, values?: unknown[]): Promise<{ rows: T[] }>;
 }
 
-const QUESTION_COLUMNS = `q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"`;
+function questionColumns(): string {
+  return `q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"`;
+}
 
 /**
  * SRS ordering: earliest due_at first, so overdue words (due_at <= now())
@@ -78,7 +79,7 @@ async function pickRevisionQuestion(
   excludeQuestionId?: string,
 ): Promise<QuestionJson | undefined> {
   const { rows } = await db.query<QuestionJson>(
-    `SELECT ${QUESTION_COLUMNS}
+    `SELECT ${questionColumns()}
      FROM practice_progress pp
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'learning'
@@ -101,7 +102,7 @@ async function pickNewQuestion(
   excludeQuestionId?: string,
 ): Promise<QuestionJson | undefined> {
   const { rows } = await db.query<QuestionJson>(
-    `SELECT ${QUESTION_COLUMNS}
+    `SELECT ${questionColumns()}
      FROM questions q
      LEFT JOIN practice_progress pp ON pp.question_id = q.id AND pp.user_id = $1
      WHERE q.cefr_level = $2 AND pp.question_id IS NULL
@@ -124,7 +125,7 @@ async function pickRetentionQuestion(
   excludeQuestionId?: string,
 ): Promise<QuestionJson | undefined> {
   const { rows } = await db.query<QuestionJson>(
-    `SELECT ${QUESTION_COLUMNS}
+    `SELECT ${questionColumns()}
      FROM practice_progress pp
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'mastered'
@@ -150,7 +151,7 @@ async function pickSkippedFallbackQuestion(
   excludeQuestionId?: string,
 ): Promise<QuestionJson | undefined> {
   const { rows } = await db.query<QuestionJson>(
-    `SELECT ${QUESTION_COLUMNS}
+    `SELECT ${questionColumns()}
      FROM practice_progress pp
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'learning'
@@ -240,19 +241,6 @@ async function practiceProgressSnapshot(
   return rows[0];
 }
 
-const helpParamsSchema = z.object({
-  id: z.string().uuid('question id must be a valid UUID'),
-});
-
-const skipBodySchema = z.object({
-  questionId: z.string().uuid('questionId must be a valid UUID'),
-});
-
-const historyQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(50).default(20),
-  cursor: z.string().uuid('cursor must be a valid UUID').optional(),
-});
-
 interface PracticeClaim {
   attemptNo: number;
   claimId: string;
@@ -327,13 +315,25 @@ async function storePracticeResult(
   requestId: string,
   requestClaimId: string,
   body: Record<string, unknown>,
-  responseKind: 'passed' | 'retry' | 'final-failed',
   level: string,
-  finalFeedback?: string,
+  finalFeedback: string,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Serialize every scored result for a learner before any child-row/FK
+    // write. Besides making threshold promotion atomic, this makes a result
+    // that waited behind a rival promotion answer from the learner's current
+    // level even when this result itself did not master a word. Parent-first
+    // ordering also avoids lock-upgrade and account-deletion deadlocks.
+    const lockedUser = await client.query<{ cefr_level: string | null }>(
+      'SELECT cefr_level FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const lockedUserLevel = lockedUser.rows[0]?.cefr_level;
+    if (!lockedUserLevel) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     const owned = await client.query(
       `SELECT 1 FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2 AND claim_id = $3
@@ -368,6 +368,7 @@ async function storePracticeResult(
     // failed -> index 0 / due now.
     const insertIndex = mastered || result.score >= PASS_SCORE ? 1 : 0;
     const insertDueDays = mastered ? SRS_INTERVALS_DAYS[1] : result.score >= PASS_SCORE ? 1 : 0;
+    const maxSrsIntervalIndex = SRS_INTERVALS_DAYS.length - 1;
     await client.query(
       `INSERT INTO practice_progress
          (user_id, question_id, status, best_score, attempt_count, last_attempt_at, srs_interval_index, due_at)
@@ -383,14 +384,14 @@ async function storePracticeResult(
          last_attempt_at = now(),
          srs_interval_index = CASE
            WHEN EXCLUDED.status = 'mastered'
-             THEN least(practice_progress.srs_interval_index + 1, ${MAX_SRS_INTERVAL_INDEX})
+             THEN least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex})
            WHEN EXCLUDED.best_score >= ${PASS_SCORE} THEN 1
            ELSE 0
          END,
          due_at = CASE
            WHEN EXCLUDED.status = 'mastered'
              THEN now() +
-               (ARRAY[${SRS_INTERVALS_DAYS.join(', ')}])[least(practice_progress.srs_interval_index + 1, ${MAX_SRS_INTERVAL_INDEX}) + 1]
+               (ARRAY[${SRS_INTERVALS_DAYS.join(', ')}])[least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex}) + 1]
                * interval '1 day'
            WHEN EXCLUDED.best_score >= ${PASS_SCORE} THEN now() + interval '1 day'
            ELSE now()
@@ -398,50 +399,50 @@ async function storePracticeResult(
       [userId, questionId, mastered ? 'mastered' : 'learning', result.score, insertIndex, insertDueDays],
     );
 
-    // Level promotion: mastering this word may complete the level. The
-    // level-guarded UPDATE serializes rival promotions on the user row so the
-    // level advances exactly once; the loser matches zero rows and echoes the
-    // promotion after re-reading the level (below). C2 never promotes (no
-    // next level).
-    let effectiveLevel = level;
-    let levelUp: { from: string; to: string } | undefined;
-    if (justMastered) {
+    // Level promotion: mastering this word may complete the level. Lock the
+    // user row BEFORE counting mastery so distinct words mastered in parallel
+    // cannot both observe a pre-threshold snapshot and then commit without a
+    // promotion. The waiter takes a fresh READ COMMITTED snapshot after the
+    // winner commits. C2 never promotes (no next level).
+    let effectiveLevel = lockedUserLevel;
+    let levelUp: { from: string; to: string } | undefined =
+      lockedUserLevel && lockedUserLevel !== level ? { from: level, to: lockedUserLevel } : undefined;
+    if (justMastered && lockedUserLevel === level) {
       const nextLevel = CEFR_LEVELS[CEFR_LEVELS.indexOf(level as (typeof CEFR_LEVELS)[number]) + 1];
       if (nextLevel) {
         const snapshot = await practiceProgressSnapshot(userId, level, client);
         if (snapshot.masteredCount >= Math.ceil(LEVEL_UP_MASTERY_RATIO * snapshot.totalAtLevel)) {
-          const promoted = await client.query('UPDATE users SET cefr_level = $1 WHERE id = $2 AND cefr_level = $3', [
+          await client.query('UPDATE users SET cefr_level = $1 WHERE id = $2 AND cefr_level = $3', [
             nextLevel,
             userId,
             level,
           ]);
-          if (promoted.rowCount === 1) {
-            levelUp = { from: level, to: nextLevel };
-            effectiveLevel = nextLevel;
-          } else {
-            // A rival transaction won the promotion (its commit released the
-            // user-row lock this UPDATE waited on; the stale level guard then
-            // matched 0 rows). This attempt still mastered the word that
-            // crossed the threshold, so re-read the level and echo the
-            // levelUp — answering from the OLD level would serve one
-            // stale-level question and swallow the promotion the learner
-            // just earned.
-            const current = await client.query<{ cefr_level: string | null }>(
-              'SELECT cefr_level FROM users WHERE id = $1',
-              [userId],
-            );
-            const currentLevel = current.rows[0]?.cefr_level;
-            if (currentLevel && currentLevel !== level) {
-              levelUp = { from: level, to: currentLevel };
-              effectiveLevel = currentLevel;
-            }
-          }
+          // The user row is held FOR UPDATE and the level equality guard above
+          // was evaluated from that locked row, so this guarded UPDATE must
+          // affect exactly that row.
+          levelUp = { from: level, to: nextLevel };
+          effectiveLevel = nextLevel;
         }
       }
     }
 
     let response: Record<string, unknown>;
-    if (responseKind === 'retry') {
+    const shouldRetry = !result.passed && claim.attemptNo < MAX_ATTEMPTS;
+    if (shouldRetry && levelUp) {
+      // The old-level question became ineligible while this provider call was
+      // in flight. Do not tell the client to retry a question the next request
+      // must reject; close this run and continue from the current level.
+      const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
+      const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
+      const next = nextPick ? { ...nextPick, progress } : undefined;
+      response = {
+        ...body,
+        attemptsLeft: 0,
+        finalFeedback: 'Your level advanced while this answer was assessed. Continue with the next question.',
+        levelUp,
+        next,
+      };
+    } else if (shouldRetry) {
       response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
     } else {
       // Select after the current attempt is visible in this transaction and
@@ -451,10 +452,9 @@ async function storePracticeResult(
       const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
       const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
       const next = nextPick ? { ...nextPick, progress } : undefined;
-      response =
-        responseKind === 'passed'
-          ? { ...body, ...(levelUp ? { levelUp } : {}), next }
-          : { ...body, attemptsLeft: 0, finalFeedback, ...(levelUp ? { levelUp } : {}), next };
+      response = result.passed
+        ? { ...body, levelUp, next }
+        : { ...body, attemptsLeft: 0, finalFeedback, levelUp, next };
     }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
       userId,
@@ -512,12 +512,21 @@ async function storeSilenceResult(
 }
 
 export function authoredAnswerHint(question: QuestionRow, language: string): string {
-  const example = question.translations[language]?.examples?.[0]?.en?.trim();
+  const translation = question.translations[language];
+  if (!translation || !Array.isArray(translation.examples)) {
+    return `a few clear, on-topic sentences about "${question.prompt_word}"`;
+  }
+  const firstExample = translation.examples[0];
+  const example = firstExample && typeof firstExample.en === 'string' ? firstExample.en.trim() : '';
   return example || `a few clear, on-topic sentences about "${question.prompt_word}"`;
 }
 
-function authoredNativeExample(question: QuestionRow, language: string): string | undefined {
-  return question.translations[language]?.examples?.[0]?.native?.trim() || undefined;
+export function authoredNativeExample(question: QuestionRow, language: string): string | undefined {
+  const translation = question.translations[language];
+  if (!translation || !Array.isArray(translation.examples)) return undefined;
+  const firstExample = translation.examples[0];
+  if (!firstExample || typeof firstExample.native !== 'string') return undefined;
+  return firstExample.native.trim() || undefined;
 }
 
 export function buildFinalFeedback(providerFeedback: string, hint: string): string {
@@ -533,8 +542,8 @@ export function buildFinalFeedback(providerFeedback: string, hint: string): stri
  * see what an on-topic answer looks like. Capped to the attempts feedback
  * contract.
  */
-function buildNativeFallbackFeedback(providerFeedback: string, nativeExample?: string): string {
-  if (!nativeExample) return providerFeedback;
+export function buildNativeFallbackFeedback(providerFeedback: string, nativeExample?: string): string {
+  if (!nativeExample) return providerFeedback.slice(0, 800);
   const prefix = `${providerFeedback} An on-topic answer could be: `;
   const suffix = ' — try saying it in English next!';
   const available = Math.max(0, 800 - prefix.length - suffix.length);
@@ -550,8 +559,27 @@ function assessQuestionContext(question: QuestionRow) {
   };
 }
 
+function matchesIfNoneMatch(header: string | undefined, etag: string): boolean {
+  if (!header) return false;
+  return header.split(',').some((value) => {
+    const candidate = value.trim();
+    if (candidate === '*') return true;
+    return (candidate.startsWith('W/') ? candidate.slice(2) : candidate) === etag;
+  });
+}
+
 export function createPracticeRouter(limiters: Limiters) {
   const router = Router();
+  const helpParamsSchema = z.object({
+    id: z.string().uuid('question id must be a valid UUID'),
+  });
+  const skipBodySchema = z.object({
+    questionId: z.string().uuid('questionId must be a valid UUID'),
+  });
+  const historyQuerySchema = z.object({
+    limit: z.coerce.number().int().min(1).max(50).default(20),
+    cursor: z.string().uuid('cursor must be a valid UUID').optional(),
+  });
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
@@ -734,7 +762,12 @@ export function createPracticeRouter(limiters: Limiters) {
       const etag = `"${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}"`;
       res.set('Cache-Control', 'private, max-age=3600');
       res.set('ETag', etag);
-      if (req.headers['if-none-match'] === etag) {
+      // Fetch clients commonly add `Cache-Control: no-cache` while
+      // revalidating an explicit If-None-Match. Express then deliberately
+      // reports req.fresh=false, so evaluate the validator directly. GET uses
+      // weak comparison: exact, W/, comma-list, and wildcard validators all
+      // match the current representation.
+      if (matchesIfNoneMatch(req.headers['if-none-match'], etag)) {
         return res.status(304).end();
       }
       res.json(payload);
@@ -779,19 +812,11 @@ export function createPracticeRouter(limiters: Limiters) {
             feedback: result.feedback,
           };
 
-          let responseKind: 'passed' | 'retry' | 'final-failed';
-          let finalFeedback: string | undefined;
-          if (result.passed) {
-            responseKind = 'passed';
-          } else if (claim.attemptNo < MAX_ATTEMPTS) {
-            responseKind = 'retry';
-          } else {
-            // Use reviewed, authored examples instead of making a second,
-            // unmetered provider call after the assessment has already succeeded.
-            const hint = authoredAnswerHint(question, user.native_language);
-            finalFeedback = buildFinalFeedback(result.feedback, hint);
-            responseKind = 'final-failed';
-          }
+          // Precompute the final-failure response without another provider
+          // call. Retry/pass branches never expose it; storePracticeResult's
+          // final-failure branch is the sole consumer.
+          const hint = authoredAnswerHint(question, user.native_language);
+          const finalFeedback = buildFinalFeedback(result.feedback, hint);
           return storePracticeResult(
             user.id,
             question.id,
@@ -801,7 +826,6 @@ export function createPracticeRouter(limiters: Limiters) {
             requestId,
             requestClaimId,
             body,
-            responseKind,
             user.cefr_level!,
             finalFeedback,
           );

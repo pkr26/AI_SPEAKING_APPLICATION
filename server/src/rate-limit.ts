@@ -13,6 +13,36 @@ export function normalizeLoginEmail(value: unknown): string | undefined {
   return normalized;
 }
 
+/** One stable fallback key for the rare request whose socket has no address. */
+export function rateLimitIpKey(ip: string | undefined): string {
+  return ipKeyGenerator(ip ?? '');
+}
+
+/** express-rate-limit validates custom request key functions by source. */
+export function requestIpRateLimitKey(req: { ip?: string }): string {
+  return ipKeyGenerator(req.ip ?? '');
+}
+
+function userOrIpRateLimitKey(req: AuthedRequest): string {
+  const user = req.user;
+  return user ? `user:${user.id}` : rateLimitIpKey(req.ip);
+}
+
+type ParsedEmailRequest = { body: { email?: unknown } };
+
+// Both email-keyed limiters are mounted after express.json(), which initializes
+// an empty object even when the request carries no body. A future unsafe mount
+// order should fail loudly rather than silently bypassing a security budget.
+function skipInvalidEmail(req: ParsedEmailRequest): boolean {
+  return normalizeLoginEmail(req.body.email) === undefined;
+}
+
+/** express-rate-limit invokes this only after skipInvalidEmail returned false. */
+function validEmailRateLimitKey(req: ParsedEmailRequest): string {
+  const email = normalizeLoginEmail(req.body.email)!;
+  return `email:${email}`;
+}
+
 /**
  * Security-sensitive limiters use PostgreSQL counters so every API replica
  * enforces one shared budget. Built per app so tests can vary configuration;
@@ -72,13 +102,8 @@ export function buildLimiters() {
       `login-account:${config.rateLimit.loginAccountWindowMs}:${config.rateLimit.loginAccountMax}`,
       config.rateLimit.loginAccountWindowMs,
     ),
-    skip: (req) => normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email) === undefined,
-    keyGenerator: (req) => {
-      const email = normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email);
-      // `skip` excludes this case before key generation; retain a stable
-      // defensive value for custom express-rate-limit implementations.
-      return email ? `email:${email}` : 'email:invalid';
-    },
+    skip: skipInvalidEmail,
+    keyGenerator: validEmailRateLimitKey,
     handler: (_req, res, next) => {
       res.locals.loginAccountThrottled = true;
       next();
@@ -101,10 +126,7 @@ export function buildLimiters() {
     ),
     // Mounted after requireAuth; the user is always present. The IP fallback
     // only protects against a future route that forgets that ordering.
-    keyGenerator: (req) => {
-      const user = (req as AuthedRequest).user;
-      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
-    },
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     handler: (_req, res, next) => {
       res.locals.passwordAccountThrottled = true;
       next();
@@ -127,13 +149,8 @@ export function buildLimiters() {
       `forgot-email:${config.rateLimit.forgotEmailWindowMs}:${config.rateLimit.forgotEmailMax}`,
       config.rateLimit.forgotEmailWindowMs,
     ),
-    skip: (req) => normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email) === undefined,
-    keyGenerator: (req) => {
-      const email = normalizeLoginEmail((req.body as { email?: unknown } | undefined)?.email);
-      // `skip` excludes this case before key generation; retain a stable
-      // defensive value for custom express-rate-limit implementations.
-      return email ? `email:${email}` : 'email:invalid';
-    },
+    skip: skipInvalidEmail,
+    keyGenerator: validEmailRateLimitKey,
     handler: (_req, res, next) => {
       res.locals.forgotEmailThrottled = true;
       next();
@@ -150,7 +167,7 @@ export function buildLimiters() {
       `register:${config.rateLimit.registerWindowMs}:${config.rateLimit.registerMax}`,
       config.rateLimit.registerWindowMs,
     ),
-    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    keyGenerator: requestIpRateLimitKey,
     message: { error: 'Too many accounts created from this network, please try again later', code: 'RATE_LIMITED' },
   });
 
@@ -169,10 +186,7 @@ export function buildLimiters() {
     ),
     // Mounted after requireAuth; the user is always present. The IP fallback
     // only protects against a future route that forgets that ordering.
-    keyGenerator: (req) => {
-      const user = (req as AuthedRequest).user;
-      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
-    },
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
   });
 
@@ -210,10 +224,7 @@ export function buildLimiters() {
     windowMs: config.rateLimit.assessWindowMs,
     limit: config.rateLimit.assessMax,
     store: assessStore,
-    keyGenerator: (req) => {
-      const user = (req as AuthedRequest).user;
-      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
-    },
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Assessment rate limit reached, please slow down', code: 'RATE_LIMITED' },
@@ -237,7 +248,7 @@ export function buildLimiters() {
     windowMs: 24 * 60 * 60 * 1000,
     limit: config.assessIpDailyCap,
     store: assessIpDailyStore,
-    keyGenerator: (req) => ipKeyGenerator(req.ip ?? ''),
+    keyGenerator: requestIpRateLimitKey,
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Daily assessment limit reached for this network', code: 'NETWORK_DAILY_LIMIT' },
@@ -258,9 +269,8 @@ export function buildLimiters() {
   // already closed (the guard's close listener has fired by then and will not
   // fire again).
   const respendAssessmentBudget = (req: AuthedRequest): void => {
-    const user = req.user;
-    void assessStore.incrementWithinWindow(user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? ''));
-    void assessIpDailyStore.incrementWithinWindow(ipKeyGenerator(req.ip ?? ''));
+    void assessStore.incrementWithinWindow(userOrIpRateLimitKey(req));
+    void assessIpDailyStore.incrementWithinWindow(rateLimitIpKey(req.ip));
   };
 
   // Mounted after the two assessment limiters, this re-spends the pair of
@@ -284,10 +294,7 @@ export function buildLimiters() {
       `upload-grant:${config.rateLimit.uploadGrantWindowMs}:${config.rateLimit.uploadGrantMax}`,
       config.rateLimit.uploadGrantWindowMs,
     ),
-    keyGenerator: (req) => {
-      const user = (req as AuthedRequest).user;
-      return user ? `user:${user.id}` : ipKeyGenerator(req.ip ?? '');
-    },
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Audio upload grant rate limit reached, please try again later', code: 'RATE_LIMITED' },
   });
 

@@ -164,11 +164,11 @@ describe('logger initialization', () => {
     vi.resetModules();
   });
 
-  async function capturePinoOptions(config: {
+  async function captureLoggerOptions(config: {
     nodeEnv: 'development' | 'test' | 'production';
     isProduction: boolean;
-    logLevel: undefined;
-  }): Promise<unknown> {
+    logLevel: string | undefined;
+  }): Promise<{ pinoOptions: Record<string, unknown>; httpOptions: Record<string, unknown> }> {
     const mockLogger = { kind: 'base-logger' };
     const mockHttpLogger = vi.fn();
     const pinoSpy = vi.fn((_options: unknown) => mockLogger);
@@ -186,7 +186,10 @@ describe('logger initialization', () => {
     expect(pinoSpy).toHaveBeenCalledOnce();
     expect(pinoHttpSpy).toHaveBeenCalledOnce();
     expect(pinoHttpSpy).toHaveBeenCalledWith(expect.objectContaining({ logger: mockLogger }));
-    return pinoSpy.mock.calls[0]?.[0];
+    return {
+      pinoOptions: pinoSpy.mock.calls[0]?.[0] as Record<string, unknown>,
+      httpOptions: pinoHttpSpy.mock.calls[0]?.[0] as Record<string, unknown>,
+    };
   }
 
   it.each([
@@ -196,7 +199,7 @@ describe('logger initialization', () => {
   ])(
     'uses the $expectedLevel fallback and exact transport for $nodeEnv',
     async ({ nodeEnv, isProduction, expectedLevel }) => {
-      const options = await capturePinoOptions({ nodeEnv, isProduction, logLevel: undefined });
+      const { pinoOptions: options } = await captureLoggerOptions({ nodeEnv, isProduction, logLevel: undefined });
 
       expect(options).toHaveProperty('level', expectedLevel);
       expect(options).toHaveProperty(
@@ -210,4 +213,93 @@ describe('logger initialization', () => {
       );
     },
   );
+
+  it('passes the exact redaction, request-id, level, serializer, and auto-log contracts to pino', async () => {
+    const { pinoOptions, httpOptions } = await captureLoggerOptions({
+      nodeEnv: 'test',
+      isProduction: false,
+      logLevel: 'warn',
+    });
+
+    expect(pinoOptions).toEqual({
+      level: 'warn',
+      redact: {
+        paths: [
+          'password',
+          'currentPassword',
+          'newPassword',
+          'token',
+          'accessToken',
+          'refreshToken',
+          'req.headers.authorization',
+          'req.headers.cookie',
+          'req.headers["x-api-key"]',
+          'req.body.password',
+          'req.body.currentPassword',
+          'req.body.newPassword',
+          'req.body.token',
+          'req.body.accessToken',
+          'req.body.refreshToken',
+          'res.headers["set-cookie"]',
+        ],
+        censor: '[redacted]',
+      },
+      transport: undefined,
+    });
+
+    const genReqId = httpOptions.genReqId as (
+      req: { headers: Record<string, unknown> },
+      res: { setHeader: (name: string, value: string) => void },
+    ) => string;
+    const setHeader = vi.fn();
+    expect(genReqId({ headers: { 'x-request-id': 'request-123' } }, { setHeader })).toBe('request-123');
+    expect(setHeader).toHaveBeenCalledWith('x-request-id', 'request-123');
+
+    const exactMaximum = 'x'.repeat(128);
+    const maximumHeader = vi.fn();
+    expect(genReqId({ headers: { 'x-request-id': exactMaximum } }, { setHeader: maximumHeader })).toBe(exactMaximum);
+    expect(maximumHeader).toHaveBeenCalledWith('x-request-id', exactMaximum);
+
+    for (const rejected of ['', 'x'.repeat(129)]) {
+      const rejectedHeader = vi.fn();
+      const generated = genReqId({ headers: { 'x-request-id': rejected } }, { setHeader: rejectedHeader });
+      expect(generated).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(generated).not.toBe(rejected);
+      expect(rejectedHeader).toHaveBeenCalledWith('x-request-id', generated);
+    }
+
+    const customLogLevel = httpOptions.customLogLevel as (
+      req: unknown,
+      res: { statusCode: number },
+      err?: Error,
+    ) => string;
+    expect(customLogLevel({}, { statusCode: 200 })).toBe('info');
+    expect(customLogLevel({}, { statusCode: 400 })).toBe('warn');
+    expect(customLogLevel({}, { statusCode: 500 })).toBe('error');
+    expect(customLogLevel({}, { statusCode: 200 }, new Error('request failed'))).toBe('error');
+
+    const serializers = httpOptions.serializers as {
+      req: (value: Record<string, unknown>) => unknown;
+      res: (value: Record<string, unknown>) => unknown;
+    };
+    expect(
+      serializers.req({
+        id: 'request-123',
+        method: 'POST',
+        url: '/practice/attempt',
+        remoteAddress: '203.0.113.10',
+        body: { password: 'must-not-be-serialized' },
+      }),
+    ).toEqual({
+      id: 'request-123',
+      method: 'POST',
+      url: '/practice/attempt',
+      remoteAddress: '203.0.113.10',
+    });
+    expect(serializers.res({ statusCode: 204, headers: { 'set-cookie': 'secret' } })).toEqual({ statusCode: 204 });
+
+    const autoLogging = httpOptions.autoLogging as { ignore: (req: { url: string }) => boolean };
+    expect(autoLogging.ignore({ url: '/health' })).toBe(true);
+    expect(autoLogging.ignore({ url: '/ready' })).toBe(false);
+  });
 });

@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { z } from 'zod';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
+import { shedRequestsTotal } from '../src/metrics';
 import {
   AuthedRequest,
   clientVersionGate,
@@ -47,7 +48,10 @@ describe('requireAuth', () => {
     for (const header of [undefined, 'Basic abc123', 'Bearer', 'bearer validlooking']) {
       const res = await me(header as string | undefined);
       expect(res.status).toBe(401);
-      expect(res.body.error).toBe('Missing or invalid Authorization header');
+      expect(res.body).toEqual({
+        error: 'Missing or invalid Authorization header',
+        code: 'UNAUTHENTICATED',
+      });
     }
   });
 
@@ -65,7 +69,7 @@ describe('requireAuth', () => {
     ]) {
       const res = await me(`Bearer ${token}`);
       expect(res.status).toBe(401);
-      expect(res.body.error).toBe('Invalid or expired token');
+      expect(res.body).toEqual({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
     }
   });
 
@@ -87,15 +91,27 @@ describe('requireAuth', () => {
     expect(res.body.error).toBe('Invalid or expired token');
   });
 
+  it('requires the entire token subject to be exactly one UUID', async () => {
+    const userId = randomUUID();
+    for (const subject of [`prefix-${userId}`, `${userId}-suffix`]) {
+      const res = await me(`Bearer ${sign({ sub: subject, tv: 1 })}`);
+      expect(res.status).toBe(401);
+      expect(res.body).toEqual({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
+    }
+  });
+
   it('rejects tokens for unknown users and stale token versions', async () => {
     const unknown = await me(`Bearer ${sign({ sub: randomUUID(), tv: 1 })}`);
     expect(unknown.status).toBe(401);
-    expect(unknown.body.error).toBe('Invalid token: user not found');
+    expect(unknown.body).toEqual({ error: 'Invalid token: user not found', code: 'UNAUTHENTICATED' });
 
     const { res } = await registerUser(a);
     const stale = await me(`Bearer ${sign({ sub: res.body.user.id, tv: 999 })}`);
     expect(stale.status).toBe(401);
-    expect(stale.body.error).toContain('no longer valid');
+    expect(stale.body).toEqual({
+      error: 'Token no longer valid — please log in again',
+      code: 'TOKEN_REVOKED',
+    });
   });
 
   it('forwards a user lookup rejection exactly once without rewriting it as a 401', async () => {
@@ -126,6 +142,26 @@ describe('requireAuth', () => {
       sub: { toString: () => userId },
       tv: 1,
     } as never);
+    const query = vi.spyOn(pool, 'query');
+    const req = { headers: { authorization: 'Bearer structurally-valid-token' } } as AuthedRequest;
+    const res = { status: vi.fn(), json: vi.fn() };
+    res.status.mockReturnValue(res);
+    const next = vi.fn();
+
+    try {
+      await requireAuth(req, res as never, next);
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
+      expect(query).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+    } finally {
+      query.mockRestore();
+      verify.mockRestore();
+    }
+  });
+
+  it('rejects a string payload returned by the verifier before querying PostgreSQL', async () => {
+    const verify = vi.spyOn(jwt, 'verify').mockReturnValueOnce('string-payload' as never);
     const query = vi.spyOn(pool, 'query');
     const req = { headers: { authorization: 'Bearer structurally-valid-token' } } as AuthedRequest;
     const res = { status: vi.fn(), json: vi.fn() };
@@ -187,15 +223,41 @@ describe('validate', () => {
       validate({ body: z.object({ value: z.string() }).refine(() => false, 'root validation failed') }),
       (_req, res) => res.sendStatus(204),
     );
+    a.get(
+      '/query',
+      validate({ query: z.object({ filter: z.string().transform((value) => value.toUpperCase()) }) }),
+      (req, res) => res.json(req.query),
+    );
     a.use(errorHandler);
 
     const transformed = await request(a).get('/items/lowercase');
     expect(transformed.status).toBe(200);
     expect(transformed.body).toEqual({ slug: 'LOWERCASE' });
 
+    const transformedQuery = await request(a).get('/query?filter=lowercase');
+    expect(transformedQuery.status).toBe(200);
+    expect(transformedQuery.body).toEqual({ filter: 'LOWERCASE' });
+
     const rootError = await request(a).post('/root-error').send({ value: 'valid-shape' });
     expect(rootError.status).toBe(400);
     expect(rootError.body).toEqual({ error: 'root validation failed', code: 'VALIDATION_FAILED' });
+  });
+
+  it('joins every nested issue path segment with a dot', async () => {
+    const a = express();
+    a.use(express.json());
+    a.post(
+      '/nested',
+      validate({ body: z.object({ parent: z.object({ child: z.string().min(2, 'child is too short') }) }) }),
+      (_req, res) => res.sendStatus(204),
+    );
+    a.use(errorHandler);
+
+    const res = await request(a)
+      .post('/nested')
+      .send({ parent: { child: 'x' } });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ error: 'parent.child: child is too short', code: 'VALIDATION_FAILED' });
   });
 });
 
@@ -321,6 +383,17 @@ describe('errorHandler', () => {
         throw new HttpError(429, 'capped', { retryAfterHours: 3 }, 'DAILY_LIMIT');
       }),
     );
+    a.get(
+      '/reserved-extra',
+      h(async () => {
+        throw new HttpError(
+          409,
+          'canonical message',
+          { error: 'spoofed message', code: 'INTERNAL', hint: 'preserved' },
+          'STATE_CHANGED',
+        );
+      }),
+    );
     a.get('/multer-size', (_req, _res, next) => next(new multer.MulterError('LIMIT_FILE_SIZE')));
     a.get('/multer-other', (_req, _res, next) => next(new multer.MulterError('LIMIT_FIELD_COUNT')));
     a.get('/request-aborted', (_req, _res, next) => next({ type: 'request.aborted' }));
@@ -341,6 +414,12 @@ describe('errorHandler', () => {
     expect(res.body).toEqual({ error: 'teapot', code: 'VALIDATION_FAILED', hint: 'use coffee' });
     // No retry extras: the uniform contract must not invent a header.
     expect(res.headers['retry-after']).toBeUndefined();
+  });
+
+  it('never lets HttpError extras overwrite the reserved error contract fields', async () => {
+    const res = await request(buildApp()).get('/reserved-extra');
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'canonical message', code: 'STATE_CHANGED', hint: 'preserved' });
   });
 
   it('advertises Retry-After uniformly for second- and hour-denominated retry extras', async () => {
@@ -378,17 +457,46 @@ describe('errorHandler', () => {
   it('maps MulterError LIMIT_FILE_SIZE to 413 and other codes to 400', async () => {
     const size = await request(buildApp()).get('/multer-size');
     expect(size.status).toBe(413);
-    expect(size.body.error).toBe('File too large (max 25MB)');
+    expect(size.body).toEqual({ error: 'File too large (max 25MB)', code: 'AUDIO_TOO_LARGE' });
 
     const other = await request(buildApp()).get('/multer-other');
     expect(other.status).toBe(400);
-    expect(typeof other.body.error).toBe('string');
+    expect(other.body).toEqual({ error: 'Too many fields', code: 'VALIDATION_FAILED' });
   });
 
   it('maps malformed JSON bodies to 400 instead of a misleading 500', async () => {
     const res = await request(buildApp()).post('/anything').set('Content-Type', 'application/json').send('{ not json');
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe('Request body is not valid JSON');
+    expect(res.body).toEqual({ error: 'Request body is not valid JSON', code: 'VALIDATION_FAILED' });
+  });
+
+  it('sheds an exhausted PostgreSQL pool with its exact log, metric, retry, and response contract', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const increment = vi.spyOn(shedRequestsTotal, 'inc').mockImplementation(() => undefined as never);
+    const req = { id: 'pool-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+
+    try {
+      errorHandler(new Error('timeout exceeded when trying to connect'), req, res, vi.fn());
+      expect(warn).toHaveBeenCalledWith({ requestId: 'pool-request' }, 'database pool saturated; shedding request');
+      expect(increment).toHaveBeenCalledWith({ reason: 'pool_saturated' });
+      expect(res.set).toHaveBeenCalledWith('Retry-After', '5');
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
+    } finally {
+      increment.mockRestore();
+      warn.mockRestore();
+    }
   });
 
   it('maps an oversized JSON body to 413 without exposing parser details', async () => {
@@ -442,30 +550,38 @@ describe('errorHandler', () => {
     expect(new HttpError(418, 'teapot').name).toBe('HttpError');
   });
 
-  it('drops the error response quietly when the client is already gone', () => {
-    const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
-    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
-    try {
-      const res = {
-        writableEnded: false,
-        destroyed: false,
-        end: vi.fn(),
-        status: vi.fn().mockReturnThis(),
-        json: vi.fn(),
-        set: vi.fn(),
-      } as unknown as express.Response;
-      const req = { socket: { destroyed: true }, id: 'req-gone' } as unknown as express.Request;
-      errorHandler(new Error('ENOENT from the temp-file close race'), req, res, vi.fn());
-      expect(info).toHaveBeenCalledWith(
-        { err: expect.any(Error), requestId: 'req-gone' },
-        'client gone before error response; dropping it',
-      );
-      expect(error).not.toHaveBeenCalled();
-      expect(res.end).toHaveBeenCalledOnce();
-      expect(res.status).not.toHaveBeenCalled();
-    } finally {
-      info.mockRestore();
-      error.mockRestore();
-    }
-  });
+  it.each([
+    { condition: 'response already ended', writableEnded: true, responseDestroyed: false, socketDestroyed: false },
+    { condition: 'response destroyed', writableEnded: false, responseDestroyed: true, socketDestroyed: false },
+    { condition: 'socket destroyed', writableEnded: false, responseDestroyed: false, socketDestroyed: true },
+  ])(
+    'drops the error response quietly when the $condition',
+    ({ writableEnded, responseDestroyed, socketDestroyed }) => {
+      const info = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
+      const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+      try {
+        const res = {
+          writableEnded,
+          destroyed: responseDestroyed,
+          end: vi.fn(),
+          status: vi.fn().mockReturnThis(),
+          json: vi.fn(),
+          set: vi.fn(),
+        } as unknown as express.Response;
+        const req = { socket: { destroyed: socketDestroyed }, id: 'req-gone' } as unknown as express.Request;
+        errorHandler(new Error('ENOENT from the temp-file close race'), req, res, vi.fn());
+        expect(info).toHaveBeenCalledWith(
+          { err: expect.any(Error), requestId: 'req-gone' },
+          'client gone before error response; dropping it',
+        );
+        expect(error).not.toHaveBeenCalled();
+        if (!writableEnded && !responseDestroyed) expect(res.end).toHaveBeenCalledOnce();
+        else expect(res.end).not.toHaveBeenCalled();
+        expect(res.status).not.toHaveBeenCalled();
+      } finally {
+        info.mockRestore();
+        error.mockRestore();
+      }
+    },
+  );
 });

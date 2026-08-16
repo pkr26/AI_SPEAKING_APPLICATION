@@ -1,19 +1,23 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
+import fsSync from 'node:fs';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
 import express from 'express';
 import request from 'supertest';
 import { ipKeyGenerator } from 'express-rate-limit';
+import { createApp } from '../src/app';
 import { buildAssessmentSubmissionChain, runAssessmentSubmission } from '../src/assessment-pipeline';
 import { config } from '../src/config';
 import { JANITOR_BATCH_SIZE } from '../src/janitor';
 import { logger } from '../src/logger';
+import { shedRequestsTotal } from '../src/metrics';
 import { AuthedRequest, errorHandler, HttpError, UserRow, validate } from '../src/middleware';
-import { buildLimiters, normalizeLoginEmail } from '../src/rate-limit';
+import { buildLimiters, normalizeLoginEmail, rateLimitIpKey, requestIpRateLimitKey } from '../src/rate-limit';
 import { cleanupRateLimitWindows, PostgresRateLimitStore } from '../src/postgres-rate-limit-store';
+import { submittedAudioFileIsOwned } from '../src/upload';
 import { fakeM4aBuffer, pool } from './helpers';
 
 const saved = { ...config.rateLimit };
@@ -61,13 +65,78 @@ async function expectRefunded(namespace: string) {
   });
 }
 
+async function shedCounterValue(reason: string): Promise<number> {
+  const { values } = await shedRequestsTotal.get();
+  return values.find((entry) => entry.labels.reason === reason)?.value ?? 0;
+}
+
 describe('rate limiters', () => {
+  it('runs the cheap global flood brake before PostgreSQL credential counters', async () => {
+    config.rateLimit.globalStore = 'memory';
+    config.rateLimit.globalWindowMs = 60_000;
+    config.rateLimit.globalMax = 1;
+    config.rateLimit.authWindowMs = 60_000;
+    config.rateLimit.authMax = 100;
+    const a = createApp();
+
+    const first = await request(a).post('/auth/login').send({ email: 'missing@example.com', password: 'wrong123' });
+    const second = await request(a).post('/auth/login').send({ email: 'missing@example.com', password: 'wrong123' });
+
+    expect(first.status).toBe(401);
+    expect(second.status).toBe(429);
+    expect(second.body).toEqual({ error: 'Too many requests, please try again later', code: 'RATE_LIMITED' });
+    const { rows } = await pool.query<{ hits: number }>(
+      `SELECT coalesce(sum(hits), 0)::int AS hits
+       FROM rate_limit_windows
+       WHERE namespace = $1`,
+      [`auth:${config.rateLimit.authWindowMs}:${config.rateLimit.authMax}`],
+    );
+    expect(rows[0].hits).toBe(1);
+    // Probes are intentionally mounted before the global budget.
+    expect((await request(a).get('/health')).status).toBe(200);
+  });
+
   it('normalizes bounded login account identifiers and skips unusable values', () => {
     expect(normalizeLoginEmail('  Learner@Example.COM ')).toBe('learner@example.com');
     expect(normalizeLoginEmail('X'.repeat(254))).toBe('x'.repeat(254));
     expect(normalizeLoginEmail('')).toBeUndefined();
     expect(normalizeLoginEmail(123)).toBeUndefined();
     expect(normalizeLoginEmail('x'.repeat(255))).toBeUndefined();
+    expect(rateLimitIpKey('203.0.113.42')).toBe(ipKeyGenerator('203.0.113.42'));
+    expect(rateLimitIpKey('2001:db8:abcd:1234::1')).toBe(ipKeyGenerator('2001:db8:abcd:1234::1'));
+    expect(rateLimitIpKey(undefined)).toBe(ipKeyGenerator(''));
+    expect(requestIpRateLimitKey({ ip: '203.0.113.42' })).toBe(ipKeyGenerator('203.0.113.42'));
+    expect(requestIpRateLimitKey({ ip: '2001:db8:abcd:1234::1' })).toBe(ipKeyGenerator('2001:db8:abcd:1234::1'));
+    expect(requestIpRateLimitKey({ ip: undefined })).toBe(ipKeyGenerator(''));
+  });
+
+  it('skips unusable forgot-password identifiers and isolates each valid normalized email key', async () => {
+    config.rateLimit.forgotEmailWindowMs = 60_000;
+    config.rateLimit.forgotEmailMax = 1;
+    const namespace = 'forgot-email:60000:1';
+    const a = express();
+    a.use(express.json());
+    a.use(buildLimiters().forgotPasswordEmail);
+    a.post('/x', (_req, res) => res.json({ throttled: res.locals.forgotEmailThrottled === true }));
+
+    expect((await request(a).post('/x')).body).toEqual({ throttled: false });
+    expect((await request(a).post('/x').send({})).body).toEqual({ throttled: false });
+    expect((await request(a).post('/x').send({ email: 42 })).body).toEqual({ throttled: false });
+    const skipped = await pool.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM rate_limit_windows WHERE namespace = $1',
+      [namespace],
+    );
+    expect(skipped.rows[0].count).toBe(0);
+
+    expect((await request(a).post('/x').send({ email: ' First@Example.com ' })).body).toEqual({ throttled: false });
+    expect((await request(a).post('/x').send({ email: 'second@example.com' })).body).toEqual({ throttled: false });
+    expect((await request(a).post('/x').send({ email: 'first@example.COM' })).body).toEqual({ throttled: true });
+
+    const stored = await pool.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM rate_limit_windows WHERE namespace = $1',
+      [namespace],
+    );
+    expect(stored.rows[0].count).toBe(2);
   });
 
   it('throttles the global limiter with the shared message and standard headers', async () => {
@@ -165,6 +234,20 @@ describe('rate limiters', () => {
       error: 'Too many accounts created from this network, please try again later',
       code: 'RATE_LIMITED',
     });
+  });
+
+  it('throttles diagnostic restarts per user without coupling authenticated learners', async () => {
+    config.rateLimit.passwordWindowMs = 60_000;
+    config.rateLimit.passwordMax = 1;
+    const limiters = buildLimiters();
+    const first = userApp('diagnostic-user-1', limiters.diagnosticRestart);
+    const second = userApp('diagnostic-user-2', limiters.diagnosticRestart);
+
+    expect((await request(first).get('/x')).status).toBe(200);
+    const limited = await request(first).get('/x');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
+    expect((await request(second).get('/x')).status).toBe(200);
   });
 
   it('keys the assess limiter per user, not per IP', async () => {
@@ -282,6 +365,7 @@ describe('rate limiters', () => {
     const failure = new Error('database unavailable');
     const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(failure as never);
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const shedBefore = await shedCounterValue('store_brownout');
     try {
       const res = await request(a).get('/x');
       expect(res.status).toBe(503);
@@ -291,6 +375,7 @@ describe('rate limiters', () => {
         code: 'POOL_SATURATED',
         retryAfterSeconds: 5,
       });
+      expect(await shedCounterValue('store_brownout')).toBe(shedBefore + 1);
     } finally {
       warn.mockRestore();
       query.mockRestore();
@@ -650,7 +735,17 @@ describe('assessment reservation after client disconnect', () => {
   // already closed: express-rate-limit's close handler has refunded them while
   // the abort guard saw no reservation flag, and 'close' never fires twice.
 
-  async function submissionHarness({ closed }: { closed: boolean }) {
+  async function submissionHarness({
+    closed = false,
+    destroyed = false,
+    socketDestroyed = false,
+    emitCloseDuringAssessment = false,
+  }: {
+    closed?: boolean;
+    destroyed?: boolean;
+    socketDestroyed?: boolean;
+    emitCloseDuringAssessment?: boolean;
+  }) {
     const limiters = buildLimiters();
     const chain = buildAssessmentSubmissionChain(limiters);
     const respend = vi.fn();
@@ -669,7 +764,7 @@ describe('assessment reservation after client disconnect', () => {
       ip: '127.0.0.1',
       body: { questionId: questionRows[0].id, requestId: randomUUID() },
       file: { path: audioPath },
-      socket: { destroyed: false },
+      socket: { destroyed: socketDestroyed },
     } as unknown as AuthedRequest;
     const res = new EventEmitter() as EventEmitter & {
       locals: Record<string, unknown>;
@@ -681,8 +776,15 @@ describe('assessment reservation after client disconnect', () => {
     res.locals = {};
     res.writableEnded = false;
     res.closed = closed;
-    res.destroyed = false;
+    res.destroyed = destroyed;
     res.json = vi.fn();
+    if (emitCloseDuringAssessment) {
+      // Model uploadAudio's response-close listener without running multipart
+      // parsing in this focused pipeline harness.
+      res.once('close', () => {
+        if (!submittedAudioFileIsOwned(res as never)) fsSync.unlinkSync(audioPath);
+      });
+    }
 
     try {
       // validated() only serves bodies parsed by the validate() middleware.
@@ -700,6 +802,10 @@ describe('assessment reservation after client disconnect', () => {
         requireQuestionAtUserLevel: false,
         claimAttempt: async () => ({ claimId: randomUUID() }),
         assess: async (_audioPath, _user, _question, _claim, options) => {
+          if (emitCloseDuringAssessment) {
+            res.emit('close');
+            await expect(fs.stat(audioPath)).resolves.toBeTruthy();
+          }
           options.onCapacityReserved?.();
           return { ok: true };
         },
@@ -710,11 +816,15 @@ describe('assessment reservation after client disconnect', () => {
       // The in-flight idempotency claim row cascades away with the user.
       await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
     }
-    return { req, res, respend };
+    return { req, res, respend, audioPath };
   }
 
-  it('re-spends both hits when capacity commits after the response closed', async () => {
-    const { req, res, respend } = await submissionHarness({ closed: true });
+  it.each([
+    ['response closed', { closed: true }],
+    ['response destroyed', { destroyed: true }],
+    ['request socket destroyed', { socketDestroyed: true }],
+  ] as const)('re-spends both hits when capacity commits after the %s', async (_condition, state) => {
+    const { req, res, respend } = await submissionHarness(state);
     expect(res.locals.assessmentCapacityReserved).toBe(true);
     expect(respend).toHaveBeenCalledOnce();
     expect(respend).toHaveBeenCalledWith(req);
@@ -722,8 +832,13 @@ describe('assessment reservation after client disconnect', () => {
   });
 
   it('does not re-spend when the client is still connected at reservation time', async () => {
-    const { res, respend } = await submissionHarness({ closed: false });
+    const { res, respend } = await submissionHarness({});
     expect(res.locals.assessmentCapacityReserved).toBe(true);
     expect(respend).not.toHaveBeenCalled();
+  });
+
+  it('keeps owned local audio readable after close and removes it when the runner unwinds', async () => {
+    const { audioPath } = await submissionHarness({ emitCloseDuringAssessment: true });
+    await expect(fs.stat(audioPath)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 });

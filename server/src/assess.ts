@@ -102,23 +102,35 @@ let openaiClient: OpenAI | null = null;
 
 const MAX_TRANSCRIPT_CHARS = 12_000;
 
-const gradingSchema = z.object({
-  score: z.number().min(0).max(100),
-  feedback: z.string().trim().min(1).max(800),
-});
+// Construct structured-output contracts at assessment time so the provider
+// formatter and the parser always share the exact same fresh schema.
+function createSpeakingGradingSchema() {
+  return z.object({
+    score: z.number().min(0).max(100),
+    feedback: z.string().trim().min(1).max(800),
+  });
+}
 
-const nativeGradingSchema = z.object({
-  understood: z.boolean(),
-  modelAnswer: z.string().trim().min(1).max(800),
-  feedback: z.string().trim().min(1).max(800),
-});
+function createNativeGradingSchema() {
+  return z.object({
+    understood: z.boolean(),
+    modelAnswer: z.string().trim().min(1).max(800),
+    feedback: z.string().trim().min(1).max(800),
+  });
+}
 
-const NATIVE_LANGUAGE_NAMES: Record<NativeLanguage, string> = {
-  te: 'Telugu',
-  hi: 'Hindi',
-  es: 'Spanish',
-  zh: 'Chinese',
-};
+function nativeLanguageName(language: NativeLanguage): string {
+  switch (language) {
+    case 'te':
+      return 'Telugu';
+    case 'hi':
+      return 'Hindi';
+    case 'es':
+      return 'Spanish';
+    case 'zh':
+      return 'Chinese';
+  }
+}
 
 function getOpenAI(): OpenAI {
   if (!config.openaiApiKey) {
@@ -358,6 +370,7 @@ export function assessSpeaking(
   userId: string,
   options: AssessOptions = {},
 ): Promise<AssessResult> {
+  const gradingSchema = createSpeakingGradingSchema();
   return callProvider<AssessResult>(audioPath, q, userId, options, {
     transcriptionLanguage: 'en',
     mockResult: () => {
@@ -412,6 +425,7 @@ export function assessNativeComprehension(
   userId: string,
   options: AssessOptions = {},
 ): Promise<NativeAssessResult> {
+  const nativeGradingSchema = createNativeGradingSchema();
   return callProvider<NativeAssessResult>(audioPath, q, userId, options, {
     transcriptionLanguage: nativeLanguage,
     mockResult: () => ({
@@ -429,7 +443,7 @@ export function assessNativeComprehension(
     responseFormat: zodResponseFormat(nativeGradingSchema, 'native_comprehension'),
     systemPrompt: [
       'You help an English learner who answered a speaking question in their native language.',
-      `The learner answered in ${NATIVE_LANGUAGE_NAMES[nativeLanguage]}.`,
+      `The learner answered in ${nativeLanguageName(nativeLanguage)}.`,
       'Decide only whether the transcript shows they understood the question and answered it on-topic (understood).',
       'Do not judge English quality: no English was expected.',
       'modelAnswer: 2-3 simple English sentences, at the given CEFR level, that answer the question and can be imitated.',

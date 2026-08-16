@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import { app, pool, registerUser } from './helpers';
 
@@ -6,7 +6,11 @@ afterAll(async () => {
   await pool.end();
 });
 
-const a = app();
+let a: ReturnType<typeof app>;
+
+beforeEach(() => {
+  a = app();
+});
 
 /** Fresh learner placed at A1 directly (no diagnostic budget spent). */
 async function freshUser() {
@@ -78,6 +82,11 @@ describe('GET /practice/history', () => {
     // Diagnostic attempts belong to the history, flagged by their context.
     expect(r.body.items[2]).toMatchObject({ context: 'diagnostic', score: 55, passed: false });
 
+    const exactLimit = await request(a).get('/practice/history?limit=3').set('Authorization', `Bearer ${token}`);
+    expect(exactLimit.status).toBe(200);
+    expect(exactLimit.body.items).toHaveLength(3);
+    expect(exactLimit.body.nextCursor).toBeNull();
+
     expect((await request(a).get('/practice/history')).status).toBe(401);
   });
 
@@ -96,9 +105,12 @@ describe('GET /practice/history', () => {
       const url: string = `/practice/history?limit=2${cursor ? `&cursor=${cursor}` : ''}`;
       const page: request.Response = await request(a).get(url).set('Authorization', `Bearer ${token}`);
       expect(page.status).toBe(200);
-      seen.push(...page.body.items.map((item: { id: string }) => item.id));
+      const pageIds = page.body.items.map((item: { id: string }) => item.id) as string[];
+      expect(pageIds.every((id) => !seen.includes(id))).toBe(true);
+      seen.push(...pageIds);
       cursor = page.body.nextCursor as string | null;
       pages++;
+      expect(pages).toBeLessThanOrEqual(3);
     } while (cursor !== null);
 
     expect(pages).toBe(3); // 2 + 2 + 1

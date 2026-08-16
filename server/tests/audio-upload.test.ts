@@ -38,6 +38,19 @@ describe('POST /uploads/audio-url', () => {
     expect(res.body).toEqual({ error: 'Unsupported audio media type', code: 'AUDIO_INVALID' });
   });
 
+  it('rejects a content type beyond the grant schema boundary before the handler runs', async () => {
+    const a = app();
+    const { res: reg } = await registerUser(a);
+    const token = reg.body.token as string;
+    const res = await request(a)
+      .post('/uploads/audio-url')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ contentType: 'a'.repeat(129) });
+
+    expect(res.status).toBe(400);
+    expect(res.body.code).toBe('VALIDATION_FAILED');
+  });
+
   it('returns 415 for prototype-chain content types that inherit truthy members', async () => {
     const a = app();
     const { res: reg } = await registerUser(a);

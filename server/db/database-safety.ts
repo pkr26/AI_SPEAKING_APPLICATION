@@ -2,9 +2,6 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 
-const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-const DEFAULT_POSTGRES_PORT = '5432';
-
 export type DestructiveDatabasePurpose = 'test' | 'mutation';
 
 export interface DestructiveDatabaseTarget {
@@ -54,14 +51,15 @@ export function configuredApplicationDatabaseUrl(
 
 function canonicalHost(parsed: URL): string {
   const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
-  return LOOPBACK_HOSTS.has(host) ? 'loopback' : host;
+  const loopbackHosts = new Set(['localhost', '127.0.0.1', '[::1]']);
+  return loopbackHosts.has(host) ? 'loopback' : host;
 }
 
 function effectivePort(parsed: URL, variableName: string, pgPort: string | undefined): number {
   // node-postgres applies parseInt(..., 10) to PGPORT when the URL omits a
   // port. Mirror that normalization so whitespace/zeros/suffixes cannot make
   // the same target compare as different.
-  const port = Number.parseInt(parsed.port || pgPort || DEFAULT_POSTGRES_PORT, 10);
+  const port = Number.parseInt(parsed.port || pgPort || '5432', 10);
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error(`${variableName} has an invalid effective PostgreSQL port`);
   }

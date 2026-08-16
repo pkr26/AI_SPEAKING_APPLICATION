@@ -2,7 +2,14 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
 import { QuestionRow } from '../src/db';
-import { authoredAnswerHint, buildFinalFeedback, MAX_FINAL_FEEDBACK_LENGTH } from '../src/practice';
+import {
+  authoredAnswerHint,
+  authoredNativeExample,
+  buildFinalFeedback,
+  buildNativeFallbackFeedback,
+  MAX_FINAL_FEEDBACK_LENGTH,
+  pickPracticeNext,
+} from '../src/practice';
 
 afterAll(async () => {
   await pool.end();
@@ -14,6 +21,48 @@ afterEach(() => {
 
 const FAIL_SCORE = 0; // Math.random() -> 0 gives mock score 40 (fail)
 const PASS_SCORE = 0.9999; // mock score 95 (pass)
+
+describe('practice picker query contract', () => {
+  const candidate = {
+    id: '00000000-0000-4000-8000-000000000001',
+    cefrLevel: 'A1',
+    promptWord: 'candidate',
+    questionText: 'Describe the candidate.',
+  };
+
+  it('passes the completed-question exclusion to every bucket and labels the second-bucket fallback', async () => {
+    const userId = '00000000-0000-4000-8000-000000000002';
+    const excludedQuestionId = '00000000-0000-4000-8000-000000000003';
+    const allBucketsQuery = vi.fn(async (text: string, _values?: unknown[]) => {
+      if (text.includes('FROM attempts latest')) return { rows: [] };
+      if (text.includes('pp.skipped_until > now()')) return { rows: [candidate] };
+      return { rows: [] };
+    });
+    const allBucketsDb = { query: allBucketsQuery } as unknown as Parameters<typeof pickPracticeNext>[2];
+
+    const skippedFallback = await pickPracticeNext(userId, 'A1', allBucketsDb, excludedQuestionId);
+
+    expect(skippedFallback).toEqual({ question: candidate, kind: 'revision' });
+    const bucketCalls = allBucketsQuery.mock.calls.filter(([text]) => text.includes('$3::uuid'));
+    expect(bucketCalls).toHaveLength(4);
+    for (const [, values] of bucketCalls) {
+      expect(values).toEqual([userId, 'A1', excludedQuestionId]);
+    }
+
+    const secondBucketQuery = vi.fn(async (text: string) => {
+      if (text.includes('FROM attempts latest')) return { rows: [{ was_revision: true }] };
+      if (text.includes('LEFT JOIN practice_progress')) return { rows: [] };
+      if (text.includes("pp.status = 'learning'")) return { rows: [candidate] };
+      return { rows: [] };
+    });
+    const secondBucketDb = { query: secondBucketQuery } as unknown as Parameters<typeof pickPracticeNext>[2];
+
+    await expect(pickPracticeNext(userId, 'A1', secondBucketDb, excludedQuestionId)).resolves.toEqual({
+      question: candidate,
+      kind: 'revision',
+    });
+  });
+});
 
 describe('practice attempt numbering (deterministic mock scores)', () => {
   const a = app();
@@ -125,6 +174,10 @@ describe('practice feedback response bounds', () => {
 
   it.each([
     ['the requested language is absent', { hi: { word: 'नगर', question: 'प्रश्न', examples: [{ en: 'नमस्ते' }] } }],
+    [
+      'the authored examples property is absent',
+      { te: { word: 'ఊరు', question: 'ప్రశ్న', examples: undefined } } as unknown as QuestionRow['translations'],
+    ],
     ['the authored example list is empty', { te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [] } }],
     [
       'the first example has no English text',
@@ -141,5 +194,51 @@ describe('practice feedback response bounds', () => {
     expect(feedback).toHaveLength(MAX_FINAL_FEEDBACK_LENGTH);
     expect(feedback).toContain('Keep practicing.');
     expect(feedback.endsWith(". Let's move on!")).toBe(true);
+  });
+
+  it('caps unexpectedly large provider feedback even when no authored hint can fit', () => {
+    expect(buildFinalFeedback('x'.repeat(10_000), 'short hint')).toHaveLength(MAX_FINAL_FEEDBACK_LENGTH);
+  });
+
+  it('validates and trims authored native examples before using them', () => {
+    const valid = questionRow({
+      te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [{ native: '  నా ఊరు ప్రశాంతంగా ఉంటుంది.  ' }] },
+    });
+    expect(authoredNativeExample(valid, 'te')).toBe('నా ఊరు ప్రశాంతంగా ఉంటుంది.');
+    expect(authoredNativeExample(questionRow({}), 'te')).toBeUndefined();
+    expect(
+      authoredNativeExample(
+        questionRow({
+          te: { word: 'ఊరు', question: 'ప్రశ్న', examples: undefined },
+        } as unknown as QuestionRow['translations']),
+        'te',
+      ),
+    ).toBeUndefined();
+    expect(
+      authoredNativeExample(questionRow({ te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [] } }), 'te'),
+    ).toBeUndefined();
+    expect(
+      authoredNativeExample(
+        questionRow({ te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [{ en: 'English only' }] } }),
+        'te',
+      ),
+    ).toBeUndefined();
+    expect(
+      authoredNativeExample(
+        questionRow({ te: { word: 'ఊరు', question: 'ప్రశ్న', examples: [{ native: '   ' }] } }),
+        'te',
+      ),
+    ).toBeUndefined();
+  });
+
+  it('caps native fallback feedback while preserving its prefix and closing guidance', () => {
+    const suffix = ' — try saying it in English next!';
+    const feedback = buildNativeFallbackFeedback('Needs more detail.', 'న'.repeat(2_000));
+    expect(feedback).toHaveLength(800);
+    expect(feedback.startsWith('Needs more detail. An on-topic answer could be: ')).toBe(true);
+    expect(feedback.endsWith(suffix)).toBe(true);
+    expect(buildNativeFallbackFeedback('Record again.')).toBe('Record again.');
+    expect(buildNativeFallbackFeedback('x'.repeat(1_000))).toHaveLength(800);
+    expect(buildNativeFallbackFeedback('x'.repeat(1_000), 'native example')).toHaveLength(800);
   });
 });

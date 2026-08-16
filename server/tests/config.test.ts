@@ -99,14 +99,20 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-async function loadConfig(env: Record<string, string>) {
+async function loadConfigModule(env: Record<string, string>) {
   for (const key of MANAGED_KEYS) delete process.env[key];
   Object.assign(process.env, env);
   vi.resetModules();
-  return (await import('../src/config')).config;
+  return import('../src/config');
+}
+
+async function loadConfig(env: Record<string, string>) {
+  return (await loadConfigModule(env)).config;
 }
 
 async function expectInvalid(env: Record<string, string>, fragment: string) {
+  exitSpy.mockClear();
+  errorSpy.mockClear();
   await expect(loadConfig(env)).rejects.toThrow('process.exit called');
   expect(exitSpy).toHaveBeenCalledWith(1);
   expect(errorSpy.mock.calls.map((c: unknown[]) => String(c[0])).join('\n')).toContain(fragment);
@@ -177,6 +183,17 @@ describe('config env validation', () => {
     });
   });
 
+  it('uses the documented development and real-provider defaults when their variables are absent', async () => {
+    const env = baseEnv({ OPENAI_API_KEY: 'sk-real' });
+    delete env.NODE_ENV;
+    delete env.MOCK_AI;
+
+    const config = await loadConfig(env);
+    expect(config.nodeEnv).toBe('development');
+    expect(config.isProduction).toBe(false);
+    expect(config.mockAi).toBe(false);
+  });
+
   it('parses explicit numeric and list values', async () => {
     const config = await loadConfig(
       baseEnv({
@@ -187,14 +204,15 @@ describe('config env validation', () => {
         AI_MAX_CONCURRENCY: '2',
         AUDIO_INSPECTION_MAX_CONCURRENCY: '3',
         OPENAI_TIMEOUT_MS: '5000',
-        FFMPEG_PATH: '/opt/tools/ffmpeg',
-        FFPROBE_PATH: '/opt/tools/ffprobe',
+        FFMPEG_PATH: ' /opt/tools/ffmpeg ',
+        FFPROBE_PATH: ' /opt/tools/ffprobe ',
         RATE_LIMIT_LOGIN_ACCOUNT_WINDOW_MS: '180000',
         RATE_LIMIT_LOGIN_ACCOUNT_MAX: '6',
         RATE_LIMIT_ASSESS_MAX: '4',
         RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS: '120000',
         RATE_LIMIT_UPLOAD_GRANT_MAX: '8',
         CORS_ORIGINS: ' https://a.example ,,https://b.example ',
+        S3_REGION: ' eu-west-2 ',
         S3_UPLOAD_URL_TTL_SECONDS: '120',
         S3_OPERATION_TIMEOUT_MS: '4000',
         LOG_LEVEL: 'warn',
@@ -217,11 +235,23 @@ describe('config env validation', () => {
     expect(config.corsOrigins).toEqual(['https://a.example', 'https://b.example']);
     expect(config.s3.uploadUrlTtlSeconds).toBe(120);
     expect(config.s3.operationTimeoutMs).toBe(4000);
+    expect(config.s3.region).toBe('eu-west-2');
     expect(config.logLevel).toBe('warn');
   });
 
   it('rejects a missing/empty DATABASE_URL and a short JWT_SECRET', async () => {
+    const missingDatabase = baseEnv({});
+    delete missingDatabase.DATABASE_URL;
+    await expectSingleInvalidIssue(missingDatabase, 'DATABASE_URL', 'DATABASE_URL is required');
     await expectInvalid(baseEnv({ DATABASE_URL: '' }), 'DATABASE_URL is required');
+
+    const missingSecret = baseEnv({});
+    delete missingSecret.JWT_SECRET;
+    await expectSingleInvalidIssue(
+      missingSecret,
+      'JWT_SECRET',
+      'JWT_SECRET is required (no default — set a real secret)',
+    );
     await expectInvalid(baseEnv({ JWT_SECRET: 'too-short' }), 'JWT_SECRET must be at least 32 characters');
   });
 
@@ -331,6 +361,10 @@ describe('config env validation', () => {
     await expectInvalid(baseEnv({ DATABASE_URL: 'not-a-database' }), 'must be a PostgreSQL URL');
     await expectInvalid(baseEnv({ DATABASE_URL: 'https://db.example/ai_english' }), 'must be a PostgreSQL URL');
     await expectInvalid(baseEnv({ DATABASE_URL: 'postgres://db.example' }), 'must be a PostgreSQL URL');
+    await expectInvalid(baseEnv({ DATABASE_URL: 'postgres://db.example/' }), 'must be a PostgreSQL URL');
+    expect(
+      (await loadConfig(baseEnv({ DATABASE_URL: ' postgresql://localhost:5432/ai_english_test ' }))).databaseUrl,
+    ).toBe('postgresql://localhost:5432/ai_english_test');
     expect(
       (await loadConfig(baseEnv({ DATABASE_URL: 'postgresql://localhost:5432/ai_english_test' }))).databaseUrl,
     ).toBe('postgresql://localhost:5432/ai_english_test');
@@ -348,7 +382,13 @@ describe('config env validation', () => {
   });
 
   it('supports silent logging and rejects an unseparated testsecret placeholder in production', async () => {
-    expect((await loadConfig(baseEnv({ LOG_LEVEL: 'silent' }))).logLevel).toBe('silent');
+    for (const level of ['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']) {
+      expect((await loadConfig(baseEnv({ LOG_LEVEL: level }))).logLevel).toBe(level);
+    }
+    expect(
+      (await loadConfig(baseEnv({ NODE_ENV: 'development', JWT_SECRET: 'this-is-a-test-secret-with-enough-length' })))
+        .nodeEnv,
+    ).toBe('development');
     await expectInvalid(
       baseEnv({
         NODE_ENV: 'production',
@@ -392,6 +432,9 @@ describe('config env validation', () => {
     );
     expect(accepted.isProduction).toBe(true);
 
+    const exactlyTenDistinct = await loadConfig(baseEnv({ ...production, JWT_SECRET: 'abcdefghij'.repeat(4) }));
+    expect(exactlyTenDistinct.isProduction).toBe(true);
+
     // Outside production the length floor is the only constraint.
     expect((await loadConfig(baseEnv({ JWT_SECRET: 'a'.repeat(32) }))).jwtSecret).toBe('a'.repeat(32));
   });
@@ -414,6 +457,7 @@ describe('config env validation', () => {
       'must either both be set or both be empty',
     );
     await expectInvalid(baseEnv({ S3_SESSION_TOKEN: 'token-only' }), 'requires both');
+    await expectInvalid(baseEnv({ S3_ACCESS_KEY_ID: 'access-only' }), 'S3_BUCKET');
     await expectInvalid(baseEnv({ S3_ACCESS_KEY_ID: 'access', S3_SECRET_ACCESS_KEY: 'secret' }), 'S3_BUCKET');
 
     const config = await loadConfig(
@@ -468,6 +512,10 @@ describe('config env validation', () => {
     // Blank stays "gate disabled" rather than becoming an empty string.
     const disabledGate = await loadConfig(baseEnv({ MIN_CLIENT_VERSION: '   ' }));
     expect(disabledGate.minClientVersion).toBeUndefined();
+
+    for (const version of ['12', '1.12', '1.2.345', '123456789.123456789.123456789']) {
+      expect((await loadConfig(baseEnv({ MIN_CLIENT_VERSION: version }))).minClientVersion).toBe(version);
+    }
   });
 
   it('parses the mailer knobs and enforces the webhook-mode URL invariants', async () => {
@@ -525,9 +573,25 @@ describe('config env validation', () => {
       'MAIL_WEBHOOK_URL',
       'must be an https URL in production (http is allowed only for loopback hosts)',
     );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: 'http://127.attacker.example/mail' }),
+      'MAIL_WEBHOOK_URL',
+      'must be an https URL in production (http is allowed only for loopback hosts)',
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: 'http://10.0.0.1/mail' }),
+      'MAIL_WEBHOOK_URL',
+      'must be an https URL in production (http is allowed only for loopback hosts)',
+    );
 
     // Co-located relays that never leave the host may stay on plaintext http.
-    for (const loopback of ['http://127.0.0.1:8080/mail', 'http://localhost:8080/mail', 'http://[::1]:8080/mail']) {
+    for (const loopback of [
+      'http://127.0.0.1:8080/mail',
+      'http://127.255.1.2:8080/mail',
+      'http://localhost:8080/mail',
+      'http://relay.localhost:8080/mail',
+      'http://[::1]:8080/mail',
+    ]) {
       const config = await loadConfig(baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: loopback }));
       expect(config.mail).toEqual({ mode: 'webhook', webhookUrl: loopback });
     }
@@ -545,6 +609,23 @@ describe('config env validation', () => {
       'MIN_CLIENT_VERSION',
       "must be a dotted numeric version like '1.2.3' (or empty to disable the client gate)",
     );
+    for (const version of ['1.2.3x', '1234567890', '1.1234567890', '1.2.1234567890']) {
+      await expectSingleInvalidIssue(
+        baseEnv({ MIN_CLIENT_VERSION: version }),
+        'MIN_CLIENT_VERSION',
+        "must be a dotted numeric version like '1.2.3' (or empty to disable the client gate)",
+      );
+    }
+  });
+
+  it('formats nested and root configuration issues unambiguously for operators', async () => {
+    const { formatConfigProblems } = await loadConfigModule(baseEnv({}));
+    expect(
+      formatConfigProblems([
+        { path: ['outer', 2, 'leaf'], message: 'nested problem' },
+        { path: [], message: 'root problem' },
+      ]),
+    ).toBe('  - outer.2.leaf: nested problem\n  - (root): root problem');
   });
 
   it('rejects out-of-range pool and timeout numbers', async () => {

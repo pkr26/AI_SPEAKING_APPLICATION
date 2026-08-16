@@ -14,10 +14,11 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  server:
+  server-code:
     runs-on: ubuntu-24.04
-    # Stryker runs the integration suite per mutant at concurrency 1; give the
-    # campaign the full job budget and report whatever it produced.
+    # Nineteen disjoint source/test lanes retain static mutants without making
+    # each one reload the complete integration suite. They run sequentially
+    # because every lane recreates the same guarded mutation database.
     timeout-minutes: 360
     services:
       postgres:
@@ -57,21 +58,51 @@ jobs:
           fi
           ffmpeg -hide_banner -version
           ffprobe -hide_banner -version
-      # Advisory only: a below-threshold score should surface in the report
-      # artifact for review, not block the scheduled run from uploading it.
-      - name: Run server mutation campaign
-        continue-on-error: true
-        run: npm run mutation
+      # The lane orchestrator continues after a below-threshold lane, merges
+      # every completed report, and fails this job after all lanes finish.
+      - name: Run server code mutation lanes
+        run: npm run mutation:code
         env:
           # The guard requires a dedicated loopback database whose name contains
           # "mutation", ends in "_test", and differs from the app/test DBs.
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/ai_english_mutation_test
-      - name: Upload mutation reports
+      - name: Upload server code mutation reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: server-mutation-report
-          path: server/reports/mutation/
+          name: server-code-mutation-report
+          path: server/reports/mutation/code/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The static multilingual catalog is deliberately independent of the code
+  # job, so a code-lane failure or six-hour timeout cannot prevent its report.
+  server-catalog:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+      - name: Run server catalog mutation campaign
+        run: npm run mutation:catalog
+      - name: Upload server catalog mutation reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: server-catalog-mutation-report
+          path: |
+            server/reports/mutation/catalog.json
+            server/reports/mutation/catalog.html
           if-no-files-found: warn
           retention-days: 30
 

@@ -171,6 +171,7 @@ describe('assessment request recovery', () => {
     ).rejects.toMatchObject({
       status: 409,
       message: 'Assessment request ownership changed; please retry',
+      code: 'STATE_CHANGED',
     });
 
     const stillOwned = await pool.query<{ claim_id: string; status: string }>(

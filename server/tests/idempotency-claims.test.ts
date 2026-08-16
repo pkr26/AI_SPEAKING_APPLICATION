@@ -45,12 +45,14 @@ describe('claimAssessmentRequest ownership and replay', () => {
     await expect(differentQuestion).rejects.toMatchObject({
       status: 409,
       message: 'Assessment request identifier was already used',
+      code: 'REQUEST_ID_REUSED',
     });
     const differentContext = claimAssessmentRequest(userId, requestId, 'diagnostic', questionId);
     await expect(differentContext).rejects.toBeInstanceOf(AssessmentRequestInFlightError);
     await expect(differentContext).rejects.toMatchObject({
       status: 409,
       message: 'Assessment request identifier was already used',
+      code: 'REQUEST_ID_REUSED',
     });
     // A different user can still use the same request UUID independently.
     const other = await registerUser(a);
@@ -71,6 +73,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     await expect(collision).rejects.toMatchObject({
       status: 409,
       message: 'Assessment request identifier was already used',
+      code: 'REQUEST_ID_REUSED',
     });
   });
 
@@ -240,6 +243,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       await expect(claimAssessmentRequest(userId, randomUUID(), 'practice', questionId)).rejects.toMatchObject({
         status: 409,
         message: 'Assessment request identifier was already used',
+        code: 'REQUEST_ID_REUSED',
       });
       expect(client.query.mock.calls.at(-1)?.[0]).toBe('ROLLBACK');
       expect(client.release).toHaveBeenCalledOnce();

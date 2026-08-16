@@ -63,6 +63,32 @@ describe('question seed generator', () => {
     expect(() => renderSeedSql(visuallyDuplicate)).toThrow('duplicate question key');
   });
 
+  it('uses Unicode case folding when detecting duplicate natural keys', () => {
+    const authored = copyQuestions();
+    authored[0]!.promptWord = 'straße';
+    authored[1]!.promptWord = 'STRASSE';
+
+    expect(() => renderSeedSql(authored)).toThrow('duplicate question key');
+
+    const canonicallyEquivalent = copyQuestions();
+    canonicallyEquivalent[0]!.promptWord = 'İstanbul';
+    canonicallyEquivalent[1]!.promptWord = 'i\u0307stanbul';
+
+    expect(() => renderSeedSql(canonicallyEquivalent)).toThrow('duplicate question key');
+  });
+
+  it('collapses repeated whitespace without erasing word boundaries in natural keys', () => {
+    const repeatedWhitespace = copyQuestions();
+    repeatedWhitespace[0]!.promptWord = 'mutation boundary';
+    repeatedWhitespace[1]!.promptWord = 'mutation  boundary';
+    expect(() => renderSeedSql(repeatedWhitespace)).toThrow('duplicate question key');
+
+    const meaningfulWhitespace = copyQuestions();
+    meaningfulWhitespace[0]!.promptWord = 'mutation boundary';
+    meaningfulWhitespace[1]!.promptWord = 'mutationboundary';
+    expect(() => renderSeedSql(meaningfulWhitespace)).not.toThrow();
+  });
+
   it('rejects a question duplicated under another prompt or level', () => {
     const authored = copyQuestions();
     authored[1]!.questionText = authored[0]!.questionText.toUpperCase();
@@ -99,9 +125,23 @@ describe('question seed generator', () => {
       'incomplete te translation',
     ],
     [
+      'empty translated word',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.word = '';
+      },
+      'incomplete es translation',
+    ],
+    [
+      'padded translated word',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.word = ` ${authored[0]!.translations.es.word}`;
+      },
+      'incomplete es translation',
+    ],
+    [
       'oversized translated word',
       (authored: QuestionSeed[]) => {
-        authored[0]!.translations.te.word = 'x'.repeat(501);
+        authored[0]!.translations.te.word = `త${'x'.repeat(500)}`;
       },
       'incomplete te translation',
     ],
@@ -113,9 +153,23 @@ describe('question seed generator', () => {
       'incomplete hi translation',
     ],
     [
+      'empty translated question',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.question = '';
+      },
+      'incomplete es translation',
+    ],
+    [
+      'padded translated question',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.question += ' ';
+      },
+      'incomplete es translation',
+    ],
+    [
       'oversized translated question',
       (authored: QuestionSeed[]) => {
-        authored[0]!.translations.hi.question = 'x'.repeat(4_001);
+        authored[0]!.translations.hi.question = `हि${'x'.repeat(3_999)}`;
       },
       'incomplete hi translation',
     ],
@@ -134,6 +188,20 @@ describe('question seed generator', () => {
       'empty example in zh',
     ],
     [
+      'empty English example',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.zh.examples[0]!.en = '';
+      },
+      'empty example in zh',
+    ],
+    [
+      'padded English example',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.zh.examples[0]!.en += ' ';
+      },
+      'empty example in zh',
+    ],
+    [
       'oversized English example',
       (authored: QuestionSeed[]) => {
         authored[0]!.translations.zh.examples[0]!.en = 'x'.repeat(4_001);
@@ -148,11 +216,25 @@ describe('question seed generator', () => {
       'empty example in zh',
     ],
     [
+      'empty native example',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.examples[0]!.native = '';
+      },
+      'empty example in es',
+    ],
+    [
+      'padded native example',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.translations.es.examples[0]!.native += ' ';
+      },
+      'empty example in es',
+    ],
+    [
       'oversized native example',
       (authored: QuestionSeed[]) => {
-        authored[0]!.translations.zh.examples[0]!.native = 'x'.repeat(4_001);
+        authored[0]!.translations.es.examples[0]!.native = 'x'.repeat(4_001);
       },
-      'empty example in zh',
+      'empty example in es',
     ],
   ] as const)('rejects %s', (_caseName, corrupt, expectedMessage) => {
     const authored = copyQuestions();
@@ -197,9 +279,21 @@ describe('question seed generator', () => {
       },
     ],
     [
+      'empty English prompt',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.promptWord = '';
+      },
+    ],
+    [
       'padded English prompt',
       (authored: QuestionSeed[]) => {
         authored[0]!.promptWord = ` ${authored[0]!.promptWord}`;
+      },
+    ],
+    [
+      'a native-only joiner in an English prompt',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.promptWord += '\u200c';
       },
     ],
     [
@@ -218,6 +312,12 @@ describe('question seed generator', () => {
       'blank English question',
       (authored: QuestionSeed[]) => {
         authored[0]!.questionText = '   ';
+      },
+    ],
+    [
+      'empty English question',
+      (authored: QuestionSeed[]) => {
+        authored[0]!.questionText = '';
       },
     ],
     [
@@ -253,9 +353,11 @@ describe('question seed generator', () => {
     hidden[0]!.translations.te.word += '\u180e';
     expect(() => renderSeedSql(hidden)).toThrow('incomplete te translation');
 
-    const legitimateJoiner = copyQuestions();
-    legitimateJoiner[0]!.translations.te.word += '\u200c';
-    expect(() => renderSeedSql(legitimateJoiner)).not.toThrow();
+    for (const joiner of ['\u200c', '\u200d']) {
+      const legitimateJoiner = copyQuestions();
+      legitimateJoiner[0]!.translations.te.word += joiner;
+      expect(() => renderSeedSql(legitimateJoiner)).not.toThrow();
+    }
   });
 
   it('escapes apostrophes in SQL values without changing JSON content', () => {

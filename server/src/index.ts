@@ -30,8 +30,8 @@ if (config.trustProxy) {
 server.requestTimeout = config.s3.operationTimeoutMs + config.openaiTimeoutMs + 40_000;
 server.headersTimeout = 30_000;
 
-const UPLOAD_JANITOR_INTERVAL_MS = 15 * 60 * 1000;
-const DATABASE_JANITOR_INTERVAL_MS = 60 * 60 * 1000;
+const UPLOAD_JANITOR_INTERVAL_MS = 900_000;
+const DATABASE_JANITOR_INTERVAL_MS = 3_600_000;
 
 interface JanitorDefinition {
   /** Stable metric label for janitor_removed_total (metrics.ts). */
@@ -80,7 +80,7 @@ const janitorDefinitions: JanitorDefinition[] = [
   },
 ];
 
-let janitorTimers: NodeJS.Timeout[] = [];
+let janitorTimers: NodeJS.Timeout[] | undefined;
 
 function runJanitor(definition: JanitorDefinition): void {
   void definition
@@ -93,7 +93,6 @@ function runJanitor(definition: JanitorDefinition): void {
 }
 
 function startJanitors(): void {
-  if (janitorTimers.length > 0) return;
   janitorTimers = janitorDefinitions.map((definition) => {
     // The first cleanup happens only after startup dependencies pass. Failed
     // processes never mutate storage/database state while refusing traffic.
@@ -107,8 +106,10 @@ function startJanitors(): void {
 let shuttingDown = false;
 
 function clearJanitors() {
-  for (const timer of janitorTimers) clearInterval(timer);
-  janitorTimers = [];
+  const timers = janitorTimers;
+  janitorTimers = undefined;
+  if (!timers) return;
+  for (const timer of timers) clearInterval(timer);
 }
 
 function shutdown(signal: string) {
@@ -150,7 +151,7 @@ function shutdown(signal: string) {
     server.close(finishShutdown);
     // Sever idle keep-alive sockets immediately so they cannot pin the drain
     // open; active requests keep their connection until they respond.
-    server.closeIdleConnections?.();
+    server.closeIdleConnections();
   } else {
     finishShutdown();
   }
@@ -172,7 +173,7 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 async function warnIfPoolOversized(): Promise<void> {
   try {
     const { rows } = await pool.query<{ max_connections: string }>('SHOW max_connections');
-    const maxConnections = Number(rows[0]?.max_connections);
+    const maxConnections = Number(rows[0].max_connections);
     if (Number.isInteger(maxConnections) && maxConnections > 0 && config.dbPoolMax > maxConnections - 3) {
       logger.error(
         { dbPoolMax: config.dbPoolMax, maxConnections },
@@ -190,6 +191,7 @@ Promise.all([assertDatabaseSchemaCurrent(), assertAudioInspectorAvailable({ forc
   .then(async () => {
     if (shuttingDown) return;
     await warnIfPoolOversized();
+    if (shuttingDown) return;
     startJanitors();
     server.listen(config.port, () => {
       logger.info({ port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv }, 'AI English API listening');

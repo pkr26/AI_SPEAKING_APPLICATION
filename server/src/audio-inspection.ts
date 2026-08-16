@@ -13,15 +13,21 @@ const INSPECTION_TIMEOUT_MS = 10_000;
 const AVAILABILITY_TIMEOUT_MS = 2_000;
 const AVAILABILITY_SUCCESS_TTL_MS = 30_000;
 const AVAILABILITY_FAILURE_TTL_MS = 2_000;
-const MAX_DIAGNOSTIC_BYTES = 64 * 1024;
+const MAX_DIAGNOSTIC_BYTES = 65_536;
 // One audio-stream index per line; anything beyond this is hostile, not a
 // long listing.
-const MAX_STREAM_LISTING_BYTES = 4 * 1024;
-const MAX_VERSION_BYTES = 16 * 1024;
+const MAX_STREAM_LISTING_BYTES = 4_096;
+const MAX_VERSION_BYTES = 16_384;
 const DECODED_SAMPLE_RATE = 8_000;
 const DECODED_BYTES_PER_SAMPLE = 2;
-const DECODED_BYTES_PER_SECOND = DECODED_SAMPLE_RATE * DECODED_BYTES_PER_SAMPLE;
-const MAX_DECODED_BYTES = Math.floor(MAX_AUDIO_DURATION_SECONDS * DECODED_BYTES_PER_SECOND);
+
+function decodedBytesPerSecond(): number {
+  return DECODED_SAMPLE_RATE * DECODED_BYTES_PER_SAMPLE;
+}
+
+function maxDecodedBytes(): number {
+  return Math.floor(MAX_AUDIO_DURATION_SECONDS * decodedBytesPerSecond());
+}
 
 // Native decoding is independently bounded before spawn. Requests fail fast
 // rather than queueing and retaining uploaded files/assessment claims while a
@@ -38,10 +44,7 @@ function acquireInspectionSlot(): () => void {
     throw new HttpError(503, 'Audio inspection capacity busy', { retryAfterSeconds: 2 }, 'CAPACITY_BUSY');
   }
   inspectionsInFlight++;
-  let released = false;
   return () => {
-    if (released) return;
-    released = true;
     inspectionsInFlight--;
   };
 }
@@ -61,18 +64,26 @@ const INSPECTOR_ENV = buildAudioInspectorEnvironment(process.env);
 // Select the one demuxer family implied by the already magic-checked upload
 // extension. Besides reducing native parser attack surface, this prevents an
 // uploaded playlist/manifest from making FFmpeg open secondary resources.
-const INPUT_FORMAT_BY_EXTENSION: Readonly<Record<string, string>> = {
-  '.m4a': 'mov',
-  '.mp4': 'mov',
-  '.mp3': 'mp3',
-  '.wav': 'wav',
-  '.ogg': 'ogg',
-  '.oga': 'ogg',
-  '.webm': 'matroska,webm',
-  '.flac': 'flac',
-};
+function inputFormatFor(extension: string): string | undefined {
+  switch (extension) {
+    case '.m4a':
+    case '.mp4':
+      return 'mov';
+    case '.mp3':
+      return 'mp3';
+    case '.wav':
+      return 'wav';
+    case '.ogg':
+    case '.oga':
+      return 'ogg';
+    case '.webm':
+      return 'matroska,webm';
+    case '.flac':
+      return 'flac';
+  }
+}
 
-type InspectionFailure = 'invalid' | 'timeout' | 'unavailable';
+type InspectionFailure = 'timeout' | 'unavailable';
 
 interface AvailabilityCache {
   expiresAt: number;
@@ -85,6 +96,28 @@ let availabilityInFlight: Promise<void> | undefined;
 class InspectionError extends Error {
   constructor(readonly kind: InspectionFailure) {
     super(kind);
+  }
+}
+
+class InvalidInspectionError extends Error {}
+
+function inspectionFailureHttpError(kind: InspectionFailure): HttpError {
+  switch (kind) {
+    case 'unavailable':
+      // The inspector itself is broken (ffmpeg/ffprobe lost at runtime) — an
+      // operator-side fault, not client backpressure: deliberately no retry
+      // hint, because a short client retry cannot restore a missing binary.
+      return new HttpError(503, 'Audio inspection is temporarily unavailable', 'PROVIDER_FAILED');
+    case 'timeout':
+      // A 10s probe/decode budget exhausted on a saturated host (or a
+      // pathological input) is transient backpressure, not a bad file: answer
+      // with a retryable 503 instead of blaming the recording with a 415.
+      return new HttpError(
+        503,
+        'Audio inspection timed out; please try again',
+        { retryAfterSeconds: 5 },
+        'CAPACITY_BUSY',
+      );
   }
 }
 
@@ -113,8 +146,8 @@ class InspectionError extends Error {
  * opens is not reachable; both opens still re-verify a regular file.
  */
 async function inspectDecodedDuration(filePath: string): Promise<number> {
-  const inputFormat = INPUT_FORMAT_BY_EXTENSION[path.extname(filePath).toLowerCase()];
-  if (!inputFormat) throw new InspectionError('invalid');
+  const inputFormat = inputFormatFor(path.extname(filePath).toLowerCase());
+  if (!inputFormat) throw new InvalidInspectionError();
 
   // MOV's external data references are disabled by default; passing the
   // options explicitly makes that security boundary resilient to defaults
@@ -126,8 +159,7 @@ async function inspectDecodedDuration(filePath: string): Promise<number> {
   const movSafetyOptions =
     inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0', '-ignore_editlist', '1'] : [];
 
-  const audioStreamCount = await probeAudioStreamCount(filePath, inputFormat, movSafetyOptions);
-  if (audioStreamCount !== 1) throw new InspectionError('invalid');
+  await verifySingleAudioStream(filePath, inputFormat, movSafetyOptions);
   return decodeMeasuredDuration(filePath, inputFormat, movSafetyOptions);
 }
 
@@ -144,16 +176,16 @@ function openPrivateInput(filePath: string): number {
   let fd: number | undefined;
   try {
     if (!fs.lstatSync(filePath).isFile()) {
-      throw new InspectionError('invalid');
+      throw new InvalidInspectionError();
     }
     fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
     if (!fs.fstatSync(fd).isFile()) {
-      throw new InspectionError('invalid');
+      throw new InvalidInspectionError();
     }
     const opened = fd;
     fd = undefined;
     return opened;
-  } catch (error) {
+  } catch {
     if (fd !== undefined) {
       try {
         fs.closeSync(fd);
@@ -161,19 +193,19 @@ function openPrivateInput(filePath: string): number {
         // Best-effort cleanup on the failure path.
       }
     }
-    throw error instanceof InspectionError ? error : new InspectionError('invalid');
+    throw new InvalidInspectionError();
   }
 }
 
 /**
- * Count the container's audio streams with ffprobe over an already-open
- * private descriptor. Header-only and machine-readable (`nokey/noprint`
+ * Verify that the container has exactly one audio stream with ffprobe over an
+ * already-open private descriptor. Header-only and machine-readable (`nokey/noprint`
  * prints one stream index per line), with the same sandboxing as the decoder:
  * allowlisted demuxer/protocol, bounded probe window, capped output, and a
  * wall-clock deadline. A missing/unstartable ffprobe is 'unavailable' (the
  * caller maps it to 503); anything unparsable is 'invalid'.
  */
-function probeAudioStreamCount(filePath: string, inputFormat: string, movSafetyOptions: string[]): Promise<number> {
+function verifySingleAudioStream(filePath: string, inputFormat: string, movSafetyOptions: string[]): Promise<void> {
   return new Promise((resolve, reject) => {
     let inputFd: number;
     try {
@@ -236,13 +268,13 @@ function probeAudioStreamCount(filePath: string, inputFormat: string, movSafetyO
     let listingBytes = 0;
     let diagnosticBytes = 0;
     let listing = '';
-    const finish = (result: number | InspectionError) => {
+    const finish = (error?: Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       if (!child.killed) child.kill('SIGKILL');
-      if (result instanceof InspectionError) reject(result);
-      else resolve(result);
+      if (error) reject(error);
+      else resolve();
     };
     const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
     timeout.unref();
@@ -252,14 +284,14 @@ function probeAudioStreamCount(filePath: string, inputFormat: string, movSafetyO
       // One line per audio stream; far more lines than any honest container
       // can hold means hostile media, not a long listing.
       if (listingBytes > MAX_STREAM_LISTING_BYTES) {
-        finish(new InspectionError('invalid'));
+        finish(new InvalidInspectionError());
         return;
       }
       listing += chunk.toString('utf8');
     });
     child.stderr!.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
-      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InspectionError('invalid'));
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
     });
     child.once('error', () => {
       // A ChildProcess error here is an inability to start/control the
@@ -267,20 +299,16 @@ function probeAudioStreamCount(filePath: string, inputFormat: string, movSafetyO
       finish(new InspectionError('unavailable'));
     });
     child.once('close', (code) => {
-      if (settled) return;
       if (code !== 0) {
-        finish(new InspectionError('invalid'));
+        finish(new InvalidInspectionError());
         return;
       }
-      const lines = listing
-        .trim()
-        .split('\n')
-        .filter((line) => line !== '');
-      if (!lines.every((line) => /^\d+$/.test(line))) {
-        finish(new InspectionError('invalid'));
+      const streamIndex = listing.trim();
+      if (!/^\d+$/.test(streamIndex)) {
+        finish(new InvalidInspectionError());
         return;
       }
-      finish(lines.length);
+      finish();
     });
   });
 }
@@ -370,17 +398,17 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
     const stop = () => {
       if (!child.killed) child.kill('SIGKILL');
     };
-    const finish = (duration: number | InspectionError) => {
+    const finish = (duration: number | Error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
       stop();
-      if (duration instanceof InspectionError) reject(duration);
+      if (duration instanceof Error) reject(duration);
       else resolve(duration);
     };
     const countDecodedBytes = (chunk: Buffer) => {
       decodedBytes += chunk.length;
-      if (decodedBytes > MAX_DECODED_BYTES) {
+      if (decodedBytes > maxDecodedBytes()) {
         overlong = true;
         stop();
       }
@@ -394,7 +422,7 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
     child.stdout!.on('data', countDecodedBytes);
     child.stderr!.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
-      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InspectionError('invalid'));
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
     });
     child.once('error', () => {
       // A ChildProcess error here is an inability to start/control the
@@ -402,13 +430,12 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
       finish(new InspectionError('unavailable'));
     });
     child.once('close', (code) => {
-      if (settled) return;
       if (overlong) {
         finish(MAX_AUDIO_DURATION_SECONDS + 1);
       } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
-        finish(new InspectionError('invalid'));
+        finish(new InvalidInspectionError());
       } else {
-        finish(decodedBytes / DECODED_BYTES_PER_SECOND);
+        finish(decodedBytes / decodedBytesPerSecond());
       }
     });
   });
@@ -420,6 +447,15 @@ interface MediaToolAvailabilityCheck {
   executable: string;
   identity: MediaToolIdentity;
   label: 'FFmpeg' | 'FFprobe';
+}
+
+function identifiesExpectedMediaTool(identity: MediaToolIdentity, versionOutput: string): boolean {
+  switch (identity) {
+    case 'ffmpeg':
+      return /^ffmpeg version[\t ]+\S/.test(versionOutput);
+    case 'ffprobe':
+      return /^ffprobe version[\t ]+\S/.test(versionOutput);
+  }
 }
 
 function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToolAvailabilityCheck): Promise<void> {
@@ -474,10 +510,7 @@ function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToo
     child.once('close', (code) => {
       // The configured executable must identify itself at the very beginning
       // of its bounded stdout. A later, injected-looking line is insufficient.
-      const identifiesExpectedTool =
-        identity === 'ffmpeg'
-          ? /^ffmpeg version[\t ]+\S/.test(versionOutput)
-          : /^ffprobe version[\t ]+\S/.test(versionOutput);
+      const identifiesExpectedTool = identifiesExpectedMediaTool(identity, versionOutput);
       if (code === 0 && identifiesExpectedTool) finish();
       else finish(new Error(`${label} is unavailable`));
     });
@@ -517,9 +550,7 @@ export function assertAudioInspectorAvailable({ force = false }: { force?: boole
     .then(() => {
       availabilityCache = { expiresAt: Date.now() + AVAILABILITY_SUCCESS_TTL_MS };
     })
-    .catch((error: unknown) => {
-      const availabilityError =
-        error instanceof Error ? error : new Error('Audio inspection dependencies are unavailable');
+    .catch((availabilityError: Error) => {
       availabilityCache = {
         expiresAt: Date.now() + AVAILABILITY_FAILURE_TTL_MS,
         error: availabilityError,
@@ -539,23 +570,7 @@ export async function verifyAudioDuration(filePath: string): Promise<true> {
   try {
     duration = await inspectDecodedDuration(filePath);
   } catch (error) {
-    if (error instanceof InspectionError && error.kind === 'unavailable') {
-      // The inspector itself is broken (ffmpeg/ffprobe lost at runtime) — an
-      // operator-side fault, not client backpressure: deliberately no retry
-      // hint, because a short client retry cannot restore a missing binary.
-      throw new HttpError(503, 'Audio inspection is temporarily unavailable', 'PROVIDER_FAILED');
-    }
-    // A 10s probe/decode budget exhausted on a saturated host (or a
-    // pathological input) is transient backpressure, not a bad file: answer
-    // with a retryable 503 instead of blaming the recording with a 415.
-    if (error instanceof InspectionError && error.kind === 'timeout') {
-      throw new HttpError(
-        503,
-        'Audio inspection timed out; please try again',
-        { retryAfterSeconds: 5 },
-        'CAPACITY_BUSY',
-      );
-    }
+    if (error instanceof InspectionError) throw inspectionFailureHttpError(error.kind);
     throw new HttpError(415, 'Invalid or unsupported audio file', 'AUDIO_UNREADABLE');
   } finally {
     releaseSlot();

@@ -2,10 +2,14 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import { createHash } from 'crypto';
 import { createServer, type Server } from 'http';
 import type { AddressInfo } from 'net';
+import bcrypt from 'bcrypt';
+import express from 'express';
 import request from 'supertest';
-import { cleanupPasswordResetTokens } from '../src/auth';
+import { cleanupPasswordResetTokens, createAuthRouter } from '../src/auth';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
+import { sendMail } from '../src/mailer';
+import { errorHandler } from '../src/middleware';
 import { app, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers';
 
 afterAll(async () => {
@@ -206,6 +210,29 @@ describe('POST /auth/reset-password', () => {
     expect(replay.body).toEqual(RESET_INVALID_BODY);
   });
 
+  it('consumes one reset token exactly once under simultaneous requests', async () => {
+    const { body: reg } = await registerUser(a);
+    const email = reg.email as string;
+    const token = await issueToken(email);
+
+    const [first, second] = await Promise.all([
+      request(a).post('/auth/reset-password').send({ email, token, newPassword: 'concurrentPass1' }),
+      request(a).post('/auth/reset-password').send({ email, token, newPassword: 'concurrentPass2' }),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([204, 400]);
+    const rejected = first.status === 400 ? first : second;
+    expect(rejected.body).toEqual(RESET_INVALID_BODY);
+    const { rows } = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n
+       FROM password_reset_tokens t
+       JOIN users u ON u.id = t.user_id
+       WHERE u.email = $1`,
+      [email],
+    );
+    expect(rows[0].n).toBe(0);
+  });
+
   it('rejects wrong, expired, and unknown-account codes with one uniform contract', async () => {
     const { body: reg } = await registerUser(a);
     const email = reg.email as string;
@@ -253,6 +280,68 @@ describe('POST /auth/reset-password', () => {
     const ok = await request(a).post('/auth/reset-password').send({ email, token, newPassword: 'freshPass1word' });
     expect(ok.status).toBe(204);
   });
+
+  it('begins, rolls back, and releases the reset transaction when the user update fails', async () => {
+    const userId = '11111111-1111-4111-8111-111111111111';
+    const email = uniqueEmail('reset-transaction-failure');
+    const token = 'known-reset-token';
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const primaryError = new Error('user update failed');
+    const query = vi
+      .spyOn(pool, 'query')
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: userId,
+            name: 'Reset Failure',
+            email,
+            password_hash: 'old-hash',
+            native_language: 'te',
+            cefr_level: null,
+            diagnostic_completed: false,
+            token_version: 1,
+            created_at: new Date().toISOString(),
+          },
+        ],
+      } as never)
+      .mockResolvedValueOnce({ rows: [{ token_hash: tokenHash }] } as never);
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [] };
+        if (text.startsWith('DELETE FROM password_reset_tokens')) return { rows: [], rowCount: 1 };
+        if (text.startsWith('UPDATE users SET password_hash')) throw primaryError;
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const hash = vi.spyOn(bcrypt, 'hash').mockResolvedValue('replacement-hash' as never);
+    const pass = (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
+    const direct = express();
+    direct.use(express.json());
+    direct.use('/auth', createAuthRouter({ forgotPasswordEmail: pass, passwordAccount: pass } as never));
+    direct.use(errorHandler);
+
+    try {
+      const response = await request(direct)
+        .post('/auth/reset-password')
+        .send({ email, token, newPassword: 'replacementPass1' });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+        'BEGIN',
+        expect.stringContaining('DELETE FROM password_reset_tokens'),
+        expect.stringContaining('UPDATE users SET password_hash'),
+        'ROLLBACK',
+      ]);
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      hash.mockRestore();
+      connect.mockRestore();
+      query.mockRestore();
+    }
+  });
 });
 
 describe('webhook mail mode', () => {
@@ -283,6 +372,21 @@ describe('webhook mail mode', () => {
     return { server, url: `http://127.0.0.1:${port}/hooks/mail`, received };
   }
 
+  it('does not log a rejection for a successful webhook response', async () => {
+    const { server, url, received } = await startWebhookServer();
+    config.mail.mode = 'webhook';
+    config.mail.webhookUrl = url;
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      await sendMail({ to: 'success@example.com', subject: 'Successful delivery', text: 'hello' });
+      expect(received).toHaveLength(1);
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it('POSTs {to, subject, text} to MAIL_WEBHOOK_URL and the mailed code actually resets the password', async () => {
     const { server, url, received } = await startWebhookServer();
     config.mail.mode = 'webhook';
@@ -307,6 +411,50 @@ describe('webhook mail mode', () => {
       expect(reset.status).toBe(204);
     } finally {
       await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  it('refuses redirects so a relay cannot forward a reset code to another origin', async () => {
+    const received: string[] = [];
+    const receiver = createServer((req, res) => {
+      let body = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk: string) => (body += chunk));
+      req.on('end', () => {
+        received.push(body);
+        res.statusCode = 204;
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => receiver.listen(0, '127.0.0.1', resolve));
+    const receiverPort = (receiver.address() as AddressInfo).port;
+    const redirector = createServer((_req, res) => {
+      res.statusCode = 307;
+      res.setHeader('Location', `http://127.0.0.1:${receiverPort}/stolen`);
+      res.end();
+    });
+    await new Promise<void>((resolve) => redirector.listen(0, '127.0.0.1', resolve));
+    const redirectorPort = (redirector.address() as AddressInfo).port;
+    config.mail.mode = 'webhook';
+    config.mail.webhookUrl = `http://127.0.0.1:${redirectorPort}/hooks/mail`;
+    const errorSpy = vi.spyOn(logger, 'error').mockImplementation((() => logger) as never);
+
+    try {
+      const { body: reg } = await registerUser(a);
+      const response = await request(a).post('/auth/forgot-password').send({ email: reg.email });
+
+      expect(response.status).toBe(204);
+      await vi.waitFor(() =>
+        expect(errorSpy).toHaveBeenCalledWith(
+          expect.objectContaining({ to: reg.email, subject: 'Your password reset code' }),
+          'mail webhook delivery failed',
+        ),
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(received).toEqual([]);
+    } finally {
+      await new Promise((resolve) => redirector.close(resolve));
+      await new Promise((resolve) => receiver.close(resolve));
     }
   });
 

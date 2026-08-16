@@ -22,4 +22,5 @@ GoogleService-Info.plist
 # Mutation testing (Stryker) scratch + reports
 .stryker-tmp/
 .stryker-catalog-tmp/
+.stryker-*-tmp/
 reports/

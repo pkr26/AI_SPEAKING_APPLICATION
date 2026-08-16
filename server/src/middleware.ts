@@ -119,8 +119,9 @@ export const JWT_AUDIENCE = 'ai-english-mobile';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
-  const header = req.headers.authorization || '';
-  const [scheme, token] = header.split(' ');
+  const parts = req.headers.authorization?.split(' ');
+  const scheme = parts?.[0];
+  const token = parts?.[1];
   if (scheme !== 'Bearer' || !token) {
     return res.status(401).json({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
   }
@@ -136,22 +137,21 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
     return res.status(401).json({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
   }
 
-  if (
-    typeof payload === 'string' ||
-    typeof payload.sub !== 'string' ||
-    !UUID_PATTERN.test(payload.sub) ||
-    typeof payload.tv !== 'number'
-  ) {
+  // jsonwebtoken can return a primitive string. Such a value has no string
+  // `sub` claim (String.prototype.sub is a function), so the same structural
+  // checks reject it without a redundant special case.
+  const claims = payload as jwt.JwtPayload;
+  if (typeof claims.sub !== 'string' || !UUID_PATTERN.test(claims.sub) || typeof claims.tv !== 'number') {
     return res.status(401).json({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
   }
 
   try {
-    const { rows } = await pool.query<UserRow>('SELECT * FROM users WHERE id = $1', [payload.sub]);
+    const { rows } = await pool.query<UserRow>('SELECT * FROM users WHERE id = $1', [claims.sub]);
     const user = rows[0];
     if (!user) {
       return res.status(401).json({ error: 'Invalid token: user not found', code: 'UNAUTHENTICATED' });
     }
-    if (user.token_version !== payload.tv) {
+    if (user.token_version !== claims.tv) {
       return res.status(401).json({ error: 'Token no longer valid — please log in again', code: 'TOKEN_REVOKED' });
     }
     req.user = user;
@@ -185,8 +185,9 @@ export const validate =
       const result = schema.safeParse(req[key]);
       if (!result.success) {
         const issue = result.error.issues[0];
-        const where = issue.path.length > 0 ? `${issue.path.join('.')}: ` : '';
-        return next(new HttpError(400, `${where}${issue.message}`));
+        const path = issue.path.join('.');
+        const message = path.length > 0 ? `${path}: ${issue.message}` : issue.message;
+        return next(new HttpError(400, message));
       }
       let store = validatedBySchema.get(req);
       if (!store) {
@@ -238,8 +239,8 @@ export const clientVersionGate: RequestHandler = (req, _res, next) => {
   const clientVersion = parseClientVersion(header);
   const minimum = parseClientVersion(minimumRaw);
   if (!clientVersion || !minimum) return next();
-  for (let i = 0; i < 3; i++) {
-    const diff = (clientVersion[i] ?? 0) - (minimum[i] ?? 0);
+  for (const index of [0, 1, 2] as const) {
+    const diff = (clientVersion[index] ?? 0) - (minimum[index] ?? 0);
     if (diff < 0) {
       return next(
         new HttpError(426, 'This app version is no longer supported; please update it', 'CLIENT_UPGRADE_REQUIRED'),
@@ -273,9 +274,9 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
       res.set('Retry-After', String(extra.retryAfterHours * 3600));
     }
     return res.status(err.status).json({
+      ...err.extra,
       error: err.message,
       code: err.code ?? defaultErrorCode(err.status),
-      ...err.extra,
     });
   }
   // A saturated pg pool (pg-pool's acquisition timeout) is transient

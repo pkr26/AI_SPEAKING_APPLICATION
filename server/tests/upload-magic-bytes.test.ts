@@ -4,7 +4,7 @@ import fsSync from 'fs';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
-import { Writable } from 'stream';
+import { Readable, Writable } from 'stream';
 import request from 'supertest';
 import { describe, expect, it, vi } from 'vitest';
 import { errorHandler } from '../src/middleware';
@@ -95,6 +95,7 @@ describe('verifyAudioMagicBytes', () => {
     await expect(verifyAudioMagicBytes(filePath)).rejects.toMatchObject({
       status: 415,
       message: 'Invalid audio file',
+      code: 'AUDIO_INVALID',
     });
     expect(await exists(filePath)).toBe(false);
   });
@@ -194,7 +195,10 @@ describe('upload fileFilter extension/MIME matrix', () => {
   it.each(rejected)('rejects %s as %s with 415', async (filename, contentType) => {
     const res = await request(buildApp()).post('/upload').attach('audio', FTYP, { filename, contentType });
     expect(res.status).toBe(415);
-    expect(res.body.error).toBe('Unsupported audio filename or media type');
+    expect(res.body).toEqual({
+      error: 'Unsupported audio filename or media type',
+      code: 'AUDIO_INVALID',
+    });
   });
 });
 
@@ -221,6 +225,40 @@ describe('uploadAudio cleanup', () => {
       expect(unlink).not.toHaveBeenCalled();
     } finally {
       unlink.mockRestore();
+    }
+  });
+
+  it('falls back to a safe .m4a extension when the storage engine is invoked defensively', async () => {
+    const storage = (
+      upload as unknown as {
+        storage: {
+          _handleFile: (
+            req: unknown,
+            file: { originalname: string; stream: Readable },
+            callback: (error: Error | null, stored?: { filename: string; path: string }) => void,
+          ) => void;
+          _removeFile: (req: unknown, file: { path: string }, callback: (error: Error | null) => void) => void;
+        };
+      }
+    ).storage;
+
+    const stored = await new Promise<{ filename: string; path: string }>((resolve, reject) => {
+      storage._handleFile({}, { originalname: 'answer.unsupported', stream: Readable.from(FTYP) }, (error, info) => {
+        if (error) reject(error);
+        else resolve(info!);
+      });
+    });
+
+    try {
+      expect(stored.filename).toMatch(/^[0-9a-f-]{36}\.m4a$/);
+      expect(path.extname(stored.path)).toBe('.m4a');
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        storage._removeFile({}, stored, (error) => {
+          if (error) reject(error);
+          else resolve();
+        });
+      });
     }
   });
 

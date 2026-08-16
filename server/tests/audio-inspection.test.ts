@@ -130,10 +130,12 @@ describe('verifyAudioDuration', () => {
   it('rejects malformed media and recordings that are too short', async () => {
     await expect(verifyAudioDuration(await fixture('invalid.wav', Buffer.from('not audio')))).rejects.toMatchObject({
       status: 415,
+      code: 'AUDIO_UNREADABLE',
     });
     await expect(verifyAudioDuration(await fixture('short.wav', pcmWav(0.25)))).rejects.toMatchObject({
       status: 422,
       message: 'Recording is too short to assess',
+      code: 'AUDIO_INVALID',
     });
     await expect(
       verifyAudioDuration(await generatedAudio('generated-short.wav', { codec: 'pcm_s16le', durationSeconds: 0.25 })),
@@ -145,6 +147,7 @@ describe('verifyAudioDuration', () => {
     await expect(verifyAudioDuration(await fixture('long.wav', overLimit))).rejects.toMatchObject({
       status: 413,
       message: 'Recording must be two minutes or shorter',
+      code: 'AUDIO_TOO_LONG',
     });
   });
 
@@ -303,6 +306,7 @@ describe('verifyAudioDuration', () => {
   it('rejects extensions outside the fixed demuxer allowlist', async () => {
     await expect(verifyAudioDuration(await fixture('valid-audio.bin', pcmWav(1)))).rejects.toMatchObject({
       status: 415,
+      code: 'AUDIO_UNREADABLE',
     });
   });
 

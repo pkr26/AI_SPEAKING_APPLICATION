@@ -6,6 +6,7 @@ import request from 'supertest';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../src/app';
+import { pool } from '../src/db';
 import {
   assertDatabaseSchemaCurrent,
   expectedMigrationManifest,
@@ -76,6 +77,7 @@ describe('database schema readiness', () => {
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
       latestMigration: '011_srs_check_and_question_fk_restrict.sql',
     });
+    expect(query.mock.calls[0]).toEqual(['SELECT name, checksum FROM schema_migrations ORDER BY name']);
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
     expect(query.mock.calls[2]?.[0]).toContain('FROM questions');
   });
@@ -123,6 +125,7 @@ describe('database schema readiness', () => {
       current.map((row, index) => (index === 0 ? { ...row, name: 7 } : row)),
       current.map((row, index) => (index === 0 ? { ...row, checksum: null } : row)),
       [...current].reverse(),
+      Object.assign([...current], { 0: undefined }),
     ]) {
       const query = vi.fn().mockResolvedValue({ rows });
       await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
@@ -136,7 +139,7 @@ describe('database schema readiness', () => {
     for (const rows of [
       [],
       completeQuestionInventory.slice(0, -1),
-      [{ cefr_level: 'A1', count: 99 }],
+      completeQuestionInventory.map((row) => (row.cefr_level === 'A1' ? { ...row, count: 99 } : row)),
       completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, cefr_level: null } : row)),
       completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '100' } : row)),
     ]) {
@@ -160,6 +163,27 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow('Question inventory is incomplete');
+  });
+
+  it('uses the pool adapter with explicit values for every readiness query', async () => {
+    const query = vi
+      .spyOn(pool, 'query')
+      .mockResolvedValueOnce({ rows: successfulMigrationRows() } as never)
+      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] } as never)
+      .mockResolvedValueOnce({ rows: completeQuestionInventory } as never);
+
+    try {
+      await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
+        latestMigration: '011_srs_check_and_question_fk_restrict.sql',
+      });
+      expect(query.mock.calls).toEqual([
+        ['SELECT name, checksum FROM schema_migrations ORDER BY name', []],
+        ['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']],
+        [expect.stringContaining('FROM questions'), []],
+      ]);
+    } finally {
+      query.mockRestore();
+    }
   });
 
   it.each(['schema', 'media inspector'] as const)('/ready hides a failed %s dependency check', async (failure) => {

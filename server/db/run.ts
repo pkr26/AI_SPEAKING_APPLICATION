@@ -10,17 +10,11 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { Client } from 'pg';
 
-const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
-const SEED_FILE = path.join(__dirname, 'seed.sql');
 const CONNECTION_TIMEOUT_MS = 10_000;
-const MIGRATION_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
-const MIGRATION_LOCK_TIMEOUT_MS = 30_000;
 
 function databaseClient(connectionString: string): Client {
   return new Client({ connectionString, connectionTimeoutMillis: CONNECTION_TIMEOUT_MS });
 }
-
-type CapturedError = { value: unknown };
 
 /**
  * Run every cleanup action, preserving an error that is already propagating.
@@ -29,22 +23,28 @@ type CapturedError = { value: unknown };
  */
 async function cleanupPreservingPrimaryError(
   actions: Array<() => Promise<unknown>>,
-  primaryError?: CapturedError,
+  primaryFailure: boolean,
 ): Promise<void> {
-  let firstError = primaryError;
+  let firstCleanupError: unknown;
+  let cleanupFailed = false;
   for (const action of actions) {
     try {
       await action();
     } catch (error) {
-      firstError ??= { value: error };
+      if (!cleanupFailed) {
+        firstCleanupError = error;
+        cleanupFailed = true;
+      }
     }
   }
-  if (!primaryError && firstError) throw firstError.value;
+  if (!primaryFailure && cleanupFailed) throw firstCleanupError;
 }
 
 async function setOperationTimeouts(client: Client): Promise<void> {
-  await client.query("SELECT set_config('statement_timeout', $1, false)", [String(MIGRATION_STATEMENT_TIMEOUT_MS)]);
-  await client.query("SELECT set_config('lock_timeout', $1, false)", [String(MIGRATION_LOCK_TIMEOUT_MS)]);
+  const statementTimeoutMs = 600_000;
+  const lockTimeoutMs = 30_000;
+  await client.query("SELECT set_config('statement_timeout', $1, false)", [String(statementTimeoutMs)]);
+  await client.query("SELECT set_config('lock_timeout', $1, false)", [String(lockTimeoutMs)]);
 }
 
 function parseDbName(dbUrl: string): string {
@@ -74,7 +74,7 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
   adminUrl.pathname = '/postgres';
   const admin = databaseClient(adminUrl.toString());
   await admin.connect();
-  let operationError: CapturedError | undefined;
+  let operationFailed = false;
   try {
     await setOperationTimeouts(admin);
     const { rows } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
@@ -85,10 +85,10 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
       log(`database "${dbName}" already exists`);
     }
   } catch (error) {
-    operationError = { value: error };
+    operationFailed = true;
     throw error;
   } finally {
-    await cleanupPreservingPrimaryError([() => admin.end()], operationError);
+    await cleanupPreservingPrimaryError([() => admin.end()], operationFailed);
   }
 }
 
@@ -98,10 +98,11 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
  * A PostgreSQL advisory lock serializes concurrent migration jobs.
  */
 export async function migrate(dbUrl: string, log: (msg: string) => void = console.log): Promise<string[]> {
+  const migrationsDir = path.join(__dirname, 'migrations');
   const client = databaseClient(dbUrl);
   await client.connect();
   const applied: string[] = [];
-  let operationError: CapturedError | undefined;
+  let operationFailed = false;
   try {
     await setOperationTimeouts(client);
     const lock = await client.query<{ locked: boolean }>(
@@ -110,7 +111,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
     if (!lock.rows[0].locked) {
       throw new Error('another migration or seed operation is already in progress');
     }
-    let migrationError: CapturedError | undefined;
+    let migrationFailed = false;
     try {
       await client.query(
         `CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -121,7 +122,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
       );
       await client.query('ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT');
       const files = fs
-        .readdirSync(MIGRATIONS_DIR)
+        .readdirSync(migrationsDir)
         .filter((f) => f.endsWith('.sql'))
         .sort();
       const { rows } = await client.query<{ name: string; checksum: string | null }>(
@@ -133,7 +134,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
         throw new Error(`database contains migration records missing from this release: ${unknown.join(', ')}`);
       }
       for (const file of files) {
-        const sql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
+        const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf8');
         const checksum = createHash('sha256').update(sql).digest('hex');
         if (done.has(file)) {
           const recorded = done.get(file);
@@ -155,7 +156,7 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
           await client.query('INSERT INTO schema_migrations (name, checksum) VALUES ($1, $2)', [file, checksum]);
           await client.query('COMMIT');
         } catch (err) {
-          await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], { value: err });
+          await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], true);
           throw err;
         }
         applied.push(file);
@@ -163,30 +164,31 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
       }
       await client.query('ALTER TABLE schema_migrations ALTER COLUMN checksum SET NOT NULL');
     } catch (error) {
-      migrationError = { value: error };
+      migrationFailed = true;
       throw error;
     } finally {
       await cleanupPreservingPrimaryError(
         [() => client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))")],
-        migrationError,
+        migrationFailed,
       );
     }
     if (applied.length === 0) log('no pending migrations');
   } catch (error) {
-    operationError = { value: error };
+    operationFailed = true;
     throw error;
   } finally {
-    await cleanupPreservingPrimaryError([() => client.end()], operationError);
+    await cleanupPreservingPrimaryError([() => client.end()], operationFailed);
   }
   return applied;
 }
 
 /** Idempotently insert/update the 600 questions without changing their IDs. */
 export async function seed(dbUrl: string, log: (msg: string) => void = console.log): Promise<void> {
+  const seedFile = path.join(__dirname, 'seed.sql');
   const client = databaseClient(dbUrl);
   await client.connect();
   let operationLockHeld = false;
-  let operationError: CapturedError | undefined;
+  let operationFailed = false;
   try {
     await setOperationTimeouts(client);
     const lock = await client.query<{ locked: boolean }>(
@@ -198,10 +200,10 @@ export async function seed(dbUrl: string, log: (msg: string) => void = console.l
     operationLockHeld = true;
     await client.query('BEGIN');
     try {
-      await client.query(fs.readFileSync(SEED_FILE, 'utf8'));
+      await client.query(fs.readFileSync(seedFile, 'utf8'));
       await client.query('COMMIT');
     } catch (error) {
-      await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], { value: error });
+      await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], true);
       throw error;
     }
     const { rows: counts } = await client.query(
@@ -209,18 +211,14 @@ export async function seed(dbUrl: string, log: (msg: string) => void = console.l
     );
     log('questions per level: ' + JSON.stringify(counts));
   } catch (error) {
-    operationError = { value: error };
+    operationFailed = true;
     throw error;
   } finally {
-    await cleanupPreservingPrimaryError(
-      [
-        ...(operationLockHeld
-          ? [() => client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))")]
-          : []),
-        () => client.end(),
-      ],
-      operationError,
-    );
+    const cleanupActions: Array<() => Promise<unknown>> = [() => client.end()];
+    if (operationLockHeld) {
+      cleanupActions.unshift(() => client.query("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))"));
+    }
+    await cleanupPreservingPrimaryError(cleanupActions, operationFailed);
   }
 }
 
@@ -230,16 +228,18 @@ export interface DatabaseSetupSteps {
   seed: typeof seed;
 }
 
-const defaultSetupSteps: DatabaseSetupSteps = {
-  ensure: ensureDatabase,
-  migrate,
-  seed,
-};
+function defaultSetupSteps(): DatabaseSetupSteps {
+  return {
+    ensure: ensureDatabase,
+    migrate,
+    seed,
+  };
+}
 
 export async function setupDatabase(
   dbUrl: string,
   log: (msg: string) => void = console.log,
-  steps: DatabaseSetupSteps = defaultSetupSteps,
+  steps: DatabaseSetupSteps = defaultSetupSteps(),
 ): Promise<void> {
   await steps.ensure(dbUrl, log);
   await steps.migrate(dbUrl, log);
@@ -255,17 +255,19 @@ export interface DatabaseCommandActions {
   setup: typeof setupDatabase;
 }
 
-const defaultCommandActions: DatabaseCommandActions = {
-  migrate,
-  catalog: seed,
-  seed,
-  setup: setupDatabase,
-};
+function defaultCommandActions(): DatabaseCommandActions {
+  return {
+    migrate,
+    catalog: seed,
+    seed,
+    setup: setupDatabase,
+  };
+}
 
 export async function runDatabaseCommand(
   databaseUrl: string | undefined,
   command = 'setup',
-  actions: DatabaseCommandActions = defaultCommandActions,
+  actions: DatabaseCommandActions = defaultCommandActions(),
 ): Promise<void> {
   if (!databaseUrl) throw new Error('DATABASE_URL is required');
   if (command === 'migrate') {

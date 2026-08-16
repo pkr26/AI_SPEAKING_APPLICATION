@@ -1,5 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
+import bcrypt from 'bcrypt';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { assertDailyAssessmentCapacity } from '../src/assess';
 import { createAuthRouter } from '../src/auth';
@@ -11,6 +13,52 @@ import { app, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers
 afterAll(async () => {
   await pool.end();
 });
+
+/**
+ * Hold a user's row until the request has authenticated, verified its password,
+ * and issued its guarded mutation. The blocker can then change just one piece
+ * of authentication state before releasing the write, making TOCTOU coverage
+ * deterministic instead of relying on bcrypt or scheduler timing.
+ */
+async function runAuthenticationWriteRace<T>(options: {
+  userId: string;
+  matchesWrite: (sql: string) => boolean;
+  startRequest: () => PromiseLike<T>;
+  mutateBeforeRelease: (client: PoolClient) => Promise<unknown>;
+  expectedWrites?: number;
+}): Promise<T> {
+  const blocker = await pool.connect();
+  let transactionOpen = false;
+  let querySpy: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    await blocker.query('BEGIN');
+    transactionOpen = true;
+    await blocker.query('SELECT id FROM users WHERE id = $1 FOR UPDATE', [options.userId]);
+
+    const originalQuery = pool.query.bind(pool);
+    let observedWrites = 0;
+    querySpy = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...rest: unknown[]) => {
+      if (typeof text === 'string' && options.matchesWrite(text)) observedWrites += 1;
+      return (originalQuery as (...args: unknown[]) => unknown)(text, ...rest);
+    }) as never);
+
+    const responsePromise = Promise.resolve(options.startRequest());
+    await vi.waitFor(
+      () => {
+        expect(observedWrites).toBeGreaterThanOrEqual(options.expectedWrites ?? 1);
+      },
+      { timeout: 15_000, interval: 10 },
+    );
+    await options.mutateBeforeRelease(blocker);
+    await blocker.query('COMMIT');
+    transactionOpen = false;
+    return await responsePromise;
+  } finally {
+    querySpy?.mockRestore();
+    if (transactionOpen) await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+}
 
 describe('auth: register validation', () => {
   const a = app();
@@ -118,6 +166,30 @@ describe('auth: login', () => {
     const login = await request(a).post('/auth/login').send({ email: body.email, password: 'wrong-pass-1' });
     expect(login.status).toBe(401);
     expect(login.body.error).toBe('Invalid email or password');
+  });
+
+  it('uses a real cost-12 dummy bcrypt hash and keeps unknown and known-wrong responses identical', async () => {
+    const { res, body } = await registerUser(a);
+    expect(res.status).toBe(201);
+    const compare = vi.spyOn(bcrypt, 'compare');
+
+    const unknown = await request(a)
+      .post('/auth/login')
+      .send({
+        email: uniqueEmail('unknown-login'),
+        password: 'wrong-pass-1',
+      });
+    const knownWrong = await request(a).post('/auth/login').send({ email: body.email, password: 'wrong-pass-1' });
+
+    expect(unknown.status).toBe(401);
+    expect(knownWrong.status).toBe(401);
+    expect(unknown.body).toEqual({ error: 'Invalid email or password', code: 'INVALID_CREDENTIALS' });
+    expect(knownWrong.body).toEqual(unknown.body);
+    expect(compare).toHaveBeenCalledTimes(2);
+    const dummyHash = compare.mock.calls[0][1] as string;
+    expect(dummyHash).toMatch(/^\$2b\$12\$/);
+    expect(bcrypt.getRounds(dummyHash)).toBe(12);
+    expect(compare.mock.calls[1][1]).not.toBe(dummyHash);
   });
 
   it('logs in with correct credentials', async () => {
@@ -393,6 +465,91 @@ describe('auth: change-password token revocation', () => {
     const login = await request(a).post('/auth/login').send({ email: body.email, password: newPassword });
     expect(login.status).toBe(200);
   });
+
+  it('allows exactly one of two concurrent changes verified against the same credential snapshot', async () => {
+    const { res, body } = await registerUser(a);
+    const userId = res.body.user.id as string;
+    const oldToken = res.body.token as string;
+    const before = await pool.query<{ token_version: number }>('SELECT token_version FROM users WHERE id = $1', [
+      userId,
+    ]);
+
+    const responses = await runAuthenticationWriteRace({
+      userId,
+      matchesWrite: (sql) => sql.includes('UPDATE users') && sql.includes('SET password_hash = $1'),
+      expectedWrites: 2,
+      startRequest: () =>
+        Promise.all([
+          request(a)
+            .post('/auth/change-password')
+            .set('Authorization', `Bearer ${oldToken}`)
+            .send({ currentPassword: STRONG_PASSWORD, newPassword: 'first-new-pass1' }),
+          request(a)
+            .post('/auth/change-password')
+            .set('Authorization', `Bearer ${oldToken}`)
+            .send({ currentPassword: STRONG_PASSWORD, newPassword: 'second-new-pass2' }),
+        ]),
+      mutateBeforeRelease: async () => undefined,
+    });
+
+    expect(responses.map((response) => response.status).sort()).toEqual([200, 409]);
+    const conflicted = responses.find((response) => response.status === 409)!;
+    expect(conflicted.body).toEqual({
+      error: 'Authentication state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+
+    const after = await pool.query<{ token_version: number }>('SELECT token_version FROM users WHERE id = $1', [
+      userId,
+    ]);
+    expect(after.rows[0].token_version).toBe(before.rows[0].token_version + 1);
+    const firstLogin = await request(a).post('/auth/login').send({ email: body.email, password: 'first-new-pass1' });
+    const secondLogin = await request(a).post('/auth/login').send({ email: body.email, password: 'second-new-pass2' });
+    expect([firstLogin.status, secondLogin.status].sort()).toEqual([200, 401]);
+  });
+
+  it('rejects password-hash-only and token-version-only drift after password verification', async () => {
+    for (const changedState of ['password_hash', 'token_version'] as const) {
+      const { res } = await registerUser(a);
+      const userId = res.body.user.id as string;
+      const token = res.body.token as string;
+      const before = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [userId],
+      );
+      const replacementHash = `superseded-${before.rows[0].password_hash}`;
+
+      const response = await runAuthenticationWriteRace({
+        userId,
+        matchesWrite: (sql) => sql.includes('UPDATE users') && sql.includes('SET password_hash = $1'),
+        startRequest: () =>
+          request(a)
+            .post('/auth/change-password')
+            .set('Authorization', `Bearer ${token}`)
+            .send({ currentPassword: STRONG_PASSWORD, newPassword: 'replacement-pass1' }),
+        mutateBeforeRelease: (client) =>
+          changedState === 'password_hash'
+            ? client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [replacementHash, userId])
+            : client.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [userId]),
+      });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({
+        error: 'Authentication state changed; please try again',
+        code: 'STATE_CHANGED',
+      });
+      const after = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [userId],
+      );
+      expect(after.rows).toHaveLength(1);
+      expect(after.rows[0]).toEqual(
+        changedState === 'password_hash'
+          ? { password_hash: replacementHash, token_version: before.rows[0].token_version }
+          : { password_hash: before.rows[0].password_hash, token_version: before.rows[0].token_version + 1 },
+      );
+    }
+  });
 });
 
 describe('auth: logout token revocation', () => {
@@ -424,6 +581,49 @@ describe('auth: delete account', () => {
       .send({ password: 'nope-nope1' });
     expect(r.status).toBe(401);
     expect(r.body).toEqual({ error: 'Password is incorrect', code: 'INVALID_CREDENTIALS' });
+  });
+
+  it('preserves the account when either authentication snapshot field changes after verification', async () => {
+    for (const changedState of ['password_hash', 'token_version'] as const) {
+      const { res } = await registerUser(a);
+      const userId = res.body.user.id as string;
+      const token = res.body.token as string;
+      const before = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [userId],
+      );
+      const replacementHash = `superseded-${before.rows[0].password_hash}`;
+
+      const response = await runAuthenticationWriteRace({
+        userId,
+        matchesWrite: (sql) => sql.startsWith('DELETE FROM users WHERE id'),
+        startRequest: () =>
+          request(a)
+            .delete('/auth/account')
+            .set('Authorization', `Bearer ${token}`)
+            .send({ password: STRONG_PASSWORD }),
+        mutateBeforeRelease: (client) =>
+          changedState === 'password_hash'
+            ? client.query('UPDATE users SET password_hash = $1 WHERE id = $2', [replacementHash, userId])
+            : client.query('UPDATE users SET token_version = token_version + 1 WHERE id = $1', [userId]),
+      });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({
+        error: 'Authentication state changed; please try again',
+        code: 'STATE_CHANGED',
+      });
+      const after = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [userId],
+      );
+      expect(after.rows).toHaveLength(1);
+      expect(after.rows[0]).toEqual(
+        changedState === 'password_hash'
+          ? { password_hash: replacementHash, token_version: before.rows[0].token_version }
+          : { password_hash: before.rows[0].password_hash, token_version: before.rows[0].token_version + 1 },
+      );
+    }
   });
 
   it('deletes personal data but retains an anonymous global provider-cost reservation', async () => {

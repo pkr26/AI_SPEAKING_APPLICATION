@@ -28,6 +28,10 @@ export async function sendMail(message: MailMessage): Promise<void> {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ to: message.to, subject: message.subject, text: message.text }),
         signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+        // The configured URL is security-validated, but fetch would otherwise
+        // forward this POST (including password-reset codes) across a 307/308
+        // redirect to an arbitrary or plaintext destination.
+        redirect: 'error',
       });
       if (!response.ok) {
         logger.error({ to: message.to, subject: message.subject, status: response.status }, 'mail webhook rejected');

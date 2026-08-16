@@ -8,21 +8,15 @@ import {
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
   ownSubmittedPresignedAudio,
-  preserveSubmittedPresignedAudio,
   resolvePresignedAudio,
   SubmittedAudioFile,
 } from './audio-upload';
 import { config } from './config';
 import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
-import {
-  abandonAssessmentRequest,
-  AssessmentContext,
-  AssessmentRequestInFlightError,
-  claimAssessmentRequest,
-} from './idempotency';
+import { abandonAssessmentRequest, AssessmentContext, claimAssessmentRequest } from './idempotency';
 import { AuthedRequest, HttpError, UserRow, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
-import { uploadAudio, verifyAudioMagicBytes } from './upload';
+import { ownSubmittedAudioFile, uploadAudio, verifyAudioMagicBytes } from './upload';
 
 /**
  * Shared choreography for the three paid assessment submission routes
@@ -34,16 +28,18 @@ import { uploadAudio, verifyAudioMagicBytes } from './upload';
  * persistence, error codes) is injected through AssessmentSubmissionHooks.
  */
 
-const submissionBodySchema = z.object({
-  questionId: z.string().uuid('questionId must be a valid UUID'),
-  requestId: z.string().uuid('requestId must be a valid UUID'),
-});
+function createSubmissionBodySchema() {
+  const submissionBodySchema = z.object({
+    questionId: z.string().uuid('questionId must be a valid UUID'),
+    requestId: z.string().uuid('requestId must be a valid UUID'),
+  });
 
-// S3 mode receives JSON with the presigned object key; local mode receives
-// multipart audio (see audio-upload.ts / upload.ts).
-const submissionJsonBodySchema = submissionBodySchema.extend({ audioKey: z.string().max(512) });
+  // S3 mode receives JSON with the presigned object key; local mode receives
+  // multipart audio (see audio-upload.ts / upload.ts).
+  return config.s3.bucket ? submissionBodySchema.extend({ audioKey: z.string().max(512) }) : submissionBodySchema;
+}
 
-export type SubmissionBodySchema = typeof submissionBodySchema | typeof submissionJsonBodySchema;
+export type SubmissionBodySchema = ReturnType<typeof createSubmissionBodySchema>;
 
 export interface AssessmentSubmissionChain {
   /** Mount before the route handler; ends with the dual-mode body validation. */
@@ -77,7 +73,7 @@ export function buildAssessmentSubmissionChain(
   limiters: Limiters,
   eligibility: RequestHandler[] = [],
 ): AssessmentSubmissionChain {
-  const bodySchema = config.s3.bucket ? submissionJsonBodySchema : submissionBodySchema;
+  const bodySchema = createSubmissionBodySchema();
   return {
     bodySchema,
     respendAssessmentBudget: limiters.respendAssessmentBudget,
@@ -138,13 +134,13 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
  * - inner finally: the per-question claim is always cleared once taken, and a
  *   request that did not complete abandons its durable request claim so the
  *   same requestId stays retryable;
- * - outer finally: the local audio file is always unlinked, and the S3 object
- *   is finalized here only when the route responded itself — on error paths
- *   the error handler sets the real status only after this handler unwinds,
- *   so finalizing now would read a stale 200 and delete objects that the
- *   409/429 contract preserves; the response-finish listener (registered by
- *   discardSubmittedPresignedAudio) sees the final status and finalizes those
- *   paths instead. Finalization is idempotent.
+ * - each successful response owns a small finally that finalizes its S3
+ *   object even when a disconnected response never emits `finish`;
+ * - outer finally: the local audio file is always unlinked. Error-path S3
+ *   finalization stays with the response listener because the error handler
+ *   sets the real status only after this handler unwinds; reading the stale
+ *   200 here could delete an object that a 409/429 response must preserve.
+ *   Finalization is idempotent.
  */
 export async function runAssessmentSubmission<Claim, Result>(
   req: AuthedRequest,
@@ -152,8 +148,11 @@ export async function runAssessmentSubmission<Claim, Result>(
   hooks: AssessmentSubmissionHooks<Claim, Result>,
 ): Promise<unknown> {
   const user = req.user!;
-  let responded = false;
   let audioFile: SubmittedAudioFile | undefined = req.file;
+  // From this point the outer finally is the sole close-path owner of the
+  // local file. The request may deliberately finish after a client abort, so
+  // upload middleware must not unlink it from a response `close` listener.
+  ownSubmittedAudioFile(res);
   try {
     const { questionId, requestId } = validated(req, hooks.bodySchema);
     const { rows: qRows } = await pool.query<QuestionRow>(
@@ -162,29 +161,29 @@ export async function runAssessmentSubmission<Claim, Result>(
     );
     const question = qRows[0];
     if (!question) throw hooks.questionMissingError();
-    if (hooks.requireQuestionAtUserLevel && question.cefr_level !== user.cefr_level) {
-      throw new HttpError(403, 'Question is not available at your level');
-    }
-
-    let requestClaim;
-    try {
-      requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId);
-    } catch (err) {
-      if (err instanceof AssessmentRequestInFlightError) {
-        preserveSubmittedPresignedAudio(res);
-      }
-      throw err;
-    }
+    const requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId);
     if (requestClaim.kind === 'completed') {
       completeSubmittedPresignedAudioReplay(res);
-      responded = true;
-      return res.json(requestClaim.response);
+      try {
+        return res.json(requestClaim.response);
+      } finally {
+        // Direct-upload mode has no registered cleanup, where finalization is
+        // deliberately a no-op; keeping this unconditional avoids divergent
+        // response-finally semantics between ingress modes.
+        await finalizeSubmittedPresignedAudio(res);
+      }
     }
     ownSubmittedPresignedAudio(res);
 
     let claim: Claim | undefined;
     let completed = false;
     try {
+      // A completed idempotent response takes precedence over mutable level
+      // eligibility: the original request may itself have promoted the user,
+      // and its retry must still replay byte-for-byte without new paid work.
+      if (hooks.requireQuestionAtUserLevel && question.cefr_level !== user.cefr_level) {
+        throw new HttpError(403, 'Question is not available at your level', 'FORBIDDEN');
+      }
       await hooks.assertEligibleAfterOwned?.(user);
       if (config.s3.bucket) audioFile = await resolvePresignedAudio(req, res);
       if (!audioFile) {
@@ -210,14 +209,16 @@ export async function runAssessmentSubmission<Claim, Result>(
       });
       const response = await hooks.persist(user, question, claim, result, requestId, requestClaim.claimId);
       completed = true;
-      responded = true;
-      return res.json(response);
+      try {
+        return res.json(response);
+      } finally {
+        await finalizeSubmittedPresignedAudio(res);
+      }
     } finally {
       if (claim) await hooks.clearClaim(user, question, claim);
       if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
     }
   } finally {
     if (audioFile) await fs.unlink(audioFile.path).catch(() => {});
-    if (responded && config.s3.bucket) await finalizeSubmittedPresignedAudio(res);
   }
 }

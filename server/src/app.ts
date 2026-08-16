@@ -85,6 +85,12 @@ export function createApp({
     );
   }
 
+  // Reject over-budget requests before any shared PostgreSQL security counter,
+  // compression, or body parsing work. The default in-memory global limiter is
+  // the cheap per-replica flood brake; mounting it after credential limiters
+  // would let rejected attack traffic keep writing a PG row on every request.
+  app.use(limiters.global);
+
   // Credential routes are throttled before JSON parsing/bcrypt work. Logout is
   // deliberately excluded: an authenticated learner must always be able to
   // revoke a token, even after an attacker exhausts the IP's login budget.
@@ -100,9 +106,6 @@ export function createApp({
   // parsed body).
   app.use('/auth/forgot-password', limiters.auth);
   app.use('/auth/reset-password', limiters.auth);
-
-  // Reject over-budget requests before compression/body parsing allocates work.
-  app.use(limiters.global);
 
   app.use(compression());
   app.use(express.json({ limit: '1mb' }));

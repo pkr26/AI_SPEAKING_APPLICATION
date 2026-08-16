@@ -6,25 +6,26 @@ interface IntegrityCheck {
   sql: string;
 }
 
-const checks: IntegrityCheck[] = [
-  {
-    name: 'invalid users',
-    sql: `SELECT count(*)::int AS n FROM users
+function integrityChecks(): IntegrityCheck[] {
+  return [
+    {
+      name: 'invalid users',
+      sql: `SELECT count(*)::int AS n FROM users
           WHERE name IS NULL OR char_length(name) NOT BETWEEN 1 AND 100
              OR created_at IS NULL OR char_length(email) NOT BETWEEN 3 AND 254
              OR token_version <= 0
              OR (cefr_level IS NOT NULL AND cefr_level NOT IN ('A1','A2','B1','B2','C1','C2'))
              OR (diagnostic_completed AND cefr_level IS NULL)`,
-  },
-  {
-    name: 'duplicate question natural keys',
-    sql: `SELECT count(*)::int AS n FROM (
+    },
+    {
+      name: 'duplicate question natural keys',
+      sql: `SELECT count(*)::int AS n FROM (
             SELECT 1 FROM questions GROUP BY cefr_level, prompt_word HAVING count(*) > 1
           ) duplicates`,
-  },
-  {
-    name: 'invalid questions',
-    sql: `SELECT count(*)::int AS n FROM questions
+    },
+    {
+      name: 'invalid questions',
+      sql: `SELECT count(*)::int AS n FROM questions
           WHERE created_at IS NULL
              OR char_length(prompt_word) NOT BETWEEN 1 AND 100
              OR btrim(prompt_word) = ''
@@ -62,23 +63,24 @@ const checks: IntegrityCheck[] = [
                          )
                      END
              )`,
-  },
-  {
-    name: 'invalid attempts',
-    sql: `SELECT count(*)::int AS n FROM attempts
+    },
+    {
+      name: 'invalid attempts',
+      sql: `SELECT count(*)::int AS n FROM attempts
           WHERE user_id IS NULL OR question_id IS NULL OR transcript IS NULL
              OR score IS NULL OR passed IS NULL OR feedback IS NULL OR created_at IS NULL
              OR attempt_no <= 0 OR score NOT BETWEEN 0 AND 100
              OR char_length(transcript) > 12000
              OR char_length(feedback) NOT BETWEEN 1 AND 800`,
-  },
-  {
-    name: 'invalid diagnostic states',
-    sql: `SELECT count(*)::int AS n FROM diagnostic_state
+    },
+    {
+      name: 'invalid diagnostic states',
+      sql: `SELECT count(*)::int AS n FROM diagnostic_state
           WHERE low_idx NOT BETWEEN 0 AND 6 OR high_idx NOT BETWEEN -1 AND 5
              OR questions_asked NOT BETWEEN 0 AND 5 OR low_idx > high_idx + 1`,
-  },
-];
+    },
+  ];
+}
 
 /** Read-only validation for databases created before migration 003. */
 export async function preflight(dbUrl: string): Promise<void> {
@@ -88,7 +90,7 @@ export async function preflight(dbUrl: string): Promise<void> {
   try {
     await client.query("SET statement_timeout = '60s'");
     const failures: string[] = [];
-    for (const check of checks) {
+    for (const check of integrityChecks()) {
       const { rows } = await client.query<{ n: number }>(check.sql);
       if (rows[0].n > 0) failures.push(`${check.name}: ${rows[0].n}`);
     }

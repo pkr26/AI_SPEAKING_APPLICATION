@@ -11,6 +11,12 @@ import {
   mutationLaneNames,
   mutationLanes,
 } from './mutation-lanes.mjs';
+import {
+  assertMutationLaneProvenance,
+  mutationLaneProvenancePath,
+  mutationSharedInputFiles,
+} from './mutation-provenance.mjs';
+import { mutationCampaignLockFileName, runMutation } from './run-mutation.mjs';
 
 /** Build a throwaway app tree with the given source and test file names. */
 async function fixtureAppDir(sourceFiles, testFiles) {
@@ -201,4 +207,307 @@ test('declaration files and non-TypeScript sources are not expected to have lane
   });
   assert.deepEqual(result.sourceFiles, ['src/a.ts']);
   assert.deepEqual(result.testFiles, ['__tests__/a-test.ts']);
+});
+
+async function fixtureMutationRunnerApp() {
+  return fixtureAppDir(
+    [...mutationSharedInputFiles, ...mutationLanes.recorder.mutate],
+    [...mutationLanes.recorder.testFiles],
+  );
+}
+
+test('runMutation writes provenance only after a successful lane report', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  let observedParallelLanes;
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: { MUTATION_PARALLEL_LANES: '9' },
+    laneNames: ['recorder'],
+    parallelLanes: 2,
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async ({ environment }) => {
+      observedParallelLanes = environment.MUTATION_PARALLEL_LANES;
+      await fs.mkdir(reportDir, { recursive: true });
+      await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
+      return 0;
+    },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(observedParallelLanes, '2');
+  const provenance = JSON.parse(
+    await fs.readFile(mutationLaneProvenancePath(reportDir, 'recorder'), 'utf8'),
+  );
+  assert.equal(provenance.laneName, 'recorder');
+  assert.match(provenance.fingerprint, /^[a-f0-9]{64}$/);
+  await assert.doesNotReject(() =>
+    assertMutationLaneProvenance({
+      reportDir,
+      appDir,
+      lanes: mutationLanes,
+      laneNames: ['recorder'],
+      environment: { MUTATION_PARALLEL_LANES: '2' },
+    }),
+  );
+  await assert.rejects(
+    () =>
+      assertMutationLaneProvenance({
+        reportDir,
+        appDir,
+        lanes: mutationLanes,
+        laneNames: ['recorder'],
+        environment: { MUTATION_PARALLEL_LANES: '9' },
+      }),
+    /runtime, or environment changed/,
+  );
+
+  const failedReportDir = path.join(appDir, 'failed-reports');
+  const failed = await runMutation({
+    appDir,
+    reportDir: failedReportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => {
+      await fs.writeFile(path.join(failedReportDir, 'recorder.json'), '{}');
+      return 1;
+    },
+  });
+  assert.equal(failed.exitCode, 1);
+  await assert.rejects(
+    fs.access(mutationLaneProvenancePath(failedReportDir, 'recorder')),
+    /ENOENT/,
+  );
+
+  const missingReportDir = path.join(appDir, 'missing-reports');
+  const missing = await runMutation({
+    appDir,
+    reportDir: missingReportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => 0,
+  });
+  assert.equal(missing.exitCode, 1);
+  await assert.rejects(
+    fs.access(mutationLaneProvenancePath(missingReportDir, 'recorder')),
+    /ENOENT/,
+  );
+});
+
+test('runMutation fails when an unmutated production dependency changes during a lane', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => {
+      await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
+      const unmutatedDependency = expectedMutationFiles.find(
+        (fileName) => !mutationLanes.recorder.mutate.includes(fileName),
+      );
+      assert.ok(unmutatedDependency);
+      await fs.writeFile(path.join(appDir, unmutatedDependency), '// changed');
+      return 0;
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(result.failedLanes, [{ laneName: 'recorder', exitCode: 1 }]);
+  await assert.rejects(fs.access(mutationLaneProvenancePath(reportDir, 'recorder')), /ENOENT/);
+});
+
+test('runMutation rejects duplicate lanes before cleaning reports or starting work', async (t) => {
+  const appDir = await fixtureAppDir([], []);
+  const reportDir = path.join(appDir, 'reports');
+  const existingReport = path.join(reportDir, 'recorder.json');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(existingReport, 'keep me');
+  let laneStarted = false;
+
+  await assert.rejects(
+    () =>
+      runMutation({
+        appDir,
+        reportDir,
+        laneNames: ['recorder', 'recorder'],
+        merge: false,
+        validateManifest: async () => {},
+        runLane: async () => {
+          laneStarted = true;
+          return 0;
+        },
+      }),
+    /Mutation lanes requested more than once: recorder/,
+  );
+  assert.equal(laneStarted, false);
+  assert.equal(await fs.readFile(existingReport, 'utf8'), 'keep me');
+});
+
+test('runMutation locks the app against campaigns using different report directories', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  const secondReportDir = path.join(appDir, 'other-reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  let signalEntered;
+  const enteredLane = new Promise((resolve) => {
+    signalEntered = resolve;
+  });
+  let releaseLane;
+  const continueLane = new Promise((resolve) => {
+    releaseLane = resolve;
+  });
+  const firstRun = runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => {
+      signalEntered();
+      await continueLane;
+      await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
+      return 0;
+    },
+  });
+  await enteredLane;
+
+  try {
+    await assert.rejects(
+      () =>
+        runMutation({
+          appDir,
+          reportDir: secondReportDir,
+          environment: {},
+          laneNames: ['recorder'],
+          merge: false,
+          validateManifest: async () => {},
+          runLane: async () => {
+            throw new Error('the locked campaign must never start a lane');
+          },
+        }),
+      /Another mutation campaign .* already owns/s,
+    );
+  } finally {
+    releaseLane();
+  }
+
+  assert.equal((await firstRun).exitCode, 0);
+  await assert.rejects(fs.access(path.join(appDir, mutationCampaignLockFileName)), /ENOENT/);
+});
+
+test('runMutation refuses a stale-looking lock until it is manually cleared', async (t) => {
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  const lockPath = path.join(appDir, mutationCampaignLockFileName);
+  const lockContents = `${JSON.stringify({
+    pid: 999_999,
+    token: 'stale-owner',
+    reportDir: '/tmp/old-mutation-reports',
+  })}\n`;
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  await fs.writeFile(lockPath, lockContents);
+  let laneStarted = false;
+
+  await assert.rejects(
+    () =>
+      runMutation({
+        appDir,
+        reportDir,
+        environment: {},
+        laneNames: ['recorder'],
+        merge: false,
+        validateManifest: async () => {},
+        runLane: async () => {
+          laneStarted = true;
+          return 0;
+        },
+      }),
+    /pid 999999.*Verify that neither its parent nor any Stryker child is alive/s,
+  );
+  assert.equal(laneStarted, false);
+  assert.equal(await fs.readFile(lockPath, 'utf8'), lockContents);
+});
+
+test('runMutation release never removes a lock with another ownership token', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  const lockPath = path.join(appDir, mutationCampaignLockFileName);
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const replacement = {
+    pid: process.pid,
+    token: 'replacement-owner',
+    reportDir: '/tmp/replacement',
+  };
+
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => {
+      await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
+      await fs.writeFile(lockPath, `${JSON.stringify(replacement)}\n`);
+      return 0;
+    },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')), replacement);
+});
+
+test('the app Stryker config defaults to two mutation workers', async () => {
+  const previousLane = process.env.MUTATION_LANE;
+  const previousConcurrency = process.env.MUTATION_CONCURRENCY;
+  process.env.MUTATION_LANE = 'recorder';
+  delete process.env.MUTATION_CONCURRENCY;
+  try {
+    const configUrl = new URL('../stryker.lane.config.mjs', import.meta.url);
+    configUrl.searchParams.set('test', String(Date.now()));
+    const { default: config } = await import(configUrl.href);
+    assert.equal(config.concurrency, 2);
+  } finally {
+    if (previousLane === undefined) delete process.env.MUTATION_LANE;
+    else process.env.MUTATION_LANE = previousLane;
+    if (previousConcurrency === undefined) delete process.env.MUTATION_CONCURRENCY;
+    else process.env.MUTATION_CONCURRENCY = previousConcurrency;
+  }
+});
+
+test('runMutation derives parallel lanes from its injected environment', async () => {
+  await assert.rejects(
+    () =>
+      runMutation({
+        appDir: '/unused-before-validation',
+        environment: { MUTATION_PARALLEL_LANES: 'invalid' },
+        merge: false,
+        validateManifest: async () => {
+          throw new Error('parallel-lane validation must happen first');
+        },
+      }),
+    /MUTATION_PARALLEL_LANES must be a positive integer/,
+  );
 });

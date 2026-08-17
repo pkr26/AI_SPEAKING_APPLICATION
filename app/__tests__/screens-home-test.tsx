@@ -193,9 +193,9 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => {
+    for (const client of queryClients) client.clear();
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  for (const client of queryClients) client.clear();
   queryClients.length = 0;
   // Mounting the provider syncs the module-level language; every other test
   // renders without one and must still fall back to English.

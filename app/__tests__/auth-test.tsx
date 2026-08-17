@@ -141,11 +141,19 @@ function renderTree(queryClient: QueryClient) {
 }
 
 async function renderAuth(storedToken: string | null = null) {
-  mockedGetToken.mockResolvedValue(storedToken);
+  const restore = deferred<string | null>();
+  mockedGetToken.mockReturnValue(restore.promise);
   const queryClient = new QueryClient();
   const clearSpy = jest.spyOn(queryClient, 'clear');
   const rendered = await renderTree(queryClient);
-  await waitFor(() => expect(text('isRestoring')).toBe('false'));
+  // Resolve the storage read inside one controlled act scope. A broken restore
+  // path now fails the assertion immediately instead of making every caller
+  // consume waitFor's full timeout.
+  await act(async () => {
+    restore.resolve(storedToken);
+    await restore.promise;
+  });
+  expect(text('isRestoring')).toBe('false');
   return { ...rendered, queryClient, clearSpy };
 }
 

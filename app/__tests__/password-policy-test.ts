@@ -138,5 +138,6 @@ describe('UTF-8 password policy', () => {
     expect(passwordPolicyError('abcdefgh', keyEcho)).toBe('password.needsLetterAndNumber');
     expect(comparablePasswordError(`a1${'é'.repeat(36)}`, keyEcho)).toBe('password.tooLong');
     expect(passwordPolicyError(`a1${'é'.repeat(36)}`, keyEcho)).toBe('password.tooLong');
+    expect(passwordPolicyError(`a1${'é'.repeat(36)}`, () => '')).toBeNull();
   });
 });

@@ -13,7 +13,7 @@ if (!laneName || !lane) {
 }
 
 const reportDirectory = process.env.MUTATION_REPORT_DIR || 'reports/mutation';
-const concurrency = Number(process.env.MUTATION_CONCURRENCY || '4');
+const concurrency = Number(process.env.MUTATION_CONCURRENCY || '2');
 
 if (!Number.isInteger(concurrency) || concurrency < 1) {
   throw new Error(

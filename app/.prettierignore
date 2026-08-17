@@ -2,6 +2,7 @@ node_modules/
 .expo/
 dist/
 coverage/
+.mutation-campaign.lock
 .stryker-tmp/
 reports/
 .stryker-*-tmp/

@@ -852,7 +852,7 @@ export default function Recorder<T>({
     };
   }, [recoverPending, stopForLifecycle]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const previous = previousIdentityRef.current;
     if (
       previous.ownerId !== ownerId ||
@@ -860,9 +860,11 @@ export default function Recorder<T>({
       previous.questionId !== questionId
     ) {
       previousIdentityRef.current = { ownerId, endpoint, questionId };
+      // stopForLifecycle invalidates the epoch synchronously before its first
+      // await. Keeping this in the commit's layout phase prevents old async
+      // work from observing the new identity before cleanup begins.
       void stopForLifecycle();
-      if (mountedRef.current) setPermissionDenied(false);
-      if (mountedRef.current) setPermissionNeedsSettings(false);
+      setPermissionDenied(false);
     }
   }, [endpoint, ownerId, questionId, stopForLifecycle]);
 
@@ -1018,9 +1020,6 @@ export default function Recorder<T>({
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentLifecycle = () =>
       lifecycleEpoch === lifecycleEpochRef.current &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
@@ -1096,9 +1095,6 @@ export default function Recorder<T>({
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentLifecycle = () =>
       lifecycleEpoch === lifecycleEpochRef.current &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
@@ -1175,9 +1171,6 @@ export default function Recorder<T>({
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentSubmission = () =>
       lifecycleEpoch === lifecycleEpochRef.current &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
       mountedRef.current &&
       focusedRef.current &&
       AppState.currentState === 'active';
@@ -1522,7 +1515,6 @@ export default function Recorder<T>({
           onPress={handleMicPress}
           style={({ pressed }) => [
             styles.recordButton,
-            isRecording && styles.recordButtonActive,
             (busy || pressed) && styles.recordButtonDimmed,
           ]}
         >
@@ -1678,9 +1670,6 @@ const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => 
     shadowRadius: 8,
     shadowOffset: { width: 0, height: 4 },
     elevation: 6,
-  },
-  recordButtonActive: {
-    backgroundColor: colors.danger,
   },
   recordButtonDimmed: {
     opacity: 0.6,

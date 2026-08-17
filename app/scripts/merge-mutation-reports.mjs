@@ -11,6 +11,7 @@ import {
   mutationLaneNames,
   mutationLanes,
 } from './mutation-lanes.mjs';
+import { assertMutationLaneProvenance } from './mutation-provenance.mjs';
 
 const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 const appDirectory = path.resolve(scriptsDirectory, '..');
@@ -179,6 +180,42 @@ function assertReportShape(report, laneName, definition) {
     if (!isRecord(testFile) || !Array.isArray(testFile.tests)) {
       throw new Error(`Test file ${testFileName} in lane ${laneName} has no tests array`);
     }
+    if (typeof testFile.source !== 'string') {
+      throw new Error(`Test file ${testFileName} in lane ${laneName} has no source text`);
+    }
+  }
+}
+
+/**
+ * Reports are reusable across partial runs only while the exact source and
+ * owning test contents they exercised still match the workspace.
+ */
+export async function assertMutationReportInputsMatchWorkspace({
+  reportsByLane,
+  lanes,
+  laneNames,
+  appDir,
+}) {
+  for (const laneName of laneNames) {
+    const definition = lanes[laneName];
+    const report = reportsByLane[laneName];
+    assertReportShape(report, laneName, definition);
+    for (const fileName of definition.mutate) {
+      const currentSource = await fs.readFile(path.join(appDir, fileName), 'utf8');
+      if (report.files[fileName].source !== currentSource) {
+        throw new Error(
+          `Mutation report for lane ${laneName} is stale: source file ${fileName} changed; rerun that lane before merging`,
+        );
+      }
+    }
+    for (const testFileName of definition.testFiles) {
+      const currentSource = await fs.readFile(path.join(appDir, testFileName), 'utf8');
+      if (report.testFiles[testFileName].source !== currentSource) {
+        throw new Error(
+          `Mutation report for lane ${laneName} is stale: test file ${testFileName} changed; rerun every lane that owns that test before merging`,
+        );
+      }
+    }
   }
 }
 
@@ -219,7 +256,7 @@ export function summarizeMutants(mutants) {
   };
 }
 
-/** Whole source lines spanned by a mutant, used to identify it without line numbers. */
+/** Whole source lines spanned by a mutant, retained as reviewable matching context. */
 export function mutantSourceText(source, location) {
   return String(source)
     .split('\n')
@@ -230,7 +267,8 @@ export function mutantSourceText(source, location) {
 
 /**
  * Collect every mutant the campaign left unresolved, tagged with the file and
- * the source text it replaced so the equivalence allowlist can identify it.
+ * its exact node location and the source text it replaced so the equivalence
+ * allowlist can identify it without excusing a same-line sibling.
  */
 export function collectUnresolvedMutants(files) {
   const unresolved = [];
@@ -243,6 +281,7 @@ export function collectUnresolvedMutants(files) {
         mutatorName: mutant.mutatorName,
         replacement: mutant.replacement,
         original: mutantSourceText(file.source, mutant.location),
+        location: mutant.location,
         line: mutant.location.start.line,
       });
     }
@@ -526,12 +565,26 @@ async function writeArtifactsAtomically(artifacts) {
 export async function mergeMutationReports({
   reportDir = process.env.MUTATION_REPORT_DIR || defaultReportDirectory,
   writeHtml = true,
+  environment = process.env,
 } = {}) {
   if (typeof reportDir !== 'string' || reportDir.length === 0)
     throw new Error('reportDir must be a non-empty string');
   await assertMutationLaneManifest({ appDir: appDirectory });
   const reportDirectory = path.resolve(reportDir);
   const reportsByLane = await readLaneReports(reportDirectory);
+  await assertMutationLaneProvenance({
+    reportDir: reportDirectory,
+    appDir: appDirectory,
+    lanes: mutationLanes,
+    laneNames: mutationLaneNames,
+    environment,
+  });
+  await assertMutationReportInputsMatchWorkspace({
+    reportsByLane,
+    lanes: mutationLanes,
+    laneNames: mutationLaneNames,
+    appDir: appDirectory,
+  });
   const merged = mergeMutationReportData({
     reportsByLane,
     lanes: mutationLanes,

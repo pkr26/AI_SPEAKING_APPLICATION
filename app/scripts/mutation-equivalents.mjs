@@ -15,18 +15,238 @@
  *
  * So exemptions live here, and `Ignored` is not treated as a resolved status.
  *
- * Entries are matched on file, mutator, the mutated replacement, and the trimmed
- * source text of the mutated node, and must excuse exactly the number of mutants
- * they declare. The gate fails on a survivor that matches nothing here, on an
- * entry that matches nothing, and on an entry that matches more than it claims —
- * so neither a stale exemption nor a newly regressed sibling can pass quietly.
- *
- * `lines` is the last resort, used only where a guard repeats verbatim: Recorder
- * has nineteen `if (!isCurrent()) return;` statements of which two are
- * unkillable, and no amount of text matching can separate those. Line numbers
- * drift, but drift makes the gate fail and ask for a review, which is the safe
- * direction.
+ * Entries are matched on file, mutator, replacement, source text, and the exact
+ * start/end location Stryker reported for the mutated node. They must excuse
+ * exactly the number of mutants they declare. The gate fails on a survivor that
+ * matches nothing here, on an entry that matches nothing, and on an entry that
+ * matches more than it claims — so source drift, a stale exemption, or a newly
+ * regressed same-line sibling cannot pass quietly.
  */
+function exactLocations(...coordinates) {
+  if (coordinates.length === 0 || coordinates.length % 4 !== 0) {
+    throw new Error('Exact mutant locations require start/end line and column values');
+  }
+  const locations = [];
+  for (let index = 0; index < coordinates.length; index += 4) {
+    const [startLine, startColumn, endLine, endColumn] = coordinates.slice(index, index + 4);
+    locations.push(
+      Object.freeze({
+        start: Object.freeze({ line: startLine, column: startColumn }),
+        end: Object.freeze({ line: endLine, column: endColumn }),
+      }),
+    );
+  }
+  return Object.freeze(locations);
+}
+
+// Mechanically derived from the unresolved mutants in the 18 fresh lane
+// reports. This table is deliberately one-to-one with the reviewed entries
+// below; module initialization fails if an entry is added, removed, or changes
+// its declared count without updating its exact node locations.
+const equivalentMutantLocations = Object.freeze([
+  exactLocations(51, 18, 53, 6),
+  exactLocations(52, 16, 52, 21),
+  exactLocations(54, 6, 54, 8),
+  exactLocations(179, 10, 179, 35, 179, 10, 179, 61),
+  exactLocations(179, 10, 179, 61),
+  exactLocations(313, 5, 313, 36),
+  exactLocations(353, 38, 353, 70),
+  exactLocations(395, 5, 395, 38),
+  exactLocations(396, 5, 396, 40),
+  exactLocations(457, 7, 457, 31, 488, 5, 488, 29),
+  exactLocations(719, 11, 721, 4),
+  exactLocations(731, 36, 731, 71),
+  exactLocations(737, 7, 737, 25),
+  exactLocations(774, 5, 774, 30),
+  exactLocations(156, 7, 156, 25),
+  exactLocations(28, 37, 28, 62, 45, 47, 45, 72),
+  exactLocations(121, 6, 121, 8),
+  exactLocations(93, 7, 93, 33),
+  exactLocations(93, 35, 95, 4, 121, 17, 123, 4),
+  exactLocations(121, 7, 121, 15),
+  exactLocations(122, 34, 122, 55),
+  exactLocations(34, 54, 34, 65),
+  exactLocations(46, 52, 46, 57),
+  exactLocations(47, 58, 47, 60),
+  exactLocations(74, 11, 74, 52),
+  exactLocations(48, 5, 48, 44),
+  exactLocations(75, 6, 75, 44),
+  exactLocations(175, 11, 175, 33),
+  exactLocations(175, 51, 175, 74),
+  exactLocations(26, 8, 26, 10),
+  exactLocations(99, 6, 99, 8, 196, 6, 196, 8),
+  exactLocations(189, 5, 189, 7),
+  exactLocations(112, 6, 112, 30),
+  exactLocations(195, 36, 195, 47),
+  exactLocations(108, 11, 108, 52),
+  exactLocations(178, 18, 180, 6),
+  exactLocations(179, 19, 179, 23),
+  exactLocations(40, 10, 40, 35),
+  exactLocations(54, 11, 56, 4),
+  exactLocations(57, 7, 57, 14),
+  exactLocations(19, 7, 19, 31),
+  exactLocations(19, 7, 19, 31),
+  exactLocations(19, 7, 19, 16),
+  exactLocations(81, 6, 81, 8, 82, 62, 82, 64, 83, 77, 83, 79),
+  exactLocations(58, 9, 58, 16),
+  exactLocations(59, 19, 59, 41),
+  exactLocations(95, 6, 95, 8),
+  exactLocations(98, 9, 98, 27),
+  exactLocations(98, 9, 98, 27),
+  exactLocations(110, 9, 110, 30, 110, 9, 110, 48),
+  exactLocations(110, 9, 110, 30, 110, 9, 110, 48),
+  exactLocations(207, 35, 207, 63, 345, 31, 345, 59, 356, 31, 356, 59),
+  exactLocations(329, 47, 329, 73, 329, 47, 329, 73),
+  exactLocations(329, 47, 329, 73),
+  exactLocations(302, 35, 302, 43, 302, 46, 302, 55),
+  exactLocations(80, 6, 80, 8),
+  exactLocations(83, 9, 83, 34),
+  exactLocations(83, 9, 83, 34),
+  exactLocations(201, 29, 201, 37, 201, 40, 201, 49),
+  exactLocations(211, 47, 211, 55, 211, 57, 211, 72),
+  exactLocations(102, 11, 102, 17),
+  exactLocations(106, 18, 108, 6),
+  exactLocations(107, 16, 107, 21),
+  exactLocations(109, 6, 109, 8),
+  exactLocations(232, 9, 232, 18),
+  exactLocations(237, 9, 237, 39),
+  exactLocations(237, 9, 237, 39),
+  exactLocations(418, 39, 418, 65, 435, 39, 435, 65),
+  exactLocations(214, 32, 214, 45),
+  exactLocations(130, 38, 130, 67, 161, 38, 161, 71),
+  exactLocations(38, 82, 42, 4),
+  exactLocations(45, 39, 45, 49, 45, 39, 45, 49),
+  exactLocations(121, 10, 121, 35),
+  exactLocations(312, 10, 312, 35),
+  exactLocations(312, 10, 312, 61),
+  exactLocations(321, 7, 321, 14),
+  exactLocations(337, 18, 337, 50, 337, 26, 337, 50),
+  exactLocations(337, 18, 337, 50),
+  exactLocations(350, 7, 350, 32),
+  exactLocations(350, 7, 351, 29),
+  exactLocations(388, 50, 388, 72),
+  exactLocations(640, 52, 640, 74),
+  exactLocations(444, 13, 444, 39),
+  exactLocations(629, 7, 629, 36),
+  exactLocations(105, 25, 108, 6),
+  exactLocations(1165, 15, 1169, 6),
+  exactLocations(1166, 19, 1166, 25),
+  exactLocations(1167, 46, 1167, 71),
+  exactLocations(1373, 77, 1373, 81, 1388, 77, 1388, 81),
+  exactLocations(103, 31, 103, 59, 103, 61, 103, 73),
+  exactLocations(105, 9, 105, 23),
+  exactLocations(145, 7, 145, 35),
+  exactLocations(178, 11, 180, 4),
+  exactLocations(204, 74, 204, 79),
+  exactLocations(208, 56, 208, 61),
+  exactLocations(216, 29, 216, 33),
+  exactLocations(220, 42, 220, 47),
+  exactLocations(224, 37, 224, 42),
+  exactLocations(225, 38, 225, 43),
+  exactLocations(232, 31, 239, 4),
+  exactLocations(240, 30, 240, 63),
+  exactLocations(278, 32, 278, 77),
+  exactLocations(279, 9, 279, 27, 1037, 13, 1037, 31),
+  exactLocations(
+    283,
+    6,
+    283,
+    8,
+    296,
+    6,
+    296,
+    8,
+    303,
+    6,
+    303,
+    8,
+    313,
+    6,
+    313,
+    8,
+    321,
+    6,
+    321,
+    8,
+    881,
+    6,
+    881,
+    8,
+  ),
+  exactLocations(291, 7, 291, 21),
+  exactLocations(295, 9, 295, 27),
+  exactLocations(310, 13, 312, 6),
+  exactLocations(326, 11, 326, 51),
+  exactLocations(339, 7, 339, 37),
+  exactLocations(355, 41, 355, 46, 1081, 41, 1081, 46, 1117, 41, 1117, 46, 1133, 41, 1133, 46),
+  exactLocations(358, 11, 358, 29, 358, 11, 358, 29, 1082, 11, 1082, 29, 1082, 11, 1082, 29),
+  exactLocations(362, 11, 362, 54),
+  exactLocations(379, 7, 379, 43, 409, 7, 409, 43),
+  exactLocations(385, 40, 385, 74, 415, 40, 415, 74),
+  exactLocations(425, 9, 425, 45),
+  exactLocations(430, 42, 430, 76),
+  exactLocations(453, 28, 453, 32, 1171, 28, 1171, 32),
+  exactLocations(458, 7, 458, 41),
+  exactLocations(477, 13, 477, 25, 487, 13, 487, 25, 779, 25, 779, 37),
+  exactLocations(
+    502,
+    29,
+    502,
+    61,
+    607,
+    35,
+    607,
+    67,
+    631,
+    35,
+    631,
+    67,
+    652,
+    33,
+    652,
+    65,
+    723,
+    37,
+    723,
+    69,
+    1327,
+    29,
+    1327,
+    61,
+    1345,
+    27,
+    1345,
+    59,
+  ),
+  exactLocations(551, 36, 551, 41, 557, 36, 557, 41),
+  exactLocations(568, 17, 570, 10),
+  exactLocations(711, 85, 711, 90),
+  exactLocations(813, 13, 813, 47),
+  exactLocations(849, 28, 849, 33),
+  exactLocations(864, 11, 864, 29, 1027, 9, 1027, 27),
+  exactLocations(865, 11, 865, 29, 865, 11, 865, 29),
+  exactLocations(865, 58, 865, 63),
+  exactLocations(873, 13, 873, 19),
+  exactLocations(878, 16, 878, 21),
+  exactLocations(886, 9, 886, 29),
+  exactLocations(886, 19, 886, 29),
+  exactLocations(889, 49, 889, 71),
+  exactLocations(898, 11, 898, 29),
+  exactLocations(917, 40, 917, 46),
+  exactLocations(926, 43, 926, 49),
+  exactLocations(928, 9, 928, 44),
+  exactLocations(970, 9, 970, 41),
+  exactLocations(1098, 7, 1099, 46),
+  exactLocations(1098, 7, 1098, 51),
+  exactLocations(1165, 9, 1165, 13),
+  exactLocations(1172, 34, 1172, 39, 1361, 38, 1361, 43),
+  exactLocations(1245, 17, 1245, 43),
+  exactLocations(1360, 13, 1360, 40),
+  exactLocations(1525, 13, 1525, 53, 1525, 13, 1525, 53),
+  exactLocations(1525, 13, 1525, 53),
+  exactLocations(1682, 23, 1684, 4),
+]);
+
 export const equivalentMutants = Object.freeze(
   [
     {
@@ -395,14 +615,6 @@ export const equivalentMutants = Object.freeze(
       replacements: ['index - 1'],
       reason:
         'index - 1 < value.length is vacuously true for every index, which is the same as the ConditionalExpression -> true case above.',
-    },
-    {
-      file: 'src/lib/password-policy.ts',
-      mutator: 'ConditionalExpression',
-      original: 'if (byteError) return byteError;',
-      replacements: ['true'],
-      reason:
-        'comparablePasswordError returns string | null, so returning it unconditionally is identical. The only distinguishing input is a Translator returning an empty string, which no dictionary-backed translator can produce for a typed MessageKey — and under such a translator the original would wrongly accept a 73-byte password too, so asserting it would pin an accident.',
     },
     {
       file: 'src/lib/practice-flow.tsx',
@@ -817,30 +1029,6 @@ export const equivalentMutants = Object.freeze(
     },
     {
       file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "signal.removeEventListener('abort', rejectAbort);",
-      replacements: ['""'],
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ObjectLiteral',
-      original: "signal.addEventListener('abort', rejectAbort, { once: true });",
-      replacements: ['{}'],
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: "signal.addEventListener('abort', rejectAbort, { once: true });",
-      replacements: ['false'],
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
       mutator: 'ConditionalExpression',
       original: "if (typeof metering !== 'number' || !Number.isFinite(metering)) return 0;",
       replacements: ['false'],
@@ -852,7 +1040,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BlockStatement',
       original: '} catch {\n    return false;\n  }',
       replacements: ['{}'],
-      lines: [178],
       reason:
         'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
     },
@@ -877,14 +1064,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BooleanLiteral',
       original: 'const mountedRef = useRef(true);',
       replacements: ['false'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const focusedRef = useRef(false);',
-      replacements: ['true'],
       reason:
         'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
     },
@@ -952,7 +1131,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'ArrayDeclaration',
       original: '}, []);',
       replacements: ['["Stryker was here"]'],
-      lines: [283, 296, 303, 313, 321, 881],
       count: 6,
       reason:
         'A constant dependency literal compares equal on every render under Object.is, so React runs the effect (or rebuilds the callback) exactly as often either way.',
@@ -978,7 +1156,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BlockStatement',
       original: '} catch {\n      return false;\n    }',
       replacements: ['{}'],
-      lines: [310],
       reason:
         'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
     },
@@ -1003,7 +1180,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BooleanLiteral',
       original: 'hasObservedRecordingRef.current = false;',
       replacements: ['true'],
-      lines: [355, 1081, 1117, 1133],
       count: 4,
       reason:
         'hasObservedRecordingRef is only read while phaseRef.current is "recording", and the sole transition into that phase resets it first, so these defensive resets are unobservable.',
@@ -1064,7 +1240,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BooleanLiteral',
       original: 'operationRef.current = true;',
       replacements: ['false'],
-      lines: [453, 1171],
       count: 2,
       reason:
         'In recoverPending the operation lock is redundant with recoveringRef and the recovering phase; in submit it is redundant with updatePhase("uploading") three synchronous lines later.',
@@ -1082,7 +1257,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'ConditionalExpression',
       original: 'if (!isCurrent()) return;',
       replacements: ['false'],
-      lines: [477, 487, 779],
       count: 3,
       reason:
         "Only microtasks separate this guard from the caller's own identical guard, so no macrotask can interleave and both branches return with no side effect.",
@@ -1110,7 +1284,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BlockStatement',
       original: '} catch {\n          return false;\n        }',
       replacements: ['{}'],
-      lines: [568],
       reason:
         'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
     },
@@ -1143,7 +1316,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'ConditionalExpression',
       original: 'if (mountedRef.current) setPermissionDenied(false);',
       replacements: ['true'],
-      lines: [864, 1027],
       count: 2,
       reason:
         'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
@@ -1208,26 +1380,10 @@ export const equivalentMutants = Object.freeze(
     {
       file: 'src/components/Recorder.tsx',
       mutator: 'ConditionalExpression',
-      original: "if (phase !== 'uploading' && phase !== 'recovering') return;",
-      replacements: ['false'],
-      reason:
-        'waitStartedAtRef is non-null exactly in the uploading and recovering phases, and the elapsed line renders only in those phases, so a tick in another phase writes nothing observable.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
       original: 'if (startedAt !== null) setWaitElapsedMillis(Date.now() - startedAt);',
       replacements: ['true'],
       reason:
         'Same wait-clock invariant: startedAt is non-null exactly when this interval runs in a wait phase.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ArrowFunction',
-      original: 'return () => clearInterval(interval);',
-      replacements: ['() => undefined'],
-      reason:
-        'A leaked interval recomputes an identical elapsed value in a phase that renders nothing, so the cleanup is unobservable. Note: scoring this one needs jest --forceExit, since the leaked real timer keeps the process alive after the suite passes.',
     },
     {
       file: 'src/components/Recorder.tsx',
@@ -1263,40 +1419,12 @@ export const equivalentMutants = Object.freeze(
     },
     {
       file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'identityRef.current.ownerId === ownerId &&',
-      replacements: ['true'],
-      count: 3,
-      reason:
-        'Every identity change routes through stopForLifecycle, which increments lifecycleEpochRef synchronously before any awaited continuation can read the new identityRef. The epoch operand is already false whenever an identity operand would be.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'identityRef.current.endpoint === endpoint &&',
-      replacements: ['true'],
-      count: 3,
-      reason:
-        'Every identity change routes through stopForLifecycle, which increments lifecycleEpochRef synchronously before any awaited continuation can read the new identityRef. The epoch operand is already false whenever an identity operand would be.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'identityRef.current.questionId === questionId &&',
-      replacements: ['true'],
-      count: 3,
-      reason:
-        'Every identity change routes through stopForLifecycle, which increments lifecycleEpochRef synchronously before any awaited continuation can read the new identityRef. The epoch operand is already false whenever an identity operand would be.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
       mutator: 'LogicalOperator',
       original:
         'lifecycleEpoch === lifecycleEpochRef.current &&\n      identityRef.current.ownerId === ownerId &&',
       replacements: [
         'lifecycleEpoch === lifecycleEpochRef.current || identityRef.current.ownerId === ownerId',
       ],
-      lines: [1098],
       reason:
         'Dropping the epoch check in stopRecording lets a superseded stop adopt its take, but the stopForLifecycle that bumped the epoch is awaiting the same native stop promise and immediately re-discards the recording and returns to idle, so the final observable state is identical.',
     },
@@ -1305,7 +1433,6 @@ export const equivalentMutants = Object.freeze(
       mutator: 'ConditionalExpression',
       original: 'lifecycleEpoch === lifecycleEpochRef.current &&',
       replacements: ['true'],
-      lines: [1098],
       reason:
         'Same as the LogicalOperator on this line: a superseded stop is undone by the lifecycle stop that superseded it before anything is rendered.',
     },
@@ -1322,20 +1449,9 @@ export const equivalentMutants = Object.freeze(
       mutator: 'BooleanLiteral',
       original: 'cancelRequestedRef.current = false;',
       replacements: ['true'],
-      lines: [1172, 1361],
       count: 2,
       reason:
         'cancelRequestedRef is reset before any await of the next submission, so leaving it set here cannot leak into a later run.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!isCurrentSubmission()) return;',
-      replacements: ['false'],
-      lines: [1214, 1228],
-      count: 2,
-      reason:
-        'The only statement between this guard and the next identical one is a pure filename/MIME computation whose result the later guard discards, and only microtasks separate them.',
     },
     {
       file: 'src/components/Recorder.tsx',
@@ -1352,30 +1468,6 @@ export const equivalentMutants = Object.freeze(
       replacements: ['false'],
       reason:
         'Every non-user abort originates in stopForLifecycle, which increments the lifecycle epoch first, so the submission-currency guard just above already fails.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: "if (phaseRef.current !== 'uploading') return;",
-      replacements: ['false'],
-      reason:
-        'A controller exists only while the phase is uploading, so this phase test is subsumed by the null check immediately below it.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'OptionalChaining',
-      original: 'previewPlayerRef.current?.pause();',
-      replacements: ['previewPlayerRef.current.pause'],
-      reason:
-        'Reachable only while previewPlaying is true, which implies a live player, so the optional chain never short-circuits.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!uri) return;',
-      replacements: ['false'],
-      reason:
-        'A documented, unreachable fail-closed block: every path that clears activeUriRef also leaves the recorded phase, so uri is non-null wherever this runs. It is annotated "Unreachable by design" in the source.',
     },
     {
       file: 'src/components/Recorder.tsx',
@@ -1402,17 +1494,32 @@ export const equivalentMutants = Object.freeze(
       reason:
         'recordButtonActive is byte-identical to the base recordButton fill, so emptying it changes no rendered style.',
     },
-  ].map((entry) =>
-    Object.freeze({
+  ].map((entry, index) => {
+    const locations = equivalentMutantLocations[index];
+    const expected = entry.count ?? 1;
+    if (locations === undefined || locations.length !== expected) {
+      throw new Error(
+        `Equivalent mutant entry ${index} must pin exactly ${expected} exact location(s)`,
+      );
+    }
+    return Object.freeze({
       ...entry,
       replacements: Object.freeze(entry.replacements),
       // One guard can be reported under more than one span: Stryker mutates each
       // AST node, so `typeof x === 'number'` and the `typeof x && isFinite(x)`
       // pair around it arrive as separate mutants with different source text.
       originals: Object.freeze(entry.originals ?? [entry.original]),
-    }),
-  ),
+      locations,
+    });
+  }),
 );
+
+if (equivalentMutantLocations.length !== equivalentMutants.length) {
+  throw new Error(
+    `Equivalent mutant location table has ${equivalentMutantLocations.length} entries for ` +
+      `${equivalentMutants.length} registry entries`,
+  );
+}
 
 function normalize(text) {
   return String(text).replace(/\s+/g, ' ').trim();
@@ -1423,22 +1530,54 @@ function sourceSpans(entry) {
   return entry.originals ?? [entry.original];
 }
 
-/**
- * Some guards repeat verbatim across a file — `if (!isCurrent()) return;` occurs
- * nineteen times in Recorder.tsx, of which exactly two are unkillable. Text alone
- * cannot separate those, so such entries additionally pin the lines they cover.
- * Line numbers do drift, but drifting makes the gate fail and ask for a review,
- * which is the safe direction.
- */
-function matchesLine(entry, survivor) {
-  return entry.lines === undefined || entry.lines.includes(survivor.line);
+function isPosition(position) {
+  return (
+    position !== null &&
+    typeof position === 'object' &&
+    Number.isInteger(position.line) &&
+    position.line > 0 &&
+    Number.isInteger(position.column) &&
+    position.column > 0
+  );
+}
+
+function isExactLocation(location) {
+  return (
+    location !== null &&
+    typeof location === 'object' &&
+    isPosition(location.start) &&
+    isPosition(location.end)
+  );
+}
+
+function locationsEqual(first, second) {
+  return (
+    first.start.line === second.start.line &&
+    first.start.column === second.start.column &&
+    first.end.line === second.end.line &&
+    first.end.column === second.end.column
+  );
+}
+
+function assertEntryLocations(entry, index) {
+  const expected = expectedMatches(entry);
+  if (
+    !Array.isArray(entry.locations) ||
+    entry.locations.length !== expected ||
+    entry.locations.some((location) => !isExactLocation(location))
+  ) {
+    throw new Error(
+      `Equivalence entry ${index} (${entry.file ?? 'unknown file'}) must declare ` +
+        `${expected} exact start/end location(s)`,
+    );
+  }
 }
 
 /**
- * How many mutants an entry is allowed to excuse. Spans are whole source lines,
- * so a line holding several mutants of the same mutator and replacement — a
- * chained condition, say — would let one entry cover a sibling that is killed
- * today and regresses tomorrow. Pinning the count turns that into a failure.
+ * How many mutants an entry is allowed to excuse. Some mutators produce more
+ * than one mutant at the same AST node and exact span, while other reviewed
+ * entries intentionally group several equivalent nodes. Pinning the count makes
+ * both additions and removals fail closed.
  */
 function expectedMatches(entry) {
   return entry.count ?? 1;
@@ -1454,6 +1593,7 @@ function expectedMatches(entry) {
  * reported so neither can pass quietly.
  */
 export function applyEquivalenceAllowlist(survivors, entries = equivalentMutants) {
+  for (const [index, entry] of entries.entries()) assertEntryLocations(entry, index);
   const matchCounts = new Map();
   const accepted = [];
   const unexplained = [];
@@ -1469,7 +1609,7 @@ export function applyEquivalenceAllowlist(survivors, entries = equivalentMutants
         sourceSpans(entry).some(
           (original) => normalize(original) === normalize(survivor.original),
         ) &&
-        matchesLine(entry, survivor),
+        entry.locations.some((location) => locationsEqual(location, survivor.location)),
     );
     if (index === -1) unexplained.push(survivor);
     else {

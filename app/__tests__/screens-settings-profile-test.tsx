@@ -4,7 +4,7 @@ import { File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import React from 'react';
 import { Alert, StyleSheet } from 'react-native';
-import type { TestInstance } from 'test-renderer';
+import type { Fiber, TestInstance } from 'test-renderer';
 
 import SettingsScreen, { formatReminderHour } from '../src/app/settings/index';
 import {
@@ -177,6 +177,23 @@ function parentOf(node: TestInstance): TestInstance {
   const parent = node.parent;
   if (!parent) throw new Error('Element is not laid out inside a parent view');
   return parent;
+}
+
+/**
+ * Return the Pressable callback associated with a queried host node without
+ * opening RNTL's own async act scope. This is only for same-render re-entrancy
+ * tests, where awaiting one fireEvent would commit the disabled state before
+ * the second activation.
+ */
+function committedPressHandler(node: TestInstance): () => unknown {
+  let fiber: Fiber | null = node.unstable_fiber;
+  while (fiber) {
+    const props = fiber.memoizedProps as { onPress?: unknown } | null;
+    if (typeof props?.onPress === 'function') return props.onPress as () => unknown;
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
 }
 
 /**
@@ -1001,8 +1018,13 @@ describe('daily reminder controls', () => {
 
     const toggle = screen.getByRole('switch', { name: t('reminder.toggleLabel') });
     await act(async () => {
-      fireEvent.press(toggle);
-      fireEvent.press(toggle);
+      // Invoke the committed handler twice inside one React act scope. Calling
+      // async RNTL fireEvent twice without awaiting it creates overlapping act
+      // scopes, while awaiting the first call would let React disable the
+      // control before this same-render re-entrancy case can be exercised.
+      const press = committedPressHandler(toggle);
+      press();
+      press();
     });
 
     expect(mockEnableReminder).toHaveBeenCalledTimes(1);
@@ -1221,8 +1243,11 @@ describe('retake placement test', () => {
 
     const row = screen.getByRole('button', { name: t('settings.export') });
     await act(async () => {
-      fireEvent.press(row);
-      fireEvent.press(row);
+      // Keep both activations in the same committed render without nesting the
+      // async act scope that RNTL's fireEvent creates internally.
+      const press = committedPressHandler(row);
+      press();
+      press();
     });
 
     expect(mockExportData).toHaveBeenCalledTimes(1);

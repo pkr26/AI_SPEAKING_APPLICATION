@@ -43,21 +43,26 @@ npm run audit:ci
 ### Mutation campaign
 
 `npm run mutation` mutates every production `.ts`/`.tsx` file. It fails unless
-every mutant is Killed, Timeout, Ignored, or a survivor somebody has proven
-unkillable and written down. Stryker's own score ignores CompileError,
-RuntimeError, and Pending mutants and has no notion of a reviewed exemption, so
-the merged report is re-checked against that stricter rule and Stryker's own
-break threshold is disabled.
+every mutant is Killed or Timeout, or an otherwise unresolved mutant has been
+proven unkillable and written down. Unresolved includes Survived, NoCoverage,
+Ignored, CompileError, RuntimeError, and Pending. Stryker's own score excludes
+some of those statuses and has no notion of a reviewed exemption, so the merged
+report is re-checked against that stricter rule and Stryker's own break
+threshold is disabled.
 
 Equivalent mutants — ones no test could ever kill, such as a `typeof` guard that
 exists only to narrow a type — are recorded in `scripts/mutation-equivalents.mjs`
-with the reasoning for each. Entries match on file, mutator, replacement, and the
-mutated source text, never on line numbers. The gate fails both on a survivor
-that matches no entry _and_ on an entry that matches nothing, so an exemption
-cannot outlive the code it excused. Prefer a `// Stryker disable` comment when
-every mutant on the target line is unkillable (see `src/app/(auth)/login.tsx`);
-use the list when killable and unkillable mutants share a line, because Stryker's
-directives cannot separate them.
+with the reasoning for each. Entries match on file, mutator, replacement,
+mutated source text, and Stryker's exact start/end node location. Every expected
+mutant has a mechanically pinned span, so even a one-for-one survivor swap on
+the same source line makes both the new mutant unexplained and the old exemption
+stale. The gate fails both on a survivor that matches no entry _and_ on an entry
+that matches nothing, so an exemption cannot outlive or drift away from the code
+it excused. Refresh spans only from a fresh full campaign after reviewing the
+survivors again. A `// Stryker disable` directive is not an exemption: it
+produces Ignored mutants, which the strict gate rejects unless they are
+explicitly reviewed. Keep exemptions in the allowlist, where their scope and
+continued relevance are validated.
 
 The campaign runs as lanes rather than one Stryker invocation.
 `scripts/mutation-lanes.mjs` assigns each source file to exactly one lane and
@@ -67,6 +72,21 @@ the campaign. `scripts/run-mutation.mjs` runs the lanes, then
 `scripts/merge-mutation-reports.mjs` validates each lane report against the
 manifest and merges them into `reports/mutation/app.{json,html}` plus
 `app-summary.json`. `npm run test:mutation-tooling` covers that tooling itself.
+Each successful lane also writes a provenance sidecar. A partial run may reuse
+an unselected lane only when that sidecar proves its toolchain, runtime,
+environment, source, and owning tests still match the current workspace. A
+missing or stale sidecar makes the merge fail closed and names the lane to
+rerun. Every production source file is a shared input because one lane can
+execute code owned by another: changing any production source or shared
+mutation-tooling input requires a full campaign. An owning-test-only change may
+be handled by rerunning every lane that names that test. The runner also rejects
+duplicate lane arguments and uses the app-root `.mutation-campaign.lock` to keep
+independent processes from colliding even when they select different report
+directories. Locks are never reclaimed automatically because an orphan Stryker
+child may still be active even after the recorded parent exits. After an
+interrupted run, verify that neither the recorded parent nor any Stryker child
+is alive before removing the lock manually. Invalid locks fail closed in the
+same way.
 
 Two settings in `stryker.lane.config.mjs` are load-bearing and explained in
 full there: each lane pins jest's `testMatch` (Stryker's `testFiles` only
@@ -79,11 +99,12 @@ Useful knobs:
 
 ```bash
 npm run mutation:lanes:verify          # manifest only, no mutants
-node scripts/run-mutation.mjs ui types # re-run named lanes, then re-merge
+node scripts/run-mutation.mjs ui types # re-run named lanes; reuse only current reports
 MUTATION_PARALLEL_LANES=3 MUTATION_CONCURRENCY=2 npm run mutation
 ```
 
-The backend must be running on port 4000.
+The mutation tests mock network access and do not need the backend. Running the
+app against the local API does require the backend on port 4000.
 
 ### API URL
 

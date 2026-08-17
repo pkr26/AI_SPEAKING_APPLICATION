@@ -136,18 +136,21 @@ function fakeResponse(
 
 /** Mimics a platform fetch that only settles when the request is aborted. */
 function fetchUntilAborted(): void {
-  fetchMock.mockImplementation(
-    (_input: unknown, init?: RequestInit) =>
-      new Promise<Response>((_resolve, reject) => {
-        const rejectAbort = () =>
-          reject(new DOMException('The operation was aborted.', 'AbortError'));
-        if (init?.signal?.aborted) {
-          rejectAbort();
-          return;
-        }
-        init?.signal?.addEventListener('abort', rejectAbort);
-      }),
-  );
+  fetchMock.mockImplementation((_input: unknown, init?: RequestInit) => {
+    if (!init?.signal) {
+      return Promise.reject(new Error('fetchWithTimeout must pass fetch an AbortSignal'));
+    }
+    const { signal } = init;
+    return new Promise<Response>((_resolve, reject) => {
+      const rejectAbort = () =>
+        reject(new DOMException('The operation was aborted.', 'AbortError'));
+      if (signal.aborted) {
+        rejectAbort();
+        return;
+      }
+      signal.addEventListener('abort', rejectAbort);
+    });
+  });
 }
 
 async function catchAsync(promise: Promise<unknown>): Promise<unknown> {

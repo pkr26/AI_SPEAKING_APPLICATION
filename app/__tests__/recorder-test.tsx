@@ -38,6 +38,7 @@ import {
   apiRequestAudioUpload,
   apiUploadAudio,
   AUDIO_TIMEOUT_MS,
+  resolveAudioFileDescriptor,
 } from '../src/lib/api';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import {
@@ -149,6 +150,7 @@ jest.mock('../src/lib/api', () => {
     apiPostPresignedAudio: jest.fn(),
     apiRequestAudioUpload: jest.fn(),
     apiUploadAudio: jest.fn(),
+    resolveAudioFileDescriptor: jest.fn(),
   };
 });
 
@@ -406,22 +408,59 @@ function invokeRolePressHandler(accessibleName: string): Promise<void> {
   return Promise.resolve(onPress()).then(() => undefined);
 }
 
-async function renderRecorder(
-  overrides: {
-    ownerId?: string;
-    questionId?: string;
-    endpoint?: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
-    parseResult?: (data: unknown) => { parsed: unknown };
-    onError?: (message: string) => void;
-    onRecoveryUnresolved?: () => void;
-    onInteractionLockChange?: (locked: boolean) => void;
-    onRecoveryEndpointMismatch?: (
-      endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
-    ) => boolean;
-    onRateLimited?: (message: string) => void;
-  } = {},
-) {
-  const props = {
+function AfterRecorderLayout({ onLayout }: { onLayout?: () => void }) {
+  React.useLayoutEffect(() => {
+    onLayout?.();
+  }, [onLayout]);
+  return null;
+}
+
+type IdentityHarnessRecorderProps<T> = {
+  ownerId: string;
+  questionId: string;
+  endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
+  parseResult: (data: unknown) => T;
+  onResult: (data: T) => void;
+  onError: (message: string) => void;
+  onRecoveryUnresolved: () => void;
+  onInteractionLockChange?: (locked: boolean) => void;
+  onRecoveryEndpointMismatch?: (
+    endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+  ) => boolean;
+  onRateLimited?: (message: string) => void;
+};
+
+function IdentityLayoutHarness<T>({
+  recorderProps,
+  onRecorderLayout,
+}: {
+  recorderProps: IdentityHarnessRecorderProps<T>;
+  onRecorderLayout?: () => void;
+}) {
+  return (
+    <>
+      <Recorder {...recorderProps} />
+      <AfterRecorderLayout onLayout={onRecorderLayout} />
+    </>
+  );
+}
+
+type RecorderTestOverrides = {
+  ownerId?: string;
+  questionId?: string;
+  endpoint?: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
+  parseResult?: (data: unknown) => { parsed: unknown };
+  onError?: (message: string) => void;
+  onRecoveryUnresolved?: () => void;
+  onInteractionLockChange?: (locked: boolean) => void;
+  onRecoveryEndpointMismatch?: (
+    endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+  ) => boolean;
+  onRateLimited?: (message: string) => void;
+};
+
+function recorderTestProps(overrides: RecorderTestOverrides = {}) {
+  return {
     ownerId: OWNER_ID,
     questionId: QUESTION_ID,
     endpoint: ENDPOINT as '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
@@ -431,7 +470,18 @@ async function renderRecorder(
     onRecoveryUnresolved: jest.fn(),
     ...overrides,
   };
+}
+
+async function renderRecorder(overrides: RecorderTestOverrides = {}) {
+  const props = recorderTestProps(overrides);
   const view = await render(<Recorder {...props} />);
+  await flushAct();
+  return { view, props };
+}
+
+async function renderIdentityRaceRecorder(overrides: RecorderTestOverrides = {}) {
+  const props = recorderTestProps(overrides);
+  const view = await render(<IdentityLayoutHarness recorderProps={props} />);
   await flushAct();
   return { view, props };
 }
@@ -490,15 +540,16 @@ function RecoveryModeHarness({
 }
 
 async function startRecording(): Promise<void> {
+  expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
   await fireEvent.press(screen.getByLabelText(START_LABEL));
-  await waitFor(() => expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy());
+  expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
 }
 
 async function recordAndStop(durationMillis = 5000): Promise<void> {
   await startRecording();
   mockRecorderState.durationMillis = durationMillis;
   await fireEvent.press(screen.getByLabelText(STOP_LABEL));
-  await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
+  expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy();
 }
 
 async function submitLiveRecordingIntoRecovery(
@@ -593,6 +644,11 @@ beforeEach(() => {
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);
   asMock(apiUploadAudio).mockReset();
   asMock(apiUploadAudio).mockResolvedValue({ ok: true });
+  asMock(resolveAudioFileDescriptor).mockReset();
+  asMock(resolveAudioFileDescriptor).mockResolvedValue({
+    name: 'audio.m4a',
+    type: 'audio/mp4',
+  });
 
   asMock(loadPendingAssessment).mockReset();
   asMock(loadPendingAssessment).mockResolvedValue(null);
@@ -637,6 +693,18 @@ describe('Recorder', () => {
         screen.getByText('We send your recording only after you tap Send Answer.'),
       ).toBeTruthy();
       expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+    });
+
+    it('does not run the assessment wait clock while idle', async () => {
+      const setWaitInterval = jest.spyOn(globalThis, 'setInterval');
+
+      try {
+        await renderRecorder();
+
+        expect(setWaitInterval).not.toHaveBeenCalledWith(expect.any(Function), 1_000);
+      } finally {
+        setWaitInterval.mockRestore();
+      }
     });
 
     it('reports when mode-changing interactions must be locked and releases them on unmount', async () => {
@@ -1969,22 +2037,27 @@ describe('Recorder', () => {
       async (_field, next) => {
         const permission = deferred<{ granted: boolean }>();
         asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
-        const { view, props } = await renderRecorder();
+        const { view, props } = await renderIdentityRaceRecorder();
         const staleStart = invokePressHandler(view, START_LABEL);
         const nextError = jest.fn();
         const nextResult = jest.fn();
         const nextRecovery = jest.fn();
 
         await view.rerender(
-          <Recorder
-            {...props}
-            {...next}
-            onError={nextError}
-            onResult={nextResult}
-            onRecoveryUnresolved={nextRecovery}
+          <IdentityLayoutHarness
+            recorderProps={{
+              ...props,
+              ...next,
+              onError: nextError,
+              onResult: nextResult,
+              onRecoveryUnresolved: nextRecovery,
+            }}
+            onRecorderLayout={() => permission.resolve({ granted: true })}
           />,
         );
-        permission.resolve({ granted: true });
+        // The following sibling resolves after Recorder's identity layout
+        // effect and before passive lifecycle cleanup can change the epoch.
+        // The identity operands themselves must reject this old start.
         await staleStart;
         await flushAct();
 
@@ -2064,7 +2137,7 @@ describe('Recorder', () => {
       'does not adopt or report an old stop with no URI after the %s changes',
       async (_field, next) => {
         const nativeStop = deferred<void>();
-        const { view, props } = await renderRecorder();
+        const { view, props } = await renderIdentityRaceRecorder();
         await startRecording();
         mockRecorder.stop.mockImplementation(async () => nativeStop.promise);
         mockRecorderState.durationMillis = 5_000;
@@ -2074,19 +2147,19 @@ describe('Recorder', () => {
         const nextRecovery = jest.fn();
 
         await view.rerender(
-          <Recorder
-            {...props}
-            {...next}
-            onError={nextError}
-            onResult={nextResult}
-            onRecoveryUnresolved={nextRecovery}
+          <IdentityLayoutHarness
+            recorderProps={{
+              ...props,
+              ...next,
+              onError: nextError,
+              onResult: nextResult,
+              onRecoveryUnresolved: nextRecovery,
+            }}
+            onRecorderLayout={() => nativeStop.resolve()}
           />,
         );
-        await act(async () => {
-          nativeStop.resolve();
-          await staleStop;
-          await flushMicrotasks();
-        });
+        await staleStop;
+        await flushAct();
 
         expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
         expect(props.onError).not.toHaveBeenCalled();
@@ -2239,8 +2312,7 @@ describe('Recorder', () => {
       await recordAndStop();
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
-      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
+      await flushAct();
 
       expect(savePendingAssessment).toHaveBeenCalledWith({
         ownerId: OWNER_ID,
@@ -2261,7 +2333,9 @@ describe('Recorder', () => {
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
       expect(props.parseResult).toHaveBeenCalledWith({ ok: true });
+      expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } });
       expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
       expect(deletedRecordingUris()).toContain(RECORDING_URI);
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
@@ -3112,7 +3186,7 @@ describe('Recorder', () => {
       async (_field, next) => {
         const upload = deferred<{ score: number }>();
         asMock(apiUploadAudio).mockReturnValue(upload.promise);
-        const { view, props } = await renderRecorder();
+        const { view, props } = await renderIdentityRaceRecorder();
         await recordAndStop();
         await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
         await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
@@ -3123,22 +3197,23 @@ describe('Recorder', () => {
         const nextRecovery = jest.fn();
 
         await view.rerender(
-          <Recorder
-            {...props}
-            {...next}
-            parseResult={nextParse}
-            onResult={nextResult}
-            onError={nextError}
-            onRecoveryUnresolved={nextRecovery}
+          <IdentityLayoutHarness
+            recorderProps={{
+              ...props,
+              ...next,
+              parseResult: nextParse,
+              onResult: nextResult,
+              onError: nextError,
+              onRecoveryUnresolved: nextRecovery,
+            }}
+            onRecorderLayout={() => upload.resolve({ score: 95 })}
           />,
         );
+        // Resolve after Recorder's identity layout effect but before passive
+        // cleanup aborts the controller. Identity checks must reject the old
+        // result independently of the lifecycle epoch and abort signal.
         await flushAct();
         expect(signal.aborted).toBe(true);
-
-        await act(async () => {
-          upload.resolve({ score: 95 });
-          await flushMicrotasks();
-        });
 
         expect(props.parseResult).not.toHaveBeenCalled();
         expect(props.onResult).not.toHaveBeenCalled();
@@ -3394,8 +3469,12 @@ describe('Recorder', () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockReset();
       asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
 
-      const first = invokeRolePressHandler(RERECORD_TEXT);
-      const second = invokeRolePressHandler(RERECORD_TEXT);
+      let first!: Promise<void>;
+      let second!: Promise<void>;
+      await act(() => {
+        first = invokeRolePressHandler(RERECORD_TEXT);
+        second = invokeRolePressHandler(RERECORD_TEXT);
+      });
       expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
 
       await act(async () => {
@@ -6131,6 +6210,36 @@ describe('Recorder', () => {
       ).toBeNull();
     });
 
+    it('clears the assessment wait interval after leaving the busy phase', async () => {
+      const setWaitInterval = jest.spyOn(globalThis, 'setInterval');
+      const clearWaitInterval = jest.spyOn(globalThis, 'clearInterval');
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      try {
+        await renderRecorder();
+        await recordAndStop();
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
+        const waitIntervalIndex = setWaitInterval.mock.calls.findIndex(
+          ([, delay]) => delay === 1_000,
+        );
+        expect(waitIntervalIndex).toBeGreaterThanOrEqual(0);
+        const waitInterval = setWaitInterval.mock.results[waitIntervalIndex]?.value;
+
+        await act(async () => {
+          upload.resolve({ ok: true });
+          await flushMicrotasks();
+        });
+        await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
+
+        expect(clearWaitInterval).toHaveBeenCalledWith(waitInterval);
+      } finally {
+        clearWaitInterval.mockRestore();
+        setWaitInterval.mockRestore();
+      }
+    });
+
     it('shows the longer-than-usual note with elapsed time while recovering', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
@@ -6301,6 +6410,51 @@ describe('Recorder', () => {
       });
     });
 
+    it('releases a completed capacity-retry abort listener', async () => {
+      jest.useFakeTimers();
+      const addAbortListener = jest.spyOn(AbortSignal.prototype, 'addEventListener');
+      const removeAbortListener = jest.spyOn(AbortSignal.prototype, 'removeEventListener');
+      asMock(apiUploadAudio)
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1))
+        .mockResolvedValueOnce({ ok: true });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      await act(async () => {
+        jest.advanceTimersByTime(1_000);
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+
+      expect(addAbortListener).toHaveBeenCalledWith('abort', expect.any(Function), { once: true });
+      expect(removeAbortListener).toHaveBeenCalledWith('abort', expect.any(Function));
+    });
+
+    it('ignores a captured Cancel invoked by the synchronous result callback', async () => {
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(screen.getByRole('button', { name: CANCEL_TEXT })).toBeTruthy());
+      const cancelOnPress = compositePressablePropsForNode(
+        screen.getByRole('button', { name: CANCEL_TEXT }),
+      ).onPress as () => unknown;
+      const signal = asMock(apiUploadAudio).mock.calls[0][3].signal as AbortSignal;
+      props.onResult.mockImplementation(() => cancelOnPress());
+
+      await act(async () => {
+        upload.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+
+      expect(signal.aborted).toBe(false);
+    });
+
     it('ignores a cancel press once the take is back in review', async () => {
       await renderRecorder();
       await recordAndStop();
@@ -6330,6 +6484,47 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
       expect(createAudioPlayer).toHaveBeenCalledTimes(1);
       expect(mockPreviewPlayer.play).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps a captured Pause handler safe after submission releases the player', async () => {
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
+      const pauseOnPress = compositePressablePropsForNode(
+        screen.getByRole('button', { name: t('recorder.pauseLabel') }),
+      ).onPress as () => unknown;
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        expect(() => pauseOnPress()).not.toThrow();
+      });
+
+      await act(async () => {
+        upload.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+    });
+
+    it('keeps a captured Play handler inert after submission discards the take', async () => {
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      const playOnPress = compositePressablePropsForNode(
+        screen.getByRole('button', { name: t('recorder.playLabel') }),
+      ).onPress as () => unknown;
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+      asMock(createAudioPlayer).mockClear();
+
+      await act(async () => {
+        expect(() => playOnPress()).not.toThrow();
+      });
+      expect(createAudioPlayer).not.toHaveBeenCalled();
     });
 
     it('rewinds and shows Play again when the take finishes', async () => {
@@ -6649,6 +6844,21 @@ describe('Recorder', () => {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
     }
+
+    it('does not recover on a foreground signal when initially mounted unfocused', async () => {
+      mockScreenFocused = false;
+      await renderRecorder();
+      asMock(loadPendingAssessment).mockClear();
+
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(loadPendingAssessment).not.toHaveBeenCalled();
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
 
     it('does not read retry storage while a recording start is still resolving', async () => {
       const permission = deferred<{ granted: boolean }>();
@@ -7313,6 +7523,27 @@ describe('Recorder', () => {
       backgroundApp();
       await act(async () => {
         saved.resolve();
+        await flushMicrotasks();
+      });
+
+      expect(resolveAudioFileDescriptor).not.toHaveBeenCalled();
+      expect(apiRequestAudioUpload).not.toHaveBeenCalled();
+      expect(apiUploadAudio).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it('does not request an upload grant when descriptor resolution finishes after backgrounding', async () => {
+      const descriptor = deferred<{ name: string; type: string }>();
+      asMock(resolveAudioFileDescriptor).mockReturnValue(descriptor.promise);
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(resolveAudioFileDescriptor).toHaveBeenCalledTimes(1));
+
+      backgroundApp();
+      await act(async () => {
+        descriptor.resolve({ name: 'audio.m4a', type: 'audio/mp4' });
         await flushMicrotasks();
       });
 

@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import {
   assertMutant,
+  assertMutationReportInputsMatchWorkspace,
   createMutationReportHtml,
   mergeMutationReportData,
   resolvedStatuses,
@@ -10,8 +14,17 @@ import {
   unresolvedStatusSummary,
 } from './merge-mutation-reports.mjs';
 import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
+import {
+  assertMutationLaneProvenance,
+  createMutationLaneProvenance,
+  mutationSharedInputFiles,
+  writeMutationLaneProvenance,
+} from './mutation-provenance.mjs';
 
-const location = (line) => ({ start: { line, column: 1 }, end: { line, column: 9 } });
+const location = (line, startColumn = 1, endColumn = 9) => ({
+  start: { line, column: startColumn },
+  end: { line, column: endColumn },
+});
 
 function mutant(id, status, extra = {}) {
   return {
@@ -149,6 +162,7 @@ test('a survivor explained by a reviewed equivalence entry passes the gate', () 
       mutator: 'BooleanLiteral',
       original: '// src/b.ts',
       replacements: ['true'],
+      locations: [location(1)],
       reason: 'fixture: proven unkillable',
     },
   ];
@@ -196,6 +210,7 @@ test('an equivalence entry that matches nothing fails the gate', () => {
       mutator: 'BooleanLiteral',
       original: 'code that no longer exists',
       replacements: ['true'],
+      locations: [location(1)],
       reason: 'fixture: stale exemption',
     },
   ];
@@ -213,14 +228,14 @@ test('an equivalence entry that matches nothing fails the gate', () => {
 });
 
 test('an entry must excuse exactly the number of mutants it declares', () => {
-  // Spans are whole source lines, so one entry can straddle several mutants of
-  // the same mutator and replacement. If a sibling that is killed today starts
-  // surviving, it must not slip in behind an existing exemption.
+  // Some mutators can report multiple variants at one exact node. The declared
+  // count must still agree so an added or removed variant cannot pass silently.
   const entry = {
     file: 'src/a.ts',
     mutator: 'ConditionalExpression',
     original: 'if (a && b) return;',
     replacements: ['true'],
+    locations: [location(1)],
     count: 1,
     reason: 'fixture',
   };
@@ -230,6 +245,7 @@ test('an entry must excuse exactly the number of mutants it declares', () => {
     mutatorName: 'ConditionalExpression',
     replacement: 'true',
     original: 'if (a && b) return;',
+    location: location(1),
     line: 1,
   };
 
@@ -247,7 +263,7 @@ test('an entry must excuse exactly the number of mutants it declares', () => {
   assert.equal(none.staleEntries[0].matched, 0);
 });
 
-test('an entry may pin the lines it covers when the node text repeats', () => {
+test('an entry may pin multiple exact locations when the node text repeats', () => {
   // `if (!isCurrent()) return;` occurs 19 times in Recorder.tsx and exactly two
   // are unkillable, so text alone would excuse the seventeen that are killed.
   const entry = {
@@ -255,16 +271,17 @@ test('an entry may pin the lines it covers when the node text repeats', () => {
     mutator: 'ConditionalExpression',
     original: 'if (!isCurrent()) return;',
     replacements: ['false'],
-    lines: [477, 487],
+    locations: [location(477, 13, 25), location(487, 13, 25)],
     count: 2,
     reason: 'fixture',
   };
-  const at = (line) => ({
+  const at = (line, startColumn = 13, endColumn = 25) => ({
     file: 'src/components/Recorder.tsx',
     status: 'Survived',
     mutatorName: 'ConditionalExpression',
     replacement: 'false',
     original: 'if (!isCurrent()) return;',
+    location: location(line, startColumn, endColumn),
     line,
   });
 
@@ -277,7 +294,62 @@ test('an entry may pin the lines it covers when the node text repeats', () => {
   assert.equal(elsewhere.unexplained[0].line, 1211);
 });
 
-test('equivalence matching ignores line numbers and reflowed whitespace', () => {
+test('a same-line one-for-one survivor swap fails closed on exact columns', () => {
+  const entry = {
+    file: 'src/a.ts',
+    mutator: 'ConditionalExpression',
+    original: 'if (a && b) return;',
+    replacements: ['true'],
+    locations: [location(12, 5, 11)],
+    reason: 'fixture',
+  };
+  const swappedSibling = {
+    file: 'src/a.ts',
+    status: 'Survived',
+    mutatorName: 'ConditionalExpression',
+    replacement: 'true',
+    original: 'if (a && b) return;',
+    location: location(12, 16, 22),
+    line: 12,
+  };
+
+  const { accepted, unexplained, staleEntries } = applyEquivalenceAllowlist(
+    [swappedSibling],
+    [entry],
+  );
+  assert.deepEqual(accepted, []);
+  assert.equal(unexplained.length, 1, 'the newly surviving sibling must not inherit the exemption');
+  assert.equal(staleEntries.length, 1, 'the original exact-span exemption must become stale');
+});
+
+test('every equivalence entry must declare its exact start and end locations', () => {
+  const incomplete = {
+    file: 'src/a.ts',
+    mutator: 'BooleanLiteral',
+    original: 'const enabled = true;',
+    replacements: ['false'],
+    reason: 'fixture',
+  };
+  assert.throws(
+    () => applyEquivalenceAllowlist([], [incomplete]),
+    /must declare 1 exact start\/end location/,
+  );
+  assert.throws(
+    () =>
+      applyEquivalenceAllowlist(
+        [],
+        [
+          {
+            ...incomplete,
+            locations: [{ start: { line: 1, column: 17 } }],
+          },
+        ],
+      ),
+    /must declare 1 exact start\/end location/,
+  );
+});
+
+test('equivalence matching normalizes whitespace while retaining the exact location', () => {
   const survivors = [
     {
       file: 'src/a.ts',
@@ -285,6 +357,7 @@ test('equivalence matching ignores line numbers and reflowed whitespace', () => 
       mutatorName: 'LogicalOperator',
       replacement: 'a   ||   b',
       original: 'const x =\n  a &&\n  b;',
+      location: location(999),
       line: 999,
     },
   ];
@@ -294,6 +367,7 @@ test('equivalence matching ignores line numbers and reflowed whitespace', () => 
       mutator: 'LogicalOperator',
       original: 'const x = a && b;',
       replacements: ['a || b'],
+      locations: [location(999)],
       reason: 'fixture',
     },
   ]);
@@ -314,6 +388,19 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
       assert.ok(original.trim().length > 0, `${entry.file} entry has an empty source span`);
     }
     assert.ok(entry.replacements.length > 0, `${entry.file} entry lists no replacement`);
+    assert.equal(
+      entry.locations.length,
+      entry.count ?? 1,
+      `${entry.file} [${entry.mutator}] must pin every expected mutant location`,
+    );
+    assert.ok(Object.isFrozen(entry.locations), `${entry.file} locations must be frozen`);
+    for (const exact of entry.locations) {
+      assert.ok(Object.isFrozen(exact), `${entry.file} exact locations must be frozen`);
+      for (const position of [exact.start, exact.end]) {
+        assert.ok(Number.isInteger(position.line) && position.line > 0);
+        assert.ok(Number.isInteger(position.column) && position.column > 0);
+      }
+    }
     assert.ok(
       entry.reason.trim().length >= 40,
       `${entry.file} [${entry.mutator}] must explain WHY no test can kill it`,
@@ -374,6 +461,118 @@ test('a missing lane report is rejected rather than silently skipped', () => {
     () => mergeMutationReportData({ reportsByLane: reports, ...twoLaneManifest }),
     /Mutation lane reports.*Missing: second/s,
   );
+});
+
+test('retained lane reports must match current source and test contents', async (t) => {
+  const appDir = await fs.mkdtemp(path.join(os.tmpdir(), 'app-mutation-inputs-'));
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  await fs.mkdir(path.join(appDir, 'src'), { recursive: true });
+  await fs.mkdir(path.join(appDir, '__tests__'), { recursive: true });
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// src/a.ts');
+  await fs.writeFile(path.join(appDir, '__tests__/a-test.ts'), '// __tests__/a-test.ts');
+
+  const lanes = {
+    only: { mutate: ['src/a.ts'], testFiles: ['__tests__/a-test.ts'] },
+  };
+  const reportsByLane = {
+    only: laneReport({
+      files: { 'src/a.ts': [mutant('0', 'Killed')] },
+      testFiles: { '__tests__/a-test.ts': [{ id: '0', name: 'owns a' }] },
+    }),
+  };
+  const validate = () =>
+    assertMutationReportInputsMatchWorkspace({
+      reportsByLane,
+      lanes,
+      laneNames: ['only'],
+      appDir,
+    });
+
+  await assert.doesNotReject(validate);
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// changed source');
+  await assert.rejects(validate, /source file src\/a\.ts changed; rerun that lane/);
+
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// src/a.ts');
+  await fs.writeFile(path.join(appDir, '__tests__/a-test.ts'), '// changed test');
+  await assert.rejects(
+    validate,
+    /test file __tests__\/a-test\.ts changed; rerun every lane that owns that test/,
+  );
+});
+
+test('lane provenance rejects missing, lane-stale, and toolchain-stale reports', async (t) => {
+  const appDir = await fs.mkdtemp(path.join(os.tmpdir(), 'app-mutation-provenance-'));
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  for (const fileName of mutationSharedInputFiles) {
+    const absolutePath = path.join(appDir, fileName);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, `// ${fileName}`);
+  }
+  await fs.mkdir(path.join(appDir, 'src'), { recursive: true });
+  await fs.mkdir(path.join(appDir, '__tests__'), { recursive: true });
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// source');
+  await fs.writeFile(path.join(appDir, '__tests__/a-test.ts'), '// test');
+
+  const lanes = {
+    only: { mutate: ['src/a.ts'], testFiles: ['__tests__/a-test.ts'] },
+  };
+  const environment = {
+    CI: 'true',
+    LANG: 'en_US.UTF-8',
+    MUTATION_CONCURRENCY: '2',
+    NODE_ENV: 'test',
+    TZ: 'UTC',
+  };
+  const runtime = { node: 'v-test', platform: 'test', arch: 'test' };
+  const validate = () =>
+    assertMutationLaneProvenance({
+      reportDir,
+      appDir,
+      lanes,
+      laneNames: ['only'],
+      environment,
+      runtime,
+    });
+
+  await assert.rejects(validate, /provenance for lane only is missing/);
+  const provenance = await createMutationLaneProvenance({
+    appDir,
+    laneName: 'only',
+    lane: lanes.only,
+    environment,
+    runtime,
+  });
+  await writeMutationLaneProvenance({ reportDir, provenance });
+  await assert.doesNotReject(validate);
+
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// changed source');
+  await assert.rejects(validate, /lane inputs changed/);
+
+  await fs.writeFile(path.join(appDir, 'src/a.ts'), '// source');
+  const unmutatedDependency = mutationSharedInputFiles.find((fileName) =>
+    fileName.startsWith('src/lib/'),
+  );
+  assert.ok(unmutatedDependency, 'the shared fingerprint must include production dependencies');
+  await fs.writeFile(path.join(appDir, unmutatedDependency), '// changed dependency');
+  await assert.rejects(validate, /a production source, the mutation toolchain/);
+
+  await fs.writeFile(path.join(appDir, unmutatedDependency), `// ${unmutatedDependency}`);
+  await assert.rejects(
+    () =>
+      assertMutationLaneProvenance({
+        reportDir,
+        appDir,
+        lanes,
+        laneNames: ['only'],
+        environment: { ...environment, MUTATION_PARALLEL_LANES: '2' },
+        runtime,
+      }),
+    /runtime, or environment changed/,
+  );
+
+  await fs.writeFile(path.join(appDir, 'package.json'), '// changed package');
+  await assert.rejects(validate, /production source, the mutation toolchain/);
 });
 
 test('reports produced by different Stryker versions are rejected', () => {

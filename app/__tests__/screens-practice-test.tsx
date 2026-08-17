@@ -2360,6 +2360,28 @@ describe('skip word', () => {
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledTimes(1);
   });
+
+  it('alerts when the post-skip refetch fails, since the parked word stays on screen', async () => {
+    // The skip itself succeeded but the replacement question could not load;
+    // refetch() never throws, so the failure must be read off its result or it
+    // would pass silently with the parked word still showing.
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockRejectedValueOnce(new Error('network down'));
+    mockSkipWord.mockResolvedValue(undefined);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(mockSkipWord).toHaveBeenCalledWith(QUESTION.id);
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    expect(alertSpy).toHaveBeenCalledWith(t('practice.skipFailedTitle'), t('practice.skipFailed'));
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+  });
 });
 
 describe('inline rate-limit notice', () => {

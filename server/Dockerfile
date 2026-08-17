@@ -17,7 +17,12 @@ RUN npm run build && npm prune --omit=dev
 # ---- runtime: prod deps + dist only, non-root ----
 FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS runtime
 WORKDIR /app
-RUN apk add --no-cache dumb-init ffmpeg
+# Bound the ffmpeg major family: the audio duration/stream-count gates are
+# designed and tested against the 6.1–8.x CLI/AVOption surface (see
+# src/audio-inspection.ts), and the resolved versions are logged so a silent
+# index drift is visible in the build output.
+RUN apk add --no-cache dumb-init 'ffmpeg>=6.1' 'ffmpeg<9' \
+    && ffmpeg -version | head -n 1 && ffprobe -version | head -n 1
 ENV NODE_ENV=production
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist

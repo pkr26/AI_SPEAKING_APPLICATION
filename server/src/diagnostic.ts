@@ -138,6 +138,10 @@ async function finalizeDiagnosticAnswer(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Parent-first lock ordering (mirrors storePracticeResult in practice.ts):
+    // account deletion locks users and then cascades into diagnostic_state, so
+    // taking the child row first here would be a lock-inversion deadlock.
+    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
     const state = await lockState(client, userId);
     if (
       state.processing_claim_id !== claimId ||
@@ -282,6 +286,9 @@ export function createDiagnosticRouter(limiters: Limiters) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        // Parent-first lock ordering (mirrors finalizeDiagnosticAnswer):
+        // account deletion locks users and then cascades into diagnostic_state.
+        await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [user.id]);
         // Locks the row (creating it on first use) so a restart serializes
         // against any concurrent answer finalization.
         await lockState(client, user.id);

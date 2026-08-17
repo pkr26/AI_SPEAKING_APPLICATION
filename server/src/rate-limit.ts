@@ -1,5 +1,5 @@
 import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
-import type { RequestHandler } from 'express';
+import type { RequestHandler, Response } from 'express';
 import { config } from './config';
 import { AuthedRequest } from './middleware';
 import { PostgresRateLimitStore } from './postgres-rate-limit-store';
@@ -267,8 +267,11 @@ export function buildLimiters() {
   // dead client. Exposed on the limiter set so the assessment pipeline can
   // make the same decision when the reservation commits AFTER the response
   // already closed (the guard's close listener has fired by then and will not
-  // fire again).
-  const respendAssessmentBudget = (req: AuthedRequest): void => {
+  // fire again). The res.locals sentinel makes the pair of paths idempotent:
+  // whichever re-spends first wins, and the other becomes a no-op.
+  const respendAssessmentBudget = (req: AuthedRequest, res: Response): void => {
+    if (res.locals.assessmentBudgetRespent) return;
+    res.locals.assessmentBudgetRespent = true;
     void assessStore.incrementWithinWindow(userOrIpRateLimitKey(req));
     void assessIpDailyStore.incrementWithinWindow(rateLimitIpKey(req.ip));
   };
@@ -278,7 +281,7 @@ export function buildLimiters() {
   const assessAbortGuard: RequestHandler = (req, res, next) => {
     res.on('close', () => {
       if (res.writableEnded || !res.locals.assessmentCapacityReserved) return;
-      respendAssessmentBudget(req as AuthedRequest);
+      respendAssessmentBudget(req as AuthedRequest, res);
     });
     next();
   };

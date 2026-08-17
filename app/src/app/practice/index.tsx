@@ -112,7 +112,15 @@ export default function PracticeScreen() {
     try {
       await apiSkipPracticeWord(question.id);
       setRateLimitNotice(null);
-      await questionQuery.refetch();
+      // refetch() swallows its own failure: without this check the just-parked
+      // word would stay on screen with no error shown.
+      const refetched = await questionQuery.refetch();
+      if (refetched.isError) {
+        Alert.alert(
+          t('practice.skipFailedTitle'),
+          userMessageForError(refetched.error, t('practice.skipFailed')),
+        );
+      }
     } catch (error) {
       Alert.alert(
         t('practice.skipFailedTitle'),

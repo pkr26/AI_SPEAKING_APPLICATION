@@ -8,7 +8,7 @@ import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { RequestHandler, Response, Router } from 'express';
 import { z } from 'zod';
 import { config } from './config';
-import { isAssessmentRequestProcessing } from './idempotency';
+import { isAssessmentRequestProcessing, isAudioKeyClaimedForProcessing } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
@@ -228,18 +228,25 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
       return;
     }
     // A duplicate can be stopped before claimAssessmentRequest (for example by
-    // the assessment limiter). Consult the shared claim table before deleting.
-    if (cleanup.requestId) {
-      try {
-        if (await isAssessmentRequestProcessing(cleanup.userId, cleanup.requestId)) {
-          return;
-        }
-      } catch (err) {
-        // Fail closed for data safety: retain transient audio when ownership
-        // cannot be established. The required bucket lifecycle bounds storage.
-        logger.warn({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
+    // the assessment limiter). Consult the shared claim table before deleting:
+    // preserve while this request's own claim is still processing, and also
+    // while ANY non-expired processing claim for this user references the same
+    // object — a duplicate submitted under a different (or malformed)
+    // requestId, or a blind same-key retry that re-claimed before a failed
+    // request's post-response delete landed, must never delete the object out
+    // from under its live owner.
+    try {
+      if (cleanup.requestId && (await isAssessmentRequestProcessing(cleanup.userId, cleanup.requestId))) {
         return;
       }
+      if (await isAudioKeyClaimedForProcessing(cleanup.userId, cleanup.audioKey)) {
+        return;
+      }
+    } catch (err) {
+      // Fail closed for data safety: retain transient audio when ownership
+      // cannot be established. The required bucket lifecycle bounds storage.
+      logger.warn({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
+      return;
     }
     await discardPresignedAudio(cleanup.userId, cleanup.audioKey);
   })();
@@ -270,7 +277,9 @@ export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next
     preserve: false,
   };
   // Finalize on a microtask so synchronous finish listeners can mark a
-  // pre-route 409/429 as non-definitive before ownership is evaluated.
+  // pre-route 409/429 as non-definitive before ownership is evaluated. An
+  // error after a client abort intentionally retains the object (no `finish`
+  // fires): that is the same-key retry window, bounded by the bucket lifecycle.
   res.once('finish', () => queueMicrotask(() => void finalizeSubmittedPresignedAudio(res)));
   // `close` can precede route/claim resolution when a client disconnects. In
   // that case retain the object for the active worker and let the mandatory S3
@@ -347,6 +356,14 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     const s3Err = err as { name?: string };
     if (s3Err.name === 'NoSuchKey' || s3Err.name === 'NotFound' || s3Err.name === '404') {
       throw new HttpError(400, 'audio upload not found or expired');
+    }
+    // A Node syscall failure (ENOSPC/EMFILE/EACCES from the temp-file write
+    // stream or chmod) is a local disk fault, not an S3 outage: plain 500 with
+    // a distinct log line. AWS SDK errors carry $metadata and keep the 502.
+    const systemError = err as NodeJS.ErrnoException & { $metadata?: unknown };
+    if (systemError.$metadata === undefined && typeof systemError.code === 'string') {
+      logger.error({ err, userId: authed.user!.id }, 'failed to store downloaded audio on local disk');
+      throw new HttpError(500, 'Internal server error', 'INTERNAL');
     }
     logger.warn({ err, userId: authed.user!.id }, 'failed to fetch audio from S3');
     throw new HttpError(502, 'Audio storage unavailable; please try again', 'PROVIDER_FAILED');

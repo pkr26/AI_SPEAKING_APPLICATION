@@ -92,9 +92,21 @@ export default function SettingsScreen() {
   // read the same render's state, so a second press landing before React has
   // re-rendered would still see `false` and fire the request twice. A ref
   // updates synchronously, which is what these guards were always meant to do.
+  const nameBusyRef = useRef(false);
+  const languageBusyRef = useRef(false);
   const exportBusyRef = useRef(false);
   const reminderBusyRef = useRef(false);
   const retakeBusyRef = useRef(false);
+  // Mirrors nameFocused for the re-sync effect below: keying the effect on the
+  // focus state itself would wipe an unsaved edit the moment the field blurs.
+  const nameFocusedRef = useRef(false);
+
+  // Re-sync the draft when the canonical name changes outside this field (a
+  // refreshed /me, another session), but never clobber text being typed.
+  const userName = user?.name;
+  useEffect(() => {
+    if (!nameFocusedRef.current) setNameDraft(userName ?? '');
+  }, [userName]);
 
   useEffect(() => {
     let active = true;
@@ -119,7 +131,8 @@ export default function SettingsScreen() {
     !nameBusy;
 
   const saveName = async () => {
-    if (!canSaveName) return;
+    if (!canSaveName || nameBusyRef.current) return;
+    nameBusyRef.current = true;
     setNameBusy(true);
     setNameError(null);
     setNameSaved(false);
@@ -131,12 +144,14 @@ export default function SettingsScreen() {
     } catch (error) {
       setNameError(userMessageForError(error, t('settings.updateFailed')));
     } finally {
+      nameBusyRef.current = false;
       setNameBusy(false);
     }
   };
 
   const chooseLanguage = async (code: NativeLanguage) => {
-    if (code === user.nativeLanguage || languageBusy) return;
+    if (code === user.nativeLanguage || languageBusyRef.current) return;
+    languageBusyRef.current = true;
     setLanguageBusy(true);
     setLanguageError(null);
     try {
@@ -161,6 +176,7 @@ export default function SettingsScreen() {
     } catch (error) {
       setLanguageError(userMessageForError(error, t('settings.updateFailed')));
     } finally {
+      languageBusyRef.current = false;
       setLanguageBusy(false);
     }
   };
@@ -304,8 +320,14 @@ export default function SettingsScreen() {
               setNameDraft(value);
               setNameSaved(false);
             }}
-            onFocus={() => setNameFocused(true)}
-            onBlur={() => setNameFocused(false)}
+            onFocus={() => {
+              nameFocusedRef.current = true;
+              setNameFocused(true);
+            }}
+            onBlur={() => {
+              nameFocusedRef.current = false;
+              setNameFocused(false);
+            }}
             placeholder={t('signup.namePlaceholder')}
             placeholderTextColor={colors.muted}
             autoCapitalize="words"

@@ -2,7 +2,10 @@ import path from 'node:path';
 import { codeMutationLanes } from './scripts/mutation-lanes.mjs';
 
 const laneName = process.env.MUTATION_LANE;
-const lane = laneName === undefined ? undefined : codeMutationLanes[laneName];
+// Object.hasOwn: an inherited Object.prototype key (e.g. MUTATION_LANE=constructor)
+// must fail the unknown-lane guard here, not later with an obscure TypeError.
+const lane =
+  laneName === undefined || !Object.hasOwn(codeMutationLanes, laneName) ? undefined : codeMutationLanes[laneName];
 
 if (!laneName || !lane) {
   throw new Error(

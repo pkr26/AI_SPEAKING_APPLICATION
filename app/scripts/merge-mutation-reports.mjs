@@ -456,10 +456,12 @@ export function mergeMutationReportData({
     strictMutationGatePassed: unexplained.length === 0 && staleEntries.length === 0,
     acceptedEquivalents: accepted.length,
     unexplainedSurvivors: unexplained,
-    staleEquivalenceEntries: staleEntries.map(({ file, mutator, original }) => ({
+    staleEquivalenceEntries: staleEntries.map(({ file, mutator, original, matched, expected }) => ({
       file,
       mutator,
       original,
+      matched,
+      expected,
     })),
     thresholds: { ...firstReport.thresholds },
     lanes: laneSummaries,
@@ -625,8 +627,15 @@ async function main() {
       );
     }
     for (const entry of result.summary.staleEquivalenceEntries) {
+      // Over-matching (matched > expected) means a previously killed mutant now
+      // survives behind an existing exemption — the dangerous case — so the
+      // label must not claim "matched nothing" when it did.
+      const matchDetail =
+        entry.matched === 0
+          ? 'matched nothing'
+          : `matched ${entry.matched} of expected ${entry.expected}`;
       process.stderr.write(
-        `  stale equivalence entry (matched nothing): ${entry.file} [${entry.mutator}] ${entry.original.split('\n')[0]}\n`,
+        `  stale equivalence entry (${matchDetail}): ${entry.file} [${entry.mutator}] ${entry.original.split('\n')[0]}\n`,
       );
     }
     process.exitCode = 1;

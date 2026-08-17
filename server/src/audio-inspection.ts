@@ -39,12 +39,19 @@ export function getAudioInspectionSlotsInUse(): number {
   return inspectionsInFlight;
 }
 
-function acquireInspectionSlot(): () => void {
+// Exported for the release-contract tests; production code only ever reaches
+// the releaser through verifyAudioDuration's try/finally.
+export function acquireInspectionSlot(): () => void {
   if (inspectionsInFlight >= config.audioInspectionMaxConcurrency) {
     throw new HttpError(503, 'Audio inspection capacity busy', { retryAfterSeconds: 2 }, 'CAPACITY_BUSY');
   }
   inspectionsInFlight++;
+  // The releaser must be idempotent: a double call would otherwise drive the
+  // in-flight count negative and admit more native decoders than the cap.
+  let released = false;
   return () => {
+    if (released) return;
+    released = true;
     inspectionsInFlight--;
   };
 }

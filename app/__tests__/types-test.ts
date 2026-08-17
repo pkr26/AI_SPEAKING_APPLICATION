@@ -1587,6 +1587,40 @@ describe('practice stats parser', () => {
     );
   });
 
+  it('accepts the pre-placement null level with the all-zero progress snapshot', () => {
+    // Before the diagnostic places the learner, the server intentionally
+    // answers level: null and zeroed progress counters (there is no level to
+    // count words against). The home screen must not fail this as drift.
+    const prePlacement = {
+      ...stats,
+      level: null,
+      progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      streakDays: 0,
+      practicedToday: 0,
+      totalAttempts: 0,
+      lastPracticedAt: null,
+    };
+    expect(parsePracticeStats(prePlacement)).toEqual(prePlacement);
+  });
+
+  it.each([
+    [
+      'masteredCount above zero',
+      { masteredCount: 1, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+    ],
+    [
+      'learningCount above zero',
+      { masteredCount: 0, learningCount: 1, totalAtLevel: 1, dueCount: 0 },
+    ],
+    [
+      'a non-empty level word list',
+      { masteredCount: 0, learningCount: 0, totalAtLevel: 10, dueCount: 0 },
+    ],
+    ['a due word', { masteredCount: 1, learningCount: 0, totalAtLevel: 1, dueCount: 1 }],
+  ])('rejects a null level with %s', (_label, progress) => {
+    expectContractError(() => parsePracticeStats({ ...stats, level: null, progress }));
+  });
+
   it.each([
     ['a non-record value', 'stats'],
     ['an unknown level', { ...stats, level: 'Z9' }],

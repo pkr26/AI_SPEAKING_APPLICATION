@@ -60,7 +60,7 @@ export async function runMutationCode({
 
   const failedLanes = [];
   for (const laneName of laneNames) {
-    if (!codeMutationLanes[laneName]) throw new Error(`Unknown mutation lane requested: ${laneName}`);
+    if (!Object.hasOwn(codeMutationLanes, laneName)) throw new Error(`Unknown mutation lane requested: ${laneName}`);
     console.log(`\n=== Backend mutation lane: ${laneName} ===`);
     let exitCode;
     try {

@@ -34,8 +34,13 @@ export function migrationManifestFromDirectory(migrationsDirectory: string): rea
   return Object.freeze(entries);
 }
 
+// The packaged manifest is immutable for a given release, so hash it once at
+// module load instead of re-reading the migrations directory on every /ready
+// probe.
+const PACKAGED_MIGRATION_MANIFEST = migrationManifestFromDirectory(path.join(__dirname, '..', 'db', 'migrations'));
+
 export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
-  return migrationManifestFromDirectory(path.join(__dirname, '..', 'db', 'migrations'));
+  return PACKAGED_MIGRATION_MANIFEST;
 }
 
 async function queryPool(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
@@ -49,7 +54,9 @@ export async function assertDatabaseSchemaCurrent(
   // migrationManifestFromDirectory rejects an empty release manifest.
   const latest = expected.at(-1)!;
 
-  const migrationResult = await query('SELECT name, checksum FROM schema_migrations ORDER BY name');
+  // Binary-name ordering, independent of the database's collation, so the
+  // row sequence always matches the byte-sorted packaged manifest.
+  const migrationResult = await query('SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"');
   const actual = migrationResult.rows as Array<{
     name?: unknown;
     checksum?: unknown;

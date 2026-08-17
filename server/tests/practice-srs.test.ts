@@ -126,24 +126,26 @@ describe('practice SRS scheduling and skip', () => {
     }
   });
 
-  it('shortens the review to 1 day on a 60-74 retention pass without losing mastery', async () => {
+  it('advances the interval ladder on a 60-74 retention pass without losing mastery', async () => {
     const { token, userId, level } = await freshUserAt();
     const [questionId] = await questionsAt(level, 1);
 
     mockScore(90);
-    await attempt(token, questionId);
-    mockScore(90);
-    await attempt(token, questionId); // index 2 (7d)
+    await attempt(token, questionId); // mastered at index 1 (3d)
 
+    // A retention pass (60-74) on a mastered word never demotes it and never
+    // resets the schedule: the index advances (clamped) exactly like mastery.
     mockScore(65);
-    expect((await attempt(token, questionId)).status).toBe(200);
-    expect(await srsRow(userId, questionId)).toMatchObject({
-      status: 'mastered',
-      srs_interval_index: 1,
-      due_in_days: 1,
-      is_due: false,
-      best_score: 90,
-    });
+    const expected = [
+      { srs_interval_index: 2, due_in_days: 7 },
+      { srs_interval_index: 3, due_in_days: 21 },
+      { srs_interval_index: 4, due_in_days: 60 },
+      { srs_interval_index: 4, due_in_days: 60 }, // clamped
+    ];
+    for (const step of expected) {
+      expect((await attempt(token, questionId)).status).toBe(200);
+      expect(await srsRow(userId, questionId)).toMatchObject({ status: 'mastered', best_score: 90, ...step });
+    }
   });
 
   it('demotes a mastered word to learning/index 0/due now only on a failed scored attempt', async () => {

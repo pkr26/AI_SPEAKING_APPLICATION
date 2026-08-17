@@ -225,6 +225,44 @@ test('an equivalence entry that matches nothing fails the gate', () => {
   assert.equal(summary.strictMutationGatePassed, false, 'a stale exemption must not pass silently');
   assert.equal(summary.staleEquivalenceEntries.length, 1);
   assert.equal(summary.staleEquivalenceEntries[0].original, 'code that no longer exists');
+  // The counts travel with the summary so the diagnostic can label the entry
+  // accurately instead of always claiming "matched nothing".
+  assert.equal(summary.staleEquivalenceEntries[0].matched, 0);
+  assert.equal(summary.staleEquivalenceEntries[0].expected, 1);
+});
+
+test('an over-matching equivalence entry keeps its real matched and expected counts', () => {
+  // Two mutants at one exact span survive behind an exemption written for
+  // exactly one: the dangerous drift direction, and the one a blanket
+  // "matched nothing" label would hide.
+  const equivalences = [
+    {
+      file: 'src/b.ts',
+      mutator: 'BooleanLiteral',
+      original: '// src/b.ts',
+      replacements: ['true'],
+      locations: [location(1)],
+      reason: 'fixture: proven unkillable',
+    },
+  ];
+  const reports = twoLaneReports();
+  reports.second.files['src/b.ts'].mutants[0].replacement = 'true';
+  reports.second.files['src/b.ts'].mutants[1] = {
+    ...reports.second.files['src/b.ts'].mutants[1],
+    status: 'Survived',
+    replacement: 'true',
+    location: location(1),
+  };
+  const { summary } = mergeMutationReportData({
+    reportsByLane: reports,
+    ...twoLaneManifest,
+    equivalences,
+  });
+  assert.equal(summary.strictMutationGatePassed, false);
+  assert.equal(summary.unexplainedSurvivors.length, 0, 'both survivors sit behind the entry');
+  assert.equal(summary.staleEquivalenceEntries.length, 1);
+  assert.equal(summary.staleEquivalenceEntries[0].matched, 2);
+  assert.equal(summary.staleEquivalenceEntries[0].expected, 1);
 });
 
 test('an entry must excuse exactly the number of mutants it declares', () => {

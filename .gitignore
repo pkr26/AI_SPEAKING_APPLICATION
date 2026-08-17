@@ -24,3 +24,6 @@ GoogleService-Info.plist
 .stryker-catalog-tmp/
 .stryker-*-tmp/
 reports/
+# Audit reports are meant to be committed; only machine-generated artifacts stay ignored.
+!/reports/*.md
+!/reports/adversarial/*.md

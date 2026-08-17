@@ -361,7 +361,7 @@ describe('settings profile card', () => {
     expect(screen.queryByText(t('settings.retake'))).toBeNull();
   });
 
-  it('starts the name draft blank when the screen renders before the session user', async () => {
+  it('re-syncs the name draft when the session user arrives after mount', async () => {
     mockAuthValue = makeAuth({ user: null });
     const { rerenderSettings } = await renderSettings();
     expect(screen.queryByLabelText(t('signup.nameLabel'))).toBeNull();
@@ -369,12 +369,92 @@ describe('settings profile card', () => {
     mockAuthValue = makeAuth();
     await act(async () => rerenderSettings());
 
-    // The draft seeds from the user present at mount; with none there is
-    // nothing to prefill and nothing to save.
-    expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe('');
+    // The draft follows the canonical name once the session user is known;
+    // seeding only at mount would leave the field stuck blank.
+    expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe(USER.name);
     expect(
       screen.getByRole('button', { name: t('settings.saveName') }).props.accessibilityState,
     ).toMatchObject({ disabled: true });
+  });
+
+  it('re-syncs the draft on an external name change but never while the field is focused', async () => {
+    const { rerenderSettings } = await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+
+    // An in-progress edit belongs to the learner, not to the arriving profile.
+    await act(async () => {
+      await fireEvent(input(), 'focus');
+    });
+    await fireEvent.changeText(input(), 'Grace');
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada King' } });
+    await act(async () => rerenderSettings());
+    expect(input().props.value).toBe('Grace');
+
+    // Once the field is not focused, the canonical name wins again.
+    await act(async () => {
+      await fireEvent(input(), 'blur');
+    });
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada Byron' } });
+    await act(async () => rerenderSettings());
+    expect(input().props.value).toBe('Ada Byron');
+  });
+
+  it('saves the name once when Save is tapped twice before a re-render', async () => {
+    // Same-render re-entrancy: the committed handler still sees nameBusy=false
+    // on the second activation, so only a synchronous latch prevents a double
+    // PATCH.
+    let resolveUpdate: (user: User) => void = () => undefined;
+    mockUpdateProfile.mockReturnValue(
+      new Promise<User>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+    await renderSettings();
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
+    const saveButton = screen.getByRole('button', { name: t('settings.saveName') });
+    await act(async () => {
+      const press = committedPressHandler(saveButton);
+      press();
+      press();
+    });
+
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      resolveUpdate({ ...USER, name: 'Ada King' });
+    });
+    expect(await screen.findByText(t('settings.saved'))).toBeTruthy();
+
+    // The latch releases in the finally: a later edit saves normally.
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada K');
+    mockUpdateProfile.mockResolvedValue({ ...USER, name: 'Ada K' });
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+    });
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(2);
+  });
+
+  it('changes the language once when a chip is tapped twice before a re-render', async () => {
+    let resolveUpdate: (user: User) => void = () => undefined;
+    mockUpdateProfile.mockReturnValue(
+      new Promise<User>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+    await renderSettings();
+
+    const chip = languageChip(1); // Hindi
+    await act(async () => {
+      const press = committedPressHandler(chip);
+      press();
+      press();
+    });
+
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
+    expect(mockUpdateProfile).toHaveBeenCalledWith({ nativeLanguage: 'hi' });
+    await act(async () => {
+      resolveUpdate({ ...USER, nativeLanguage: 'hi' });
+    });
   });
 
   it('saves an edited name through PATCH /auth/me and confirms inline', async () => {

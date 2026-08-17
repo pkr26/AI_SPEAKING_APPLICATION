@@ -13,6 +13,9 @@ export const mutationProvenanceSchemaVersion = 1;
  * change remains lane-local.
  */
 export const mutationSharedInputFiles = Object.freeze([
+  // jest-expo reads app.json, so config-plugin changes must stale retained
+  // lane reports just like source or toolchain changes.
+  'app.json',
   'package.json',
   'package-lock.json',
   'stryker.lane.config.mjs',

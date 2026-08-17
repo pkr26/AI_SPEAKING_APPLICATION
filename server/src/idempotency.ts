@@ -32,12 +32,16 @@ export class AssessmentRequestInFlightError extends HttpError {
  * Claim a client request UUID before any quota/provider work. Completed rows
  * replay their exact response; concurrent processing returns 409 with a short
  * retry hint. The same UUID can never be reused for another question/context.
+ * In S3 ingress mode the submitted audioKey is recorded with the processing
+ * claim so submitted-object cleanup can tell which object a live worker is
+ * reading (see finalizeSubmittedPresignedAudio).
  */
 export async function claimAssessmentRequest(
   userId: string,
   requestId: string,
   context: AssessmentContext,
   questionId: string,
+  audioKey?: string,
 ): Promise<AssessmentRequestClaim> {
   const client = await pool.connect();
   try {
@@ -55,10 +59,10 @@ export async function claimAssessmentRequest(
     );
     const requestClaimId = randomUUID();
     const inserted = await client.query(
-      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status)
-       VALUES ($1, $2, $3, $4, $5, 'processing')
+      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, audio_key)
+       VALUES ($1, $2, $3, $4, $5, 'processing', $6)
        ON CONFLICT (user_id, request_id) DO NOTHING`,
-      [userId, requestId, requestClaimId, context, questionId],
+      [userId, requestId, requestClaimId, context, questionId, audioKey ?? null],
     );
     if (inserted.rowCount === 1) {
       await client.query('COMMIT');
@@ -74,7 +78,12 @@ export async function claimAssessmentRequest(
     );
     const row = existing.rows[0];
     if (!row) {
-      throw new HttpError(409, 'Assessment request identifier was already used', 'REQUEST_ID_REUSED');
+      // The conflicting row vanished between the failed insert and this read,
+      // so the identifier is immediately free again — not permanently burned.
+      // Report it with the sibling branch's in-flight retry hint.
+      throw new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
+        retryAfterSeconds: 2,
+      });
     }
     if (row.context !== context || row.question_id !== questionId) {
       if (row.status === 'processing') {
@@ -184,6 +193,26 @@ export async function isAssessmentRequestProcessing(userId: string, requestId: s
        AND status = 'processing'
        AND started_at >= now() - interval '5 minutes'`,
     [userId, requestId],
+  );
+  return rows.length > 0;
+}
+
+/**
+ * Companion cleanup guard keyed by the submitted object instead of the
+ * request: true while ANY non-expired processing claim for this user
+ * references this audioKey. Catches the duplicates a per-requestId check
+ * cannot see — same object resubmitted under a different or malformed
+ * requestId, or a blind same-key retry that re-claimed in the gap between a
+ * failed request's claim abandon and its post-response delete.
+ */
+export async function isAudioKeyClaimedForProcessing(userId: string, audioKey: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    `SELECT 1
+     FROM assessment_requests
+     WHERE user_id = $1 AND audio_key = $2
+       AND status = 'processing'
+       AND started_at >= now() - interval '5 minutes'`,
+    [userId, audioKey],
   );
   return rows.length > 0;
 }

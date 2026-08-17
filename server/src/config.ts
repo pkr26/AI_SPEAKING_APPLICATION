@@ -70,7 +70,8 @@ const envSchema = z
     // Graceful-shutdown drain budget. The default sits above the 130s
     // worst-case request budget (S3 download + provider deadline + ingress
     // margin, see index.ts requestTimeout) so a deploy never socket-kills the
-    // slowest legitimate assessment.
+    // slowest legitimate assessment; the superRefine below enforces that
+    // invariant for every configuration.
     SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(10_000).max(300_000).default(140_000),
     // Prometheus endpoint gate. Off by default: GET /metrics exposes
     // operational detail (routes, latencies, provider error rates) and must
@@ -317,6 +318,17 @@ const envSchema = z
         code: z.ZodIssueCode.custom,
         path: ['ASSESS_IP_DAILY_CAP'],
         message: 'must be greater than or equal to ASSESS_DAILY_CAP so one learner keeps their full daily allowance',
+      });
+    }
+    // The drain budget must cover the whole-request budget (index.ts sets
+    // requestTimeout = S3 operation timeout + provider deadline + 40s ingress
+    // margin); a smaller drain force-kills the slowest legitimate in-flight
+    // assessment on every deploy.
+    if (env.SHUTDOWN_DRAIN_MS < env.S3_OPERATION_TIMEOUT_MS + env.OPENAI_TIMEOUT_MS + 40_000) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['SHUTDOWN_DRAIN_MS'],
+        message: 'must be at least S3_OPERATION_TIMEOUT_MS + OPENAI_TIMEOUT_MS + 40s (the worst-case request budget)',
       });
     }
   });

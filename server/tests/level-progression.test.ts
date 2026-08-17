@@ -241,9 +241,12 @@ describe('CEFR level progression', () => {
     expect(rb.status).toBe(200);
     // The promotion commits exactly once, and the waiter observes that new
     // level from the parent-row lock instead of running a redundant old-level
-    // mastery aggregate or a guaranteed-zero guarded UPDATE.
-    expect(ra.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
-    expect(rb.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    // mastery aggregate or a guaranteed-zero guarded UPDATE. Only the attempt
+    // whose own mastery crossed the threshold reports levelUp — the waiter's
+    // mastered pass keeps its normal outcome shape without the flag.
+    expect(ra.body.mastered).toBe(true);
+    expect(rb.body.mastered).toBe(true);
+    expect([ra.body.levelUp, rb.body.levelUp].filter(Boolean)).toEqual([{ from: 'A1', to: 'A2' }]);
     expect(ra.body.next.question.cefrLevel).toBe('A2');
     expect(rb.body.next.question.cefrLevel).toBe('A2');
     const oldLevelMasterySnapshots = queries.filter(
@@ -323,14 +326,18 @@ describe('CEFR level progression', () => {
     releaseWaiter({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
     const waited = await waiterPromise;
     expect(waited.status).toBe(200);
-    expect(waited.body).toMatchObject({ mastered: false, levelUp: { from: 'A1', to: 'A2' } });
+    // The rival earned the promotion, not this attempt: no levelUp (the client
+    // contract rejects the flag on a non-mastering attempt), while the next
+    // question and progress still come from the promoted level.
+    expect(waited.body).toMatchObject({ passed: true, mastered: false });
+    expect(waited.body.levelUp).toBeUndefined();
     expect(waited.body.attemptsLeft).toBeUndefined();
     expect(waited.body.finalFeedback).toBeUndefined();
     expect(waited.body.next.question.cefrLevel).toBe('A2');
     expect(await userLevel(userId)).toBe('A2');
   });
 
-  it('does not offer an invalid old-level retry when a miss waits behind a promotion', async () => {
+  it('answers an in-flight miss with the normal retry shape when a rival promotion lands mid-assessment', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
@@ -355,14 +362,18 @@ describe('CEFR level progression', () => {
     const waited = await waiterPromise;
 
     expect(waited.status).toBe(200);
+    // The miss keeps its ordinary retry shape: the client contract rejects
+    // attemptsLeft: 0 before the final attempt and a levelUp this attempt did
+    // not earn, so neither may appear here.
     expect(waited.body).toMatchObject({
       passed: false,
       mastered: false,
-      attemptsLeft: 0,
-      levelUp: { from: 'A1', to: 'A2' },
+      attemptNo: 1,
+      attemptsLeft: 2,
     });
-    expect(waited.body.finalFeedback).toContain('Continue with the next question');
-    expect(waited.body.next.question.cefrLevel).toBe('A2');
+    expect(waited.body.levelUp).toBeUndefined();
+    expect(waited.body.finalFeedback).toBeUndefined();
+    expect(waited.body.next).toBeUndefined();
   });
 
   it('rejects an in-flight scored result when diagnostic state was reset before persistence', async () => {

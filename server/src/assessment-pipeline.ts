@@ -51,9 +51,9 @@ export interface AssessmentSubmissionChain {
    * after paid capacity was committed. The runner needs it when the capacity
    * reservation lands after the response already closed — by then the abort
    * guard's close listener has run (refund issued, flag unset) and will never
-   * fire again.
+   * fire again. Idempotent per response (res.locals.assessmentBudgetRespent).
    */
-  respendAssessmentBudget: (req: AuthedRequest) => void;
+  respendAssessmentBudget: (req: AuthedRequest, res: Response) => void;
 }
 
 /**
@@ -94,7 +94,7 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
   /** The chain's schema instance, so the runner reads the validated body. */
   bodySchema: SubmissionBodySchema;
   /** The chain's abort re-spend, invoked when capacity commits after close. */
-  respendAssessmentBudget: (req: AuthedRequest) => void;
+  respendAssessmentBudget: (req: AuthedRequest, res: Response) => void;
   /** Per-route error for a questionId that matches no catalog row. */
   questionMissingError: () => HttpError;
   /** Practice routes reject questions outside the learner's level with 403. */
@@ -155,13 +155,20 @@ export async function runAssessmentSubmission<Claim, Result>(
   ownSubmittedAudioFile(res);
   try {
     const { questionId, requestId } = validated(req, hooks.bodySchema);
+    // The dual-mode schema carries audioKey only in S3 ingress mode (the zod
+    // union collapses it out of the inferred type, so read it the same
+    // defensive way resolvePresignedAudio does). Recording it with the
+    // processing claim lets submitted-object cleanup see which object this
+    // worker is reading. Direct (local multipart) mode has none.
+    const rawAudioKey = (req.body as { audioKey?: unknown }).audioKey;
+    const audioKey = typeof rawAudioKey === 'string' ? rawAudioKey : undefined;
     const { rows: qRows } = await pool.query<QuestionRow>(
       `SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`,
       [questionId],
     );
     const question = qRows[0];
     if (!question) throw hooks.questionMissingError();
-    const requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId);
+    const requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId, audioKey);
     if (requestClaim.kind === 'completed') {
       completeSubmittedPresignedAudioReplay(res);
       try {
@@ -201,9 +208,10 @@ export async function runAssessmentSubmission<Claim, Result>(
           // express-rate-limit's close handler has refunded both hits while
           // the abort guard saw no reservation flag and stayed silent — and
           // 'close' never fires twice. Re-spend the pair now that paid
-          // capacity is consumed (fail-open inside the store).
+          // capacity is consumed (fail-open inside the store). The sentinel
+          // inside respendAssessmentBudget makes a second path a no-op.
           if (res.closed || res.destroyed || req.socket.destroyed) {
-            hooks.respendAssessmentBudget(req);
+            hooks.respendAssessmentBudget(req, res);
           }
         },
       });

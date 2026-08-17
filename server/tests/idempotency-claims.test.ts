@@ -5,6 +5,7 @@ import {
   claimAssessmentRequest,
   completeAssessmentRequest,
   getAssessmentRequestStatus,
+  isAudioKeyClaimedForProcessing,
 } from '../src/idempotency';
 import { HttpError } from '../src/middleware';
 import { app, pool, registerUser } from './helpers';
@@ -227,7 +228,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     }
   });
 
-  it('returns a stable 409 when the conflicting row disappears during an insert race', async () => {
+  it('returns a retryable in-flight 409 when the conflicting row disappears during an insert race', async () => {
     const client = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'ROLLBACK') return undefined;
@@ -240,16 +241,59 @@ describe('claimAssessmentRequest ownership and replay', () => {
     };
     const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
     try {
+      // The conflicting row vanished between the failed insert and the read, so
+      // the identifier is immediately free: a retryable in-flight hint, not the
+      // permanently burned REQUEST_ID_REUSED.
       await expect(claimAssessmentRequest(userId, randomUUID(), 'practice', questionId)).rejects.toMatchObject({
+        name: 'AssessmentRequestInFlightError',
         status: 409,
-        message: 'Assessment request identifier was already used',
-        code: 'REQUEST_ID_REUSED',
+        message: 'Assessment is still processing',
+        code: 'REQUEST_IN_FLIGHT',
+        extra: { retryAfterSeconds: 2 },
       });
       expect(client.query.mock.calls.at(-1)?.[0]).toBe('ROLLBACK');
       expect(client.release).toHaveBeenCalledOnce();
     } finally {
       connect.mockRestore();
     }
+  });
+
+  it('records the submitted audio key on the processing claim for cleanup arbitration', async () => {
+    const requestId = randomUUID();
+    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId, audioKey);
+    if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
+
+    const { rows } = await pool.query<{ audio_key: string | null }>(
+      'SELECT audio_key FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(rows[0].audio_key).toBe(audioKey);
+
+    // Only a live processing row for the SAME user protects the object.
+    await expect(isAudioKeyClaimedForProcessing(userId, audioKey)).resolves.toBe(true);
+    await expect(isAudioKeyClaimedForProcessing(randomUUID(), audioKey)).resolves.toBe(false);
+
+    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, { passed: true });
+    await expect(isAudioKeyClaimedForProcessing(userId, audioKey)).resolves.toBe(false);
+
+    // An expired processing row no longer protects the object either.
+    const staleKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    await pool.query(
+      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
+      [userId, randomUUID(), randomUUID(), questionId, staleKey],
+    );
+    await expect(isAudioKeyClaimedForProcessing(userId, staleKey)).resolves.toBe(false);
+
+    // Claims without an object key (local multipart mode) store NULL.
+    const keyless = randomUUID();
+    await claimAssessmentRequest(userId, keyless, 'practice', questionId);
+    const keylessRow = await pool.query<{ audio_key: string | null }>(
+      'SELECT audio_key FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, keyless],
+    );
+    expect(keylessRow.rows[0].audio_key).toBeNull();
   });
 
   it('rolls back and releases the claim transaction after a query failure', async () => {

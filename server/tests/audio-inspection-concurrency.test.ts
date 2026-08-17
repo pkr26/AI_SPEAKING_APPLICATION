@@ -14,8 +14,10 @@ vi.mock('node:child_process', async (importOriginal) => {
 });
 
 import {
+  acquireInspectionSlot,
   assertAudioInspectorAvailable,
   buildAudioInspectorEnvironment,
+  getAudioInspectionSlotsInUse,
   verifyAudioDuration,
 } from '../src/audio-inspection';
 import { config } from '../src/config';
@@ -235,6 +237,19 @@ describe('audio inspection concurrency', () => {
     await expect(first.result).resolves.toEqual({ status: 'fulfilled', value: true });
     await proveNextSlotIsUsable();
     expect(spawnMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('releases an acquired slot at most once, never driving the in-flight count negative', () => {
+    const release = acquireInspectionSlot();
+    expect(getAudioInspectionSlotsInUse()).toBe(1);
+    release();
+    release();
+    expect(getAudioInspectionSlotsInUse()).toBe(0);
+    // A guarded releaser still interacts correctly with the capacity gate.
+    const held = acquireInspectionSlot();
+    expect(() => acquireInspectionSlot()).toThrowError(expect.objectContaining({ status: 503, code: 'CAPACITY_BUSY' }));
+    held();
+    expect(getAudioInspectionSlotsInUse()).toBe(0);
   });
 
   it('releases the slot after a synchronous spawn failure', async () => {

@@ -276,6 +276,9 @@ async function claimPracticeAttempt(userId: string, questionId: string): Promise
       [userId, questionId],
     );
     const last = rows[0];
+    // Deliberate: attempt_no is per serving cycle, not lifetime. A pass or a
+    // final (third) failure closes the 3-attempt window, and the next attempt
+    // on this word restarts the cycle at 1.
     const attemptNo = last && !last.passed && last.attempt_no < MAX_ATTEMPTS ? last.attempt_no + 1 : 1;
     await client.query('COMMIT');
     return { attemptNo, claimId };
@@ -359,20 +362,23 @@ async function storePracticeResult(
     // SRS schedule, bucketed by score:
     //   < PASS_SCORE          -> due now, index 0 (a mastered word DEMOTES to
     //                            learning — the only downgrade path);
-    //   PASS_SCORE..<MASTER   -> due in 1 day, index 1 (a mastered word keeps
-    //                            its status but reviews again soon);
+    //   PASS_SCORE..<MASTER   -> learning word: due in 1 day, index 1. A
+    //                            mastered word keeps its status and treats the
+    //                            pass as retention: index advances (clamped)
+    //                            exactly like a mastery pass;
     //   >= MASTER_SCORE       -> mastered, index advances (clamped), due after
     //                            SRS_INTERVALS_DAYS[new index] days.
     // The insert branch bakes the same rules for a first attempt (prior
     // index 0): mastered -> index 1 / +3d, passed -> index 1 / +1d,
-    // failed -> index 0 / due now.
+    // failed -> index 0 / due now. A scored answer puts the word back in play,
+    // so both branches clear any skip park (skipped_until).
     const insertIndex = mastered || result.score >= PASS_SCORE ? 1 : 0;
     const insertDueDays = mastered ? SRS_INTERVALS_DAYS[1] : result.score >= PASS_SCORE ? 1 : 0;
     const maxSrsIntervalIndex = SRS_INTERVALS_DAYS.length - 1;
     await client.query(
       `INSERT INTO practice_progress
-         (user_id, question_id, status, best_score, attempt_count, last_attempt_at, srs_interval_index, due_at)
-       VALUES ($1, $2, $3, $4, 1, now(), $5, now() + $6 * interval '1 day')
+         (user_id, question_id, status, best_score, attempt_count, last_attempt_at, srs_interval_index, due_at, skipped_until)
+       VALUES ($1, $2, $3, $4, 1, now(), $5, now() + $6 * interval '1 day', NULL)
        ON CONFLICT (user_id, question_id) DO UPDATE SET
          status = CASE
            WHEN EXCLUDED.status = 'mastered' THEN 'mastered'
@@ -382,14 +388,21 @@ async function storePracticeResult(
          best_score = greatest(practice_progress.best_score, EXCLUDED.best_score),
          attempt_count = practice_progress.attempt_count + 1,
          last_attempt_at = now(),
+         skipped_until = NULL,
          srs_interval_index = CASE
            WHEN EXCLUDED.status = 'mastered'
+             THEN least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex})
+           WHEN practice_progress.status = 'mastered' AND EXCLUDED.best_score >= ${PASS_SCORE}
              THEN least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex})
            WHEN EXCLUDED.best_score >= ${PASS_SCORE} THEN 1
            ELSE 0
          END,
          due_at = CASE
            WHEN EXCLUDED.status = 'mastered'
+             THEN now() +
+               (ARRAY[${SRS_INTERVALS_DAYS.join(', ')}])[least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex}) + 1]
+               * interval '1 day'
+           WHEN practice_progress.status = 'mastered' AND EXCLUDED.best_score >= ${PASS_SCORE}
              THEN now() +
                (ARRAY[${SRS_INTERVALS_DAYS.join(', ')}])[least(practice_progress.srs_interval_index + 1, ${maxSrsIntervalIndex}) + 1]
                * interval '1 day'
@@ -403,10 +416,14 @@ async function storePracticeResult(
     // user row BEFORE counting mastery so distinct words mastered in parallel
     // cannot both observe a pre-threshold snapshot and then commit without a
     // promotion. The waiter takes a fresh READ COMMITTED snapshot after the
-    // winner commits. C2 never promotes (no next level).
+    // winner commits. C2 never promotes (no next level). Only THIS attempt's
+    // own mastery may attach levelUp: the client contract rejects a promotion
+    // flag on an attempt that did not master a word, so when a rival
+    // promotion lands while this provider call is in flight, the response
+    // keeps this attempt's normal outcome shape (next/progress still come
+    // from the possibly promoted current level below).
     let effectiveLevel = lockedUserLevel;
-    let levelUp: { from: string; to: string } | undefined =
-      lockedUserLevel && lockedUserLevel !== level ? { from: level, to: lockedUserLevel } : undefined;
+    let levelUp: { from: string; to: string } | undefined;
     if (justMastered && lockedUserLevel === level) {
       const nextLevel = CEFR_LEVELS[CEFR_LEVELS.indexOf(level as (typeof CEFR_LEVELS)[number]) + 1];
       if (nextLevel) {
@@ -428,27 +445,14 @@ async function storePracticeResult(
 
     let response: Record<string, unknown>;
     const shouldRetry = !result.passed && claim.attemptNo < MAX_ATTEMPTS;
-    if (shouldRetry && levelUp) {
-      // The old-level question became ineligible while this provider call was
-      // in flight. Do not tell the client to retry a question the next request
-      // must reject; close this run and continue from the current level.
-      const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
-      const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
-      const next = nextPick ? { ...nextPick, progress } : undefined;
-      response = {
-        ...body,
-        attemptsLeft: 0,
-        finalFeedback: 'Your level advanced while this answer was assessed. Continue with the next question.',
-        levelUp,
-        next,
-      };
-    } else if (shouldRetry) {
+    if (shouldRetry) {
       response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
     } else {
       // Select after the current attempt is visible in this transaction and
       // explicitly exclude it. A pass/final failure must always advance, and
-      // after a promotion both the next question and the progress snapshot
-      // come from the NEW level.
+      // after a promotion — this attempt's own, or a rival's that landed while
+      // the provider call was in flight — both the next question and the
+      // progress snapshot come from the CURRENT level.
       const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
       const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
       const next = nextPick ? { ...nextPick, progress } : undefined;

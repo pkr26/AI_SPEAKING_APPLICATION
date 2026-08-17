@@ -588,5 +588,36 @@ describe('practice stuck cases', () => {
       expect(second.status).toBe(200);
       expect(second.body.question.id).toBe(rows[1].id);
     });
+
+    it('clears the park when the served fallback word is answered, putting it back in play', async () => {
+      const { token, userId, level } = await freshUser();
+      await parkAllBut(userId, level);
+      const served = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      expect(served.status).toBe(200);
+      expect(served.body.kind).toBe('revision');
+      const servedId = served.body.question.id as string;
+
+      // A scored answer means the word is back in play: the park is cleared
+      // instead of the level re-serving the same parked word for up to 7 days.
+      const answer = await answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        servedId,
+      );
+      expect(answer.status).toBe(200);
+
+      const progress = await pool.query<{ skipped_until: string | null; attempt_count: number }>(
+        'SELECT skipped_until, attempt_count FROM practice_progress WHERE user_id = $1 AND question_id = $2',
+        [userId, servedId],
+      );
+      expect(progress.rows[0]).toEqual({ skipped_until: null, attempt_count: 1 });
+
+      const counts = await pool.query<{ parked: number; total: number }>(
+        `SELECT
+           (SELECT count(*)::int FROM practice_progress WHERE user_id = $1 AND skipped_until > now()) AS parked,
+           (SELECT count(*)::int FROM questions WHERE cefr_level = $2) AS total`,
+        [userId, level],
+      );
+      expect(counts.rows[0].parked).toBe(counts.rows[0].total - 1);
+    });
   });
 });

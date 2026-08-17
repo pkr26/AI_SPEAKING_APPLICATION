@@ -347,7 +347,11 @@ export function createAuthRouter(limiters: Limiters) {
         'UPDATE users SET name = coalesce($1, name), native_language = coalesce($2, native_language) WHERE id = $3 RETURNING *',
         [name ?? null, nativeLanguage ?? null, user.id],
       );
-      res.json({ user: toUserJson(rows[0]) });
+      const updated = rows[0];
+      // A concurrent self-delete between requireAuth and this UPDATE leaves no
+      // row; treat it like the sibling routes' state change, not a TypeError.
+      if (!updated) throw authenticationStateChanged();
+      res.json({ user: toUserJson(updated) });
     }),
   );
 

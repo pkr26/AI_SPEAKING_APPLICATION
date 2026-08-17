@@ -240,13 +240,78 @@ describe('enableDailyReminder failure leaves no lying preference', () => {
 
     await expect(enableDailyReminder(9)).rejects.toBe(failure);
   });
+
+  it('cancels the just-scheduled notification when storing the preference fails', async () => {
+    // Otherwise the OS schedule stays live while the toggle reads off.
+    const failure = new Error('keychain unavailable');
+    setItemAsync.mockRejectedValueOnce(failure);
+
+    await expect(enableDailyReminder(9)).rejects.toBe(failure);
+
+    // One cancel replaces the old schedule before scheduling; the second is
+    // the compensation for the live schedule the learner never asked for.
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(2);
+    expect(mockScheduleNotificationAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reports the storage failure when the compensating cancel also fails', async () => {
+    const failure = new Error('keychain unavailable');
+    setItemAsync.mockRejectedValueOnce(failure);
+    mockCancelAllScheduledNotificationsAsync
+      .mockImplementationOnce(async () => undefined)
+      .mockRejectedValueOnce(new Error('os error'));
+
+    await expect(enableDailyReminder(9)).rejects.toBe(failure);
+  });
 });
 
 describe('disableDailyReminder', () => {
-  it('cancels the schedule and forgets the stored preference', async () => {
+  it('forgets the preference and cancels the schedule, preference first', async () => {
     await disableDailyReminder();
-    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
     expect(deleteItemAsync).toHaveBeenCalledWith('daily_reminder_v1', STORAGE_OPTIONS);
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    // Delete-first: a failed delete then leaves preference and schedule
+    // consistently on instead of a live toggle with nothing scheduled.
+    expect(deleteItemAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      mockCancelAllScheduledNotificationsAsync.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('leaves the schedule alone when forgetting the preference fails', async () => {
+    getItemAsync.mockImplementation(async () => JSON.stringify({ hour: 8 }));
+    const failure = new Error('keychain unavailable');
+    deleteItemAsync.mockRejectedValueOnce(failure);
+
+    await expect(disableDailyReminder()).rejects.toBe(failure);
+
+    // Preference and schedule both stay on — they never disagree.
+    expect(mockCancelAllScheduledNotificationsAsync).not.toHaveBeenCalled();
+  });
+
+  it('restores the preference when the OS cancel fails after the delete', async () => {
+    getItemAsync.mockImplementation(async () => JSON.stringify({ hour: 8 }));
+    const failure = new Error('os error');
+    mockCancelAllScheduledNotificationsAsync.mockRejectedValueOnce(failure);
+
+    await expect(disableDailyReminder()).rejects.toBe(failure);
+
+    expect(deleteItemAsync).toHaveBeenCalledWith('daily_reminder_v1', STORAGE_OPTIONS);
+    // Compensation: the preference goes back so it agrees with the schedule
+    // that is still live.
+    expect(setItemAsync).toHaveBeenCalledWith(
+      'daily_reminder_v1',
+      JSON.stringify({ hour: 8 }),
+      STORAGE_OPTIONS,
+    );
+  });
+
+  it('still reports the cancel failure when restoring the preference also fails', async () => {
+    getItemAsync.mockImplementation(async () => JSON.stringify({ hour: 8 }));
+    const failure = new Error('os error');
+    mockCancelAllScheduledNotificationsAsync.mockRejectedValueOnce(failure);
+    setItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(disableDailyReminder()).rejects.toBe(failure);
   });
 
   it('propagates cancellation failures to the settings UI', async () => {

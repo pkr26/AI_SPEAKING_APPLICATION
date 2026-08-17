@@ -4,7 +4,8 @@ import path from 'path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
-import { assertSafeTestDatabase } from './global-setup';
+import { assertSafeDestructiveDatabase } from '../db/database-safety';
+import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
 import { pool } from './helpers';
 
 afterAll(async () => {
@@ -353,5 +354,21 @@ describe('destructive test database guard', () => {
     expect(() =>
       assertSafeTestDatabase('postgres://localhost:5432/customer_test', 'postgres:///customer_test'),
     ).toThrow('DATABASE_URL must include a hostname');
+  });
+
+  it('applies the stricter mutation guard at the destructive moment when MUTATION_LANE is set', () => {
+    // Direct `npx stryker` runs bypass the npm pre-step guard, so globalSetup
+    // must escalate to the mutation rules on its own. (Calling globalSetup
+    // itself is not test-safe: with a valid mutation URL it would drop a
+    // database mid-suite.)
+    expect(destructivePurposeForEnvironment({})).toBe('test');
+    expect(destructivePurposeForEnvironment({ MUTATION_LANE: 'config' })).toBe('mutation');
+    expect(() =>
+      assertSafeDestructiveDatabase(
+        'postgres://localhost:5432/ai_english_test',
+        undefined,
+        destructivePurposeForEnvironment({ MUTATION_LANE: 'config' }),
+      ),
+    ).toThrow('must name a dedicated mutation database');
   });
 });

@@ -91,7 +91,8 @@ export interface AttemptResult {
 }
 
 export interface PracticeStats {
-  level: CefrLevel;
+  /** Null before placement, when the progress snapshot is exactly all zeros. */
+  level: CefrLevel | null;
   progress: {
     masteredCount: number;
     learningCount: number;
@@ -532,15 +533,14 @@ function isTimestamp(value: unknown): value is string {
 export function parsePracticeStats(value: unknown): PracticeStats {
   if (
     !isRecord(value) ||
-    !isCefrLevel(value.level) ||
+    !(isCefrLevel(value.level) || value.level === null) ||
     !isRecord(value.progress) ||
     !isCount(value.progress.masteredCount) ||
     !isCount(value.progress.learningCount) ||
     !isCount(value.progress.totalAtLevel) ||
-    value.progress.totalAtLevel < 1 ||
-    value.progress.masteredCount + value.progress.learningCount > value.progress.totalAtLevel ||
     // Stats were born after SRS, so dueCount is required here.
     !isCount(value.progress.dueCount) ||
+    value.progress.masteredCount + value.progress.learningCount > value.progress.totalAtLevel ||
     value.progress.dueCount > value.progress.masteredCount + value.progress.learningCount ||
     !isCount(value.streakDays) ||
     !isCount(value.practicedToday) ||
@@ -549,6 +549,22 @@ export function parsePracticeStats(value: unknown): PracticeStats {
     value.practicedToday > value.totalAttempts ||
     (value.lastPracticedAt !== null && !isTimestamp(value.lastPracticedAt))
   ) {
+    throw new ContractError();
+  }
+  // Before placement the server intentionally answers level: null with the
+  // all-zero progress snapshot (there is no level to count words against);
+  // exactly that shape may carry a null level. A placed level always has at
+  // least one question, so totalAtLevel 0 stays contract drift there.
+  if (value.level === null) {
+    if (
+      value.progress.masteredCount !== 0 ||
+      value.progress.learningCount !== 0 ||
+      value.progress.totalAtLevel !== 0 ||
+      value.progress.dueCount !== 0
+    ) {
+      throw new ContractError();
+    }
+  } else if (value.progress.totalAtLevel < 1) {
     throw new ContractError();
   }
   return {

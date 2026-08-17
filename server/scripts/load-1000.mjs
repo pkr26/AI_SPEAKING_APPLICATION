@@ -195,7 +195,15 @@ async function reqRobust(method, pathName, opts = {}, maxAttempts = 12) {
       if (result.status === 503 && typeof result.body?.retryAfterSeconds === 'number') {
         stats.throttled++;
         last = result;
-        await wait(result.body.retryAfterSeconds * 1000 + Math.random() * 1000);
+        // Clamp the server-supplied hint: a pathological Retry-After (e.g. a
+        // daily-capacity value in hours) must not stall the load run.
+        const retryAfterSeconds = Math.min(result.body.retryAfterSeconds, 60);
+        if (retryAfterSeconds !== result.body.retryAfterSeconds) {
+          console.warn(
+            `clamping retryAfterSeconds ${result.body.retryAfterSeconds}s -> ${retryAfterSeconds}s for ${method} ${pathName}`,
+          );
+        }
+        await wait(retryAfterSeconds * 1000 + Math.random() * 1000);
         continue;
       }
       if (result.status >= 500) {

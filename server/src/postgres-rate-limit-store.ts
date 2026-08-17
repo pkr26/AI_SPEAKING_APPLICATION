@@ -68,7 +68,11 @@ export class PostgresRateLimitStore implements Store {
   }
 
   // The window guard keeps a late refund (response finishing after the window
-  // rolled over) from eating a hit that belongs to the NEXT window.
+  // rolled over) from touching the row once it has expired. One accepted
+  // residue: a refund landing in the sub-millisecond gap AFTER a new-window
+  // increment rolled reset_at forward still passes the guard and takes back
+  // one of the new window's hits (bounded ±1 per rollover, self-healing at
+  // expiry). Closing that gap would need per-hit window bookkeeping.
   // The try/catch is load-bearing: express-rate-limit invokes decrement
   // fire-and-forget without handling rejections, so a database brownout here
   // would otherwise surface as an unhandled rejection and terminate the

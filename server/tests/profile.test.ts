@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { app, pool, registerUser } from './helpers';
 
@@ -121,5 +121,26 @@ describe('PATCH /auth/me', () => {
     const r = await request(a).patch('/auth/me').send({ name: 'Nobody' });
     expect(r.status).toBe(401);
     expect(r.body).toEqual({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
+  });
+
+  it('answers 409 STATE_CHANGED when the account vanishes between auth and the update', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    // A concurrent self-delete commits after requireAuth loaded the user: the
+    // UPDATE then matches no row. Simulate by emptying that one query result.
+    const originalQuery = pool.query.bind(pool);
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...args: unknown[]) => {
+      if (typeof text === 'string' && text.startsWith('UPDATE users SET name = coalesce')) {
+        return Promise.resolve({ rows: [], rowCount: 0 });
+      }
+      return originalQuery(text as never, ...(args as never[]));
+    }) as typeof pool.query);
+    try {
+      const r = await request(a).patch('/auth/me').set('Authorization', `Bearer ${token}`).send({ name: 'Gone' });
+      expect(r.status).toBe(409);
+      expect(r.body).toEqual({ error: 'Authentication state changed; please try again', code: 'STATE_CHANGED' });
+    } finally {
+      query.mockRestore();
+    }
   });
 });

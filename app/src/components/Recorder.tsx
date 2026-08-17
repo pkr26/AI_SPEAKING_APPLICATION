@@ -95,9 +95,15 @@ const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
  * or rejects with an AbortError as soon as the signal fires, whichever comes
  * first. Without this the cancel button would appear dead for up to
  * CAPACITY_RETRY_MAX_DELAY_MS of plain setTimeout.
+ *
+ * The timer declaration is hoisted above rejectAbort: a signal that is already
+ * aborted at entry rejects before the setTimeout line runs, and a `const`
+ * declared below would still be in its temporal dead zone at that point.
+ * Exported for the pre-aborted-signal unit test.
  */
-function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
+export function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const rejectAbort = () => {
       clearTimeout(timer);
       reject(new DOMException('The operation was aborted.', 'AbortError'));
@@ -106,7 +112,7 @@ function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
       rejectAbort();
       return;
     }
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       signal.removeEventListener('abort', rejectAbort);
       resolve();
     }, ms);
@@ -200,6 +206,11 @@ export default function Recorder<T>({
   const styles = themedStyles(theme);
 
   const [phase, setPhase] = useState<Phase>('idle');
+  // True only when a terminal recovery failure parked the recorder in
+  // 'recovering' with no polling loop behind it; the Try Again affordance then
+  // re-invokes recoverPending so a SecureStore hiccup cannot latch the
+  // controls until a remount.
+  const [recoveryRetryNeeded, setRecoveryRetryNeeded] = useState(false);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);
   const [reduceMotion, setReduceMotion] = useState(false);
@@ -281,6 +292,21 @@ export default function Recorder<T>({
       setWaitElapsedMillis(0);
     }
   }, []);
+
+  /**
+   * Every terminal recovery failure goes through here: the recorder stays in
+   * 'recovering' (the pending state is genuinely unresolved) but the retry
+   * flag arms the Try Again button, so the learner is never one remount away
+   * from escaping a failed storage read.
+   */
+  const failRecoveryAwaitingRetry = useCallback(
+    (message: string) => {
+      updatePhase('recovering');
+      if (mountedRef.current) setRecoveryRetryNeeded(true);
+      callbacksRef.current.onError(message);
+    },
+    [updatePhase],
+  );
 
   const releasePreviewPlayer = useCallback(() => {
     previewListenerRef.current?.remove();
@@ -398,8 +424,7 @@ export default function Recorder<T>({
         identityIsCurrent() &&
         (phaseRef.current === 'idle' || phaseRef.current === 'recovering')
       ) {
-        updatePhase('recovering');
-        callbacksRef.current.onError(translate('recorder.errRetryInfoUnavailable'));
+        failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUnavailable'));
       }
       return;
     }
@@ -451,6 +476,9 @@ export default function Recorder<T>({
     activeRecoveryOwner = instanceId;
     recoveringRef.current = true;
     operationRef.current = true;
+    // A live recovery loop now owns the recovering phase; hide the stale
+    // failure's Try Again affordance.
+    if (mountedRef.current) setRecoveryRetryNeeded(false);
     const generation = ++recoveryGenerationRef.current;
     const isCurrent = () =>
       recoveryGenerationRef.current === generation &&
@@ -465,9 +493,10 @@ export default function Recorder<T>({
       if (pending.ownerId !== ownerId) {
         const cleared = await clearRequestTracking(pending.requestId);
         if (isCurrent()) {
-          updatePhase(cleared ? 'idle' : 'recovering');
-          if (!cleared) {
-            callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+          if (cleared) {
+            updatePhase('idle');
+          } else {
+            failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
           }
         }
         return;
@@ -487,11 +516,10 @@ export default function Recorder<T>({
         if (!isCurrent()) return;
         const cleared = await clearRequestTracking(pending.requestId);
         if (!isCurrent()) return;
-        updatePhase(
-          cleared ? (activeUriRef.current && routeMatches ? 'recorded' : 'idle') : 'recovering',
-        );
-        if (!cleared) {
-          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+        if (cleared) {
+          updatePhase(activeUriRef.current && routeMatches ? 'recorded' : 'idle');
+        } else {
+          failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
         }
         return;
       }
@@ -503,8 +531,7 @@ export default function Recorder<T>({
           }
         } catch {
           if (!isCurrent()) return;
-          updatePhase('recovering');
-          callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
+          failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
           return;
         }
         if (!isCurrent()) return;
@@ -608,8 +635,7 @@ export default function Recorder<T>({
                 }
               } catch {
                 if (isCurrent()) {
-                  updatePhase('recovering');
-                  callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
+                  failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
                 }
                 return;
               }
@@ -632,8 +658,7 @@ export default function Recorder<T>({
                 }
               } catch {
                 if (isCurrent()) {
-                  updatePhase('recovering');
-                  callbacksRef.current.onError(translate('recorder.errRetryInfoUpdate'));
+                  failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
                 }
                 return;
               }
@@ -653,8 +678,7 @@ export default function Recorder<T>({
               }
             } catch {
               if (isCurrent()) {
-                updatePhase('recovering');
-                callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
+                failRecoveryAwaitingRetry(translate('recorder.errResultSafeRetryInfo'));
               }
               return;
             }
@@ -724,8 +748,7 @@ export default function Recorder<T>({
                   }
                 } catch {
                   if (isCurrent()) {
-                    updatePhase('recovering');
-                    callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
+                    failRecoveryAwaitingRetry(translate('recorder.errResultSafeRetryInfo'));
                   }
                   return;
                 }
@@ -813,7 +836,15 @@ export default function Recorder<T>({
         if (activeRecoveryOwner === instanceId) activeRecoveryOwner = null;
       }
     }
-  }, [clearRequestTracking, discardRecording, endpoint, ownerId, questionId, updatePhase]);
+  }, [
+    clearRequestTracking,
+    discardRecording,
+    endpoint,
+    failRecoveryAwaitingRetry,
+    ownerId,
+    questionId,
+    updatePhase,
+  ]);
 
   useFocusEffect(
     useCallback(() => {
@@ -1045,8 +1076,7 @@ export default function Recorder<T>({
         const cleared = await clearRequestTracking(previousRequestId);
         if (!isCurrentLifecycle()) return;
         if (!cleared) {
-          updatePhase('recovering');
-          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+          failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
           return;
         }
       }
@@ -1321,8 +1351,7 @@ export default function Recorder<T>({
           }
         } catch {
           if (!isCurrentSubmission()) return;
-          updatePhase('recovering');
-          callbacksRef.current.onError(translate('recorder.errAnswerSavedRetryInfo'));
+          failRecoveryAwaitingRetry(translate('recorder.errAnswerSavedRetryInfo'));
           return;
         }
         if (!isCurrentSubmission()) return;
@@ -1339,8 +1368,7 @@ export default function Recorder<T>({
         }
       } catch {
         if (!isCurrentSubmission()) return;
-        updatePhase('recovering');
-        callbacksRef.current.onError(translate('recorder.errResultSafeRetryInfo'));
+        failRecoveryAwaitingRetry(translate('recorder.errResultSafeRetryInfo'));
         return;
       }
       if (!isCurrentSubmission()) return;
@@ -1366,8 +1394,7 @@ export default function Recorder<T>({
         const cleared = requestId ? await clearRequestTracking(requestId) : true;
         if (!isCurrentSubmission()) return;
         if (!cleared) {
-          updatePhase('recovering');
-          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+          failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
           return;
         }
         updatePhase('recorded');
@@ -1381,8 +1408,7 @@ export default function Recorder<T>({
         const cleared = requestId ? await clearRequestTracking(requestId) : true;
         if (!isCurrentSubmission()) return;
         if (!cleared) {
-          updatePhase('recovering');
-          callbacksRef.current.onError(translate('recorder.errRetryInfoClear'));
+          failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
           return;
         }
         updatePhase('recorded');
@@ -1432,6 +1458,13 @@ export default function Recorder<T>({
     if (!controller) return;
     cancelRequestedRef.current = true;
     controller.abort();
+  };
+
+  // Escape hatch for a terminally failed recovery (e.g. SecureStore threw):
+  // re-run the same recovery path the focus/foreground triggers would run.
+  const retryRecovery = () => {
+    setRecoveryRetryNeeded(false);
+    void recoverPending();
   };
 
   const togglePreview = () => {
@@ -1594,6 +1627,15 @@ export default function Recorder<T>({
               size="sm"
               accessibilityHint={t('recorder.cancelHint')}
               onPress={cancelUpload}
+              style={styles.cancelButton}
+            />
+          )}
+          {phase === 'recovering' && recoveryRetryNeeded && (
+            <Button
+              title={t('common.tryAgain')}
+              variant="secondary"
+              size="sm"
+              onPress={retryRecovery}
               style={styles.cancelButton}
             />
           )}

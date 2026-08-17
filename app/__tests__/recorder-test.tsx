@@ -30,7 +30,7 @@ import {
   type EmitterSubscription,
 } from 'react-native';
 
-import Recorder from '../src/components/Recorder';
+import Recorder, { sleepAbortable } from '../src/components/Recorder';
 import {
   ApiError,
   apiFetch,
@@ -677,6 +677,42 @@ beforeEach(() => {
 afterEach(() => {
   jest.useRealTimers();
   jest.restoreAllMocks();
+});
+
+describe('sleepAbortable', () => {
+  it('rejects with an AbortError when the signal is already aborted at entry', async () => {
+    // Regression: the timer was declared below the abort check, so a
+    // pre-aborted signal hit clearTimeout in the temporal dead zone and
+    // rejected with a ReferenceError instead of an AbortError.
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(sleepAbortable(60_000, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+  });
+
+  it('resolves after the delay when the signal never fires', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const wait = sleepAbortable(1_000, controller.signal);
+
+    jest.advanceTimersByTime(1_000);
+
+    await expect(wait).resolves.toBeUndefined();
+    expect(controller.signal.aborted).toBe(false);
+  });
+
+  it('rejects with an AbortError when the signal fires mid-wait', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const wait = sleepAbortable(60_000, controller.signal);
+    const assertion = expect(wait).rejects.toMatchObject({ name: 'AbortError' });
+
+    controller.abort();
+
+    await assertion;
+  });
 });
 
 describe('Recorder', () => {
@@ -5739,6 +5775,74 @@ describe('Recorder', () => {
 
       expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUnavailable'));
       expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+    });
+
+    it('escapes a terminally failed recovery via Try Again without a remount', async () => {
+      // A SecureStore read failure parks the recorder in 'recovering' with no
+      // polling loop running; the Try Again affordance re-runs the recovery
+      // path instead of leaving the mic locked until a remount.
+      asMock(loadPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
+      const { props } = await renderRecorder();
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUnavailable'));
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toMatchObject({
+        disabled: true,
+      });
+      const tryAgain = screen.getByRole('button', { name: t('common.tryAgain') });
+
+      // Storage recovers and a completed assessment is waiting: the retried
+      // recovery runs the ordinary path to its durable result.
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 7 },
+      });
+      await fireEvent.press(tryAgain);
+
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 7 } }));
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
+      expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toMatchObject({
+        disabled: false,
+      });
+    });
+
+    it('keeps the Try Again affordance armed when the retried recovery fails again', async () => {
+      asMock(loadPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
+      const { props } = await renderRecorder();
+
+      expect(screen.getByRole('button', { name: t('common.tryAgain') })).toBeTruthy();
+
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenNthCalledWith(2, t('recorder.errRetryInfoUnavailable')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(screen.getByRole('button', { name: t('common.tryAgain') })).toBeTruthy();
+    });
+
+    it('recovers through Try Again after the pending-record cleanup fails', async () => {
+      // The tombstone belongs to another install's user; forgetting it is the
+      // whole recovery. A clear failure must not latch the controls either.
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord({ ownerId: OTHER_OWNER_ID }));
+      asMock(clearPendingAssessment).mockRejectedValueOnce(new Error('keychain unavailable'));
+      const { props } = await renderRecorder();
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoClear')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+
+      await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
     });
 
     it('polls a processing assessment until the durable result arrives', async () => {

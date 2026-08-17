@@ -494,16 +494,38 @@ describe('config env validation', () => {
     expect(ok.assessIpDailyCap).toBe(10);
   });
 
+  it('requires SHUTDOWN_DRAIN_MS to cover the worst-case request budget', async () => {
+    // Defaults: 30s S3 operation + 60s provider deadline + 40s ingress margin.
+    await expectSingleInvalidIssue(
+      baseEnv({ SHUTDOWN_DRAIN_MS: '129999' }),
+      'SHUTDOWN_DRAIN_MS',
+      'must be at least S3_OPERATION_TIMEOUT_MS + OPENAI_TIMEOUT_MS + 40s (the worst-case request budget)',
+    );
+
+    const exact = await loadConfig(baseEnv({ SHUTDOWN_DRAIN_MS: '130000' }));
+    expect(exact.shutdownDrainMs).toBe(130_000);
+
+    // Smaller timeouts shrink the floor accordingly.
+    const lowered = await loadConfig(
+      baseEnv({ OPENAI_TIMEOUT_MS: '1000', S3_OPERATION_TIMEOUT_MS: '1000', SHUTDOWN_DRAIN_MS: '42000' }),
+    );
+    expect(lowered.shutdownDrainMs).toBe(42_000);
+    await expectInvalid(
+      baseEnv({ OPENAI_TIMEOUT_MS: '1000', S3_OPERATION_TIMEOUT_MS: '1000', SHUTDOWN_DRAIN_MS: '41999' }),
+      'SHUTDOWN_DRAIN_MS',
+    );
+  });
+
   it('parses the grading model, shutdown drain, and minimum client version knobs', async () => {
     const config = await loadConfig(
       baseEnv({
         GRADING_MODEL: ' gpt-4o-mini-2025-01-01 ',
-        SHUTDOWN_DRAIN_MS: '10000',
+        SHUTDOWN_DRAIN_MS: '150000',
         MIN_CLIENT_VERSION: ' 1.2.3 ',
       }),
     );
     expect(config.gradingModel).toBe('gpt-4o-mini-2025-01-01');
-    expect(config.shutdownDrainMs).toBe(10_000);
+    expect(config.shutdownDrainMs).toBe(150_000);
     expect(config.minClientVersion).toBe('1.2.3');
 
     const maxDrain = await loadConfig(baseEnv({ SHUTDOWN_DRAIN_MS: '300000' }));

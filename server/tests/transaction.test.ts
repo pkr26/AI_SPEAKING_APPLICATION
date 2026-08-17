@@ -314,6 +314,7 @@ describe('diagnostic transaction rollback precedence', () => {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN') return { rows: [] };
         if (text === 'ROLLBACK') throw rollbackError;
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rows: [user], rowCount: 1 };
         if (text.includes('SELECT * FROM diagnostic_state')) throw primaryError;
         throw new Error(`unexpected restart query: ${text}`);
       }),
@@ -342,8 +343,10 @@ describe('diagnostic transaction rollback precedence', () => {
 
     expect(response.status).toBe(409);
     expect(response.body).toEqual({ error: 'restart state changed', code: 'STATE_CHANGED' });
+    // The parent users row is locked before the diagnostic_state child row.
     expect(client.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
+      'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
       expect.stringContaining('SELECT * FROM diagnostic_state'),
       'ROLLBACK',
     ]);
@@ -372,6 +375,7 @@ describe('diagnostic transaction rollback precedence', () => {
     const client = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: null };
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rows: [user], rowCount: 1 };
         if (text === 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE') {
           return {
             rows: [
@@ -417,8 +421,10 @@ describe('diagnostic transaction rollback precedence', () => {
       .send({ confirm: true });
 
     expect(response.status).toBe(204);
+    // Parent-first lock ordering: users before diagnostic_state.
     expect(client.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
+      'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
       'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE',
       expect.stringContaining('UPDATE diagnostic_state'),
       expect.stringContaining('UPDATE users'),

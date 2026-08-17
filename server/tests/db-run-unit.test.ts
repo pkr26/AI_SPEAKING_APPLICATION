@@ -338,27 +338,25 @@ describe('database deployment runner', () => {
 
   it('preserves a seed failure while still attempting rollback, unlock, and disconnect', async () => {
     const seedError = new Error('seed SQL failed');
-    let transactionStarted = false;
     const client = provideClient(async (sql) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (sql === 'BEGIN') {
-        transactionStarted = true;
-        return { rows: [] };
-      }
       if (sql === 'ROLLBACK') throw new Error('rollback failed');
       if (sql.includes('pg_advisory_unlock')) throw new Error('unlock failed');
-      if (transactionStarted) throw seedError;
-      return { rows: [] };
+      if (sql.startsWith('SELECT set_config') || sql.startsWith('SELECT cefr_level')) return { rows: [] };
+      // The seed file contents (seed.sql owns its own BEGIN/COMMIT).
+      throw seedError;
     });
     client.end.mockRejectedValueOnce(new Error('disconnect failed'));
 
     await expect(seed('postgres://localhost/release_test')).rejects.toBe(seedError);
+    expect(client.query).not.toHaveBeenCalledWith('BEGIN');
+    expect(client.query).not.toHaveBeenCalledWith('COMMIT');
     expect(client.query).toHaveBeenCalledWith('ROLLBACK');
     expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
     expect(client.end).toHaveBeenCalledOnce();
   });
 
-  it('commits a successful seed and logs the resulting CEFR inventory', async () => {
+  it('runs a successful seed without wrapping seed.sql in a second transaction', async () => {
     const counts = [
       { cefr_level: 'A1', n: 6 },
       { cefr_level: 'A2', n: 6 },
@@ -372,8 +370,9 @@ describe('database deployment runner', () => {
 
     await seed('postgres://localhost/release_test', log);
 
-    expect(client.query).toHaveBeenCalledWith('BEGIN');
-    expect(client.query).toHaveBeenCalledWith('COMMIT');
+    // seed.sql contains its own BEGIN/COMMIT; the runner must not add another pair.
+    expect(client.query).not.toHaveBeenCalledWith('BEGIN');
+    expect(client.query).not.toHaveBeenCalledWith('COMMIT');
     expect(client.query).not.toHaveBeenCalledWith('ROLLBACK');
     expect(client.query).toHaveBeenCalledWith("SELECT pg_advisory_unlock(hashtext('ai_english_schema_migrations'))");
     expect(log).toHaveBeenCalledWith(`questions per level: ${JSON.stringify(counts)}`);

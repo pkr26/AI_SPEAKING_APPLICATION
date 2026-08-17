@@ -387,6 +387,21 @@ describe('webhook mail mode', () => {
     }
   });
 
+  it('cancels the unread webhook response body so keep-alive sockets are released', async () => {
+    config.mail.mode = 'webhook';
+    config.mail.webhookUrl = 'https://relay.example/hooks/mail';
+    const cancel = vi.fn().mockResolvedValue(undefined);
+    const fetchMock = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue({ ok: true, status: 200, body: { cancel } } as unknown as Response);
+    try {
+      await sendMail({ to: 'keepalive@example.com', subject: 'Keepalive', text: 'hello' });
+      expect(cancel).toHaveBeenCalledOnce();
+    } finally {
+      fetchMock.mockRestore();
+    }
+  });
+
   it('POSTs {to, subject, text} to MAIL_WEBHOOK_URL and the mailed code actually resets the password', async () => {
     const { server, url, received } = await startWebhookServer();
     config.mail.mode = 'webhook';

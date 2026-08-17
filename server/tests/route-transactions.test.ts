@@ -170,4 +170,45 @@ describe('assessment route transaction lifecycles', () => {
       ]);
     }
   });
+
+  it('locks the users parent row before the diagnostic_state child row in finalize and restart', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+
+    const { result, leases } = await observePoolLeases(async () => {
+      const answer = await answerForm(
+        request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+        next.body.question.id,
+      );
+      const restart = await request(a)
+        .post('/diagnostic/restart')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ confirm: true });
+      return { answer, restart };
+    });
+
+    expect(result.answer.status).toBe(200);
+    expect(result.restart.status).toBe(204);
+
+    // Account deletion locks users first and cascades into diagnostic_state,
+    // so any diagnostic transaction that writes users after locking
+    // diagnostic_state would deadlock against it (40P01). Both transactions
+    // below write users, so both must take the parent lock first.
+    const parentLock = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
+    const childLock = 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE';
+    const finalizeLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes("VALUES ($1, $2, 'diagnostic', $3")),
+    );
+    const restartLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes('SET low_idx = 0, high_idx = 5')),
+    );
+    for (const lease of [finalizeLease, restartLease]) {
+      expect(lease).toBeDefined();
+      const parentAt = lease!.statements.indexOf(parentLock);
+      const childAt = lease!.statements.indexOf(childLock);
+      expect(parentAt).toBeGreaterThanOrEqual(0);
+      expect(childAt).toBeGreaterThan(parentAt);
+    }
+  });
 });

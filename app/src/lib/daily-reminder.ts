@@ -114,15 +114,39 @@ export async function enableDailyReminder(
     await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
     throw error;
   }
-  await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ hour }), STORAGE_OPTIONS);
+  try {
+    await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ hour }), STORAGE_OPTIONS);
+  } catch (error) {
+    // The new schedule is already live, so a missing "on" preference would
+    // leave the OS nudging a learner whose toggle reads off — the mirror of
+    // the failure compensated above. Cancel the just-scheduled notification,
+    // then surface the original storage failure. Best effort — the storage
+    // failure is the one worth reporting.
+    await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+    throw error;
+  }
   return 'enabled';
 }
 
 /** Cancels the reminder and forgets the stored preference. */
 export async function disableDailyReminder(): Promise<void> {
   const Notifications = notifications();
-  await Notifications.cancelAllScheduledNotificationsAsync();
+  // Forget the preference first: a failed delete then leaves the preference
+  // and the schedule consistently ON. If the OS cancel fails after the delete
+  // succeeded, restore the just-read preference so the two cannot durably
+  // disagree that way either — the same compensation shape as the enable path.
+  const previous = await getDailyReminder();
   await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
+  try {
+    await Notifications.cancelAllScheduledNotificationsAsync();
+  } catch (error) {
+    if (previous) {
+      await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify(previous), STORAGE_OPTIONS).catch(
+        () => undefined,
+      );
+    }
+    throw error;
+  }
 }
 
 /**

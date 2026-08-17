@@ -5,6 +5,11 @@ const runtime = vi.hoisted(() => {
     listening: false,
     requestTimeout: 0,
     headersTimeout: 0,
+    errorListeners: [] as Array<(err: Error) => void>,
+    on: vi.fn((event: string, listener: (err: Error) => void) => {
+      if (event === 'error') server.errorListeners.push(listener);
+      return server;
+    }),
     listen: vi.fn((_: number, callback?: () => void) => {
       server.listening = true;
       callback?.();
@@ -91,6 +96,7 @@ beforeEach(() => {
   runtime.dbPoolMax = 20;
   runtime.poolQuery.mockResolvedValue({ rows: [{ max_connections: '100' }] });
   runtime.server.listening = false;
+  runtime.server.errorListeners.length = 0;
   runtime.server.listen.mockImplementation((_: number, callback?: () => void) => {
     runtime.server.listening = true;
     callback?.();
@@ -669,5 +675,55 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.server.closeIdleConnections).not.toHaveBeenCalled();
     releaseSchema();
     await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  it('exits through the fatal path when the HTTP server errors (e.g. EADDRINUSE)', async () => {
+    const listenError = Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' });
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.server.errorListeners).toHaveLength(1);
+
+    runtime.server.errorListeners[0](listenError);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: listenError }, 'HTTP server failed');
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+  });
+
+  it('still exits 1 when the pool drain after an HTTP server error fails', async () => {
+    const listenError = Object.assign(new Error('listen EADDRINUSE'), { code: 'EADDRINUSE' });
+    const poolError = new Error('pool close failed');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    runtime.poolEnd.mockRejectedValueOnce(poolError);
+
+    runtime.server.errorListeners[0](listenError);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: listenError }, 'HTTP server failed');
+    expect(runtime.logger.error).toHaveBeenCalledWith(
+      { err: poolError },
+      'error closing pg pool after HTTP server failure',
+    );
+  });
+
+  it('ignores an HTTP server error once shutdown has begun', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+
+    runtime.server.errorListeners[0](new Error('socket error during drain'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.logger.fatal).not.toHaveBeenCalled();
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledOnce();
   });
 });

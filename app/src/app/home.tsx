@@ -170,10 +170,18 @@ export default function HomeScreen() {
               style={[
                 styles.masteryFill,
                 {
-                  width: `${Math.min(
-                    100,
-                    Math.round((stats.progress.masteredCount / stats.progress.totalAtLevel) * 100),
-                  )}%`,
+                  // totalAtLevel is 0 only on the pre-placement snapshot, which
+                  // normal routing never renders here; divide defensively anyway.
+                  width: `${
+                    stats.progress.totalAtLevel > 0
+                      ? Math.min(
+                          100,
+                          Math.round(
+                            (stats.progress.masteredCount / stats.progress.totalAtLevel) * 100,
+                          ),
+                        )
+                      : 0
+                  }%`,
                 },
               ]}
             />

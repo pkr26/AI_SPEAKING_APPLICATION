@@ -592,6 +592,46 @@ describe('rate limiters', () => {
         resp.mockRestore();
       }
     });
+
+    it('re-spends at most once per response even when both re-spend paths fire', async () => {
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const res = fakeResponse({ assessmentCapacityReserved: true });
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+
+        // Close-before-commit: the reservation-time hook re-spends first...
+        limiters.respendAssessmentBudget(req, res as never);
+        expect(res.locals.assessmentBudgetRespent).toBe(true);
+        // ...then the abort guard's close listener must become a no-op.
+        res.emit('close');
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(resp).toHaveBeenCalledTimes(2);
+
+        // A repeated direct re-spend stays a no-op as well.
+        limiters.respendAssessmentBudget(req, res as never);
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(resp).toHaveBeenCalledTimes(2);
+      } finally {
+        resp.mockRestore();
+      }
+    });
+
+    it('skips the abort-guard re-spend when the reservation-time hook already re-spent', async () => {
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const res = fakeResponse({ assessmentCapacityReserved: true, assessmentBudgetRespent: true });
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+        res.emit('close');
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(resp).not.toHaveBeenCalled();
+      } finally {
+        resp.mockRestore();
+      }
+    });
   });
 
   it('logs exact diagnostic context when fail-safe store cleanup fails', async () => {
@@ -827,7 +867,7 @@ describe('assessment reservation after client disconnect', () => {
     const { req, res, respend } = await submissionHarness(state);
     expect(res.locals.assessmentCapacityReserved).toBe(true);
     expect(respend).toHaveBeenCalledOnce();
-    expect(respend).toHaveBeenCalledWith(req);
+    expect(respend).toHaveBeenCalledWith(req, res);
     expect(res.json).toHaveBeenCalledWith({ ok: true });
   });
 

@@ -12,10 +12,24 @@ export function assertSafeTestDatabase(testDbUrl: string, applicationDbUrl?: str
   return assertSafeDestructiveDatabase(testDbUrl, applicationDbUrl, 'test');
 }
 
+/**
+ * Stryker lane runs export MUTATION_LANE, which vitest workers inherit. When
+ * it is present the destructive target must satisfy the stricter mutation
+ * rules even when Stryker is invoked directly (bypassing the npm pre-step
+ * guard in db/mutation-db-guard.ts).
+ */
+export function destructivePurposeForEnvironment(environment: NodeJS.ProcessEnv): 'test' | 'mutation' {
+  return environment.MUTATION_LANE === undefined ? 'test' : 'mutation';
+}
+
 /** Recreate the test database from scratch: drop, create, migrate, seed. */
 export default async function globalSetup() {
   const applicationDatabaseUrl = configuredApplicationDatabaseUrl(process.env.DATABASE_URL);
-  const target = assertSafeTestDatabase(TEST_DB_URL, applicationDatabaseUrl);
+  const target = assertSafeDestructiveDatabase(
+    TEST_DB_URL,
+    applicationDatabaseUrl,
+    destructivePurposeForEnvironment(process.env),
+  );
   const adminUrl = new URL(target.url.toString());
   adminUrl.pathname = '/postgres';
   const admin = new Client({ connectionString: adminUrl.toString() });

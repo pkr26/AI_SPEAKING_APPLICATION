@@ -163,6 +163,21 @@ function shutdown(signal: string) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
+// A listen/accept failure (EADDRINUSE, exhausted descriptors) would otherwise
+// crash with a raw uncaught exception. Route it through the same fatal log +
+// pool drain as every other startup failure; the shuttingDown guard keeps a
+// shutdown-time socket error from double-exiting.
+server.on('error', (err) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearJanitors();
+  logger.fatal({ err }, 'HTTP server failed');
+  pool
+    .end()
+    .catch((poolErr) => logger.error({ err: poolErr }, 'error closing pg pool after HTTP server failure'))
+    .finally(() => process.exit(1));
+});
+
 /**
  * Operational guardrail: a pool that can consume every server connection locks
  * out readiness probes, migrations, and admin clients (observed as

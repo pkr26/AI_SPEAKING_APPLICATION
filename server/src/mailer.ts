@@ -36,6 +36,9 @@ export async function sendMail(message: MailMessage): Promise<void> {
       if (!response.ok) {
         logger.error({ to: message.to, subject: message.subject, status: response.status }, 'mail webhook rejected');
       }
+      // The response body is never read; cancel it so the keep-alive socket is
+      // released back to the pool immediately instead of being held until GC.
+      await response.body?.cancel().catch(() => undefined);
     } catch (err) {
       logger.error({ err, to: message.to, subject: message.subject }, 'mail webhook delivery failed');
     }

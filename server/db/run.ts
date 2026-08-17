@@ -198,10 +198,12 @@ export async function seed(dbUrl: string, log: (msg: string) => void = console.l
       throw new Error('another migration or seed operation is already in progress');
     }
     operationLockHeld = true;
-    await client.query('BEGIN');
+    // seed.sql carries its own BEGIN/COMMIT; wrapping it in a second
+    // transaction only produces "already in transaction" warnings. The catch
+    // still issues a ROLLBACK so a mid-file failure leaves no open
+    // transaction on this client before it ends.
     try {
       await client.query(fs.readFileSync(seedFile, 'utf8'));
-      await client.query('COMMIT');
     } catch (error) {
       await cleanupPreservingPrimaryError([() => client.query('ROLLBACK')], true);
       throw error;

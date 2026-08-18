@@ -894,7 +894,11 @@ describe('S3 object download boundaries', () => {
     try {
       await expect(
         resolvePresignedAudio(directS3Request(randomUUID()), new EventEmitter() as never),
-      ).rejects.toMatchObject({ status: 400, message: 'audio upload not found or expired' });
+      ).rejects.toMatchObject({
+        status: 400,
+        message: 'audio upload not found or expired',
+        code: 'AUDIO_UPLOAD_MISSING',
+      });
       expect(createWriteStream).not.toHaveBeenCalled();
     } finally {
       createWriteStream.mockRestore();
@@ -946,7 +950,11 @@ describe('S3 object download boundaries', () => {
 
     await expect(
       resolvePresignedAudio(directS3Request(randomUUID()), new EventEmitter() as never),
-    ).rejects.toMatchObject({ status: 400, message: 'audio upload not found or expired' });
+    ).rejects.toMatchObject({
+      status: 400,
+      message: 'audio upload not found or expired',
+      code: 'AUDIO_UPLOAD_MISSING',
+    });
   });
 
   it('reports an unexpected fetch failure with the learner context and stable client error', async () => {
@@ -1532,7 +1540,10 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
     expect(res.status).toBe(400);
-    expect(res.body.error).toBe('audio upload not found or expired');
+    expect(res.body).toEqual({
+      error: 'audio upload not found or expired',
+      code: 'AUDIO_UPLOAD_MISSING',
+    });
     // Drain the deferred cleanup delete so it cannot leak into the next test.
     await vi.waitFor(() => {
       expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');

@@ -473,6 +473,7 @@ describe('userMessageForError', () => {
       ['CAPACITY_BUSY', 'error.busy'],
       ['POOL_SATURATED', 'error.busy'],
       ['AUDIO_INVALID', 'error.audioInvalid'],
+      ['AUDIO_UPLOAD_MISSING', 'error.audioInvalid'],
       ['AUDIO_TOO_LARGE', 'error.tooLarge'],
       ['AUDIO_TOO_LONG', 'error.audioTooLong'],
       ['AUDIO_UNREADABLE', 'error.audioUnreadable'],
@@ -699,6 +700,57 @@ describe('apiFetch', () => {
       'Content-Type': 'application/json',
       Authorization: 'Bearer jwt-first-request',
     });
+  });
+
+  it('marks a request started exactly once after token acquisition and immediately before fetch', async () => {
+    const tokenReadStarted = deferred<void>();
+    const allowTokenRead = deferred<string | null>();
+    const events: string[] = [];
+    jest.resetModules();
+    const freshSecureStore = require('expo-secure-store') as typeof SecureStore;
+    jest.mocked(freshSecureStore.getItemAsync).mockImplementationOnce(async () => {
+      tokenReadStarted.resolve();
+      return allowTokenRead.promise;
+    });
+    const fresh = require('../src/lib/api') as ApiModule;
+    const onRequestStarted = jest.fn(() => events.push('request-started'));
+    fetchMock.mockImplementationOnce(async () => {
+      events.push('fetch');
+      return fakeResponse();
+    });
+
+    const request = fresh.apiFetch('/me', { onRequestStarted });
+    await tokenReadStarted.promise;
+
+    expect(onRequestStarted).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    allowTokenRead.resolve('jwt-after-delay');
+    await expect(request).resolves.toEqual({});
+
+    expect(onRequestStarted).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(['request-started', 'fetch']);
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer jwt-after-delay',
+    });
+  });
+
+  it('does not mark a pre-aborted request as started', async () => {
+    const controller = new AbortController();
+    const reason = new Error('cancelled before request start');
+    const onRequestStarted = jest.fn();
+    controller.abort(reason);
+    fetchMock.mockRejectedValue(new Error('aborted by platform'));
+
+    await catchAsync(
+      api.apiFetch('/pre-aborted-start-hook', {
+        signal: controller.signal,
+        onRequestStarted,
+      }),
+    );
+
+    expect(onRequestStarted).not.toHaveBeenCalled();
   });
 
   it('invokes the unauthorized handler on 401 when a token was used', async () => {
@@ -954,6 +1006,21 @@ describe('error response parsing', () => {
 
     expect(error).toMatchObject({ status: 422, code: 'AUDIO_TOO_LONG' });
     expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.audioTooLong'));
+  });
+
+  it('maps a definitive missing S3 upload to the safe recording-again message', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status: 400,
+        json: async () => ({ code: 'AUDIO_UPLOAD_MISSING' }),
+      }),
+    );
+
+    const error = await catchAsync(api.apiFetch('/practice/attempt'));
+
+    expect(error).toMatchObject({ status: 400, code: 'AUDIO_UPLOAD_MISSING' });
+    expect(api.userMessageForError(error, 'Fallback')).toBe(t('error.audioInvalid'));
   });
 
   describe('retry hints', () => {

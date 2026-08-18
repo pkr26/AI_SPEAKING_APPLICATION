@@ -107,6 +107,7 @@ export const API_ERROR_CODES = [
   'CAPACITY_BUSY',
   'POOL_SATURATED',
   'AUDIO_INVALID',
+  'AUDIO_UPLOAD_MISSING',
   'AUDIO_TOO_LARGE',
   'AUDIO_TOO_LONG',
   'AUDIO_UNREADABLE',
@@ -170,6 +171,7 @@ const CODE_MESSAGE_KEYS: Readonly<Record<ApiErrorCode, MessageKey>> = {
   CAPACITY_BUSY: 'error.busy',
   POOL_SATURATED: 'error.busy',
   AUDIO_INVALID: 'error.audioInvalid',
+  AUDIO_UPLOAD_MISSING: 'error.audioInvalid',
   AUDIO_TOO_LARGE: 'error.tooLarge',
   AUDIO_TOO_LONG: 'error.audioTooLong',
   AUDIO_UNREADABLE: 'error.audioUnreadable',
@@ -521,6 +523,8 @@ interface ApiFetchOptions {
   auth?: boolean;
   /** Some authenticated endpoints use 401 for credential confirmation errors. */
   expireSessionOn401?: boolean;
+  /** Called immediately before the request can reach the API. */
+  onRequestStarted?: () => void;
 }
 
 function handleUnauthorized(status: number, token: string | null, enabled: boolean): void {
@@ -534,6 +538,7 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
   const token = useAuth ? await tokenForRequest() : null;
   const timeoutMs = options.timeoutMs ?? JSON_TIMEOUT_MS;
   const startedAt = Date.now();
+  if (!options.signal?.aborted) options.onRequestStarted?.();
   const res = await fetchWithTimeout(
     `${API_URL}${path}`,
     {

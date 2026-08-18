@@ -11,11 +11,11 @@ import {
   createAudioPlayer,
   setAudioModeAsync,
   useAudioRecorder,
-  useAudioRecorderState,
+  type RecordingStatus,
 } from 'expo-audio';
 import * as Crypto from 'expo-crypto';
 import * as Haptics from 'expo-haptics';
-import { File } from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import React from 'react';
 import type { TestInstance } from 'test-renderer';
 import {
@@ -23,6 +23,7 @@ import {
   Animated,
   AppState,
   Linking,
+  Platform,
   StyleSheet,
   Text,
   useColorScheme,
@@ -42,10 +43,13 @@ import {
 } from '../src/lib/api';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import {
+  claimPendingAssessmentRecoveryPost,
   clearPendingAssessment,
   loadPendingAssessment,
+  markPendingAssessmentCancelled,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
+  refundPendingAssessmentRecoveryPost,
   savePendingAssessment,
   type PendingAssessment,
 } from '../src/lib/pending-assessment';
@@ -71,12 +75,18 @@ jest.mock('expo-secure-store', () => ({
 jest.mock('expo-crypto', () => ({ randomUUID: jest.fn() }));
 
 jest.mock('expo-file-system', () => ({
+  Directory: jest.fn(() => ({
+    exists: true,
+    list: jest.fn(() => []),
+  })),
   File: jest.fn((uri: string) => ({
     uri,
     exists: true,
+    size: 1024,
     delete: jest.fn(),
     arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
   })),
+  Paths: { cache: 'file:///cache' },
   UploadType: { MULTIPART: 'multipart' },
 }));
 
@@ -99,7 +109,6 @@ jest.mock('expo-audio', () => ({
   createAudioPlayer: jest.fn(),
   setAudioModeAsync: jest.fn(),
   useAudioRecorder: jest.fn(),
-  useAudioRecorderState: jest.fn(),
 }));
 
 jest.mock('expo-haptics', () => ({
@@ -155,10 +164,13 @@ jest.mock('../src/lib/api', () => {
 });
 
 jest.mock('../src/lib/pending-assessment', () => ({
+  claimPendingAssessmentRecoveryPost: jest.fn(),
   clearPendingAssessment: jest.fn(),
   loadPendingAssessment: jest.fn(),
+  markPendingAssessmentCancelled: jest.fn(),
   markPendingAssessmentForReconciliation: jest.fn(),
   markPendingAssessmentStage: jest.fn(),
+  refundPendingAssessmentRecoveryPost: jest.fn(),
   savePendingAssessment: jest.fn(),
 }));
 
@@ -190,6 +202,7 @@ const recordedStatusText = (elapsed: string) => t('recorder.statusRecorded', { e
 const waitingForText = (elapsed: string) => t('recorder.waitingFor', { elapsed });
 
 interface MockRecorder {
+  getStatus: jest.Mock;
   prepareToRecordAsync: jest.Mock;
   record: jest.Mock;
   stop: jest.Mock;
@@ -198,6 +211,7 @@ interface MockRecorder {
 }
 
 interface MockRecorderState {
+  canRecord: boolean;
   isRecording: boolean;
   durationMillis: number;
   url: string | null;
@@ -225,10 +239,14 @@ function makeMockPreviewPlayer(): MockPreviewPlayer {
 
 let mockRecorder: MockRecorder;
 let mockRecorderState: MockRecorderState;
+let liveRecorderState: MockRecorderState;
+let recordingStatusListener: ((status: RecordingStatus) => void) | undefined;
 let mockPreviewPlayer: MockPreviewPlayer;
 let appStateHandlers: ((state: AppStateStatus) => void)[];
 let appStateSubscriptionRemove: jest.Mock;
 let reduceMotionSubscriptionRemove: jest.Mock;
+let mockRecoveryPostAttempts: number;
+let mockRecorderStatusReads: number;
 
 const asMock = (fn: unknown) => fn as jest.Mock;
 
@@ -240,6 +258,50 @@ function deferred<T>() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function emitRecordingStatus(overrides: Partial<RecordingStatus> = {}): void {
+  if (!recordingStatusListener) throw new Error('Recording status listener was not installed');
+  recordingStatusListener({
+    id: 'test-recording',
+    isFinished: false,
+    hasError: false,
+    error: null,
+    url: null,
+    ...overrides,
+  });
+}
+
+function mockStartedApiFetchFailureOnce(error: unknown): void {
+  asMock(apiFetch).mockImplementationOnce(
+    async (_path: string, options?: { onRequestStarted?: () => void }) => {
+      options?.onRequestStarted?.();
+      throw error;
+    },
+  );
+}
+
+function mockStartedApiFetchResultOnce(result: unknown): void {
+  asMock(apiFetch).mockImplementationOnce(
+    async (_path: string, options?: { onRequestStarted?: () => void }) => {
+      options?.onRequestStarted?.();
+      return result;
+    },
+  );
+}
+
+function mockStartedUploadFailure(error: unknown): void {
+  asMock(apiUploadAudio).mockImplementation(
+    async (
+      _endpoint: string,
+      _uri: string,
+      _fields: unknown,
+      options?: { onRequestStarted?: () => void },
+    ) => {
+      options?.onRequestStarted?.();
+      throw error;
+    },
+  );
 }
 
 async function flushMicrotasks(rounds = 25): Promise<void> {
@@ -476,12 +538,14 @@ async function renderRecorder(overrides: RecorderTestOverrides = {}) {
   const props = recorderTestProps(overrides);
   const view = await render(<Recorder {...props} />);
   await flushAct();
+  await flushAct();
   return { view, props };
 }
 
 async function renderIdentityRaceRecorder(overrides: RecorderTestOverrides = {}) {
   const props = recorderTestProps(overrides);
   const view = await render(<IdentityLayoutHarness recorderProps={props} />);
+  await flushAct();
   await flushAct();
   return { view, props };
 }
@@ -560,7 +624,7 @@ async function submitLiveRecordingIntoRecovery(
     .mockResolvedValueOnce(null)
     .mockResolvedValueOnce(null)
     .mockResolvedValue(recoveryRecord);
-  asMock(apiUploadAudio).mockRejectedValue(new ApiError(0, 'connection interrupted'));
+  mockStartedUploadFailure(new ApiError(0, 'connection interrupted'));
   const rendered = await renderRecorder(overrides);
   await recordAndStop();
   asMock(File).mockClear();
@@ -576,6 +640,8 @@ beforeEach(() => {
   reduceMotionSubscriptionRemove = jest.fn();
   mockFocusSubscribers = [];
   mockScreenFocused = true;
+  mockRecoveryPostAttempts = 0;
+  mockRecorderStatusReads = 0;
   // Module factory mocks outlive restoreAllMocks; re-arm the light default.
   asMock(useColorScheme).mockReset();
   asMock(useColorScheme).mockReturnValue('light');
@@ -589,25 +655,54 @@ beforeEach(() => {
   });
 
   mockRecorder = {
+    getStatus: jest.fn(() => {
+      mockRecorderStatusReads += 1;
+      return mockRecorderStatusReads === 1 ? { ...mockRecorderState } : liveRecorderState;
+    }),
     prepareToRecordAsync: jest.fn(async () => undefined),
-    record: jest.fn(),
+    record: jest.fn(() => {
+      mockRecorder.isRecording = true;
+      mockRecorderState = {
+        ...mockRecorderState,
+        canRecord: true,
+        isRecording: true,
+      };
+    }),
     stop: jest.fn(async () => {
+      mockRecorder.isRecording = false;
+      mockRecorderState = {
+        ...mockRecorderState,
+        canRecord: false,
+        isRecording: false,
+      };
       mockRecorder.uri = RECORDING_URI;
+      emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
     }),
     uri: null,
     isRecording: false,
   };
   mockRecorderState = {
+    canRecord: true,
     isRecording: false,
     durationMillis: 0,
     url: null,
     mediaServicesDidReset: false,
   };
+  // Keep the state object held by Recorder live across explicit rerenders.
+  // Expo returns immutable snapshots, while this forwarding proxy lets tests
+  // model the next native snapshot without waiting 200 real milliseconds.
+  liveRecorderState = new Proxy({} as MockRecorderState, {
+    get: (_target, property: keyof MockRecorderState) => mockRecorderState[property],
+  });
 
   asMock(useAudioRecorder).mockReset();
-  asMock(useAudioRecorder).mockImplementation(() => mockRecorder);
-  asMock(useAudioRecorderState).mockReset();
-  asMock(useAudioRecorderState).mockImplementation(() => mockRecorderState);
+  recordingStatusListener = undefined;
+  asMock(useAudioRecorder).mockImplementation(
+    (_options: unknown, listener?: (status: RecordingStatus) => void) => {
+      recordingStatusListener = listener;
+      return mockRecorder;
+    },
+  );
   mockPreviewPlayer = makeMockPreviewPlayer();
   asMock(createAudioPlayer).mockReset();
   asMock(createAudioPlayer).mockImplementation(() => mockPreviewPlayer);
@@ -633,8 +728,14 @@ beforeEach(() => {
   asMock(File).mockImplementation((uri: string) => ({
     uri,
     exists: true,
+    size: 1024,
     delete: jest.fn(),
     arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
+  }));
+  asMock(Directory).mockReset();
+  asMock(Directory).mockImplementation(() => ({
+    exists: true,
+    list: jest.fn(() => []),
   }));
 
   asMock(apiFetch).mockReset();
@@ -643,7 +744,17 @@ beforeEach(() => {
   asMock(apiPostPresignedAudio).mockReset();
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);
   asMock(apiUploadAudio).mockReset();
-  asMock(apiUploadAudio).mockResolvedValue({ ok: true });
+  asMock(apiUploadAudio).mockImplementation(
+    async (
+      _endpoint: string,
+      _uri: string,
+      _fields: unknown,
+      options?: { onRequestStarted?: () => void },
+    ) => {
+      options?.onRequestStarted?.();
+      return { ok: true };
+    },
+  );
   asMock(resolveAudioFileDescriptor).mockReset();
   asMock(resolveAudioFileDescriptor).mockResolvedValue({
     name: 'audio.m4a',
@@ -658,6 +769,21 @@ beforeEach(() => {
   asMock(clearPendingAssessment).mockResolvedValue(undefined);
   asMock(markPendingAssessmentForReconciliation).mockReset();
   asMock(markPendingAssessmentForReconciliation).mockResolvedValue(true);
+  asMock(markPendingAssessmentCancelled).mockReset();
+  asMock(markPendingAssessmentCancelled).mockResolvedValue(true);
+  asMock(claimPendingAssessmentRecoveryPost).mockReset();
+  asMock(claimPendingAssessmentRecoveryPost).mockImplementation(
+    async (_requestId: string, maxAttempts = 1) => {
+      if (mockRecoveryPostAttempts >= maxAttempts) return false;
+      mockRecoveryPostAttempts += 1;
+      return true;
+    },
+  );
+  asMock(refundPendingAssessmentRecoveryPost).mockReset();
+  asMock(refundPendingAssessmentRecoveryPost).mockImplementation(async () => {
+    mockRecoveryPostAttempts = Math.max(0, mockRecoveryPostAttempts - 1);
+    return true;
+  });
   asMock(markPendingAssessmentStage).mockReset();
   asMock(markPendingAssessmentStage).mockResolvedValue(true);
 
@@ -674,7 +800,8 @@ beforeEach(() => {
     .mockReturnValue({ remove: reduceMotionSubscriptionRemove } as unknown as EmitterSubscription);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await flushAct();
   jest.useRealTimers();
   jest.restoreAllMocks();
 });
@@ -718,6 +845,41 @@ describe('sleepAbortable', () => {
 describe('Recorder', () => {
   describe('idle rendering and recording lifecycle', () => {
     it('renders idle with a start button and no permission banner', async () => {
+      const currentDelete = jest.fn();
+      const audioOrphanDelete = jest.fn();
+      const expoOrphanDelete = jest.fn(() => {
+        throw new Error('cache entry disappeared');
+      });
+      const cacheEntry = (uri: string, name: string, remove: jest.Mock) =>
+        Object.assign(Object.create((File as unknown as { prototype: object }).prototype), {
+          uri,
+          name,
+          delete: remove,
+        });
+      const currentUri = 'file:///cache/Audio/recording-current.m4a';
+      mockRecorder.uri = currentUri;
+      asMock(Directory).mockImplementation((_root: unknown, directoryName: string) => ({
+        exists: true,
+        list: jest.fn(() =>
+          directoryName === 'Audio'
+            ? [
+                cacheEntry(currentUri, 'recording-current.m4a', currentDelete),
+                cacheEntry(
+                  'file:///cache/Audio/recording-orphan.m4a',
+                  'recording-orphan.m4a',
+                  audioOrphanDelete,
+                ),
+              ]
+            : [
+                cacheEntry(
+                  'file:///cache/ExpoAudio/recording-orphan.m4a',
+                  'recording-orphan.m4a',
+                  expoOrphanDelete,
+                ),
+              ],
+        ),
+      }));
+
       await renderRecorder();
 
       expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
@@ -729,6 +891,11 @@ describe('Recorder', () => {
         screen.getByText('We send your recording only after you tap Send Answer.'),
       ).toBeTruthy();
       expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(Directory).toHaveBeenCalledWith(Paths.cache, 'Audio');
+      expect(Directory).toHaveBeenCalledWith(Paths.cache, 'ExpoAudio');
+      expect(currentDelete).not.toHaveBeenCalled();
+      expect(audioOrphanDelete).toHaveBeenCalledTimes(1);
+      expect(expoOrphanDelete).toHaveBeenCalledTimes(1);
     });
 
     it('does not run the assessment wait clock while idle', async () => {
@@ -835,8 +1002,11 @@ describe('Recorder', () => {
             bitsPerSecond: 64_000,
           }),
         }),
+        expect.any(Function),
       );
-      expect(useAudioRecorderState).toHaveBeenCalledWith(mockRecorder, 200);
+      const installedStatusListeners = asMock(useAudioRecorder).mock.calls.map((call) => call[1]);
+      expect(new Set(installedStatusListeners).size).toBe(1);
+      expect(mockRecorder.getStatus).toHaveBeenCalled();
       expect(setAudioModeAsync).toHaveBeenCalledWith({
         allowsRecording: true,
         allowsBackgroundRecording: false,
@@ -1004,7 +1174,10 @@ describe('Recorder', () => {
       asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
       const { view, props } = await renderRecorder();
 
-      const start = invokePressHandler(view, START_LABEL);
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
       );
@@ -1040,14 +1213,62 @@ describe('Recorder', () => {
       expect(props.onError).not.toHaveBeenCalled();
     });
 
-    it('abandons a granted prompt when the app never comes back to the foreground', async () => {
+    it('shows a prompt denial only after the permission dialog returns to foreground', async () => {
+      jest.useFakeTimers();
+      const permission = deferred<{ granted: boolean; canAskAgain: boolean }>();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
+        granted: false,
+        canAskAgain: true,
+      });
+      asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
+      const { view } = await renderRecorder();
+
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
+      await waitFor(() =>
+        expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
+      );
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        permission.resolve({ granted: false, canAskAgain: false });
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        jest.advanceTimersByTime(2_000);
+        await start;
+        await flushMicrotasks();
+      });
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy();
+      expect(screen.getByText(t('recorder.openSettings'))).toBeTruthy();
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+    });
+
+    it('defers a granted prompt until a late foreground return', async () => {
       jest.useFakeTimers();
       const permission = deferred<{ granted: boolean }>();
       asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: false });
       asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
       const { view, props } = await renderRecorder();
 
-      const start = invokePressHandler(view, START_LABEL);
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
       );
@@ -1082,23 +1303,26 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
 
-      // The learner really did leave: nothing records, nothing is announced,
-      // and the device is never switched into recording mode behind them.
+      // The learner really did leave: nothing records or switches audio mode
+      // while the app remains inactive.
       expect(setAudioModeAsync).not.toHaveBeenCalledWith(
         expect.objectContaining({ allowsRecording: true }),
       );
       expect(mockRecorder.record).not.toHaveBeenCalled();
       expect(props.onError).not.toHaveBeenCalled();
 
-      // ...and the wait released both its listener and the recorder controls,
-      // so the next tap in the foreground records normally.
+      // The bounded waiter releases its listener/operation, but remembers the
+      // granted response so the original tap resumes automatically on active.
       expect(appStateSubscriptionRemove).toHaveBeenCalledTimes(1);
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
         writable: true,
         value: 'active',
       });
-      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
       await waitFor(() => expect(mockRecorder.record).toHaveBeenCalledTimes(1));
     });
 
@@ -1118,12 +1342,50 @@ describe('Recorder', () => {
       expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
     });
 
+    it('times out a start invoked while the app is already inactive', async () => {
+      jest.useFakeTimers();
+      const { view, props } = await renderRecorder();
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'inactive',
+      });
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
+
+      await act(async () => {
+        jest.advanceTimersByTime(2_000);
+        await start;
+        await flushMicrotasks();
+      });
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errStartFailed'));
+      expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+    });
+
+    it('locks recovery when start preflight cannot read durable metadata', async () => {
+      const { props } = await renderRecorder();
+      asMock(loadPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
+
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUnavailable')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(mockRecorder.prepareToRecordAsync).not.toHaveBeenCalled();
+    });
+
     it('opens device settings after microphone permission is permanently denied', async () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
         granted: false,
         canAskAgain: false,
       });
       const openSettings = jest.spyOn(Linking, 'openSettings').mockResolvedValue(undefined);
+      openSettings.mockClear();
       await renderRecorder();
 
       await fireEvent.press(screen.getByLabelText(START_LABEL));
@@ -1195,7 +1457,7 @@ describe('Recorder', () => {
       expect(mockRecorder.record).not.toHaveBeenCalled();
     });
 
-    it('reports an error and restores audio mode when the permission check fails', async () => {
+    it('reports an error without disturbing another audio session when the permission check fails', async () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockRejectedValue(
         new Error('native permission failure'),
       );
@@ -1205,11 +1467,7 @@ describe('Recorder', () => {
       await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('recorder.errStartFailed')));
 
       expect(mockRecorder.record).not.toHaveBeenCalled();
-      expect(setAudioModeAsync).toHaveBeenCalledWith({
-        allowsRecording: false,
-        allowsBackgroundRecording: false,
-        shouldPlayInBackground: false,
-      });
+      expect(setAudioModeAsync).not.toHaveBeenCalled();
       expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
     });
 
@@ -1271,6 +1529,7 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
@@ -1297,8 +1556,40 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
+    });
+
+    it('rejects an Android stop that resolves but reports its native failure by status event', async () => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(Platform, 'OS');
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: 'android' });
+      try {
+        mockRecorder.stop.mockImplementation(async () => {
+          mockRecorder.uri = RECORDING_URI;
+          mockRecorder.isRecording = false;
+          emitRecordingStatus({
+            isFinished: true,
+            hasError: true,
+            error: 'MediaRecorder.stop failed',
+            url: RECORDING_URI,
+          });
+          return { url: null };
+        });
+        const { props } = await renderRecorder();
+        await startRecording();
+        mockRecorderState.durationMillis = 5_000;
+
+        await fireEvent.press(screen.getByLabelText(STOP_LABEL));
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(t('recorder.errSaveFailed')),
+        );
+
+        expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
+        expect(deletedRecordingUris()).toContain(RECORDING_URI);
+      } finally {
+        if (platformDescriptor) Object.defineProperty(Platform, 'OS', platformDescriptor);
+      }
     });
 
     it('discards a rejected stop whose recording file no longer exists', async () => {
@@ -1312,6 +1603,25 @@ describe('Recorder', () => {
         mockRecorder.uri = RECORDING_URI;
         throw new Error('native stop failure');
       });
+      const { props } = await renderRecorder();
+      await startRecording();
+      mockRecorderState.durationMillis = 5_000;
+
+      await fireEvent.press(screen.getByLabelText(STOP_LABEL));
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('recorder.errSaveFailed')));
+
+      expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('rejects a zero-byte recording even when the native URI exists', async () => {
+      asMock(File).mockImplementation((uri: string) => ({
+        uri,
+        exists: true,
+        size: 0,
+        delete: jest.fn(),
+        arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
+      }));
       const { props } = await renderRecorder();
       await startRecording();
       mockRecorderState.durationMillis = 5_000;
@@ -1390,12 +1700,13 @@ describe('Recorder', () => {
       async (wallDuration, valid) => {
         const startedAt = 1_700_000_000_000;
         jest.useFakeTimers({ now: startedAt });
+        const monotonicNow = jest.spyOn(performance, 'now').mockReturnValue(1_000);
         asMock(AccessibilityInfo.isReduceMotionEnabled).mockResolvedValue(true);
         const { props } = await renderRecorder();
         await startRecording();
 
         mockRecorderState.durationMillis = 100;
-        jest.setSystemTime(startedAt + wallDuration);
+        monotonicNow.mockReturnValue(1_000 + wallDuration);
 
         await fireEvent.press(screen.getByLabelText(STOP_LABEL));
         if (valid) {
@@ -1419,8 +1730,113 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
+    });
+
+    it('retries audio-mode restoration once before releasing its global owner', async () => {
+      let restoreAttempts = 0;
+      asMock(setAudioModeAsync).mockImplementation(
+        async ({ allowsRecording }: { allowsRecording: boolean }) => {
+          if (allowsRecording) return;
+          restoreAttempts += 1;
+          if (restoreAttempts === 1) throw new Error('transient audio-session failure');
+        },
+      );
+      const { props } = await renderRecorder();
+
+      await recordAndStop();
+
+      expect(restoreAttempts).toBe(2);
+      expect(props.onError).not.toHaveBeenCalledWith(t('recorder.errAudioReset'));
+      expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy();
+    });
+
+    it('reports one foreground error after both audio-mode restore attempts fail', async () => {
+      asMock(setAudioModeAsync).mockImplementation(
+        async ({ allowsRecording }: { allowsRecording: boolean }) => {
+          if (!allowsRecording) throw new Error('audio session would not reset');
+        },
+      );
+      const { props } = await renderRecorder();
+
+      await recordAndStop();
+
+      expect(setAudioModeAsync).toHaveBeenCalledTimes(3);
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errAudioReset'));
+      expect(props.onError).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy();
+    });
+
+    it('waits for a stale instance to restore audio mode before a new instance records', async () => {
+      const restored = deferred<void>();
+      asMock(setAudioModeAsync).mockImplementation(
+        ({ allowsRecording }: { allowsRecording: boolean }) =>
+          allowsRecording ? Promise.resolve() : restored.promise,
+      );
+      const first = await renderRecorder();
+      await startRecording();
+      await first.view.unmount();
+      await waitFor(() =>
+        expect(setAudioModeAsync).toHaveBeenCalledWith(
+          expect.objectContaining({ allowsRecording: false }),
+        ),
+      );
+
+      const second = await renderRecorder();
+      let nextStart!: Promise<void>;
+      await act(() => {
+        nextStart = invokePressHandler(second.view, START_LABEL);
+      });
+      await flushAct();
+      expect(
+        asMock(setAudioModeAsync).mock.calls.filter(
+          ([options]) => (options as { allowsRecording: boolean }).allowsRecording,
+        ),
+      ).toHaveLength(1);
+
+      await act(async () => {
+        restored.resolve();
+        await nextStart;
+        await flushMicrotasks();
+      });
+
+      expect(
+        asMock(setAudioModeAsync).mock.calls.filter(
+          ([options]) => (options as { allowsRecording: boolean }).allowsRecording,
+        ),
+      ).toHaveLength(2);
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+    });
+
+    it('allows only one recorder instance to acquire the global audio session', async () => {
+      const firstError = jest.fn();
+      const secondError = jest.fn();
+      const first = recorderTestProps({ onError: firstError });
+      const second = recorderTestProps({ onError: secondError });
+      await render(
+        <>
+          <Recorder {...first} />
+          <Recorder {...second} />
+        </>,
+      );
+      await flushAct();
+      await flushAct();
+      const startButtons = screen.getAllByLabelText(START_LABEL);
+      const firstStart = compositePressablePropsForNode(startButtons[0]).onPress as () => unknown;
+      const secondStart = compositePressablePropsForNode(startButtons[1]).onPress as () => unknown;
+
+      await act(async () => {
+        await Promise.all([Promise.resolve(firstStart()), Promise.resolve(secondStart())]);
+        await flushMicrotasks();
+      });
+
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+      expect(firstError.mock.calls.length + secondError.mock.calls.length).toBe(1);
+      expect([...firstError.mock.calls, ...secondError.mock.calls]).toContainEqual([
+        t('recorder.errStartFailed'),
+      ]);
     });
 
     it('serializes overlapping stop handlers and rejects a stale stop handler', async () => {
@@ -1428,6 +1844,7 @@ describe('Recorder', () => {
       mockRecorder.stop.mockImplementation(async () => {
         await nativeStop.promise;
         mockRecorder.uri = RECORDING_URI;
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
       });
       const { view } = await renderRecorder();
       await startRecording();
@@ -1437,8 +1854,12 @@ describe('Recorder', () => {
       const stopHandler = compositePressableProps(view, STOP_LABEL).onPress as () => Promise<void>;
       asMock(setAudioModeAsync).mockClear();
 
-      const firstStop = stopHandler();
-      const overlappingStop = stopHandler();
+      let firstStop!: Promise<void>;
+      let overlappingStop!: Promise<void>;
+      await act(() => {
+        firstStop = stopHandler();
+        overlappingStop = stopHandler();
+      });
       expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
 
       await act(async () => {
@@ -1451,6 +1872,7 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
 
@@ -1470,6 +1892,7 @@ describe('Recorder', () => {
 
       mockRecorder.stop.mockImplementation(async () => {
         mockRecorder.uri = secondUri;
+        emitRecordingStatus({ isFinished: true, url: secondUri });
       });
       asMock(File).mockClear();
       await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
@@ -1496,6 +1919,80 @@ describe('Recorder', () => {
       expect(screen.getByText(recordingStatusText('1:05'))).toBeTruthy();
     });
 
+    it('does not mistake an interrupt-paused recorder for a completed take', async () => {
+      const { view, props } = await renderRecorder();
+      await startRecording();
+
+      mockRecorder.uri = RECORDING_URI;
+      mockRecorderState = {
+        ...mockRecorderState,
+        canRecord: true,
+        isRecording: false,
+        durationMillis: 5_000,
+        url: RECORDING_URI,
+      };
+      await view.rerender(<Recorder {...props} />);
+      await flushAct();
+
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+      expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['encoder error', { hasError: true, error: 'encoder failed' }],
+      ['media-services reset', { mediaServicesDidReset: true }],
+    ] as const)('tears down a recording after a terminal %s event', async (_case, event) => {
+      const { props } = await renderRecorder();
+      await startRecording();
+
+      await act(async () => {
+        emitRecordingStatus(event);
+        await flushMicrotasks();
+      });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errDeviceInterrupted')),
+      );
+      await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
+      expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
+      expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      ['too short', 100, 1024, 'recorder.errTooShort'],
+      ['empty', 5_000, 0, 'recorder.errSaveFailed'],
+    ] as const)(
+      'rejects a completed status-event take that is %s',
+      async (_case, durationMillis, size, messageKey) => {
+        asMock(File).mockImplementation((uri: string) => ({
+          uri,
+          exists: true,
+          size,
+          delete: jest.fn(),
+          arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
+        }));
+        const { props } = await renderRecorder();
+        await startRecording();
+        mockRecorder.uri = RECORDING_URI;
+        mockRecorderState = {
+          ...mockRecorderState,
+          canRecord: false,
+          isRecording: false,
+          durationMillis,
+        };
+
+        await act(async () => {
+          emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+          await flushMicrotasks();
+        });
+
+        await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t(messageKey)));
+        expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+        expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
+      },
+    );
+
     it('adopts a native auto-stop and clamps the duration at two minutes', async () => {
       const { view, props } = await renderRecorder();
       await startRecording();
@@ -1510,11 +2007,16 @@ describe('Recorder', () => {
 
       mockRecorder.uri = RECORDING_URI;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 200_000,
         url: null,
         mediaServicesDidReset: false,
       };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+        await flushMicrotasks();
+      });
       await view.rerender(<Recorder {...props} />);
       await flushAct();
 
@@ -1531,6 +2033,7 @@ describe('Recorder', () => {
         // to recorded; within the grace window it must not destroy the take.
         const autoStoppedAt = 1_700_000_000_000;
         jest.useFakeTimers({ now: autoStoppedAt });
+        const monotonicNow = jest.spyOn(performance, 'now').mockReturnValue(1_000);
         asMock(AccessibilityInfo.isReduceMotionEnabled).mockResolvedValue(true);
         const { view, props } = await renderRecorder();
         await startRecording();
@@ -1545,16 +2048,21 @@ describe('Recorder', () => {
 
         mockRecorder.uri = RECORDING_URI;
         mockRecorderState = {
+          canRecord: false,
           isRecording: false,
           durationMillis: 120_000,
           url: null,
           mediaServicesDidReset: false,
         };
+        await act(async () => {
+          emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+          await flushMicrotasks();
+        });
         await view.rerender(<Recorder {...props} />);
         await flushAct();
         expect(screen.getByText(recordedStatusText('2:00'))).toBeTruthy();
 
-        jest.setSystemTime(autoStoppedAt + elapsed);
+        monotonicNow.mockReturnValue(1_000 + elapsed);
         await fireEvent.press(screen.getByLabelText(START_LABEL));
         await flushAct();
 
@@ -1569,6 +2077,101 @@ describe('Recorder', () => {
         }
       },
     );
+
+    it('does not apply auto-stop tap grace after the monotonic clock moves backward', async () => {
+      const monotonicNow = jest.spyOn(performance, 'now').mockReturnValue(2_000);
+      const { view, props } = await renderRecorder();
+      await startRecording();
+      mockRecorder.uri = RECORDING_URI;
+      mockRecorderState = {
+        ...mockRecorderState,
+        canRecord: false,
+        isRecording: false,
+        durationMillis: 5_000,
+      };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+        await flushMicrotasks();
+      });
+      await view.rerender(<Recorder {...props} />);
+      await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
+
+      monotonicNow.mockReturnValue(1_999);
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+
+      expect(mockRecorder.record).toHaveBeenCalledTimes(2);
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+    });
+
+    it('uses its own web auto-stop timer and never passes forDuration to the browser', async () => {
+      jest.useFakeTimers();
+      const platformDescriptor = Object.getOwnPropertyDescriptor(Platform, 'OS');
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+      try {
+        await renderRecorder();
+        await startRecording();
+
+        expect(mockRecorder.record).toHaveBeenCalledWith();
+        expect(mockRecorder.record).not.toHaveBeenCalledWith({ forDuration: 120 });
+        mockRecorderState.durationMillis = 5_000;
+        await fireEvent.press(screen.getByLabelText(STOP_LABEL));
+        await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
+        expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+          jest.advanceTimersByTime(120_000);
+          await flushMicrotasks();
+        });
+        expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+      } finally {
+        if (platformDescriptor) Object.defineProperty(Platform, 'OS', platformDescriptor);
+      }
+    });
+
+    it('runs the web auto-stop timer and adopts the completed blob', async () => {
+      jest.useFakeTimers();
+      let monotonicTime = 1_000;
+      jest.spyOn(performance, 'now').mockImplementation(() => monotonicTime);
+      const platformDescriptor = Object.getOwnPropertyDescriptor(Platform, 'OS');
+      const blobUri = 'blob:https://app.example/recordings/timed.webm';
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+      try {
+        mockRecorder.stop.mockImplementation(async () => {
+          mockRecorder.isRecording = false;
+          mockRecorder.uri = blobUri;
+        });
+        const { props } = await renderRecorder();
+        await startRecording();
+        mockRecorderState.durationMillis = 120_000;
+        monotonicTime = 121_000;
+
+        await act(async () => {
+          jest.advanceTimersByTime(120_000);
+          await flushMicrotasks();
+        });
+
+        expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+        expect(props.onError).not.toHaveBeenCalled();
+        await waitFor(() => expect(screen.getByText(recordedStatusText('2:00'))).toBeTruthy());
+      } finally {
+        if (platformDescriptor) Object.defineProperty(Platform, 'OS', platformDescriptor);
+      }
+    });
+
+    it('polls recorder status only while a live recording needs it', async () => {
+      const interval = jest.spyOn(globalThis, 'setInterval');
+      const clear = jest.spyOn(globalThis, 'clearInterval');
+      await renderRecorder();
+      expect(interval).not.toHaveBeenCalledWith(expect.any(Function), 200);
+
+      await startRecording();
+      expect(interval).toHaveBeenCalledWith(expect.any(Function), 200);
+      mockRecorderState.durationMillis = 5_000;
+      await fireEvent.press(screen.getByLabelText(STOP_LABEL));
+      await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
+
+      expect(clear).toHaveBeenCalled();
+    });
 
     it('re-records immediately from the mic after a user-tapped stop', async () => {
       // The grace window guards only native auto-stops; a take the learner
@@ -1603,11 +2206,16 @@ describe('Recorder', () => {
 
         mockRecorder.uri = null;
         mockRecorderState = {
+          canRecord: false,
           isRecording: false,
           durationMillis: 5_000,
           url: fallbackUri,
           mediaServicesDidReset: false,
         };
+        await act(async () => {
+          emitRecordingStatus({ isFinished: true });
+          await flushMicrotasks();
+        });
         await view.rerender(<Recorder {...props} />);
         await flushAct();
         expect(screen.getByText(recordedStatusText('0:05'))).toBeTruthy();
@@ -1646,11 +2254,16 @@ describe('Recorder', () => {
 
       mockRecorder.uri = null;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 5_000,
         url: null,
         mediaServicesDidReset: false,
       };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true });
+        await flushMicrotasks();
+      });
       await view.rerender(<Recorder {...props} />);
       await flushAct();
 
@@ -1811,6 +2424,30 @@ describe('Recorder', () => {
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
+    it('reports one discard after duplicate inactive and background notifications', async () => {
+      const { props } = await renderRecorder();
+      await startRecording();
+
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('inactive');
+        await flushMicrotasks();
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errBackgroundDiscarded'));
+      expect(props.onError).toHaveBeenCalledTimes(1);
+    });
+
     it('says nothing on return when the background found no take to discard', async () => {
       const { props } = await renderRecorder();
 
@@ -1862,19 +2499,34 @@ describe('Recorder', () => {
       expect(reduceMotionSubscriptionRemove).toHaveBeenCalledTimes(1);
     });
 
+    it('ignores an unavailable reduce-motion preference read', async () => {
+      jest
+        .spyOn(AccessibilityInfo, 'isReduceMotionEnabled')
+        .mockRejectedValue(new Error('accessibility service unavailable'));
+
+      await renderRecorder();
+
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
+    });
+
     it('shares one native stop across repeated background notifications', async () => {
       const stop = deferred<void>();
       mockRecorder.stop.mockImplementation(async () => {
         await stop.promise;
         mockRecorder.uri = RECORDING_URI;
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
       });
       await renderRecorder();
       await startRecording();
 
-      for (const handler of appStateHandlers) {
-        handler('background');
-        handler('background');
-      }
+      await act(async () => {
+        for (const handler of appStateHandlers) {
+          handler('background');
+          handler('background');
+        }
+        await flushMicrotasks();
+      });
       expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
 
       await act(async () => {
@@ -1933,6 +2585,7 @@ describe('Recorder', () => {
       mockRecorder.stop.mockImplementation(async () => {
         await stop.promise;
         mockRecorder.uri = RECORDING_URI;
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
       });
       const { props } = await renderRecorder();
       await startRecording();
@@ -1949,14 +2602,19 @@ describe('Recorder', () => {
         writable: true,
         value: 'background',
       });
-      for (const handler of appStateHandlers) handler('background');
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
         writable: true,
         value: 'active',
       });
-      for (const handler of appStateHandlers) handler('active');
-      await flushAct();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
 
       expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
       expect(apiFetch).not.toHaveBeenCalled();
@@ -1969,6 +2627,7 @@ describe('Recorder', () => {
 
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(deletedRecordingUris()).toContain(RECORDING_URI);
     });
@@ -2102,6 +2761,7 @@ describe('Recorder', () => {
       // The native recorder never reports isRecording, so the URI left behind
       // by the discarded take must not be adopted as the new one.
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 4_000,
         url: null,
@@ -2126,11 +2786,16 @@ describe('Recorder', () => {
 
       mockRecorder.uri = RECORDING_URI;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 30_000,
         url: null,
         mediaServicesDidReset: false,
       };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+        await flushMicrotasks();
+      });
       await view.rerender(<Recorder {...props} />);
       await flushAct();
       expect(screen.getByText(recordedStatusText('0:30'))).toBeTruthy();
@@ -2139,6 +2804,7 @@ describe('Recorder', () => {
       // take the learner made and must not silently replace the saved one.
       mockRecorder.uri = laterUri;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 90_000,
         url: null,
@@ -2163,6 +2829,7 @@ describe('Recorder', () => {
       mockRecorder.stop.mockImplementation(async () => {
         await stop.promise;
         mockRecorder.uri = RECORDING_URI;
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
       });
       const { view, props } = await renderRecorder();
       await startRecording();
@@ -2170,11 +2837,14 @@ describe('Recorder', () => {
       await view.rerender(<Recorder {...props} />);
       await flushAct();
 
-      for (const handler of appStateHandlers) handler('background');
-      await flushAct();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
 
       mockRecorder.uri = RECORDING_URI;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 9_000,
         url: null,
@@ -2295,7 +2965,10 @@ describe('Recorder', () => {
         const permission = deferred<{ granted: boolean }>();
         asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
         const { view, props } = await renderIdentityRaceRecorder();
-        const staleStart = invokePressHandler(view, START_LABEL);
+        let staleStart!: Promise<void>;
+        await act(() => {
+          staleStart = invokePressHandler(view, START_LABEL);
+        });
         const nextError = jest.fn();
         const nextResult = jest.fn();
         const nextRecovery = jest.fn();
@@ -2331,13 +3004,46 @@ describe('Recorder', () => {
       },
     );
 
+    it('abandons a granted system prompt when the recorder identity changed while it was open', async () => {
+      const permission = deferred<{ granted: boolean }>();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
+        granted: false,
+        canAskAgain: true,
+      });
+      asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
+      const { view, props } = await renderIdentityRaceRecorder();
+      let staleStart!: Promise<void>;
+      await act(() => {
+        staleStart = invokePressHandler(view, START_LABEL);
+      });
+      await waitFor(() =>
+        expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
+      );
+
+      await view.rerender(
+        <IdentityLayoutHarness
+          recorderProps={{ ...props, questionId: OTHER_QUESTION_ID }}
+          onRecorderLayout={() => permission.resolve({ granted: true })}
+        />,
+      );
+      await staleStart;
+      await flushAct();
+
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
     it('abandons an in-flight start when the identity changes during audio-mode setup', async () => {
       const recordingMode = deferred<void>();
       asMock(setAudioModeAsync).mockImplementation(async (options: { allowsRecording: boolean }) =>
         options.allowsRecording ? recordingMode.promise : undefined,
       );
       const { view, props } = await renderRecorder();
-      const staleStart = invokePressHandler(view, START_LABEL);
+      let staleStart!: Promise<void>;
+      await act(() => {
+        staleStart = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(setAudioModeAsync).toHaveBeenCalledWith(
           expect.objectContaining({ allowsRecording: true }),
@@ -2356,6 +3062,7 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
@@ -2365,7 +3072,10 @@ describe('Recorder', () => {
       const preparation = deferred<void>();
       mockRecorder.prepareToRecordAsync.mockReturnValue(preparation.promise);
       const { view, props } = await renderRecorder();
-      const staleStart = invokePressHandler(view, START_LABEL);
+      let staleStart!: Promise<void>;
+      await act(() => {
+        staleStart = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() => expect(mockRecorder.prepareToRecordAsync).toHaveBeenCalledTimes(1));
 
       await view.rerender(<Recorder {...props} questionId={OTHER_QUESTION_ID} />);
@@ -2381,8 +3091,48 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        playsInSilentMode: true,
         shouldPlayInBackground: false,
       });
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+
+      // Disposing the stale prepared instance must release Android's native
+      // preparation latch so the replacement identity can record immediately.
+      mockRecorder.uri = null;
+      await startRecording();
+      expect(mockRecorder.prepareToRecordAsync).toHaveBeenCalledTimes(2);
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+    });
+
+    it('releases stale native preparation even when disposal stop throws', async () => {
+      const preparation = deferred<void>();
+      mockRecorder.prepareToRecordAsync.mockReturnValue(preparation.promise);
+      mockRecorder.stop.mockImplementation(async () => {
+        emitRecordingStatus({
+          isFinished: true,
+          hasError: true,
+          error: 'prepared recorder could not stop',
+        });
+        throw new Error('prepared recorder could not stop');
+      });
+      const { view, props } = await renderIdentityRaceRecorder();
+      let staleStart!: Promise<void>;
+      await act(() => {
+        staleStart = invokePressHandler(view, START_LABEL);
+      });
+      await waitFor(() => expect(mockRecorder.prepareToRecordAsync).toHaveBeenCalledTimes(1));
+
+      await view.rerender(
+        <IdentityLayoutHarness
+          recorderProps={{ ...props, questionId: OTHER_QUESTION_ID }}
+          onRecorderLayout={() => preparation.resolve()}
+        />,
+      );
+      await staleStart;
+      await flushAct();
+
+      expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+      expect(mockRecorder.record).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
@@ -2398,7 +3148,10 @@ describe('Recorder', () => {
         await startRecording();
         mockRecorder.stop.mockImplementation(async () => nativeStop.promise);
         mockRecorderState.durationMillis = 5_000;
-        const staleStop = invokePressHandler(view, STOP_LABEL);
+        let staleStop!: Promise<void>;
+        await act(() => {
+          staleStop = invokePressHandler(view, STOP_LABEL);
+        });
         const nextError = jest.fn();
         const nextResult = jest.fn();
         const nextRecovery = jest.fn();
@@ -2482,6 +3235,7 @@ describe('Recorder', () => {
       try {
         mockRecorder.stop.mockImplementation(async () => {
           mockRecorder.uri = blobUri;
+          emitRecordingStatus({ isFinished: true, url: blobUri });
         });
         const { view, props } = await renderRecorder();
         await recordAndStop();
@@ -2506,6 +3260,7 @@ describe('Recorder', () => {
       const remoteUri = 'https://attacker.example/recording.m4a';
       mockRecorder.stop.mockImplementation(async () => {
         mockRecorder.uri = remoteUri;
+        emitRecordingStatus({ isFinished: true, url: remoteUri });
       });
       const { view, props } = await renderRecorder();
       await recordAndStop();
@@ -2519,13 +3274,15 @@ describe('Recorder', () => {
 
     it('does not delete a local recording that no longer exists', async () => {
       const deleteFile = jest.fn();
+      const { view, props } = await renderRecorder();
+      await recordAndStop();
+      asMock(File).mockClear();
       asMock(File).mockImplementation((uri: string) => ({
         uri,
         exists: false,
+        size: 0,
         delete: deleteFile,
       }));
-      const { view, props } = await renderRecorder();
-      await recordAndStop();
 
       await view.rerender(<Recorder {...props} questionId={OTHER_QUESTION_ID} />);
       await flushAct();
@@ -2599,7 +3356,7 @@ describe('Recorder', () => {
 
     it('resubmits the same requestId after a 503, honoring the Retry-After delay', async () => {
       asMock(apiUploadAudio)
-        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1))
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }))
         .mockResolvedValueOnce({ ok: true });
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -2619,9 +3376,11 @@ describe('Recorder', () => {
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
-    it('falls back to recovery with the same requestId when 503 backpressure outlasts the retry budget', async () => {
+    it('returns the take after 503 backpressure outlasts the retry budget', async () => {
       jest.useFakeTimers();
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(503, 'capacity busy', 1));
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }),
+      );
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -2640,9 +3399,68 @@ describe('Recorder', () => {
         expect(call[2]).toEqual({ questionId: QUESTION_ID, requestId: REQUEST_ID });
       }
       await waitFor(() =>
-        expect(props.onError).toHaveBeenCalledWith(t('recorder.errNothingToConfirm')),
+        expect(props.onError).toHaveBeenCalledWith(`${t('error.busy')} ${t('wait.second')}`),
       );
       expect(props.onResult).not.toHaveBeenCalled();
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+    });
+
+    it('does not in-band retry a bare 503 and spends the durable recovery-POST budget', async () => {
+      mockStartedUploadFailure(new ApiError(503, 'gateway unavailable', 1));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      asMock(loadPendingAssessment)
+        .mockReset()
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 90 },
+      });
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 90 } }));
+
+      expect(apiUploadAudio).toHaveBeenCalledTimes(1);
+      expect(claimPendingAssessmentRecoveryPost).toHaveBeenCalledWith(REQUEST_ID);
+    });
+
+    it('keeps recovery locked when reserving ambiguity after an HTTP response fails', async () => {
+      mockStartedUploadFailure(new ApiError(502, 'gateway returned an invalid response'));
+      asMock(claimPendingAssessmentRecoveryPost).mockRejectedValue(
+        new Error('keychain unavailable'),
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(apiFetch).not.toHaveBeenCalled();
+    });
+
+    it('does not in-band retry a pool-saturation 503 and returns the take', async () => {
+      mockStartedUploadFailure(new ApiError(503, 'pool saturated', 5, { code: 'POOL_SATURATED' }));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(
+          `${t('error.busy')} ${t('wait.seconds', { count: 5 })}`,
+        ),
+      );
+
+      expect(apiUploadAudio).toHaveBeenCalledTimes(1);
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
     it('uses distinct request ids for sequential completed answers', async () => {
@@ -2864,6 +3682,7 @@ describe('Recorder', () => {
       expect(apiUploadAudio).not.toHaveBeenCalled();
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${OTHER_REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
       expect(props.onResult).not.toHaveBeenCalled();
@@ -2894,6 +3713,7 @@ describe('Recorder', () => {
           if (existing.ownerId === OWNER_ID) {
             expect(apiFetch).toHaveBeenCalledWith(`/assessments/${existing.requestId}`, {
               timeoutMs: 5000,
+              signal: expect.any(AbortSignal),
             });
           } else {
             expect(clearPendingAssessment).toHaveBeenCalledWith(existing.requestId);
@@ -3207,11 +4027,11 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
         .mockResolvedValue(pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }));
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+      mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(413, 'object rejected'));
+      mockStartedApiFetchFailureOnce(new ApiError(413, 'object rejected'));
       asMock(clearPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -3222,6 +4042,9 @@ describe('Recorder', () => {
       await waitFor(() => expect(screen.getByRole('button', { name: RERECORD_TEXT })).toBeTruthy());
       expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone'));
       const recordCallsBeforeRetry = mockRecorder.record.mock.calls.length;
+      // The terminal recovery already removed its own tombstone. The retained
+      // in-memory request id still has to be cleared before a new take starts.
+      asMock(loadPendingAssessment).mockResolvedValue(null);
 
       await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
       await waitFor(() =>
@@ -3278,7 +4101,7 @@ describe('Recorder', () => {
     });
 
     it('recovers the durable result after a network failure mid-upload', async () => {
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(0, 'Could not connect to the server.'));
+      mockStartedUploadFailure(new ApiError(0, 'Could not connect to the server.'));
       const { props } = await renderRecorder();
       await recordAndStop();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
@@ -3562,7 +4385,7 @@ describe('Recorder', () => {
       },
     );
 
-    it('keeps a newer upload controller attached when an aborted old upload settles', async () => {
+    it('keeps controls locked until an aborted old upload settles before creating a new controller', async () => {
       const oldUpload = deferred<{ score: number }>();
       const currentUpload = deferred<{ score: number }>();
       asMock(apiUploadAudio)
@@ -3592,20 +4415,23 @@ describe('Recorder', () => {
       expect(oldSignal.aborted).toBe(true);
       await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
 
-      await recordAndStop();
-      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(2));
-      const currentSignal = asMock(apiUploadAudio).mock.calls[1][3].signal as AbortSignal;
-      expect(currentSignal.aborted).toBe(false);
-
-      // This transport deliberately ignores the first abort. Its late finally
-      // must compare controller identity instead of detaching the newer one.
+      // An abort-ignoring transport still owns an in-flight operation. It must
+      // settle before the replacement identity may open another microphone or
+      // upload controller.
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
       await act(async () => {
         oldUpload.resolve({ score: 1 });
         await flushMicrotasks();
       });
       expect(props.onResult).not.toHaveBeenCalled();
       expect(nextResult).not.toHaveBeenCalled();
+
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(2));
+      const currentSignal = asMock(apiUploadAudio).mock.calls[1][3].signal as AbortSignal;
+      expect(currentSignal.aborted).toBe(false);
 
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
@@ -3654,7 +4480,7 @@ describe('Recorder', () => {
       expect(props.parseResult).not.toHaveBeenCalled();
     });
 
-    it('reconciles the current identity after a stale upload finishes following lifecycle cleanup', async () => {
+    it('reconciles the current identity on foreground after a stale upload finishes', async () => {
       const upload = deferred<{ score: number }>();
       asMock(apiUploadAudio).mockReturnValue(upload.promise);
       const { props } = await renderRecorder();
@@ -3683,9 +4509,8 @@ describe('Recorder', () => {
       });
       await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
 
-      // Restore only the observable lifecycle state. Deliberately do not emit a
-      // foreground event: the stale submission's finally block must initiate
-      // reconciliation after it releases the operation lock.
+      // Restore lifecycle state, let the stale transport release its operation
+      // ownership, then deliver the real foreground signal that owns recovery.
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
         writable: true,
@@ -3693,6 +4518,8 @@ describe('Recorder', () => {
       });
       await act(async () => {
         upload.resolve({ score: 95 });
+        await flushMicrotasks();
+        for (const handler of appStateHandlers) handler('active');
         await flushMicrotasks();
       });
 
@@ -3703,6 +4530,7 @@ describe('Recorder', () => {
       );
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(props.parseResult).not.toHaveBeenCalledWith({ score: 95 });
     });
@@ -3807,7 +4635,10 @@ describe('Recorder', () => {
       });
 
       await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 91 } }));
-      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, { timeoutMs: 5000 });
+      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
+        timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
+      });
     });
 
     it('refuses to record or cancel while a stranded upload hands off to recovery', async () => {
@@ -3888,9 +4719,11 @@ describe('Recorder', () => {
       expect(view).toBeTruthy();
     });
 
-    it('stops resubmitting after exactly three capacity retries', async () => {
+    it('stops resubmitting after exactly three capacity retries and returns the take', async () => {
       jest.useFakeTimers();
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(503, 'capacity busy', 1));
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }),
+      );
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -3903,16 +4736,18 @@ describe('Recorder', () => {
       }
       await flushAct();
       await waitFor(() =>
-        expect(props.onError).toHaveBeenCalledWith(t('recorder.errNothingToConfirm')),
+        expect(props.onError).toHaveBeenCalledWith(`${t('error.busy')} ${t('wait.second')}`),
       );
 
       expect(apiUploadAudio).toHaveBeenCalledTimes(4);
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
     it('waits out the full server-specified Retry-After before a capacity retry', async () => {
       jest.useFakeTimers();
       asMock(apiUploadAudio)
-        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 6))
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 6, { code: 'CAPACITY_BUSY' }))
         .mockResolvedValueOnce({ ok: true });
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -4005,59 +4840,63 @@ describe('Recorder', () => {
   });
 
   describe('crash recovery', () => {
-    it('does not let a delayed recovery read overtake an active recording', async () => {
+    it('blocks recording until a delayed recovery read releases operation ownership', async () => {
       const pending = deferred<PendingAssessment | null>();
-      const status = deferred<unknown>();
       asMock(loadPendingAssessment).mockReturnValue(pending.promise);
-      asMock(apiFetch).mockReturnValue(status.promise);
       const { props } = await renderRecorder();
 
-      await startRecording();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
+      expect(mockRecorder.record).not.toHaveBeenCalled();
       await act(async () => {
-        pending.resolve(pendingRecord());
+        pending.resolve(null);
         await flushMicrotasks();
       });
 
+      await startRecording();
       expect(apiFetch).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
       expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
     });
 
-    it('suppresses a delayed recovery storage error after recording starts', async () => {
+    it('does not start recording while a delayed recovery storage read fails', async () => {
       const pending = deferred<PendingAssessment | null>();
       asMock(loadPendingAssessment).mockReturnValue(pending.promise);
       const { props } = await renderRecorder();
 
-      await startRecording();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
       await act(async () => {
         pending.reject(new Error('keychain unavailable'));
         await flushMicrotasks();
       });
 
       expect(apiFetch).not.toHaveBeenCalled();
-      expect(props.onError).not.toHaveBeenCalled();
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUnavailable'));
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
-      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
     });
 
-    it('does not let a delayed recovery read overtake a recording start before permission resolves', async () => {
-      const pending = deferred<PendingAssessment | null>();
+    it('does not start a recovery read while recording permission is still resolving', async () => {
       const permission = deferred<{ granted: boolean }>();
-      asMock(loadPendingAssessment).mockReturnValue(pending.promise);
-      asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
       const { view, props } = await renderRecorder();
+      asMock(loadPendingAssessment).mockClear();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
 
-      const start = invokePressHandler(view, START_LABEL);
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
       );
-      await act(async () => {
-        pending.resolve(pendingRecord());
-        await flushMicrotasks();
-      });
+      for (const handler of appStateHandlers) handler('active');
+      await flushAct();
 
       expect(apiFetch).not.toHaveBeenCalled();
+      expect(loadPendingAssessment).not.toHaveBeenCalled();
       expect(props.onError).not.toHaveBeenCalled();
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
 
@@ -4127,6 +4966,7 @@ describe('Recorder', () => {
       expect(loadPendingAssessment).toHaveBeenCalledTimes(1);
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${OTHER_REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
       expect(props.onError).not.toHaveBeenCalled();
@@ -4217,6 +5057,7 @@ describe('Recorder', () => {
 
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(props.parseResult).toHaveBeenCalledWith({ level: 'B1' });
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { level: 'B1' } });
@@ -4345,6 +5186,7 @@ describe('Recorder', () => {
         expect(apiFetch).toHaveBeenCalledTimes(1);
         expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
           timeoutMs: 5000,
+          signal: expect.any(AbortSignal),
         });
         expect(asMock(apiFetch).mock.invocationCallOrder[0]).toBeGreaterThan(
           appStateSubscriptionRemove.mock.invocationCallOrder[0],
@@ -4775,15 +5617,24 @@ describe('Recorder', () => {
       expect(secondResult).not.toHaveBeenCalled();
     });
 
-    it('does not let an invalidated same-identity recovery overtake its replacement', async () => {
-      const oldStatus = deferred<unknown>();
+    it('aborts an invalidated recovery before its same-identity replacement starts', async () => {
       const currentStatus = deferred<unknown>();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
       asMock(apiFetch)
-        .mockReturnValueOnce(oldStatus.promise)
+        .mockImplementationOnce(
+          (_path: string, { signal }: { signal: AbortSignal }) =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener(
+                'abort',
+                () => reject(new DOMException('The operation was aborted.', 'AbortError')),
+                { once: true },
+              );
+            }),
+        )
         .mockReturnValueOnce(currentStatus.promise);
       const { props } = await renderRecorder();
       await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
+      const oldSignal = asMock(apiFetch).mock.calls[0][1].signal as AbortSignal;
 
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
@@ -4794,6 +5645,7 @@ describe('Recorder', () => {
         for (const handler of appStateHandlers) handler('background');
         await flushMicrotasks();
       });
+      expect(oldSignal.aborted).toBe(true);
       await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
 
       Object.defineProperty(AppState, 'currentState', {
@@ -4806,16 +5658,6 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
       await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
-
-      await act(async () => {
-        oldStatus.resolve({
-          status: 'completed',
-          context: 'practice',
-          questionId: QUESTION_ID,
-          response: { score: 1 },
-        });
-        await flushMicrotasks();
-      });
       expect(props.parseResult).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
       expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
@@ -4917,7 +5759,7 @@ describe('Recorder', () => {
         .mockReturnValueOnce(followerRead.promise) // its post-failure recovery
         .mockResolvedValue(pendingRecord()); // the first recorder's recovery
       asMock(apiFetch).mockReturnValue(status.promise);
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(0, 'connection interrupted'));
+      mockStartedUploadFailure(new ApiError(0, 'connection interrupted'));
 
       await render(
         <>
@@ -4934,8 +5776,7 @@ describe('Recorder', () => {
       expect(appStateHandlers).toHaveLength(2);
       expect(apiFetch).not.toHaveBeenCalled();
 
-      // The second recorder submits; its ambiguous transport failure drops it
-      // into recovery, and its own storage read is left in flight.
+      // The second recorder submits and remains in its durable-metadata read.
       const followerMic = () => screen.getAllByLabelText(RECORD_BUTTON_LABEL)[1];
       await fireEvent.press(followerMic());
       await waitFor(() => expect(screen.getAllByLabelText(STOP_LABEL)).toHaveLength(1));
@@ -4944,7 +5785,7 @@ describe('Recorder', () => {
       await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await waitFor(() => expect(screen.getAllByText(RECOVERING_TEXT)).toHaveLength(1));
+      await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
       expect(loadPendingAssessment).toHaveBeenCalledTimes(4);
 
       // The first recorder claims the global lease during that window.
@@ -4953,7 +5794,7 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
       await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
-      expect(screen.getAllByText(RECOVERING_TEXT)).toHaveLength(2);
+      expect(screen.getAllByText(RECOVERING_TEXT)).toHaveLength(1);
 
       await act(async () => {
         followerRead.resolve(null);
@@ -4987,13 +5828,12 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
         .mockResolvedValue(pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }));
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+      mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch)
-        .mockRejectedValueOnce(new ApiError(409, 'question mismatch'))
-        .mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      mockStartedApiFetchFailureOnce(new ApiError(409, 'question mismatch'));
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       const { props } = await renderRecorder();
       await recordAndStop();
       asMock(File).mockClear();
@@ -5061,9 +5901,9 @@ describe('Recorder', () => {
       // recovery before uploading anything; the abandoned record never left
       // the 'prepared' stage, so clearing it returns the fresh take.
       const abandonedHandoff = pendingRecord({ requestId: OTHER_REQUEST_ID, stage: 'prepared' });
-      asMock(loadPendingAssessment).mockResolvedValueOnce(null).mockResolvedValue(abandonedHandoff);
       const { props } = await renderRecorder();
       await recordAndStop();
+      asMock(loadPendingAssessment).mockReset().mockResolvedValue(abandonedHandoff);
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(OTHER_REQUEST_ID));
@@ -5176,16 +6016,19 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValue(retainedHandoff);
       let assessmentPostCount = 0;
-      asMock(apiFetch).mockImplementation(async (path: string) => {
-        if (path === ENDPOINT) {
-          assessmentPostCount += 1;
-          if (assessmentPostCount === 1) {
-            throw new ApiError(0, 'assessment response disconnected');
+      asMock(apiFetch).mockImplementation(
+        async (path: string, options?: { onRequestStarted?: () => void }) => {
+          if (path === ENDPOINT) {
+            options?.onRequestStarted?.();
+            assessmentPostCount += 1;
+            if (assessmentPostCount === 1) {
+              throw new ApiError(0, 'assessment response disconnected');
+            }
+            return { unsupported: true };
           }
-          return { unsupported: true };
-        }
-        throw new ApiError(404, 'not submitted');
-      });
+          throw new ApiError(404, 'not submitted');
+        },
+      );
       const { props } = await renderRecorder({
         parseResult: () => {
           throw new ContractError();
@@ -5219,10 +6062,10 @@ describe('Recorder', () => {
       expect(
         asMock(apiFetch).mock.calls.filter(([path]) => path === `/assessments/${REQUEST_ID}`),
       ).toHaveLength(2);
-      // Jump the wall clock so the third consecutive absence also satisfies
-      // the ten-second anti-race window, without manufacturing extra 404s.
+      // Recovery uses monotonic elapsed time, so a wall-clock jump cannot
+      // manufacture the ten-second anti-race window.
       jest.setSystemTime(startedAt.getTime() + 10_000);
-      await advancePolls(1);
+      await advancePolls(4);
 
       await waitFor(() =>
         expect(props.onError).toHaveBeenCalledWith(t('recorder.errCannotDisplay')),
@@ -5231,34 +6074,22 @@ describe('Recorder', () => {
         ([path]) => path === `/assessments/${REQUEST_ID}`,
       );
       const assessmentPosts = asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT);
-      expect(recoveryStatusCalls).toHaveLength(3);
-      expect(assessmentPosts).toEqual([
-        [
-          ENDPOINT,
-          {
-            method: 'POST',
-            body: {
-              questionId: QUESTION_ID,
-              requestId: REQUEST_ID,
-              audioKey: S3_AUDIO_KEY,
-            },
-            signal: expect.any(AbortSignal),
-            timeoutMs: AUDIO_TIMEOUT_MS,
+      expect(recoveryStatusCalls).toHaveLength(6);
+      expect(assessmentPosts).toHaveLength(2);
+      for (const [, options] of assessmentPosts) {
+        expect(options).toMatchObject({
+          method: 'POST',
+          body: {
+            questionId: QUESTION_ID,
+            requestId: REQUEST_ID,
+            audioKey: S3_AUDIO_KEY,
           },
-        ],
-        [
-          ENDPOINT,
-          {
-            method: 'POST',
-            body: {
-              questionId: QUESTION_ID,
-              requestId: REQUEST_ID,
-              audioKey: S3_AUDIO_KEY,
-            },
-            timeoutMs: AUDIO_TIMEOUT_MS,
-          },
-        ],
-      ]);
+          timeoutMs: AUDIO_TIMEOUT_MS,
+        });
+        expect(options.signal).toBeInstanceOf(AbortSignal);
+      }
+      expect(assessmentPosts[0][1].onRequestStarted).toEqual(expect.any(Function));
+      expect(assessmentPosts[1][1].onRequestStarted).toEqual(expect.any(Function));
       expect(deletedRecordingUris()).toEqual([RECORDING_URI]);
       expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
       expect(props.onError).toHaveBeenCalledTimes(1);
@@ -5310,6 +6141,28 @@ describe('Recorder', () => {
       await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 94 } }));
     });
 
+    it('never re-posts a durably cancelled S3 handoff after remount', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({
+          stage: 's3-granted',
+          audioKey: S3_AUDIO_KEY,
+          cancelRequested: true,
+        }),
+      );
+      asMock(apiFetch).mockRejectedValue(new ApiError(404, 'not submitted'));
+      const { props } = await renderRecorder();
+
+      await advancePolls(5);
+
+      expect(asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT)).toHaveLength(0);
+      expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
     it.each([
       ['another owner', { ownerId: OTHER_OWNER_ID }],
       ['a prepared request', { stage: 'prepared' as const }],
@@ -5334,7 +6187,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockResolvedValueOnce({ score: 77 });
+      mockStartedApiFetchResultOnce({ score: 77 });
       const { props } = await renderRecorder();
 
       // Do not race a possibly-started original POST on the first 404.
@@ -5344,6 +6197,7 @@ describe('Recorder', () => {
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 77 } });
       expect(apiFetch).toHaveBeenNthCalledWith(1, `/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(apiFetch).toHaveBeenNthCalledWith(7, ENDPOINT, {
         method: 'POST',
@@ -5352,7 +6206,9 @@ describe('Recorder', () => {
           requestId: REQUEST_ID,
           audioKey: S3_AUDIO_KEY,
         },
+        signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
+        onRequestStarted: expect.any(Function),
       });
       expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
       expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
@@ -5368,7 +6224,7 @@ describe('Recorder', () => {
         for (let i = 0; i < 6; i++) {
           asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
         }
-        asMock(apiFetch).mockResolvedValueOnce({ score: 84 });
+        mockStartedApiFetchResultOnce({ score: 84 });
         if (failureMode === 'returns false') {
           asMock(markPendingAssessmentForReconciliation).mockResolvedValue(false);
         } else {
@@ -5400,7 +6256,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockResolvedValueOnce({ unsupported: true });
+      mockStartedApiFetchResultOnce({ unsupported: true });
       const { props } = await renderRecorder({
         parseResult: () => {
           throw new ContractError();
@@ -5431,7 +6287,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockResolvedValueOnce({ score: 77 });
+      mockStartedApiFetchResultOnce({ score: 77 });
       const { props } = await renderRecorder();
 
       await advancePolls(5);
@@ -5443,7 +6299,9 @@ describe('Recorder', () => {
           requestId: REQUEST_ID,
           audioKey: S3_AUDIO_KEY,
         },
+        signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
+        onRequestStarted: expect.any(Function),
       });
       expect(props.parseResult).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
@@ -5453,8 +6311,8 @@ describe('Recorder', () => {
       expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
     });
 
-    it.each([0, 408, 503])(
-      'retries the identical S3 assessment POST after ambiguous status %i',
+    it.each([0, 408, 502, 504])(
+      'polls for the durable result without repeating an S3 POST after ambiguous status %i',
       async (ambiguousStatus) => {
         jest.useFakeTimers();
         asMock(loadPendingAssessment).mockResolvedValue(
@@ -5463,42 +6321,30 @@ describe('Recorder', () => {
         for (let i = 0; i < 6; i++) {
           asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
         }
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(ambiguousStatus, 'temporary failure'));
-        for (let i = 0; i < 3; i++) {
-          asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
-        }
-        asMock(apiFetch).mockResolvedValueOnce({ score: 83 });
+        mockStartedApiFetchFailureOnce(new ApiError(ambiguousStatus, 'temporary failure'));
+        asMock(apiFetch).mockResolvedValueOnce({
+          status: 'completed',
+          context: 'practice',
+          questionId: QUESTION_ID,
+          response: { score: 83 },
+        });
         const { props } = await renderRecorder();
 
-        await advancePolls(8);
+        await advancePolls(6);
 
         const assessmentPosts = asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT);
-        expect(assessmentPosts).toEqual([
-          [
-            ENDPOINT,
-            {
-              method: 'POST',
-              body: {
-                questionId: QUESTION_ID,
-                requestId: REQUEST_ID,
-                audioKey: S3_AUDIO_KEY,
-              },
-              timeoutMs: AUDIO_TIMEOUT_MS,
-            },
-          ],
-          [
-            ENDPOINT,
-            {
-              method: 'POST',
-              body: {
-                questionId: QUESTION_ID,
-                requestId: REQUEST_ID,
-                audioKey: S3_AUDIO_KEY,
-              },
-              timeoutMs: AUDIO_TIMEOUT_MS,
-            },
-          ],
-        ]);
+        expect(assessmentPosts).toHaveLength(1);
+        expect(assessmentPosts[0][1]).toMatchObject({
+          method: 'POST',
+          body: {
+            questionId: QUESTION_ID,
+            requestId: REQUEST_ID,
+            audioKey: S3_AUDIO_KEY,
+          },
+          timeoutMs: AUDIO_TIMEOUT_MS,
+        });
+        expect(assessmentPosts[0][1].signal).toBeInstanceOf(AbortSignal);
+        expect(claimPendingAssessmentRecoveryPost).toHaveBeenCalledTimes(1);
         expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 83 } });
       },
     );
@@ -5511,7 +6357,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockRejectedValueOnce(
+      mockStartedApiFetchFailureOnce(
         new ApiError(429, 'daily limit', 7 * 60 * 60, { code: 'DAILY_LIMIT' }),
       );
       const { props } = await renderRecorder();
@@ -5528,7 +6374,9 @@ describe('Recorder', () => {
           requestId: REQUEST_ID,
           audioKey: S3_AUDIO_KEY,
         },
+        signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
+        onRequestStarted: expect.any(Function),
       });
       expect(props.onError).toHaveBeenCalledWith(
         `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`,
@@ -5550,7 +6398,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(429, 'too many', 30));
+      mockStartedApiFetchFailureOnce(new ApiError(429, 'too many', 30));
       const { props } = await submitLiveRecordingIntoRecovery(
         pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
         { onRateLimited },
@@ -5568,59 +6416,174 @@ describe('Recorder', () => {
       expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
-    it('bounds repeated ambiguous S3 assessment POST attempts', async () => {
+    it('bounds an ambiguous S3 assessment POST to one durable attempt', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
       );
-      asMock(apiFetch).mockImplementation(async (path: string) => {
-        if (path === ENDPOINT) throw new ApiError(500, 'temporary failure');
-        throw new ApiError(404, 'not submitted');
-      });
+      asMock(apiFetch).mockImplementation(
+        async (path: string, options?: { onRequestStarted?: () => void }) => {
+          if (path === ENDPOINT) {
+            options?.onRequestStarted?.();
+            throw new ApiError(0, 'connection interrupted');
+          }
+          throw new ApiError(404, 'not submitted');
+        },
+      );
       await renderRecorder();
 
       await advancePolls(30);
 
       const assessmentPosts = asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT);
-      expect(assessmentPosts).toHaveLength(3);
+      expect(assessmentPosts).toHaveLength(1);
       for (const [, options] of assessmentPosts) {
         expect(options.body).toEqual({
           questionId: QUESTION_ID,
           requestId: REQUEST_ID,
           audioKey: S3_AUDIO_KEY,
         });
+        expect(options.signal).toBeInstanceOf(AbortSignal);
       }
+      expect(claimPendingAssessmentRecoveryPost).toHaveBeenCalledTimes(2);
     });
 
-    it('applies exponential backoff before the third S3 assessment resubmission', async () => {
+    it('keeps recovery locked when reserving its one durable POST fails', async () => {
       jest.useFakeTimers();
-      const startedAt = new Date('2030-01-01T00:00:00Z');
-      jest.setSystemTime(startedAt);
       asMock(loadPendingAssessment).mockResolvedValue(
-        pendingRecord({
-          createdAt: startedAt.getTime(),
-          stage: 's3-granted',
-          audioKey: S3_AUDIO_KEY,
-        }),
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
       );
-      asMock(apiFetch).mockImplementation(async (path: string) => {
-        if (path === ENDPOINT) throw new ApiError(503, 'temporary failure');
-        throw new ApiError(404, 'not submitted');
-      });
-      await renderRecorder();
-
-      const assessmentPostCount = () =>
-        asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT).length;
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      asMock(claimPendingAssessmentRecoveryPost).mockRejectedValue(
+        new Error('keychain unavailable'),
+      );
+      const { props } = await renderRecorder();
 
       await advancePolls(5);
-      expect(assessmentPostCount()).toBe(1);
-      await advancePolls(3);
-      expect(assessmentPostCount()).toBe(2);
-      await advancePolls(4);
-      expect(assessmentPostCount()).toBe(2);
-      await advancePolls(1);
-      expect(assessmentPostCount()).toBe(3);
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate'));
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT)).toHaveLength(0);
     });
+
+    it('refunds a recovery-POST claim when the recorder becomes stale before dispatch', async () => {
+      jest.useFakeTimers();
+      const claim = deferred<boolean>();
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+      );
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      asMock(claimPendingAssessmentRecoveryPost).mockReturnValue(claim.promise);
+      const { props } = await renderRecorder();
+      await advancePolls(5);
+      await waitFor(() => expect(claimPendingAssessmentRecoveryPost).toHaveBeenCalled());
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        claim.resolve(true);
+        await flushMicrotasks();
+      });
+
+      expect(refundPendingAssessmentRecoveryPost).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT)).toHaveLength(0);
+    });
+
+    it('refunds a claim when recovery fails before the POST reaches the network', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+      );
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'token read failed'));
+      const { props } = await renderRecorder();
+
+      await advancePolls(5);
+
+      expect(refundPendingAssessmentRecoveryPost).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onError).toHaveBeenCalledWith(t('error.network'));
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+    });
+
+    it('uses a finite recovery Retry-After before polling again', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch)
+        .mockRejectedValueOnce(new ApiError(503, 'busy', 7))
+        .mockResolvedValueOnce({
+          status: 'completed',
+          context: 'practice',
+          questionId: QUESTION_ID,
+          response: { score: 86 },
+        });
+      const { props } = await renderRecorder();
+
+      await act(async () => {
+        jest.advanceTimersByTime(6_999);
+        await flushMicrotasks();
+      });
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await flushMicrotasks();
+      });
+
+      expect(apiFetch).toHaveBeenCalledTimes(2);
+      expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 86 } });
+    });
+
+    it('aborts a recovery while it is sleeping between status reads', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      const { props } = await renderRecorder();
+      const signal = asMock(apiFetch).mock.calls[0][1].signal as AbortSignal;
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+
+      expect(signal.aborted).toBe(true);
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      [500, 'INTERNAL', 'error.internal'],
+      [503, 'CAPACITY_BUSY', 'error.busy'],
+      [504, 'PROVIDER_TIMEOUT', 'error.timeout'],
+    ] as const)(
+      'returns the surviving take after a definite recovery POST HTTP %i (%s)',
+      async (status, code, expectedMessageKey) => {
+        jest.useFakeTimers();
+        const onRateLimited = jest.fn();
+        for (let i = 0; i < 6; i++) {
+          asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+        }
+        mockStartedApiFetchFailureOnce(
+          new ApiError(status, 'provider failed', undefined, { code }),
+        );
+        const { props } = await submitLiveRecordingIntoRecovery(
+          pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+          { onRateLimited },
+        );
+
+        await advancePolls(6);
+        await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t(expectedMessageKey)));
+
+        expect(asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT)).toHaveLength(1);
+        expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+        expect(deletedRecordingUris()).toEqual([]);
+        expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+        expect(onRateLimited).not.toHaveBeenCalled();
+      },
+    );
 
     it('stops S3 resubmission immediately when authentication expires', async () => {
       jest.useFakeTimers();
@@ -5630,7 +6593,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(401, 'signed out'));
+      mockStartedApiFetchFailureOnce(new ApiError(401, 'signed out'));
       const { props } = await renderRecorder();
 
       await advancePolls(5);
@@ -5652,14 +6615,13 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch)
-        .mockRejectedValueOnce(new ApiError(409, 'processing'))
-        .mockResolvedValueOnce({
-          status: 'completed',
-          context: 'practice',
-          questionId: QUESTION_ID,
-          response: { score: 81 },
-        });
+      mockStartedApiFetchFailureOnce(new ApiError(409, 'processing'));
+      asMock(apiFetch).mockResolvedValueOnce({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 81 },
+      });
       const { props } = await renderRecorder();
 
       expect(apiFetch).toHaveBeenCalledTimes(1);
@@ -5678,11 +6640,10 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch)
-        .mockRejectedValueOnce(new ApiError(409, 'question mismatch'))
-        // The row a genuine in-flight claim would have produced never appears:
-        // the next read is still absent, so the conflict is terminal.
-        .mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      mockStartedApiFetchFailureOnce(new ApiError(409, 'question mismatch'));
+      // The row a genuine in-flight claim would have produced never appears:
+      // the next read is still absent, so the conflict is terminal.
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       const { props } = await renderRecorder();
 
       await advancePolls(8);
@@ -5708,7 +6669,7 @@ describe('Recorder', () => {
         for (let i = 0; i < 6; i++) {
           asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
         }
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(status, 'object unavailable'));
+        mockStartedApiFetchFailureOnce(new ApiError(status, 'object unavailable'));
         const { props } = await renderRecorder();
 
         await advancePolls(5);
@@ -5763,12 +6724,15 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(S3_GRANT)
           .mockResolvedValueOnce(REUPLOAD_GRANT);
         mockTombstoneAfterSubmit();
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
         mockAbsentStatusReads();
-        asMock(apiFetch)
-          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'))
-          .mockRejectedValueOnce(new ApiError(404, 'not submitted'))
-          .mockResolvedValueOnce({ ok: true });
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+        mockStartedApiFetchResultOnce({ ok: true });
         const { props } = await renderRecorder();
         await recordAndStop();
 
@@ -5790,7 +6754,7 @@ describe('Recorder', () => {
           RECORDING_URI,
           'audio/mp4',
           REUPLOAD_GRANT.maxBytes,
-          {},
+          { signal: expect.any(AbortSignal) },
         );
         // Initial POST + resubmission with the dead key + resubmission with the
         // fresh key — all carrying the SAME durable requestId.
@@ -5817,12 +6781,19 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(S3_GRANT)
           .mockResolvedValueOnce(REUPLOAD_GRANT);
         mockTombstoneAfterSubmit();
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
         mockAbsentStatusReads();
-        asMock(apiFetch)
-          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'))
-          .mockRejectedValueOnce(new ApiError(404, 'not submitted'))
-          .mockRejectedValueOnce(new ApiError(400, 'audio upload not found or expired'));
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
         const { props } = await renderRecorder();
         await recordAndStop();
 
@@ -5848,10 +6819,12 @@ describe('Recorder', () => {
         jest.useFakeTimers();
         asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
         mockTombstoneAfterSubmit();
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
         mockAbsentStatusReads();
-        asMock(apiFetch).mockRejectedValueOnce(
-          new ApiError(400, 'audio upload not found or expired'),
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
         );
         const { props } = await renderRecorder();
         await recordAndStop();
@@ -5878,12 +6851,66 @@ describe('Recorder', () => {
         expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
       });
 
+      it('treats a local-file inspection throw as a terminal missing-object result', async () => {
+        jest.useFakeTimers();
+        asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
+        mockTombstoneAfterSubmit();
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
+        mockAbsentStatusReads();
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
+        const { props } = await renderRecorder();
+        await recordAndStop();
+        asMock(File).mockImplementation(() => {
+          throw new Error('cache metadata unavailable');
+        });
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await advancePolls(5);
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone')),
+        );
+
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1);
+        expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      });
+
+      it('keeps recovery locked when refunding a dead-key POST claim fails', async () => {
+        jest.useFakeTimers();
+        asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
+        mockTombstoneAfterSubmit();
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
+        mockAbsentStatusReads();
+        mockStartedApiFetchFailureOnce(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
+        asMock(refundPendingAssessmentRecoveryPost).mockRejectedValue(
+          new Error('keychain unavailable'),
+        );
+        const { props } = await renderRecorder();
+        await recordAndStop();
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+        await advancePolls(5);
+
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate'));
+        expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1);
+      });
+
       /** Drives one submission into recovery and up to the dead-key rejection. */
       async function submitIntoDeadKeyRejection(rejection: ApiError) {
         mockTombstoneAfterSubmit();
-        asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+        mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
         mockAbsentStatusReads();
-        asMock(apiFetch).mockRejectedValueOnce(rejection);
+        mockStartedApiFetchFailureOnce(rejection);
         const rendered = await renderRecorder();
         await recordAndStop();
 
@@ -5892,38 +6919,24 @@ describe('Recorder', () => {
         return rendered;
       }
 
-      it('re-uploads when the dead-key rejection names the validation failure', async () => {
+      it('does not infer a missing object from a generic validation failure', async () => {
         jest.useFakeTimers();
-        asMock(apiRequestAudioUpload)
-          .mockResolvedValueOnce(S3_GRANT)
-          .mockResolvedValueOnce(REUPLOAD_GRANT);
+        asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
         const { props } = await submitIntoDeadKeyRejection(
           new ApiError(400, 'audio upload not found or expired', undefined, {
             code: 'VALIDATION_FAILED',
           }),
         );
-        asMock(apiFetch)
-          .mockRejectedValueOnce(new ApiError(404, 'not submitted'))
-          .mockResolvedValueOnce({ ok: true });
 
-        await advancePolls(7);
-        await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+        await advancePolls(6);
+        await waitFor(() =>
+          expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone')),
+        );
 
-        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(2);
-        expect(markPendingAssessmentStage).toHaveBeenCalledWith(
-          REQUEST_ID,
-          's3-granted',
-          REUPLOAD_KEY,
-        );
-        const postBodies = assessmentPostCalls().map(
-          ([, init]) => (init as { body: { audioKey: string; requestId: string } }).body,
-        );
-        expect(postBodies.map((body) => body.audioKey)).toEqual([
-          S3_AUDIO_KEY,
-          S3_AUDIO_KEY,
-          REUPLOAD_KEY,
-        ]);
-        expect(props.onError).not.toHaveBeenCalled();
+        expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1);
+        expect(apiPostPresignedAudio).toHaveBeenCalledTimes(1);
+        expect(assessmentPostCalls()).toHaveLength(2);
+        expect(props.onResult).not.toHaveBeenCalled();
       });
 
       it('does not re-upload when the rejection names an unrelated failure', async () => {
@@ -5955,7 +6968,9 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(S3_GRANT)
           .mockResolvedValueOnce({ mode: 'direct' });
         const { props } = await submitIntoDeadKeyRejection(
-          new ApiError(400, 'audio upload not found or expired'),
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
         );
 
         await advancePolls(6);
@@ -5980,7 +6995,9 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(REUPLOAD_GRANT);
         asMock(markPendingAssessmentStage).mockResolvedValueOnce(true).mockResolvedValue(false);
         const { props } = await submitIntoDeadKeyRejection(
-          new ApiError(400, 'audio upload not found or expired'),
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
         );
 
         await advancePolls(6);
@@ -6009,7 +7026,9 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(S3_GRANT)
           .mockRejectedValueOnce(new ApiError(0, 'grant request disconnected'));
         const { props } = await submitIntoDeadKeyRejection(
-          new ApiError(400, 'audio upload not found or expired'),
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
         );
 
         await advancePolls(6);
@@ -6035,7 +7054,9 @@ describe('Recorder', () => {
           .mockResolvedValueOnce(true)
           .mockReturnValue(stage.promise);
         const { props } = await submitIntoDeadKeyRejection(
-          new ApiError(400, 'audio upload not found or expired'),
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
         );
 
         await advancePolls(6);
@@ -6073,6 +7094,7 @@ describe('Recorder', () => {
 
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 88 } });
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
@@ -6267,6 +7289,7 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(1);
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
       expect(props.onResult).not.toHaveBeenCalled();
@@ -6415,7 +7438,7 @@ describe('Recorder', () => {
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
-    it('uses the third confirmed 404 as the exact absence threshold', async () => {
+    it('does not let a wall-clock jump bypass the monotonic 404 confirmation window', async () => {
       jest.useFakeTimers();
       const startedAt = new Date('2030-01-01T00:00:00Z');
       jest.setSystemTime(startedAt);
@@ -6430,12 +7453,16 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(2);
       expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
 
-      // Move beyond the independent ten-second race window without firing an
-      // extra poll; the next scheduled poll is exactly confirmation three.
+      // Moving wall time cannot manufacture monotonic elapsed time.
       jest.setSystemTime(new Date(startedAt.getTime() + 10_000));
       await advancePolls(1);
 
       expect(apiFetch).toHaveBeenCalledTimes(3);
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+
+      await advancePolls(3);
+
+      expect(apiFetch).toHaveBeenCalledTimes(6);
       expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
       expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
     });
@@ -6502,7 +7529,7 @@ describe('Recorder', () => {
       // A mid-submit 401 is not a definite rejection: the attempt may have
       // committed, so the recorder enters recovery and lets the session-expiry
       // flow unmount the screen rather than surfacing a misleading error.
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(401, 'Request failed with status 401'));
+      mockStartedUploadFailure(new ApiError(401, 'Request failed with status 401'));
       // No tombstone at mount or at submit's pre-upload check; it exists by
       // the time recovery looks for it, so the 401 stops the poll silently.
       asMock(loadPendingAssessment)
@@ -6631,9 +7658,10 @@ describe('Recorder', () => {
         _endpoint: unknown,
         _uri: unknown,
         _fields: unknown,
-        { signal }: { signal: AbortSignal },
+        { signal, onRequestStarted }: { signal: AbortSignal; onRequestStarted?: () => void },
       ) =>
         new Promise((_resolve, reject) => {
+          onRequestStarted?.();
           signal.addEventListener('abort', () => reject(new ApiError(0, 'aborted')), {
             once: true,
           });
@@ -6798,6 +7826,7 @@ describe('Recorder', () => {
         body: { questionId: QUESTION_ID, requestId: REQUEST_ID, audioKey: S3_AUDIO_KEY },
         signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
+        onRequestStarted: expect.any(Function),
       });
     });
 
@@ -6826,11 +7855,108 @@ describe('Recorder', () => {
 
       // The cancelled POST may have committed: the durable request is
       // resolved and the same audio is never submitted a second time.
+      expect(markPendingAssessmentCancelled).toHaveBeenCalledWith(REQUEST_ID);
       expect(apiUploadAudio).toHaveBeenCalledTimes(1);
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('persists cancel intent before lifecycle cleanup aborts a posted request', async () => {
+      const marker = deferred<boolean>();
+      asMock(markPendingAssessmentCancelled).mockReturnValue(marker.promise);
+      asMock(apiUploadAudio).mockImplementation(abortRejectingUpload());
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      const signal = asMock(apiUploadAudio).mock.calls[0][3].signal as AbortSignal;
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      expect(signal.aborted).toBe(false);
+
+      await act(async () => {
+        marker.resolve(true);
+        await flushMicrotasks();
+      });
+
+      expect(signal.aborted).toBe(true);
+      expect(markPendingAssessmentCancelled).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it('honors cancel when a successful response races durable cancel persistence', async () => {
+      const response = deferred<{ ok: string }>();
+      const marker = deferred<boolean>();
+      asMock(markPendingAssessmentCancelled).mockReturnValue(marker.promise);
+      asMock(apiUploadAudio).mockImplementation(
+        (
+          _endpoint: string,
+          _uri: string,
+          _fields: unknown,
+          { onRequestStarted }: { onRequestStarted?: () => void },
+        ) => {
+          onRequestStarted?.();
+          return response.promise;
+        },
+      );
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord({ cancelRequested: true }));
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { ok: 'recovered' },
+      });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      await act(async () => {
+        response.resolve({ ok: 'direct' });
+        await flushMicrotasks();
+      });
+      expect(props.parseResult).not.toHaveBeenCalledWith({ ok: 'direct' });
+
+      await act(async () => {
+        marker.resolve(true);
+        await flushMicrotasks();
+      });
+
+      await waitFor(() =>
+        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'recovered' } }),
+      );
+      expect(props.onResult).not.toHaveBeenCalledWith({ parsed: { ok: 'direct' } });
+    });
+
+    it('keeps recovery locked when durable cancel intent cannot be recorded', async () => {
+      asMock(markPendingAssessmentCancelled).mockResolvedValue(false);
+      asMock(apiUploadAudio).mockImplementation(abortRejectingUpload());
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
     it('honors a cancel instead of resubmitting once recovery confirms nothing landed', async () => {
@@ -6840,14 +7966,20 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
         .mockResolvedValue(pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }));
-      asMock(apiFetch).mockImplementation((path: string, options: { signal?: AbortSignal }) =>
-        path === ENDPOINT
-          ? new Promise((_resolve, reject) => {
-              options.signal?.addEventListener('abort', () => reject(new ApiError(0, 'aborted')), {
-                once: true,
-              });
-            })
-          : Promise.reject(new ApiError(404, 'not submitted')),
+      asMock(apiFetch).mockImplementation(
+        (path: string, options: { signal?: AbortSignal; onRequestStarted?: () => void }) =>
+          path === ENDPOINT
+            ? new Promise((_resolve, reject) => {
+                options.onRequestStarted?.();
+                options.signal?.addEventListener(
+                  'abort',
+                  () => reject(new ApiError(0, 'aborted')),
+                  {
+                    once: true,
+                  },
+                );
+              })
+            : Promise.reject(new ApiError(404, 'not submitted')),
       );
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -6923,22 +8055,12 @@ describe('Recorder', () => {
       expect(props.onResult).not.toHaveBeenCalled();
     });
 
-    it('cancel during the 503 capacity-retry wait defers to recovery without waiting it out', async () => {
+    it('cancel during the 503 capacity-retry wait returns the take without waiting it out', async () => {
       // A 30 s Retry-After would pin the old plain setTimeout; the abort-aware
       // wait must wake on cancel immediately (real timers prove promptness).
       asMock(apiUploadAudio)
-        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 30))
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 30, { code: 'CAPACITY_BUSY' }))
         .mockReturnValue(new Promise(() => undefined));
-      asMock(loadPendingAssessment)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValue(pendingRecord());
-      asMock(apiFetch).mockResolvedValue({
-        status: 'completed',
-        context: 'practice',
-        questionId: QUESTION_ID,
-        response: { ok: 'recovered' },
-      });
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -6947,17 +8069,16 @@ describe('Recorder', () => {
       await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
 
       await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
-      await waitFor(() =>
-        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'recovered' } }),
-      );
+      await waitFor(() => expect(screen.getByText(recordedStatusText('0:05'))).toBeTruthy());
 
       expect(Date.now() - cancelledAt).toBeLessThan(5_000);
-      // The earlier POST may have committed: recovery resolves the durable
-      // request and the same audio is never submitted a second time.
+      // A received 503 proves that request finished without a durable claim.
+      // While waiting to retry, no POST is in flight and cancel is definitive.
       expect(apiUploadAudio).toHaveBeenCalledTimes(1);
-      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
-        timeoutMs: 5000,
-      });
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(markPendingAssessmentCancelled).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onResult).not.toHaveBeenCalled();
     });
 
     it('releases a completed capacity-retry abort listener', async () => {
@@ -6965,7 +8086,7 @@ describe('Recorder', () => {
       const addAbortListener = jest.spyOn(AbortSignal.prototype, 'addEventListener');
       const removeAbortListener = jest.spyOn(AbortSignal.prototype, 'removeEventListener');
       asMock(apiUploadAudio)
-        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1))
+        .mockRejectedValueOnce(new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }))
         .mockResolvedValueOnce({ ok: true });
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -7034,6 +8155,63 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
       expect(createAudioPlayer).toHaveBeenCalledTimes(1);
       expect(mockPreviewPlayer.play).toHaveBeenCalledTimes(2);
+    });
+
+    it('recovers when native preview play or pause throws synchronously', async () => {
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      mockPreviewPlayer.play.mockImplementationOnce(() => {
+        throw new Error('decoder failed to start');
+      });
+
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errPlayFailed'));
+      expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+
+      mockPreviewPlayer = makeMockPreviewPlayer();
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
+      mockPreviewPlayer.pause.mockImplementationOnce(() => {
+        throw new Error('decoder failed to pause');
+      });
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.pauseLabel') }));
+
+      expect(props.onError).toHaveBeenLastCalledWith(t('recorder.errPlayFailed'));
+      expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    });
+
+    it('releases a preview whose asynchronous playback status reports an error', async () => {
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
+      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
+        didJustFinish: boolean;
+        error: string | null;
+      }) => void;
+
+      await act(async () => {
+        onStatus({ didJustFinish: false, error: 'native decoder failed' });
+        await flushMicrotasks();
+      });
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errPlayFailed'));
+      expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    });
+
+    it('cleans up when preview listener installation throws', async () => {
+      mockPreviewPlayer.addListener.mockImplementationOnce(() => {
+        throw new Error('listener unavailable');
+      });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errPlayFailed'));
+      expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1);
+      expect(mockPreviewPlayer.play).not.toHaveBeenCalled();
     });
 
     it('keeps a captured Pause handler safe after submission releases the player', async () => {
@@ -7410,23 +8588,32 @@ describe('Recorder', () => {
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
-    it('does not read retry storage while a recording start is still resolving', async () => {
+    it('preflights a handoff that appears while recording permission is resolving', async () => {
       const permission = deferred<{ granted: boolean }>();
       asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
-      const { view } = await renderRecorder();
-      const start = invokePressHandler(view, START_LABEL);
+      const { view, props } = await renderRecorder();
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
       );
       asMock(loadPendingAssessment).mockClear();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 92 },
+      });
 
       await act(async () => {
         for (const handler of appStateHandlers) handler('active');
         await flushMicrotasks();
       });
 
-      // A start already owns the operation lock; recovery must not race it.
+      // The foreground callback must not race the start's permission wait.
       expect(loadPendingAssessment).not.toHaveBeenCalled();
       expect(apiFetch).not.toHaveBeenCalled();
 
@@ -7435,7 +8622,10 @@ describe('Recorder', () => {
         await start;
         await flushMicrotasks();
       });
-      await waitFor(() => expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy());
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 92 } }));
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(loadPendingAssessment).toHaveBeenCalledTimes(2);
     });
 
     it('does not read retry storage while the app is backgrounded', async () => {
@@ -7504,13 +8694,13 @@ describe('Recorder', () => {
 
     it('reports nothing to confirm only while the app is in the foreground', async () => {
       const recoveryRead = deferred<PendingAssessment | null>();
-      asMock(loadPendingAssessment)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(null)
-        .mockReturnValueOnce(recoveryRead.promise);
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(0, 'connection interrupted'));
+      mockStartedUploadFailure(new ApiError(0, 'connection interrupted'));
       const { props } = await renderRecorder();
       await recordAndStop();
+      asMock(loadPendingAssessment)
+        .mockReset()
+        .mockResolvedValueOnce(null)
+        .mockReturnValueOnce(recoveryRead.promise);
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
@@ -7630,7 +8820,7 @@ describe('Recorder', () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
-      asMock(apiFetch).mockResolvedValueOnce({ score: 5 });
+      mockStartedApiFetchResultOnce({ score: 5 });
       const { props } = await renderRecorder({
         parseResult: () => {
           backgroundApp();
@@ -7886,7 +9076,12 @@ describe('Recorder', () => {
       const resubmission = deferred<unknown>();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
-      asMock(apiFetch).mockReturnValueOnce(resubmission.promise);
+      asMock(apiFetch).mockImplementationOnce(
+        (_path: string, options?: { onRequestStarted?: () => void }) => {
+          options?.onRequestStarted?.();
+          return resubmission.promise;
+        },
+      );
       const { props } = await renderRecorder();
       await advancePolls(5);
       await waitFor(() =>
@@ -7909,7 +9104,7 @@ describe('Recorder', () => {
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
-      asMock(apiFetch).mockResolvedValueOnce({ score: 12 });
+      mockStartedApiFetchResultOnce({ score: 12 });
       asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await advancePolls(5);
@@ -7932,7 +9127,7 @@ describe('Recorder', () => {
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
-      asMock(apiFetch).mockResolvedValueOnce({ score: 12 });
+      mockStartedApiFetchResultOnce({ score: 12 });
       asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await advancePolls(5);
@@ -7966,9 +9161,14 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
         .mockResolvedValue(S3_HANDOFF);
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+      mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
       mockAbsentStatusReads();
-      asMock(apiFetch).mockReturnValueOnce(resubmission.promise);
+      asMock(apiFetch).mockImplementationOnce(
+        (_path: string, options?: { onRequestStarted?: () => void }) => {
+          options?.onRequestStarted?.();
+          return resubmission.promise;
+        },
+      );
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -7979,7 +9179,11 @@ describe('Recorder', () => {
 
       backgroundApp();
       await act(async () => {
-        resubmission.reject(new ApiError(400, 'audio upload not found or expired'));
+        resubmission.reject(
+          new ApiError(400, 'audio upload not found or expired', undefined, {
+            code: 'AUDIO_UPLOAD_MISSING',
+          }),
+        );
         await flushMicrotasks();
       });
 
@@ -8011,10 +9215,12 @@ describe('Recorder', () => {
       asMock(apiPostPresignedAudio)
         .mockResolvedValueOnce(undefined)
         .mockReturnValueOnce(objectUpload.promise);
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+      mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
       mockAbsentStatusReads();
-      asMock(apiFetch).mockRejectedValueOnce(
-        new ApiError(400, 'audio upload not found or expired'),
+      mockStartedApiFetchFailureOnce(
+        new ApiError(400, 'audio upload not found or expired', undefined, {
+          code: 'AUDIO_UPLOAD_MISSING',
+        }),
       );
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -8040,14 +9246,12 @@ describe('Recorder', () => {
 
     it('abandons a submission whose retry-storage read lands after backgrounding', async () => {
       const existing = deferred<PendingAssessment | null>();
-      asMock(loadPendingAssessment)
-        .mockResolvedValueOnce(null)
-        .mockReturnValueOnce(existing.promise);
       const { props } = await renderRecorder();
       await recordAndStop();
+      asMock(loadPendingAssessment).mockReset().mockReturnValueOnce(existing.promise);
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(1));
 
       backgroundApp();
       await act(async () => {
@@ -8143,7 +9347,9 @@ describe('Recorder', () => {
 
     it('abandons a capacity retry that wakes up after backgrounding', async () => {
       jest.useFakeTimers();
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(503, 'capacity busy', 1));
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }),
+      );
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -8163,7 +9369,7 @@ describe('Recorder', () => {
 
     it('does not capacity-retry a failure that only looks like the 503 contract', async () => {
       jest.useFakeTimers();
-      asMock(apiUploadAudio).mockRejectedValue({ status: 503, message: 'not an ApiError' });
+      mockStartedUploadFailure({ status: 503, message: 'not an ApiError' });
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -8177,7 +9383,7 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledTimes(1);
     });
 
-    it('suppresses a cancel whose abort rejection lands after backgrounding', async () => {
+    it('finishes durable pre-POST cancel cleanup when abort rejection lands after backgrounding', async () => {
       const abortRejection = deferred<void>();
       asMock(apiRequestAudioUpload).mockImplementation(
         (_type: unknown, _owner: unknown, { signal }: { signal: AbortSignal }) =>
@@ -8204,7 +9410,7 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
 
-      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
       expect(props.onError).not.toHaveBeenCalled();
       expect(screen.queryByRole('button', { name: SUBMIT_TEXT })).toBeNull();
     });
@@ -8282,7 +9488,10 @@ describe('Recorder', () => {
       const permission = deferred<{ granted: boolean }>();
       asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permission.promise);
       const { view } = await renderRecorder();
-      const start = invokePressHandler(view, START_LABEL);
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() =>
         expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
       );
@@ -8303,7 +9512,7 @@ describe('Recorder', () => {
     });
 
     it('abandons a start whose stale handoff clear lands after backgrounding', async () => {
-      asMock(apiUploadAudio).mockRejectedValue(new Error('unexpected transport defect'));
+      mockStartedUploadFailure(new Error('unexpected transport defect'));
       const { view, props } = await renderRecorder();
       await recordAndStop();
 
@@ -8315,7 +9524,10 @@ describe('Recorder', () => {
       const cleared = deferred<void>();
       asMock(clearPendingAssessment).mockReturnValue(cleared.promise);
       asMock(setAudioModeAsync).mockClear();
-      const start = invokePressHandler(view, START_LABEL);
+      let start!: Promise<void>;
+      await act(() => {
+        start = invokePressHandler(view, START_LABEL);
+      });
       await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
 
       backgroundApp();
@@ -8334,12 +9546,16 @@ describe('Recorder', () => {
       mockRecorder.stop.mockImplementation(async () => {
         await stop.promise;
         mockRecorder.uri = RECORDING_URI;
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
       });
       const { view, props } = await renderRecorder();
       await startRecording();
       mockRecorderState.durationMillis = 5_000;
       const stopHandler = compositePressableProps(view, STOP_LABEL).onPress as () => Promise<void>;
-      const pendingStop = stopHandler();
+      let pendingStop!: Promise<void>;
+      await act(() => {
+        pendingStop = stopHandler();
+      });
 
       backgroundApp();
       await act(async () => {
@@ -8365,11 +9581,16 @@ describe('Recorder', () => {
       backgroundApp();
       mockRecorder.uri = RECORDING_URI;
       mockRecorderState = {
+        canRecord: false,
         isRecording: false,
         durationMillis: 30_000,
         url: null,
         mediaServicesDidReset: false,
       };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true, url: RECORDING_URI });
+        await flushMicrotasks();
+      });
       await view.rerender(<Recorder {...props} />);
       await flushAct();
 
@@ -8394,10 +9615,12 @@ describe('Recorder', () => {
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
         .mockResolvedValue(S3_HANDOFF);
-      asMock(apiFetch).mockRejectedValueOnce(new ApiError(0, 'connection interrupted'));
+      mockStartedApiFetchFailureOnce(new ApiError(0, 'connection interrupted'));
       mockAbsentStatusReads();
-      asMock(apiFetch).mockRejectedValueOnce(
-        new ApiError(400, 'audio upload not found or expired'),
+      mockStartedApiFetchFailureOnce(
+        new ApiError(400, 'audio upload not found or expired', undefined, {
+          code: 'AUDIO_UPLOAD_MISSING',
+        }),
       );
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -8411,6 +9634,7 @@ describe('Recorder', () => {
         return {
           uri,
           exists: true,
+          size: 1024,
           delete: jest.fn(),
           arrayBuffer: jest.fn(async () => new ArrayBuffer(0)),
         };
@@ -8446,8 +9670,10 @@ describe('Recorder', () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
-      asMock(apiFetch).mockRejectedValueOnce(
-        new ApiError(400, 'audio upload not found or expired'),
+      mockStartedApiFetchFailureOnce(
+        new ApiError(400, 'audio upload not found or expired', undefined, {
+          code: 'AUDIO_UPLOAD_MISSING',
+        }),
       );
       const { props } = await renderRecorder();
       asMock(File).mockClear();
@@ -8494,6 +9720,7 @@ describe('Recorder', () => {
       // A replacement native recorder rebuilds the lifecycle callbacks without
       // changing any identity, so the banner the learner is reading survives.
       mockRecorder = {
+        getStatus: jest.fn(() => liveRecorderState),
         prepareToRecordAsync: jest.fn(async () => undefined),
         record: jest.fn(),
         stop: jest.fn(async () => undefined),
@@ -8512,6 +9739,7 @@ describe('Recorder', () => {
       await startRecording();
       const previousRecorder = mockRecorder;
       const replacement: MockRecorder = {
+        getStatus: jest.fn(() => liveRecorderState),
         prepareToRecordAsync: jest.fn(async () => undefined),
         record: jest.fn(),
         stop: jest.fn(async () => {
@@ -8546,7 +9774,9 @@ describe('Recorder', () => {
       expect(replacement.record).toHaveBeenCalledTimes(1);
       expect(replacement.stop).toHaveBeenCalledTimes(1);
       expect(previousRecorder.stop).not.toHaveBeenCalled();
-      expect(deletedRecordingUris()).toEqual([RECORDING_URI]);
+      // The abandoned instance's live take and the replacement instance's
+      // later take are distinct recordings even though this mock reuses a URI.
+      expect(deletedRecordingUris()).toEqual([RECORDING_URI, RECORDING_URI]);
     });
 
     it('still performs the final status read when the clock moves during setup', async () => {
@@ -8652,7 +9882,7 @@ describe('Recorder', () => {
       expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
     });
 
-    it('passes through unlocked while a re-record clears the previous take', async () => {
+    it('stays locked while a re-record clears the previous take', async () => {
       const onInteractionLockChange = jest.fn();
       await renderRecorder({ onInteractionLockChange });
       await recordAndStop();
@@ -8662,12 +9892,12 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
       await waitFor(() => expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy());
 
-      expect(onInteractionLockChange).toHaveBeenCalledWith(false);
-      expect(onInteractionLockChange).toHaveBeenLastCalledWith(true);
+      expect(onInteractionLockChange).not.toHaveBeenCalledWith(false);
+      expect(onInteractionLockChange).not.toHaveBeenCalled();
     });
 
     it('unlocks when an ambiguous submission has nothing left to confirm', async () => {
-      asMock(apiUploadAudio).mockRejectedValue(new Error('unexpected transport defect'));
+      mockStartedUploadFailure(new Error('unexpected transport defect'));
       const onInteractionLockChange = jest.fn();
       const { props } = await renderRecorder({ onInteractionLockChange });
       await recordAndStop();
@@ -8785,7 +10015,7 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch).mockResolvedValueOnce({ score: 77 });
+      mockStartedApiFetchResultOnce({ score: 77 });
       const onInteractionLockChange = jest.fn();
       const { props } = await renderRecorder({ onInteractionLockChange });
 
@@ -8842,14 +10072,14 @@ describe('Recorder', () => {
     });
 
     it('stays locked and reports unavailable retry storage while already recovering', async () => {
-      asMock(loadPendingAssessment)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(null)
-        .mockRejectedValue(new Error('keychain unavailable'));
-      asMock(apiUploadAudio).mockRejectedValue(new ApiError(0, 'connection interrupted'));
+      mockStartedUploadFailure(new ApiError(0, 'connection interrupted'));
       const onInteractionLockChange = jest.fn();
       const { props } = await renderRecorder({ onInteractionLockChange });
       await recordAndStop();
+      asMock(loadPendingAssessment)
+        .mockReset()
+        .mockResolvedValueOnce(null)
+        .mockRejectedValue(new Error('keychain unavailable'));
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() =>

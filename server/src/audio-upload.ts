@@ -367,7 +367,7 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     const object = await getS3().send(new GetObjectCommand({ Bucket: config.s3.bucket, Key: audioKey }), {
       abortSignal: controller.signal,
     });
-    if (!object.Body) throw new HttpError(400, 'audio upload not found or expired');
+    if (!object.Body) throw new HttpError(400, 'audio upload not found or expired', 'AUDIO_UPLOAD_MISSING');
     if (typeof object.ContentLength === 'number' && object.ContentLength > MAX_AUDIO_BYTES) {
       releaseUnreadObjectBody(object.Body);
       throw new HttpError(413, 'Audio file is too large', 'AUDIO_TOO_LARGE');
@@ -385,7 +385,7 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     }
     const s3Err = err as { name?: string };
     if (s3Err.name === 'NoSuchKey' || s3Err.name === 'NotFound' || s3Err.name === '404') {
-      throw new HttpError(400, 'audio upload not found or expired');
+      throw new HttpError(400, 'audio upload not found or expired', 'AUDIO_UPLOAD_MISSING');
     }
     // A filesystem syscall failure (ENOSPC/EFBIG/EMFILE/EACCES from the temp-file
     // write stream or chmod) is a local disk fault, not an S3 outage: plain 500

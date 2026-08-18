@@ -6,6 +6,15 @@ import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
 
+/**
+ * Completed responses must outlive the app's 25-hour recovery window so a
+ * delayed retry still replays the original result instead of spending paid
+ * provider work and recording a second attempt under a newly claimable UUID.
+ */
+export const ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS = 48;
+
+const COMPLETED_RETENTION_INTERVAL_SQL = `interval '${ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS} hours'` as const;
+
 interface RequestRow {
   context: AssessmentContext;
   question_id: string;
@@ -62,7 +71,7 @@ export async function claimAssessmentRequest(
       `DELETE FROM assessment_requests
        WHERE user_id = $1 AND request_id = $2
          AND ((status = 'processing' AND started_at < now() - interval '5 minutes')
-           OR (status = 'completed' AND completed_at < now() - interval '1 day'))`,
+           OR (status = 'completed' AND completed_at < now() - ${COMPLETED_RETENTION_INTERVAL_SQL}))`,
       [userId, requestId],
     );
     const requestClaimId = randomUUID();
@@ -149,7 +158,7 @@ export async function cleanupAssessmentRequests(): Promise<number> {
      WHERE ctid IN (
        SELECT ctid FROM assessment_requests
        WHERE (status = 'processing' AND started_at < now() - interval '5 minutes')
-          OR (status = 'completed' AND completed_at < now() - interval '1 day')
+          OR (status = 'completed' AND completed_at < now() - ${COMPLETED_RETENTION_INTERVAL_SQL})
        LIMIT ${JANITOR_BATCH_SIZE}
      )`,
   );
@@ -175,7 +184,7 @@ export async function getAssessmentRequestStatus(
        AND (
          (status = 'processing' AND started_at >= now() - interval '5 minutes')
          OR
-         (status = 'completed' AND completed_at >= now() - interval '1 day')
+         (status = 'completed' AND completed_at >= now() - ${COMPLETED_RETENTION_INTERVAL_SQL})
        )`,
     [userId, requestId],
   );

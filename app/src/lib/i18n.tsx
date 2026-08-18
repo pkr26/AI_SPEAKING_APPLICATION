@@ -368,6 +368,8 @@ const en = {
   'recorder.errNoRecording': 'No recording was saved. Please record again.',
   'recorder.errStartFailed':
     'We could not start recording. Please check the microphone and try again.',
+  'recorder.errAudioReset':
+    'We could not reset audio. If sound does not work correctly, close and reopen the app.',
   'recorder.errPlayFailed': 'We could not play your recording. You can still send it.',
   'recorder.errRejected':
     'The server did not accept this recording. Please read the question and try again.',
@@ -811,6 +813,8 @@ const te: Record<MessageKey, string> = {
   'recorder.errNoRecording': 'రికార్డింగ్ సేవ్ కాలేదు. దయచేసి మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errStartFailed':
     'రికార్డింగ్ మొదలుపెట్టలేకపోయాము. దయచేసి మైక్రోఫోన్ చూసుకుని మళ్లీ ప్రయత్నించండి.',
+  'recorder.errAudioReset':
+    'ఆడియోను రీసెట్ చేయలేకపోయాము. శబ్దం సరిగా పని చేయకపోతే యాప్‌ను మూసి మళ్లీ తెరవండి.',
   'recorder.errPlayFailed': 'మీ రికార్డింగ్ ప్లే చేయలేకపోయాము. అయినా దాన్ని పంపవచ్చు.',
   'recorder.errRejected':
     'సర్వర్ ఈ రికార్డింగ్‌ను తీసుకోలేదు. దయచేసి ప్రశ్నను చదివి మళ్లీ ప్రయత్నించండి.',
@@ -1242,6 +1246,8 @@ const hi: Record<MessageKey, string> = {
   'recorder.errNoRecording': 'कोई रिकॉर्डिंग सेव नहीं हुई। कृपया फिर से रिकॉर्ड करें।',
   'recorder.errStartFailed':
     'हम रिकॉर्डिंग शुरू नहीं कर पाए। कृपया माइक्रोफ़ोन देखें और फिर से कोशिश करें।',
+  'recorder.errAudioReset':
+    'हम ऑडियो रीसेट नहीं कर पाए। अगर आवाज़ ठीक से काम न करे, तो ऐप बंद करके फिर खोलें।',
   'recorder.errPlayFailed': 'हम आपकी रिकॉर्डिंग नहीं चला पाए। आप फिर भी उसे भेज सकते हैं।',
   'recorder.errRejected':
     'सर्वर ने यह रिकॉर्डिंग स्वीकार नहीं की। कृपया सवाल पढ़ें और फिर से कोशिश करें।',
@@ -1666,6 +1672,8 @@ const es: Record<MessageKey, string> = {
   'recorder.errSaveFailed': 'No pudimos guardar la grabación. Graba tu respuesta de nuevo.',
   'recorder.errNoRecording': 'No se guardó ninguna grabación. Graba de nuevo, por favor.',
   'recorder.errStartFailed': 'No pudimos empezar a grabar. Revisa el micrófono e intenta de nuevo.',
+  'recorder.errAudioReset':
+    'No pudimos restablecer el audio. Si el sonido no funciona bien, cierra y vuelve a abrir la app.',
   'recorder.errPlayFailed': 'No pudimos reproducir tu grabación. Aún puedes enviarla.',
   'recorder.errRejected':
     'El servidor no aceptó esta grabación. Lee la pregunta e intenta de nuevo.',
@@ -2069,6 +2077,7 @@ const zh: Record<MessageKey, string> = {
   'recorder.errSaveFailed': '我们无法保存录音。请重新录你的回答。',
   'recorder.errNoRecording': '没有保存任何录音。请重新录音。',
   'recorder.errStartFailed': '我们无法开始录音。请检查麦克风后再试一次。',
+  'recorder.errAudioReset': '我们无法重置音频。如果声音异常，请关闭并重新打开应用。',
   'recorder.errPlayFailed': '我们无法播放你的录音。你还是可以发送它。',
   'recorder.errRejected': '服务器没有接受这段录音。请读一读问题，再试一次。',
 

@@ -131,7 +131,7 @@ describe('assessment request recovery', () => {
     await insertRequest(recentlyCompletedId, {
       status: 'completed',
       startedAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
-      completedAt: new Date().toISOString(),
+      completedAt: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
       response: { passed: false, score: 50 },
     });
     const recentlyCompleted = await request(a)
@@ -143,7 +143,7 @@ describe('assessment request recovery', () => {
     const expiredCompletedId = randomUUID();
     await insertRequest(expiredCompletedId, {
       status: 'completed',
-      completedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      completedAt: new Date(Date.now() - 49 * 60 * 60 * 1000).toISOString(),
       response: { passed: true, score: 90 },
     });
     const expiredCompleted = await request(a)
@@ -207,12 +207,12 @@ describe('assessment request recovery', () => {
     });
     await insertRequest(recentCompletedId, {
       status: 'completed',
-      completedAt: new Date().toISOString(),
+      completedAt: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
       response: { passed: true, score: 80 },
     });
     await insertRequest(expiredCompletedId, {
       status: 'completed',
-      completedAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(),
+      completedAt: new Date(Date.now() - 49 * 60 * 60 * 1000).toISOString(),
       response: { passed: false, score: 40 },
     });
 

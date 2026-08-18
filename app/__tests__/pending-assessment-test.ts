@@ -1,8 +1,10 @@
 import * as SecureStore from 'expo-secure-store';
 
 import {
+  claimPendingAssessmentRecoveryPost,
   clearPendingAssessment,
   loadPendingAssessment,
+  markPendingAssessmentCancelled,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   parsePendingAssessment,
@@ -67,6 +69,31 @@ describe('durable assessment handoff', () => {
 
     await clearPendingAssessment(pending.requestId);
     expect(await loadPendingAssessment()).toBeNull();
+  });
+
+  it('preserves durable cancellation and recovery claims through stage and reconciliation updates', async () => {
+    await savePendingAssessment({ ...pending, stage: 'prepared' });
+
+    await expect(claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    await expect(markPendingAssessmentCancelled(pending.requestId)).resolves.toBe(true);
+    await expect(
+      markPendingAssessmentStage(pending.requestId, 's3-granted', audioKey),
+    ).resolves.toBe(true);
+    expect(await loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 's3-granted',
+      audioKey,
+      cancelRequested: true,
+      recoveryPostAttempts: 1,
+    });
+
+    await expect(markPendingAssessmentForReconciliation(pending.requestId)).resolves.toBe(true);
+    expect(await loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 'reconcile',
+      cancelRequested: true,
+      recoveryPostAttempts: 1,
+    });
   });
 
   it('keeps a successful clear authoritative in the instrumented module cache', async () => {
@@ -215,6 +242,18 @@ describe('pending assessment edge cases', () => {
         'audio-uploads/550e8400-e29b-41d4-a716-446655440000/prefix-550e8400-e29b-41d4-a716-446655440003.m4a',
     },
     { ...pending, delivery: 'unknown' },
+    { ...pending, cancelRequested: null },
+    { ...pending, cancelRequested: 0 },
+    { ...pending, cancelRequested: 1 },
+    { ...pending, cancelRequested: 'true' },
+    { ...pending, cancelRequested: {} },
+    { ...pending, recoveryPostAttempts: null },
+    { ...pending, recoveryPostAttempts: -1 },
+    { ...pending, recoveryPostAttempts: 1.5 },
+    { ...pending, recoveryPostAttempts: 4 },
+    { ...pending, recoveryPostAttempts: Number.NaN },
+    { ...pending, recoveryPostAttempts: Number.POSITIVE_INFINITY },
+    { ...pending, recoveryPostAttempts: '1' },
   ])('rejects malformed metadata %#', (value) => {
     expect(parsePendingAssessment(value)).toBeNull();
   });
@@ -240,6 +279,28 @@ describe('pending assessment edge cases', () => {
       ...pending,
       stage: 'reconcile',
     });
+  });
+
+  it('accepts legacy metadata without a cancellation marker and preserves explicit booleans', () => {
+    expect(parsePendingAssessment(pending)).toEqual(pending);
+    expect(parsePendingAssessment({ ...pending, cancelRequested: false })).toEqual({
+      ...pending,
+      cancelRequested: false,
+    });
+    expect(parsePendingAssessment({ ...pending, cancelRequested: true })).toEqual({
+      ...pending,
+      cancelRequested: true,
+    });
+  });
+
+  it('accepts a missing legacy recovery counter and every bounded integer value', () => {
+    expect(parsePendingAssessment(pending)).toEqual(pending);
+    for (const recoveryPostAttempts of [0, 1, 2, 3]) {
+      expect(parsePendingAssessment({ ...pending, recoveryPostAttempts })).toEqual({
+        ...pending,
+        recoveryPostAttempts,
+      });
+    }
   });
 
   it.each(['prepared', 'direct-posting', 'reconcile'] as const)(
@@ -457,6 +518,145 @@ describe('pending assessment edge cases', () => {
     expect(secureStore.setItemAsync).not.toHaveBeenCalled();
   });
 
+  it('marks only the matching pending request as cancelled in memory and secure storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+
+    await expect(mod.markPendingAssessmentCancelled('different-request-id')).resolves.toBe(false);
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual(pending);
+
+    await expect(mod.markPendingAssessmentCancelled(pending.requestId)).resolves.toBe(true);
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(1);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      cancelRequested: true,
+    });
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual({
+      ...pending,
+      cancelRequested: true,
+    });
+  });
+
+  it('returns false without writing when cancellation has no pending record', async () => {
+    const { secureStore, mod } = loadFresh();
+
+    await expect(mod.markPendingAssessmentCancelled(pending.requestId)).resolves.toBe(false);
+
+    expect(secureStore.getItemAsync).toHaveBeenCalledTimes(1);
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('treats repeated cancellation of the same request as an idempotent success', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+
+    await expect(mod.markPendingAssessmentCancelled(pending.requestId)).resolves.toBe(true);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(mod.markPendingAssessmentCancelled(pending.requestId)).resolves.toBe(true);
+
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      cancelRequested: true,
+    });
+  });
+
+  it('claims at most one recovery POST by default and persists the counter', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(false);
+
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(1);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 1,
+    });
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual({
+      ...pending,
+      recoveryPostAttempts: 1,
+    });
+  });
+
+  it('honors bounded custom recovery POST limits', async () => {
+    const { mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId, 3)).resolves.toBe(true);
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId, 3)).resolves.toBe(true);
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId, 3)).resolves.toBe(true);
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId, 3)).resolves.toBe(false);
+
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 3,
+    });
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 4, Number.MAX_SAFE_INTEGER + 1])(
+    'rejects the invalid recovery POST maximum %p before storage access',
+    async (maxAttempts) => {
+      const { secureStore, mod } = loadFresh();
+
+      await expect(
+        mod.claimPendingAssessmentRecoveryPost(pending.requestId, maxAttempts),
+      ).rejects.toThrow('maxAttempts must be a positive safe integer no greater than 3');
+      expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+      expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not claim for an absent or stale pending request', async () => {
+    const { secureStore, mod } = loadFresh();
+
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(false);
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(mod.claimPendingAssessmentRecoveryPost('different-request-id')).resolves.toBe(
+      false,
+    );
+
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual(pending);
+  });
+
+  it('refunds a matching recovery claim without crossing below zero', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment({ ...pending, recoveryPostAttempts: 2 });
+    jest.mocked(secureStore.setItemAsync).mockClear();
+
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(2);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 0,
+    });
+  });
+
+  it('does not refund an absent or stale pending request', async () => {
+    const { secureStore, mod } = loadFresh();
+
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(false);
+    await mod.savePendingAssessment({ ...pending, recoveryPostAttempts: 1 });
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(mod.refundPendingAssessmentRecoveryPost('different-request-id')).resolves.toBe(
+      false,
+    );
+
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 1,
+    });
+  });
+
   it('does not advance an absent or different pending request', async () => {
     const { secureStore, mod } = loadFresh();
 
@@ -533,6 +733,222 @@ describe('pending assessment edge cases', () => {
     expect(storageEvents).toEqual(['save-started', 'save-finished', 'cleared']);
     expect(mockStorage.has(STORAGE_KEY)).toBe(false);
     await expect(mod.loadPendingAssessment()).resolves.toBeNull();
+  });
+
+  it('atomically allows only one of two concurrent default recovery claims', async () => {
+    const { secureStore, mod } = loadFresh();
+    const claimWriteStarted = deferred<void>();
+    const allowClaimWrite = deferred<void>();
+    await mod.savePendingAssessment(pending);
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        claimWriteStarted.resolve();
+        await allowClaimWrite.promise;
+        mockStorage.set(key, value);
+      });
+
+    const firstClaim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
+    await claimWriteStarted.promise;
+    const secondClaim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
+
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(2); // Initial save plus first claim.
+    allowClaimWrite.resolve();
+    await expect(Promise.all([firstClaim, secondClaim])).resolves.toEqual([true, false]);
+
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(2);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 1,
+    });
+  });
+
+  it('orders a concurrent refund after its in-flight recovery claim', async () => {
+    const { secureStore, mod } = loadFresh();
+    const claimWriteStarted = deferred<void>();
+    const allowClaimWrite = deferred<void>();
+    const storageEvents: string[] = [];
+    await mod.savePendingAssessment(pending);
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('claim-started');
+        claimWriteStarted.resolve();
+        await allowClaimWrite.promise;
+        mockStorage.set(key, value);
+        storageEvents.push('claim-finished');
+      })
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('refunded');
+        mockStorage.set(key, value);
+      });
+
+    const claim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
+    await claimWriteStarted.promise;
+    const refund = mod.refundPendingAssessmentRecoveryPost(pending.requestId);
+
+    expect(storageEvents).toEqual(['claim-started']);
+    allowClaimWrite.resolve();
+    await expect(Promise.all([claim, refund])).resolves.toEqual([true, true]);
+
+    expect(storageEvents).toEqual(['claim-started', 'claim-finished', 'refunded']);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 0,
+    });
+  });
+
+  it('keeps the counter unchanged after a failed recovery claim write', async () => {
+    const { secureStore, mod } = loadFresh();
+    const storageFailure = new Error('keychain write failed');
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockRejectedValueOnce(storageFailure);
+
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).rejects.toBe(
+      storageFailure,
+    );
+    expect(await mod.loadPendingAssessment()).toEqual(pending);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(pending);
+
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 1,
+    });
+  });
+
+  it('keeps the counter unchanged after a failed recovery refund write', async () => {
+    const { secureStore, mod } = loadFresh();
+    const claimed = { ...pending, recoveryPostAttempts: 1 };
+    const storageFailure = new Error('keychain write failed');
+    await mod.savePendingAssessment(claimed);
+    jest.mocked(secureStore.setItemAsync).mockRejectedValueOnce(storageFailure);
+
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).rejects.toBe(
+      storageFailure,
+    );
+    expect(await mod.loadPendingAssessment()).toEqual(claimed);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(claimed);
+
+    await expect(mod.refundPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(true);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      recoveryPostAttempts: 0,
+    });
+  });
+
+  it('serializes cancellation behind an in-flight save and marks that saved request', async () => {
+    const { secureStore, mod } = loadFresh();
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    const storageEvents: string[] = [];
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('save-started');
+        writeStarted.resolve();
+        await allowWrite.promise;
+        mockStorage.set(key, value);
+        storageEvents.push('save-finished');
+      })
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('cancelled');
+        mockStorage.set(key, value);
+      });
+
+    const saving = mod.savePendingAssessment(pending);
+    await writeStarted.promise;
+    const cancelling = mod.markPendingAssessmentCancelled(pending.requestId);
+
+    expect(storageEvents).toEqual(['save-started']);
+    allowWrite.resolve();
+    await expect(Promise.all([saving, cancelling])).resolves.toEqual([undefined, true]);
+
+    expect(storageEvents).toEqual(['save-started', 'save-finished', 'cancelled']);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      cancelRequested: true,
+    });
+  });
+
+  it('does not let a queued cancellation mark a newer request with a stale id', async () => {
+    const { secureStore, mod } = loadFresh();
+    const replacement: PendingAssessment = {
+      ...pending,
+      requestId: '550e8400-e29b-41d4-a716-446655440004',
+      stage: 'prepared',
+    };
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        writeStarted.resolve();
+        await allowWrite.promise;
+        mockStorage.set(key, value);
+      });
+
+    const savingReplacement = mod.savePendingAssessment(replacement);
+    await writeStarted.promise;
+    const cancellingStaleRequest = mod.markPendingAssessmentCancelled(pending.requestId);
+    allowWrite.resolve();
+
+    await expect(savingReplacement).resolves.toBeUndefined();
+    await expect(cancellingStaleRequest).resolves.toBe(false);
+    expect(await mod.loadPendingAssessment()).toEqual(replacement);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(replacement);
+  });
+
+  it('lets a replacement saved after cancellation become authoritative', async () => {
+    const { secureStore, mod } = loadFresh();
+    const replacement: PendingAssessment = {
+      ...pending,
+      requestId: '550e8400-e29b-41d4-a716-446655440004',
+      stage: 'prepared',
+    };
+    const cancellationStarted = deferred<void>();
+    const allowCancellation = deferred<void>();
+    const storageEvents: string[] = [];
+    await mod.savePendingAssessment(pending);
+    jest
+      .mocked(secureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('cancel-started');
+        cancellationStarted.resolve();
+        await allowCancellation.promise;
+        mockStorage.set(key, value);
+        storageEvents.push('cancel-finished');
+      })
+      .mockImplementationOnce(async (key: string, value: string) => {
+        storageEvents.push('replacement-saved');
+        mockStorage.set(key, value);
+      });
+
+    const cancelling = mod.markPendingAssessmentCancelled(pending.requestId);
+    await cancellationStarted.promise;
+    const savingReplacement = mod.savePendingAssessment(replacement);
+
+    expect(storageEvents).toEqual(['cancel-started']);
+    allowCancellation.resolve();
+    await expect(Promise.all([cancelling, savingReplacement])).resolves.toEqual([true, undefined]);
+
+    expect(storageEvents).toEqual(['cancel-started', 'cancel-finished', 'replacement-saved']);
+    expect(await mod.loadPendingAssessment()).toEqual(replacement);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(replacement);
+  });
+
+  it('keeps the prior record authoritative when persisting cancellation fails', async () => {
+    const { secureStore, mod } = loadFresh();
+    const storageFailure = new Error('keychain write failed');
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockRejectedValueOnce(storageFailure);
+
+    await expect(mod.markPendingAssessmentCancelled(pending.requestId)).rejects.toBe(
+      storageFailure,
+    );
+
+    expect(await mod.loadPendingAssessment()).toEqual(pending);
+    expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(pending);
   });
 
   it('preserves the prior memory and durable record when a queued save fails', async () => {

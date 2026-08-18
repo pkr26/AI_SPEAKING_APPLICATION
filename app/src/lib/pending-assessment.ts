@@ -14,9 +14,12 @@ export interface PendingAssessment {
   createdAt: number;
   stage: 'prepared' | 'direct-posting' | 's3-granted' | 'reconcile';
   audioKey?: string;
+  cancelRequested?: boolean;
+  recoveryPostAttempts?: number;
 }
 
 const STORAGE_KEY = 'pending_assessment_v1';
+const MAX_STORED_RECOVERY_POST_ATTEMPTS = 3;
 const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
   keychainService: 'ai-english-coach.pending-assessment',
@@ -60,6 +63,17 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
   ) {
     return null;
   }
+  if (candidate.cancelRequested !== undefined && typeof candidate.cancelRequested !== 'boolean') {
+    return null;
+  }
+  if (
+    candidate.recoveryPostAttempts !== undefined &&
+    (!Number.isSafeInteger(candidate.recoveryPostAttempts) ||
+      candidate.recoveryPostAttempts < 0 ||
+      candidate.recoveryPostAttempts > MAX_STORED_RECOVERY_POST_ATTEMPTS)
+  ) {
+    return null;
+  }
   const legacyDelivery = (candidate as Partial<PendingAssessment> & { delivery?: string }).delivery;
   if (
     legacyDelivery !== undefined &&
@@ -85,6 +99,12 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
     createdAt: candidate.createdAt,
     stage,
     ...(stage === 's3-granted' ? { audioKey: candidate.audioKey } : {}),
+    ...(candidate.cancelRequested !== undefined
+      ? { cancelRequested: candidate.cancelRequested }
+      : {}),
+    ...(candidate.recoveryPostAttempts !== undefined
+      ? { recoveryPostAttempts: candidate.recoveryPostAttempts }
+      : {}),
   };
 }
 
@@ -163,6 +183,69 @@ export async function markPendingAssessmentForReconciliation(requestId: string):
       ...current,
       stage: 'reconcile',
       audioKey: undefined,
+    });
+    return true;
+  });
+}
+
+/**
+ * Durably records cancellation intent for only the expected logical request.
+ * The marker is monotonic: subsequent stage and reconciliation writes preserve
+ * it until that request is conditionally cleared.
+ */
+export async function markPendingAssessmentCancelled(requestId: string): Promise<boolean> {
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (!current || current.requestId !== requestId) return false;
+    if (current.cancelRequested === true) return true;
+    await savePendingUnsafe({
+      ...current,
+      cancelRequested: true,
+    });
+    return true;
+  });
+}
+
+/** Atomically reserves one bounded recovery POST before any network work begins. */
+export async function claimPendingAssessmentRecoveryPost(
+  requestId: string,
+  maxAttempts = 1,
+): Promise<boolean> {
+  if (
+    !Number.isSafeInteger(maxAttempts) ||
+    maxAttempts <= 0 ||
+    maxAttempts > MAX_STORED_RECOVERY_POST_ATTEMPTS
+  ) {
+    throw new RangeError(
+      `maxAttempts must be a positive safe integer no greater than ${MAX_STORED_RECOVERY_POST_ATTEMPTS}`,
+    );
+  }
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (!current || current.requestId !== requestId) return false;
+    const attempts = current.recoveryPostAttempts ?? 0;
+    if (attempts >= maxAttempts) return false;
+    await savePendingUnsafe({
+      ...current,
+      recoveryPostAttempts: attempts + 1,
+    });
+    return true;
+  });
+}
+
+/**
+ * Refunds a claimed recovery POST that definitively failed before provider work.
+ * A matching zero balance is already fully refunded and succeeds without I/O.
+ */
+export async function refundPendingAssessmentRecoveryPost(requestId: string): Promise<boolean> {
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (!current || current.requestId !== requestId) return false;
+    const attempts = current.recoveryPostAttempts ?? 0;
+    if (attempts === 0) return true;
+    await savePendingUnsafe({
+      ...current,
+      recoveryPostAttempts: attempts - 1,
     });
     return true;
   });

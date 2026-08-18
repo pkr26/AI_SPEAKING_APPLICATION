@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import {
+  ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS,
   AssessmentRequestInFlightError,
   claimAssessmentRequest,
   completeAssessmentRequest,
@@ -118,6 +119,46 @@ describe('claimAssessmentRequest ownership and replay', () => {
       questionId,
       response: { passed: true, score: 91 },
     });
+  });
+
+  it('retains completed claims for 48 hours before allowing the request UUID to be claimed again', async () => {
+    expect(ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS).toBe(48);
+
+    const replayableRequestId = randomUUID();
+    const replayableClaim = await claimAssessmentRequest(userId, replayableRequestId, 'practice', questionId);
+    if (replayableClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
+    const replayableResponse = { passed: true, score: 86 };
+    await completeAssessmentRequest(pool, userId, replayableRequestId, replayableClaim.claimId, replayableResponse);
+    await pool.query(
+      `UPDATE assessment_requests
+       SET completed_at = now() - interval '47 hours'
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, replayableRequestId],
+    );
+
+    await expect(claimAssessmentRequest(userId, replayableRequestId, 'practice', questionId)).resolves.toEqual({
+      kind: 'completed',
+      response: replayableResponse,
+    });
+
+    const expiredRequestId = randomUUID();
+    const expiredClaim = await claimAssessmentRequest(userId, expiredRequestId, 'practice', questionId);
+    if (expiredClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
+    await completeAssessmentRequest(pool, userId, expiredRequestId, expiredClaim.claimId, {
+      passed: false,
+      score: 42,
+    });
+    await pool.query(
+      `UPDATE assessment_requests
+       SET completed_at = now() - interval '49 hours'
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, expiredRequestId],
+    );
+
+    const replacement = await claimAssessmentRequest(userId, expiredRequestId, 'practice', questionId);
+    expect(replacement).toMatchObject({ kind: 'claimed' });
+    if (replacement.kind !== 'claimed') throw new Error('expected an expired claim to be replaced');
+    expect(replacement.claimId).not.toBe(expiredClaim.claimId);
   });
 
   it('commits and releases the transaction used to replay a completed request', async () => {

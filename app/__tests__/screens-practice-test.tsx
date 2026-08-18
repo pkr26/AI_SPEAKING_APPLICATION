@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
-import type { TestInstance } from 'test-renderer';
+import type { Fiber, TestInstance } from 'test-renderer';
 import React from 'react';
 import { Alert, BackHandler, StyleSheet, useColorScheme, View } from 'react-native';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -323,6 +323,19 @@ type SemanticStyle = Record<string, unknown>;
 
 function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
+}
+
+/** Returns the currently committed Pressable handler without dispatching a
+ * separate RNTL act(), for same-frame interaction race coverage. */
+function committedPressHandler(node: TestInstance): () => unknown {
+  let fiber: Fiber | null = node.unstable_fiber;
+  while (fiber) {
+    const props = fiber.memoizedProps as { onPress?: unknown } | null;
+    if (typeof props?.onPress === 'function') return props.onPress as () => unknown;
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
 }
 
 function responderEvent() {
@@ -672,6 +685,30 @@ describe('practice home screen', () => {
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
+  it('rejects stale control taps delivered in the same commit as a recorder lock', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    // Capture the enabled handlers first. In production the Recorder can take
+    // ownership of a take and another touch can already be queued before React
+    // commits the disabled controls, so render-state checks alone are too late.
+    const staleTogglePress = committedPressHandler(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
+    );
+    const staleSkipPress = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      staleTogglePress();
+      staleSkipPress();
+    });
+
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+    expect(mockSkipWord).not.toHaveBeenCalled();
   });
 
   it('locks help and footer actions while a recording or submission is active', async () => {
@@ -1104,6 +1141,23 @@ describe('practice attempt screen', () => {
     expect(flattenedStyle(unlocked).opacity).toBeUndefined();
     await fireEvent.press(unlocked);
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
+  it('rejects a stale Practice Mode switch tap delivered with its recorder lock', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const staleTogglePress = committedPressHandler(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
+    );
+
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      staleTogglePress();
+    });
+
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
   });
 
   it('blocks the Android hardware back press only while a recording or submission is active', async () => {
@@ -2375,6 +2429,32 @@ describe('skip word', () => {
     expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
     expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('issues one skip for two same-render activations', async () => {
+    let resolveSkip: () => void = () => undefined;
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveSkip = resolve;
+      }),
+    );
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const press = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+
+    await act(async () => {
+      first = Promise.resolve(press());
+      second = Promise.resolve(press());
+    });
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+
+    await act(async () => resolveSkip());
+    await Promise.all([first, second]);
   });
 
   it('disables skipping while the recorder holds the interaction lock', async () => {

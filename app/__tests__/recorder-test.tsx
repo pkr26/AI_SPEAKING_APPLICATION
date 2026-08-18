@@ -851,6 +851,23 @@ describe('Recorder', () => {
       expect(AudioModule.requestRecordingPermissionsAsync).not.toHaveBeenCalled();
     });
 
+    it('ignores a stale same-frame start press after recording has begun', async () => {
+      const { view } = await renderRecorder();
+      // Keep the pre-recording Pressable handler. React has not committed its
+      // Stop-button render between these two calls, which models a second tap
+      // delivered in the same frame after the first async start resolves.
+      const onPress = compositePressableProps(view, START_LABEL).onPress as () => unknown;
+
+      await act(async () => {
+        await Promise.resolve(onPress());
+        await Promise.resolve(onPress());
+      });
+
+      expect(mockRecorder.prepareToRecordAsync).toHaveBeenCalledTimes(1);
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+    });
+
     it('starts and stops the pulse animation only while recording', async () => {
       const start = jest.fn();
       const stop = jest.fn();

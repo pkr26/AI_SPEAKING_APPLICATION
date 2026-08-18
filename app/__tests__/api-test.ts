@@ -626,7 +626,12 @@ describe('apiFetch', () => {
     try {
       await api.apiFetch('/me', timeoutMs === undefined ? {} : { timeoutMs });
 
-      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([expectedDelay]);
+      // Headers and the JSON body are independently bounded: fetch() resolves
+      // before a peer necessarily finishes streaming its body.
+      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([
+        expectedDelay,
+        expectedDelay,
+      ]);
     } finally {
       timeoutSpy.mockRestore();
     }
@@ -641,7 +646,20 @@ describe('apiFetch', () => {
     });
 
     expect(fetchMock.mock.calls[0][1].method).toBe('POST');
+    expect(fetchMock.mock.calls[0][1].redirect).toBe('error');
     expect(fetchMock.mock.calls[0][1].body).toBe('{"name":"x","count":2}');
+  });
+
+  it('times out a response body that never arrives after successful headers', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    const error = await catchAsync(api.apiFetch('/body-stalled', { timeoutMs: 10 }));
+
+    expect(error).toMatchObject({ status: 408 });
   });
 
   it('attaches the bearer token when one is stored', async () => {
@@ -1240,7 +1258,10 @@ describe('resolveAudioFileDescriptor', () => {
       name: 'audio.m4a',
       type: 'audio/mp4',
     });
-    expect(fetchMock).toHaveBeenCalledWith('blob:https://app/audio-1');
+    expect(fetchMock).toHaveBeenCalledWith(
+      'blob:https://app/audio-1',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 
   it('keeps the web default when the blob reports no type', async () => {
@@ -1263,6 +1284,39 @@ describe('resolveAudioFileDescriptor', () => {
       name: 'audio.webm',
       type: 'audio/webm',
     });
+  });
+
+  it('aborts a stalled web descriptor read instead of continuing to an upload grant', async () => {
+    mockPlatform.OS = 'web';
+    const blob = deferred<Blob>();
+    const cancel = jest.fn(async () => undefined);
+    fetchMock.mockResolvedValueOnce({
+      blob: () => blob.promise,
+      body: { cancel },
+    } as unknown as Response);
+    const controller = new AbortController();
+
+    const descriptor = api.resolveAudioFileDescriptor('blob:https://app/audio-1', {
+      signal: controller.signal,
+      timeoutMs: 60_000,
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(descriptor).rejects.toMatchObject({ name: 'AbortError' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces a stalled web descriptor fetch instead of spending a second timeout on a grant', async () => {
+    mockPlatform.OS = 'web';
+    fetchUntilAborted();
+
+    const error = await catchAsync(
+      api.resolveAudioFileDescriptor('blob:https://app/audio-1', { timeoutMs: 10 }),
+    );
+
+    expect(error).toMatchObject({ status: 408 });
   });
 });
 
@@ -1329,7 +1383,11 @@ describe('apiUploadAudio', () => {
       questionId: 'q-1',
     });
 
-    expect(fetchMock.mock.calls[0]).toEqual(['blob:https://app/audio-1']);
+    expect(fetchMock.mock.calls[0][0]).toBe('blob:https://app/audio-1');
+    expect(fetchMock.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
+    expect(fetchMock.mock.calls[1][1].redirect).toBe('error');
     const form = fetchMock.mock.calls[1][1].body as unknown as MockFormData;
     expect(form.entries[0]).toEqual({
       name: 'audio',
@@ -1355,6 +1413,29 @@ describe('apiUploadAudio', () => {
       value: blob,
       filename: 'audio.m4a',
     });
+  });
+
+  it('does not mark a direct upload as started until its local web blob is ready', async () => {
+    mockPlatform.OS = 'web';
+    const body = deferred<Blob>();
+    const onRequestStarted = jest.fn();
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, blob: () => body.promise } as unknown as Response)
+      .mockResolvedValueOnce(fakeResponse({ json: async () => ({ ok: true }) }));
+
+    const upload = api.apiUploadAudio(
+      '/practice/attempt',
+      'blob:https://app/audio-1',
+      {},
+      { onRequestStarted },
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onRequestStarted).not.toHaveBeenCalled();
+
+    body.resolve(new Blob(['audio-bytes'], { type: 'audio/webm' }));
+    await expect(upload).resolves.toEqual({ ok: true });
+    expect(onRequestStarted).toHaveBeenCalledTimes(1);
   });
 
   it('reports 401 uploads to the unauthorized handler', async () => {
@@ -1999,32 +2080,42 @@ describe('apiPostPresignedAudio', () => {
   it.each([
     ['the default audio timeout', undefined, 150_000],
     ['a caller-selected audio timeout', 1_234, 1_234],
-  ])('applies %s to both browser upload requests', async (_label, timeoutMs, expectedDelay) => {
-    mockPlatform.OS = 'web';
-    const body = { size: 5 } as Blob;
-    fetchMock
-      .mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body })
-      .mockResolvedValueOnce(fakeResponse());
-    const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+  ])(
+    'applies %s to browser upload requests and their local blob body',
+    async (_label, timeoutMs, expectedDelay) => {
+      mockPlatform.OS = 'web';
+      const body = { size: 5 } as Blob;
+      fetchMock
+        .mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body })
+        .mockResolvedValueOnce(fakeResponse());
+      const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
 
-    try {
-      await api.apiPostPresignedAudio(
-        uploadUrl,
-        { ...uploadFields, 'Content-Type': 'audio/webm' },
-        'blob:https://app/audio-1',
-        'audio/webm',
-        maxBytes,
-        timeoutMs === undefined ? {} : { timeoutMs },
-      );
+      try {
+        await api.apiPostPresignedAudio(
+          uploadUrl,
+          { ...uploadFields, 'Content-Type': 'audio/webm' },
+          'blob:https://app/audio-1',
+          'audio/webm',
+          maxBytes,
+          timeoutMs === undefined ? {} : { timeoutMs },
+        );
 
-      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([
-        expectedDelay,
-        expectedDelay,
-      ]);
-    } finally {
-      timeoutSpy.mockRestore();
-    }
-  });
+        const delays = timeoutSpy.mock.calls.map(([, delay]) => delay as number);
+        // The local-blob fetch begins with the whole end-to-end allowance;
+        // later body/upload operations receive its remaining portion. Wall
+        // clock time can advance one millisecond between mocked awaits, so
+        // pin the budget shape rather than an accidentally exact timestamp.
+        expect(delays).toHaveLength(3);
+        expect(delays[0]).toBe(expectedDelay);
+        for (const delay of delays.slice(1)) {
+          expect(delay).toBeGreaterThanOrEqual(1);
+          expect(delay).toBeLessThanOrEqual(expectedDelay);
+        }
+      } finally {
+        timeoutSpy.mockRestore();
+      }
+    },
+  );
 });
 
 describe('resolveBaseUrl', () => {

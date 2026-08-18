@@ -558,7 +558,7 @@ describe('diagnostic account deletion races', () => {
     expect(await accountRemnants(userId)).toEqual({ users: 0, state: 0, attempts: 0 });
   });
 
-  it('POST /answer answers 409 when the account is deleted before finalization', async () => {
+  it('POST /answer answers 409 when the account is deleted before claiming paid work', async () => {
     const { token, userId } = await registerDiagnosticUser();
     const questionId = await assignB1Question(userId);
     const requestId = randomUUID();
@@ -572,8 +572,9 @@ describe('diagnostic account deletion races', () => {
 
     expect(response.status).toBe(409);
     expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
-    // Finalization stops at the parent lock: no attempt row, no diagnostic_state
-    // re-insert, and therefore no foreign-key violation to answer as a 500.
+    // The generic idempotency claim stops at the parent lock: no attempt row,
+    // diagnostic-state re-insert, provider call, or foreign-key violation to
+    // answer as a 500.
     expect(statements).toEqual(['BEGIN', WRITER_PARENT_LOCK, 'ROLLBACK']);
     expect(await accountRemnants(userId)).toEqual({ users: 0, state: 0, attempts: 0 });
   });

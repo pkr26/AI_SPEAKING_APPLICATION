@@ -80,6 +80,20 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Account deletion locks users before cascading into diagnostic_state.
+    // Claiming this child first could either deadlock with that cascade or
+    // recreate a missing state row into a foreign-key error after deletion.
+    const lockedUser = await client.query<{ diagnostic_completed: boolean }>(
+      'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const currentUser = lockedUser.rows[0];
+    if (!currentUser) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
+    if (currentUser.diagnostic_completed) {
+      throw new HttpError(400, 'Diagnostic already completed', 'DIAGNOSTIC_DONE');
+    }
     const state = await lockState(client, userId);
     if (!state.current_question_id || state.current_question_id !== questionId) {
       throw new HttpError(409, 'Question mismatch', 'QUESTION_MISMATCH');

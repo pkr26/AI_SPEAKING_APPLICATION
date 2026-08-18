@@ -31,6 +31,7 @@ afterAll(async () => {
 function sign(payload: string | Record<string, unknown>, options: jwt.SignOptions = {}) {
   return jwt.sign(payload, config.jwtSecret, {
     algorithm: 'HS256',
+    expiresIn: '30d',
     issuer: JWT_ISSUER,
     audience: JWT_AUDIENCE,
     ...options,
@@ -44,8 +45,8 @@ describe('requireAuth', () => {
     return token === undefined ? req : req.set('Authorization', token);
   };
 
-  it('rejects a missing header, a non-Bearer scheme, and a bare Bearer scheme', async () => {
-    for (const header of [undefined, 'Basic abc123', 'Bearer', 'bearer validlooking']) {
+  it('rejects a missing header, malformed schemes, and bearer values with extra credentials', async () => {
+    for (const header of [undefined, 'Basic abc123', 'Bearer', 'bearer validlooking', 'Bearer token another-token']) {
       const res = await me(header as string | undefined);
       expect(res.status).toBe(401);
       expect(res.body).toEqual({
@@ -79,6 +80,8 @@ describe('requireAuth', () => {
       { sub: 12345, tv: 1 }, // sub not a string
       { sub: randomUUID() }, // no tv
       { sub: randomUUID(), tv: '1' }, // tv not a number
+      { sub: randomUUID(), tv: 0 }, // token versions are positive integers
+      { sub: randomUUID(), tv: 1.5 }, // integer database versions only
     ]) {
       const res = await me(`Bearer ${sign(payload)}`);
       expect(res.status).toBe(401);
@@ -89,6 +92,17 @@ describe('requireAuth', () => {
     const res = await me(`Bearer ${stringToken}`);
     expect(res.status).toBe(401);
     expect(res.body.error).toBe('Invalid or expired token');
+  });
+
+  it('rejects an otherwise valid signature that omitted the mandatory expiry claim', async () => {
+    const tokenWithoutExpiry = jwt.sign({ sub: randomUUID(), tv: 1 }, config.jwtSecret, {
+      algorithm: 'HS256',
+      issuer: JWT_ISSUER,
+      audience: JWT_AUDIENCE,
+    });
+    const res = await me(`Bearer ${tokenWithoutExpiry}`);
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
   });
 
   it('requires the entire token subject to be exactly one UUID', async () => {

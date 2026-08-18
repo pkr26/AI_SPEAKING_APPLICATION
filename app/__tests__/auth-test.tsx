@@ -1550,6 +1550,20 @@ describe('daily reminder cleanup', () => {
     expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
   });
 
+  it('cancels the reminder and pending handoff when the saved session is reset', async () => {
+    await renderLoggedIn();
+    const pendingCallsBeforeReset = mockedClearPendingAssessment.mock.calls.length;
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+
+    await waitFor(() => {
+      expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(pendingCallsBeforeReset + 1);
+    });
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
+  });
+
   it('never blocks logout on reminder cleanup: the quiet cancel resolves internally', async () => {
     // The cleanup contract is fire-and-forget; even a rejected promise from a
     // misbehaving mock must not fail the logout path.

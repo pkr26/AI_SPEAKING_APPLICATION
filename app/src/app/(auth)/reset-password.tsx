@@ -39,6 +39,7 @@ export default function ResetPasswordScreen() {
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
+  const busyRef = useRef(false);
 
   const trimmedEmail = email.trim();
   const trimmedCode = code.trim();
@@ -52,7 +53,8 @@ export default function ResetPasswordScreen() {
     !busy;
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -65,6 +67,7 @@ export default function ResetPasswordScreen() {
     } catch (err) {
       setError(userMessageForError(err, t('cp.failed')));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };

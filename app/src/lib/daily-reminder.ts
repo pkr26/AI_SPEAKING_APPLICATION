@@ -29,6 +29,24 @@ const ANDROID_CHANNEL_ID = 'daily-reminder';
 
 type NotificationsModule = typeof import('expo-notifications');
 
+// Scheduling is a read/cancel/schedule/write transaction spread across the OS
+// notification service and SecureStore. Settings, an auth expiry, and logout
+// can all invoke it in the same JS process, so serialize those operations: an
+// older enable must never finish by restoring a reminder after logout has
+// already cancelled it.
+let reminderQueue: Promise<void> = Promise.resolve();
+
+function withReminderLock<T>(operation: () => Promise<T>): Promise<T> {
+  const result = reminderQueue.then(operation, operation);
+  // Leave the queue usable after an OS/storage failure while preserving that
+  // failure for the caller that initiated the operation.
+  reminderQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 function notifications(): NotificationsModule {
   // Lazy require instead of a top-level import: Metro inlines it at the call
   // site, and jest (which cannot execute dynamic import()) intercepts it.
@@ -72,7 +90,7 @@ export async function getDailyReminder(): Promise<DailyReminder | null> {
  * language only updates on the render after a language change, so Settings
  * passes the just-chosen language when re-scheduling.
  */
-export async function enableDailyReminder(
+async function enableDailyReminderUnsafe(
   hour: number,
   language?: UiLanguage,
 ): Promise<'enabled' | 'denied'> {
@@ -141,8 +159,15 @@ export async function enableDailyReminder(
   return 'enabled';
 }
 
+export function enableDailyReminder(
+  hour: number,
+  language?: UiLanguage,
+): Promise<'enabled' | 'denied'> {
+  return withReminderLock(() => enableDailyReminderUnsafe(hour, language));
+}
+
 /** Cancels the reminder and forgets the stored preference. */
-export async function disableDailyReminder(): Promise<void> {
+async function disableDailyReminderUnsafe(): Promise<void> {
   const Notifications = notifications();
   // Forget the preference first: a failed delete then leaves the preference
   // and the schedule consistently ON. If the OS cancel fails after the delete
@@ -160,6 +185,10 @@ export async function disableDailyReminder(): Promise<void> {
     }
     throw error;
   }
+}
+
+export function disableDailyReminder(): Promise<void> {
+  return withReminderLock(disableDailyReminderUnsafe);
 }
 
 /**

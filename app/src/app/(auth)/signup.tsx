@@ -47,6 +47,7 @@ export default function SignupScreen() {
   const [error, setError] = useState<string | null>(null);
   const emailRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
+  const busyRef = useRef(false);
 
   // Live preview: tapping a language chip switches this screen's UI language
   // immediately, before any account exists. The chosen language is also pushed
@@ -78,7 +79,8 @@ export default function SignupScreen() {
     !busy;
 
   const handleSignup = async () => {
-    if (!canSubmit || !nativeLanguage) return;
+    if (!canSubmit || !nativeLanguage || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -91,6 +93,7 @@ export default function SignupScreen() {
         setError(userMessageForError(err, t('signup.failed')));
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };

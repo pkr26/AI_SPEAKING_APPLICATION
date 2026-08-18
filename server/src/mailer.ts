@@ -14,6 +14,19 @@ export interface MailMessage {
   text: string;
 }
 
+// Logging itself is an operational dependency. A transport/serializer fault
+// must not turn this best-effort mail helper into a rejected promise (the
+// caller intentionally dispatches it after returning a uniform reset response).
+function logDeliveryFailure(payload: Record<string, unknown>, message: string): void {
+  try {
+    logger.error(payload, message);
+  } catch {
+    // The API must keep its no-throw mail-delivery contract even when logging
+    // is impaired; the reset token is already durable and the caller has no
+    // response distinction to expose.
+  }
+}
+
 /**
  * Deliver one mail per the configured MAIL_MODE. 'log' writes the whole
  * message (including any embedded code) to the info log — dev/manual delivery.
@@ -21,34 +34,41 @@ export interface MailMessage {
  * (network, timeout, non-2xx) are logged and swallowed. Never rejects.
  */
 export async function sendMail(message: MailMessage): Promise<void> {
-  if (config.mail.mode === 'webhook') {
-    try {
-      const response = await fetch(config.mail.webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: message.to, subject: message.subject, text: message.text }),
-        signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
-        // The configured URL is security-validated, but fetch would otherwise
-        // forward this POST (including password-reset codes) across a 307/308
-        // redirect to an arbitrary or plaintext destination.
-        redirect: 'error',
-      });
-      if (!response.ok) {
-        logger.error({ to: message.to, subject: message.subject, status: response.status }, 'mail webhook rejected');
+  try {
+    if (config.mail.mode === 'webhook') {
+      try {
+        const response = await fetch(config.mail.webhookUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ to: message.to, subject: message.subject, text: message.text }),
+          signal: AbortSignal.timeout(WEBHOOK_TIMEOUT_MS),
+          // The configured URL is security-validated, but fetch would otherwise
+          // forward this POST (including password-reset codes) across a 307/308
+          // redirect to an arbitrary or plaintext destination.
+          redirect: 'error',
+        });
+        if (!response.ok) {
+          logDeliveryFailure(
+            { to: message.to, subject: message.subject, status: response.status },
+            'mail webhook rejected',
+          );
+        }
+        // The response body is never read; cancel it so the keep-alive socket is
+        // released back to the pool immediately instead of being held until GC.
+        await response.body?.cancel().catch(() => undefined);
+      } catch (err) {
+        logDeliveryFailure({ err, to: message.to, subject: message.subject }, 'mail webhook delivery failed');
       }
-      // The response body is never read; cancel it so the keep-alive socket is
-      // released back to the pool immediately instead of being held until GC.
-      await response.body?.cancel().catch(() => undefined);
-    } catch (err) {
-      logger.error({ err, to: message.to, subject: message.subject }, 'mail webhook delivery failed');
+      return;
     }
-    return;
+    // Deliberately at info level: log mode IS the delivery channel in dev, so
+    // the operator must see the message text (the reset code lives in `text`,
+    // which the logger's redaction allowlist does not touch).
+    logger.info(
+      { to: message.to, subject: message.subject, text: message.text },
+      'mail delivered to log (MAIL_MODE=log)',
+    );
+  } catch (err) {
+    logDeliveryFailure({ err, to: message.to, subject: message.subject }, 'mail delivery failed unexpectedly');
   }
-  // Deliberately at info level: log mode IS the delivery channel in dev, so
-  // the operator must see the message text (the reset code lives in `text`,
-  // which the logger's redaction allowlist does not touch).
-  logger.info(
-    { to: message.to, subject: message.subject, text: message.text },
-    'mail delivered to log (MAIL_MODE=log)',
-  );
 }

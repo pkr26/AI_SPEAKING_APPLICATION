@@ -3,7 +3,10 @@ import path from 'node:path';
 import { mutationLanes } from './scripts/mutation-lanes.mjs';
 
 const laneName = process.env.MUTATION_LANE;
-const lane = laneName === undefined ? undefined : mutationLanes[laneName];
+const lane =
+  laneName !== undefined && Object.hasOwn(mutationLanes, laneName)
+    ? mutationLanes[laneName]
+    : undefined;
 
 if (!laneName || !lane) {
   throw new Error(

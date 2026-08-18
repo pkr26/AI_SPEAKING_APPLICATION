@@ -332,6 +332,9 @@ describe('POST /auth/reset-password', () => {
     const client = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [] };
+        if (text.startsWith('SELECT id FROM users WHERE id = $1 FOR UPDATE')) {
+          return { rows: [{ id: userId }], rowCount: 1 };
+        }
         if (text.startsWith('DELETE FROM password_reset_tokens')) return { rows: [], rowCount: 1 };
         if (text.startsWith('UPDATE users SET password_hash')) throw primaryError;
         throw new Error(`unexpected query: ${text}`);
@@ -355,6 +358,7 @@ describe('POST /auth/reset-password', () => {
       expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
       expect(client.query.mock.calls.map(([text]) => text)).toEqual([
         'BEGIN',
+        expect.stringContaining('SELECT id FROM users WHERE id = $1 FOR UPDATE'),
         expect.stringContaining('DELETE FROM password_reset_tokens'),
         expect.stringContaining('UPDATE users SET password_hash'),
         'ROLLBACK',
@@ -364,6 +368,31 @@ describe('POST /auth/reset-password', () => {
       hash.mockRestore();
       connect.mockRestore();
       query.mockRestore();
+    }
+  });
+});
+
+describe('mailer resilience', () => {
+  const savedMail = { ...config.mail };
+
+  afterEach(() => {
+    Object.assign(config.mail, savedMail);
+  });
+
+  it('never rejects the best-effort log delivery path when the logger transport fails', async () => {
+    config.mail.mode = 'log';
+    const info = vi.spyOn(logger, 'info').mockImplementation((() => {
+      throw new Error('log transport failed');
+    }) as never);
+    const error = vi.spyOn(logger, 'error').mockImplementation((() => {
+      throw new Error('error log transport failed');
+    }) as never);
+
+    try {
+      await expect(sendMail({ to: 'learner@example.com', subject: 'Reset', text: 'code' })).resolves.toBeUndefined();
+    } finally {
+      error.mockRestore();
+      info.mockRestore();
     }
   });
 });

@@ -418,39 +418,41 @@ describe('submitted S3 cleanup lifecycle', () => {
     await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
   });
 
-  it.each([409, 429, 503])('preserves the submitted object on a %s without an ownership lookup', async (statusCode) => {
-    const userId = randomUUID();
-    const req = {
-      body: { audioKey: ownedKey(userId), requestId: randomUUID() },
-      user: { id: userId },
-    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
-    const listeners = new Map<string, Array<() => void>>();
-    const res = {
-      statusCode,
-      writableFinished: true,
-      once: vi.fn((event: string, listener: () => void) => {
-        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
-        return res;
-      }),
-    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+  it.each([409, 429, 500, 502, 503, 504])(
+    'preserves the submitted object on a retryable %s without an ownership lookup',
+    async (statusCode) => {
+      const userId = randomUUID();
+      const req = {
+        body: { audioKey: ownedKey(userId), requestId: randomUUID() },
+        user: { id: userId },
+      } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
+      const listeners = new Map<string, Array<() => void>>();
+      const res = {
+        statusCode,
+        writableFinished: true,
+        once: vi.fn((event: string, listener: () => void) => {
+          listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+          return res;
+        }),
+      } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
 
-    const ownershipQuery = vi.spyOn(pool, 'query');
-    try {
-      discardSubmittedPresignedAudio(req, res, vi.fn());
-      for (const listener of listeners.get('finish') ?? []) listener();
+      const ownershipQuery = vi.spyOn(pool, 'query');
+      try {
+        discardSubmittedPresignedAudio(req, res, vi.fn());
+        for (const listener of listeners.get('finish') ?? []) listener();
 
-      // Await the same finalizer that the response listener started. A 409/429
-      // must preserve the response contract without looking up ownership or
-      // deleting an object that a saturated worker may still claim, and a 503
-      // must keep the object the client's contracted retry re-submits.
-      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
-      expect(res.statusCode).toBe(statusCode);
-      expect(ownershipQuery).not.toHaveBeenCalled();
-      expect(sendMock).not.toHaveBeenCalled();
-    } finally {
-      ownershipQuery.mockRestore();
-    }
-  });
+        // Await the same finalizer that the response listener started. 409/429
+        // and every retryable 5xx must preserve without looking up ownership or
+        // deleting an object the client's same-key retry re-submits.
+        await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+        expect(res.statusCode).toBe(statusCode);
+        expect(ownershipQuery).not.toHaveBeenCalled();
+        expect(sendMock).not.toHaveBeenCalled();
+      } finally {
+        ownershipQuery.mockRestore();
+      }
+    },
+  );
 
   it('deletes only a key owned by the supplied user and sends the exact bucket/key pair', async () => {
     const userId = randomUUID();
@@ -758,6 +760,7 @@ describe('S3 object download boundaries', () => {
     });
     expect(bodyRead).toBe(false);
     expect(destroy).toHaveBeenCalledOnce();
+    expect(() => body.emit('error', new Error('late transport failure'))).not.toThrow();
   });
 
   it('ignores malformed nonnumeric length metadata and still enforces the streaming cap', async () => {
@@ -964,7 +967,7 @@ describe('S3 object download boundaries', () => {
     }
   });
 
-  it.each(['EACCES', 'EDQUOT', 'EEXIST', 'EIO', 'EMFILE', 'ENFILE', 'ENOSPC', 'EPERM', 'EROFS'])(
+  it.each(['EACCES', 'EDQUOT', 'EEXIST', 'EFBIG', 'EIO', 'EMFILE', 'ENFILE', 'ENOSPC', 'EPERM', 'EROFS'])(
     'maps the local filesystem failure %s to a plain 500 with a distinct log line, not a provider failure',
     async (code) => {
       const userId = randomUUID();
@@ -1365,7 +1368,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     }
   });
 
-  it('deletes submitted audio when request claiming fails with a non-in-flight error', async () => {
+  it('retains submitted audio when request claiming fails with a retryable infrastructure error', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1387,11 +1390,11 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
-      // Error-path finalization runs from the response-finish listener, which
-      // sees the real status the error handler set.
-      await vi.waitFor(() => {
-        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-      });
+      // A 500 has no durable claim and may be retried with this same key.
+      // Finalization therefore retains the object for the bucket lifecycle
+      // rather than racing the retry with a late DeleteObject.
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      expect(sendMock).not.toHaveBeenCalled();
     } finally {
       connect.mockRestore();
     }
@@ -1574,20 +1577,36 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     });
   });
 
-  it('returns 502 when S3 is unavailable', async () => {
+  it('keeps a retryable S3 failure object so the same requestId/key can be claimed again without a re-upload', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
-    sendMock.mockRejectedValue(new Error('connection refused'));
+    const requestId = randomUUID();
+    const audioKey = ownedKey(userId);
+    let unavailable = true;
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind !== 'get') return Promise.resolve({});
+      if (unavailable) return Promise.reject(new Error('connection refused'));
+      return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+    });
+    const submit = () =>
+      request(a)
+        .post('/diagnostic/answer')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId, requestId, audioKey });
 
-    const res = await request(a)
-      .post('/diagnostic/answer')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
-    expect(res.status).toBe(502);
-    expect(res.body).toEqual({ error: 'Audio storage unavailable; please try again', code: 'PROVIDER_FAILED' });
-    // Drain the deferred cleanup delete so it cannot leak into the next test.
+    const failed = await submit();
+    expect(failed.status).toBe(502);
+    expect(failed.body).toEqual({ error: 'Audio storage unavailable; please try again', code: 'PROVIDER_FAILED' });
+    // A 502 abandons its claim, so a retry is entitled to use this exact S3
+    // object. No late DeleteObject may race in and turn it into a 400.
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
+
+    unavailable = false;
+    const retried = await submit();
+    expect(retried.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'delete']);
     });
   });
 
@@ -1613,10 +1632,10 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
         .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
       expect(res.status).toBe(504);
       expect(res.body).toEqual({ error: 'Audio storage timed out; please try again', code: 'PROVIDER_TIMEOUT' });
-      // Drain the deferred cleanup delete so it cannot leak into the next test.
-      await vi.waitFor(() => {
-        expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
-      });
+      // The timed-out handoff remains available for the same-key retry rather
+      // than being deleted out from under its replacement claim.
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
     } finally {
       config.s3.operationTimeoutMs = previousTimeout;
     }
@@ -1828,7 +1847,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     expect(claims.rows[0].count).toBe(0);
   });
 
-  it('deletes submitted audio when request claiming fails with a non-in-flight error', async () => {
+  it('retains submitted audio when request claiming fails with a retryable infrastructure error', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
@@ -1855,11 +1874,10 @@ describe('POST /practice/attempt (S3 mode)', () => {
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
-      // Error-path finalization runs from the response-finish listener, which
-      // sees the real status the error handler set.
-      await vi.waitFor(() => {
-        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-      });
+      // The same retryable-500 rule applies to practice: no DeleteObject can
+      // race a same-key resubmission after the temporary database outage.
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      expect(sendMock).not.toHaveBeenCalled();
     } finally {
       connect.mockRestore();
     }

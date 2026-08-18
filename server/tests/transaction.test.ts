@@ -144,6 +144,9 @@ describe('diagnostic transaction rollback precedence', () => {
     const requestClaimClient = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: null };
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') {
+          return { rows: [user], rowCount: 1 };
+        }
         if (text.includes('DELETE FROM assessment_requests')) return { rows: [], rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rows: [], rowCount: 1 };
         throw new Error(`unexpected request-claim query: ${text}`);
@@ -153,6 +156,9 @@ describe('diagnostic transaction rollback precedence', () => {
     const diagnosticClient = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [], rowCount: null };
+        if (text === 'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE') {
+          return { rows: [user], rowCount: 1 };
+        }
         if (text.includes('SELECT * FROM diagnostic_state')) {
           return {
             rows: [
@@ -228,6 +234,7 @@ describe('diagnostic transaction rollback precedence', () => {
     expect(diagnosticClient.release).toHaveBeenCalledOnce();
     expect(diagnosticClient.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
+      'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
       expect.stringContaining('SELECT * FROM diagnostic_state'),
       expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions'),
       'ROLLBACK',

@@ -72,6 +72,8 @@ describe('verifyAudioMagicBytes', () => {
     ['a.wav', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVX')]), 'not a WAVE form type'],
     ['a.mp3', Buffer.from([0x00, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]), 'frame sync without 0xff'],
     ['a.mp3', Buffer.from([0xff, 0x1f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 'frame sync without the 0xe0 mask'],
+    ['a.mp3', MP3_FRAME.subarray(0, 3), 'truncated MPEG frame header'],
+    ['a.mp3', ADTS, 'ADTS/AAC sync bytes are not an MP3 frame'],
     ['a.m4b', FTYP, 'unsupported audiobook extension'],
     ['a.aac', ADTS, 'unsupported raw AAC extension'],
     ['a.webm', Buffer.from([0x1b, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]), 'wrong EBML first byte'],

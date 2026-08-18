@@ -25,6 +25,7 @@ const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
 const LOCAL_DISK_ERROR_CODES = new Set([
   'EACCES',
   'EDQUOT',
+  'EFBIG',
   'EEXIST',
   'EIO',
   'EMFILE',
@@ -90,8 +91,14 @@ function releaseUnreadObjectBody(body: unknown): void {
   const discardable = body as {
     destroy?: () => void;
     cancel?: () => void | Promise<void>;
+    on?: (event: string, listener: (error: Error) => void) => unknown;
   };
   try {
+    // The S3 SDK body is normally a Node Readable. We reject it before a
+    // pipeline has attached listeners, so retain a no-op error listener while
+    // destroying it; a concurrent transport failure must not become an
+    // unhandled EventEmitter error in the API process.
+    if (typeof discardable.on === 'function') discardable.on('error', () => undefined);
     if (typeof discardable.destroy === 'function') {
       discardable.destroy();
     } else if (typeof discardable.cancel === 'function') {
@@ -237,14 +244,16 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
   if (cleanup.preserve) return Promise.resolve();
 
   cleanup.finalizing = (async () => {
-    // A pre-route conflict is not definitive: an owner may be processing even
-    // before it can insert the shared claim under DB-pool saturation. A 503 is
-    // pure backpressure (assess semaphore, inspection cap, shed pool): no claim
-    // survives it and no paid work committed, and the client is contracted to
-    // retry the identical submission after Retry-After, so the object must
-    // still be there. The mandatory bucket lifecycle bounds the orphan window
-    // exactly as it already does for 409/429.
-    if (res.statusCode === 409 || res.statusCode === 429 || res.statusCode === 503) {
+    // A conflict/rate refusal is not definitive: an owner may be processing
+    // before it can insert the shared claim under DB-pool saturation. Every
+    // 5xx is likewise retryable by contract (including provider/storage 502
+    // and 504). For an unfinished request, its idempotency row is abandoned
+    // so the client re-posts this exact key. Deleting in that window races a blind same-key retry:
+    // the retry can re-claim between the ownership read and DeleteObject, then
+    // lose its audio to that late delete. Retain instead; the mandatory bucket
+    // lifecycle bounds the transient object exactly as it already does for
+    // 409/429.
+    if (res.statusCode === 409 || res.statusCode === 429 || res.statusCode >= 500) {
       return;
     }
     // A duplicate can be stopped before claimAssessmentRequest (for example by
@@ -276,7 +285,8 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
 /**
  * Register exactly one best-effort deletion before assessment body validation.
  * This covers malformed requests, idempotent replays, state/authorization
- * failures, missing objects, and provider errors without racing route cleanup.
+ * failures, missing objects, and successful/provider-error retention decisions
+ * without racing route cleanup.
  */
 export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next) => {
   const req = rawReq as AuthedRequest;
@@ -377,7 +387,7 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     if (s3Err.name === 'NoSuchKey' || s3Err.name === 'NotFound' || s3Err.name === '404') {
       throw new HttpError(400, 'audio upload not found or expired');
     }
-    // A filesystem syscall failure (ENOSPC/EMFILE/EACCES from the temp-file
+    // A filesystem syscall failure (ENOSPC/EFBIG/EMFILE/EACCES from the temp-file
     // write stream or chmod) is a local disk fault, not an S3 outage: plain 500
     // with a distinct log line. AWS SDK errors carry $metadata and keep the
     // 502, and so does every transport errno the download stream can raise.

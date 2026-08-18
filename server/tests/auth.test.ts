@@ -151,7 +151,15 @@ describe('auth: register validation', () => {
       code: 'VALIDATION_FAILED',
     });
 
-    for (const name of ['line\nbreak', 'tab\tname', 'bell\x07name', 'del\x7Fname']) {
+    for (const name of [
+      'line\nbreak',
+      'tab\tname',
+      'bell\x07name',
+      'del\x7Fname',
+      'next\u0085record',
+      'line\u2028separator',
+      'paragraph\u2029separator',
+    ]) {
       expect((await registerUser(a, { name })).res.status).toBe(400);
     }
   });

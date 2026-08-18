@@ -399,6 +399,26 @@ describe('settings profile card', () => {
     expect(input().props.value).toBe('Ada Byron');
   });
 
+  it('re-syncs an unchanged focused draft as soon as it blurs', async () => {
+    const { rerenderSettings } = await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+
+    await act(async () => {
+      await fireEvent(input(), 'focus');
+    });
+    // A profile refresh while focused must not overwrite active typing, but a
+    // field the learner never edited should adopt that canonical name on blur
+    // instead of leaving an accidental stale overwrite ready to save.
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada King' } });
+    await act(async () => rerenderSettings());
+    expect(input().props.value).toBe(USER.name);
+
+    await act(async () => {
+      await fireEvent(input(), 'blur');
+    });
+    expect(input().props.value).toBe('Ada King');
+  });
+
   it('saves the name once when Save is tapped twice before a re-render', async () => {
     // Same-render re-entrancy: the committed handler still sees nameBusy=false
     // on the second activation, so only a synchronous latch prevents a double
@@ -484,6 +504,68 @@ describe('settings profile card', () => {
     // Typing again retracts the stale confirmation.
     await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada K');
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
+  });
+
+  it('merges out-of-order name and language PATCH responses without reverting either field', async () => {
+    let resolveName: (user: User) => void = () => undefined;
+    let resolveLanguage: (user: User) => void = () => undefined;
+    mockUpdateProfile
+      .mockImplementationOnce(
+        () =>
+          new Promise<User>((resolve) => {
+            resolveName = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<User>((resolve) => {
+            resolveLanguage = resolve;
+          }),
+      );
+    await renderSettings();
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+      await fireEvent.press(languageChip(1));
+    });
+
+    const setUser = mockAuthValue.setUser;
+    await act(async () => {
+      resolveLanguage({ ...USER, nativeLanguage: 'hi' });
+    });
+    await act(async () => {
+      // This delayed server snapshot predates the language write.
+      resolveName({ ...USER, name: 'Ada King' });
+    });
+
+    expect(setUser).toHaveBeenLastCalledWith({
+      ...USER,
+      name: 'Ada King',
+      nativeLanguage: 'hi',
+    });
+  });
+
+  it('does not restore a profile when a delayed name PATCH finishes after logout', async () => {
+    let resolveName: (user: User) => void = () => undefined;
+    mockUpdateProfile.mockReturnValue(
+      new Promise<User>((resolve) => {
+        resolveName = resolve;
+      }),
+    );
+    const { rerenderSettings } = await renderSettings();
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+
+    const setUser = mockAuthValue.setUser;
+    mockAuthValue = makeAuth({ user: null, sessionVersion: 2, setUser });
+    await act(async () => rerenderSettings());
+    await act(async () => {
+      resolveName({ ...USER, name: 'Ada King' });
+    });
+
+    expect(setUser).not.toHaveBeenCalled();
   });
 
   it('accepts a name of exactly the maximum length but not one character more', async () => {
@@ -1445,7 +1527,7 @@ describe('retake placement test', () => {
     // screen) and the recorded answer would come back 409 QUESTION_MISMATCH.
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['diagnostic-next'] });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-question'] });
-    expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
+    expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'], type: 'inactive' });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-history'] });
     // The session profile just lost its level: the cached /auth/me must refetch.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });

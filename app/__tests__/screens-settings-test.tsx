@@ -782,7 +782,9 @@ describe('delete account screen', () => {
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
     expect(screen.getByLabelText(t('da.passwordLabel')).props).toMatchObject({
       secureTextEntry: true,
+      autoCapitalize: 'none',
       autoComplete: 'password',
+      autoCorrect: false,
       textContentType: 'password',
       returnKeyType: 'done',
       maxLength: MAX_PASSWORD_UTF8_BYTES,

@@ -16,11 +16,12 @@ collectDefaultMetrics({ register: registry });
 
 /**
  * HTTP request latency. The route label is the matched Express route pattern
- * (lower-cased req.baseUrl + req.route.path), never the raw URL, so label
- * cardinality stays bounded; requests that end before a route matches (404s,
- * limiter and version-gate rejections) share the single '(unmatched)' label,
- * and requests that never produced a response share the single 'aborted'
- * status. The top bucket tracks the 130s worst-case request budget (index.ts).
+ * (lower-cased req.baseUrl + req.route.path), never the raw URL, and the
+ * method label is normalized to a small allowlist, so label cardinality stays
+ * bounded. Requests that end before a route matches (404s, limiter and
+ * version-gate rejections) share the single '(unmatched)' label, and requests
+ * that never produced a response share the single 'aborted' status. The top
+ * bucket tracks the 130s worst-case request budget (index.ts).
  */
 export const httpRequestDuration = new Histogram({
   name: 'http_request_duration_seconds',
@@ -30,8 +31,16 @@ export const httpRequestDuration = new Histogram({
   registers: [registry],
 });
 
+const METRIC_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
+
+/** Keep attacker-chosen HTTP extension methods from minting metric series. */
+export function metricMethod(method: string): string {
+  const normalized = method.toUpperCase();
+  return METRIC_METHODS.has(normalized) ? normalized : 'OTHER';
+}
+
 export const httpMetricsMiddleware: RequestHandler = (req, res, next) => {
-  const endTimer = httpRequestDuration.startTimer({ method: req.method });
+  const endTimer = httpRequestDuration.startTimer({ method: metricMethod(req.method) });
   // 'close', not 'finish': a client abort or a requestTimeout socket kill only
   // ever emits 'close', while a normal response emits it right after 'finish'.
   // Timing here is therefore the only hook that observes every request,

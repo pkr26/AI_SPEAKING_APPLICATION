@@ -4,8 +4,16 @@ import fs from 'fs';
 import path from 'path';
 import { questions, type QuestionSeed } from './seed-data';
 
-function esc(value: string): string {
-  return value.replace(/'/g, "''");
+/**
+ * Render one SQL text literal without relying on the server-wide
+ * standard_conforming_strings setting. Normal catalog text keeps the compact
+ * standard literal used by the reviewed artifact; a value containing a
+ * backslash uses an explicit escape literal so an authored `\\'` sequence can
+ * never terminate the literal when a legacy database has that setting off.
+ */
+function sqlLiteral(value: string): string {
+  if (!value.includes('\\')) return `'${value.replace(/'/g, "''")}'`;
+  return `E'${value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 }
 
 // PostgreSQL text cannot contain NUL. Other C0/C1 controls, bidi controls, and
@@ -142,9 +150,9 @@ export function renderSeedSql(seedQuestions: readonly QuestionSeed[] = questions
     'BEGIN;',
   ];
   for (const question of seedQuestions) {
-    const translations = esc(JSON.stringify(question.translations));
+    const translations = sqlLiteral(JSON.stringify(question.translations));
     lines.push(
-      `INSERT INTO questions (cefr_level, prompt_word, question_text, translations) VALUES ('${question.cefrLevel}', '${esc(question.promptWord)}', '${esc(question.questionText)}', '${translations}'::jsonb) ON CONFLICT (cefr_level, prompt_word) DO UPDATE SET question_text = EXCLUDED.question_text, translations = EXCLUDED.translations;`,
+      `INSERT INTO questions (cefr_level, prompt_word, question_text, translations) VALUES (${sqlLiteral(question.cefrLevel)}, ${sqlLiteral(question.promptWord)}, ${sqlLiteral(question.questionText)}, ${translations}::jsonb) ON CONFLICT (cefr_level, prompt_word) DO UPDATE SET question_text = EXCLUDED.question_text, translations = EXCLUDED.translations;`,
     );
   }
   lines.push('COMMIT;', '');

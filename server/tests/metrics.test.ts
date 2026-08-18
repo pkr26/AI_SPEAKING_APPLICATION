@@ -36,6 +36,7 @@ import { logger } from '../src/logger';
 import {
   httpMetricsMiddleware,
   httpRequestDuration,
+  metricMethod,
   providerCallDuration,
   providerCallErrors,
   registry,
@@ -125,6 +126,27 @@ describe('GET /metrics gating', () => {
 });
 
 describe('http_request_duration_seconds', () => {
+  it('maps arbitrary extension methods to one bounded metric label', async () => {
+    expect(metricMethod('GET')).toBe('GET');
+    expect(metricMethod('patch')).toBe('PATCH');
+    expect(metricMethod('BREW')).toBe('OTHER');
+    expect(metricMethod('x-tenant-specific-method')).toBe('OTHER');
+
+    const labels = { method: 'OTHER', route: '/method-probe', status: '200' };
+    const before = await histogramCount(httpRequestDuration, labels);
+    const req = { method: 'BREW', baseUrl: '', route: { path: '/method-probe' } } as express.Request;
+    const res = Object.assign(new EventEmitter(), { writableEnded: true, statusCode: 200 }) as express.Response;
+    const next = vi.fn();
+
+    httpMetricsMiddleware(req, res, next);
+    res.emit('close');
+
+    expect(next).toHaveBeenCalledOnce();
+    await vi.waitFor(async () => {
+      expect(await histogramCount(httpRequestDuration, labels)).toBe(before + 1);
+    });
+  });
+
   it('records the matched route pattern with method and status labels', async () => {
     const a = app();
     const labels = { method: 'GET', route: '/health', status: '200' };

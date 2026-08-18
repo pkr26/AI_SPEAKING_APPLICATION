@@ -1,6 +1,6 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { router } from 'expo-router';
-import React from 'react';
+import React, { useEffect } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -33,11 +33,12 @@ function DecorativeEmoji({ children, style }: { children: string; style: StylePr
  * count, today's activity, and the session summary tallied while practicing.
  */
 export default function HomeScreen() {
-  const { user } = useAuth();
+  const { user, setUser } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { sessionTally, resetSessionTally } = usePracticeFlow();
+  const queryClient = useQueryClient();
 
   const statsQuery = useQuery({
     queryKey: ['practice-stats', user?.id],
@@ -46,6 +47,19 @@ export default function HomeScreen() {
     retry: false,
   });
   const stats = statsQuery.data;
+
+  // `/practice/stats` is deliberately available before placement and returns
+  // `level: null` only for that all-zero state. If another device restarts the
+  // diagnostic while this Home screen is open, the in-memory profile remains
+  // temporarily stale and would otherwise keep this learner on a broken
+  // practice route. Adopt the authoritative state and retire caches whose
+  // level/question identity is no longer valid.
+  useEffect(() => {
+    if (!user?.diagnosticCompleted || stats?.level !== null) return;
+    queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
+    queryClient.removeQueries({ queryKey: ['practice-question'] });
+    setUser({ ...user, diagnosticCompleted: false, cefrLevel: null });
+  }, [queryClient, setUser, stats?.level, user]);
 
   // Home is the root of the signed-in stack: while the entry gate is still
   // beneath it, Android hardware back must not pop back onto the gate (which
@@ -56,6 +70,23 @@ export default function HomeScreen() {
 
   // The route gate redirects after logout/session expiry.
   if (!user) return null;
+
+  // Do not leave a tappable Practice CTA in the one render before the effect
+  // above updates the route gate for a cross-device diagnostic reset.
+  if (user.diagnosticCompleted && stats?.level === null) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator
+          accessibilityLabel={t('gate.loadingProfile')}
+          size="large"
+          color={theme.colors.primary}
+        />
+        <Text accessibilityLiveRegion="polite" style={styles.muted}>
+          {t('gate.loadingProfile')}
+        </Text>
+      </View>
+    );
+  }
 
   const level = stats?.level ?? user.cefrLevel;
   const practicedTodayLine = !stats

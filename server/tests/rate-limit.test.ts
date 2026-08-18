@@ -103,9 +103,12 @@ describe('rate limiters', () => {
 
   it('normalizes bounded login account identifiers and skips unusable values', () => {
     expect(normalizeLoginEmail('  Learner@Example.COM ')).toBe('learner@example.com');
-    expect(normalizeLoginEmail('X'.repeat(254))).toBe('x'.repeat(254));
+    const maxLengthEmail = `${'X'.repeat(248)}@A.COM`;
+    expect(maxLengthEmail).toHaveLength(254);
+    expect(normalizeLoginEmail(maxLengthEmail)).toBe(`${'x'.repeat(248)}@a.com`);
     expect(normalizeLoginEmail('')).toBeUndefined();
     expect(normalizeLoginEmail(123)).toBeUndefined();
+    expect(normalizeLoginEmail('not-an-email')).toBeUndefined();
     expect(normalizeLoginEmail('x'.repeat(255))).toBeUndefined();
     expect(rateLimitIpKey('203.0.113.42')).toBe(ipKeyGenerator('203.0.113.42'));
     expect(rateLimitIpKey('2001:db8:abcd:1234::1')).toBe(ipKeyGenerator('2001:db8:abcd:1234::1'));
@@ -127,6 +130,7 @@ describe('rate limiters', () => {
     expect((await request(a).post('/x')).body).toEqual({ throttled: false });
     expect((await request(a).post('/x').send({})).body).toEqual({ throttled: false });
     expect((await request(a).post('/x').send({ email: 42 })).body).toEqual({ throttled: false });
+    expect((await request(a).post('/x').send({ email: 'not-an-email' })).body).toEqual({ throttled: false });
     const skipped = await pool.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM rate_limit_windows WHERE namespace = $1',
       [namespace],

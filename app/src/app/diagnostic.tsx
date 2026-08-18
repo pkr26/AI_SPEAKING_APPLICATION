@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, ScrollView, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -47,6 +47,8 @@ export default function DiagnosticScreen() {
   const [answers, setAnswers] = useState<AnswerRecord[]>([]);
   const [stateIdentity, setStateIdentity] = useState(identityKey);
   const [recorderLocked, setRecorderLocked] = useState(false);
+  const recorderLockedRef = useRef(false);
+  const logoutBusyRef = useRef(false);
   // Mirrors the on-screen answer card for the /next effect below (effects must
   // not depend on `result`, or clearing it would reapply the stale question).
   const resultRef = useRef<DiagnosticAnswerResult | null>(null);
@@ -127,7 +129,14 @@ export default function DiagnosticScreen() {
     void nextQuery.refetch();
   };
 
+  const handleRecorderLockChange = useCallback((locked: boolean) => {
+    recorderLockedRef.current = locked;
+    setRecorderLocked(locked);
+  }, []);
+
   const handleLogout = async () => {
+    if (recorderLockedRef.current || logoutBusyRef.current) return;
+    logoutBusyRef.current = true;
     try {
       await logout();
       router.replace('/');
@@ -137,6 +146,8 @@ export default function DiagnosticScreen() {
       } else {
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
       }
+    } finally {
+      logoutBusyRef.current = false;
     }
   };
 
@@ -157,6 +168,11 @@ export default function DiagnosticScreen() {
     if (activeIdentityRef.current !== identityKey || !user || !currentLevel) return;
     // Keep the diagnostic route protected until the completion screen has
     // actually been acknowledged; changing this earlier removes the screen.
+    // A cross-device diagnostic restart can leave a cached pre-placement
+    // stats response for this same account. This screen has no active stats
+    // observer, so retire it here before Home mounts at the new level rather
+    // than removing Home's own live query during a route-gate transition.
+    queryClient.removeQueries({ queryKey: ['practice-stats'] });
     setUser({
       ...user,
       diagnosticCompleted: true,
@@ -266,7 +282,9 @@ export default function DiagnosticScreen() {
           size="sm"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
           disabled={recorderLocked}
-          onPress={() => router.push('/settings')}
+          onPress={() => {
+            if (!recorderLockedRef.current) router.push('/settings');
+          }}
         />
         <Button
           title={t('common.logOut')}
@@ -336,7 +354,7 @@ export default function DiagnosticScreen() {
               onResult={handleResult}
               onError={handleError}
               onRecoveryUnresolved={handleRecoveryUnresolved}
-              onInteractionLockChange={setRecorderLocked}
+              onInteractionLockChange={handleRecorderLockChange}
             />
           )}
         </>

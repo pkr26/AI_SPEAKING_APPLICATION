@@ -330,6 +330,25 @@ describe('audio inspection concurrency', () => {
     await proveNextSlotIsUsable();
   });
 
+  it('maps piped probe and decoder stream errors to retryable unavailability without an uncaught error event', async () => {
+    const probe = new FakeChild();
+    spawnMock.mockReturnValueOnce(probe);
+    activeChildren.push(probe);
+    const probeResult = verifyAudioDuration(filePath).then(
+      (value) => ({ status: 'fulfilled' as const, value }),
+      (reason: unknown) => ({ status: 'rejected' as const, reason }),
+    );
+    probe.stderr.emit('error', new Error('probe descriptor failed'));
+    await expect(probeResult).resolves.toMatchObject({ status: 'rejected', reason: { status: 503 } });
+    expect(spawnMock).toHaveBeenCalledOnce();
+
+    const decoderFailure = await startInspection();
+    decoderFailure.child.stdout.emit('error', new Error('decoder descriptor failed'));
+    await expect(decoderFailure.result).resolves.toMatchObject({ status: 'rejected', reason: { status: 503 } });
+    expect(() => decoderFailure.child.stdout.emit('error', new Error('late decoder descriptor failure'))).not.toThrow();
+    await proveNextSlotIsUsable();
+  });
+
   it('rejects multi-track media on the probed stream count without decoding', async () => {
     // The multi-track invariant must not depend on muxer behavior (FFmpeg 8
     // errors on multi-stream s16le, 6.1 decodes it): the ffprobe count alone
@@ -897,6 +916,17 @@ describe('audio inspector readiness coalescing', () => {
     });
 
     await expect(assertAudioInspectorAvailable({ force: true })).rejects.toThrow('FFprobe is unavailable');
+  });
+
+  it('converts a piped readiness-stream error into a normal availability failure', async () => {
+    const child = new FakeChild();
+    spawnMock.mockReturnValueOnce(child);
+    const check = assertAudioInspectorAvailable({ force: true });
+
+    child.stdout.emit('error', new Error('read failed'));
+
+    await expect(check).rejects.toThrow('FFprobe is unavailable');
+    expect(child.kill).toHaveBeenCalledWith('SIGKILL');
   });
 
   it.each([false, true])(

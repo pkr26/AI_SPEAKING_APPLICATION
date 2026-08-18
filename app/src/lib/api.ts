@@ -339,12 +339,96 @@ const MAX_RETRY_AFTER_SECONDS_503 = 120;
 const MAX_RETRY_AFTER_SECONDS_429 = 24 * 60 * 60;
 const MAX_RETRY_AFTER_HOURS = 48;
 
-async function throwForStatus(res: Response): Promise<never> {
+/**
+ * `fetch()` resolves once response headers arrive, so its timeout does not
+ * protect a server that holds a JSON/blob body open forever. Bound body reads
+ * separately and cancel the stream where the platform exposes one. This also
+ * lets a caller cancellation stop a local web Blob read before it can reach an
+ * assessment endpoint.
+ */
+function readResponseBody<T>(
+  res: Response,
+  read: () => Promise<T>,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cancelBody = () => {
+      try {
+        const body = res.body;
+        if (body) void Promise.resolve(body.cancel()).catch(() => undefined);
+      } catch {
+        // Stream cancellation is a best-effort resource cleanup. The caller's
+        // timeout/abort result must still settle even on a nonstandard fetch
+        // implementation whose body cannot be cancelled.
+      }
+    };
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener('abort', abortFromCaller);
+      callback();
+    };
+    const abortFromCaller = () => {
+      cancelBody();
+      finish(() =>
+        reject(
+          externalSignal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+        ),
+      );
+    };
+    const timeout = setTimeout(() => {
+      cancelBody();
+      finish(() =>
+        reject(
+          new ApiError(408, 'The response timed out. Please check your connection and try again.'),
+        ),
+      );
+    }, timeoutMs);
+
+    if (externalSignal?.aborted) {
+      abortFromCaller();
+      return;
+    }
+    externalSignal?.addEventListener('abort', abortFromCaller, { once: true });
+    void Promise.resolve()
+      .then(read)
+      .then(
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(error)),
+      );
+  });
+}
+
+function readJsonBody(
+  res: Response,
+  timeoutMs: number,
+  externalSignal?: AbortSignal,
+): Promise<unknown> {
+  return readResponseBody(res, () => res.json(), timeoutMs, externalSignal);
+}
+
+async function throwForStatus(
+  res: Response,
+  timeoutMs = JSON_TIMEOUT_MS,
+  externalSignal?: AbortSignal,
+): Promise<never> {
   // Do not forward server or upstream-provider error bodies into the UI. The
   // only fields read are the machine-readable `code` (mapped to localized
   // copy by userMessageForError) and the bounded, non-sensitive retry delays
   // that drive the 429/503 "please wait" contract.
-  const body: unknown = await res.json().catch(() => undefined);
+  let body: unknown;
+  try {
+    body = await readJsonBody(res, timeoutMs, externalSignal);
+  } catch (error) {
+    // A malformed error body is deliberately ignored, but a timed-out or
+    // cancelled body must retain its transport meaning instead of becoming an
+    // arbitrary HTTP error.
+    if (error instanceof ApiError || externalSignal?.aborted) throw error;
+    body = undefined;
+  }
   const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : undefined;
   const code = isApiErrorCode(record?.code) ? record.code : undefined;
 
@@ -423,6 +507,11 @@ async function fetchWithTimeout(
   }
 }
 
+/** Remaining portion of one end-to-end transport budget after an earlier step. */
+function remainingTimeoutMs(startedAt: number, totalTimeoutMs: number): number {
+  return Math.max(1, totalTimeoutMs - (Date.now() - startedAt));
+}
+
 interface ApiFetchOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -443,10 +532,16 @@ function handleUnauthorized(status: number, token: string | null, enabled: boole
 export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
   const useAuth = options.auth !== false;
   const token = useAuth ? await tokenForRequest() : null;
+  const timeoutMs = options.timeoutMs ?? JSON_TIMEOUT_MS;
+  const startedAt = Date.now();
   const res = await fetchWithTimeout(
     `${API_URL}${path}`,
     {
       method: options.method ?? 'GET',
+      // API requests carry a bearer token. A deployment redirect must fail
+      // closed instead of relying on platform-specific redirect behavior to
+      // strip that credential before crossing an origin boundary.
+      redirect: 'error',
       headers: {
         'Content-Type': 'application/json',
         ...clientVersionHeader(),
@@ -454,17 +549,18 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
       },
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
     },
-    options.timeoutMs ?? JSON_TIMEOUT_MS,
+    timeoutMs,
     options.signal,
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, options.expireSessionOn401 !== false);
-    await throwForStatus(res);
+    await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
   }
   if (res.status === 204) return undefined as T;
   try {
-    return (await res.json()) as T;
-  } catch {
+    return (await readJsonBody(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal)) as T;
+  } catch (error) {
+    if (error instanceof ApiError || options.signal?.aborted) throw error;
     throw new ApiError(502, 'The server returned an invalid response');
   }
 }
@@ -515,15 +611,32 @@ export function audioFileDescriptor(
  * recorded Blob is the only source of truth for the container MediaRecorder
  * chose; native recordings are described by their file URI alone.
  */
-export async function resolveAudioFileDescriptor(audioUri: string): Promise<{
+export async function resolveAudioFileDescriptor(
+  audioUri: string,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<{
   name: string;
   type: string;
 }> {
   if (Platform.OS !== 'web') return audioFileDescriptor(audioUri);
+  const timeoutMs = options.timeoutMs ?? AUDIO_TIMEOUT_MS;
+  const startedAt = Date.now();
   try {
-    const blob = await (await fetch(audioUri)).blob();
+    const response = await fetchWithTimeout(audioUri, {}, timeoutMs, options.signal);
+    const blob = await readResponseBody(
+      response,
+      () => response.blob(),
+      remainingTimeoutMs(startedAt, timeoutMs),
+      options.signal,
+    );
     return audioFileDescriptor(audioUri, blob.type);
-  } catch {
+  } catch (error) {
+    // Cancellation is a control-flow signal, not an unknown recording type.
+    // Propagate it so Recorder returns the take to the learner rather than
+    // continuing into an upload-grant request after they pressed Cancel.
+    if (options.signal?.aborted || (error instanceof ApiError && error.status === 408)) {
+      throw error;
+    }
     // A lost blob is reported as a definite failure by the upload step; the
     // grant request itself must not fail on it.
     return audioFileDescriptor(audioUri);
@@ -534,13 +647,28 @@ export async function apiUploadAudio<T>(
   path: string,
   audioUri: string,
   fields: Record<string, string>,
-  options: { signal?: AbortSignal; timeoutMs?: number } = {},
+  options: {
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    /** Called immediately before the multipart request can reach the API. */
+    onRequestStarted?: () => void;
+  } = {},
 ): Promise<T> {
   const token = await tokenForRequest();
+  const timeoutMs = options.timeoutMs ?? AUDIO_TIMEOUT_MS;
+  const startedAt = Date.now();
   const form = new FormData();
   if (Platform.OS === 'web') {
-    const audioResponse = await fetch(audioUri);
-    const blob = await audioResponse.blob();
+    const audioResponse = await fetchWithTimeout(audioUri, {}, timeoutMs, options.signal);
+    if (audioResponse.ok === false) {
+      await throwForStatus(audioResponse, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+    }
+    const blob = await readResponseBody(
+      audioResponse,
+      () => audioResponse.blob(),
+      remainingTimeoutMs(startedAt, timeoutMs),
+      options.signal,
+    );
     // The recorded Blob names the upload so Safari's MP4 output is not
     // declared as WebM and rejected by the server allowlist.
     form.append('audio', blob, audioFileDescriptor(audioUri, blob.type).name);
@@ -561,24 +689,32 @@ export async function apiUploadAudio<T>(
   for (const [key, value] of Object.entries(fields)) {
     form.append(key, value);
   }
+  // Web has to read the local Blob before this point. Do not mark an
+  // assessment as possibly committed until the actual API request is about to
+  // start: cancelling during that local read is safe to return to `recorded`.
+  if (!options.signal?.aborted) options.onRequestStarted?.();
   const res = await fetchWithTimeout(
     `${API_URL}${path}`,
     {
       method: 'POST',
+      // This multipart request includes the bearer token, so follow the same
+      // fail-closed redirect policy as JSON API calls.
+      redirect: 'error',
       // Do not set Content-Type manually; fetch adds the multipart boundary.
       headers: { ...clientVersionHeader(), ...authHeader(token) },
       body: form,
     },
-    options.timeoutMs ?? AUDIO_TIMEOUT_MS,
+    remainingTimeoutMs(startedAt, timeoutMs),
     options.signal,
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, true);
-    await throwForStatus(res);
+    await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
   }
   try {
-    return (await res.json()) as T;
-  } catch {
+    return (await readJsonBody(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal)) as T;
+  } catch (error) {
+    if (error instanceof ApiError || options.signal?.aborted) throw error;
     // A 2xx assessment may already be committed. Recorder keeps the audio and
     // idempotency key so retrying safely replays the durable server response.
     throw new ApiError(502, 'The server returned an invalid response');
@@ -687,14 +823,18 @@ export async function apiPostPresignedAudio(
     return;
   }
 
-  const audioResponse = await fetchWithTimeout(
-    audioUri,
-    {},
-    options.timeoutMs ?? AUDIO_TIMEOUT_MS,
+  const timeoutMs = options.timeoutMs ?? AUDIO_TIMEOUT_MS;
+  const startedAt = Date.now();
+  const audioResponse = await fetchWithTimeout(audioUri, {}, timeoutMs, options.signal);
+  if (!audioResponse.ok) {
+    await throwForStatus(audioResponse, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+  }
+  const body = await readResponseBody(
+    audioResponse,
+    () => audioResponse.blob(),
+    remainingTimeoutMs(startedAt, timeoutMs),
     options.signal,
   );
-  if (!audioResponse.ok) await throwForStatus(audioResponse);
-  const body = await audioResponse.blob();
   if (body.size === 0) {
     // A lost or evicted blob is the web analogue of the missing native file:
     // a definite local failure that means "record again", not "record less".
@@ -711,10 +851,12 @@ export async function apiPostPresignedAudio(
   const res = await fetchWithTimeout(
     uploadUrl,
     { method: 'POST', body: form },
-    options.timeoutMs ?? AUDIO_TIMEOUT_MS,
+    remainingTimeoutMs(startedAt, timeoutMs),
     options.signal,
   );
-  if (!res.ok) await throwForStatus(res);
+  if (!res.ok) {
+    await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+  }
 }
 
 // ----- Typed endpoint helpers -----

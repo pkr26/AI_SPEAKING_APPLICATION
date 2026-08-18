@@ -1,5 +1,5 @@
 import { Link, router } from 'expo-router';
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -24,12 +24,14 @@ export default function ForgotPasswordScreen() {
   const [busy, setBusy] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const busyRef = useRef(false);
 
   const trimmedEmail = email.trim();
   const canSubmit = trimmedEmail.length > 0 && trimmedEmail.length <= MAX_EMAIL_LENGTH && !busy;
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -40,6 +42,7 @@ export default function ForgotPasswordScreen() {
       // never distinguishes existing from unknown accounts.
       setError(userMessageForError(err, t('reset.requestFailed')));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };

@@ -46,6 +46,14 @@ export async function claimAssessmentRequest(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Account deletion locks users before cascading into assessment_requests.
+    // Take that parent lock before touching this child table so a delete that
+    // won the race becomes a stable 409, rather than a foreign-key error (or a
+    // parent/child lock inversion) on the claim insert below.
+    const owner = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (owner.rowCount !== 1) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     // Only this claim's own expired row can block the insert below, so the
     // delete is scoped to it. An unscoped sweep here would scan and row-lock
     // every stale row cluster-wide on the hottest path; the hourly janitor

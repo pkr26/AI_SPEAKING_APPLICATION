@@ -200,6 +200,11 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => {
     for (const client of queryClients) client.clear();
+    // TanStack batches cache-observer notifications through a timer; clearing
+    // one query can schedule a second notification from the first batch. Drain
+    // both turns while still inside act so a prior screen never updates during
+    // the next test.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
   queryClients.length = 0;
@@ -297,6 +302,54 @@ describe('home screen', () => {
     expect(screen.getByText(t('cefr.B2'))).toBeTruthy();
     // 'B1' is the account's stale level; it must not reach the screen.
     expect(screen.queryByText('B1')).toBeNull();
+  });
+
+  it('returns to placement when another device has reset the diagnostic', async () => {
+    // Stats is authorized from the live server and level:null is its exact
+    // pre-placement state. The in-memory profile can be stale after a
+    // cross-device retake, so Home must update the route gate rather than
+    // offering a practice button that the server will reject.
+    const client = makeQueryClient();
+    client.setQueryData(['diagnostic-next', 1, USER.id], { done: true, level: 'B1' });
+    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], { stale: true });
+    mockGetStats.mockResolvedValue({
+      level: null,
+      progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      streakDays: 0,
+      practicedToday: 0,
+      totalAttempts: 0,
+      lastPracticedAt: null,
+    });
+
+    await renderHome(client);
+    // Let React Query deliver the resolved stats and this screen's cache
+    // retirement effect inside act; otherwise its scheduled observer update
+    // leaks into the next test as an act warning.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => {
+      expect(mockAuthValue.setUser).toHaveBeenCalledWith({
+        ...USER,
+        diagnosticCompleted: false,
+        cefrLevel: null,
+      });
+    });
+    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+    expect(screen.queryByRole('button', { name: t('home.startPractice') })).toBeNull();
+    expect(
+      client.getQueryCache().find({
+        queryKey: ['diagnostic-next', 1, USER.id],
+        exact: true,
+      }),
+    ).toBeUndefined();
+    expect(
+      client.getQueryCache().find({
+        queryKey: ['practice-question', USER.id, USER.cefrLevel],
+        exact: true,
+      }),
+    ).toBeUndefined();
   });
 
   it('drops the revision suffix from the mastery line when nothing is in revision', async () => {

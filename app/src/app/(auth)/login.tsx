@@ -41,6 +41,7 @@ export default function LoginScreen() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const passwordRef = useRef<TextInput>(null);
+  const busyRef = useRef(false);
 
   // One-shot explanation for a 401-driven sign-out (revoked/expired token).
   useEffect(() => {
@@ -65,7 +66,8 @@ export default function LoginScreen() {
     !busy;
 
   const handleLogin = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -78,6 +80,7 @@ export default function LoginScreen() {
         setError(userMessageForError(err, t('login.failed')));
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };

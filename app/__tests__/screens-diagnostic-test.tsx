@@ -649,6 +649,7 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
     const queryClient = makeQueryClient();
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    const removeSpy = jest.spyOn(queryClient, 'removeQueries');
     await renderScreen(queryClient);
     await screen.findByText('Describe a time you showed courage.');
 
@@ -697,6 +698,7 @@ describe('diagnostic screen', () => {
       diagnosticCompleted: true,
       cefrLevel: 'B2',
     });
+    expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });

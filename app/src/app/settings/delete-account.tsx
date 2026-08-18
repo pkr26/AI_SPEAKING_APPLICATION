@@ -122,7 +122,12 @@ export default function DeleteAccountScreen() {
               placeholder={t('da.passwordPlaceholder')}
               placeholderTextColor={colors.muted}
               secureTextEntry={!passwordVisible}
+              // Revealing a password clears secureTextEntry, which otherwise
+              // suppresses keyboard capitalization/correction defaults.
+              // Preserve the exact password the learner typed in either mode.
+              autoCapitalize="none"
               autoComplete="password"
+              autoCorrect={false}
               textContentType="password"
               returnKeyType="done"
               onSubmitEditing={handleSubmit}

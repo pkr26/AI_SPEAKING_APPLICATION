@@ -332,6 +332,40 @@ test('runMutation fails when an unmutated production dependency changes during a
   await assert.rejects(fs.access(mutationLaneProvenancePath(reportDir, 'recorder')), /ENOENT/);
 });
 
+test('mutation provenance fails when the report gate or equivalence policy changes', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp();
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['recorder'],
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async () => {
+      await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
+      return 0;
+    },
+  });
+  assert.equal(result.exitCode, 0);
+
+  await fs.appendFile(path.join(appDir, 'scripts', 'mutation-equivalents.mjs'), '// changed');
+  await assert.rejects(
+    () =>
+      assertMutationLaneProvenance({
+        reportDir,
+        appDir,
+        lanes: mutationLanes,
+        laneNames: ['recorder'],
+        environment: {},
+      }),
+    /production source, the mutation toolchain, runtime, or environment changed/,
+  );
+});
+
 test('runMutation rejects duplicate lanes before cleaning reports or starting work', async (t) => {
   const appDir = await fixtureAppDir([], []);
   const reportDir = path.join(appDir, 'reports');
@@ -355,6 +389,34 @@ test('runMutation rejects duplicate lanes before cleaning reports or starting wo
         },
       }),
     /Mutation lanes requested more than once: recorder/,
+  );
+  assert.equal(laneStarted, false);
+  assert.equal(await fs.readFile(existingReport, 'utf8'), 'keep me');
+});
+
+test('runMutation rejects inherited object-property lane names before starting work', async (t) => {
+  const appDir = await fixtureAppDir([], []);
+  const reportDir = path.join(appDir, 'reports');
+  const existingReport = path.join(reportDir, 'recorder.json');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(existingReport, 'keep me');
+  let laneStarted = false;
+
+  await assert.rejects(
+    () =>
+      runMutation({
+        appDir,
+        reportDir,
+        laneNames: ['constructor'],
+        merge: false,
+        validateManifest: async () => {},
+        runLane: async () => {
+          laneStarted = true;
+          return 0;
+        },
+      }),
+    /Unknown mutation lane requested: constructor/,
   );
   assert.equal(laneStarted, false);
   assert.equal(await fs.readFile(existingReport, 'utf8'), 'keep me');
@@ -494,6 +556,22 @@ test('the app Stryker config defaults to two mutation workers', async () => {
     else process.env.MUTATION_LANE = previousLane;
     if (previousConcurrency === undefined) delete process.env.MUTATION_CONCURRENCY;
     else process.env.MUTATION_CONCURRENCY = previousConcurrency;
+  }
+});
+
+test('the app Stryker config rejects inherited object-property lane names', async () => {
+  const previousLane = process.env.MUTATION_LANE;
+  try {
+    process.env.MUTATION_LANE = 'constructor';
+    const configUrl = new URL('../stryker.lane.config.mjs', import.meta.url);
+    configUrl.searchParams.set('inherited-lane-test', String(Date.now()));
+    await assert.rejects(
+      () => import(configUrl.href),
+      /MUTATION_LANE must name one configured lane \(received "constructor"\)/,
+    );
+  } finally {
+    if (previousLane === undefined) delete process.env.MUTATION_LANE;
+    else process.env.MUTATION_LANE = previousLane;
   }
 });
 

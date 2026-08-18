@@ -173,7 +173,9 @@ export async function runMutation({
     );
   }
   for (const laneName of laneNames) {
-    if (!mutationLanes[laneName]) throw new Error(`Unknown mutation lane requested: ${laneName}`);
+    if (!Object.hasOwn(mutationLanes, laneName)) {
+      throw new Error(`Unknown mutation lane requested: ${laneName}`);
+    }
   }
   const releaseCampaignLock = await acquireMutationCampaignLock(appDir, reportDir, laneNames);
   try {

@@ -260,7 +260,7 @@ describe('logger initialization', () => {
     expect(genReqId({ headers: { 'x-request-id': exactMaximum } }, { setHeader: maximumHeader })).toBe(exactMaximum);
     expect(maximumHeader).toHaveBeenCalledWith('x-request-id', exactMaximum);
 
-    for (const rejected of ['', 'x'.repeat(129)]) {
+    for (const rejected of ['', 'x'.repeat(129), 'contains/slash', '.starts-with-punctuation']) {
       const rejectedHeader = vi.fn();
       const generated = genReqId({ headers: { 'x-request-id': rejected } }, { setHeader: rejectedHeader });
       expect(generated).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);

@@ -174,7 +174,15 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
   const isoBmff = head.toString('ascii', 4, 8) === 'ftyp';
   const wav = head.toString('ascii', 0, 4) === 'RIFF' && head.toString('ascii', 8, 12) === 'WAVE';
   const id3 = head.toString('ascii', 0, 3) === 'ID3';
-  const mpegOrAdts = head[0] === 0xff && (head[1] & 0xe0) === 0xe0;
+  // ADTS/AAC begins with the same 11-bit sync word as an MPEG audio frame.
+  // It is not an allowed `.mp3` container, so require the non-reserved MPEG
+  // version and layer fields as well as a complete four-byte frame header.
+  const mpegAudio =
+    head.length >= 4 &&
+    head[0] === 0xff &&
+    (head[1] & 0xe0) === 0xe0 &&
+    (head[1] & 0x18) !== 0x08 &&
+    (head[1] & 0x06) !== 0;
   const ogg = head.toString('ascii', 0, 4) === 'OggS';
   const webm = head[0] === 0x1a && head[1] === 0x45 && head[2] === 0xdf && head[3] === 0xa3;
   const flac = head.toString('ascii', 0, 4) === 'fLaC';
@@ -184,7 +192,7 @@ export async function verifyAudioMagicBytes(filePath: string): Promise<true> {
   const is =
     (['.m4a', '.mp4'].includes(ext) && isoBmff) ||
     (ext === '.wav' && wav) ||
-    (ext === '.mp3' && (id3 || mpegOrAdts)) ||
+    (ext === '.mp3' && (id3 || mpegAudio)) ||
     (['.ogg', '.oga'].includes(ext) && ogg) ||
     (ext === '.webm' && webm) ||
     (ext === '.flac' && flac);

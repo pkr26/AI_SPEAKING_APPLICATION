@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { gzipSync } from 'zlib';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../src/app';
@@ -67,6 +68,7 @@ describe('app wiring', () => {
     const res = await request(a).get('/health');
     expect(res.headers['x-content-type-options']).toBe('nosniff');
     expect(res.headers['x-frame-options']).toBe('SAMEORIGIN');
+    expect(res.headers['cache-control']).toBe('no-store');
   });
 
   it('returns a JSON 404 for unknown routes', async () => {
@@ -98,6 +100,12 @@ describe('app wiring', () => {
     const rejectedBoundary = await request(a).get('/health').set('x-request-id', firstRejected);
     expect(rejectedBoundary.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
     expect(rejectedBoundary.headers['x-request-id']).not.toBe(firstRejected);
+
+    for (const unsafe of ['contains a space', 'contains/slash', '.starts-with-punctuation']) {
+      const rejected = await request(a).get('/health').set('x-request-id', unsafe);
+      expect(rejected.headers['x-request-id']).toMatch(/^[0-9a-f-]{36}$/);
+      expect(rejected.headers['x-request-id']).not.toBe(unsafe);
+    }
   });
 
   it('rejects malformed JSON with 400, not 500', async () => {
@@ -107,6 +115,18 @@ describe('app wiring', () => {
       .send('{ definitely not json');
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Request body is not valid JSON');
+  });
+
+  it('rejects compressed JSON before inflating it', async () => {
+    const compressed = gzipSync(Buffer.from(JSON.stringify({ email: 'learner@example.com', password: 'passw0rd1' })));
+    const res = await request(createApp())
+      .post('/auth/login')
+      .set('Content-Type', 'application/json')
+      .set('Content-Encoding', 'gzip')
+      .send(compressed);
+
+    expect(res.status).toBe(415);
+    expect(res.body).toEqual({ error: 'Unsupported request body encoding', code: 'VALIDATION_FAILED' });
   });
 
   it('checks schema and media readiness concurrently and reports success only after both resolve', async () => {
@@ -154,6 +174,7 @@ describe('app wiring', () => {
       if (outcome.status === 'rejected') throw outcome.reason;
       expect(outcome.result.status).toBe(200);
       expect(outcome.result.body).toEqual({ ok: true });
+      expect(outcome.result.headers['cache-control']).toBe('no-store');
     } finally {
       resolveSchema?.();
       resolveInspector?.();

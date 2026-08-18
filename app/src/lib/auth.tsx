@@ -206,8 +206,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // in flight cannot resurrect the wiped session afterwards.
     epochRef.current += 1;
     void clearToken().catch(() => undefined);
+    // This is an explicit sign-out escape hatch, not merely a rendering
+    // reset. Clear account-scoped handoff metadata and the local reminder too:
+    // otherwise an unreadable old token can leave a prior learner's reminder
+    // (or assessment metadata) behind until somebody signs in again.
+    void schedulePendingCleanup().catch(() => undefined);
+    void cancelDailyReminderQuietly();
     resetMemorySession();
-  }, [resetMemorySession]);
+  }, [resetMemorySession, schedulePendingCleanup]);
 
   const beginTransition = () => {
     if (transitionRef.current) {

@@ -300,7 +300,13 @@ function verifySingleAudioStream(filePath: string, inputFormat: string, movSafet
     const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
     timeout.unref();
 
-    child.stdout!.on('data', (chunk: Buffer) => {
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    if (!stdout || !stderr) {
+      finish(new InspectionError('unavailable'));
+      return;
+    }
+    stdout.on('data', (chunk: Buffer) => {
       listingBytes += chunk.length;
       if (listingBytes > MAX_STREAM_LISTING_BYTES) {
         finish(new InvalidInspectionError());
@@ -308,10 +314,15 @@ function verifySingleAudioStream(filePath: string, inputFormat: string, movSafet
       }
       listing += chunk.toString('utf8');
     });
-    child.stderr!.on('data', (chunk: Buffer) => {
+    stderr.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
       if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
     });
+    // Child stdio can emit its own 'error' independently of the ChildProcess
+    // object (for example under descriptor exhaustion). Without these
+    // listeners EventEmitter treats that host fault as an uncaught exception.
+    stdout.on('error', () => finish(new InspectionError('unavailable')));
+    stderr.on('error', () => finish(new InspectionError('unavailable')));
     child.once('error', () => {
       // A ChildProcess error here is an inability to start/control the
       // configured prober, not evidence that the learner's media is bad.
@@ -438,11 +449,19 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
 
     // Data is counted and immediately discarded; learner audio is never
     // accumulated in application memory.
-    child.stdout!.on('data', countDecodedBytes);
-    child.stderr!.on('data', (chunk: Buffer) => {
+    const stdout = child.stdout;
+    const stderr = child.stderr;
+    if (!stdout || !stderr) {
+      finish(new InspectionError('unavailable'));
+      return;
+    }
+    stdout.on('data', countDecodedBytes);
+    stderr.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
       if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
     });
+    stdout.on('error', () => finish(new InspectionError('unavailable')));
+    stderr.on('error', () => finish(new InspectionError('unavailable')));
     child.once('error', () => {
       // A ChildProcess error here is an inability to start/control the
       // configured inspector, not evidence that the learner's media is bad.
@@ -525,6 +544,10 @@ function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToo
       }
       versionOutput += chunk.toString('utf8');
     });
+    // A piped stdio stream can fail after spawn succeeds. Handle it here so
+    // a host-side descriptor fault becomes a bounded readiness failure rather
+    // than an unhandled EventEmitter error that terminates the process.
+    versionStream.on('error', () => finish(new Error(`${label} is unavailable`)));
     child.once('error', () => finish(new Error(`${label} is unavailable`)));
     child.once('close', (code) => {
       // The configured executable must identify itself at the very beginning

@@ -5,6 +5,8 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
 import { assertSafeDestructiveDatabase } from '../db/database-safety';
+import { renderSeedSql } from '../db/generate-seed';
+import { questions, type QuestionSeed } from '../db/seed-data';
 import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
 import { pool } from './helpers';
 
@@ -13,6 +15,39 @@ afterAll(async () => {
 });
 
 describe('database content seeding', () => {
+  it('preserves a generated backslash-and-apostrophe literal with standard_conforming_strings disabled', async () => {
+    const authored = structuredClone(questions) as QuestionSeed[];
+    const promptWord = "folder\\learner's";
+    const questionText = "Don't let \\quotes change this catalog text.";
+    authored[0]!.promptWord = promptWord;
+    authored[0]!.questionText = questionText;
+    const firstInsert = renderSeedSql(authored)
+      .split('\n')
+      .find((line) => line.startsWith('INSERT INTO questions'));
+    expect(firstInsert).toBeDefined();
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query("SET LOCAL standard_conforming_strings = 'off'");
+      await client.query(`CREATE TEMP TABLE catalog_literal_test (
+        cefr_level TEXT NOT NULL,
+        prompt_word TEXT NOT NULL,
+        question_text TEXT NOT NULL,
+        translations JSONB NOT NULL,
+        UNIQUE (cefr_level, prompt_word)
+      ) ON COMMIT DROP`);
+      await client.query(firstInsert!.replace('INSERT INTO questions', 'INSERT INTO catalog_literal_test'));
+      const { rows } = await client.query<{ prompt_word: string; question_text: string }>(
+        'SELECT prompt_word, question_text FROM catalog_literal_test',
+      );
+      expect(rows).toEqual([{ prompt_word: promptWord, question_text: questionText }]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+
   it('executes every production preflight query against the healthy migrated catalog', async () => {
     await expect(preflight(process.env.DATABASE_URL!)).resolves.toBeUndefined();
   });

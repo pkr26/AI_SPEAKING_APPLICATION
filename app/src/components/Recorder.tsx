@@ -8,6 +8,7 @@ import {
   Animated,
   AppState,
   Linking,
+  Platform,
   Pressable,
   Text,
   useAnimatedValue,
@@ -1151,6 +1152,7 @@ export default function Recorder<T>({
     if (
       operationRef.current ||
       recoveringRef.current ||
+      phaseRef.current === 'recording' ||
       phaseRef.current === 'uploading' ||
       phaseRef.current === 'recovering'
     ) {
@@ -1364,7 +1366,7 @@ export default function Recorder<T>({
       // direct multipart to the API in local dev. The assessment requestId is
       // claimed by the answer endpoint either way, so the idempotency and
       // recovery flow below is identical for both paths.
-      const descriptor = await resolveAudioFileDescriptor(uri);
+      const descriptor = await resolveAudioFileDescriptor(uri, { signal: controller.signal });
       if (!isCurrentSubmission()) return;
       const grant = await apiRequestAudioUpload(descriptor.type, ownerId, {
         signal: controller.signal,
@@ -1382,8 +1384,8 @@ export default function Recorder<T>({
             // Once the assessment POST is issued, a user cancel can no longer
             // simply return to 'recorded': the server may have committed the
             // attempt, so cancellation defers to the recovery flow instead.
-            if (!controller.signal.aborted) assessmentPostedRef.current = true;
             if (grant.mode === 's3') {
+              if (!controller.signal.aborted) assessmentPostedRef.current = true;
               return await apiFetch<unknown>(endpoint, {
                 method: 'POST',
                 body: { questionId, requestId, audioKey: grant.audioKey },
@@ -1391,11 +1393,24 @@ export default function Recorder<T>({
                 timeoutMs: AUDIO_TIMEOUT_MS,
               });
             }
+            // Native FormData is ready synchronously, so issuing
+            // apiUploadAudio immediately begins the multipart API request.
+            // Web first reads its local Blob; that branch waits for the
+            // onRequestStarted callback below before considering a cancel
+            // ambiguous.
+            if (Platform.OS !== 'web' && !controller.signal.aborted) {
+              assessmentPostedRef.current = true;
+            }
             return await apiUploadAudio<unknown>(
               endpoint,
               uri,
               { questionId, requestId },
-              { signal: controller.signal },
+              {
+                signal: controller.signal,
+                onRequestStarted: () => {
+                  assessmentPostedRef.current = true;
+                },
+              },
             );
           } catch (error) {
             if (

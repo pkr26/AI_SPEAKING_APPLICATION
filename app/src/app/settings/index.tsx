@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { File, Paths } from 'expo-file-system';
 import { router } from 'expo-router';
 import * as Sharing from 'expo-sharing';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -29,7 +29,7 @@ import {
 } from '../../lib/daily-reminder';
 import { useT, useI18n, type UiLanguage } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
-import type { NativeLanguage } from '../../lib/types';
+import type { NativeLanguage, User } from '../../lib/types';
 
 const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
   { code: 'te', english: 'Telugu', native: 'తెలుగు' },
@@ -61,7 +61,7 @@ interface ReminderState {
  * and delete account.
  */
 export default function SettingsScreen() {
-  const { user, setUser, logout } = useAuth();
+  const { user, setUser, logout, sessionVersion } = useAuth();
   const t = useT();
   const { language } = useI18n();
   const theme = useTheme();
@@ -103,6 +103,7 @@ export default function SettingsScreen() {
   // Mirrors nameFocused for the re-sync effect below: keying the effect on the
   // focus state itself would wipe an unsaved edit the moment the field blurs.
   const nameFocusedRef = useRef(false);
+  const nameDirtyRef = useRef(false);
   // The committed session user. A write that lands after an await must rebuild
   // from this, never from the closure that started it: a name or language
   // change that resolved in between would be reverted, and nothing refetches
@@ -111,12 +112,46 @@ export default function SettingsScreen() {
   useEffect(() => {
     userRef.current = user;
   }, [user]);
+  // A profile request can finish after logout or another identity transition.
+  // Update this guard in the layout phase of every committed identity change,
+  // before promise continuations can run, so delayed success cannot restore a
+  // signed-out account into context.
+  const activeIdentity = `${sessionVersion}:${user?.id ?? 'anonymous'}`;
+  const activeIdentityRef = useRef(activeIdentity);
+  useLayoutEffect(() => {
+    activeIdentityRef.current = activeIdentity;
+  }, [activeIdentity]);
+
+  const commitUser = (next: User, expectedIdentity: string): boolean => {
+    if (activeIdentityRef.current !== expectedIdentity) return false;
+    userRef.current = next;
+    setUser(next);
+    return true;
+  };
+
+  const mergeProfileField = (
+    updated: User,
+    field: Pick<User, 'name'> | Pick<User, 'nativeLanguage'>,
+    expectedIdentity: string,
+  ): boolean => {
+    const current = userRef.current;
+    if (!current || current.id !== updated.id || activeIdentityRef.current !== expectedIdentity) {
+      return false;
+    }
+    // Name and language are independently editable. Merge only the field this
+    // request owns into the newest local profile so out-of-order PATCH replies
+    // cannot undo a concurrent profile edit.
+    return commitUser({ ...current, ...field }, expectedIdentity);
+  };
 
   // Re-sync the draft when the canonical name changes outside this field (a
   // refreshed /me, another session), but never clobber text being typed.
   const userName = user?.name;
   useEffect(() => {
-    if (!nameFocusedRef.current) setNameDraft(userName ?? '');
+    if (!nameFocusedRef.current) {
+      nameDirtyRef.current = false;
+      setNameDraft(userName ?? '');
+    }
   }, [userName]);
 
   useEffect(() => {
@@ -143,15 +178,18 @@ export default function SettingsScreen() {
 
   const saveName = async () => {
     if (!canSaveName || nameBusyRef.current) return;
+    const requestIdentity = activeIdentityRef.current;
     nameBusyRef.current = true;
     setNameBusy(true);
     setNameError(null);
     setNameSaved(false);
     try {
       const updated = await apiUpdateProfile({ name: trimmedName });
-      setUser(updated);
-      setNameDraft(updated.name);
-      setNameSaved(true);
+      if (mergeProfileField(updated, { name: updated.name }, requestIdentity)) {
+        nameDirtyRef.current = false;
+        setNameDraft(updated.name);
+        setNameSaved(true);
+      }
     } catch (error) {
       setNameError(userMessageForError(error, t('settings.updateFailed')));
     } finally {
@@ -162,6 +200,7 @@ export default function SettingsScreen() {
 
   const chooseLanguage = async (code: NativeLanguage) => {
     if (code === user.nativeLanguage || languageBusyRef.current) return;
+    const requestIdentity = activeIdentityRef.current;
     languageBusyRef.current = true;
     setLanguageBusy(true);
     setLanguageError(null);
@@ -169,7 +208,11 @@ export default function SettingsScreen() {
       // The server confirms first; setUser then re-renders the whole UI in the
       // new language immediately (nativeLanguage drives the i18n provider).
       const updated = await apiUpdateProfile({ nativeLanguage: code });
-      setUser(updated);
+      if (
+        !mergeProfileField(updated, { nativeLanguage: updated.nativeLanguage }, requestIdentity)
+      ) {
+        return;
+      }
       // Question help and native-mode content are keyed by language.
       void queryClient.invalidateQueries({ queryKey: ['question-help'] });
       // The scheduled reminder copy was baked in the old language. Re-schedule
@@ -294,11 +337,13 @@ export default function SettingsScreen() {
 
   const retakeTest = async () => {
     if (retakeBusyRef.current) return;
+    const requestIdentity = activeIdentityRef.current;
     retakeBusyRef.current = true;
     setRetakeBusy(true);
     setRetakeError(null);
     try {
       await apiRestartDiagnostic();
+      if (activeIdentityRef.current !== requestIdentity) return;
       // The level being retired owned these caches; drop them before the gate
       // guards flip so no stale question or count can flash afterwards. The
       // placement test's own /next payload is retired too: its key is unchanged
@@ -307,14 +352,23 @@ export default function SettingsScreen() {
       // costing a 409 mismatch and minutes of recovery lock.
       queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
       queryClient.removeQueries({ queryKey: ['practice-question'] });
-      queryClient.removeQueries({ queryKey: ['practice-stats'] });
+      // Home can remain mounted underneath this settings route during the
+      // guard transition. Do not delete its live observer out from under it;
+      // diagnostic completion clears the now-inactive stats cache before Home
+      // is allowed back at a newly assigned level.
+      queryClient.removeQueries({ queryKey: ['practice-stats'], type: 'inactive' });
       queryClient.removeQueries({ queryKey: ['practice-history'] });
       void queryClient.invalidateQueries({ queryKey: ['me'] });
       // Rebuild from the ref, not from this handler's closure: a name or
       // language change that resolved while the restart was in flight is
       // already the session user, and the stale copy would revert it.
       const current = userRef.current;
-      if (current) setUser({ ...current, diagnosticCompleted: false, cefrLevel: null });
+      if (
+        !current ||
+        !commitUser({ ...current, diagnosticCompleted: false, cefrLevel: null }, requestIdentity)
+      ) {
+        return;
+      }
       router.replace('/diagnostic');
     } catch (error) {
       setRetakeError(userMessageForError(error, t('retake.failed')));
@@ -366,6 +420,7 @@ export default function SettingsScreen() {
             style={[styles.input, styles.nameInput, nameFocused && styles.inputFocused]}
             value={nameDraft}
             onChangeText={(value) => {
+              nameDirtyRef.current = value !== (userRef.current?.name ?? '');
               setNameDraft(value);
               setNameSaved(false);
             }}
@@ -376,6 +431,7 @@ export default function SettingsScreen() {
             onBlur={() => {
               nameFocusedRef.current = false;
               setNameFocused(false);
+              if (!nameDirtyRef.current) setNameDraft(userRef.current?.name ?? '');
             }}
             placeholder={t('signup.namePlaceholder')}
             placeholderTextColor={colors.muted}

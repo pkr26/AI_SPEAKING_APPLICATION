@@ -239,6 +239,26 @@ describe('config env validation', () => {
     expect(config.logLevel).toBe('warn');
   });
 
+  it('canonicalizes complete CORS origins and rejects wildcard, opaque, and URL-shaped entries', async () => {
+    const config = await loadConfig(
+      baseEnv({ CORS_ORIGINS: ' HTTPS://APP.EXAMPLE:443/ , http://localhost:8081,https://app.example ' }),
+    );
+    expect(config.corsOrigins).toEqual(['https://app.example', 'http://localhost:8081']);
+
+    for (const invalid of [
+      '*',
+      'https://*.example.com',
+      'null',
+      'file:///tmp/app.html',
+      'https://app.example/callback',
+      'https://user:password@app.example',
+      'https://app.example?preview=true',
+      'not a url',
+    ]) {
+      await expectInvalid(baseEnv({ CORS_ORIGINS: invalid }), 'CORS_ORIGINS');
+    }
+  });
+
   it('rejects a missing/empty DATABASE_URL and a short JWT_SECRET', async () => {
     const missingDatabase = baseEnv({});
     delete missingDatabase.DATABASE_URL;

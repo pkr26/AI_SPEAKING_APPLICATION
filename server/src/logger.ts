@@ -34,12 +34,18 @@ export const logger = pino({
       : undefined,
 });
 
+// Request IDs are echoed in a response and written to every request log line.
+// Keep caller-provided correlation IDs to a compact printable-token grammar so
+// unusual Unicode/control input cannot forge confusing multi-line logs or
+// trigger a response-header validation failure.
+const INBOUND_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+
 /** HTTP request logging with request IDs (honors inbound x-request-id) and redaction. */
 export const httpLogger = pinoHttp({
   logger,
   genReqId: (req, res) => {
     const incoming = req.headers['x-request-id'];
-    const id = typeof incoming === 'string' && incoming.length > 0 && incoming.length <= 128 ? incoming : randomUUID();
+    const id = typeof incoming === 'string' && INBOUND_REQUEST_ID.test(incoming) ? incoming : randomUUID();
     res.setHeader('x-request-id', id);
     return id;
   },

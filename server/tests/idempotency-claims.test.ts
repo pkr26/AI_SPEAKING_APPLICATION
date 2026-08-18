@@ -36,6 +36,16 @@ describe('claimAssessmentRequest ownership and replay', () => {
     expect(error.code).toBe('REQUEST_IN_FLIGHT');
   });
 
+  it('locks the user parent before an idempotency claim and maps a missing account to state changed', async () => {
+    const missingUserId = randomUUID();
+
+    await expect(claimAssessmentRequest(missingUserId, randomUUID(), 'practice', questionId)).rejects.toMatchObject({
+      status: 409,
+      message: 'Assessment state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+  });
+
   it('rejects reuse of the same requestId for a different question or context', async () => {
     const requestId = randomUUID();
     const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId);
@@ -117,6 +127,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       query: vi
         .fn()
         .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce({ rowCount: 1 })
         .mockResolvedValueOnce({ rowCount: 0 })
         .mockResolvedValueOnce({ rowCount: 0 })
         .mockResolvedValueOnce({
@@ -164,6 +175,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       query: vi
         .fn()
         .mockResolvedValueOnce(undefined)
+        .mockResolvedValueOnce({ rowCount: 1 })
         .mockResolvedValueOnce({ rowCount: 0 })
         .mockResolvedValueOnce({ rowCount: 0 })
         .mockResolvedValueOnce({
@@ -232,6 +244,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const client = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'ROLLBACK') return undefined;
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
         if (text.includes('SELECT context, question_id, status, response_body')) return { rows: [] };
@@ -302,6 +315,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN') return undefined;
         if (text === 'ROLLBACK') throw new Error('rollback failed');
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         throw failure;
       }),
       release: vi.fn(),
@@ -311,6 +325,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       await expect(claimAssessmentRequest(userId, randomUUID(), 'practice', questionId)).rejects.toBe(failure);
       expect(client.query.mock.calls.map(([text]) => text)).toEqual([
         'BEGIN',
+        'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
         expect.stringContaining('DELETE FROM assessment_requests'),
         'ROLLBACK',
       ]);

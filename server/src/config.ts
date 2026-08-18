@@ -31,6 +31,48 @@ const trustProxyHops = z
     return Number(value);
   });
 
+// CORS compares an Origin header with a serialized origin (scheme, host, and
+// optional port), never a URL path. Parsing this at boot prevents dangerous
+// pseudo-origins such as `null` and operator typos such as a wildcard or a
+// callback path from silently widening or misrepresenting browser access.
+const corsOrigins = z
+  .string()
+  .default('')
+  .transform((raw, ctx): string[] => {
+    const result = new Set<string>();
+    for (const candidate of raw
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean)) {
+      if (!URL.canParse(candidate)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'must contain only complete http(s) origins (for example https://app.example)',
+        });
+        continue;
+      }
+      const url = new URL(candidate);
+      if (
+        (url.protocol !== 'http:' && url.protocol !== 'https:') ||
+        url.username ||
+        url.password ||
+        url.hostname.includes('*') ||
+        url.pathname !== '/' ||
+        url.search ||
+        url.hash ||
+        url.origin === 'null'
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'must contain only complete http(s) origins (for example https://app.example)',
+        });
+        continue;
+      }
+      result.add(url.origin);
+    }
+    return [...result];
+  });
+
 const envSchema = z
   .object({
     DATABASE_URL: z
@@ -50,7 +92,7 @@ const envSchema = z
     PORT: z.coerce.number().int().min(1).max(65535).default(4000),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).optional(),
-    CORS_ORIGINS: z.string().default(''),
+    CORS_ORIGINS: corsOrigins,
     TRUST_PROXY: trustProxyHops,
     DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(20),
     DB_STATEMENT_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(10_000),
@@ -353,9 +395,7 @@ export const config = {
   port: env.PORT,
   databaseUrl: env.DATABASE_URL,
   jwtSecret: env.JWT_SECRET,
-  corsOrigins: env.CORS_ORIGINS.split(',')
-    .map((o) => o.trim())
-    .filter(Boolean),
+  corsOrigins: env.CORS_ORIGINS,
   trustProxy: env.TRUST_PROXY,
   dbPoolMax: env.DB_POOL_MAX,
   dbStatementTimeoutMs: env.DB_STATEMENT_TIMEOUT_MS,

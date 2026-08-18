@@ -57,8 +57,12 @@ export function createApp({
   const limiters = buildLimiters();
 
   // Liveness stays cheap and independent of external services.
-  app.get('/health', (_req, res) => res.json({ ok: true }));
+  app.get('/health', (_req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ ok: true });
+  });
   app.get('/ready', limiters.readiness, async (_req, res) => {
+    res.set('Cache-Control', 'no-store');
     try {
       await Promise.all([schemaCheck(), audioInspectorCheck()]);
       res.json({ ok: true });
@@ -108,7 +112,10 @@ export function createApp({
   app.use('/auth/reset-password', limiters.auth);
 
   app.use(compression());
-  app.use(express.json({ limit: '1mb' }));
+  // This API has no legitimate compressed request bodies. Refusing them
+  // before decompression prevents a tiny gzip payload from consuming CPU and
+  // memory as an inflated JSON bomb; response compression remains enabled.
+  app.use(express.json({ limit: '1mb', inflate: false }));
 
   // The account-targeted login limiter needs the parsed/normalized-able email.
   // The independent IP limiter above still rejects abusive bodies before JSON

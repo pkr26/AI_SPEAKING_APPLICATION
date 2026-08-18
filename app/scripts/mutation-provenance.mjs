@@ -22,6 +22,11 @@ export const mutationSharedInputFiles = Object.freeze([
   'scripts/mutation-lanes.mjs',
   'scripts/mutation-provenance.mjs',
   'scripts/run-mutation.mjs',
+  // These decide whether a completed campaign is accepted. Changing either
+  // the report validator or its reviewed-equivalence policy must invalidate
+  // retained lane reports just like changing Stryker's lane config.
+  'scripts/merge-mutation-reports.mjs',
+  'scripts/mutation-equivalents.mjs',
   ...expectedMutationFiles,
 ]);
 

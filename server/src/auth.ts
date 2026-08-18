@@ -78,13 +78,11 @@ const comparablePasswordSchema = (field: string) =>
       message: `${field} must be at most ${BCRYPT_MAX_BYTES} UTF-8 bytes`,
     });
 
-// PostgreSQL text rejects U+0000 (22021 → unhandled 500), and the rest of the
-// C0/DEL control range has no place in a stored display name.
-const hasNoControlCharacters = (value: string) =>
-  [...value].every((char) => {
-    const codePoint = char.codePointAt(0)!;
-    return codePoint > 0x1f && codePoint !== 0x7f;
-  });
+// PostgreSQL text rejects U+0000 (22021 → unhandled 500), and all Unicode
+// control / line-separator code points have no place in a stored display name:
+// C1 controls and U+2028/U+2029 otherwise survive the old C0-only check and
+// can split UI, audit, and export records.
+const hasNoControlCharacters = (value: string) => !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
 
 const nameSchema = z
   .string()
@@ -310,6 +308,16 @@ export function createAuthRouter(limiters: Limiters) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        // Lock the parent user row before touching its reset-token child.
+        // Password changes and account deletion already take that order
+        // (users -> password_reset_tokens); the reverse order here formed a
+        // real 40P01 cycle under a simultaneous reset and password change.
+        // Re-checking existence inside the transaction also keeps a
+        // concurrent account deletion on the uniform invalid-reset path.
+        const lockedUser = await client.query<{ id: string }>('SELECT id FROM users WHERE id = $1 FOR UPDATE', [
+          user.id,
+        ]);
+        if (lockedUser.rowCount !== 1) throw invalidReset();
         // Guarded delete makes the token single-use even under concurrent
         // resets: only the request that removes the row applies the change.
         const consumed = await client.query(
@@ -318,10 +326,11 @@ export function createAuthRouter(limiters: Limiters) {
         );
         if (consumed.rowCount !== 1) throw invalidReset();
         // Bumping token_version invalidates every previously issued token.
-        await client.query('UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2', [
-          passwordHash,
-          user.id,
-        ]);
+        const updated = await client.query(
+          'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
+          [passwordHash, user.id],
+        );
+        if (updated.rowCount !== 1) throw invalidReset();
         await client.query('COMMIT');
       } catch (err) {
         return await rollbackTransaction(client, { value: err });

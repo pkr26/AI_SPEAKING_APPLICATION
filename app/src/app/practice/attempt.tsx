@@ -1,4 +1,4 @@
-import React, { useCallback, useLayoutEffect, useState } from 'react';
+import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
@@ -33,6 +33,9 @@ export default function AttemptScreen() {
   const navigation = useNavigation();
   const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const [recorderLocked, setRecorderLocked] = useState(false);
+  // Render state disables the switch, while this mirror closes the tiny window
+  // between Recorder taking ownership of a recording and that disabled render.
+  const recorderLockedRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
@@ -75,6 +78,7 @@ export default function AttemptScreen() {
   // A new submission owns the inline space again: clear the old wait line the
   // moment the recorder locks for the next take.
   const handleLockChange = useCallback((locked: boolean) => {
+    recorderLockedRef.current = locked;
     setRecorderLocked(locked);
     if (locked) setRateLimitNotice(null);
   }, []);
@@ -181,7 +185,9 @@ export default function AttemptScreen() {
           recorderLocked && styles.modeToggleDisabled,
           pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
         ]}
-        onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
+        onPress={() => {
+          if (!recorderLockedRef.current) setAnswerMode(nativeMode ? 'english' : 'native');
+        }}
       >
         <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
           {nativeMode ? t('practice.answeringNative') : t('practice.answerInMyLanguage')}

@@ -120,6 +120,21 @@ describe('assessSpeaking (mock mode)', () => {
 });
 
 describe('assertDailyAssessmentCapacity', () => {
+  it('returns a state-change rejection for a deleted account before writing a reservation', async () => {
+    const missingUserId = randomUUID();
+
+    await expect(assertDailyAssessmentCapacity(missingUserId)).rejects.toMatchObject({
+      status: 409,
+      message: 'Assessment state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+    const { rows } = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [missingUserId],
+    );
+    expect(rows[0].n).toBe(0);
+  });
+
   it('reserves usage rows and rejects exactly at the user cap with retryAfterHours', async () => {
     const snap = snapshotConfig();
     await pool.query('DELETE FROM assessment_usage');
@@ -256,6 +271,7 @@ describe('assertDailyAssessmentCapacity', () => {
         ) {
           return undefined;
         }
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text === 'ROLLBACK') throw new Error('rollback failed');
         throw primaryError;
       }),
@@ -268,6 +284,7 @@ describe('assertDailyAssessmentCapacity', () => {
         ['BEGIN'],
         ["SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))"],
         ["SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))", [userId]],
+        ['SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]],
         [expect.stringContaining('count(*)::int AS global_n'), [userId]],
         ['ROLLBACK'],
       ]);

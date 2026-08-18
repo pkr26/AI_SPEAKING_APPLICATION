@@ -181,8 +181,11 @@ function assertReportShape(report, laneName, definition) {
     if (!isRecord(testFile) || !Array.isArray(testFile.tests)) {
       throw new Error(`Test file ${testFileName} in lane ${laneName} has no tests array`);
     }
-    if (testFile.source !== undefined && typeof testFile.source !== 'string') {
-      throw new Error(`Test file ${testFileName} in lane ${laneName} has invalid source text`);
+    // Stryker emits the original test source for every configured test file.
+    // Require it so a report from an earlier test revision cannot be merged
+    // after coverage has been weakened or a test has been removed.
+    if (typeof testFile.source !== 'string') {
+      throw new Error(`Test file ${testFileName} in lane ${laneName} has no source text`);
     }
   }
 
@@ -484,6 +487,35 @@ async function readLaneReports(reportDirectory) {
   return reportsByLane;
 }
 
+/**
+ * A lane report is only meaningful for the exact source and test bodies it
+ * exercised. Stryker records those bodies; compare them to the workspace just
+ * before writing the merged artifact so a stale report, or a source edit made
+ * while a long campaign ran, fails closed rather than looking green.
+ */
+async function assertReportsMatchWorkspace(reportsByLane) {
+  for (const laneName of codeMutationLaneNames) {
+    const definition = codeMutationLanes[laneName];
+    const report = reportsByLane[laneName];
+    for (const sourceFileName of definition.mutate) {
+      const currentSource = await fs.readFile(path.join(serverDirectory, sourceFileName), 'utf8');
+      if (report.files[sourceFileName].source !== currentSource) {
+        throw new Error(
+          `Mutation report for lane ${laneName} embeds stale source for ${sourceFileName} that no longer matches the workspace`,
+        );
+      }
+    }
+    for (const testFileName of definition.testFiles) {
+      const currentSource = await fs.readFile(path.join(serverDirectory, testFileName), 'utf8');
+      if (report.testFiles[testFileName].source !== currentSource) {
+        throw new Error(
+          `Mutation report for lane ${laneName} embeds stale test source for ${testFileName} that no longer matches the workspace`,
+        );
+      }
+    }
+  }
+}
+
 async function writeArtifactsAtomically(artifacts) {
   const temporaryArtifacts = artifacts.map(({ filePath, contents }, index) => ({
     filePath,
@@ -519,6 +551,7 @@ export async function mergeMutationReports({
     laneNames: codeMutationLaneNames,
     expectedFiles: expectedCodeMutationFiles,
   });
+  await assertReportsMatchWorkspace(reportsByLane);
   const jsonPath = path.join(reportDirectory, 'code.json');
   const summaryPath = path.join(reportDirectory, 'code-summary.json');
   const htmlPath = path.join(reportDirectory, 'code.html');

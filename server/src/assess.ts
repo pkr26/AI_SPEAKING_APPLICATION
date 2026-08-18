@@ -177,6 +177,14 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
     // never by a sweep inside this hot path.
     await client.query("SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))");
     await client.query("SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))", [userId]);
+    // A request can outlive requireAuth's user lookup while DELETE /auth/account
+    // removes that user. Lock the parent before reading or inserting its usage
+    // rows so an already-deleted account is a normal state-change rejection,
+    // not a leaking foreign-key error from the reservation INSERT.
+    const owner = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (owner.rowCount !== 1) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     const { rows } = await client.query<{
       global_n: number;
       global_oldest: string | null;

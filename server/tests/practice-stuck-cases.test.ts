@@ -77,6 +77,10 @@ function expectCompletedPersistenceLease(leases: ObservedLease[]): void {
   expect(lease!.statements[0]).toBe('BEGIN');
   expect(lease!.statements[lease!.releasedAfterStatementCount[0] - 1]).toBe('COMMIT');
   expect(lease!.release).toHaveBeenCalledOnce();
+  const parentLockAt = lease!.statements.indexOf('SELECT 1 FROM users WHERE id = $1 FOR UPDATE');
+  const claimLockAt = lease!.statements.findIndex((text) => text.includes(CLAIM_OWNERSHIP_FRAGMENT));
+  expect(parentLockAt).toBeGreaterThan(0);
+  expect(claimLockAt).toBeGreaterThan(parentLockAt);
 }
 
 const SILENCE = {

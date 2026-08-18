@@ -39,6 +39,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
@@ -95,7 +96,8 @@ if (!Number.isSafeInteger(REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS < 1_000 || R
 // Transport: raw http with a wide keep-alive agent so 1000 clients can truly
 // overlap (fetch/undici would cap per-origin sockets far below that).
 // ---------------------------------------------------------------------------
-const agent = new http.Agent({ keepAlive: true, maxSockets: 4096, maxFreeSockets: 1024, keepAliveMsecs: 30_000 });
+const transport = baseUrl.protocol === 'https:' ? https : http;
+const agent = new transport.Agent({ keepAlive: true, maxSockets: 4096, maxFreeSockets: 1024, keepAliveMsecs: 30_000 });
 
 const stats = {
   requests: 0,
@@ -137,7 +139,7 @@ function rawHttpRequest(method, pathName, { token, json, form, timeoutMs, extraH
     if (body) headers['Content-Length'] = body.length;
     if (token) headers.Authorization = `Bearer ${token}`;
 
-    const req = http.request(
+    const req = transport.request(
       { method, hostname: baseUrl.hostname, port: baseUrl.port, path: pathName, agent, headers },
       (res) => {
         const chunks = [];

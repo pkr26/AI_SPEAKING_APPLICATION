@@ -227,6 +227,49 @@ describe('practice SRS scheduling and skip', () => {
   });
 
   describe('POST /practice/skip', () => {
+    it('clears a skip that commits while an already-started scored assessment is waiting on the provider', async () => {
+      const { token, userId, level } = await freshUserAt();
+      const [questionId] = await questionsAt(level, 1);
+      let resolveAssessment!: (result: {
+        transcript: string;
+        score: number;
+        passed: boolean;
+        feedback: string;
+      }) => void;
+      speakMock.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveAssessment = resolve;
+          }),
+      );
+
+      const pendingAttempt = attempt(token, questionId).then((response) => response);
+      await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+
+      // The assessment has claimed its question but does not hold a database
+      // lease while provider work is in flight. A skip may therefore commit
+      // here; result persistence must serialize after it and clear the park.
+      const skipped = await request(a)
+        .post('/practice/skip')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId });
+      expect(skipped.status).toBe(204);
+
+      resolveAssessment({
+        transcript: 'a scored answer',
+        score: 82,
+        passed: true,
+        feedback: 'Scored after the concurrent skip.',
+      });
+      expect((await pendingAttempt).status).toBe(200);
+
+      const { rows } = await pool.query<{ skipped_until: string | null; attempt_count: number }>(
+        'SELECT skipped_until, attempt_count FROM practice_progress WHERE user_id = $1 AND question_id = $2',
+        [userId, questionId],
+      );
+      expect(rows[0]).toEqual({ skipped_until: null, attempt_count: 1 });
+    });
+
     it('parks a new word for 7 days with a zero-attempt learning row, and the next pick differs', async () => {
       const { token, userId } = await freshUserAt();
       const first = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);

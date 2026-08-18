@@ -63,6 +63,16 @@ function withPersistedReminder(initial: DailyReminder): void {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
   const originalOS = Object.getOwnPropertyDescriptor(Platform, 'OS');
   Object.defineProperty(Platform, 'OS', { configurable: true, value: os });
@@ -388,5 +398,41 @@ describe('cancelDailyReminderQuietly', () => {
     mockCancelAllScheduledNotificationsAsync.mockImplementation(async () => undefined);
     await expect(cancelDailyReminderQuietly()).resolves.toBeUndefined();
     expect(deleteItemAsync).toHaveBeenCalledWith('daily_reminder_v1', STORAGE_OPTIONS);
+  });
+
+  it('serializes an in-flight enable before logout cancellation', async () => {
+    // Enabling spans multiple awaits. Without the module lock, logout could
+    // cancel the OS schedule and then the earlier enable would write its old
+    // preference after logout, leaving a cross-account reminder behind.
+    let persisted: string | null = null;
+    getItemAsync.mockImplementation(async () => persisted);
+    setItemAsync.mockImplementation(async (_key: string, value: string) => {
+      persisted = value;
+    });
+    deleteItemAsync.mockImplementation(async () => {
+      persisted = null;
+    });
+    const scheduled = deferred<string>();
+    mockScheduleNotificationAsync.mockReturnValueOnce(scheduled.promise);
+
+    const enabling = enableDailyReminder(19);
+    // Drive the queue through the permission check and into its held schedule.
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(mockScheduleNotificationAsync).toHaveBeenCalledTimes(1);
+
+    const loggingOut = cancelDailyReminderQuietly();
+    // The queued cancellation must not delete midway through the enable.
+    expect(deleteItemAsync).not.toHaveBeenCalled();
+    scheduled.resolve('notification-id');
+
+    await expect(enabling).resolves.toBe('enabled');
+    await expect(loggingOut).resolves.toBeUndefined();
+    expect(persisted).toBeNull();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(2);
+    expect(setItemAsync.mock.invocationCallOrder[0]).toBeLessThan(
+      deleteItemAsync.mock.invocationCallOrder[0],
+    );
   });
 });

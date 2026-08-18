@@ -1,15 +1,22 @@
 import { ipKeyGenerator, rateLimit, type RateLimitInfo } from 'express-rate-limit';
 import type { RequestHandler, Response } from 'express';
+import { z } from 'zod';
 import { config } from './config';
 import { AuthedRequest } from './middleware';
 import { PostgresRateLimitStore } from './postgres-rate-limit-store';
 
 const MAX_EMAIL_LENGTH = 254;
+const emailShape = z.string().email();
 
 export function normalizeLoginEmail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim().toLowerCase();
-  if (!normalized || normalized.length > MAX_EMAIL_LENGTH) return undefined;
+  // Do not let arbitrary malformed JSON strings create a durable shared
+  // counter row. The auth route applies the same normalization and Zod email
+  // shape check immediately after this limiter, so only identifiers that
+  // could name an account need a cross-replica budget.
+  if (!normalized || normalized.length > MAX_EMAIL_LENGTH || !emailShape.safeParse(normalized).success)
+    return undefined;
   return normalized;
 }
 
@@ -28,18 +35,19 @@ function userOrIpRateLimitKey(req: AuthedRequest): string {
   return user ? `user:${user.id}` : rateLimitIpKey(req.ip);
 }
 
-type ParsedEmailRequest = { body: { email?: unknown } };
+type ParsedEmailRequest = { body?: { email?: unknown } };
 
-// Both email-keyed limiters are mounted after express.json(), which initializes
-// an empty object even when the request carries no body. A future unsafe mount
-// order should fail loudly rather than silently bypassing a security budget.
+// Both email-keyed limiters are mounted after express.json(). Treat a missing
+// body as an invalid identifier too: Express deliberately leaves req.body
+// undefined for requests with no JSON content type, and a malformed request
+// must not turn that defensive limiter into a TypeError/500.
 function skipInvalidEmail(req: ParsedEmailRequest): boolean {
-  return normalizeLoginEmail(req.body.email) === undefined;
+  return normalizeLoginEmail(req.body?.email) === undefined;
 }
 
 /** express-rate-limit invokes this only after skipInvalidEmail returned false. */
 function validEmailRateLimitKey(req: ParsedEmailRequest): string {
-  const email = normalizeLoginEmail(req.body.email)!;
+  const email = normalizeLoginEmail(req.body?.email)!;
   return `email:${email}`;
 }
 

@@ -119,10 +119,13 @@ export const JWT_AUDIENCE = 'ai-english-mobile';
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
-  const parts = req.headers.authorization?.split(' ');
-  const scheme = parts?.[0];
-  const token = parts?.[1];
-  if (scheme !== 'Bearer' || !token) {
+  // Accept the RFC-compatible whitespace between the scheme and credentials,
+  // but require the entire value to contain exactly one bearer credential.
+  // Silently ignoring a trailing token makes the API and an upstream proxy
+  // disagree about which credential was authenticated.
+  const authorization = req.headers.authorization;
+  const token = typeof authorization === 'string' ? /^Bearer[ \t]+([^\s]+)$/.exec(authorization)?.[1] : undefined;
+  if (!token) {
     return res.status(401).json({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
   }
 
@@ -141,7 +144,17 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
   // `sub` claim (String.prototype.sub is a function), so the same structural
   // checks reject it without a redundant special case.
   const claims = payload as jwt.JwtPayload;
-  if (typeof claims.sub !== 'string' || !UUID_PATTERN.test(claims.sub) || typeof claims.tv !== 'number') {
+  // Every API-issued token has an expiry and an integer, positive token
+  // version. `jwt.verify` checks an exp claim when present, but does not
+  // require one; enforce the issuance contract here so a future signing call
+  // cannot accidentally mint a non-expiring bearer credential.
+  if (
+    typeof claims.sub !== 'string' ||
+    !UUID_PATTERN.test(claims.sub) ||
+    !Number.isSafeInteger(claims.tv) ||
+    claims.tv < 1 ||
+    !Number.isSafeInteger(claims.exp)
+  ) {
     return res.status(401).json({ error: 'Invalid or expired token', code: 'UNAUTHENTICATED' });
   }
 

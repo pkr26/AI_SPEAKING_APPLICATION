@@ -2,13 +2,15 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 
-import { mergeMutationReportData, mergeMutationReports } from './merge-mutation-reports.mjs';
+import { createMutationReportHtml, mergeMutationReportData, mergeMutationReports } from './merge-mutation-reports.mjs';
 import { codeMutationLaneNames, codeMutationLanes, expectedCodeMutationFiles } from './mutation-lanes.mjs';
 
 const thresholds = Object.freeze({ high: 95, low: 90, break: 90 });
 const framework = Object.freeze({ name: 'StrykerJS', version: '9.6.1' });
+const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 function position(line, column) {
   return { line, column };
@@ -160,40 +162,53 @@ test('rejects dangling test references and unexpected source files', () => {
   assert.throws(() => mergeMutationReportData(unexpectedSource), /Unexpected: src\/unexpected\.ts/);
 });
 
-function fullManifestReport(laneName) {
+test('escapes report data before embedding it into self-contained HTML', async () => {
+  const html = await createMutationReportHtml({
+    files: { 'src/unsafe.ts': { source: 'const unsafe = "</script>";' } },
+  });
+
+  assert.match(html, /\\u003c\/script>/);
+  assert.doesNotMatch(html, /const unsafe = "<\/script>"/);
+});
+
+async function fullManifestReport(laneName) {
   const definition = codeMutationLanes[laneName];
   const testFiles = Object.fromEntries(
-    definition.testFiles.map((testFileName, index) => [
-      testFileName,
-      {
-        source: `// source for ${testFileName}\n`,
-        tests: [{ id: String(index), name: `test in ${testFileName}` }],
-      },
-    ]),
+    await Promise.all(
+      definition.testFiles.map(async (testFileName, index) => [
+        testFileName,
+        {
+          source: await fs.readFile(path.join(serverDirectory, testFileName), 'utf8'),
+          tests: [{ id: String(index), name: `test in ${testFileName}` }],
+        },
+      ]),
+    ),
   );
   const firstTestId = testFiles[definition.testFiles[0]].tests[0].id;
   const files = Object.fromEntries(
-    definition.mutate.map((sourceFileName, index) => [
-      sourceFileName,
-      {
-        language: 'typescript',
-        source: index === 0 && laneName === codeMutationLaneNames[0] ? 'const unsafe = "</script>";\n' : '// source\n',
-        mutants:
-          index === 0
-            ? [
-                {
-                  id: '0',
-                  mutatorName: 'StringLiteral',
-                  replacement: '""',
-                  status: laneName === codeMutationLaneNames[0] ? 'Killed' : 'NoCoverage',
-                  coveredBy: [firstTestId],
-                  ...(laneName === codeMutationLaneNames[0] ? { killedBy: [firstTestId] } : {}),
-                  location: mutationLocation(1),
-                },
-              ]
-            : [],
-      },
-    ]),
+    await Promise.all(
+      definition.mutate.map(async (sourceFileName, index) => [
+        sourceFileName,
+        {
+          language: 'typescript',
+          source: await fs.readFile(path.join(serverDirectory, sourceFileName), 'utf8'),
+          mutants:
+            index === 0
+              ? [
+                  {
+                    id: '0',
+                    mutatorName: 'StringLiteral',
+                    replacement: '""',
+                    status: laneName === codeMutationLaneNames[0] ? 'Killed' : 'NoCoverage',
+                    coveredBy: [firstTestId],
+                    ...(laneName === codeMutationLaneNames[0] ? { killedBy: [firstTestId] } : {}),
+                    location: mutationLocation(1),
+                  },
+                ]
+              : [],
+        },
+      ]),
+    ),
   );
   return report({ files, tests: testFiles, performance: undefined });
 }
@@ -206,7 +221,7 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
   for (const laneName of codeMutationLaneNames.slice(0, -1)) {
     await fs.writeFile(
       path.join(reportDirectory, `${laneName}.json`),
-      JSON.stringify(fullManifestReport(laneName)),
+      JSON.stringify(await fullManifestReport(laneName)),
       'utf8',
     );
   }
@@ -218,7 +233,7 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
 
   await fs.writeFile(
     path.join(reportDirectory, `${missingLane}.json`),
-    JSON.stringify(fullManifestReport(missingLane)),
+    JSON.stringify(await fullManifestReport(missingLane)),
     'utf8',
   );
   const result = await mergeMutationReports({ reportDir: reportDirectory });
@@ -233,6 +248,23 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
   assert.equal(summaryJson.fileCount, expectedCodeMutationFiles.length);
   assert.equal(summaryJson.mutantCount, codeMutationLaneNames.length);
   assert.match(html, /<mutation-test-report-app/);
-  assert.match(html, /\\u003c\/script>/);
-  assert.doesNotMatch(html, /const unsafe = "<\/script>"/);
+
+  const staleSourceLane = codeMutationLaneNames[0];
+  const staleSource = await fullManifestReport(staleSourceLane);
+  const staleSourceFile = codeMutationLanes[staleSourceLane].mutate[0];
+  staleSource.files[staleSourceFile].source = '// stale source\n';
+  await fs.writeFile(path.join(reportDirectory, `${staleSourceLane}.json`), JSON.stringify(staleSource), 'utf8');
+  await assert.rejects(
+    mergeMutationReports({ reportDir: reportDirectory }),
+    /embeds stale source .* no longer matches the workspace/,
+  );
+
+  const staleTest = await fullManifestReport(staleSourceLane);
+  const staleTestFile = codeMutationLanes[staleSourceLane].testFiles[0];
+  staleTest.testFiles[staleTestFile].source = '// stale test\n';
+  await fs.writeFile(path.join(reportDirectory, `${staleSourceLane}.json`), JSON.stringify(staleTest), 'utf8');
+  await assert.rejects(
+    mergeMutationReports({ reportDir: reportDirectory }),
+    /embeds stale test source .* no longer matches the workspace/,
+  );
 });

@@ -375,6 +375,20 @@ describe('question seed generator', () => {
     expect(sql.endsWith('COMMIT;\n')).toBe(true);
   });
 
+  it('uses an explicit escape literal for authored text containing backslashes', () => {
+    const authored = copyQuestions();
+    authored[0]!.promptWord = 'folder\\name';
+    authored[0]!.questionText = "Don't use \\quotes in SQL literals.";
+
+    const sql = renderSeedSql(authored);
+
+    // E'' makes the escape rules explicit even if a legacy target has
+    // standard_conforming_strings disabled. Backslashes are doubled for the
+    // SQL parser and apostrophes are escaped inside that literal.
+    expect(sql).toContain("E'folder\\\\name'");
+    expect(sql).toContain("E'Don\\'t use \\\\quotes in SQL literals.'");
+  });
+
   it('writes a validated artifact to the requested path', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-english-seed-'));
     const outputPath = path.join(directory, 'seed.sql');

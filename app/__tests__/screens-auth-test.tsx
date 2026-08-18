@@ -197,6 +197,23 @@ function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
 
+/** Reads the currently committed Pressable callback without a nested RNTL act,
+ * used to model two taps arriving before the busy render commits. */
+function committedPressHandler(node: TestInstance): () => unknown {
+  type Fiber = {
+    memoizedProps?: { onPress?: unknown };
+    return: Fiber | null;
+  };
+  let fiber = node.unstable_fiber as Fiber | null;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.onPress as () => unknown;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
+}
+
 function textNode(node: TestInstance, text: string): TestInstance {
   const match = node.queryAll((candidate) => candidate.children.includes(text))[0];
   if (!match) throw new Error(`Text "${text}" not found inside rendered control`);
@@ -669,6 +686,25 @@ describe('login screen', () => {
       }
     }
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+  });
+
+  it('submits login once for two same-render activations', async () => {
+    const login = deferred<User>();
+    mockAuthValue.login = jest.fn(() => login.promise);
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', 'password1');
+    const press = committedPressHandler(logInButton());
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+
+    await act(async () => {
+      first = Promise.resolve(press());
+      second = Promise.resolve(press());
+    });
+    expect(mockAuthValue.login).toHaveBeenCalledTimes(1);
+
+    await act(async () => login.resolve(USER));
+    await Promise.all([first, second]);
   });
 
   it('shows a credential error on 401', async () => {
@@ -1310,6 +1346,26 @@ describe('signup screen', () => {
       }
     }
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+  });
+
+  it('submits registration once for two same-render activations', async () => {
+    const registration = deferred<User>();
+    mockAuthValue.register = jest.fn(() => registration.promise);
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    const press = committedPressHandler(signUpButton('te'));
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+
+    await act(async () => {
+      first = Promise.resolve(press());
+      second = Promise.resolve(press());
+    });
+    expect(mockAuthValue.register).toHaveBeenCalledTimes(1);
+
+    await act(async () => registration.resolve(USER));
+    await Promise.all([first, second]);
   });
 
   it('shows a duplicate-account error on 409', async () => {

@@ -250,7 +250,7 @@ interface PracticeClaim {
 }
 
 /** Claim one (user, question) attempt without holding a DB connection during AI work. */
-async function claimPracticeAttempt(userId: string, questionId: string): Promise<PracticeClaim> {
+async function claimPracticeAttempt(userId: string, questionId: string, questionLevel: string): Promise<PracticeClaim> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -259,7 +259,21 @@ async function claimPracticeAttempt(userId: string, questionId: string): Promise
     // practice_inflight, so taking the child row first here — the stale-claim
     // DELETE below, or the INSERT's FK check — would be a lock inversion that
     // deadlocks (40P01) against a concurrent DELETE /auth/account.
-    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    const lockedUser = await client.query<{ cefr_level: string | null; diagnostic_completed: boolean }>(
+      'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const currentUser = lockedUser.rows[0];
+    if (!currentUser) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
+    // The request-time user snapshot can go stale while audio validation runs:
+    // a diagnostic restart or rival promotion must be noticed before this path
+    // begins paid provider work. Once a claim is live, persist handles a later
+    // level change as its own state transition.
+    if (!currentUser.diagnostic_completed || currentUser.cefr_level !== questionLevel) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     await client.query(
       `DELETE FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2
@@ -508,6 +522,14 @@ async function storeSilenceResult(
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Keep the same parent-first ordering as scored and native persistence.
+    // Without it, account deletion can lock users and cascade into this claim
+    // while this transaction locks practice_inflight then tries to complete the
+    // idempotency row — a child-table deadlock or a post-delete FK failure.
+    const lockedUser = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (lockedUser.rowCount !== 1) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     const owned = await client.query(
       `SELECT 1 FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2 AND claim_id = $3
@@ -646,21 +668,44 @@ export function createPracticeRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       const { questionId } = validated(req, skipBodySchema);
-      const { rows } = await pool.query<{ cefr_level: string }>('SELECT cefr_level FROM questions WHERE id = $1', [
-        questionId,
-      ]);
-      const q = rows[0];
-      if (!q) throw new HttpError(404, 'Question not found');
-      if (q.cefr_level !== user.cefr_level) {
-        throw new HttpError(403, 'Question is not available at your level');
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // Serialize skip against result persistence and account deletion. This
+        // makes a score that races an earlier skip reliably clear that park,
+        // while a skip that wins after scoring deliberately parks the word.
+        const lockedUser = await client.query<{ cefr_level: string | null; diagnostic_completed: boolean }>(
+          'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+          [user.id],
+        );
+        const currentUser = lockedUser.rows[0];
+        if (!currentUser) {
+          throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+        }
+        if (!currentUser.diagnostic_completed || !currentUser.cefr_level) {
+          throw new HttpError(403, 'Diagnostic not completed');
+        }
+        const { rows } = await client.query<{ cefr_level: string }>('SELECT cefr_level FROM questions WHERE id = $1', [
+          questionId,
+        ]);
+        const q = rows[0];
+        if (!q) throw new HttpError(404, 'Question not found');
+        if (q.cefr_level !== currentUser.cefr_level) {
+          throw new HttpError(403, 'Question is not available at your level');
+        }
+        await client.query(
+          `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
+           VALUES ($1, $2, 'learning', 0, 0, now() + interval '${SKIP_DAYS} days')
+           ON CONFLICT (user_id, question_id) DO UPDATE SET
+             skipped_until = now() + interval '${SKIP_DAYS} days'`,
+          [user.id, questionId],
+        );
+        await client.query('COMMIT');
+      } catch (err) {
+        return await rollbackTransaction(client, { value: err });
+      } finally {
+        releaseTransactionClient(client);
       }
-      await pool.query(
-        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
-         VALUES ($1, $2, 'learning', 0, 0, now() + interval '${SKIP_DAYS} days')
-         ON CONFLICT (user_id, question_id) DO UPDATE SET
-           skipped_until = now() + interval '${SKIP_DAYS} days'`,
-        [user.id, questionId],
-      );
       res.status(204).end();
     }),
   );
@@ -815,7 +860,7 @@ export function createPracticeRouter(limiters: Limiters) {
         respendAssessmentBudget: submission.respendAssessmentBudget,
         questionMissingError: () => new HttpError(404, 'Question not found'),
         requireQuestionAtUserLevel: true,
-        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id),
+        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id, question.cefr_level),
         assess: (audioPath, user, question, _claim, options) =>
           assessSpeaking(audioPath, assessQuestionContext(question), user.id, options),
         persist: (user, question, claim, result, requestId, requestClaimId) => {
@@ -884,7 +929,7 @@ export function createPracticeRouter(limiters: Limiters) {
         // Same per-question serialization as English practice: without a
         // claim, concurrent native submissions with distinct requestIds each
         // trigger their own paid provider calls for one question.
-        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id),
+        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id, question.cefr_level),
         assess: (audioPath, user, question, _claim, options) =>
           assessNativeComprehension(
             audioPath,
@@ -908,6 +953,13 @@ export function createPracticeRouter(limiters: Limiters) {
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
+            // Account deletion takes users before cascading into
+            // practice_inflight/assessment_requests. Keep this native path in
+            // the same parent-first order as scored and silent persistence.
+            const lockedUser = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [user.id]);
+            if (lockedUser.rowCount !== 1) {
+              throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+            }
             // Same claim-ownership re-check as both English persist paths: a
             // worker whose claim lease expired and was replaced must fail 409
             // here instead of completing a duplicate paid result.

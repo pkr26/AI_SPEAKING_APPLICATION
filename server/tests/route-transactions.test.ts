@@ -134,6 +134,34 @@ describe('assessment route transaction lifecycles', () => {
     expect(commitIndex).toBeGreaterThan(requestCompletionIndex);
   });
 
+  it('locks the current user before parking a skipped word', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+
+    const { result, leases } = await observePoolLeases(() =>
+      request(a)
+        .post('/practice/skip')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId: question.rows[0].id }),
+    );
+
+    expect(result.status).toBe(204);
+    const skipLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes('INSERT INTO practice_progress')),
+    );
+    expect(skipLease).toBeDefined();
+    expect(skipLease!.statements[0]).toBe('BEGIN');
+    expect(skipLease!.statements[1]).toBe(
+      'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+    );
+    expect(skipLease!.statements.findIndex((text) => text.includes('FROM questions WHERE id = $1'))).toBeGreaterThan(1);
+    expect(skipLease!.statements.at(-1)).toBe('COMMIT');
+  });
+
   it('rolls back and releases a practice claim when ownership is already live', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
@@ -193,11 +221,13 @@ describe('assessment route transaction lifecycles', () => {
     );
     expect(claimLease).toBeDefined();
     expect(claimLease!.statements[0]).toBe('BEGIN');
-    expect(claimLease!.statements[1]).toBe('SELECT 1 FROM users WHERE id = $1 FOR UPDATE');
+    expect(claimLease!.statements[1]).toBe(
+      'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+    );
     expect(claimLease!.statements.findIndex((text) => text.includes('FROM practice_inflight'))).toBeGreaterThan(1);
   });
 
-  it('locks the users parent row before the diagnostic_state child row in next, finalize, and restart', async () => {
+  it('locks the users parent row before the diagnostic_state child row in claim, next, finalize, and restart', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
 
@@ -220,10 +250,11 @@ describe('assessment route transaction lifecycles', () => {
 
     // Account deletion locks users first and cascades into diagnostic_state,
     // so any diagnostic transaction that writes diagnostic_state after locking
-    // it would deadlock against it (40P01). All three transactions below reach
-    // the child row, so all three must take the parent lock first — and for
+    // it would deadlock against it (40P01). All four transactions below reach
+    // the child row, so all four must take the parent lock first — and for
     // GET /next that lock is also the authoritative completion check.
     const writerParentLock = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
+    const claimParentLock = 'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
     const nextParentLock = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
     const childLock = 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE';
     const nextLease = leases.find(({ statements }) =>
@@ -232,11 +263,15 @@ describe('assessment route transaction lifecycles', () => {
     const finalizeLease = leases.find(({ statements }) =>
       statements.some((text) => text.includes("VALUES ($1, $2, 'diagnostic', $3")),
     );
+    const claimLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes('SET processing_question_id = $1, processing_started_at = now()')),
+    );
     const restartLease = leases.find(({ statements }) =>
       statements.some((text) => text.includes('SET low_idx = 0, high_idx = 5')),
     );
     for (const [lease, parentLock] of [
       [nextLease, nextParentLock],
+      [claimLease, claimParentLock],
       [finalizeLease, writerParentLock],
       [restartLease, writerParentLock],
     ] as const) {

@@ -134,6 +134,23 @@ function flattenedStyle(node: TestInstance): SemanticStyle {
   return StyleSheet.flatten(node.props.style) ?? {};
 }
 
+/** Reads the currently committed Pressable callback without a nested RNTL act,
+ * used to model two taps arriving before the busy render commits. */
+function committedPressHandler(node: TestInstance): () => unknown {
+  type Fiber = {
+    memoizedProps?: { onPress?: unknown };
+    return: Fiber | null;
+  };
+  let fiber = node.unstable_fiber as Fiber | null;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.onPress as () => unknown;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
+}
+
 /** The host view a control is laid out in (the reveal-overlay input row). */
 function parentOf(node: TestInstance): TestInstance {
   const parent = node.parent;
@@ -486,6 +503,27 @@ describe('forgot-password screen', () => {
       await pending.promise;
     });
     expect(screen.getByText(t('reset.sentTitle'))).toBeTruthy();
+  });
+
+  it('sends one reset-request email for two same-render activations', async () => {
+    const pending = deferred<void>();
+    mockForgot.mockReturnValue(pending.promise);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    const press = committedPressHandler(
+      screen.getByRole('button', { name: t('reset.submitRequest') }),
+    );
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+
+    await act(async () => {
+      first = Promise.resolve(press());
+      second = Promise.resolve(press());
+    });
+    expect(mockForgot).toHaveBeenCalledTimes(1);
+
+    await act(async () => pending.resolve());
+    await Promise.all([first, second]);
   });
 
   it('re-enables the request form and centers the error after a failure', async () => {
@@ -906,6 +944,26 @@ describe('reset-password screen', () => {
         params: { notice: 'reset' },
       }),
     );
+  });
+
+  it('spends a reset code once for two same-render activations', async () => {
+    const pending = deferred<void>();
+    mockReset.mockReturnValue(pending.promise);
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillValidForm();
+    const press = committedPressHandler(screen.getByRole('button', { name: t('reset.submitNew') }));
+    let first!: Promise<unknown>;
+    let second!: Promise<unknown>;
+
+    await act(async () => {
+      first = Promise.resolve(press());
+      second = Promise.resolve(press());
+    });
+    expect(mockReset).toHaveBeenCalledTimes(1);
+
+    await act(async () => pending.resolve());
+    await Promise.all([first, second]);
   });
 
   it('re-enables the form with the fallback copy after an unexpected failure', async () => {

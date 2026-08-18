@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { router, useNavigation } from 'expo-router';
-import React, { useCallback, useEffect, useLayoutEffect, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -32,10 +32,16 @@ export default function PracticeScreen() {
   const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
   const [recorderLocked, setRecorderLocked] = useState(false);
+  // The Recorder reports a lock during its own commit. Keep a synchronous
+  // mirror as well as render state so a second, same-frame tap cannot skip the
+  // question, switch modes, or navigate away before React disables the control.
+  const recorderLockedRef = useRef(false);
   const [skipBusy, setSkipBusy] = useState(false);
+  const skipBusyRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
+  const logoutBusyRef = useRef(false);
   // First-practice-visit one-shot explainer of the mastery rules. The stored
   // flag is keyed by account so a stale read from a previous session's user
   // can never show or hide the card for the wrong learner; while unknown
@@ -90,6 +96,7 @@ export default function PracticeScreen() {
   // A new submission owns the inline space again: clear the old wait line the
   // moment the recorder locks for the next take.
   const handleLockChange = useCallback((locked: boolean) => {
+    recorderLockedRef.current = locked;
     setRecorderLocked(locked);
     if (locked) setRateLimitNotice(null);
   }, []);
@@ -107,7 +114,8 @@ export default function PracticeScreen() {
   };
 
   const handleSkip = async () => {
-    if (!question || skipBusy || recorderLocked) return;
+    if (!question || skipBusyRef.current || recorderLockedRef.current) return;
+    skipBusyRef.current = true;
     setSkipBusy(true);
     try {
       await apiSkipPracticeWord(question.id);
@@ -127,11 +135,14 @@ export default function PracticeScreen() {
         userMessageForError(error, t('practice.skipFailed')),
       );
     } finally {
+      skipBusyRef.current = false;
       setSkipBusy(false);
     }
   };
 
   const handleLogout = async () => {
+    if (recorderLockedRef.current || logoutBusyRef.current) return;
+    logoutBusyRef.current = true;
     try {
       await logout();
       router.replace('/');
@@ -141,6 +152,8 @@ export default function PracticeScreen() {
       } else {
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
       }
+    } finally {
+      logoutBusyRef.current = false;
     }
   };
 
@@ -220,12 +233,13 @@ export default function PracticeScreen() {
                 recorderLocked && styles.controlDisabled,
                 pressed && styles.helpButtonPressed,
               ]}
-              onPress={() =>
+              onPress={() => {
+                if (recorderLockedRef.current) return;
                 router.push({
                   pathname: '/practice/help',
                   params: { questionId: question.id },
-                })
-              }
+                });
+              }}
             >
               <Text style={styles.helpButtonText}>?</Text>
             </Pressable>
@@ -290,7 +304,9 @@ export default function PracticeScreen() {
                 recorderLocked && styles.modeToggleDisabled,
                 pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
               ]}
-              onPress={() => setAnswerMode(nativeMode ? 'english' : 'native')}
+              onPress={() => {
+                if (!recorderLockedRef.current) setAnswerMode(nativeMode ? 'english' : 'native');
+              }}
             >
               <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
                 {nativeMode ? t('practice.answeringNative') : t('practice.answerInMyLanguage')}
@@ -354,7 +370,9 @@ export default function PracticeScreen() {
           disabled={recorderLocked}
           hitSlop={4}
           style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
-          onPress={() => router.push('/settings')}
+          onPress={() => {
+            if (!recorderLockedRef.current) router.push('/settings');
+          }}
         >
           <Text style={styles.footerButtonText}>{t('practice.settings')}</Text>
         </Pressable>

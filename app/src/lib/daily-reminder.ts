@@ -83,7 +83,16 @@ export async function enableDailyReminder(
   if (!granted) {
     granted = (await Notifications.requestPermissionsAsync()).granted;
   }
-  if (!granted) return 'denied';
+  if (!granted) {
+    // Permission can be revoked long after the reminder was enabled. Nothing
+    // can fire now, so a surviving preference would show the toggle on for a
+    // reminder the OS will never deliver: forget it, and drop any schedule
+    // orphaned by the revoked grant. Best effort — the denial is what the
+    // caller acts on.
+    await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
+    return 'denied';
+  }
   if (Platform.OS === 'android') {
     await Notifications.setNotificationChannelAsync(ANDROID_CHANNEL_ID, {
       name: tr('reminder.toggleLabel'),
@@ -123,6 +132,10 @@ export async function enableDailyReminder(
     // then surface the original storage failure. Best effort — the storage
     // failure is the one worth reporting.
     await Notifications.cancelAllScheduledNotificationsAsync().catch(() => undefined);
+    // A failed write leaves the *previous* preference behind, which after the
+    // cancel above is the same lie the sibling catch prevents: toggle on, hour
+    // stale, nothing scheduled. Forget it too so storage and the OS agree.
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
     throw error;
   }
   return 'enabled';

@@ -398,6 +398,10 @@ describe('errorHandler', () => {
     a.get('/multer-other', (_req, _res, next) => next(new multer.MulterError('LIMIT_FIELD_COUNT')));
     a.get('/request-aborted', (_req, _res, next) => next({ type: 'request.aborted' }));
     a.get('/request-size-invalid', (_req, _res, next) => next({ type: 'request.size.invalid' }));
+    // Parser-shaped failures the generic 4xx fallback must NOT claim.
+    a.get('/parser-server-status', (_req, _res, next) => next({ status: 500, expose: true }));
+    a.get('/parser-not-exposed', (_req, _res, next) => next({ status: 400, expose: false }));
+    a.get('/parser-status-not-a-number', (_req, _res, next) => next({ status: '429', expose: true }));
     a.get(
       '/boom',
       h(async () => {
@@ -533,6 +537,42 @@ describe('errorHandler', () => {
       expect(res.body).toEqual({ error: 'Invalid request body', code: 'VALIDATION_FAILED' });
     },
   );
+
+  it('maps a corrupt Content-Encoding body to 400 without an error-level log', async () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      // body-parser inflates by default and wraps the zlib failure as an
+      // exposed 400 carrying no `type`, so only the generic parser fallback
+      // keeps this plainly malformed request off the INTERNAL path.
+      const res = await request(buildApp())
+        .post('/anything')
+        .set('Content-Type', 'application/json')
+        .set('Content-Encoding', 'gzip')
+        .send('not gzip at all');
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'Invalid request body', code: 'VALIDATION_FAILED' });
+      // A client protocol error must never mint a fake 5xx or a logged stack.
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it.each([
+    ['a parser status outside the client range', '/parser-server-status'],
+    ['an error the parser did not mark exposable', '/parser-not-exposed'],
+    ['a parser status that is not a number', '/parser-status-not-a-number'],
+  ])('keeps %s on the logged 500 path', async (_condition, path) => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      const res = await request(buildApp()).get(path);
+      expect(res.status).toBe(500);
+      expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+      expect(error).toHaveBeenCalledWith({ err: expect.anything(), requestId: undefined }, 'unhandled error');
+    } finally {
+      error.mockRestore();
+    }
+  });
 
   it('maps unexpected errors to a generic 500', async () => {
     const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);

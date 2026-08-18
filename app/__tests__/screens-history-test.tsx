@@ -338,7 +338,7 @@ describe('history screen', () => {
     expect(screen.getByText(t('history.loadFailed'))).toBeTruthy();
   });
 
-  it('keeps the loaded answers on screen when an older page fails', async () => {
+  it('reports a failed older page in the footer without losing the loaded answers', async () => {
     mockGetHistory
       .mockResolvedValueOnce({
         items: [historyItem()],
@@ -354,8 +354,92 @@ describe('history screen', () => {
     });
 
     expect(screen.getByText('courage')).toBeTruthy();
+    // The list survives, so the full-screen error state must stay away — but
+    // the footer has to say the older page failed instead of falling silently
+    // back to the same 'Show older answers' button.
     expect(screen.queryByText(t('history.loadFailedTitle'))).toBeNull();
+    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
+    expect(screen.queryByText(t('history.loadingMore'))).toBeNull();
+
+    const message = screen.getByText(t('error.serverBusy'));
+    expect(message.props.accessibilityLiveRegion).toBe('assertive');
+    expect(flattenedStyle(message)).toEqual(MUTED_TEXT);
+    expect(flattenedStyle(parentOf(message))).toEqual({
+      paddingVertical: spacing.lg,
+      alignItems: 'center',
+    });
+    // The retry is a full-width outlined action under the message.
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
+    ).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.primary,
+      alignSelf: 'stretch',
+      marginTop: spacing.lg,
+    });
+  });
+
+  it('falls back to the screen copy when a failed older page carries no API status', async () => {
+    mockGetHistory
+      .mockResolvedValueOnce({
+        items: [historyItem()],
+        nextCursor: '550e8400-e29b-41d4-a716-446655440061',
+      })
+      .mockRejectedValueOnce(new TypeError('offline'));
+    await renderHistory();
+    await screen.findByText('courage');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText(t('history.loadFailed'))).toBeTruthy();
+    // Transport detail never reaches the learner.
+    expect(screen.queryByText(/offline/)).toBeNull();
+  });
+
+  it('waits for an explicit retry after a failed page instead of re-firing on scroll', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440062';
+    mockGetHistory
+      .mockResolvedValueOnce({ items: [historyItem()], nextCursor: cursor })
+      .mockRejectedValueOnce(new ApiError(500, 'boom'))
+      .mockResolvedValueOnce({
+        items: [
+          historyItem({
+            id: '550e8400-e29b-41d4-a716-446655440063',
+            promptWord: 'journey',
+            createdAt: '2026-08-13T10:00:00.000Z',
+          }),
+        ],
+        nextCursor: null,
+      });
+    await renderHistory();
+    await screen.findByText('courage');
+
+    await act(async () => {
+      await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
+
+    // Scrolling to the end again must not hammer the failing request.
+    await act(async () => {
+      await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(mockGetHistory).toHaveBeenCalledTimes(3);
+    expect(mockGetHistory).toHaveBeenLastCalledWith(cursor, expect.anything());
+    expect(await screen.findByText('journey')).toBeTruthy();
     expect(screen.queryByText(t('error.serverBusy'))).toBeNull();
+    expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
   });
 
   it('shows the empty state for a learner with no attempts', async () => {
@@ -409,9 +493,12 @@ describe('history screen', () => {
       maxWidth: layout.contentMaxWidth,
       alignSelf: 'center',
     });
+    // The day header pins to the top of the list while its rows scroll past on
+    // iOS, so it pads its own opaque band rather than floating on margins.
     expect(flattenedStyle(screen.getByText(dayHeading('2026-08-15T10:00:00.000Z')))).toEqual({
-      marginTop: spacing.lg,
-      marginBottom: spacing.sm,
+      paddingTop: spacing.lg,
+      paddingBottom: spacing.sm,
+      backgroundColor: colors.background,
       fontSize: 14,
       fontWeight: '700',
       color: colors.muted,

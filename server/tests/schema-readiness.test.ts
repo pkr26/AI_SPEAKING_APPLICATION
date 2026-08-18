@@ -23,6 +23,10 @@ const completeQuestionInventory = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].map((cefr
   count: 100,
 }));
 
+// A migration this release does not package, sorting after every packaged one
+// — what an old replica sees once the next release's migration job has run.
+const NEWER_RELEASE_MIGRATION = { name: '999_from_a_newer_release.sql', checksum: 'f'.repeat(64) };
+
 describe('database schema readiness', () => {
   it('filters non-SQL assets and hashes migrations in deterministic filename order', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-english-migration-manifest-'));
@@ -92,19 +96,35 @@ describe('database schema readiness', () => {
     expect(query.mock.calls[2]?.[0]).toContain('FROM questions');
   });
 
-  it('rejects a missing, extra, or checksum-mismatched migration', async () => {
+  it('rejects a missing or checksum-mismatched migration, even beside newer extra rows', async () => {
     const current = successfulMigrationRows();
-    for (const rows of [
-      current.slice(0, -1),
-      [...current, { name: '999_unknown.sql', checksum: 'f'.repeat(64) }],
-      current.map((row, index) => (index === current.length - 1 ? { ...row, checksum: '0'.repeat(64) } : row)),
-    ]) {
+    const mismatched = current.map((row, index) =>
+      index === current.length - 1 ? { ...row, checksum: '0'.repeat(64) } : row,
+    );
+    for (const rows of [current.slice(0, -1), mismatched, [...mismatched, NEWER_RELEASE_MIGRATION]]) {
       const query = vi.fn().mockResolvedValue({ rows });
       await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
         'Database migrations do not match this release',
       );
       expect(query).toHaveBeenCalledOnce();
     }
+  });
+
+  // Ship blocker: the new release's migration job runs before its replicas
+  // boot, so an already-running replica sees a row it does not package. If
+  // that failed readiness, every old replica would leave the load balancer at
+  // once for an additive migration and the service would go dark.
+  it('stays ready when a newer release has already applied an additive migration', async () => {
+    const query = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: [...successfulMigrationRows(), NEWER_RELEASE_MIGRATION] })
+      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
+      .mockResolvedValueOnce({ rows: completeQuestionInventory });
+
+    // The reported migration is still this release's latest packaged one.
+    await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
+      latestMigration: '012_assessment_request_audio_key.sql',
+    });
   });
 
   it('rejects a missing latest runtime table', async () => {

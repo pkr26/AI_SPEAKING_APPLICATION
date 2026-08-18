@@ -4,4 +4,8 @@ coverage/
 uploads/
 .stryker-tmp/
 .stryker-catalog-tmp/
+# Per-lane sandboxes (.stryker-<lane>-tmp/) survive an interrupted mutation run
+# (Stryker only removes tempDir on clean completion), so format:check must not
+# descend into their instrumented copies.
+.stryker-*-tmp/
 reports/

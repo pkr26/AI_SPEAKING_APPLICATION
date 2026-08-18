@@ -51,8 +51,9 @@ describe('theme palette', () => {
       text: '#111827',
       muted: '#6B7280',
       border: '#E5E7EB',
-      // U-M1: form-field borders need 3:1 non-text contrast on white.
-      inputBorder: '#9CA3AF',
+      // U-M1: form-field borders need 3:1 non-text contrast on white, which
+      // the former #9CA3AF (2.54:1) never reached.
+      inputBorder: '#6B7280',
       inputBackground: '#FFFFFF',
       danger: '#B91C1C',
       dangerLight: '#FEF2F2',
@@ -139,17 +140,32 @@ describe('theme palette', () => {
       ['danger fill on background', palette.danger, palette.background],
       ['success meter fill on background', palette.success, palette.background],
       ['success progress fill on its track', palette.success, palette.border],
+      // Signup's language chips are filled with the card they sit on, so this
+      // token is the only boundary a mandatory tap target has.
+      ['form-field border on card', palette.inputBorder, palette.card],
     ])('%s meets 3:1', (_pair, foreground, background) => {
       expect(contrastRatio(foreground, background)).toBeGreaterThanOrEqual(3);
     });
   });
 
-  it('meets 3:1 for dark form-field borders on the dark input fill', () => {
-    // The light value (#9CA3AF on white, ~2.5:1) is a pre-existing compromise
-    // pinned by design; the dark palette must not repeat it.
+  it('meets 3:1 for form-field borders on the input fill in both schemes', () => {
+    // The light border was #9CA3AF (2.54:1 on white) for far too long: every
+    // text input in the app uses this token, so pin both schemes.
+    expect(
+      contrastRatio(lightColors.inputBorder, lightColors.inputBackground),
+    ).toBeGreaterThanOrEqual(3);
     expect(
       contrastRatio(darkColors.inputBorder, darkColors.inputBackground),
     ).toBeGreaterThanOrEqual(3);
+  });
+
+  it('meets 3:1 for form-field borders against the screen behind them', () => {
+    // A field border is perceived against both of its sides, and the outer
+    // side is the screen the form is laid out on.
+    expect(contrastRatio(lightColors.inputBorder, lightColors.background)).toBeGreaterThanOrEqual(
+      3,
+    );
+    expect(contrastRatio(darkColors.inputBorder, darkColors.background)).toBeGreaterThanOrEqual(3);
   });
 
   describe('useTheme', () => {

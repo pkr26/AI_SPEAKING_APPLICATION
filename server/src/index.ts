@@ -29,6 +29,15 @@ if (config.trustProxy) {
 // ingress margin, or worst-case requests are socket-killed mid-flight.
 server.requestTimeout = config.s3.operationTimeoutMs + config.openaiTimeoutMs + 40_000;
 server.headersTimeout = 30_000;
+// Node's 5s keep-alive default is shorter than every common fronting proxy's
+// idle timeout (AWS ALB defaults to 60s), so the balancer keeps reusing a
+// connection this process is closing at the same moment and the mobile app
+// sees a sporadic 502/ECONNRESET. Outlive the proxy instead. Deliberately
+// above headersTimeout: Node measures header time from the first byte of each
+// request, not across an idle keep-alive gap, so the 30s slow-header guard is
+// unaffected, and shutdown severs idle sockets explicitly
+// (closeIdleConnections) so a longer keep-alive cannot pin the drain open.
+server.keepAliveTimeout = 65_000;
 
 const UPLOAD_JANITOR_INTERVAL_MS = 900_000;
 const DATABASE_JANITOR_INTERVAL_MS = 3_600_000;
@@ -163,12 +172,22 @@ function shutdown(signal: string) {
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
-// A listen/accept failure (EADDRINUSE, exhausted descriptors) would otherwise
-// crash with a raw uncaught exception. Route it through the same fatal log +
-// pool drain as every other startup failure; the shuttingDown guard keeps a
-// shutdown-time socket error from double-exiting.
+// A listen failure (EADDRINUSE, a refused bind) would otherwise crash with a
+// raw uncaught exception. Route it through the same fatal log + pool drain as
+// every other startup failure; the shuttingDown guard keeps a shutdown-time
+// socket error from double-exiting.
 server.on('error', (err) => {
   if (shuttingDown) return;
+  // Node emits this same event for a single failed accept() (EMFILE/ENFILE
+  // under descriptor pressure) on a server that stays listening and keeps
+  // serving. Losing that one connection is recoverable; exiting here would
+  // reset every in-flight request without the SHUTDOWN_DRAIN_MS drain the
+  // signal path grants them — including paid assessments that already spent
+  // provider money and a daily-capacity reservation.
+  if (server.listening && (err as NodeJS.ErrnoException).syscall === 'accept') {
+    logger.error({ err }, 'accept failed; dropped one incoming connection');
+    return;
+  }
   shuttingDown = true;
   clearJanitors();
   logger.fatal({ err }, 'HTTP server failed');

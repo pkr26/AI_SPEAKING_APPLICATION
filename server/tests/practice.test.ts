@@ -104,7 +104,13 @@ describe('practice', () => {
 
     const help = await request(a).get(`/practice/question/${questionId}/help`).set('Authorization', `Bearer ${token}`);
     expect(help.status).toBe(200);
-    expect(help.headers['cache-control']).toBe('private, max-age=3600');
+    // The body is picked by the caller's native_language but the URL carries
+    // no language, so a stored copy must always be revalidated (a cheap 304
+    // when nothing changed) instead of being replayed for up to an hour.
+    expect(help.headers['cache-control']).toBe('private, no-cache');
+    // Vary also carries the app-level Origin/Accept-Encoding contributions;
+    // what this route owns is the Authorization dependency.
+    expect(help.headers['vary'].split(', ')).toContain('Authorization');
     const etag = help.headers['etag'];
     expect(etag).toMatch(/^"[0-9a-f]{64}"$/);
     expect(help.body).toMatchObject({
@@ -169,6 +175,35 @@ describe('practice', () => {
       .set('Authorization', `Bearer ${token}`);
     expect(missing.status).toBe(404);
     expect(missing.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
+  });
+
+  it('help revalidates per caller language: the same URL never replays the previous language', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    await completeDiagnostic(a, token);
+    const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const url = `/practice/question/${q.body.question.id}/help`;
+
+    const telugu = await request(a).get(url).set('Authorization', `Bearer ${token}`);
+    expect(telugu.status).toBe(200);
+
+    const switched = await request(a)
+      .patch('/auth/me')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ nativeLanguage: 'hi' });
+    expect(switched.status).toBe(200);
+
+    // Same learner, same URL, new language: the ETag hashes the
+    // language-specific payload, so the stored validator misses and the
+    // revalidation returns the Hindi body instead of the cached Telugu one.
+    const hindi = await request(a)
+      .get(url)
+      .set('Authorization', `Bearer ${token}`)
+      .set('If-None-Match', telugu.headers['etag']);
+    expect(hindi.status).toBe(200);
+    expect(hindi.headers['etag']).not.toBe(telugu.headers['etag']);
+    expect(hindi.body.promptWordNative).not.toBe(telugu.body.promptWordNative);
+    expect(hindi.body.questionTextNative).not.toBe(telugu.body.questionTextNative);
   });
 
   it('help returns the exact 404 contract when the learner translation is missing', async () => {

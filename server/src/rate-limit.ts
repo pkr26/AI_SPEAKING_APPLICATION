@@ -1,4 +1,4 @@
-import { ipKeyGenerator, rateLimit } from 'express-rate-limit';
+import { ipKeyGenerator, rateLimit, type RateLimitInfo } from 'express-rate-limit';
 import type { RequestHandler, Response } from 'express';
 import { config } from './config';
 import { AuthedRequest } from './middleware';
@@ -43,6 +43,16 @@ function validEmailRateLimitKey(req: ParsedEmailRequest): string {
   return `email:${email}`;
 }
 
+// The two assessment limiters publish their per-request info under distinct
+// properties: with the shared default name the second would overwrite the
+// first, and the abort re-spend needs the exact window EACH hit was counted
+// in (increment renews an expired row in place, so "some window is live" is
+// not the same question as "the window this hit belongs to is still live").
+type AssessRateLimitedRequest = AuthedRequest & {
+  assessRateLimit?: RateLimitInfo;
+  assessIpDailyRateLimit?: RateLimitInfo;
+};
+
 /**
  * Security-sensitive limiters use PostgreSQL counters so every API replica
  * enforces one shared budget. Built per app so tests can vary configuration;
@@ -54,6 +64,23 @@ export function buildLimiters() {
     legacyHeaders: false as const,
     message: { error: 'Too many requests, please try again later', code: 'RATE_LIMITED' },
   };
+
+  // Budgets that flag instead of rejecting must stay invisible at the HTTP
+  // level too. express-rate-limit emits the over-limit Retry-After only when a
+  // header family is enabled, so turning standardHeaders off (legacyHeaders is
+  // already off above) makes an over-budget response byte-identical to an
+  // in-budget one. All three count an account identifier rather than the
+  // caller — for login/forgot-password the TARGET email, shared across every
+  // source IP and replica — so RateLimit-Remaining/Reset would otherwise
+  // publish a third party's recent failed logins or reset requests to any
+  // unauthenticated prober, and Retry-After would tell an attacker exactly when
+  // the always-204 forgot-password route started silently dropping mail. The
+  // headers also contradict these responses: an over-budget request that
+  // verifies the correct password still succeeds, Retry-After and all. The
+  // rejecting limiters keep their headers — they key the caller and their 429
+  // already states the throttle — and the per-IP limiter mounted ahead of
+  // these routes still reports the caller's own budget.
+  const silentBudgetHeaders = { standardHeaders: false as const };
 
   // The global limiter is a coarse per-IP flood brake, not a security budget.
   // With RATE_LIMIT_GLOBAL_STORE=memory (the default) it uses express-rate-
@@ -96,6 +123,7 @@ export function buildLimiters() {
   // the bcrypt work this always-verify policy pays per source.
   const loginAccount = rateLimit({
     ...common,
+    ...silentBudgetHeaders,
     windowMs: config.rateLimit.loginAccountWindowMs,
     limit: config.rateLimit.loginAccountMax,
     store: new PostgresRateLimitStore(
@@ -118,6 +146,7 @@ export function buildLimiters() {
   // the password, and only failures are throttled.
   const passwordAccount = rateLimit({
     ...common,
+    ...silentBudgetHeaders,
     windowMs: config.rateLimit.passwordWindowMs,
     limit: config.rateLimit.passwordMax,
     store: new PostgresRateLimitStore(
@@ -143,6 +172,7 @@ export function buildLimiters() {
   // Unlike loginAccount there is no success refund: every issued mail counts.
   const forgotPasswordEmail = rateLimit({
     ...common,
+    ...silentBudgetHeaders,
     windowMs: config.rateLimit.forgotEmailWindowMs,
     limit: config.rateLimit.forgotEmailMax,
     store: new PostgresRateLimitStore(
@@ -225,6 +255,7 @@ export function buildLimiters() {
     limit: config.rateLimit.assessMax,
     store: assessStore,
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
+    requestPropertyName: 'assessRateLimit',
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Assessment rate limit reached, please slow down', code: 'RATE_LIMITED' },
@@ -249,6 +280,7 @@ export function buildLimiters() {
     limit: config.assessIpDailyCap,
     store: assessIpDailyStore,
     keyGenerator: requestIpRateLimitKey,
+    requestPropertyName: 'assessIpDailyRateLimit',
     skipFailedRequests: true,
     requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Daily assessment limit reached for this network', code: 'NETWORK_DAILY_LIMIT' },
@@ -259,21 +291,26 @@ export function buildLimiters() {
   // refund is legitimate before paid work — but once the daily-capacity
   // reservation has committed, the paid pipeline runs to completion whether or
   // not the caller stays connected, so an abort must keep both hits. Re-spend
-  // is window-guarded (incrementWithinWindow): an abort landing after the
-  // window rolled over got no refund, so nothing is taken back either. Both
-  // counter ops are single atomic updates on the same row, so the refund and
-  // the re-spend net to zero in either completion order; failures fail open
-  // (log only, inside the store) rather than taking the request down with a
-  // dead client. Exposed on the limiter set so the assessment pipeline can
-  // make the same decision when the reservation commits AFTER the response
-  // already closed (the guard's close listener has fired by then and will not
-  // fire again). The res.locals sentinel makes the pair of paths idempotent:
-  // whichever re-spends first wins, and the other becomes a no-op.
+  // is guarded by the exact window each limiter observed for this request
+  // (incrementWithinWindow): an abort landing after that window expired got no
+  // refund, so nothing is taken back either — and because the store renews an
+  // expired window in place on the same row, the observed reset time is what
+  // keeps a late re-spend off a SUCCESSOR window opened by somebody else's
+  // request. Both counter ops are single atomic updates on the same row, so
+  // the refund and the re-spend net to zero in either completion order;
+  // failures fail open (log only, inside the store) rather than taking the
+  // request down with a dead client. Exposed on the limiter set so the
+  // assessment pipeline can make the same decision when the reservation
+  // commits AFTER the response already closed (the guard's close listener has
+  // fired by then and will not fire again). The res.locals sentinel makes the
+  // pair of paths idempotent: whichever re-spends first wins, and the other
+  // becomes a no-op.
   const respendAssessmentBudget = (req: AuthedRequest, res: Response): void => {
     if (res.locals.assessmentBudgetRespent) return;
     res.locals.assessmentBudgetRespent = true;
-    void assessStore.incrementWithinWindow(userOrIpRateLimitKey(req));
-    void assessIpDailyStore.incrementWithinWindow(rateLimitIpKey(req.ip));
+    const observed = req as AssessRateLimitedRequest;
+    void assessStore.incrementWithinWindow(userOrIpRateLimitKey(req), observed.assessRateLimit?.resetTime);
+    void assessIpDailyStore.incrementWithinWindow(rateLimitIpKey(req.ip), observed.assessIpDailyRateLimit?.resetTime);
   };
 
   // Mounted after the two assessment limiters, this re-spends the pair of

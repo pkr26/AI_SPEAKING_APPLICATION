@@ -104,6 +104,40 @@ describe('A1-English source copy pins for critical safety strings', () => {
       'We could not check if your answer was saved. If you do not see it, please record it again.',
     );
   });
+
+  it('pins the expired-reset-code copy to the code the mail actually carries', () => {
+    expect(dictionaries.en['error.resetInvalid']).toBe(
+      'This code does not work or it is too old. Please ask for a new code.',
+    );
+  });
+});
+
+describe('reset-failure copy names the emailed code', () => {
+  // The reset mail contains a one-time code and no link at all, and the screen
+  // asks the learner to paste that code; copy that says "link" leaves them with
+  // nothing to connect the failure to.
+  const codeWord: Record<UiLanguage, string> = {
+    en: 'code',
+    te: 'కోడ్',
+    hi: 'कोड',
+    es: 'código',
+    zh: '验证码',
+  };
+  const linkWord: Record<UiLanguage, string> = {
+    en: 'link',
+    te: 'లింక్',
+    hi: 'लिंक',
+    es: 'enlace',
+    zh: '链接',
+  };
+
+  it.each(SUPPORTED_UI_LANGUAGES.map((language) => [language]))(
+    '%s speaks of a code, never a link',
+    (language) => {
+      expect(dictionaries[language]['error.resetInvalid']).toContain(codeWord[language]);
+      expect(dictionaries[language]['error.resetInvalid']).not.toContain(linkWord[language]);
+    },
+  );
 });
 
 describe('unified auth terminology', () => {

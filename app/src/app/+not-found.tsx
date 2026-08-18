@@ -1,4 +1,4 @@
-import { router } from 'expo-router';
+import { router, Stack } from 'expo-router';
 import React from 'react';
 import { Text, View } from 'react-native';
 
@@ -10,19 +10,25 @@ export default function NotFoundScreen() {
   const t = useT();
   const styles = themedStyles(useTheme());
   return (
-    <View style={styles.screen}>
-      <View style={styles.card}>
-        <Text accessibilityRole="header" style={styles.title}>
-          {t('notFound.title')}
-        </Text>
-        <Text style={styles.body}>{t('notFound.body')}</Text>
-        <Button
-          title={t('notFound.goHome')}
-          onPress={() => router.replace('/')}
-          style={styles.button}
-        />
+    <>
+      {/* The root stack shows headers, and an unmatched deep link has no
+          Stack.Screen declaring one: without this the native stack falls back
+          to the route name and prints the raw "+not-found" above the card. */}
+      <Stack.Screen options={{ title: t('notFound.title') }} />
+      <View style={styles.screen}>
+        <View style={styles.card}>
+          <Text accessibilityRole="header" style={styles.title}>
+            {t('notFound.title')}
+          </Text>
+          <Text style={styles.body}>{t('notFound.body')}</Text>
+          <Button
+            title={t('notFound.goHome')}
+            onPress={() => router.replace('/')}
+            style={styles.button}
+          />
+        </View>
       </View>
-    </View>
+    </>
   );
 }
 

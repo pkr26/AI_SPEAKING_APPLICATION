@@ -47,9 +47,12 @@ export default function HomeScreen() {
   });
   const stats = statsQuery.data;
 
-  // Home is the root of the signed-in stack: Android hardware back must not
-  // pop it back onto the entry gate (which would immediately redirect here).
-  useHardwareBack(() => true);
+  // Home is the root of the signed-in stack: while the entry gate is still
+  // beneath it, Android hardware back must not pop back onto the gate (which
+  // would immediately redirect here). With nothing left to pop the press falls
+  // through instead of being swallowed, so Android's own "back at the task root
+  // leaves the app" behavior still works.
+  useHardwareBack(() => router.canGoBack());
 
   // The route gate redirects after logout/session expiry.
   if (!user) return null;

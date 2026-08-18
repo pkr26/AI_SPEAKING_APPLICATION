@@ -47,11 +47,13 @@ export interface ThemeColors {
 }
 
 /**
- * Light palette. The pre-dark-mode values are kept byte-for-byte (they were
- * recently contrast-fixed); dark mode only adds the on-fill/input tokens.
+ * Light palette. The pre-dark-mode values are kept byte-for-byte apart from
+ * `inputBorder`: #9CA3AF reached only 2.54 on the white field fill, short of
+ * the 3:1 this module guarantees for non-text indicators, so it now carries
+ * the muted ink. Dark mode only adds the on-fill/input tokens.
  * Key ratios: text/bg 16.6, muted/bg 4.52, onPrimary/primary 6.29,
  * onSuccess/success 5.02, success/successLight 4.79, danger/dangerLight 5.91,
- * primary/primaryLight 5.62, onWarning/warning 7.31.
+ * primary/primaryLight 5.62, onWarning/warning 7.31, inputBorder/inputBg 4.83.
  */
 export const lightColors: ThemeColors = {
   primary: '#4F46E5',
@@ -63,7 +65,7 @@ export const lightColors: ThemeColors = {
   text: '#111827',
   muted: '#6B7280',
   border: '#E5E7EB',
-  inputBorder: '#9CA3AF',
+  inputBorder: '#6B7280',
   inputBackground: '#FFFFFF',
   danger: '#B91C1C',
   dangerLight: '#FEF2F2',

@@ -23,7 +23,16 @@ GoogleService-Info.plist
 .stryker-tmp/
 .stryker-catalog-tmp/
 .stryker-*-tmp/
+# Every reports/ directory (app/, server/) holds machine-generated run artifacts,
+# so the bare name is ignored at any depth. The repo-root one also holds the
+# committed audit write-ups, and git cannot re-include a file under an excluded
+# directory: the root reports/ and its adversarial/ subdirectory must be
+# un-ignored first, then their contents re-excluded, before the .md negations
+# take effect. Everything else under the root (mutation/, load1000/) stays
+# ignored by /reports/**.
 reports/
-# Audit reports are meant to be committed; only machine-generated artifacts stay ignored.
+!/reports/
+/reports/**
 !/reports/*.md
+!/reports/adversarial/
 !/reports/adversarial/*.md

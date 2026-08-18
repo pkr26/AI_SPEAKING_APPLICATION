@@ -419,7 +419,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
   });
 
-  it.each([409, 429])('preserves a %s before an owner has inserted its request claim', async (statusCode) => {
+  it.each([409, 429, 503])('preserves the submitted object on a %s without an ownership lookup', async (statusCode) => {
     const userId = randomUUID();
     const req = {
       body: { audioKey: ownedKey(userId), requestId: randomUUID() },
@@ -442,7 +442,8 @@ describe('submitted S3 cleanup lifecycle', () => {
 
       // Await the same finalizer that the response listener started. A 409/429
       // must preserve the response contract without looking up ownership or
-      // deleting an object that a saturated worker may still claim.
+      // deleting an object that a saturated worker may still claim, and a 503
+      // must keep the object the client's contracted retry re-submits.
       await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
       expect(res.statusCode).toBe(statusCode);
       expect(ownershipQuery).not.toHaveBeenCalled();
@@ -964,27 +965,118 @@ describe('S3 object download boundaries', () => {
     }
   });
 
-  it('maps a local filesystem failure to a plain 500 with a distinct log line, not a provider failure', async () => {
+  it.each(['EACCES', 'EDQUOT', 'EEXIST', 'EIO', 'EMFILE', 'ENFILE', 'ENOSPC', 'EPERM', 'EROFS'])(
+    'maps the local filesystem failure %s to a plain 500 with a distinct log line, not a provider failure',
+    async (code) => {
+      const userId = randomUUID();
+      const diskError = Object.assign(new Error(`write ${code}`), { code });
+      sendMock.mockRejectedValue(diskError);
+      const error = vi.spyOn(logger, 'error');
+
+      try {
+        await expect(resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never)).rejects.toMatchObject(
+          {
+            status: 500,
+            message: 'Internal server error',
+            code: 'INTERNAL',
+          },
+        );
+        expect(error).toHaveBeenCalledWith(
+          { err: diskError, userId },
+          'failed to store downloaded audio on local disk',
+        );
+      } finally {
+        error.mockRestore();
+      }
+    },
+  );
+
+  // A truncated or reset download rejects with a bare Node errno and no
+  // $metadata (the SDK operation already resolved, so it never sees the
+  // failure). Blaming local disk here would point on-call at capacity during
+  // an S3 incident and break the client's retryable provider-failure contract.
+  it.each(['ERR_STREAM_PREMATURE_CLOSE', 'ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ENOTFOUND', 'EAI_AGAIN'])(
+    'keeps the 502 provider contract for the transport failure %s',
+    async (code) => {
+      const userId = randomUUID();
+      const transportError = Object.assign(new Error(`download failed: ${code}`), { code });
+      sendMock.mockRejectedValue(transportError);
+      const warn = vi.spyOn(logger, 'warn');
+      const error = vi.spyOn(logger, 'error');
+
+      try {
+        await expect(resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never)).rejects.toMatchObject(
+          {
+            status: 502,
+            message: 'Audio storage unavailable; please try again',
+            code: 'PROVIDER_FAILED',
+          },
+        );
+        expect(warn).toHaveBeenCalledWith({ err: transportError, userId }, 'failed to fetch audio from S3');
+        expect(error).not.toHaveBeenCalled();
+      } finally {
+        error.mockRestore();
+        warn.mockRestore();
+      }
+    },
+  );
+
+  it('reports a body dropped mid-download as a retryable provider failure and removes the partial file', async () => {
     const userId = randomUUID();
-    const diskError = Object.assign(new Error('write ENOSPC'), { code: 'ENOSPC' });
-    sendMock.mockRejectedValue(diskError);
+    const body = new PassThrough();
+    const createWriteStream = vi.spyOn(fsSync, 'createWriteStream');
+    const warn = vi.spyOn(logger, 'warn');
     const error = vi.spyOn(logger, 'error');
+    sendMock.mockResolvedValue({ Body: body });
 
     try {
-      await expect(resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never)).rejects.toMatchObject({
-        status: 500,
-        message: 'Internal server error',
-        code: 'INTERNAL',
+      const result = resolvePresignedAudio(directS3Request(userId), new EventEmitter() as never).then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+      await vi.waitFor(() => expect(createWriteStream).toHaveBeenCalledOnce());
+      const tempPath = createWriteStream.mock.calls[0][0] as string;
+      body.write(fakeM4aBuffer());
+      // Wait for the partial file to exist so its removal is what the
+      // assertion below observes, not an open that never happened.
+      await vi.waitFor(async () => {
+        await expect(fs.stat(tempPath)).resolves.toBeTruthy();
       });
-      expect(error).toHaveBeenCalledWith({ err: diskError, userId }, 'failed to store downloaded audio on local disk');
+      // S3 (or an intermediate proxy) closes the connection with the body only
+      // partly drained: the rejection comes from the raw Node stream, long
+      // after the SDK's own error path could have classified it.
+      const resetError = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+      body.destroy(resetError);
+
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: {
+          status: 502,
+          message: 'Audio storage unavailable; please try again',
+          code: 'PROVIDER_FAILED',
+        },
+      });
+      expect(warn).toHaveBeenCalledWith({ err: resetError, userId }, 'failed to fetch audio from S3');
+      expect(error).not.toHaveBeenCalled();
+      await vi.waitFor(async () => {
+        await expect(fs.stat(tempPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      });
     } finally {
+      if (createWriteStream.mock.calls[0]) await fs.rm(createWriteStream.mock.calls[0][0] as string, { force: true });
+      createWriteStream.mockRestore();
       error.mockRestore();
+      warn.mockRestore();
     }
   });
 
-  it('keeps the 502 provider contract for an AWS-SDK-shaped error that also carries a service code', async () => {
+  it.each([
+    // A plain service code, and one that collides with a filesystem errno:
+    // $metadata proves the SDK raised it, so the disk branch stays out of it.
+    ['SlowDown', 'SlowDown'],
+    ['EACCES', 'AccessDenied'],
+  ])('keeps the 502 provider contract for an AWS-SDK-shaped error carrying the code %s', async (code, name) => {
     const userId = randomUUID();
-    const serviceError = Object.assign(new Error('SlowDown'), { name: 'SlowDown', code: 'SlowDown', $metadata: {} });
+    const serviceError = Object.assign(new Error(name), { name, code, $metadata: {} });
     sendMock.mockRejectedValue(serviceError);
     const warn = vi.spyOn(logger, 'warn');
 
@@ -1681,6 +1773,34 @@ describe('POST /practice/attempt (S3 mode)', () => {
     expect(claims.rows[0].count).toBe(0);
   });
 
+  it('answers a NUL-bearing audioKey with the pre-storage 400 instead of a failed claim insert', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await completeDiagnosticInS3Mode(a, token, userId);
+    sendMock.mockClear();
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const requestId = randomUUID();
+
+    // A NUL byte survives express.json() and the length-only body schema, but
+    // PostgreSQL text cannot store it: recording an unvalidated key with the
+    // processing claim would answer 500 instead of the download's clean 400.
+    const response = await request(a)
+      .post('/practice/attempt')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId: next.body.question.id, requestId, audioKey: `audio-uploads/${userId}/x\u0000y.m4a` });
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'audioKey is missing or invalid', code: 'VALIDATION_FAILED' });
+    expect(sendMock).not.toHaveBeenCalled();
+    const claims = await pool.query<{ count: number }>(
+      'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(claims.rows[0].count).toBe(0);
+  });
+
   it('returns 404 for a valid unknown question before download and deletes the owned object', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
@@ -1777,6 +1897,51 @@ describe('POST /practice/attempt (S3 mode)', () => {
         { kind: 'get', bucket: config.s3.bucket, key: audioKey },
         { kind: 'delete', bucket: config.s3.bucket, key: audioKey },
       ]);
+    });
+  });
+
+  it('keeps the submitted object through 503 backpressure so the contracted same-key retry succeeds', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await completeDiagnosticInS3Mode(a, token, userId);
+    sendMock.mockClear();
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(next.status).toBe(200);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+    const submit = () =>
+      request(a)
+        .post('/practice/attempt')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId: next.body.question.id, requestId, audioKey });
+
+    const previousConcurrency = config.aiMaxConcurrency;
+    config.aiMaxConcurrency = 0;
+    try {
+      const shed = await submit();
+      expect(shed.status).toBe(503);
+      expect(shed.body).toEqual({ error: 'Assessment capacity busy', code: 'CAPACITY_BUSY', retryAfterSeconds: 5 });
+    } finally {
+      config.aiMaxConcurrency = previousConcurrency;
+    }
+
+    // Pure backpressure spent no paid work and left no claim, and the client
+    // re-POSTs the identical grant after Retry-After. Deleting the object here
+    // would answer that retry with the definitive "not found" 400 the app
+    // treats as a permanent rejection, so the automatic retry could never win.
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
+
+    const retried = await submit();
+    expect(retried.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'delete']);
     });
   });
 

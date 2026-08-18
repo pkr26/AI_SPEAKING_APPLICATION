@@ -270,9 +270,9 @@ ok(
   r.body.promptWord === practiceQ.promptWord && r.body.questionText === practiceQ.questionText,
 );
 ok(
-  'help is privately cacheable',
-  r.headers.get('cache-control') === 'private, max-age=3600',
-  r.headers.get('cache-control'),
+  'help is privately cacheable but always revalidated',
+  r.headers.get('cache-control') === 'private, no-cache' && (r.headers.get('vary') ?? '').includes('Authorization'),
+  `${r.headers.get('cache-control')} / ${r.headers.get('vary')}`,
 );
 const helpEtag = r.headers.get('etag');
 ok('help sends an ETag', typeof helpEtag === 'string' && helpEtag.length > 0);

@@ -28,6 +28,7 @@ jest.mock('expo-router', () => {
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
+      canGoBack: jest.fn(),
     },
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
@@ -107,6 +108,8 @@ const mockGetStats = apiGetPracticeStats as jest.Mock;
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
   replace: jest.Mock;
+  back: jest.Mock;
+  canGoBack: jest.Mock;
 };
 
 const STATS: PracticeStats = {
@@ -184,6 +187,9 @@ beforeEach(() => {
   mockGetStats.mockReset();
   mockAuthValue = makeAuth();
   mockPracticeFlow = makePracticeFlow();
+  // Home is the whole signed-in stack unless a test puts a route beneath it;
+  // clearAllMocks keeps recorded return values, so re-arm the default here.
+  mockRouter.canGoBack.mockReturnValue(false);
   backHandlers = [];
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
     backHandlers.push(handler as () => boolean);
@@ -404,13 +410,31 @@ describe('home screen', () => {
     expect(screen.queryByText(t('summary.title'))).toBeNull();
   });
 
-  it('consumes the Android hardware back press so the signed-in root is never popped', async () => {
+  it('consumes the Android hardware back press while the entry gate is still beneath Home', async () => {
+    mockRouter.canGoBack.mockReturnValue(true);
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
     await screen.findByText('B1');
 
     expect(backHandlers.length).toBeGreaterThan(0);
+    // Popping would land on the gate, which redirects straight back here.
     expect(backHandlers[backHandlers.length - 1]()).toBe(true);
+    expect(mockRouter.back).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('lets the Android hardware back press leave the app when Home is the whole stack', async () => {
+    // Nothing to pop: swallowing the press would make back a dead key, since
+    // React Native only reaches its exit-the-app default when no handler
+    // claims the press.
+    mockRouter.canGoBack.mockReturnValue(false);
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+
+    expect(backHandlers.length).toBeGreaterThan(0);
+    expect(backHandlers[backHandlers.length - 1]()).toBe(false);
+    expect(mockRouter.back).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 

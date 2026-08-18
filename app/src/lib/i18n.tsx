@@ -81,7 +81,9 @@ const en = {
   'error.audioTooLong': 'The recording is too long. Please keep your answer under two minutes.',
   'error.audioUnreadable': 'We could not hear this recording. Please record your answer again.',
   'error.checkFailed': 'We could not check your answer. Please try again.',
-  'error.resetInvalid': 'This reset link does not work. Please ask for a new one.',
+  // The reset mail carries a code, never a link: this copy must name the thing
+  // the user pasted, and the action that fixes it.
+  'error.resetInvalid': 'This code does not work or it is too old. Please ask for a new code.',
   'error.upgradeRequired': 'Please update the app to keep using it.',
   'error.internal': 'Something went wrong. Please try again.',
 
@@ -356,8 +358,11 @@ const en = {
     'Your answer was saved, but we could not save app info. Please close and open the app to finish.',
   'recorder.errInfoNotSavedNotUploaded':
     'We could not save app info, so your recording was not sent. Please try again.',
+  'recorder.errNotSent': 'We could not send your recording. Please try again.',
   'recorder.errDeviceInterrupted':
     'The phone stopped the recording. Please record your answer again.',
+  'recorder.errBackgroundDiscarded':
+    'Your recording was not kept when you left the app. Please record your answer again.',
   'recorder.errTooShort': 'The recording was too short. Please record your answer again.',
   'recorder.errSaveFailed': 'We could not save the recording. Please record your answer again.',
   'recorder.errNoRecording': 'No recording was saved. Please record again.',
@@ -536,7 +541,7 @@ const te: Record<MessageKey, string> = {
   'error.audioUnreadable':
     'ఈ రికార్డింగ్ మాకు వినిపించలేదు. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'error.checkFailed': 'మీ జవాబును తనిఖీ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
-  'error.resetInvalid': 'ఈ రీసెట్ లింక్ పనిచేయదు. దయచేసి కొత్తది అడగండి.',
+  'error.resetInvalid': 'ఈ కోడ్ పనిచేయదు లేదా చాలా పాతది. దయచేసి కొత్త కోడ్ అడగండి.',
   'error.upgradeRequired': 'యాప్‌ను ఉపయోగించడానికి దయచేసి యాప్‌ను అప్‌డేట్ చేయండి.',
   'error.internal': 'ఏదో తప్పు జరిగింది. దయచేసి మళ్లీ ప్రయత్నించండి.',
 
@@ -795,8 +800,11 @@ const te: Record<MessageKey, string> = {
     'మీ జవాబు సేవ్ అయింది, కానీ యాప్ సమాచారం సేవ్ చేయలేకపోయాము. పూర్తి చేయడానికి యాప్‌ను మూసి మళ్లీ తెరవండి.',
   'recorder.errInfoNotSavedNotUploaded':
     'యాప్ సమాచారం సేవ్ చేయలేకపోయాము, అందుకే మీ రికార్డింగ్ పంపబడలేదు. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'recorder.errNotSent': 'మీ రికార్డింగ్‌ను పంపలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'recorder.errDeviceInterrupted':
     'ఫోన్ రికార్డింగ్‌ను ఆపేసింది. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
+  'recorder.errBackgroundDiscarded':
+    'మీరు యాప్ నుంచి బయటకు వెళ్లినప్పుడు మీ రికార్డింగ్ ఉంచబడలేదు. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errTooShort': 'రికార్డింగ్ చాలా చిన్నది. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errSaveFailed':
     'రికార్డింగ్‌ను సేవ్ చేయలేకపోయాము. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
@@ -965,7 +973,7 @@ const hi: Record<MessageKey, string> = {
   'error.audioTooLong': 'रिकॉर्डिंग बहुत लंबी है। कृपया अपना जवाब दो मिनट से कम रखें।',
   'error.audioUnreadable': 'हमें यह रिकॉर्डिंग सुनाई नहीं दी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'error.checkFailed': 'हम आपके जवाब की जाँच नहीं कर पाए। कृपया फिर से कोशिश करें।',
-  'error.resetInvalid': 'यह रीसेट लिंक काम नहीं करता। कृपया नया माँगें।',
+  'error.resetInvalid': 'यह कोड काम नहीं करता या बहुत पुराना है। कृपया नया कोड माँगें।',
   'error.upgradeRequired': 'ऐप का इस्तेमाल जारी रखने के लिए कृपया ऐप अपडेट करें।',
   'error.internal': 'कुछ गड़बड़ हो गई। कृपया फिर से कोशिश करें।',
 
@@ -1224,8 +1232,11 @@ const hi: Record<MessageKey, string> = {
     'आपका जवाब सेव हो गया, लेकिन हम ऐप की जानकारी सेव नहीं कर पाए। पूरा करने के लिए ऐप बंद करके दोबारा खोलें।',
   'recorder.errInfoNotSavedNotUploaded':
     'हम ऐप की जानकारी सेव नहीं कर पाए, इसलिए आपकी रिकॉर्डिंग नहीं भेजी गई। कृपया फिर से कोशिश करें।',
+  'recorder.errNotSent': 'हम आपकी रिकॉर्डिंग नहीं भेज पाए। कृपया फिर से कोशिश करें।',
   'recorder.errDeviceInterrupted':
     'फ़ोन ने रिकॉर्डिंग रोक दी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
+  'recorder.errBackgroundDiscarded':
+    'आपने ऐप छोड़ा, इसलिए आपकी रिकॉर्डिंग नहीं रखी गई। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'recorder.errTooShort': 'रिकॉर्डिंग बहुत छोटी थी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'recorder.errSaveFailed': 'हम रिकॉर्डिंग सेव नहीं कर पाए। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'recorder.errNoRecording': 'कोई रिकॉर्डिंग सेव नहीं हुई। कृपया फिर से रिकॉर्ड करें।',
@@ -1389,7 +1400,7 @@ const es: Record<MessageKey, string> = {
   'error.audioTooLong': 'La grabación es muy larga. Haz tu respuesta de menos de dos minutos.',
   'error.audioUnreadable': 'No pudimos oír esta grabación. Graba tu respuesta de nuevo.',
   'error.checkFailed': 'No pudimos revisar tu respuesta. Intenta de nuevo.',
-  'error.resetInvalid': 'Este enlace no funciona. Pide uno nuevo, por favor.',
+  'error.resetInvalid': 'Este código no funciona o es muy viejo. Pide un código nuevo, por favor.',
   'error.upgradeRequired': 'Actualiza la app para seguir usándola.',
   'error.internal': 'Algo salió mal. Intenta de nuevo.',
 
@@ -1647,7 +1658,10 @@ const es: Record<MessageKey, string> = {
     'Tu respuesta se guardó, pero no pudimos guardar la información de la app. Cierra y abre la app para terminar.',
   'recorder.errInfoNotSavedNotUploaded':
     'No pudimos guardar la información de la app, así que tu grabación no se envió. Intenta de nuevo.',
+  'recorder.errNotSent': 'No pudimos enviar tu grabación. Intenta de nuevo.',
   'recorder.errDeviceInterrupted': 'El teléfono paró la grabación. Graba tu respuesta de nuevo.',
+  'recorder.errBackgroundDiscarded':
+    'Tu grabación no se guardó cuando saliste de la app. Graba tu respuesta de nuevo.',
   'recorder.errTooShort': 'La grabación fue muy corta. Graba tu respuesta de nuevo.',
   'recorder.errSaveFailed': 'No pudimos guardar la grabación. Graba tu respuesta de nuevo.',
   'recorder.errNoRecording': 'No se guardó ninguna grabación. Graba de nuevo, por favor.',
@@ -1807,7 +1821,7 @@ const zh: Record<MessageKey, string> = {
   'error.audioTooLong': '录音太长了。回答请不要超过两分钟。',
   'error.audioUnreadable': '我们听不到这段录音。请重新录你的回答。',
   'error.checkFailed': '我们无法检查你的回答。请再试一次。',
-  'error.resetInvalid': '这个重置链接无效。请重新申请一个。',
+  'error.resetInvalid': '这个验证码无效或者太旧了。请重新申请一个验证码。',
   'error.upgradeRequired': '请更新应用后继续使用。',
   'error.internal': '出了点问题。请再试一次。',
 
@@ -2048,7 +2062,9 @@ const zh: Record<MessageKey, string> = {
   'recorder.errAnswerSavedRetryInfo':
     '你的回答已保存，但我们无法保存应用信息。请关闭应用再打开来完成。',
   'recorder.errInfoNotSavedNotUploaded': '我们无法保存应用信息，所以你的录音没有发送。请再试一次。',
+  'recorder.errNotSent': '我们无法发送你的录音。请再试一次。',
   'recorder.errDeviceInterrupted': '手机停止了录音。请重新录你的回答。',
+  'recorder.errBackgroundDiscarded': '你离开应用时录音没有保留。请重新录你的回答。',
   'recorder.errTooShort': '录音太短了。请重新录你的回答。',
   'recorder.errSaveFailed': '我们无法保存录音。请重新录你的回答。',
   'recorder.errNoRecording': '没有保存任何录音。请重新录音。',

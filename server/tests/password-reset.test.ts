@@ -233,6 +233,30 @@ describe('POST /auth/reset-password', () => {
     expect(rows[0].n).toBe(0);
   });
 
+  it('dies when the owner changes their password, so a leaked code cannot undo the rotation', async () => {
+    const { res, body: reg } = await registerUser(a);
+    const email = reg.email as string;
+    const token = await issueToken(email);
+
+    // The owner secures the account the ordinary way.
+    const changed = await request(a)
+      .post('/auth/change-password')
+      .set('Authorization', `Bearer ${res.body.token}`)
+      .send({ currentPassword: STRONG_PASSWORD, newPassword: 'rotatedPass1word' });
+    expect(changed.status).toBe(200);
+
+    // The code that was already in the mailbox must not survive the rotation
+    // it was meant to pre-empt.
+    expect(await tokenRow(email)).toBeUndefined();
+    const stolen = await request(a).post('/auth/reset-password').send({ email, token, newPassword: 'stolenPass1' });
+    expect(stolen.status).toBe(400);
+    expect(stolen.body).toEqual(RESET_INVALID_BODY);
+
+    // The rotated password is still the live one.
+    expect((await request(a).post('/auth/login').send({ email, password: 'rotatedPass1word' })).status).toBe(200);
+    expect((await request(a).post('/auth/login').send({ email, password: 'stolenPass1' })).status).toBe(401);
+  });
+
   it('rejects wrong, expired, and unknown-account codes with one uniform contract', async () => {
     const { body: reg } = await registerUser(a);
     const email = reg.email as string;

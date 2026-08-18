@@ -285,7 +285,7 @@ describe('practice SRS scheduling and skip', () => {
       expect(after.body.question.id).toBe(questionId);
     });
 
-    it('leaves retention selection unaffected by skips', async () => {
+    it('defers a skipped mastered word in retention without ever dead-ending on skips', async () => {
       const { token, userId, level } = await freshUserAt();
       await pool.query(
         `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, due_at)
@@ -295,16 +295,29 @@ describe('practice SRS scheduling and skip', () => {
         [userId, level],
       );
       const { rows } = await pool.query<{ question_id: string }>(
-        'SELECT question_id FROM practice_progress WHERE user_id = $1 ORDER BY due_at ASC LIMIT 1',
+        'SELECT question_id FROM practice_progress WHERE user_id = $1 ORDER BY due_at ASC LIMIT 2',
         [userId],
       );
-      const mostOverdue = rows[0].question_id;
+      const [mostOverdue, nextOverdue] = rows.map(({ question_id }) => question_id);
       await request(a).post('/practice/skip').set('Authorization', `Bearer ${token}`).send({ questionId: mostOverdue });
 
-      const r = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
-      expect(r.status).toBe(200);
-      expect(r.body.kind).toBe('revision');
-      expect(r.body.question.id).toBe(mostOverdue);
+      // Skip is not a dead control once the bank is exhausted: the parked word
+      // sorts last, so the next-most-overdue mastered word is served instead
+      // of the identical question the learner just skipped.
+      const deferred = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      expect(deferred.status).toBe(200);
+      expect(deferred.body.kind).toBe('revision');
+      expect(deferred.body.question.id).toBe(nextOverdue);
+
+      // Parking every mastered word still cannot empty retention (skips never
+      // make a mastered word ineligible): the most overdue one comes back.
+      await pool.query(`UPDATE practice_progress SET skipped_until = now() + interval '7 days' WHERE user_id = $1`, [
+        userId,
+      ]);
+      const allParked = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      expect(allParked.status).toBe(200);
+      expect(allParked.body.kind).toBe('revision');
+      expect(allParked.body.question.id).toBe(mostOverdue);
     });
 
     it('enforces the level, existence, UUID, and diagnostic contracts', async () => {

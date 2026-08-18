@@ -16,10 +16,11 @@ collectDefaultMetrics({ register: registry });
 
 /**
  * HTTP request latency. The route label is the matched Express route pattern
- * (req.baseUrl + req.route.path), never the raw URL, so label cardinality
- * stays bounded; requests that end before a route matches (404s, limiter and
- * version-gate rejections) share the single '(unmatched)' label. The top
- * bucket tracks the 130s worst-case request budget (see index.ts).
+ * (lower-cased req.baseUrl + req.route.path), never the raw URL, so label
+ * cardinality stays bounded; requests that end before a route matches (404s,
+ * limiter and version-gate rejections) share the single '(unmatched)' label,
+ * and requests that never produced a response share the single 'aborted'
+ * status. The top bucket tracks the 130s worst-case request budget (index.ts).
  */
 export const httpRequestDuration = new Histogram({
   name: 'http_request_duration_seconds',
@@ -31,10 +32,21 @@ export const httpRequestDuration = new Histogram({
 
 export const httpMetricsMiddleware: RequestHandler = (req, res, next) => {
   const endTimer = httpRequestDuration.startTimer({ method: req.method });
-  res.once('finish', () => {
+  // 'close', not 'finish': a client abort or a requestTimeout socket kill only
+  // ever emits 'close', while a normal response emits it right after 'finish'.
+  // Timing here is therefore the only hook that observes every request,
+  // including the timeout tail the 130s top bucket exists to expose.
+  res.once('close', () => {
     const routePath = (req.route as { path?: unknown } | undefined)?.path;
-    const route = routePath === undefined ? '(unmatched)' : `${req.baseUrl}${String(routePath)}`;
-    endTimer({ route, status: String(res.statusCode) });
+    // req.route.path is a pattern, but req.baseUrl is the matched slice of the
+    // real URL and Express routing is case-insensitive, so a caller walking
+    // case permutations of a mount ('/PrAcTiCe/stats') would otherwise mint a
+    // fresh histogram child per spelling. A match can only differ from its
+    // mount pattern by case, so lower-casing it fully restores the bound.
+    const route = routePath === undefined ? '(unmatched)' : `${req.baseUrl.toLowerCase()}${String(routePath)}`;
+    // A response that never ended carries a status no client ever saw; one
+    // 'aborted' label keeps that tail visible without unbounded cardinality.
+    endTimer({ route, status: res.writableEnded ? String(res.statusCode) : 'aborted' });
   });
   next();
 };

@@ -88,6 +88,8 @@ export default function SettingsScreen() {
   const [retakeBusy, setRetakeBusy] = useState(false);
   const [retakeError, setRetakeError] = useState<string | null>(null);
 
+  const [logoutBusy, setLogoutBusy] = useState(false);
+
   // Re-entrancy latches. Each `disabled={xBusy}` prop and the handler it gates
   // read the same render's state, so a second press landing before React has
   // re-rendered would still see `false` and fire the request twice. A ref
@@ -97,9 +99,18 @@ export default function SettingsScreen() {
   const exportBusyRef = useRef(false);
   const reminderBusyRef = useRef(false);
   const retakeBusyRef = useRef(false);
+  const logoutBusyRef = useRef(false);
   // Mirrors nameFocused for the re-sync effect below: keying the effect on the
   // focus state itself would wipe an unsaved edit the moment the field blurs.
   const nameFocusedRef = useRef(false);
+  // The committed session user. A write that lands after an await must rebuild
+  // from this, never from the closure that started it: a name or language
+  // change that resolved in between would be reverted, and nothing refetches
+  // /me while a user is set to repair it.
+  const userRef = useRef(user);
+  useEffect(() => {
+    userRef.current = user;
+  }, [user]);
 
   // Re-sync the draft when the canonical name changes outside this field (a
   // refreshed /me, another session), but never clobber text being typed.
@@ -166,11 +177,31 @@ export default function SettingsScreen() {
       // language only updates on the render after setUser. Best effort: the
       // language change already succeeded, so a failed re-schedule must not
       // surface as a language error.
-      if (reminder?.enabled) {
+      if (reminder?.enabled && !reminderBusyRef.current) {
+        // Take the latch every other reminder mutation takes: a toggle or hour
+        // change running concurrently owns the OS schedule, and the two
+        // cancel/schedule pairs can interleave into a daily notification the
+        // learner has already switched off.
+        reminderBusyRef.current = true;
+        setReminderBusy(true);
         try {
-          await enableDailyReminder(reminder.hour, code);
+          // Re-read the preference instead of trusting the state captured when
+          // the chip was pressed: the reminder may have been switched off, or
+          // moved to another hour, while the PATCH was in flight.
+          const stored = await getDailyReminder();
+          if (stored) await enableDailyReminder(stored.hour, code);
         } catch {
-          // The reminder keeps its previous language until the next toggle.
+          // enableDailyReminder cancels the old schedule before creating the
+          // new one and forgets the preference when it cannot replace it, so a
+          // failure here can leave nothing scheduled at all. Reflect whatever
+          // survived rather than a toggle that lies, and say the reminder needs
+          // re-arming — still never reported as a language error.
+          const survived = await getDailyReminder();
+          setReminder({ enabled: survived !== null, hour: survived?.hour ?? reminder.hour });
+          setReminderError(t('reminder.failed'));
+        } finally {
+          reminderBusyRef.current = false;
+          setReminderBusy(false);
         }
       }
     } catch (error) {
@@ -269,12 +300,21 @@ export default function SettingsScreen() {
     try {
       await apiRestartDiagnostic();
       // The level being retired owned these caches; drop them before the gate
-      // guards flip so no stale question or count can flash afterwards.
+      // guards flip so no stale question or count can flash afterwards. The
+      // placement test's own /next payload is retired too: its key is unchanged
+      // by a retake, so a fresh entry would re-serve the question the learner
+      // already answered (or the old completion screen) into the reset test,
+      // costing a 409 mismatch and minutes of recovery lock.
+      queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
       queryClient.removeQueries({ queryKey: ['practice-question'] });
       queryClient.removeQueries({ queryKey: ['practice-stats'] });
       queryClient.removeQueries({ queryKey: ['practice-history'] });
       void queryClient.invalidateQueries({ queryKey: ['me'] });
-      setUser({ ...user, diagnosticCompleted: false, cefrLevel: null });
+      // Rebuild from the ref, not from this handler's closure: a name or
+      // language change that resolved while the restart was in flight is
+      // already the session user, and the stale copy would revert it.
+      const current = userRef.current;
+      if (current) setUser({ ...current, diagnosticCompleted: false, cefrLevel: null });
       router.replace('/diagnostic');
     } catch (error) {
       setRetakeError(userMessageForError(error, t('retake.failed')));
@@ -285,6 +325,12 @@ export default function SettingsScreen() {
   };
 
   const handleLogout = async () => {
+    // A slow logout runs to the request timeout, and a second tap would throw
+    // out of the auth transition guard — alerting a logout failure over a
+    // logout that is in fact succeeding.
+    if (logoutBusyRef.current) return;
+    logoutBusyRef.current = true;
+    setLogoutBusy(true);
     try {
       await logout();
       router.replace('/');
@@ -294,6 +340,9 @@ export default function SettingsScreen() {
       } else {
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
       }
+    } finally {
+      logoutBusyRef.current = false;
+      setLogoutBusy(false);
     }
   };
 
@@ -549,7 +598,13 @@ export default function SettingsScreen() {
 
         <Pressable
           accessibilityRole="button"
-          style={({ pressed }) => [styles.actionRow, pressed && styles.actionRowPressed]}
+          accessibilityState={{ disabled: logoutBusy, busy: logoutBusy }}
+          disabled={logoutBusy}
+          style={({ pressed }) => [
+            styles.actionRow,
+            logoutBusy && styles.controlDisabled,
+            pressed && styles.actionRowPressed,
+          ]}
           onPress={() => void handleLogout()}
         >
           <Text style={styles.actionText}>{t('common.logOut')}</Text>

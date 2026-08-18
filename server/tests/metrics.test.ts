@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
 import fs from 'fs/promises';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import path from 'path';
 import { PassThrough } from 'node:stream';
 import express from 'express';
@@ -32,6 +34,7 @@ import { verifyAudioDuration } from '../src/audio-inspection';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
 import {
+  httpMetricsMiddleware,
   httpRequestDuration,
   providerCallDuration,
   providerCallErrors,
@@ -152,6 +155,60 @@ describe('http_request_duration_seconds', () => {
       expect(await histogramCount(histogram, registerLabels)).toBe(registerBefore + 1);
       expect(await histogramCount(histogram, unmatchedLabels)).toBe(unmatchedBefore + 1);
     });
+  });
+
+  it('collapses case-permuted mount spellings onto the mounted route label', async () => {
+    // Express routing is case-insensitive and req.baseUrl echoes the URL's own
+    // casing, so an authenticated caller could otherwise walk permutations of
+    // a mount and mint a new histogram child per spelling.
+    const a = express();
+    a.use(httpMetricsMiddleware);
+    const router = express.Router();
+    router.get('/stats', (_req, res) => res.json({ ok: true }));
+    a.use('/casing-probe', router);
+    const labels = { method: 'GET', route: '/casing-probe/stats', status: '200' };
+    const before = await histogramCount(httpRequestDuration, labels);
+
+    expect((await request(a).get('/CaSiNg-PrObE/stats')).status).toBe(200);
+
+    await vi.waitFor(async () => {
+      expect(await histogramCount(httpRequestDuration, labels)).toBe(before + 1);
+    });
+    const { values } = await httpRequestDuration.get();
+    expect(values.filter((entry) => entry.labels.route === '/CaSiNg-PrObE/stats')).toEqual([]);
+  });
+
+  it("observes a client-aborted request under the bounded 'aborted' status", async () => {
+    const labels = { method: 'GET', route: '/abort-probe', status: 'aborted' };
+    const before = await histogramCount(httpRequestDuration, labels);
+    const a = express();
+    a.use(httpMetricsMiddleware);
+    let handlerReached!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      handlerReached = resolve;
+    });
+    // The handler never responds, so 'finish' never fires: only the abort's
+    // 'close' can record the request that rate-limit.ts's abort guard exists
+    // for, and the same is true of a requestTimeout socket kill.
+    a.get('/abort-probe', () => handlerReached());
+    const server = await new Promise<http.Server>((resolve) => {
+      const listening = a.listen(0, () => resolve(listening));
+    });
+    try {
+      const clientRequest = http.request({ port: (server.address() as AddressInfo).port, path: '/abort-probe' });
+      clientRequest.on('error', () => undefined);
+      clientRequest.end();
+      await reached;
+      clientRequest.destroy();
+
+      await vi.waitFor(async () => {
+        expect(await histogramCount(httpRequestDuration, labels)).toBe(before + 1);
+      });
+    } finally {
+      // Never let a half-closed probe socket hold this suite's worker open.
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
   });
 });
 

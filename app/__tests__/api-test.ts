@@ -508,6 +508,12 @@ describe('userMessageForError', () => {
       [0.4, t('wait.second')],
       [90, t('wait.minutes', { count: 2 })],
       [60, t('wait.minute')],
+      // Header-only 429s (express-rate-limit) carry day-scale waits as seconds:
+      // the per-network daily cap must read as hours, not "1440 minutes".
+      [3599, t('wait.minutes', { count: 60 })],
+      [3600, t('wait.hour')],
+      [5401, t('wait.hours', { count: 2 })],
+      [24 * 60 * 60, t('wait.hours', { count: 24 })],
     ])('appends the wait line for a 429 with retryAfterSeconds %d', (seconds, waitLine) => {
       const error = new api.ApiError(429, 'internal', seconds);
 
@@ -1119,6 +1125,31 @@ describe('error response parsing', () => {
       expect(error).toMatchObject({ status: 429, code: 'RATE_LIMITED', retryAfterSeconds: 30 });
       expect(api.userMessageForError(error, 'Fallback')).toBe(
         `${t('error.tooMany')} ${t('wait.seconds', { count: 30 })}`,
+      );
+    });
+
+    it('renders the shared per-network daily cap as hours, not minutes', async () => {
+      // express-rate-limit answers the daily cap with a Retry-After header and
+      // no retryAfterHours field, so the whole wait arrives as seconds.
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 429,
+          headers: { 'Retry-After': '86400' },
+          json: async () => ({ code: 'NETWORK_DAILY_LIMIT' }),
+        }),
+      );
+
+      const error = await catchAsync(api.apiFetch('/practice/attempt'));
+
+      expect(error).toMatchObject({
+        status: 429,
+        code: 'NETWORK_DAILY_LIMIT',
+        retryAfterSeconds: 86_400,
+        retryAfterHours: undefined,
+      });
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.networkDailyLimit')} ${t('wait.hours', { count: 24 })}`,
       );
     });
   });
@@ -2035,6 +2066,10 @@ describe('resolveBaseUrl', () => {
     'https://user:secret@api.example.com',
     'https://api.example.com?token=1',
     'https://api.example.com#fragment',
+    // An empty query/fragment reads as '' from url.search/url.hash but stays
+    // in the serialized href, so every path would land after the delimiter.
+    'https://api.example.com/api?',
+    'https://api.example.com/api#',
   ])('rejects unsafe URL %s', async (value) => {
     setDev(false);
     setEnv(value);

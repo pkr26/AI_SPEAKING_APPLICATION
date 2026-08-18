@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { ScrollView, Text, View, type StyleProp, type TextStyle } from 'react-native';
 import { router } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
@@ -16,6 +16,7 @@ import {
   PRACTICE_MAX_ATTEMPTS,
   PRACTICE_PASS_SCORE,
   type NativeLanguage,
+  type PracticeOutcome,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
@@ -57,7 +58,12 @@ export default function FeedbackScreen() {
   const { colors } = theme;
   const queryClient = useQueryClient();
   const { feedback, clearFeedback, setAnswerMode } = usePracticeFlow();
-  const result = feedback?.result ?? null;
+  // Every exit clears the flow state before the router finishes popping this
+  // screen. Latch the outcome so the card slides away as itself instead of
+  // flipping to the no-result state for the whole transition; a freshly
+  // submitted outcome replaces the latched one.
+  const [result, setResult] = useState<PracticeOutcome | null>(null);
+  if (feedback && feedback.result !== result) setResult(feedback.result);
   const questionId = feedback?.questionId ?? null;
   const actedRef = useRef(false);
 

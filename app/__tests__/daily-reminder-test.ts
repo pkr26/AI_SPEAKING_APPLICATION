@@ -9,6 +9,7 @@ import {
   getDailyReminder,
   isReminderHour,
   parseDailyReminder,
+  type DailyReminder,
 } from '../src/lib/daily-reminder';
 import { dictionaries } from '../src/lib/i18n';
 
@@ -45,6 +46,22 @@ const deleteItemAsync = SecureStore.deleteItemAsync as jest.Mock;
 const STORAGE_OPTIONS = expect.objectContaining({
   keychainService: 'ai-english-coach.daily-reminder',
 });
+
+/**
+ * Model SecureStore as a durable keychain already holding `initial`, so a test
+ * can assert what a later getDailyReminder() really reads back rather than
+ * only which cleanup calls were made.
+ */
+function withPersistedReminder(initial: DailyReminder): void {
+  let persisted: string | null = JSON.stringify(initial);
+  getItemAsync.mockImplementation(async () => persisted);
+  setItemAsync.mockImplementation(async (_key: string, value: string) => {
+    persisted = value;
+  });
+  deleteItemAsync.mockImplementation(async () => {
+    persisted = null;
+  });
+}
 
 async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
   const originalOS = Object.getOwnPropertyDescriptor(Platform, 'OS');
@@ -200,8 +217,32 @@ describe('enableDailyReminder', () => {
 
     await expect(enableDailyReminder(7)).resolves.toBe('denied');
     expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
-    expect(mockCancelAllScheduledNotificationsAsync).not.toHaveBeenCalled();
     expect(setItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('forgets the stored preference and any schedule when permission is denied', async () => {
+    // Permission is often revoked in OS settings long after the reminder was
+    // enabled. Leaving the preference behind would show the toggle on at the
+    // stored hour on every future launch for a reminder that can never fire.
+    withPersistedReminder({ hour: 19 });
+    mockGetPermissionsAsync.mockImplementation(async () => ({ granted: false }));
+    mockRequestPermissionsAsync.mockImplementation(async () => ({ granted: false }));
+
+    await expect(enableDailyReminder(20)).resolves.toBe('denied');
+
+    await expect(getDailyReminder()).resolves.toBeNull();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+  });
+
+  it('still reports denial when forgetting the preference or the schedule fails', async () => {
+    mockGetPermissionsAsync.mockImplementation(async () => ({ granted: false }));
+    mockRequestPermissionsAsync.mockImplementation(async () => ({ granted: false }));
+    mockCancelAllScheduledNotificationsAsync.mockRejectedValueOnce(new Error('os error'));
+    deleteItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    // The denial is what the caller acts on; the cleanup is best effort.
+    await expect(enableDailyReminder(7)).resolves.toBe('denied');
   });
 
   it('rejects an invalid hour before touching the OS', async () => {
@@ -254,12 +295,27 @@ describe('enableDailyReminder failure leaves no lying preference', () => {
     expect(mockScheduleNotificationAsync).toHaveBeenCalledTimes(1);
   });
 
-  it('still reports the storage failure when the compensating cancel also fails', async () => {
+  it('forgets the previous preference when storing the new one fails', async () => {
+    // A failed write leaves the earlier hour in storage, and both schedules —
+    // the old one and the compensated new one — are gone: without forgetting
+    // the preference too, the toggle reads on at 08:00 on every future launch
+    // with nothing scheduled at all.
+    withPersistedReminder({ hour: 8 });
+    const failure = new Error('keychain unavailable');
+    setItemAsync.mockRejectedValueOnce(failure);
+
+    await expect(enableDailyReminder(20)).rejects.toBe(failure);
+
+    await expect(getDailyReminder()).resolves.toBeNull();
+  });
+
+  it('still reports the storage failure when the compensating cleanup also fails', async () => {
     const failure = new Error('keychain unavailable');
     setItemAsync.mockRejectedValueOnce(failure);
     mockCancelAllScheduledNotificationsAsync
       .mockImplementationOnce(async () => undefined)
       .mockRejectedValueOnce(new Error('os error'));
+    deleteItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
 
     await expect(enableDailyReminder(9)).rejects.toBe(failure);
   });

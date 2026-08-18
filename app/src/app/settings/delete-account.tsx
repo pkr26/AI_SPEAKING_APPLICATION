@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -37,6 +37,7 @@ export default function DeleteAccountScreen() {
   const [passwordFocused, setPasswordFocused] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const busyRef = useRef(false);
 
   // No length guard: comparablePasswordError only enforces the 72-byte bcrypt
   // ceiling, so it already returns null for an empty password.
@@ -44,6 +45,13 @@ export default function DeleteAccountScreen() {
   const canSubmit = password.length > 0 && passwordError === null && !busy;
 
   const performDelete = async () => {
+    // Two confirmation dialogs can be queued by a double tap (the render-time
+    // canSubmit is still true while a dialog is merely open). Confirming both
+    // would start a second deletion, whose synchronous auth-transition throw
+    // would show "we could not delete your account" over a deletion that is
+    // actually running.
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -56,17 +64,23 @@ export default function DeleteAccountScreen() {
       if (err instanceof ApiError && err.status === 401) {
         setError(t('da.wrongPassword'));
       } else if (err instanceof AccountDeletedCleanupError) {
-        setError(err.message);
+        // The account is gone and the session with it, so the route guard has
+        // already unmounted this screen: only a native alert outlives it to
+        // deliver the "restart before logging in again" instruction.
+        Alert.alert(t('da.deletedTitle'), err.message);
       } else {
         setError(userMessageForError(err, t('da.failed')));
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
 
   const handleSubmit = () => {
-    if (!canSubmit) return;
+    // busyRef as well as canSubmit: a keyboard submit is not gated by the
+    // button's disabled prop and can land before `busy` has re-rendered.
+    if (!canSubmit || busyRef.current) return;
     Alert.alert(t('da.confirmTitle'), t('da.confirmBody'), [
       { text: t('common.cancel'), style: 'cancel' },
       {

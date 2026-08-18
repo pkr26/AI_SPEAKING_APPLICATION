@@ -129,6 +129,10 @@ export default function LoginScreen() {
 
             <Text style={styles.label}>{t('login.passwordLabel')}</Text>
             <View style={styles.inputRow}>
+              {/* Show clears secureTextEntry, which is what suppresses the
+                  keyboard's sentence-capitalization and autocorrect defaults;
+                  without these two props the "retype it visibly" recovery
+                  gesture sends a capitalized password and fails again. */}
               <TextInput
                 ref={passwordRef}
                 accessibilityLabel={t('login.passwordLabel')}
@@ -144,7 +148,9 @@ export default function LoginScreen() {
                 placeholder={t('login.passwordPlaceholder')}
                 placeholderTextColor={colors.muted}
                 secureTextEntry={!passwordVisible}
+                autoCapitalize="none"
                 autoComplete="password"
+                autoCorrect={false}
                 textContentType="password"
                 returnKeyType="go"
                 onSubmitEditing={() => void handleLogin()}

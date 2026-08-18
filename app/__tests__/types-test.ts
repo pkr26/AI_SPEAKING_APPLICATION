@@ -816,6 +816,28 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() => parseAttemptResult({ ...final, attemptsLeft: 0.5 }));
   });
 
+  it('accepts a run closed early because a rival session promoted the level', () => {
+    // server/src/practice.ts drops the retry branch when the locked user level
+    // no longer matches the question's level, so a miss before the last attempt
+    // legitimately arrives in the terminal shape.
+    const earlyClose = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 0,
+      score: 50,
+      transcript: 'A short answer.',
+      feedback: 'Try again.',
+      finalFeedback: 'Your level advanced while this answer was assessed.',
+      next: practicePayload,
+    };
+    expect(parseAttemptResult(earlyClose)).toEqual(earlyClose);
+    // The terminal payload is still mandatory: attemptsLeft 0 alone must not
+    // let a miscounted retry through.
+    expectContractError(() => parseAttemptResult({ ...earlyClose, finalFeedback: undefined }));
+    expectContractError(() => parseAttemptResult({ ...earlyClose, next: undefined }));
+  });
+
   it('enforces passed, retry, and final response shapes', () => {
     const passed = {
       passed: true,

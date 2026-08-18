@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useCallback, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Link, router } from 'expo-router';
+import { Link, router, useFocusEffect } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
@@ -58,6 +58,13 @@ export default function SignupScreen() {
     setNativeLanguage(code);
     setPreviewLanguage(code);
   };
+
+  // The provider sits above the navigator, so the preview outlives this route,
+  // and no signed-out screen offers a way back to English (the chips are the
+  // four native languages). Scope it to the focused screen: leaving signup
+  // restores the device language, while a completed signup is unaffected
+  // because the account language already outranks the preview.
+  useFocusEffect(useCallback(() => () => setPreviewLanguage(null), [setPreviewLanguage]));
 
   const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
 
@@ -142,6 +149,10 @@ export default function SignupScreen() {
 
             <Text style={styles.label}>{t('login.passwordLabel')}</Text>
             <View style={styles.inputRow}>
+              {/* Show clears secureTextEntry, which is what suppresses the
+                  keyboard's sentence-capitalization and autocorrect defaults;
+                  without these two props a revealed password is registered
+                  with a capital first letter the user never typed. */}
               <TextInput
                 ref={passwordRef}
                 accessibilityLabel={t('login.passwordLabel')}
@@ -157,7 +168,9 @@ export default function SignupScreen() {
                 placeholder={t('signup.passwordPlaceholder')}
                 placeholderTextColor={colors.muted}
                 secureTextEntry={!passwordVisible}
+                autoCapitalize="none"
                 autoComplete="new-password"
+                autoCorrect={false}
                 textContentType="newPassword"
                 returnKeyType="go"
                 onSubmitEditing={() => void handleSignup()}
@@ -317,7 +330,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexBasis: '47%',
     flexGrow: 1,
     borderWidth: 1.5,
-    borderColor: colors.border,
+    // The chip fill is the form's own card color, so this border is the only
+    // thing that makes a mandatory tap target visible. `border` is a
+    // decorative hairline (1.24:1 on card in light, 1.27:1 in dark); the
+    // form-field token clears the 3:1 non-text threshold and is what the same
+    // control uses in Settings.
+    borderColor: colors.inputBorder,
     borderRadius: radii.input,
     paddingVertical: spacing.md,
     alignItems: 'center',

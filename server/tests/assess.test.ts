@@ -750,6 +750,7 @@ describe('assessNativeComprehension (OpenAI path)', () => {
     const [parseArgs] = openaiMocks.parse.mock.calls[0];
     expect(parseArgs.model).toBe('gpt-4o-mini-2024-07-18');
     expect(parseArgs.temperature).toBe(0);
+    expect(parseArgs.max_tokens).toBe(2000);
     expect(parseArgs.response_format).toMatchObject({
       type: 'json_schema',
       json_schema: { name: 'native_comprehension', strict: true },
@@ -774,6 +775,40 @@ describe('assessNativeComprehension (OpenAI path)', () => {
       question: 'Describe your hometown.',
       transcript: 'నా ఊరి గురించి',
     });
+  });
+
+  it('budgets more completion tokens than the speaking spec so a schema-maximal answer fits', async () => {
+    // The native schema allows TWO 800-char strings and its feedback may quote
+    // the learner's own Telugu/Hindi/Chinese words, where a character can cost
+    // a whole token. The speaking budget cannot hold that, and a truncated
+    // completion is not a soft failure: it becomes a paid 502 that a
+    // temperature-0 retry of the same recording reproduces forever.
+    openaiMocks.transcribe.mockResolvedValue({ text: 'నా ఊరి గురించి' });
+    openaiMocks.parse.mockResolvedValue({
+      choices: [
+        {
+          message: {
+            parsed: { understood: true, modelAnswer: 'a'.repeat(800), feedback: 'ఒ'.repeat(800) },
+          },
+        },
+      ],
+    });
+
+    await expect(assessNativeComprehension(audioPath, QUESTION, 'te', userId)).resolves.toMatchObject({
+      modelAnswer: 'a'.repeat(800),
+      feedback: 'ఒ'.repeat(800),
+    });
+
+    const nativeSchemaMaxChars = 800 + 800;
+    const [nativeArgs] = openaiMocks.parse.mock.calls[0];
+    expect(nativeArgs.max_tokens).toBeGreaterThanOrEqual(nativeSchemaMaxChars);
+    expect(nativeArgs.max_tokens).toBe(2000);
+
+    // The single-field speaking spec keeps its own smaller budget.
+    openaiMocks.parse.mockClear();
+    mockProviderSuccess();
+    await assessSpeaking(audioPath, QUESTION, userId);
+    expect(openaiMocks.parse.mock.calls[0][0].max_tokens).toBe(400);
   });
 
   it.each([

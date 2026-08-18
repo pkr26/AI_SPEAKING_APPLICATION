@@ -113,7 +113,7 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(237, 9, 237, 39),
   exactLocations(418, 39, 418, 65, 435, 39, 435, 65),
   exactLocations(214, 32, 214, 45),
-  exactLocations(130, 38, 130, 67, 161, 38, 161, 71),
+  exactLocations(143, 38, 143, 67, 176, 38, 176, 71),
   exactLocations(38, 82, 42, 4),
   exactLocations(45, 39, 45, 49, 45, 39, 45, 49),
   exactLocations(121, 10, 121, 35),

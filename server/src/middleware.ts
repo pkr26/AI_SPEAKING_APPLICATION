@@ -316,6 +316,20 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
   if (bodyParserError.type === 'request.aborted' || bodyParserError.type === 'request.size.invalid') {
     return res.status(400).json({ error: 'Invalid request body', code: 'VALIDATION_FAILED' });
   }
+  // Not every parser failure carries a `type`: body-parser inflates bodies by
+  // default and wraps a zlib failure (corrupt Content-Encoding) as a bare
+  // exposed 400. Answer any client-safe 4xx the parser produced as the client
+  // error it is, so a malformed request cannot mint fake 5xx traffic and
+  // ERROR-level stack traces — still without reflecting the parser's message.
+  const parserStatus = bodyParserError.status;
+  if (
+    typeof parserStatus === 'number' &&
+    parserStatus >= 400 &&
+    parserStatus < 500 &&
+    (err as { expose?: boolean }).expose === true
+  ) {
+    return res.status(parserStatus).json({ error: 'Invalid request body', code: 'VALIDATION_FAILED' });
+  }
   logger.error({ err, requestId: req.id }, 'unhandled error');
   return res.status(500).json({ error: 'Internal server error', code: 'INTERNAL' });
 }

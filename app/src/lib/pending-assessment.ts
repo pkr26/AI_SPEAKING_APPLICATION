@@ -132,10 +132,18 @@ export async function loadPendingAssessment(): Promise<PendingAssessment | null>
   return serializeStorage(loadPendingUnsafe);
 }
 
+/**
+ * Deletes only the expected record when one is supplied, mirroring clearToken.
+ * An unconditional clear never reads first: an entry that is undecryptable but
+ * deletable (an Android backup restored without its Keystore key) must still be
+ * healed, otherwise session-expiry cleanup would fail and block the next login.
+ */
 export async function clearPendingAssessment(expectedRequestId?: string): Promise<void> {
   await serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
-    if (expectedRequestId && current?.requestId !== expectedRequestId) return;
+    if (expectedRequestId !== undefined) {
+      const current = await loadPendingUnsafe();
+      if (current?.requestId !== expectedRequestId) return;
+    }
     await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
     memoryValue = null;
     memoryLoaded = true;

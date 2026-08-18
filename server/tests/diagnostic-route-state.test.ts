@@ -1,7 +1,12 @@
 import { randomUUID } from 'crypto';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
+
+/** The exact parent locks the diagnostic writers take before diagnostic_state. */
+const NEXT_PARENT_LOCK = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
+const WRITER_PARENT_LOCK = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
 
 afterAll(async () => {
   await pool.end();
@@ -93,6 +98,89 @@ async function assignB1Question(userId: string): Promise<string> {
   ]);
   expect(assigned.rowCount).toBe(1);
   return questionId;
+}
+
+/**
+ * Hold the learner's users row in a rival transaction until the route under
+ * test issues its own parent lock, then commit `mutateBeforeRelease` before
+ * releasing it. The route therefore always resumes against state that changed
+ * after requireAuth loaded its copy, instead of depending on scheduler timing.
+ * The blocker takes FOR NO KEY UPDATE so the foreign-key checks of the child
+ * rows a request writes before that lock (assessment_requests,
+ * assessment_usage) still pass while every FOR UPDATE parent lock waits.
+ * Returns the response together with every statement the blocked transaction
+ * ran, so its outcome (COMMIT or ROLLBACK) is asserted, not assumed.
+ */
+async function withUsersRowRace<T>(options: {
+  userId: string;
+  parentLock: string;
+  startRequest: () => PromiseLike<T>;
+  mutateBeforeRelease: (blocker: PoolClient) => Promise<unknown>;
+}): Promise<{ response: T; statements: string[] }> {
+  const blocker = await pool.connect();
+  const originalConnect = pool.connect.bind(pool);
+  let transactionOpen = false;
+  let blockedStatements: string[] | undefined;
+  let connectSpy: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    await blocker.query('BEGIN');
+    transactionOpen = true;
+    await blocker.query('SELECT 1 FROM users WHERE id = $1 FOR NO KEY UPDATE', [options.userId]);
+
+    connectSpy = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+      // pool.query leases through the callback overload; leave it untouched so
+      // only explicit transaction leases are observed.
+      if (typeof callback === 'function') return originalConnect(callback as never);
+      return originalConnect().then((client: PoolClient) => {
+        const statements: string[] = [];
+        const mutable = client as unknown as {
+          query: (...args: unknown[]) => unknown;
+          release: (error?: Error | boolean) => void;
+        };
+        const actualQuery = mutable.query;
+        const actualRelease = mutable.release;
+        mutable.query = (query: unknown, ...args: unknown[]) => {
+          const text = typeof query === 'string' ? query : (query as { text?: unknown } | null)?.text;
+          if (typeof text === 'string') statements.push(text);
+          if (text === options.parentLock) blockedStatements = statements;
+          return actualQuery.call(client, query, ...args);
+        };
+        mutable.release = (error?: Error | boolean) => {
+          mutable.query = actualQuery;
+          mutable.release = actualRelease;
+          actualRelease.call(client, error);
+        };
+        return client;
+      });
+    }) as typeof pool.connect);
+
+    const responsePromise = Promise.resolve(options.startRequest());
+    await vi.waitFor(
+      () => {
+        expect(blockedStatements).toBeDefined();
+      },
+      { timeout: 15_000, interval: 10 },
+    );
+    await options.mutateBeforeRelease(blocker);
+    await blocker.query('COMMIT');
+    transactionOpen = false;
+    return { response: await responsePromise, statements: blockedStatements! };
+  } finally {
+    connectSpy?.mockRestore();
+    if (transactionOpen) await blocker.query('ROLLBACK');
+    blocker.release();
+  }
+}
+
+async function accountRemnants(userId: string) {
+  const { rows } = await pool.query<{ users: number; state: number; attempts: number }>(
+    `SELECT
+       (SELECT count(*)::int FROM users WHERE id = $1) AS users,
+       (SELECT count(*)::int FROM diagnostic_state WHERE user_id = $1) AS state,
+       (SELECT count(*)::int FROM attempts WHERE user_id = $1) AS attempts`,
+    [userId],
+  );
+  return rows[0];
 }
 
 describe('diagnostic finalization ownership', () => {
@@ -381,5 +469,112 @@ describe('diagnostic question availability', () => {
         expect(response.body).toEqual({ error: 'No questions available for this level', code: 'INTERNAL' });
       },
     );
+  });
+});
+
+describe('diagnostic completion race', () => {
+  // requireAuth read diagnostic_completed before the transaction, so only the
+  // locked users row can tell GET /next that the last answer just finished.
+  // Both terminal windows below are unservable: low_idx > high_idx makes the
+  // midpoint index LEVELS out of range (all answers failed) or point past the
+  // finished search (all answers passed).
+  it.each([
+    ['every answer failed', 0, -1, 'A1'],
+    ['every answer passed', 6, 5, 'C2'],
+  ] as const)(
+    'GET /next reports the placement when finalization of a %s diagnostic commits during its lock wait',
+    async (_caseName, lowIdx, highIdx, level) => {
+      const { token, userId } = await registerDiagnosticUser();
+
+      const { response, statements } = await withUsersRowRace({
+        userId,
+        parentLock: NEXT_PARENT_LOCK,
+        startRequest: () => request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`),
+        mutateBeforeRelease: async (blocker) => {
+          await blocker.query(
+            `UPDATE diagnostic_state
+             SET low_idx = $1, high_idx = $2, questions_asked = 3, current_question_id = NULL
+             WHERE user_id = $3`,
+            [lowIdx, highIdx, userId],
+          );
+          await blocker.query('UPDATE users SET cefr_level = $1, diagnostic_completed = true WHERE id = $2', [
+            level,
+            userId,
+          ]);
+        },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ done: true, level });
+      // The terminal state is never read or written: the locked users row
+      // answers, and the transaction commits its lock release straight away.
+      expect(statements).toEqual(['BEGIN', NEXT_PARENT_LOCK, 'COMMIT']);
+      // No phantom question may be parked on the finished diagnostic: /answer
+      // could only ever reject it with 400 DIAGNOSTIC_DONE.
+      const state = await pool.query<{ current_question_id: string | null }>(
+        'SELECT current_question_id FROM diagnostic_state WHERE user_id = $1',
+        [userId],
+      );
+      expect(state.rows[0]).toEqual({ current_question_id: null });
+    },
+  );
+});
+
+describe('diagnostic account deletion races', () => {
+  // A concurrent DELETE /auth/account commits while the route waits on its
+  // parent lock. Every diagnostic writer must report the state change instead
+  // of letting lockState re-insert diagnostic_state into a foreign-key
+  // violation that the error handler can only answer as a 500.
+  it('GET /next answers 409 when the account is deleted during its lock wait', async () => {
+    const { token, userId } = await registerDiagnosticUser();
+
+    const { response, statements } = await withUsersRowRace({
+      userId,
+      parentLock: NEXT_PARENT_LOCK,
+      startRequest: () => request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`),
+      mutateBeforeRelease: (blocker) => blocker.query('DELETE FROM users WHERE id = $1', [userId]),
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+    expect(statements).toEqual(['BEGIN', NEXT_PARENT_LOCK, 'ROLLBACK']);
+    expect(await accountRemnants(userId)).toEqual({ users: 0, state: 0, attempts: 0 });
+  });
+
+  it('POST /restart answers 409 when the account is deleted during its lock wait', async () => {
+    const { token, userId } = await registerDiagnosticUser();
+
+    const { response, statements } = await withUsersRowRace({
+      userId,
+      parentLock: WRITER_PARENT_LOCK,
+      startRequest: () =>
+        request(a).post('/diagnostic/restart').set('Authorization', `Bearer ${token}`).send({ confirm: true }),
+      mutateBeforeRelease: (blocker) => blocker.query('DELETE FROM users WHERE id = $1', [userId]),
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+    expect(statements).toEqual(['BEGIN', WRITER_PARENT_LOCK, 'ROLLBACK']);
+    expect(await accountRemnants(userId)).toEqual({ users: 0, state: 0, attempts: 0 });
+  });
+
+  it('POST /answer answers 409 when the account is deleted before finalization', async () => {
+    const { token, userId } = await registerDiagnosticUser();
+    const questionId = await assignB1Question(userId);
+    const requestId = randomUUID();
+
+    const { response, statements } = await withUsersRowRace({
+      userId,
+      parentLock: WRITER_PARENT_LOCK,
+      startRequest: () => fixedRequestForm(token, questionId, requestId),
+      mutateBeforeRelease: (blocker) => blocker.query('DELETE FROM users WHERE id = $1', [userId]),
+    });
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+    // Finalization stops at the parent lock: no attempt row, no diagnostic_state
+    // re-insert, and therefore no foreign-key violation to answer as a 500.
+    expect(statements).toEqual(['BEGIN', WRITER_PARENT_LOCK, 'ROLLBACK']);
+    expect(await accountRemnants(userId)).toEqual({ users: 0, state: 0, attempts: 0 });
   });
 });

@@ -202,6 +202,12 @@ export default function HistoryScreen() {
       void historyQuery.fetchNextPage();
     }
   };
+  // A rejected page leaves hasNextPage set, so scrolling to the end again would
+  // silently re-fire the same failing request; after a failure the next attempt
+  // has to be an explicit tap on the footer's retry.
+  const loadOlderOnScroll = () => {
+    if (!historyQuery.isFetchNextPageError) loadOlder();
+  };
 
   return (
     <SectionList
@@ -217,7 +223,7 @@ export default function HistoryScreen() {
         </Text>
       )}
       onEndReachedThreshold={0.4}
-      onEndReached={loadOlder}
+      onEndReached={loadOlderOnScroll}
       ListFooterComponent={
         historyQuery.isFetchingNextPage ? (
           <View style={styles.footer}>
@@ -225,6 +231,22 @@ export default function HistoryScreen() {
             <Text accessibilityLiveRegion="polite" style={styles.muted}>
               {t('history.loadingMore')}
             </Text>
+          </View>
+        ) : historyQuery.isFetchNextPageError ? (
+          // The loaded answers stay on screen, so the full-screen error state
+          // above never runs for a failed older page: report it here instead of
+          // dropping back to a "Show older answers" button that says nothing.
+          <View style={styles.footer}>
+            <Text accessibilityLiveRegion="assertive" style={styles.muted}>
+              {userMessageForError(historyQuery.error, t('history.loadFailed'))}
+            </Text>
+            <Button
+              title={t('common.tryAgain')}
+              variant="secondary"
+              fullWidth
+              onPress={loadOlder}
+              style={styles.retryButton}
+            />
           </View>
         ) : historyQuery.hasNextPage ? (
           <Button
@@ -274,8 +296,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginTop: spacing.lg,
   },
   sectionHeader: {
-    marginTop: spacing.lg,
-    marginBottom: spacing.sm,
+    // Day headers stick to the top of the list on iOS, so the band has to be
+    // opaque and own its spacing as padding — with margins the pinned label
+    // would sit transparently over the rows scrolling underneath it.
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.sm,
+    backgroundColor: colors.background,
     fontSize: 14,
     fontWeight: '700',
     color: colors.muted,

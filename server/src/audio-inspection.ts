@@ -111,9 +111,10 @@ class InvalidInspectionError extends Error {}
 function inspectionFailureHttpError(kind: InspectionFailure): HttpError {
   switch (kind) {
     case 'unavailable':
-      // The inspector itself is broken (ffmpeg/ffprobe lost at runtime) — an
-      // operator-side fault, not client backpressure: deliberately no retry
-      // hint, because a short client retry cannot restore a missing binary.
+      // The inspector cannot run (ffmpeg/ffprobe lost at runtime, or the host
+      // refused another descriptor) — an operator-side fault, not client
+      // backpressure: deliberately no retry hint, because a short client retry
+      // cannot restore a missing binary.
       return new HttpError(503, 'Audio inspection is temporarily unavailable', 'PROVIDER_FAILED');
     case 'timeout':
       // A 10s probe/decode budget exhausted on a saturated host (or a
@@ -170,6 +171,13 @@ async function inspectDecodedDuration(filePath: string): Promise<number> {
   return decodeMeasuredDuration(filePath, inputFormat, movSafetyOptions);
 }
 
+// Descriptor/IO exhaustion while opening the upload is a host-side fault (the
+// process hit its fd limit, the disk is failing), not a verdict on the
+// learner's media: these errnos take the same 'unavailable' path as a native
+// tool that cannot be started, so the take stays retryable instead of being
+// permanently rejected as unreadable.
+const TRANSIENT_OPEN_ERROR_CODES = new Set(['EAGAIN', 'EIO', 'EMFILE', 'ENFILE']);
+
 /**
  * Open the private upload for one native stage. A FIFO or blocking device
  * node wedges the whole event loop inside openSync until a writer appears,
@@ -192,7 +200,7 @@ function openPrivateInput(filePath: string): number {
     const opened = fd;
     fd = undefined;
     return opened;
-  } catch {
+  } catch (error) {
     if (fd !== undefined) {
       try {
         fs.closeSync(fd);
@@ -200,6 +208,12 @@ function openPrivateInput(filePath: string): number {
         // Best-effort cleanup on the failure path.
       }
     }
+    const { code } = error as NodeJS.ErrnoException;
+    if (code !== undefined && TRANSIENT_OPEN_ERROR_CODES.has(code)) {
+      throw new InspectionError('unavailable');
+    }
+    // Everything else (a non-regular object, ELOOP from the O_NOFOLLOW open,
+    // ENXIO, a missing file) really is an unusable input.
     throw new InvalidInspectionError();
   }
 }

@@ -62,12 +62,18 @@ export async function assertDatabaseSchemaCurrent(
     checksum?: unknown;
   }>;
 
-  const manifestMatches =
-    actual.length === expected.length &&
-    expected.every((entry, index) => {
-      const row = actual[index];
-      return row !== undefined && row.name === entry.name && row.checksum === entry.checksum;
-    });
+  // Prefix-subset, not equality: during a rolling deploy the new release's
+  // migration job runs before its replicas boot, so this replica legitimately
+  // sees rows it does not package. Failing those would pull every old replica
+  // out of the load balancer at once for an additive migration. Rows beyond
+  // the packaged manifest come from a newer release; the packaged ones must
+  // still be present, unchanged, and in order. An under-migrated database
+  // still fails, because a packaged entry would then be missing (positional
+  // equality already implies the database has at least as many rows).
+  const manifestMatches = expected.every((entry, index) => {
+    const row = actual[index];
+    return row !== undefined && row.name === entry.name && row.checksum === entry.checksum;
+  });
 
   if (!manifestMatches) {
     throw new Error(`Database migrations do not match this release through ${latest.name}`);

@@ -7,6 +7,7 @@ import {
   completeSubmittedPresignedAudioReplay,
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
+  isOwnedAudioKey,
   ownSubmittedPresignedAudio,
   resolvePresignedAudio,
   SubmittedAudioFile,
@@ -159,9 +160,13 @@ export async function runAssessmentSubmission<Claim, Result>(
     // union collapses it out of the inferred type, so read it the same
     // defensive way resolvePresignedAudio does). Recording it with the
     // processing claim lets submitted-object cleanup see which object this
-    // worker is reading. Direct (local multipart) mode has none.
+    // worker is reading. Only a well-formed owned key is recorded: the schema
+    // constrains nothing but the length, and binding arbitrary client bytes
+    // into the claim INSERT would turn resolvePresignedAudio's clean 400 into a
+    // 500 (PostgreSQL text rejects a NUL byte). A key the download would refuse
+    // is also a key no cleanup may ever consult. Direct mode has none.
     const rawAudioKey = (req.body as { audioKey?: unknown }).audioKey;
-    const audioKey = typeof rawAudioKey === 'string' ? rawAudioKey : undefined;
+    const audioKey = typeof rawAudioKey === 'string' && isOwnedAudioKey(user.id, rawAudioKey) ? rawAudioKey : undefined;
     const { rows: qRows } = await pool.query<QuestionRow>(
       `SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`,
       [questionId],

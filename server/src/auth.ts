@@ -383,12 +383,21 @@ export function createAuthRouter(limiters: Limiters) {
       const passwordHash = await bcrypt.hash(newPassword, BCRYPT_COST);
       // Bind the write to the exact credential snapshot that was verified.
       // A concurrent password reset/change/logout must win instead of being
-      // overwritten by this now-stale request.
+      // overwritten by this now-stale request. The same statement revokes any
+      // outstanding reset code — one already sitting in a mailbox must not
+      // survive the rotation meant to re-secure the account — and driving the
+      // DELETE off the guarded UPDATE's own output keeps both writes atomic
+      // while leaving a losing (409) request's token untouched.
       const updatedResult = await pool.query<UserRow>(
-        `UPDATE users
-         SET password_hash = $1, token_version = token_version + 1
-         WHERE id = $2 AND password_hash = $3 AND token_version = $4
-         RETURNING *`,
+        `WITH updated AS (
+           UPDATE users
+           SET password_hash = $1, token_version = token_version + 1
+           WHERE id = $2 AND password_hash = $3 AND token_version = $4
+           RETURNING *
+         ), revoked AS (
+           DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM updated)
+         )
+         SELECT * FROM updated`,
         [passwordHash, user.id, user.password_hash, user.token_version],
       );
       if (updatedResult.rowCount !== 1) throw authenticationStateChanged();

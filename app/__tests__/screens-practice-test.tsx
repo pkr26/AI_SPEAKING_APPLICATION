@@ -1351,7 +1351,10 @@ describe('practice attempt screen', () => {
     expect(invalidateSpy).toHaveBeenCalledWith({
       queryKey: ['practice-question', USER.id, USER.cefrLevel],
     });
-    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
+    // Practice Mode is entered from help, so replacing only this route would
+    // strand that help screen under a second live Practice screen.
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+    expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
   it('shows a retryable error when the question fails to load', async () => {
@@ -2156,6 +2159,28 @@ describe('practice feedback screen', () => {
     expect(mockRouter.dismissTo).toHaveBeenCalledTimes(1);
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalledTimes(1);
   });
+
+  it('keeps the outcome on screen while the router pops the card away', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(mockPracticeFlow.clearFeedback).toHaveBeenCalledTimes(1);
+
+    // Clearing the flow state re-renders this card before the pop finishes;
+    // the learner must see it slide away, not a spurious failure notice.
+    mockPracticeFlow = makePracticeFlow({ feedback: null });
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+
+    expect(screen.getByText(t('feedback.passedTitle'))).toBeTruthy();
+    expect(screen.getByText('Nice work.')).toBeTruthy();
+    expect(screen.queryByText(t('feedback.noResultTitle'))).toBeNull();
+    expect(screen.queryByText(t('feedback.noResultBody'))).toBeNull();
+  });
 });
 
 describe('practice help screen', () => {
@@ -2184,6 +2209,7 @@ describe('practice help screen', () => {
     expect(screen.getByText(t('help.loading'))).toBeTruthy();
     // The spinner itself is labelled, so the wait is announced without sight.
     expect(screen.getByLabelText(t('help.loading'))).toBeTruthy();
+    expect(screen.queryByText(t('help.loadFailedTitle'))).toBeNull();
   });
 
   it('renders the word, question, and bilingual examples', async () => {
@@ -2300,6 +2326,34 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
 
     expect(await screen.findByText(t('help.loadFailed'))).toBeTruthy();
+    expect(screen.queryByText(t('help.loading'))).toBeNull();
+  });
+
+  it('keeps the help content alone when a background refresh fails', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(
+      ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+      HELP_CONTENT,
+    );
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<HelpScreen />, queryClient);
+    expect(screen.getByText(t('label.word'))).toBeTruthy();
+
+    // Practice Mode shares this query key with a far shorter staleTime, so a
+    // focus-driven refetch can fail while this screen still holds content.
+    await act(async () => {
+      await queryClient.refetchQueries({
+        queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
+      });
+    });
+
+    expect(screen.getByText('courage')).toBeTruthy();
+    expect(screen.getByRole('button', { name: t('help.startPractice') })).toBeTruthy();
+    // The retry card must not stack above the help the learner is reading.
+    expect(screen.queryByText(t('help.loadFailedTitle'))).toBeNull();
+    expect(screen.queryByText(t('error.serverBusy'))).toBeNull();
+    expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
   });
 });
 

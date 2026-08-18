@@ -54,10 +54,13 @@ export default function ForgotPasswordScreen() {
           <Text accessibilityLiveRegion="polite" style={styles.subtitle}>
             {t('reset.sentBody')}
           </Text>
+          {/* navigate, not push: a double-tap on this one unguarded target
+              would otherwise stack a second, empty reset form behind the one
+              the user fills in. navigate dedupes the identical route. */}
           <Button
             title={t('reset.continue')}
             onPress={() =>
-              router.push({ pathname: '/reset-password', params: { email: trimmedEmail } })
+              router.navigate({ pathname: '/reset-password', params: { email: trimmedEmail } })
             }
             style={styles.submitButton}
           />

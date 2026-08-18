@@ -281,6 +281,48 @@ describe('audio inspection concurrency', () => {
     await proveNextSlotIsUsable();
   });
 
+  // Descriptor/IO exhaustion is a host fault: the learner's take is fine and
+  // must stay retryable, exactly like an inspector that cannot be spawned.
+  it.each(['EAGAIN', 'EIO', 'EMFILE', 'ENFILE'])(
+    'maps the transient open failure %s to unavailable instead of blaming the recording',
+    async (code) => {
+      const open = vi.spyOn(nodeFs, 'openSync').mockImplementationOnce(() => {
+        throw Object.assign(new Error(`open failed: ${code}`), { code });
+      });
+      try {
+        await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+          status: 503,
+          message: 'Audio inspection is temporarily unavailable',
+          code: 'PROVIDER_FAILED',
+        });
+        expect(spawnMock).not.toHaveBeenCalled();
+      } finally {
+        open.mockRestore();
+      }
+      await proveNextSlotIsUsable();
+    },
+  );
+
+  it.each(['ELOOP', 'ENXIO', 'ENOENT'])(
+    'still rejects the permanent open failure %s as unusable media',
+    async (code) => {
+      const open = vi.spyOn(nodeFs, 'openSync').mockImplementationOnce(() => {
+        throw Object.assign(new Error(`open failed: ${code}`), { code });
+      });
+      try {
+        await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+          status: 415,
+          message: 'Invalid or unsupported audio file',
+          code: 'AUDIO_UNREADABLE',
+        });
+        expect(spawnMock).not.toHaveBeenCalled();
+      } finally {
+        open.mockRestore();
+      }
+      await proveNextSlotIsUsable();
+    },
+  );
+
   it('releases the slot after a child-process error', async () => {
     const failed = await startInspection();
     failed.child.emit('error', new Error('child error'));

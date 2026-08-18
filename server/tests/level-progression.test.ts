@@ -337,7 +337,7 @@ describe('CEFR level progression', () => {
     expect(await userLevel(userId)).toBe('A2');
   });
 
-  it('answers an in-flight miss with the normal retry shape when a rival promotion lands mid-assessment', async () => {
+  it('closes the run instead of arming a doomed retry when a rival promotion lands mid-assessment', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
@@ -362,18 +362,26 @@ describe('CEFR level progression', () => {
     const waited = await waiterPromise;
 
     expect(waited.status).toBe(200);
-    // The miss keeps its ordinary retry shape: the client contract rejects
-    // attemptsLeft: 0 before the final attempt and a levelUp this attempt did
-    // not earn, so neither may appear here.
+    // The answered A1 question is off-level now, so the retry this miss would
+    // otherwise advertise could never be scored: the run closes with the final
+    // feedback and a next question from A2. levelUp stays off — the client
+    // contract rejects a promotion flag this attempt did not earn.
     expect(waited.body).toMatchObject({
       passed: false,
       mastered: false,
       attemptNo: 1,
-      attemptsLeft: 2,
+      attemptsLeft: 0,
     });
     expect(waited.body.levelUp).toBeUndefined();
-    expect(waited.body.finalFeedback).toBeUndefined();
-    expect(waited.body.next).toBeUndefined();
+    expect(waited.body.finalFeedback).toContain('final feedback');
+    expect(waited.body.next.question.cefrLevel).toBe('A2');
+    expect(waited.body.next.progress.totalAtLevel).toBe((await levelQuestionIds('A2')).length);
+
+    // Exactly the retry the old shape invited, and exactly why it had to go.
+    const retry = await attempt(token, waitingQuestion);
+    expect(retry.status).toBe(403);
+    expect(retry.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
+    expect(speakMock).toHaveBeenCalledTimes(2);
   });
 
   it('rejects an in-flight scored result when diagnostic state was reset before persistence', async () => {

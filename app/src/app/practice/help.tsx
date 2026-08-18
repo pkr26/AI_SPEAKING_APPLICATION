@@ -68,7 +68,7 @@ export default function HelpScreen() {
 
   return (
     <View style={styles.container}>
-      {helpQuery.isPending && (
+      {!help && helpQuery.isPending && (
         <View style={styles.center}>
           <ActivityIndicator
             accessibilityLabel={t('help.loading')}
@@ -81,7 +81,11 @@ export default function HelpScreen() {
         </View>
       )}
 
-      {helpQuery.isError && (
+      {/* Practice Mode observes this same query key, so the shared cache can
+          go stale and a background refetch can fail while this screen still
+          holds content. Offer the retry card only when there is nothing to
+          show, or it stacks on top of the help the learner is reading. */}
+      {!help && helpQuery.isError && (
         <View style={styles.center}>
           <Text accessibilityRole="header" style={styles.errorTitle}>
             {t('help.loadFailedTitle')}

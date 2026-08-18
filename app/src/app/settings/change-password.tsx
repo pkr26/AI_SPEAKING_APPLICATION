@@ -45,6 +45,7 @@ export default function ChangePasswordScreen() {
   const [error, setError] = useState<string | null>(null);
   const newPasswordRef = useRef<TextInput>(null);
   const confirmPasswordRef = useRef<TextInput>(null);
+  const busyRef = useRef(false);
 
   const newPasswordError = newPassword.length > 0 ? passwordPolicyError(newPassword, t) : null;
   // No length guard, unlike newPasswordError above: passwordPolicyError reports
@@ -66,7 +67,12 @@ export default function ChangePasswordScreen() {
   };
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    // canSubmit reads the render-time `busy`, so two presses landing before
+    // React re-renders both pass it. The second would throw out of the auth
+    // transition guard, painting a failure under the success alert and freeing
+    // the button while the real request is still in flight.
+    if (!canSubmit || busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -81,6 +87,7 @@ export default function ChangePasswordScreen() {
         setError(userMessageForError(err, t('cp.failed')));
       }
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -110,6 +117,10 @@ export default function ChangePasswordScreen() {
         <View style={styles.form}>
           <Text style={styles.label}>{t('cp.currentLabel')}</Text>
           <View style={styles.inputRow}>
+            {/* Every field here carries autoCapitalize/autoCorrect for the same
+                reason: Show clears secureTextEntry, which is what suppresses
+                the keyboard's sentence-capitalization and autocorrect
+                defaults, and a capitalized new password would be saved. */}
             <TextInput
               accessibilityLabel={t('cp.currentLabel')}
               style={[
@@ -124,7 +135,9 @@ export default function ChangePasswordScreen() {
               placeholder={t('cp.currentPlaceholder')}
               placeholderTextColor={colors.muted}
               secureTextEntry={!visibleFields.current}
+              autoCapitalize="none"
               autoComplete="password"
+              autoCorrect={false}
               textContentType="password"
               returnKeyType="next"
               onSubmitEditing={() => newPasswordRef.current?.focus()}
@@ -155,7 +168,9 @@ export default function ChangePasswordScreen() {
               placeholder={t('signup.passwordPlaceholder')}
               placeholderTextColor={colors.muted}
               secureTextEntry={!visibleFields.next}
+              autoCapitalize="none"
               autoComplete="new-password"
+              autoCorrect={false}
               textContentType="newPassword"
               returnKeyType="next"
               onSubmitEditing={() => confirmPasswordRef.current?.focus()}
@@ -186,7 +201,9 @@ export default function ChangePasswordScreen() {
               placeholder={t('cp.confirmPlaceholder')}
               placeholderTextColor={colors.muted}
               secureTextEntry={!visibleFields.confirm}
+              autoCapitalize="none"
               autoComplete="new-password"
+              autoCorrect={false}
               textContentType="newPassword"
               returnKeyType="done"
               onSubmitEditing={() => void handleSubmit()}

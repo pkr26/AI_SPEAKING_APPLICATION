@@ -35,17 +35,23 @@ export class PostgresRateLimitStore implements Store {
   async increment(key: string): Promise<ClientRateLimitInfo> {
     let rows: CounterRow[];
     try {
+      // clock_timestamp() is VOLATILE: every call site is evaluated separately,
+      // so two independent samples straddling reset_at would let the hits and
+      // reset_at branches disagree and carry a full stale count into a brand
+      // new window. The proposed row samples the clock exactly once, and both
+      // branches recover that single instant from EXCLUDED.reset_at.
       ({ rows } = await pool.query<CounterRow>(
         `INSERT INTO rate_limit_windows (namespace, key_hash, hits, reset_at)
        VALUES ($1, $2, 1, clock_timestamp() + ($3::double precision * interval '1 millisecond'))
        ON CONFLICT (namespace, key_hash) DO UPDATE
        SET hits = CASE
-             WHEN rate_limit_windows.reset_at <= clock_timestamp() THEN 1
+             WHEN rate_limit_windows.reset_at <= EXCLUDED.reset_at - ($3::double precision * interval '1 millisecond')
+               THEN 1
              ELSE LEAST(rate_limit_windows.hits + 1, 2147483647)
            END,
            reset_at = CASE
-             WHEN rate_limit_windows.reset_at <= clock_timestamp()
-               THEN clock_timestamp() + ($3::double precision * interval '1 millisecond')
+             WHEN rate_limit_windows.reset_at <= EXCLUDED.reset_at - ($3::double precision * interval '1 millisecond')
+               THEN EXCLUDED.reset_at
              ELSE rate_limit_windows.reset_at
            END
        RETURNING hits::int, reset_at`,
@@ -96,15 +102,27 @@ export class PostgresRateLimitStore implements Store {
   // the client disconnected after paid capacity was committed. A plain
   // increment would start a FRESH window (hits=1) when the abort lands after
   // the window expired while the library refund was skipped — over-charging
-  // the aborting user into the next window. Same fail-safe contract as
-  // decrement: callers fire-and-forget, so errors are logged, never thrown.
-  async incrementWithinWindow(key: string): Promise<void> {
+  // the aborting user into the next window. Liveness alone is not enough
+  // either: increment renews an expired window IN PLACE on the same row, so a
+  // rival request can roll the counter into a successor window that is equally
+  // live but no longer owes this hit anything. `observedResetAt` is the reset
+  // time the limiter saw when it counted the hit, which pins the re-spend to
+  // that exact window; a rolled row (or an absent observation, when the
+  // limiter never ran) matches nothing and the re-spend stays a no-op. The
+  // comparison is millisecond-truncated because node-postgres drops the
+  // microsecond remainder when it parses timestamptz into a Date. Same
+  // fail-safe contract as decrement: callers fire-and-forget, so errors are
+  // logged, never thrown.
+  async incrementWithinWindow(key: string, observedResetAt: Date | undefined): Promise<void> {
     try {
       await pool.query(
         `UPDATE rate_limit_windows
          SET hits = LEAST(hits + 1, 2147483647)
-         WHERE namespace = $1 AND key_hash = $2 AND reset_at > clock_timestamp()`,
-        [this.namespace, this.hash(key)],
+         WHERE namespace = $1
+           AND key_hash = $2
+           AND reset_at > clock_timestamp()
+           AND date_trunc('milliseconds', reset_at) = $3`,
+        [this.namespace, this.hash(key), observedResetAt],
       );
     } catch (err) {
       logger.warn({ err, namespace: this.namespace }, 'rate-limit re-spend failed');

@@ -12,7 +12,14 @@ import {
   MAX_PASSWORD_UTF8_BYTES,
   type useAuth,
 } from '../src/lib/auth';
-import { translateFor, type MessageKey, type UiLanguage } from '../src/lib/i18n';
+import {
+  I18nProvider,
+  setActiveLanguage,
+  translateFor,
+  useI18n,
+  type MessageKey,
+  type UiLanguage,
+} from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -75,16 +82,27 @@ function MockLink({
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
-jest.mock('expo-router', () => ({
-  router: {
-    push: jest.fn(),
-    replace: jest.fn(),
-    back: jest.fn(),
-    dismissTo: jest.fn(),
-  },
-  useLocalSearchParams: () => mockSearchParams,
-  Link: MockLink,
-}));
+jest.mock('expo-router', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  return {
+    router: {
+      push: jest.fn(),
+      replace: jest.fn(),
+      back: jest.fn(),
+      dismissTo: jest.fn(),
+    },
+    useLocalSearchParams: () => mockSearchParams,
+    // Signup scopes its language preview to focus; run the effect on mount and
+    // its cleanup on unmount, the way expo-router does on navigation.
+    useFocusEffect: (callback: () => void | (() => void)) => {
+      ReactActual.useEffect(() => {
+        const cleanup = callback();
+        return typeof cleanup === 'function' ? cleanup : undefined;
+      }, [callback]);
+    },
+    Link: MockLink,
+  };
+});
 
 // ----- auth mock -----
 
@@ -149,6 +167,9 @@ beforeEach(() => {
   mockSearchParams = {};
   mockAuthValue = makeAuth();
   mockedConsumeSessionExpiredNotice.mockResolvedValue(false);
+  // The preview test below mounts the real I18nProvider, whose effect moves the
+  // module-level language; pin it back so every test starts in English.
+  setActiveLanguage('en');
 });
 
 async function fillLogin(email: string, password: string) {
@@ -476,7 +497,11 @@ describe('login screen', () => {
     });
     expect(screen.getByLabelText(t('login.passwordLabel')).props).toMatchObject({
       secureTextEntry: true,
+      // Show turns secureTextEntry off, so the keyboard defaults apply to a
+      // revealed password unless both of these are pinned.
+      autoCapitalize: 'none',
       autoComplete: 'password',
+      autoCorrect: false,
       textContentType: 'password',
       returnKeyType: 'go',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
@@ -723,6 +748,16 @@ function signUpButton(lang: UiLanguage = 'en') {
   return screen.getByRole('button', { name: translateFor(lang, 'signup.submit') });
 }
 
+/**
+ * Reports the provider's language from outside the signup route, so a preview
+ * that outlives the screen is observable the way login and the reset flow see
+ * it.
+ */
+function LanguageProbe() {
+  const { language } = useI18n();
+  return <Text testID="provider-language">{language}</Text>;
+}
+
 describe('signup screen', () => {
   it('renders all fields and language choices', async () => {
     await render(<SignupScreen />);
@@ -904,7 +939,9 @@ describe('signup screen', () => {
     expect(flattenedStyle(telugu)).toMatchObject({
       alignItems: 'center',
       backgroundColor: colors.card,
-      borderColor: colors.border,
+      // The chip fill is the card it sits on, so the resting boundary must be
+      // the form-field token, not the decorative hairline.
+      borderColor: colors.inputBorder,
       flexBasis: '47%',
     });
     expect(flattenedStyle(textNode(telugu, 'తెలుగు'))).toEqual({
@@ -944,6 +981,29 @@ describe('signup screen', () => {
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       selected: true,
     });
+  });
+
+  it('drops the previewed language once the signup screen is left', async () => {
+    const view = await render(
+      <I18nProvider userLanguage={null}>
+        <SignupScreen />
+        <LanguageProbe />
+      </I18nProvider>,
+    );
+
+    // The preview is provider-wide while signup is on screen.
+    await fireEvent.press(screen.getByLabelText('Chinese (Simplified), 简体中文'));
+    expect(screen.getByTestId('provider-language')).toHaveTextContent('zh');
+
+    // Leaving signup must not strand login, the reset flow, and event-time copy
+    // in a language the user only sampled: no signed-out screen offers a chip
+    // back to English.
+    await view.rerender(
+      <I18nProvider userLanguage={null}>
+        <LanguageProbe />
+      </I18nProvider>,
+    );
+    expect(screen.getByTestId('provider-language')).toHaveTextContent('en');
   });
 
   it('enforces trimmed name and email boundaries', async () => {
@@ -995,7 +1055,11 @@ describe('signup screen', () => {
     });
     expect(screen.getByLabelText(t('login.passwordLabel')).props).toMatchObject({
       secureTextEntry: true,
+      // The registered password must be exactly what was typed: with Show on,
+      // the keyboard would otherwise capitalize and autocorrect it.
+      autoCapitalize: 'none',
       autoComplete: 'new-password',
+      autoCorrect: false,
       textContentType: 'newPassword',
       returnKeyType: 'go',
       maxLength: MAX_PASSWORD_UTF8_BYTES,

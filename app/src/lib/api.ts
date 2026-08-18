@@ -70,7 +70,11 @@ function resolveBaseUrl(): string {
   if (url.protocol !== 'https:' && !(__DEV__ && url.protocol === 'http:')) {
     throw new Error('EXPO_PUBLIC_API_URL must use HTTPS outside development.');
   }
-  if (url.username || url.password || url.search || url.hash) {
+  // An empty-but-present query or fragment ('https://api.example.com/api?')
+  // reads back as '' from url.search/url.hash but still serializes into href,
+  // so the raw value is what gets checked: a trailing '?' or '#' would
+  // otherwise swallow every request path instead of failing fast here.
+  if (raw.includes('?') || raw.includes('#') || url.username || url.password) {
     throw new Error('EXPO_PUBLIC_API_URL cannot contain credentials, a query, or a fragment.');
   }
 
@@ -183,6 +187,13 @@ function retryWaitLine(error: ApiError): string | null {
     return hours === 1 ? translate('wait.hour') : translate('wait.hours', { count: hours });
   }
   if (error.retryAfterSeconds === undefined) return null;
+  // express-rate-limit emits only a Retry-After header, so hour-scale 429s
+  // (the per-network daily cap) reach us as seconds and must not be rendered
+  // as "1440 minutes".
+  if (error.retryAfterSeconds >= 3600) {
+    const hours = Math.ceil(error.retryAfterSeconds / 3600);
+    return hours === 1 ? translate('wait.hour') : translate('wait.hours', { count: hours });
+  }
   if (error.retryAfterSeconds >= 60) {
     const minutes = Math.ceil(error.retryAfterSeconds / 60);
     return minutes === 1 ? translate('wait.minute') : translate('wait.minutes', { count: minutes });

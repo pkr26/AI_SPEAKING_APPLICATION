@@ -623,6 +623,16 @@ describe('root fallback screens', () => {
     expect(router.replace).toHaveBeenCalledWith('/');
   });
 
+  it('titles the dead-link header from the catalog instead of the +not-found route name', async () => {
+    await render(<NotFoundScreen />);
+
+    // The route is declared nowhere in the root Stack, so without options of
+    // its own the native stack would print the raw route name in the header.
+    expect(capturedScreenProps).toHaveLength(1);
+    expect(capturedScreenProps[0]?.name).toBeUndefined();
+    expect(capturedScreenProps[0]?.options).toEqual({ title: t('notFound.title') });
+  });
+
   it('lays the dead-link screen out as a centered themed card', async () => {
     await render(<NotFoundScreen />);
 

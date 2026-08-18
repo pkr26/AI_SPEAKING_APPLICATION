@@ -138,13 +138,17 @@ describe('metrics initialization', () => {
 
     const endTimer = vi.fn();
     runtime.startTimer.mockReturnValueOnce(endTimer);
-    let finish: (() => void) | undefined;
-    const req = { method: 'POST', baseUrl: '/api', route: { path: '/practice' } };
+    let close: (() => void) | undefined;
+    // The mount prefix comes from the request URL, so its casing must be
+    // normalized away before it becomes a label.
+    const req = { method: 'POST', baseUrl: '/ApI', route: { path: '/practice' } };
     const res = {
       statusCode: 201,
+      writableEnded: true,
       once: vi.fn((event: string, callback: () => void) => {
-        expect(event).toBe('finish');
-        finish = callback;
+        // Only 'close' fires for aborted and socket-killed requests.
+        expect(event).toBe('close');
+        close = callback;
       }),
     };
     const next = vi.fn();
@@ -153,7 +157,30 @@ describe('metrics initialization', () => {
 
     expect(runtime.startTimer).toHaveBeenCalledWith({ method: 'POST' });
     expect(next).toHaveBeenCalledOnce();
-    finish?.();
+    close?.();
     expect(endTimer).toHaveBeenCalledWith({ route: '/api/practice', status: '201' });
+  });
+
+  it("labels a response that never ended as 'aborted' and an unmatched request once", async () => {
+    const { httpMetricsMiddleware } = await import('../src/metrics');
+
+    const endTimer = vi.fn();
+    runtime.startTimer.mockReturnValueOnce(endTimer);
+    let close: (() => void) | undefined;
+    // No matched route and no completed response: the client vanished while
+    // the request was in flight, which must still be observed.
+    const req = { method: 'GET', baseUrl: '', route: undefined };
+    const res = {
+      statusCode: 200,
+      writableEnded: false,
+      once: vi.fn((_event: string, callback: () => void) => {
+        close = callback;
+      }),
+    };
+
+    httpMetricsMiddleware(req as never, res as never, vi.fn());
+    close?.();
+
+    expect(endTimer).toHaveBeenCalledWith({ route: '(unmatched)', status: 'aborted' });
   });
 });

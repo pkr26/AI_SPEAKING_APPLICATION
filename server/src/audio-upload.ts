@@ -18,6 +18,22 @@ export { MAX_AUDIO_BYTES } from './upload';
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
+// Errnos the local temp-file write (or its chmod) can raise. Download failures
+// carry bare Node errnos too — a body truncated mid-transfer rejects with
+// ERR_STREAM_PREMATURE_CLOSE/ECONNRESET after the SDK call already resolved,
+// so it never gets $metadata — hence classification is by explicit filesystem
+// errno rather than by "looks like a plain Node error".
+const LOCAL_DISK_ERROR_CODES = new Set([
+  'EACCES',
+  'EDQUOT',
+  'EEXIST',
+  'EIO',
+  'EMFILE',
+  'ENFILE',
+  'ENOSPC',
+  'EPERM',
+  'EROFS',
+]);
 
 interface SubmittedAudioCleanup {
   userId: string;
@@ -223,8 +239,13 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
 
   cleanup.finalizing = (async () => {
     // A pre-route conflict is not definitive: an owner may be processing even
-    // before it can insert the shared claim under DB-pool saturation.
-    if (res.statusCode === 409 || res.statusCode === 429) {
+    // before it can insert the shared claim under DB-pool saturation. A 503 is
+    // pure backpressure (assess semaphore, inspection cap, shed pool): no claim
+    // survives it and no paid work committed, and the client is contracted to
+    // retry the identical submission after Retry-After, so the object must
+    // still be there. The mandatory bucket lifecycle bounds the orphan window
+    // exactly as it already does for 409/429.
+    if (res.statusCode === 409 || res.statusCode === 429 || res.statusCode === 503) {
       return;
     }
     // A duplicate can be stopped before claimAssessmentRequest (for example by
@@ -357,11 +378,16 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     if (s3Err.name === 'NoSuchKey' || s3Err.name === 'NotFound' || s3Err.name === '404') {
       throw new HttpError(400, 'audio upload not found or expired');
     }
-    // A Node syscall failure (ENOSPC/EMFILE/EACCES from the temp-file write
-    // stream or chmod) is a local disk fault, not an S3 outage: plain 500 with
-    // a distinct log line. AWS SDK errors carry $metadata and keep the 502.
+    // A filesystem syscall failure (ENOSPC/EMFILE/EACCES from the temp-file
+    // write stream or chmod) is a local disk fault, not an S3 outage: plain 500
+    // with a distinct log line. AWS SDK errors carry $metadata and keep the
+    // 502, and so does every transport errno the download stream can raise.
     const systemError = err as NodeJS.ErrnoException & { $metadata?: unknown };
-    if (systemError.$metadata === undefined && typeof systemError.code === 'string') {
+    if (
+      systemError.$metadata === undefined &&
+      typeof systemError.code === 'string' &&
+      LOCAL_DISK_ERROR_CODES.has(systemError.code)
+    ) {
       logger.error({ err, userId: authed.user!.id }, 'failed to store downloaded audio on local disk');
       throw new HttpError(500, 'Internal server error', 'INTERNAL');
     }

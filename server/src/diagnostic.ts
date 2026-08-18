@@ -140,8 +140,14 @@ async function finalizeDiagnosticAnswer(
     await client.query('BEGIN');
     // Parent-first lock ordering (mirrors storePracticeResult in practice.ts):
     // account deletion locks users and then cascades into diagnostic_state, so
-    // taking the child row first here would be a lock-inversion deadlock.
-    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    // taking the child row first here would be a lock-inversion deadlock. The
+    // locked row is also the existence check: when the account was deleted
+    // while this assessment ran, lockState would otherwise re-insert the child
+    // row and surface a foreign-key violation as a 500 instead of this 409.
+    const lockedUser = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
+    if (lockedUser.rowCount !== 1) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
     const state = await lockState(client, userId);
     if (
       state.processing_claim_id !== claimId ||
@@ -247,6 +253,24 @@ export function createDiagnosticRouter(limiters: Limiters) {
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
+        // Parent-first lock ordering (mirrors finalizeDiagnosticAnswer), and
+        // the locked row — not the copy requireAuth read before this
+        // transaction — decides whether the diagnostic is still running: this
+        // lock waits out a final answer's finalization, which leaves a
+        // terminal window (low_idx > high_idx) that would otherwise index
+        // LEVELS out of range or serve a question /answer can only reject.
+        const lockedUser = await client.query<{ cefr_level: string | null; diagnostic_completed: boolean }>(
+          'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+          [user.id],
+        );
+        const lockedUserRow = lockedUser.rows[0];
+        if (!lockedUserRow) {
+          throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+        }
+        if (lockedUserRow.diagnostic_completed) {
+          await client.query('COMMIT');
+          return res.json({ done: true, level: lockedUserRow.cefr_level });
+        }
         const state = await lockState(client, user.id);
         let question: QuestionJson | undefined;
         if (state.current_question_id) {
@@ -287,8 +311,14 @@ export function createDiagnosticRouter(limiters: Limiters) {
       try {
         await client.query('BEGIN');
         // Parent-first lock ordering (mirrors finalizeDiagnosticAnswer):
-        // account deletion locks users and then cascades into diagnostic_state.
-        await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [user.id]);
+        // account deletion locks users and then cascades into diagnostic_state,
+        // and a missing row means the account went away after requireAuth read
+        // it, so the restart must report state change instead of letting
+        // lockState re-insert the child row into a foreign-key violation.
+        const lockedUser = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [user.id]);
+        if (lockedUser.rowCount !== 1) {
+          throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+        }
         // Locks the row (creating it on first use) so a restart serializes
         // against any concurrent answer finalization.
         await lockState(client, user.id);

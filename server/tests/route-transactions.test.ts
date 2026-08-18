@@ -171,12 +171,38 @@ describe('assessment route transaction lifecycles', () => {
     }
   });
 
-  it('locks the users parent row before the diagnostic_state child row in finalize and restart', async () => {
+  it('locks the users parent row before the practice_inflight child row when claiming an attempt', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const level = await completeDiagnostic(a, token);
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
+      level,
+    ]);
+
+    const { result, leases } = await observePoolLeases(() =>
+      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), question.rows[0].id),
+    );
+
+    expect(result.status).toBe(200);
+    // Account deletion locks users and cascades into practice_inflight, so a
+    // claim that touched the child row first — the stale-claim DELETE, or the
+    // INSERT's foreign-key check on users — would deadlock (40P01) against a
+    // concurrent DELETE /auth/account.
+    const claimLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes('INSERT INTO practice_inflight (user_id, question_id, claim_id)')),
+    );
+    expect(claimLease).toBeDefined();
+    expect(claimLease!.statements[0]).toBe('BEGIN');
+    expect(claimLease!.statements[1]).toBe('SELECT 1 FROM users WHERE id = $1 FOR UPDATE');
+    expect(claimLease!.statements.findIndex((text) => text.includes('FROM practice_inflight'))).toBeGreaterThan(1);
+  });
+
+  it('locks the users parent row before the diagnostic_state child row in next, finalize, and restart', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
 
     const { result, leases } = await observePoolLeases(async () => {
+      const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
       const answer = await answerForm(
         request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
         next.body.question.id,
@@ -185,25 +211,35 @@ describe('assessment route transaction lifecycles', () => {
         .post('/diagnostic/restart')
         .set('Authorization', `Bearer ${token}`)
         .send({ confirm: true });
-      return { answer, restart };
+      return { next, answer, restart };
     });
 
+    expect(result.next.status).toBe(200);
     expect(result.answer.status).toBe(200);
     expect(result.restart.status).toBe(204);
 
     // Account deletion locks users first and cascades into diagnostic_state,
-    // so any diagnostic transaction that writes users after locking
-    // diagnostic_state would deadlock against it (40P01). Both transactions
-    // below write users, so both must take the parent lock first.
-    const parentLock = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
+    // so any diagnostic transaction that writes diagnostic_state after locking
+    // it would deadlock against it (40P01). All three transactions below reach
+    // the child row, so all three must take the parent lock first — and for
+    // GET /next that lock is also the authoritative completion check.
+    const writerParentLock = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
+    const nextParentLock = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
     const childLock = 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE';
+    const nextLease = leases.find(({ statements }) =>
+      statements.some((text) => text.includes('UPDATE diagnostic_state SET current_question_id = $1')),
+    );
     const finalizeLease = leases.find(({ statements }) =>
       statements.some((text) => text.includes("VALUES ($1, $2, 'diagnostic', $3")),
     );
     const restartLease = leases.find(({ statements }) =>
       statements.some((text) => text.includes('SET low_idx = 0, high_idx = 5')),
     );
-    for (const lease of [finalizeLease, restartLease]) {
+    for (const [lease, parentLock] of [
+      [nextLease, nextParentLock],
+      [finalizeLease, writerParentLock],
+      [restartLease, writerParentLock],
+    ] as const) {
       expect(lease).toBeDefined();
       const parentAt = lease!.statements.indexOf(parentLock);
       const childAt = lease!.statements.indexOf(childLock);

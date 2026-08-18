@@ -394,6 +394,22 @@ describe('pending assessment edge cases', () => {
     expect(mockStorage.size).toBe(0);
   });
 
+  it('deletes an unreadable record when no request id is expected', async () => {
+    // An undecryptable but deletable entry (an Android backup restored without
+    // its Keystore key) has to be healed here: gating the unconditional delete
+    // on a read would make session-expiry cleanup fail and block the next login.
+    const { secureStore, mod } = loadFresh();
+    mockStorage.set(STORAGE_KEY, JSON.stringify(pending));
+    jest.mocked(secureStore.getItemAsync).mockRejectedValue(new Error('keychain locked'));
+
+    await expect(mod.clearPendingAssessment()).resolves.toBeUndefined();
+
+    expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(secureStore.deleteItemAsync).toHaveBeenCalledTimes(1);
+    expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+    await expect(mod.loadPendingAssessment()).resolves.toBeNull();
+  });
+
   it('loads from storage when clearing without an in-memory value', async () => {
     const { mod } = loadFresh();
     mockStorage.set(STORAGE_KEY, JSON.stringify(pending));

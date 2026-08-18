@@ -58,7 +58,10 @@ export default function ResetPasswordScreen() {
     try {
       await apiResetPassword(trimmedEmail, trimmedCode, password);
       // One-shot success banner on the login screen; no secrets in the URL.
-      router.replace({ pathname: '/login', params: { notice: 'reset' } });
+      // dismissTo, not replace: the code is spent, so the request step and its
+      // "check your email" state must leave the stack with this screen instead
+      // of staying one back-gesture away with a code that now fails.
+      router.dismissTo({ pathname: '/login', params: { notice: 'reset' } });
     } catch (err) {
       setError(userMessageForError(err, t('cp.failed')));
     } finally {
@@ -119,6 +122,10 @@ export default function ResetPasswordScreen() {
 
           <Text style={styles.label}>{t('cp.newLabel')}</Text>
           <View style={styles.inputRow}>
+            {/* Show clears secureTextEntry, which is what suppresses the
+                keyboard's sentence-capitalization and autocorrect defaults;
+                without these two props the reset would store a password with
+                a capital first letter the user never typed. */}
             <TextInput
               ref={passwordRef}
               accessibilityLabel={t('cp.newLabel')}
@@ -134,7 +141,9 @@ export default function ResetPasswordScreen() {
               placeholder={t('signup.passwordPlaceholder')}
               placeholderTextColor={colors.muted}
               secureTextEntry={!passwordVisible}
+              autoCapitalize="none"
               autoComplete="new-password"
+              autoCorrect={false}
               textContentType="newPassword"
               returnKeyType="go"
               onSubmitEditing={() => void handleSubmit()}

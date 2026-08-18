@@ -58,7 +58,13 @@ function MockLink({
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
 jest.mock('expo-router', () => ({
-  router: { push: jest.fn(), replace: jest.fn(), back: jest.fn(), dismissTo: jest.fn() },
+  router: {
+    push: jest.fn(),
+    navigate: jest.fn(),
+    replace: jest.fn(),
+    back: jest.fn(),
+    dismissTo: jest.fn(),
+  },
   useLocalSearchParams: () => mockSearchParams,
   Link: MockLink,
 }));
@@ -117,7 +123,9 @@ const mockReset = apiResetPassword as jest.Mock;
 const mockedConsumeNotice = consumeSessionExpiredNotice as jest.Mock;
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
+  navigate: jest.Mock;
   replace: jest.Mock;
+  dismissTo: jest.Mock;
 };
 
 type SemanticStyle = Record<string, unknown>;
@@ -293,10 +301,31 @@ describe('forgot-password screen', () => {
     expect(screen.getByText(t('reset.sentBody'))).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('reset.continue') }));
-    expect(mockRouter.push).toHaveBeenCalledWith({
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/reset-password',
       params: { email: 'ada@example.com' },
     });
+  });
+
+  it('routes a double-tapped Continue through the deduping navigation', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+
+    await screen.findByRole('button', { name: t('reset.continue') });
+    const target = { pathname: '/reset-password', params: { email: 'ada@example.com' } };
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.continue') }));
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.continue') }));
+
+    // push always pushes, so an impatient second tap would leave an orphan,
+    // empty reset form in the stack; both taps must name the identical route
+    // so navigate dismisses back to the open one instead.
+    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(2);
+    expect(mockRouter.navigate).toHaveBeenNthCalledWith(1, target);
+    expect(mockRouter.navigate).toHaveBeenNthCalledWith(2, target);
   });
 
   it('shows the rate-limit wait line inline on a 429', async () => {
@@ -614,11 +643,14 @@ describe('reset-password screen', () => {
       'NewPass123',
     );
     await waitFor(() =>
-      expect(mockRouter.replace).toHaveBeenCalledWith({
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
         pathname: '/login',
         params: { notice: 'reset' },
       }),
     );
+    // replace would only swap this screen, leaving the request step and its
+    // "check your email" state one back-gesture away with a spent code.
+    expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
   it('maps RESET_INVALID onto the localized invalid-code copy', async () => {
@@ -636,7 +668,7 @@ describe('reset-password screen', () => {
     });
 
     expect(await screen.findByText(t('error.resetInvalid'))).toBeTruthy();
-    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });
 
   it('shows the rate-limit wait line when reset attempts are throttled', async () => {
@@ -698,7 +730,11 @@ describe('reset-password screen', () => {
     expect(screen.getByLabelText(t('cp.newLabel')).props).toMatchObject({
       placeholder: t('signup.passwordPlaceholder'),
       placeholderTextColor: colors.muted,
+      // Show clears secureTextEntry, so without these the keyboard would
+      // capitalize and autocorrect the password this flow saves.
+      autoCapitalize: 'none',
       autoComplete: 'new-password',
+      autoCorrect: false,
       textContentType: 'newPassword',
       returnKeyType: 'go',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
@@ -807,7 +843,7 @@ describe('reset-password screen', () => {
     await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'submitEditing');
 
     expect(mockReset).not.toHaveBeenCalled();
-    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
     expect(screen.queryByText(t('reset.submitNewBusy'))).toBeNull();
   });
 
@@ -865,7 +901,7 @@ describe('reset-password screen', () => {
       await pending.promise;
     });
     await waitFor(() =>
-      expect(mockRouter.replace).toHaveBeenCalledWith({
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
         pathname: '/login',
         params: { notice: 'reset' },
       }),
@@ -889,7 +925,7 @@ describe('reset-password screen', () => {
     expect(
       screen.getByRole('button', { name: t('reset.submitNew') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
-    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
   });
 
   it.each([

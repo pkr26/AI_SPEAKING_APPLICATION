@@ -210,7 +210,11 @@ export default function AttemptScreen() {
             void queryClient.invalidateQueries({
               queryKey: ['practice-question', user?.id, user?.cefrLevel],
             });
-            router.replace('/practice');
+            // Practice Mode is always entered from help, so replace() would
+            // swap only this route and leave the abandoned question's help
+            // screen under a second live Practice screen. Pop back to the one
+            // already in the stack, exactly as the feedback card does.
+            router.dismissTo('/practice');
           }}
           onRecoveryEndpointMismatch={(savedEndpoint) => {
             if (savedEndpoint === '/practice/attempt/native') {

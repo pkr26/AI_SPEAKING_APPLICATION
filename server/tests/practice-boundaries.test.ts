@@ -241,4 +241,24 @@ describe('practice feedback response bounds', () => {
     expect(buildNativeFallbackFeedback('x'.repeat(1_000))).toHaveLength(800);
     expect(buildNativeFallbackFeedback('x'.repeat(1_000), 'native example')).toHaveLength(800);
   });
+
+  it('budgets the lead-in against the provider feedback, never promising a sliced-away example', () => {
+    const lead = ' An on-topic answer could be: ';
+    const suffix = ' — try saying it in English next!';
+
+    // One character of example room left: the lead-in still earns its place.
+    const tightFeedback = 'p'.repeat(800 - lead.length - suffix.length - 1);
+    const tight = buildNativeFallbackFeedback(tightFeedback, 'నా ఊరు');
+    expect(tight).toBe(`${tightFeedback}${lead}న${suffix}`);
+    expect(tight).toHaveLength(800);
+
+    // One character more of provider feedback and nothing fits: the learner
+    // reads the feedback alone instead of a dangling "answer could be: ".
+    const exactFeedback = 'p'.repeat(800 - lead.length - suffix.length);
+    expect(buildNativeFallbackFeedback(exactFeedback, 'నా ఊరు')).toBe(exactFeedback);
+    // The grading schema allows up to 800 characters, so a 750-character
+    // feedback arrives whole rather than hard-cut inside the dropped lead-in.
+    const longFeedback = 'p'.repeat(750);
+    expect(buildNativeFallbackFeedback(longFeedback, 'నా ఊరు')).toBe(longFeedback);
+  });
 });

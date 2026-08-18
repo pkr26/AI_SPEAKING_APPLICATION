@@ -624,6 +624,150 @@ describe('settings profile card', () => {
     expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
   });
 
+  it('re-schedules at the hour storage holds, not the one captured at press time', async () => {
+    // The hour can move while the PATCH is in flight; re-arming from the
+    // closure would put the reminder back at the hour the learner just left.
+    mockGetReminder.mockResolvedValueOnce({ hour: 19 }).mockResolvedValue({ hour: 20 });
+    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+    });
+
+    expect(mockEnableReminder).toHaveBeenCalledWith(20, 'hi');
+  });
+
+  it('leaves a reminder switched off during the language change switched off', async () => {
+    // Storage is the truth: re-arming from the press-time state would revive a
+    // daily notification the learner has just turned off, with the toggle —
+    // and the stored preference — both still reading off.
+    mockGetReminder.mockResolvedValueOnce({ hour: 19 }).mockResolvedValue(null);
+    let resolveUpdate: (user: User) => void = () => undefined;
+    mockUpdateProfile.mockReturnValue(
+      new Promise<User>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(languageChip(1));
+    });
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
+    });
+    expect(mockDisableReminder).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveUpdate({ ...USER, nativeLanguage: 'hi' });
+    });
+
+    expect(mockEnableReminder).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('reminder.failed'))).toBeNull();
+    expect(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+    ).toMatchObject({ checked: false });
+  });
+
+  it('skips the language re-schedule while another reminder change is in flight', async () => {
+    // The in-flight disable owns the OS schedule: re-arming underneath it can
+    // land after its cancel and leave a notification nothing turned on.
+    mockGetReminder.mockResolvedValue({ hour: 19 });
+    let resolveDisable: () => void = () => undefined;
+    mockDisableReminder.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveDisable = resolve;
+      }),
+    );
+    let resolveUpdate: (user: User) => void = () => undefined;
+    mockUpdateProfile.mockReturnValue(
+      new Promise<User>((resolve) => {
+        resolveUpdate = resolve;
+      }),
+    );
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(languageChip(1));
+    });
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
+    });
+
+    await act(async () => {
+      resolveUpdate({ ...USER, nativeLanguage: 'hi' });
+    });
+    expect(mockEnableReminder).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveDisable();
+    });
+  });
+
+  it('holds the reminder latch while the language re-schedule runs', async () => {
+    mockGetReminder.mockResolvedValue({ hour: 19 });
+    let resolveEnable: (outcome: string) => void = () => undefined;
+    mockEnableReminder.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveEnable = resolve;
+      }),
+    );
+    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(languageChip(1));
+    });
+
+    const toggle = () => screen.getByRole('switch', { name: t('reminder.toggleLabel') });
+    expect(toggle().props.accessibilityState).toEqual({
+      checked: true,
+      disabled: true,
+      busy: true,
+    });
+    // A press already queued against the previous render must not start a
+    // second reminder mutation on top of the re-schedule.
+    await act(async () => {
+      committedPressHandler(toggle())();
+    });
+    expect(mockDisableReminder).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveEnable('enabled');
+    });
+
+    expect(toggle().props.accessibilityState).toEqual({
+      checked: true,
+      disabled: false,
+      busy: false,
+    });
+    // The latch is released in the finally: the toggle works again.
+    await act(async () => {
+      await fireEvent.press(toggle());
+    });
+    expect(mockDisableReminder).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the reminder controls alone when there is no reminder to re-schedule', async () => {
+    // The re-schedule takes the reminder latch, so it must not run at all with
+    // nothing scheduled: the toggle would lock for a keychain read the learner
+    // never asked for.
+    mockGetReminder.mockResolvedValueOnce(null).mockReturnValue(new Promise(() => undefined));
+    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(languageChip(1));
+    });
+
+    expect(mockGetReminder).toHaveBeenCalledTimes(1);
+    expect(mockEnableReminder).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+    ).toEqual({ checked: false, disabled: false, busy: false });
+  });
+
   it('does not surface a language error when the reminder re-schedule fails', async () => {
     mockGetReminder.mockResolvedValue({ hour: 19 });
     mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
@@ -636,6 +780,43 @@ describe('settings profile card', () => {
 
     expect(mockAuthValue.setUser).toHaveBeenCalled();
     expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    // A failure that never reached the schedule leaves the preference intact,
+    // so the toggle keeps reporting the reminder that is still armed.
+    expect(await screen.findByText(t('reminder.failed'))).toBeTruthy();
+    expect(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+    ).toMatchObject({ checked: true });
+    expect(screen.getByText(reminderTimeText(19))).toBeTruthy();
+  });
+
+  it('turns the toggle off when the failed re-schedule left nothing scheduled', async () => {
+    // enableDailyReminder cancels the old schedule before creating the new one
+    // and forgets the preference when it cannot replace it: the toggle must
+    // stop claiming a reminder that no longer exists anywhere.
+    mockGetReminder
+      .mockResolvedValueOnce({ hour: 8 })
+      .mockResolvedValueOnce({ hour: 8 })
+      .mockResolvedValue(null);
+    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockEnableReminder.mockRejectedValue(new Error('os error'));
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(languageChip(1));
+    });
+
+    expect(await screen.findByText(t('reminder.failed'))).toBeTruthy();
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    const toggle = () => screen.getByRole('switch', { name: t('reminder.toggleLabel') });
+    expect(toggle().props.accessibilityState).toMatchObject({ checked: false });
+    expect(screen.queryByText(reminderTimeText(8))).toBeNull();
+
+    // The hour survives the failure, so re-arming resumes where it was.
+    mockEnableReminder.mockResolvedValue('enabled');
+    await act(async () => {
+      await fireEvent.press(toggle());
+    });
+    expect(mockEnableReminder).toHaveBeenLastCalledWith(8);
   });
 
   it('does not PATCH when tapping the already-selected language', async () => {
@@ -1259,6 +1440,10 @@ describe('retake placement test', () => {
     await pressAlertButton(t('retake.confirm'));
 
     expect(mockRestartDiagnostic).toHaveBeenCalledTimes(1);
+    // The reset test re-uses the same /next cache key, so a surviving entry
+    // would re-serve the already-answered question (or the old congrats
+    // screen) and the recorded answer would come back 409 QUESTION_MISMATCH.
+    expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['diagnostic-next'] });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-question'] });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-history'] });
@@ -1377,6 +1562,62 @@ describe('retake placement test', () => {
     });
   });
 
+  it('writes the session user as it stands when the restart lands', async () => {
+    // A language (or name) change can resolve while the restart is in flight.
+    // Rebuilding the user from the confirmation-time closure would revert it,
+    // and nothing refetches /me while a user is set to repair that.
+    let resolveRestart: () => void = () => undefined;
+    mockRestartDiagnostic.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveRestart = resolve;
+      }),
+    );
+    const { rerenderSettings } = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
+    await pressAlertButton(t('retake.confirm'));
+
+    const setUser = mockAuthValue.setUser;
+    const relanguaged = { ...USER, nativeLanguage: 'hi' as const };
+    mockAuthValue = makeAuth({ user: relanguaged, setUser });
+    await act(async () => rerenderSettings());
+
+    await act(async () => {
+      resolveRestart();
+    });
+
+    expect(setUser).toHaveBeenCalledWith({
+      ...relanguaged,
+      diagnosticCompleted: false,
+      cefrLevel: null,
+    });
+  });
+
+  it('does not rebuild a session that ended while the restart was in flight', async () => {
+    let resolveRestart: () => void = () => undefined;
+    mockRestartDiagnostic.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveRestart = resolve;
+      }),
+    );
+    const { rerenderSettings } = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
+    await pressAlertButton(t('retake.confirm'));
+
+    const setUser = mockAuthValue.setUser;
+    mockAuthValue = makeAuth({ user: null, setUser });
+    await act(async () => rerenderSettings());
+
+    await act(async () => {
+      resolveRestart();
+    });
+
+    // There is no profile left to flip; writing a fields-only object would
+    // resurrect a signed-out session as a user with no id or email.
+    expect(setUser).not.toHaveBeenCalled();
+  });
+
   it('keeps the profile untouched when the restart fails', async () => {
     mockRestartDiagnostic.mockRejectedValue(new ApiError(500, 'boom'));
     await renderSettings();
@@ -1427,6 +1668,71 @@ describe('account actions', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs out once when the row is tapped twice before a re-render', async () => {
+    // The second tap would throw out of the auth transition guard, alerting
+    // "we could not log you out" over a logout that is in fact succeeding.
+    let resolveLogout: () => void = () => undefined;
+    const logout = jest.fn().mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveLogout = resolve;
+      }),
+    );
+    mockAuthValue = makeAuth({ logout });
+    await renderSettings();
+
+    const row = screen.getByRole('button', { name: t('common.logOut') });
+    await act(async () => {
+      const press = committedPressHandler(row);
+      press();
+      press();
+    });
+
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveLogout();
+    });
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
+  });
+
+  it('locks the log out row while the logout is in flight and frees it after', async () => {
+    let resolveLogout: () => void = () => undefined;
+    const logout = jest.fn().mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveLogout = resolve;
+      }),
+    );
+    mockAuthValue = makeAuth({ logout });
+    await renderSettings();
+
+    const logoutRow = () => screen.getByRole('button', { name: t('common.logOut') });
+    expect(logoutRow().props.accessibilityState).toEqual({ disabled: false, busy: false });
+
+    await fireEvent.press(logoutRow());
+
+    expect(logoutRow().props.accessibilityState).toEqual({ disabled: true, busy: true });
+    expect(flattenedStyle(logoutRow()).opacity).toBe(0.5);
+
+    await act(async () => {
+      resolveLogout();
+    });
+
+    expect(logoutRow().props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(flattenedStyle(logoutRow()).opacity).toBeUndefined();
+  });
+
+  it('frees the logout latch so a later attempt still runs', async () => {
+    mockAuthValue = makeAuth({ logout: jest.fn().mockRejectedValue(new Error('network down')) });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(mockAuthValue.logout).toHaveBeenCalledTimes(2));
   });
 
   it('explains a logout cleanup failure', async () => {

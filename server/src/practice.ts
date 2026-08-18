@@ -116,7 +116,10 @@ async function pickNewQuestion(
 
 /**
  * Bank exhausted: keep mastered words in rotation, due-first like revision.
- * Deliberately ignores skipped_until — retention is unaffected by skips.
+ * A skip never makes a mastered word ineligible here (retention must not
+ * dead-end when every word is parked), but a parked word sorts LAST: skipping
+ * defers the word whenever another mastered word can take its place, instead
+ * of re-serving the identical question the learner just skipped.
  */
 async function pickRetentionQuestion(
   userId: string,
@@ -130,7 +133,7 @@ async function pickRetentionQuestion(
      JOIN questions q ON q.id = pp.question_id
      WHERE pp.user_id = $1 AND q.cefr_level = $2 AND pp.status = 'mastered'
        AND ($3::uuid IS NULL OR q.id <> $3)
-     ORDER BY pp.due_at ASC, random()
+     ORDER BY (pp.skipped_until IS NULL OR pp.skipped_until <= now()) DESC, pp.due_at ASC, random()
      LIMIT 1`,
     [userId, level, excludeQuestionId ?? null],
   );
@@ -251,6 +254,12 @@ async function claimPracticeAttempt(userId: string, questionId: string): Promise
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+    // Parent-first lock ordering (mirrors storePracticeResult and
+    // diagnostic.ts): account deletion locks users and then cascades into
+    // practice_inflight, so taking the child row first here — the stale-claim
+    // DELETE below, or the INSERT's FK check — would be a lock inversion that
+    // deadlocks (40P01) against a concurrent DELETE /auth/account.
+    await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
     await client.query(
       `DELETE FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2
@@ -444,15 +453,23 @@ async function storePracticeResult(
     }
 
     let response: Record<string, unknown>;
-    const shouldRetry = !result.passed && claim.attemptNo < MAX_ATTEMPTS;
+    // A rival promotion that landed while this provider call was in flight
+    // left the answered question behind at the old level, and /practice/attempt
+    // rejects an off-level question with 403 (assessment-pipeline.ts). Offering
+    // a retry would arm a "Try Again" that the very next request must refuse,
+    // so a stale level closes the run from the current level instead — still
+    // without levelUp, which this attempt did not earn.
+    const staleLevel = lockedUserLevel !== level;
+    const shouldRetry = !result.passed && claim.attemptNo < MAX_ATTEMPTS && !staleLevel;
     if (shouldRetry) {
       response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
     } else {
       // Select after the current attempt is visible in this transaction and
-      // explicitly exclude it. A pass/final failure must always advance, and
-      // after a promotion — this attempt's own, or a rival's that landed while
-      // the provider call was in flight — both the next question and the
-      // progress snapshot come from the CURRENT level.
+      // explicitly exclude it. A pass, a final failure, or a run closed by a
+      // stale level must always advance, and after a promotion — this
+      // attempt's own, or a rival's that landed while the provider call was in
+      // flight — both the next question and the progress snapshot come from
+      // the CURRENT level.
       const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
       const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
       const next = nextPick ? { ...nextPick, progress } : undefined;
@@ -548,10 +565,15 @@ export function buildFinalFeedback(providerFeedback: string, hint: string): stri
  */
 export function buildNativeFallbackFeedback(providerFeedback: string, nativeExample?: string): string {
   if (!nativeExample) return providerFeedback.slice(0, 800);
-  const prefix = `${providerFeedback} An on-topic answer could be: `;
+  const lead = ' An on-topic answer could be: ';
   const suffix = ' — try saying it in English next!';
-  const available = Math.max(0, 800 - prefix.length - suffix.length);
-  return `${prefix}${nativeExample.slice(0, available)}${suffix}`.slice(0, 800);
+  // The provider feedback is itself only bounded by the 800-char grading
+  // schema, so the fixed text is budgeted against it and not just against the
+  // example: with no room left, send the feedback alone rather than a
+  // hard-cut lead-in promising an example that was sliced away.
+  const available = 800 - providerFeedback.length - lead.length - suffix.length;
+  if (available <= 0) return providerFeedback.slice(0, 800);
+  return `${providerFeedback}${lead}${nativeExample.slice(0, available)}${suffix}`;
 }
 
 /** Prompt context handed to the assess pipeline for a catalog question. */
@@ -761,10 +783,15 @@ export function createPracticeRouter(limiters: Limiters) {
         questionTextNative: t.question,
         examples: t.examples,
       };
-      // Content is static per (question, language) — cache privately with an
-      // ETag so repeat visits can be answered with a cheap 304.
+      // Content is static per (question, language), but the language comes
+      // from the caller's profile while the URL does not: a stored response
+      // must never be reused after a language switch or an account swap on
+      // the same device. Keep the cheap 304 (the ETag hashes the
+      // language-specific payload) but force revalidation, and declare the
+      // Authorization dependency for any shared cache in between.
       const etag = `"${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}"`;
-      res.set('Cache-Control', 'private, max-age=3600');
+      res.set('Cache-Control', 'private, no-cache');
+      res.vary('Authorization');
       res.set('ETag', etag);
       // Fetch clients commonly add `Cache-Control: no-cache` while
       // revalidating an explicit If-None-Match. Express then deliberately

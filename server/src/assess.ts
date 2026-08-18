@@ -119,6 +119,16 @@ function createNativeGradingSchema() {
   });
 }
 
+// Completion budgets for the grading call, derived from the schemas above.
+// The speaking schema allows one 800-char feedback field, and English packs
+// roughly four characters per token, so 400 keeps generous headroom. The
+// native schema allows two 800-char fields, and its feedback may quote the
+// learner's Telugu/Hindi/Chinese answer, where a character can cost a whole
+// token — so a schema-maximal native response needs several times that budget.
+// These are ceilings, not spend: the prompts ask for a few short sentences.
+const SPEAKING_MAX_COMPLETION_TOKENS = 400;
+const NATIVE_MAX_COMPLETION_TOKENS = 2000;
+
 function nativeLanguageName(language: NativeLanguage): string {
   switch (language) {
     case 'te':
@@ -239,6 +249,14 @@ interface ProviderAssessmentSpec<T> {
   emptyTranscriptResult: () => T;
   /** Structured-output contract for the grading call. */
   responseFormat: ReturnType<typeof zodResponseFormat>;
+  /**
+   * Completion budget for the grading call, sized from this spec's schema.
+   * Truncation is not a soft failure: the parse helper throws on
+   * finish_reason='length', which maps to a paid 502 that a temperature-0
+   * retry of the same recording reproduces forever while burning another
+   * daily-capacity reservation. Every schema-legal response must fit.
+   */
+  maxCompletionTokens: number;
   /** System prompt for the grading call. */
   systemPrompt: string;
   /**
@@ -310,9 +328,7 @@ async function callProvider<T>(
             model: config.gradingModel,
             response_format: spec.responseFormat,
             temperature: 0,
-            // Headroom above the 800-char feedback cap so a near-max response is
-            // never truncated into unparseable JSON (a paid retryable 502).
-            max_tokens: 400,
+            max_tokens: spec.maxCompletionTokens,
             messages: [
               {
                 role: 'system',
@@ -389,6 +405,7 @@ export function assessSpeaking(
       feedback: 'I could not hear enough English to assess. Please speak clearly and try a slightly longer answer.',
     }),
     responseFormat: zodResponseFormat(gradingSchema, 'speaking_assessment'),
+    maxCompletionTokens: SPEAKING_MAX_COMPLETION_TOKENS,
     systemPrompt: [
       'You evaluate English-learning transcripts against a CEFR-aligned rubric.',
       'Only judge task relevance, grammar, coherence, and vocabulary visible in the transcript.',
@@ -441,6 +458,7 @@ export function assessNativeComprehension(
       feedback: 'I could not hear enough speech to understand your answer. Please speak clearly and try again.',
     }),
     responseFormat: zodResponseFormat(nativeGradingSchema, 'native_comprehension'),
+    maxCompletionTokens: NATIVE_MAX_COMPLETION_TOKENS,
     systemPrompt: [
       'You help an English learner who answered a speaking question in their native language.',
       `The learner answered in ${nativeLanguageName(nativeLanguage)}.`,

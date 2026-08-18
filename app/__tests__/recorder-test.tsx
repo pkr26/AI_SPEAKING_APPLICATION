@@ -964,6 +964,127 @@ describe('Recorder', () => {
       expect(mockRecorder.record).toHaveBeenCalledWith({ forDuration: 120 });
     });
 
+    it('records a foreground permission grant without waiting on any timer', async () => {
+      // The prompt's resume wait must be skipped outright while the app is
+      // already active: under fake timers nothing would ever advance it, so
+      // this start would never finish.
+      jest.useFakeTimers();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: false });
+      const { view } = await renderRecorder();
+
+      await act(async () => {
+        await invokePressHandler(view, START_LABEL);
+      });
+
+      expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
+      expect(mockRecorder.record).toHaveBeenCalledWith({ forDuration: 120 });
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+    });
+
+    it('records a first-ever grant whose own permission dialog backgrounded the app', async () => {
+      const permission = deferred<{ granted: boolean }>();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: false });
+      asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
+      const { view, props } = await renderRecorder();
+
+      const start = invokePressHandler(view, START_LABEL);
+      await waitFor(() =>
+        expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
+      );
+      // The Android dialog pauses the activity itself: AppState reports
+      // 'background' and lifecycle cleanup bumps the epoch while the prompt
+      // the learner is answering is still on screen.
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        permission.resolve({ granted: true });
+        await flushMicrotasks();
+      });
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await start;
+        await flushMicrotasks();
+      });
+
+      // The tap that granted the microphone still records; swallowing it left
+      // a first-time learner pressing a button that did nothing.
+      expect(mockRecorder.record).toHaveBeenCalledWith({ forDuration: 120 });
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it('abandons a granted prompt when the app never comes back to the foreground', async () => {
+      jest.useFakeTimers();
+      const permission = deferred<{ granted: boolean }>();
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: false });
+      asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(permission.promise);
+      const { view, props } = await renderRecorder();
+
+      const start = invokePressHandler(view, START_LABEL);
+      await waitFor(() =>
+        expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1),
+      );
+      // 'inactive' with nothing recording runs no lifecycle cleanup at all, so
+      // only the bounded wait can release the start that is holding the
+      // controls while the prompt is answered off-screen.
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'inactive',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('inactive');
+        permission.resolve({ granted: true });
+        await flushMicrotasks();
+      });
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+
+      // Only a resume ends the wait: another lifecycle report leaves the start
+      // holding the operation lock, so a second tap still does nothing.
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('inactive');
+        await flushMicrotasks();
+      });
+      asMock(AudioModule.getRecordingPermissionsAsync).mockClear();
+      await invokePressHandler(view, START_LABEL);
+      expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
+
+      await act(async () => {
+        jest.advanceTimersByTime(2_000);
+        await start;
+        await flushMicrotasks();
+      });
+
+      // The learner really did leave: nothing records, nothing is announced,
+      // and the device is never switched into recording mode behind them.
+      expect(setAudioModeAsync).not.toHaveBeenCalledWith(
+        expect.objectContaining({ allowsRecording: true }),
+      );
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+
+      // ...and the wait released both its listener and the recorder controls,
+      // so the next tap in the foreground records normally.
+      expect(appStateSubscriptionRemove).toHaveBeenCalledTimes(1);
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(mockRecorder.record).toHaveBeenCalledTimes(1));
+    });
+
     it('shows the permission banner and does not record when denied', async () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
         granted: false,
@@ -1609,6 +1730,89 @@ describe('Recorder', () => {
 
       expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
       expect(deletedRecordingUris()).toEqual([RECORDING_URI]);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('tells the learner on return that backgrounding discarded the saved take', async () => {
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      // Nothing is announced to an app the learner cannot see.
+      expect(props.onError).not.toHaveBeenCalled();
+
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      // The take is deliberately not kept across backgrounding, so returning
+      // to an empty recorder has to come with an explanation.
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errBackgroundDiscarded'));
+      expect(props.onError).toHaveBeenCalledTimes(1);
+      expect(deletedRecordingUris()).toEqual([RECORDING_URI]);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      // Said once, not on every later foreground.
+      expect(props.onError).toHaveBeenCalledTimes(1);
+    });
+
+    it('tells the learner on return that backgrounding discarded a live recording', async () => {
+      const { props } = await renderRecorder();
+      await startRecording();
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errBackgroundDiscarded'));
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('says nothing on return when the background found no take to discard', async () => {
+      const { props } = await renderRecorder();
+
+      backgroundApp();
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('background');
+        await flushMicrotasks();
+      });
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(props.onError).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
@@ -2878,6 +3082,84 @@ describe('Recorder', () => {
       },
     );
 
+    it('returns the take with the upgrade message when the version gate rejects it', async () => {
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(426, 'Please update the app', undefined, {
+          code: 'CLIENT_UPGRADE_REQUIRED',
+        }),
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('error.upgradeRequired')));
+
+      // The version gate rejects ahead of the idempotency claim, so there is
+      // nothing to reconcile: no recovery poll, and the take waits for the
+      // newer build instead of being deleted by an expired lease.
+      expect(apiFetch).not.toHaveBeenCalled();
+      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
+      expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy();
+    });
+
+    it('keeps the take with a connection message when the upload grant never left', async () => {
+      asMock(apiRequestAudioUpload).mockRejectedValue(new ApiError(0, 'connection interrupted'));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      asMock(File).mockClear();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('error.network')));
+
+      // No assessment POST was ever issued, so nothing can have committed:
+      // the handoff is forgotten and the take stays sendable instead of
+      // spinning through a recovery that would silently delete it.
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+    });
+
+    it('keeps the take when the direct-to-S3 upload dies before any assessment POST', async () => {
+      asMock(apiRequestAudioUpload).mockResolvedValue({
+        mode: 's3',
+        uploadUrl: 'https://s3.example.com/upload',
+        uploadFields: { key: S3_AUDIO_KEY },
+        audioKey: S3_AUDIO_KEY,
+        contentType: 'audio/mp4',
+        expiresIn: 300,
+        maxBytes: 25 * 1024 * 1024,
+      });
+      asMock(apiPostPresignedAudio).mockRejectedValue(new ApiError(0, 'connection lost'));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      asMock(File).mockClear();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('error.network')));
+
+      // The abandoned S3 object has no claim pointing at it, so the server's
+      // own cleanup owns it; the two-minute answer is what must survive here.
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+    });
+
+    it('reports a local failure raised before the send with send-specific copy', async () => {
+      asMock(resolveAudioFileDescriptor).mockRejectedValue(new Error('file inspection failed'));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('recorder.errNotSent')));
+
+      expect(apiRequestAudioUpload).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+    });
+
     it('keeps controls locked when rejected retry metadata cannot be cleared', async () => {
       asMock(apiUploadAudio).mockRejectedValue(new ApiError(413, 'too large'));
       asMock(clearPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
@@ -2957,7 +3239,7 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() =>
         expect(onRateLimited).toHaveBeenCalledWith(
-          `${t('error.dailyLimit')} ${t('wait.minutes', { count: 420 })}`,
+          `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`,
         ),
       );
 
@@ -3455,10 +3737,66 @@ describe('Recorder', () => {
       expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
-    it('refuses to record or cancel while an abandoned upload still owns the phase', async () => {
+    it('hands an upload stranded by an inactive dip to recovery on the next foreground', async () => {
+      const upload = deferred<{ score: number }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord());
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+
+      // Control Center, a call banner, or Siri: 'inactive' never stops an
+      // upload, so no lifecycle cleanup runs and no epoch is bumped.
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'inactive',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('inactive');
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        upload.resolve({ score: 91 });
+        await flushMicrotasks();
+      });
+
+      // The result cannot be delivered while the app is away, so the phase
+      // moves on to recovery instead of spinning behind a dead Cancel button
+      // that no foreground would ever release.
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: CANCEL_TEXT })).toBeNull();
+
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 91 },
+      });
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        writable: true,
+        value: 'active',
+      });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 91 } }));
+      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, { timeoutMs: 5000 });
+    });
+
+    it('refuses to record or cancel while a stranded upload hands off to recovery', async () => {
       // A submission whose result arrives after the app leaves the foreground
-      // returns without changing the phase and detaches its controller. The
-      // wait UI is still on screen, so both guarded controls must stay inert.
+      // detaches its controller and parks the phase in recovery. The wait UI
+      // is still on screen, so both guarded controls must stay inert.
       const upload = deferred<{ score: number }>();
       asMock(apiUploadAudio).mockReturnValue(upload.promise);
       const { props } = await renderRecorder();
@@ -3466,6 +3804,9 @@ describe('Recorder', () => {
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      const cancelOnPress = compositePressablePropsForNode(
+        screen.getByRole('button', { name: CANCEL_TEXT }),
+      ).onPress as () => unknown;
       Object.defineProperty(AppState, 'currentState', {
         configurable: true,
         writable: true,
@@ -3481,7 +3822,7 @@ describe('Recorder', () => {
         value: 'active',
       });
       asMock(AudioModule.getRecordingPermissionsAsync).mockClear();
-      expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy();
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
 
       // Disabled Pressables block dispatch, so invoke the handler directly to
       // prove the runtime guard rather than only the UI lockout.
@@ -3489,11 +3830,15 @@ describe('Recorder', () => {
       expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
       expect(mockRecorder.record).toHaveBeenCalledTimes(1);
 
-      // The Cancel control is still rendered but has no controller to abort.
-      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
-      await flushAct();
+      // The Cancel control leaves with the uploading phase, and the handler
+      // captured while it was on screen stays inert.
+      expect(screen.queryByRole('button', { name: CANCEL_TEXT })).toBeNull();
+      await act(async () => {
+        cancelOnPress();
+        await flushMicrotasks();
+      });
 
-      expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy();
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
       expect(props.onError).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
     });
@@ -4694,28 +5039,48 @@ describe('Recorder', () => {
       expect(screen.queryByText(RECOVERING_TEXT)).toBeNull();
     });
 
-    it('restores a live recording after clearing its matching prepared handoff', async () => {
-      asMock(loadPendingAssessment)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(null)
-        .mockResolvedValueOnce(pendingRecord({ stage: 'prepared' }))
-        .mockResolvedValue(null);
-      asMock(apiRequestAudioUpload).mockRejectedValue(new Error('upload grant disconnected'));
+    it('restores a live recording after clearing an abandoned prepared handoff', async () => {
+      // A submission that finds a different pending record hands over to
+      // recovery before uploading anything; the abandoned record never left
+      // the 'prepared' stage, so clearing it returns the fresh take.
+      const abandonedHandoff = pendingRecord({ requestId: OTHER_REQUEST_ID, stage: 'prepared' });
+      asMock(loadPendingAssessment).mockResolvedValueOnce(null).mockResolvedValue(abandonedHandoff);
       const { props } = await renderRecorder();
       await recordAndStop();
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
+      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(OTHER_REQUEST_ID));
       await waitFor(() => expect(screen.getByText(SUBMIT_TEXT)).toBeTruthy());
 
-      expect(apiRequestAudioUpload).toHaveBeenCalledTimes(1);
+      expect(apiRequestAudioUpload).not.toHaveBeenCalled();
       expect(apiUploadAudio).not.toHaveBeenCalled();
       expect(apiFetch).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
       expect(deletedRecordingUris()).not.toContain(RECORDING_URI);
       expect(screen.getByLabelText(t('recorder.a11ySaved'))).toBeTruthy();
       expect(screen.getByRole('button', { name: RERECORD_TEXT })).toBeTruthy();
+    });
+
+    it('stops the recovery lease and asks for an upgrade when the version gate closes', async () => {
+      const onRateLimited = jest.fn();
+      asMock(apiFetch).mockRejectedValue(
+        new ApiError(426, 'Please update the app', undefined, {
+          code: 'CLIENT_UPGRADE_REQUIRED',
+        }),
+      );
+      const { props } = await submitLiveRecordingIntoRecovery(pendingRecord(), { onRateLimited });
+
+      await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('error.upgradeRequired')));
+
+      // The gate rejects before any claim, so polling it out for five minutes
+      // would only end by deleting a recording the server never accepted.
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(onRateLimited).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
     it.each([
@@ -5121,7 +5486,7 @@ describe('Recorder', () => {
       },
     );
 
-    it('keeps the same S3 handoff after replay is rate limited and an owner completes it', async () => {
+    it('ends the recovery lease with the wait line when the replay is rate limited', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
@@ -5129,23 +5494,16 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      asMock(apiFetch)
-        .mockRejectedValueOnce(new ApiError(429, 'rate limited'))
-        .mockResolvedValueOnce({
-          status: 'processing',
-          context: 'practice',
-          questionId: QUESTION_ID,
-        })
-        .mockResolvedValueOnce({
-          status: 'completed',
-          context: 'practice',
-          questionId: QUESTION_ID,
-          response: { score: 86 },
-        });
+      asMock(apiFetch).mockRejectedValueOnce(
+        new ApiError(429, 'daily limit', 7 * 60 * 60, { code: 'DAILY_LIMIT' }),
+      );
       const { props } = await renderRecorder();
 
-      await advancePolls(7);
+      await advancePolls(5);
 
+      // The limiter rejects ahead of the idempotency claim, so nothing was
+      // charged: finish with the same wait line the submit path shows instead
+      // of polling absent reads until the lease expires.
       expect(apiFetch).toHaveBeenNthCalledWith(7, ENDPOINT, {
         method: 'POST',
         body: {
@@ -5155,15 +5513,42 @@ describe('Recorder', () => {
         },
         timeoutMs: AUDIO_TIMEOUT_MS,
       });
-      expect(props.onResult).toHaveBeenCalledTimes(1);
-      expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 86 } });
-      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
-      expect(props.onError).not.toHaveBeenCalled();
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledTimes(1);
+      expect(props.onError).toHaveBeenCalledWith(
+        `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`,
+      );
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
       expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-      expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
       expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
       expect(Crypto.randomUUID).not.toHaveBeenCalled();
+
+      // Resolved: no further polling for the rest of the five-minute lease.
+      await advancePolls(3);
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+    });
+
+    it('routes a rate-limited replay to the inline wait line and keeps the take', async () => {
+      jest.useFakeTimers();
+      const onRateLimited = jest.fn();
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(429, 'too many', 30));
+      const { props } = await submitLiveRecordingIntoRecovery(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+        { onRateLimited },
+      );
+
+      await advancePolls(5);
+
+      await waitFor(() =>
+        expect(onRateLimited).toHaveBeenCalledWith(
+          `${t('error.tooMany')} ${t('wait.seconds', { count: 30 })}`,
+        ),
+      );
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
     it('bounds repeated ambiguous S3 assessment POST attempts', async () => {
@@ -6429,6 +6814,50 @@ describe('Recorder', () => {
         timeoutMs: 5000,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('honors a cancel instead of resubmitting once recovery confirms nothing landed', async () => {
+      jest.useFakeTimers();
+      asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }));
+      asMock(apiFetch).mockImplementation((path: string, options: { signal?: AbortSignal }) =>
+        path === ENDPOINT
+          ? new Promise((_resolve, reject) => {
+              options.signal?.addEventListener('abort', () => reject(new ApiError(0, 'aborted')), {
+                once: true,
+              });
+            })
+          : Promise.reject(new ApiError(404, 'not submitted')),
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      asMock(File).mockClear();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiFetch).toHaveBeenCalledWith(ENDPOINT, expect.anything()));
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+
+      // A lone 404 still races the cancelled POST, so the cancel is only
+      // honored once repeated absence has confirmed it.
+      await advancePolls(1);
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      await advancePolls(4);
+
+      // Confirmed absence proves the cancelled POST claimed nothing: the take
+      // comes back for review instead of spending a capped assessment on an
+      // answer the learner explicitly stopped.
+      const assessmentPosts = asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT);
+      expect(assessmentPosts).toHaveLength(1);
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(deletedRecordingUris()).toEqual([]);
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
     it('locks into recovery when the cancelled handoff cannot be cleared', async () => {
@@ -8347,6 +8776,52 @@ describe('Recorder', () => {
 
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 77 } });
       expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
+    });
+
+    it('leaves an inline rate-limit notice standing by not re-locking a busy phase', async () => {
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(429, 'Request failed with status 429', 7 * 60 * 60, {
+          code: 'DAILY_LIMIT',
+        }),
+      );
+      const onInteractionLockChange = jest.fn();
+      const onRateLimited = jest.fn();
+      const { props } = await renderRecorder({ onInteractionLockChange, onRateLimited });
+      await recordAndStop();
+      await waitFor(() => expect(onInteractionLockChange).toHaveBeenLastCalledWith(true));
+      onInteractionLockChange.mockClear();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(onRateLimited).toHaveBeenCalledWith(
+          `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`,
+        ),
+      );
+
+      // 'recorded' -> 'uploading' -> 'recorded' never unlocks, so the screens'
+      // "a new submission owns the inline space" reset must not fire and wipe
+      // the wait line published in the same commit.
+      expect(onInteractionLockChange).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+    });
+
+    it('re-locks the screen after the lock callback identity changes mid-take', async () => {
+      const first = jest.fn();
+      const second = jest.fn();
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      const { view, props } = await renderRecorder({ onInteractionLockChange: first });
+      await recordAndStop();
+
+      // Swapping the callback releases the old one; the replacement must
+      // still learn that the recorder is busy on the next phase change.
+      await view.rerender(<Recorder {...props} onInteractionLockChange={second} />);
+      await flushAct();
+      expect(first).toHaveBeenLastCalledWith(false);
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+
+      await waitFor(() => expect(second).toHaveBeenLastCalledWith(true));
     });
 
     it('stays locked and reports unavailable retry storage while already recovering', async () => {

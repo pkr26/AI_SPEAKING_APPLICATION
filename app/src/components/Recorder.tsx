@@ -89,6 +89,8 @@ const S3_RESUBMIT_BASE_BACKOFF_MS = 5_000;
 const MAX_S3_REUPLOADS = 1;
 const UPLOAD_STAGE_LISTENING_MS = 8_000;
 const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
+/** Bounded wait for the resume that follows a microphone permission dialog. */
+const PERMISSION_PROMPT_RESUME_MS = 2_000;
 
 /**
  * Capacity-retry backoff that stays responsive to cancel: resolves after `ms`
@@ -158,6 +160,33 @@ async function restoreAudioMode(): Promise<void> {
     allowsRecording: false,
     allowsBackgroundRecording: false,
     shouldPlayInBackground: false,
+  });
+}
+
+/**
+ * Resolves as soon as the app reports 'active' again, or after `timeoutMs`
+ * when it does not. The permission dialog pauses the app itself, so a start
+ * that survives the prompt has to outlast that blip; the timeout keeps a
+ * genuine backgrounding from latching the start (its caller re-checks the
+ * foreground and abandons the take, and its `finally` frees the controls).
+ *
+ * The timer declaration is hoisted above the listener for the same reason as
+ * in sleepAbortable: clearTimeout must never read it in its dead zone.
+ */
+function waitForForeground(timeoutMs: number): Promise<void> {
+  if (AppState.currentState === 'active') return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const subscription = AppState.addEventListener('change', (state) => {
+      if (state !== 'active') return;
+      clearTimeout(timer);
+      subscription.remove();
+      resolve();
+    });
+    timer = setTimeout(() => {
+      subscription.remove();
+      resolve();
+    }, timeoutMs);
   });
 }
 
@@ -234,6 +263,13 @@ export default function Recorder<T>({
   const requestIdRef = useRef<string | null>(null);
   const cancelRequestedRef = useRef(false);
   const assessmentPostedRef = useRef(false);
+  // The requestId of a submission the learner cancelled after its assessment
+  // POST went out. Recovery honors that cancel once it proves the server
+  // committed nothing, instead of resubmitting the answer they stopped.
+  const cancelledSubmissionRequestIdRef = useRef<string | null>(null);
+  // Set when lifecycle cleanup threw away a take on the way to the background,
+  // so the next foreground can say so instead of showing an empty recorder.
+  const backgroundDiscardedRef = useRef(false);
   const waitStartedAtRef = useRef<number | null>(null);
   const previewPlayerRef = useRef<AudioPlayer | null>(null);
   const previewListenerRef = useRef<{ remove: () => void } | null>(null);
@@ -272,12 +308,25 @@ export default function Recorder<T>({
     identityRef.current = { ownerId, endpoint, questionId };
   }, [endpoint, ownerId, questionId]);
 
+  // null until the first notification, so the screen still learns the initial
+  // unlocked state.
+  const lockedRef = useRef<boolean | null>(null);
+
   useLayoutEffect(() => {
-    onInteractionLockChange?.(phase !== 'idle');
+    const locked = phase !== 'idle';
+    // Only an actual transition is reported: screens clear their inline
+    // notices whenever the recorder locks, so re-announcing a lock the phase
+    // never left would wipe the 429 wait line published in the same commit.
+    if (lockedRef.current === locked) return;
+    lockedRef.current = locked;
+    onInteractionLockChange?.(locked);
   }, [onInteractionLockChange, phase]);
 
   useEffect(
     () => () => {
+      // Matches what the screen was just told, so a later phase change still
+      // re-locks it when this cleanup ran for a changed callback identity.
+      lockedRef.current = false;
       onInteractionLockChange?.(false);
     },
     [onInteractionLockChange],
@@ -512,8 +561,12 @@ export default function Recorder<T>({
       }
 
       const routeMatches = pending.endpoint === endpoint && pending.questionId === questionId;
-      if (pending.stage === 'prepared') {
-        if (!isCurrent()) return;
+      /**
+       * Releases a handoff that provably claimed nothing server-side and hands
+       * the take back for review: the never-uploaded 'prepared' stage, and a
+       * user cancel whose absence this recovery has now confirmed.
+       */
+      const releaseUnclaimedHandoff = async () => {
         const cleared = await clearRequestTracking(pending.requestId);
         if (!isCurrent()) return;
         if (cleared) {
@@ -521,9 +574,17 @@ export default function Recorder<T>({
         } else {
           failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
         }
+      };
+      if (pending.stage === 'prepared') {
+        if (!isCurrent()) return;
+        await releaseUnclaimedHandoff();
         return;
       }
-      const finishUnresolved = async (message: string, allowRecordedRetry: boolean) => {
+      const finishUnresolved = async (
+        message: string,
+        allowRecordedRetry: boolean,
+        rejection?: ApiError,
+      ) => {
         if (!isCurrent()) return;
         try {
           if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
@@ -543,7 +604,14 @@ export default function Recorder<T>({
         } else {
           updatePhase('recorded');
         }
-        callbacksRef.current.onError(message);
+        // A rate/daily-limit refusal carries the localized "when can I try
+        // again" line; screens that render it inline deserve it there, exactly
+        // as the submit path routes its own 429.
+        if (rejection?.status === 429 && callbacksRef.current.onRateLimited) {
+          callbacksRef.current.onRateLimited(message);
+        } else {
+          callbacksRef.current.onError(message);
+        }
         void clearRequestTracking(pending.requestId);
       };
 
@@ -707,6 +775,15 @@ export default function Recorder<T>({
             }
             const absenceConfirmed =
               notFoundCount >= NOT_FOUND_CONFIRMATIONS && Date.now() - recoveryStartedAt >= 10_000;
+            // This handoff only entered recovery because the learner cancelled
+            // after the assessment POST went out, when it might still have
+            // committed. Confirmed absence proves it did not, so honor the
+            // cancel and return the take instead of submitting an answer they
+            // explicitly stopped (and spending a capped assessment on it).
+            if (absenceConfirmed && cancelledSubmissionRequestIdRef.current === pending.requestId) {
+              await releaseUnclaimedHandoff();
+              return;
+            }
             // A lone 404 can race the original assessment POST before its
             // idempotency row exists. Only reuse the already-uploaded key after
             // repeated absence over ten seconds. Ambiguous transport failures
@@ -802,6 +879,19 @@ export default function Recorder<T>({
                     if (!isCurrent()) return;
                   }
                 }
+                // Rate and daily limits reject before the idempotency claim,
+                // so a 429 proves this resubmission committed nothing. Finish
+                // now with the wait line the submit path would have shown,
+                // instead of polling absent reads until the lease expires and
+                // then deleting a recording the server never accepted.
+                if (retryError instanceof ApiError && retryError.status === 429) {
+                  await finishUnresolved(
+                    userMessageForError(retryError, translate('recorder.errRejected')),
+                    true,
+                    retryError,
+                  );
+                  return;
+                }
                 if (
                   retryError instanceof ApiError &&
                   [400, 403, 404, 413, 415, 422].includes(retryError.status)
@@ -820,6 +910,15 @@ export default function Recorder<T>({
               return;
             }
           } else if (error instanceof ApiError && error.status === 401) {
+            return;
+          } else if (error instanceof ApiError && error.code === 'CLIENT_UPGRADE_REQUIRED') {
+            // The version gate rejects every route before any claim is made,
+            // so polling it out is pointless: surface the upgrade message and
+            // keep the take instead of burning the lease and deleting it.
+            await finishUnresolved(
+              userMessageForError(error, translate('recorder.errRejected')),
+              true,
+            );
             return;
           }
           // Offline, timeout, and transient server errors retain the durable
@@ -865,6 +964,10 @@ export default function Recorder<T>({
     mountedRef.current = true;
     const subscription = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
+        if (backgroundDiscardedRef.current) {
+          backgroundDiscardedRef.current = false;
+          callbacksRef.current.onError(translate('recorder.errBackgroundDiscarded'));
+        }
         void (async () => {
           await lifecycleStopPromiseRef.current;
           await recoverPending();
@@ -873,6 +976,12 @@ export default function Recorder<T>({
         state === 'background' ||
         (state === 'inactive' && phaseRef.current === 'recording')
       ) {
+        // Leaving the app deliberately discards an unsubmitted take (no
+        // unsubmitted audio persists outside the recovery stages), so record
+        // that a take was lost and tell the learner on the way back rather
+        // than returning them to an empty recorder with no explanation.
+        backgroundDiscardedRef.current =
+          phaseRef.current === 'recording' || phaseRef.current === 'recorded';
         void stopForLifecycle();
       }
     });
@@ -1048,7 +1157,7 @@ export default function Recorder<T>({
       return;
     }
     operationRef.current = true;
-    const lifecycleEpoch = lifecycleEpochRef.current;
+    let lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentLifecycle = () =>
       lifecycleEpoch === lifecycleEpochRef.current &&
       mountedRef.current &&
@@ -1057,11 +1166,18 @@ export default function Recorder<T>({
     if (mountedRef.current) setPermissionDenied(false);
     try {
       const current = await AudioModule.getRecordingPermissionsAsync();
-      const response = current.granted
-        ? current
-        : current.canAskAgain === false
-          ? current
-          : await AudioModule.requestRecordingPermissionsAsync();
+      const prompted = !current.granted && current.canAskAgain !== false;
+      const response = prompted ? await AudioModule.requestRecordingPermissionsAsync() : current;
+      // The system dialog pauses the app itself: on Android it fires a
+      // 'background' blip that bumps the lifecycle epoch, and on iOS it can
+      // answer before didBecomeActive crosses the bridge. Wait out that
+      // resume and adopt the fresh epoch, or a learner's first-ever grant
+      // would be swallowed with no recording and no message.
+      if (prompted && response.granted) {
+        await waitForForeground(PERMISSION_PROMPT_RESUME_MS);
+        await lifecycleStopPromiseRef.current;
+        lifecycleEpoch = lifecycleEpochRef.current;
+      }
       if (!isCurrentLifecycle()) return;
       if (!response.granted) {
         if (mountedRef.current) {
@@ -1197,6 +1313,7 @@ export default function Recorder<T>({
     operationRef.current = true;
     cancelRequestedRef.current = false;
     assessmentPostedRef.current = false;
+    cancelledSubmissionRequestIdRef.current = null;
     updatePhase('uploading');
     const lifecycleEpoch = lifecycleEpochRef.current;
     const isCurrentSubmission = () =>
@@ -1383,7 +1500,10 @@ export default function Recorder<T>({
         if (!isCurrentSubmission()) return;
         if (assessmentPostedRef.current) {
           // The cancelled POST may have committed server-side. Resolve the
-          // durable request instead of risking a double submission.
+          // durable request instead of risking a double submission, and carry
+          // the cancel across the handoff so recovery hands the take back
+          // rather than resubmitting once it proves nothing was claimed.
+          cancelledSubmissionRequestIdRef.current = requestIdRef.current;
           recoverAfterUpload = true;
           updatePhase('recovering');
           return;
@@ -1401,9 +1521,17 @@ export default function Recorder<T>({
         return;
       }
       if (!isCurrentSubmission()) return;
+      // 426 belongs here: the client-version gate rejects ahead of the
+      // idempotency claim, so it can never accompany a committed attempt.
       const definitelyRejected =
-        error instanceof ApiError && [400, 403, 404, 413, 415, 422, 429].includes(error.status);
-      if (definitelyRejected) {
+        error instanceof ApiError &&
+        [400, 403, 404, 413, 415, 422, 426, 429].includes(error.status);
+      // A definite rejection, and any failure raised before the assessment
+      // POST was ever issued, both prove nothing can have committed: clear the
+      // handoff and hand the take straight back. Routing a never-sent
+      // submission into recovery instead would spin silently and then delete
+      // the recording once the five-minute lease expired.
+      if (definitelyRejected || !assessmentPostedRef.current) {
         const requestId = requestIdRef.current;
         const cleared = requestId ? await clearRequestTracking(requestId) : true;
         if (!isCurrentSubmission()) return;
@@ -1412,10 +1540,17 @@ export default function Recorder<T>({
           return;
         }
         updatePhase('recorded');
-        const message = userMessageForError(error, translate('recorder.errRejected'));
+        const message = userMessageForError(
+          error,
+          definitelyRejected ? translate('recorder.errRejected') : translate('recorder.errNotSent'),
+        );
         // 429 covers RATE_LIMITED, DAILY_LIMIT, and NETWORK_DAILY_LIMIT; their
         // localized wait line deserves an inline home, not just an alert.
-        if (error.status === 429 && callbacksRef.current.onRateLimited) {
+        if (
+          error instanceof ApiError &&
+          error.status === 429 &&
+          callbacksRef.current.onRateLimited
+        ) {
           callbacksRef.current.onRateLimited(message);
         } else {
           callbacksRef.current.onError(message);
@@ -1431,6 +1566,25 @@ export default function Recorder<T>({
         uploadControllerRef.current = null;
       }
       operationRef.current = false;
+      // An 'inactive' dip (Control Center, a call banner, Siri) fails
+      // isCurrentSubmission without bumping the lifecycle epoch, so submit can
+      // return with the phase still 'uploading' and nothing left driving it —
+      // a permanent spinner over a dead Cancel button. Every real blur,
+      // background, or unmount bumps the epoch through stopForLifecycle and
+      // parks the phase at 'idle', so this only catches the orphan; recovery
+      // then resolves the durable request on the next foreground.
+      // Asserted because TypeScript still carries the entry guard's 'recorded'
+      // narrowing of phaseRef.current across every await above; updatePhase
+      // writes it from outside this function.
+      const settledPhase = phaseRef.current as Phase;
+      if (
+        settledPhase === 'uploading' &&
+        lifecycleEpoch === lifecycleEpochRef.current &&
+        mountedRef.current
+      ) {
+        updatePhase('recovering');
+        recoverAfterUpload = true;
+      }
       if (recoverAfterUpload) void recoverPending();
     }
   };
@@ -1455,6 +1609,10 @@ export default function Recorder<T>({
   const cancelUpload = () => {
     if (phaseRef.current !== 'uploading') return;
     const controller = uploadControllerRef.current;
+    // Unreachable by design: a submission that detaches its controller also
+    // leaves the uploading phase (it completes, or the finally hands the
+    // orphan to recovery). Kept as fail-closed defense.
+    /* istanbul ignore next */
     if (!controller) return;
     cancelRequestedRef.current = true;
     controller.abort();

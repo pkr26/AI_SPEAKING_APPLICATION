@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
-import type { TestInstance } from 'test-renderer';
+import type { Fiber, TestInstance } from 'test-renderer';
 import React from 'react';
 import { Alert, Platform, StyleSheet } from 'react-native';
 
@@ -252,6 +252,23 @@ function spyOnTextInputFocus(element: TestInstance): jest.Mock {
     fiber = fiber.return;
   }
   throw new Error('TextInput instance not found');
+}
+
+/**
+ * Return the Pressable callback committed for a queried host node without
+ * opening RNTL's own async act scope. This is only for same-render
+ * re-entrancy tests, where awaiting one fireEvent would commit the busy state
+ * before the second activation lands.
+ */
+function committedPressHandler(node: TestInstance): () => unknown {
+  let fiber: Fiber | null = node.unstable_fiber;
+  while (fiber) {
+    const props = fiber.memoizedProps as { onPress?: unknown } | null;
+    if (typeof props?.onPress === 'function') return props.onPress as () => unknown;
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
 }
 
 function responderEvent() {
@@ -550,6 +567,10 @@ describe('change password screen', () => {
     for (const label of [t('cp.currentLabel'), t('cp.newLabel'), t('cp.confirmLabel')]) {
       expect(screen.getByLabelText(label).props).toMatchObject({
         secureTextEntry: true,
+        // Show clears secureTextEntry, which is what suppresses the keyboard
+        // defaults; a revealed field must still not capitalize or autocorrect.
+        autoCapitalize: 'none',
+        autoCorrect: false,
         maxLength: MAX_PASSWORD_UTF8_BYTES,
       });
     }
@@ -632,6 +653,34 @@ describe('change password screen', () => {
       }
     }
     await waitFor(() => expect(alertSpy).toHaveBeenCalled());
+  });
+
+  it('changes the password once when Update is pressed twice before a re-render', async () => {
+    // canSubmit reads the render-time busy flag, so a second press landing in
+    // the same committed render still passes it. The second request would fail
+    // in the auth transition guard and paint that error under the success
+    // alert while re-arming the button mid-flight.
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest.fn(() => change.promise);
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+
+    await act(async () => {
+      const press = committedPressHandler(updateButton());
+      press();
+      press();
+    });
+
+    expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(1);
+
+    await act(async () => change.resolve(undefined));
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('cp.updatedTitle'),
+        t('cp.updatedBody'),
+        expect.any(Array),
+      ),
+    );
   });
 
   it('shows a credential error on 401', async () => {
@@ -962,15 +1011,64 @@ describe('delete account screen', () => {
     expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
   });
 
-  it('surfaces local cleanup failures after deletion', async () => {
+  it('surfaces local cleanup failures after deletion in an alert', async () => {
+    // The session is already reset when this rejects, so the route guard has
+    // unmounted this screen: inline copy would never be seen, and a native
+    // alert is the only way the "restart before logging in again" instruction
+    // reaches the learner.
     mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new AccountDeletedCleanupError());
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
     await fireEvent.press(deleteButton());
     await pressAlertButton(t('da.confirmDelete'));
 
-    expect(await screen.findByText(t('auth.accountDeletedCleanupFailed'))).toBeTruthy();
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('da.deletedTitle'),
+        t('auth.accountDeletedCleanupFailed'),
+      ),
+    );
+    expect(screen.queryByText(t('auth.accountDeletedCleanupFailed'))).toBeNull();
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('deletes once when a double tap queues two confirmations', async () => {
+    // Opening the dialog changes no state, so canSubmit is still true when the
+    // second tap lands. A second deletion would fail in the auth transition
+    // guard and show "we could not delete your account" — re-arming the danger
+    // button — while the real deletion is still running.
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+
+    await fireEvent.press(deleteButton());
+    await fireEvent.press(deleteButton());
+    const confirmations = alertSpy.mock.calls.map(
+      (call) =>
+        (call[2] as { text?: string; onPress?: () => void }[]).find(
+          (button) => button.text === t('da.confirmDelete'),
+        )?.onPress,
+    );
+    expect(confirmations).toHaveLength(2);
+
+    await act(async () => confirmations[0]?.());
+    await act(async () => confirmations[1]?.());
+
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(t('da.failed'))).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('da.submitBusy') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+
+    await act(async () => deletion.resolve(undefined));
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('da.deletedTitle'),
+        t('da.deletedBody'),
+        expect.any(Array),
+      ),
+    );
   });
 
   it('falls back to generic copy for non-API errors', async () => {

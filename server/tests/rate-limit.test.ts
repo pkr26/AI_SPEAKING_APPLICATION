@@ -54,14 +54,19 @@ function userApp(userId: string, middleware: express.RequestHandler) {
   return a;
 }
 
+/** Total hits currently recorded across one limiter namespace. */
+async function storedHits(namespace: string): Promise<number> {
+  const { rows } = await pool.query<{ hits: number }>(
+    'SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = $1',
+    [namespace],
+  );
+  return rows[0].hits;
+}
+
 /** Wait until fire-and-forget failure refunds have settled for one namespace. */
 async function expectRefunded(namespace: string) {
   await vi.waitFor(async () => {
-    const { rows } = await pool.query<{ hits: number }>(
-      'SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = $1',
-      [namespace],
-    );
-    expect(rows[0].hits).toBe(0);
+    expect(await storedHits(namespace)).toBe(0);
   });
 }
 
@@ -137,6 +142,55 @@ describe('rate limiters', () => {
       [namespace],
     );
     expect(stored.rows[0].count).toBe(2);
+  });
+
+  it('never advertises throttle state on the budgets that flag instead of rejecting', async () => {
+    config.rateLimit.forgotEmailWindowMs = 60_000;
+    config.rateLimit.forgotEmailMax = 1;
+    config.rateLimit.loginAccountWindowMs = 60_000;
+    config.rateLimit.loginAccountMax = 1;
+    config.rateLimit.passwordWindowMs = 60_000;
+    config.rateLimit.passwordMax = 1;
+    const limiters = buildLimiters();
+    const a = express();
+    a.use(express.json());
+    // Production shapes: forgot-password always answers the uniform 204, the
+    // credential budgets leave the verdict to the route.
+    a.post('/forgot', limiters.forgotPasswordEmail, (_req, res) => res.status(204).end());
+    a.post('/login', limiters.loginAccount, (_req, res) =>
+      res.status(401).json({ throttled: res.locals.loginAccountThrottled === true }),
+    );
+    a.post('/password', limiters.passwordAccount, (_req, res) =>
+      res.status(401).json({ throttled: res.locals.passwordAccountThrottled === true }),
+    );
+    const budgetHeaders = (headers: Record<string, string>) =>
+      Object.keys(headers).filter((name) => name.includes('ratelimit') || name === 'retry-after');
+
+    const forgot = () => request(a).post('/forgot').send({ email: 'victim@example.com' });
+    const inBudget = await forgot();
+    const overBudget = await forgot();
+    expect(inBudget.status).toBe(204);
+    expect(overBudget.status).toBe(204);
+    // The second request is over the per-target-email budget: its mail is
+    // being dropped silently...
+    expect(await storedHits('forgot-email:60000:1')).toBe(2);
+    // ...and both 204s stay indistinguishable: no Retry-After announcing the
+    // drop, and no RateLimit-* publishing a counter keyed by someone else's
+    // mailbox to whoever probes it.
+    expect(budgetHeaders(inBudget.headers)).toEqual([]);
+    expect(budgetHeaders(overBudget.headers)).toEqual([]);
+
+    const login = () => request(a).post('/login').send({ email: 'victim@example.com', password: 'wrong-secret1' });
+    expect((await login()).body).toEqual({ throttled: false });
+    const throttledLogin = await login();
+    expect(throttledLogin.body).toEqual({ throttled: true });
+    expect(budgetHeaders(throttledLogin.headers)).toEqual([]);
+
+    const confirmPassword = () => request(a).post('/password').send({});
+    expect((await confirmPassword()).body).toEqual({ throttled: false });
+    const throttledPassword = await confirmPassword();
+    expect(throttledPassword.body).toEqual({ throttled: true });
+    expect(budgetHeaders(throttledPassword.headers)).toEqual([]);
   });
 
   it('throttles the global limiter with the shared message and standard headers', async () => {
@@ -491,6 +545,39 @@ describe('rate limiters', () => {
     await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1, resetTime: expect.any(Date) });
   });
 
+  it('judges one upsert against a single clock sample, never two', async () => {
+    const namespace = 'store-clock-sample';
+    const store = new PostgresRateLimitStore(namespace, 60_000);
+    await expect(store.increment('learner')).resolves.toMatchObject({ totalHits: 1 });
+
+    // Park the expiry 300ms out, then force the ON CONFLICT clause to evaluate
+    // long after it passed by holding the row lock: the statement samples the
+    // clock for its proposed row before it starts waiting. Both CASE branches
+    // must judge the window against that one sample, so this hit belongs to
+    // the window that was live when it arrived. Two independent samples could
+    // straddle the expiry instead and carry the old count into a fresh window.
+    await pool.query(
+      "UPDATE rate_limit_windows SET reset_at = now() + interval '300 milliseconds' WHERE namespace = $1",
+      [namespace],
+    );
+    const rival = await pool.connect();
+    try {
+      await rival.query('BEGIN');
+      await rival.query('SELECT 1 FROM rate_limit_windows WHERE namespace = $1 FOR UPDATE', [namespace]);
+      const blocked = store.increment('learner');
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      await rival.query('COMMIT');
+
+      const counted = await blocked;
+      expect(counted.totalHits).toBe(2);
+      // hits and reset_at agree on the same verdict: the window was kept, not
+      // renewed behind a count that never reset.
+      expect(counted.resetTime!.getTime()).toBeLessThan(Date.now());
+    } finally {
+      rival.release();
+    }
+  });
+
   it('fails closed with a stable diagnostic when an increment returns no counter row', async () => {
     const store = new PostgresRateLimitStore('store-missing-row', 60_000);
     const query = vi.spyOn(pool, 'query').mockResolvedValueOnce({ rows: [] } as never);
@@ -546,7 +633,16 @@ describe('rate limiters', () => {
       const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
-        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        // Each limiter publishes the window it counted this request in under
+        // its own request property; the re-spend must charge exactly those.
+        const assessResetTime = new Date(Date.now() + 60_000);
+        const ipDailyResetTime = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const req = {
+          ip: '127.0.0.1',
+          user: { id: 'user-1' },
+          assessRateLimit: { resetTime: assessResetTime },
+          assessIpDailyRateLimit: { resetTime: ipDailyResetTime },
+        } as unknown as AuthedRequest;
         const res = fakeResponse({ assessmentCapacityReserved: true });
         const next = vi.fn();
         limiters.assessAbortGuard(req, res as never, next);
@@ -555,11 +651,46 @@ describe('rate limiters', () => {
 
         res.emit('close');
         await vi.waitFor(() => expect(resp).toHaveBeenCalledTimes(2));
-        const keys = resp.mock.calls.map(([key]) => key);
-        expect(keys).toContain('user:user-1');
-        expect(keys).toContain(ipKeyGenerator('127.0.0.1'));
+        expect(resp.mock.calls).toEqual([
+          ['user:user-1', assessResetTime],
+          [ipKeyGenerator('127.0.0.1'), ipDailyResetTime],
+        ]);
       } finally {
         resp.mockRestore();
+      }
+    });
+
+    it("charges each assessment limiter's own observed window when the re-spend runs", async () => {
+      config.rateLimit.assessWindowMs = 60_000;
+      config.rateLimit.assessMax = 5;
+      const savedCap = config.assessIpDailyCap;
+      config.assessIpDailyCap = 5;
+      try {
+        const limiters = buildLimiters();
+        const a = express();
+        a.use((req, _res, next) => {
+          (req as AuthedRequest).user = { id: 'respend-window-user' } as AuthedRequest['user'];
+          next();
+        });
+        a.use(limiters.assess, limiters.assessIpDaily);
+        // Close-before-commit shape: the reservation lands after the client
+        // left, so the route re-spends both hits itself. Running behind the
+        // real limiters proves each store is handed the window that limiter
+        // observed — sharing one request property would lose the first.
+        a.get('/x', (req, res) => {
+          limiters.respendAssessmentBudget(req as AuthedRequest, res);
+          res.json({ ok: true });
+        });
+
+        expect((await request(a).get('/x')).status).toBe(200);
+        // One counted hit plus one re-spent hit on each budget; a lost window
+        // observation would silently leave either at 1.
+        await vi.waitFor(async () => {
+          expect(await storedHits('assess:60000:5')).toBe(2);
+          expect(await storedHits('assess-ip-daily:5')).toBe(2);
+        });
+      } finally {
+        config.assessIpDailyCap = savedCap;
       }
     });
 
@@ -671,10 +802,10 @@ describe('rate limiters', () => {
 
   it('conditional re-spend tops up a live window but never opens a fresh one', async () => {
     const store = new PostgresRateLimitStore('store-respend-guard', 60_000);
-    await store.increment('learner');
+    const observed = await store.increment('learner');
 
     // Live window: the abort re-spend takes the refunded hit back.
-    await store.incrementWithinWindow('learner');
+    await store.incrementWithinWindow('learner', observed.resetTime);
     const live = await pool.query<{ hits: number }>(
       "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-respend-guard'",
     );
@@ -682,11 +813,13 @@ describe('rate limiters', () => {
 
     // Expired window: the library refund was skipped too, so the re-spend is
     // a no-op — a plain increment would instead open a fresh window (hits=1)
-    // and over-charge the aborting user into it.
+    // and over-charge the aborting user into it. The row is shifted whole, so
+    // it still holds the very window the hits were counted in and only the
+    // expiry check can stop the re-spend.
     await pool.query(
-      "UPDATE rate_limit_windows SET reset_at = now() - interval '1 second' WHERE namespace = 'store-respend-guard'",
+      "UPDATE rate_limit_windows SET reset_at = reset_at - interval '61 seconds' WHERE namespace = 'store-respend-guard'",
     );
-    await store.incrementWithinWindow('learner');
+    await store.incrementWithinWindow('learner', new Date(observed.resetTime!.getTime() - 61_000));
     const { rows } = await pool.query<{ hits: number; reset_at: string }>(
       "SELECT hits, reset_at FROM rate_limit_windows WHERE namespace = 'store-respend-guard'",
     );
@@ -695,13 +828,39 @@ describe('rate limiters', () => {
     expect(new Date(rows[0].reset_at).getTime()).toBeLessThan(Date.now());
   });
 
+  it('re-spends into the window the hit was counted in, never a successor window', async () => {
+    const store = new PostgresRateLimitStore('store-respend-identity', 60_000);
+    const observed = await store.increment('learner');
+
+    // The window rolled over while the aborted request was still in flight:
+    // increment renews an expired row IN PLACE, so a rival request behind the
+    // same key opened the next window on it. That successor is perfectly live,
+    // but express-rate-limit skipped this request's refund (its own window had
+    // passed), so the re-spend must leave the successor's budget alone instead
+    // of charging it a hit it never served.
+    await pool.query(
+      `UPDATE rate_limit_windows SET hits = 1, reset_at = reset_at + interval '60 seconds'
+       WHERE namespace = 'store-respend-identity'`,
+    );
+    await store.incrementWithinWindow('learner', observed.resetTime);
+
+    // A request whose limiter never published a window is treated the same
+    // way: nothing observed, nothing charged.
+    await store.incrementWithinWindow('learner', undefined);
+
+    const { rows } = await pool.query<{ hits: number }>(
+      "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-respend-identity'",
+    );
+    expect(Number(rows[0].hits)).toBe(1);
+  });
+
   it('never lets a re-spend failure escape (abort-guard re-spends fire-and-forget)', async () => {
     const store = new PostgresRateLimitStore('store-respend-fail-safe', 60_000);
     const failure = new Error('database unavailable');
     const query = vi.spyOn(pool, 'query').mockRejectedValue(failure);
     const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
     try {
-      await expect(store.incrementWithinWindow('learner')).resolves.toBeUndefined();
+      await expect(store.incrementWithinWindow('learner', new Date())).resolves.toBeUndefined();
       expect(warn).toHaveBeenCalledWith(
         { err: failure, namespace: 'store-respend-fail-safe' },
         'rate-limit re-spend failed',

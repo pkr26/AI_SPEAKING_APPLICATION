@@ -470,7 +470,13 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     return result;
   }
 
-  if (value.attemptNo < PRACTICE_MAX_ATTEMPTS) {
+  // A miss before the last attempt normally leaves retries, but the server
+  // closes the run early when a rival session promoted the level mid-assessment
+  // (server/src/practice.ts): the word belongs to a level the learner has left,
+  // so retrying it is meaningless and the response arrives in the terminal
+  // shape instead. `attemptsLeft: 0` selects that branch below, which still
+  // demands the full terminal payload, so a miscounted retry cannot slip past.
+  if (value.attemptNo < PRACTICE_MAX_ATTEMPTS && value.attemptsLeft !== 0) {
     const expectedAttemptsLeft = PRACTICE_MAX_ATTEMPTS - value.attemptNo;
     if (
       value.attemptsLeft !== expectedAttemptsLeft ||

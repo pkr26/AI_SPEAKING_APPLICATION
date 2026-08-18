@@ -5,6 +5,7 @@ const runtime = vi.hoisted(() => {
     listening: false,
     requestTimeout: 0,
     headersTimeout: 0,
+    keepAliveTimeout: 0,
     errorListeners: [] as Array<(err: Error) => void>,
     on: vi.fn((event: string, listener: (err: Error) => void) => {
       if (event === 'error') server.errorListeners.push(listener);
@@ -402,6 +403,9 @@ describe('server lifecycle failure handling', () => {
     // S3 download 30s + provider 60s + decode/ingress margin 40s.
     expect(runtime.server.requestTimeout).toBe(130_000);
     expect(runtime.server.headersTimeout).toBe(30_000);
+    // Keep-alive must outlive a fronting proxy's idle timeout (AWS ALB: 60s)
+    // so the balancer cannot dispatch onto a connection Node is closing.
+    expect(runtime.server.keepAliveTimeout).toBe(65_000);
     expect(runtime.assertSchema).toHaveBeenCalledOnce();
     expect(runtime.assertAudio).toHaveBeenCalledWith({ force: true });
     expect(runtime.server.listen).not.toHaveBeenCalled();
@@ -709,6 +713,59 @@ describe('server lifecycle failure handling', () => {
       { err: poolError },
       'error closing pg pool after HTTP server failure',
     );
+  });
+
+  it('keeps serving after a recoverable accept failure and still drains on the next signal', async () => {
+    const acceptError = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    runtime.server.errorListeners[0](acceptError);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The listener survives a per-connection accept failure, so exiting here
+    // would reset in-flight paid assessments without any drain.
+    expect(runtime.logger.error).toHaveBeenCalledWith(
+      { err: acceptError },
+      'accept failed; dropped one incoming connection',
+    );
+    expect(runtime.logger.fatal).not.toHaveBeenCalled();
+    expect(runtime.poolEnd).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+
+    // The graceful path is still armed after the recoverable error.
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+    expect(runtime.server.close).toHaveBeenCalledOnce();
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+  });
+
+  it('still exits fatally when an accept failure arrives before the listener is up', async () => {
+    const acceptError = Object.assign(new Error('accept EMFILE'), { code: 'EMFILE', syscall: 'accept' });
+    let releaseSchema!: () => void;
+    runtime.assertSchema.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSchema = resolve;
+        }),
+    );
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    expect(runtime.server.listening).toBe(false);
+
+    runtime.server.errorListeners[0](acceptError);
+
+    // Nothing is being served yet, so there is no traffic worth preserving.
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: acceptError }, 'HTTP server failed');
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+
+    releaseSchema();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.server.listen).not.toHaveBeenCalled();
   });
 
   it('ignores an HTTP server error once shutdown has begun', async () => {

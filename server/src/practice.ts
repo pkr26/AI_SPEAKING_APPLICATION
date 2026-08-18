@@ -19,7 +19,7 @@ import { releaseTransactionClient, rollbackTransaction } from './transaction';
 const MAX_ATTEMPTS = 3;
 export const MAX_FINAL_FEEDBACK_LENGTH = 4000;
 /** One practice attempt at or above this score masters the word. */
-export const MASTER_SCORE = 75;
+const MASTER_SCORE = 75;
 /** Scores below this fail the attempt (and demote a mastered word). */
 export const PASS_SCORE = 60;
 /**
@@ -35,7 +35,7 @@ const CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
  * Mastering this share of the level's word bank (with the next level existing)
  * promotes the learner inside the same transaction as the mastering attempt.
  */
-export const LEVEL_UP_MASTERY_RATIO = 0.85;
+const LEVEL_UP_MASTERY_RATIO = 0.85;
 
 interface QuestionJson {
   id: string;

@@ -3,7 +3,7 @@ import { randomUUID } from 'crypto';
 import request from 'supertest';
 import fs from 'fs/promises';
 import { config } from '../src/config';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
 afterAll(async () => {
@@ -132,7 +132,7 @@ describe('diagnostic', () => {
       request(a)
         .post('/diagnostic/answer')
         .set('Authorization', `Bearer ${token}`)
-        .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+        .attach('audio', fakeM4aBuffer(), {
           filename: 'answer.m4a',
           contentType: 'audio/mp4',
         })
@@ -244,7 +244,7 @@ describe('diagnostic', () => {
     const missing = await request(a)
       .post('/diagnostic/answer')
       .set('Authorization', `Bearer ${res.body.token}`)
-      .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+      .attach('audio', fakeM4aBuffer(), {
         filename: 'answer.m4a',
         contentType: 'audio/mp4',
       });

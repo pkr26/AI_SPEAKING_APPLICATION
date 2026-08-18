@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
-import { app, completeDiagnostic, pool, registerUser } from './helpers';
+import { app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -65,7 +65,7 @@ function fixedPracticeRequest(token: string, questionId: string, requestId: stri
   return request(a)
     .post('/practice/attempt')
     .set('Authorization', `Bearer ${token}`)
-    .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+    .attach('audio', fakeM4aBuffer(), {
       filename: 'answer.m4a',
       contentType: 'audio/mp4',
     })

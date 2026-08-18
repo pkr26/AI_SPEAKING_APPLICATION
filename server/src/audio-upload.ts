@@ -14,7 +14,6 @@ import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from '.
 import { Limiters } from './rate-limit';
 import { AUDIO_TYPES, MAX_AUDIO_BYTES, submittedAudioFileIsOwned, uploadsDir } from './upload';
 
-export { MAX_AUDIO_BYTES } from './upload';
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');

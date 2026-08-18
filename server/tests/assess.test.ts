@@ -29,7 +29,7 @@ import {
 } from '../src/assess';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
-import { app, pool, registerUser } from './helpers';
+import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
 
 let userId: string;
@@ -52,7 +52,7 @@ beforeAll(async () => {
   const { res } = await registerUser(app());
   userId = res.body.user.id;
   audioPath = path.join(uploadsDir, `assess-test-${randomUUID()}.m4a`);
-  await fs.writeFile(audioPath, Buffer.from('00000018667479704d34412000000000', 'hex'), { mode: 0o600 });
+  await fs.writeFile(audioPath, fakeM4aBuffer(), { mode: 0o600 });
 });
 
 afterEach(() => {

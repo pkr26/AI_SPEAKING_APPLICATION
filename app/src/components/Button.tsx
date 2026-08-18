@@ -108,9 +108,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
 }));
 
 /**
- * The one shared button. Replaces the hand-rolled primary/secondary/danger
- * Pressables that had drifted apart across screens (U-M9); the mic button and
- * other specialized controls stay bespoke.
+ * The one shared button (U-M9); the mic button and other specialized controls
+ * stay bespoke.
  */
 export default function Button({
   title,

@@ -15,10 +15,6 @@ export function fakeM4aBuffer(): Buffer {
   return Buffer.from('00000018667479704d34412000000000', 'hex');
 }
 
-export function fakeWavBuffer(): Buffer {
-  return Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]), Buffer.from('WAVEfmt ')]);
-}
-
 let counter = 0;
 export function uniqueEmail(prefix = 't'): string {
   counter++;

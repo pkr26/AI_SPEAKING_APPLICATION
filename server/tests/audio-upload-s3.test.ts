@@ -44,13 +44,12 @@ import {
   discardPresignedAudio,
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
-  MAX_AUDIO_BYTES,
   preserveSubmittedPresignedAudio,
   resolvePresignedAudio,
 } from '../src/audio-upload';
 import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
-import { ownSubmittedAudioFile, uploadsDir } from '../src/upload';
+import { MAX_AUDIO_BYTES, ownSubmittedAudioFile, uploadsDir } from '../src/upload';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 // Switch the whole app into S3 ingress mode (must precede createApp()).

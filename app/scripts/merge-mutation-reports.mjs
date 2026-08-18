@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
 import {
   assertMutationLaneManifest,
+  duplicates,
   expectedMutationFiles,
   mutationLaneNames,
   mutationLanes,
@@ -47,16 +48,6 @@ function isRecord(value) {
 
 function own(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
-}
-
-function duplicates(values) {
-  const seen = new Set();
-  const duplicateValues = new Set();
-  for (const value of values) {
-    if (seen.has(value)) duplicateValues.add(value);
-    seen.add(value);
-  }
-  return [...duplicateValues].toSorted();
 }
 
 function sortedDifference(first, second) {
@@ -257,7 +248,7 @@ export function summarizeMutants(mutants) {
 }
 
 /** Whole source lines spanned by a mutant, retained as reviewable matching context. */
-export function mutantSourceText(source, location) {
+function mutantSourceText(source, location) {
   return String(source)
     .split('\n')
     .slice(location.start.line - 1, location.end.line)
@@ -270,7 +261,7 @@ export function mutantSourceText(source, location) {
  * its exact node location and the source text it replaced so the equivalence
  * allowlist can identify it without excusing a same-line sibling.
  */
-export function collectUnresolvedMutants(files) {
+function collectUnresolvedMutants(files) {
   const unresolved = [];
   for (const [fileName, file] of Object.entries(files)) {
     for (const mutant of file.mutants) {

@@ -690,7 +690,7 @@ const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 // Every content type the API can issue an S3 grant for, with the canonical
 // audio-key extension the server derives for it (first allowlisted extension
 // wins, so e.g. audio/mp4 maps to .m4a). Mirrors AUDIO_TYPES +
-// CONTENT_TYPE_TO_EXT in server/src/upload.ts and server/src/audio-upload.ts.
+// contentTypeToExt in server/src/upload.ts and server/src/audio-upload.ts.
 const AUDIO_CONTENT_TYPE_TO_EXT: Readonly<Record<string, string>> = {
   'audio/m4a': 'm4a',
   'audio/mp4': 'm4a',

@@ -3,7 +3,7 @@ import fs from 'fs/promises';
 import request from 'supertest';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { logger } from '../src/logger';
-import { app, pool, registerUser } from './helpers';
+import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -68,7 +68,7 @@ function fixedRequestForm(
   return request(a)
     .post(path)
     .set('Authorization', `Bearer ${token}`)
-    .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+    .attach('audio', fakeM4aBuffer(), {
       filename: 'answer.m4a',
       contentType: 'audio/mp4',
     })

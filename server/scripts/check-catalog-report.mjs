@@ -27,7 +27,7 @@ const reviewedNonMutatedCatalogFiles = ['db/seed-data/types.ts'];
  * so a narrowed mutate glob, a renamed seed module, or a truncated report
  * cannot pass silently.
  */
-export async function expectedCatalogSourceFiles(serverDir = defaultServerDirectory) {
+async function expectedCatalogSourceFiles(serverDir = defaultServerDirectory) {
   const seedDataDirectory = path.join(serverDir, 'db', 'seed-data');
   const entries = await fs.readdir(seedDataDirectory);
   const modules = entries.filter((entry) => entry.endsWith('.ts')).map((entry) => `db/seed-data/${entry}`);

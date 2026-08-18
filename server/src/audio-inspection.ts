@@ -4,7 +4,7 @@ import path from 'node:path';
 import { config } from './config';
 import { HttpError } from './middleware';
 
-export const MIN_AUDIO_DURATION_SECONDS = 0.5;
+const MIN_AUDIO_DURATION_SECONDS = 0.5;
 // Native encoders may add a fraction of a second of AAC/MP3/WebM padding to a
 // take stopped at exactly 120 seconds. This is container tolerance, not extra
 // learner speaking time.
@@ -302,8 +302,6 @@ function verifySingleAudioStream(filePath: string, inputFormat: string, movSafet
 
     child.stdout!.on('data', (chunk: Buffer) => {
       listingBytes += chunk.length;
-      // One line per audio stream; far more lines than any honest container
-      // can hold means hostile media, not a long listing.
       if (listingBytes > MAX_STREAM_LISTING_BYTES) {
         finish(new InvalidInspectionError());
         return;

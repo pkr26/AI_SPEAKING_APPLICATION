@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { expectedMutationFiles } from './mutation-lanes.mjs';
 
-export const mutationProvenanceSchemaVersion = 1;
+const mutationProvenanceSchemaVersion = 1;
 
 /**
  * Inputs shared by every lane. Every production source is included because a

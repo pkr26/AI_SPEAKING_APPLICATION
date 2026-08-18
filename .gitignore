@@ -21,7 +21,6 @@ GoogleService-Info.plist
 .expo/
 # Mutation testing (Stryker) scratch + reports
 .stryker-tmp/
-.stryker-catalog-tmp/
 .stryker-*-tmp/
 # Every reports/ directory (app/, server/) holds machine-generated run artifacts,
 # so the bare name is ignored at any depth. The repo-root one also holds the

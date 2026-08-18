@@ -248,8 +248,6 @@ export async function setupDatabase(
   await steps.seed(dbUrl, log);
 }
 
-export type DatabaseCommand = 'migrate' | 'catalog' | 'seed' | 'setup';
-
 export interface DatabaseCommandActions {
   migrate: typeof migrate;
   catalog: typeof seed;

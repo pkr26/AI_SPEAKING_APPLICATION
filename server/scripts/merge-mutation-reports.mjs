@@ -8,6 +8,7 @@ import {
   assertMutationLaneManifest,
   codeMutationLaneNames,
   codeMutationLanes,
+  duplicates,
   expectedCodeMutationFiles,
 } from './mutation-lanes.mjs';
 
@@ -39,16 +40,6 @@ function own(object, key) {
 function sortedDifference(first, second) {
   const secondSet = new Set(second);
   return first.filter((item) => !secondSet.has(item)).toSorted();
-}
-
-function duplicates(values) {
-  const seen = new Set();
-  const duplicateValues = new Set();
-  for (const value of values) {
-    if (seen.has(value)) duplicateValues.add(value);
-    seen.add(value);
-  }
-  return [...duplicateValues].toSorted();
 }
 
 function assertExactKeys(actual, expected, label) {

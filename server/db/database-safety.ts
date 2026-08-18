@@ -79,7 +79,7 @@ function databaseName(parsed: URL, variableName: string): string {
   return name;
 }
 
-export function parseDestructiveDatabaseTarget(
+function parseDestructiveDatabaseTarget(
   value: string,
   variableName: string,
   options: { requireExplicitPort?: boolean; pgPort?: string } = {},

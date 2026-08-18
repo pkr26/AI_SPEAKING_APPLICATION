@@ -308,7 +308,7 @@ describe('practice', () => {
     const unsupportedExtension = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+      .attach('audio', fakeM4aBuffer(), {
         filename: 'answer.attacker-controlled-extension',
         contentType: 'audio/mp4',
       })
@@ -319,7 +319,7 @@ describe('practice', () => {
     const missing = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+      .attach('audio', fakeM4aBuffer(), {
         filename: 'answer.m4a',
         contentType: 'audio/mp4',
       });
@@ -480,7 +480,7 @@ describe('practice', () => {
       const response = await request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+        .attach('audio', fakeM4aBuffer(), {
           filename: 'answer.m4a',
           contentType: 'audio/mp4',
         })
@@ -691,7 +691,7 @@ describe('practice', () => {
       request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
+        .attach('audio', fakeM4aBuffer(), {
           filename: 'answer.m4a',
           contentType: 'audio/mp4',
         })

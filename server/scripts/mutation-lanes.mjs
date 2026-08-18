@@ -182,7 +182,7 @@ async function recursivelyListTypeScriptFiles(directory, relativeDirectory) {
   return files;
 }
 
-function duplicates(values) {
+export function duplicates(values) {
   const seen = new Set();
   const duplicateValues = new Set();
   for (const value of values) {

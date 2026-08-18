@@ -1,4 +1,3 @@
-import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
@@ -110,15 +109,10 @@ describe('assessment prompt context', () => {
     assessMock.mockReset();
     assessMock.mockResolvedValue({ transcript: 'final answer', score: 50, passed: false, feedback: 'Add detail.' });
 
-    const response = await request(a)
-      .post('/practice/attempt')
-      .set('Authorization', `Bearer ${token}`)
-      .attach('audio', Buffer.from('00000018667479704d34412000000000', 'hex'), {
-        filename: 'answer.m4a',
-        contentType: 'audio/mp4',
-      })
-      .field('questionId', q.id)
-      .field('requestId', randomUUID());
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      q.id,
+    );
 
     expect(response.status).toBe(200);
     expect(response.body).toMatchObject({ passed: false, attemptNo: 3, attemptsLeft: 0 });

@@ -37,7 +37,7 @@ const RESET_INVALID_MESSAGE = 'Reset code is invalid or expired';
 const authenticationStateChanged = () =>
   new HttpError(409, 'Authentication state changed; please try again', 'STATE_CHANGED');
 
-export function toUserJson(row: UserRow) {
+function toUserJson(row: UserRow) {
   return {
     id: row.id,
     name: row.name,

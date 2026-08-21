@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react-native/pure';
 import { AudioModule, setAudioModeAsync, useAudioRecorder, type RecordingStatus } from 'expo-audio';
 import * as Crypto from 'expo-crypto';
 import { Directory, File } from 'expo-file-system';
@@ -177,6 +177,8 @@ let liveState: MockRecorderState;
 let statusListener: ((status: RecordingStatus) => void) | undefined;
 let appStateHandlers: ((state: AppStateStatus) => void)[] = [];
 const pendingCleanup = new Set<() => void>();
+let containedLifecycleErrors: unknown[] = [];
+let containedLifecycleFailure: unknown = null;
 const originalPlatform = Object.getOwnPropertyDescriptor(Platform, 'OS');
 
 const asMock = (value: unknown) => value as jest.Mock;
@@ -217,6 +219,93 @@ async function flushMicrotasks(turns = 20): Promise<void> {
   if (turns <= 0) return;
   await Promise.resolve();
   await flushMicrotasks(turns - 1);
+}
+
+async function flushRealEventLoop(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await flushMicrotasks();
+}
+
+function beginContainedLifecycleTeardown(): Promise<void> {
+  for (const registration of mockSentinelFocusRegistrations) {
+    registration.cleanup = undefined;
+  }
+
+  // stopForLifecycle is intentionally fire-and-forget at the AppState boundary.
+  // Capture the promise created by its `.finally()` in this synchronous turn so
+  // destructive mutants reject into the assertion instead of becoming an
+  // unhandled rejection after Jest has disposed the environment.
+  const originalFinally = Promise.prototype.finally;
+  const lifecyclePromises: Promise<unknown>[] = [];
+  // eslint-disable-next-line no-extend-native -- restored synchronously in finally below
+  Object.defineProperty(Promise.prototype, 'finally', {
+    configurable: true,
+    writable: true,
+    value(this: Promise<unknown>, onfinally?: (() => void) | null) {
+      const result = originalFinally.call(this, onfinally);
+      lifecyclePromises.push(result);
+      return result;
+    },
+  });
+  const actEnvironment = globalThis as typeof globalThis & {
+    IS_REACT_ACT_ENVIRONMENT?: boolean;
+  };
+  const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+  actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
+  try {
+    for (const handler of [...appStateHandlers]) handler('background');
+  } finally {
+    actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+    // eslint-disable-next-line no-extend-native -- restore the captured native method
+    Object.defineProperty(Promise.prototype, 'finally', {
+      configurable: true,
+      writable: true,
+      value: originalFinally,
+    });
+  }
+
+  const observations = lifecyclePromises.map((promise) =>
+    promise.then(
+      () => undefined,
+      (error: unknown) => {
+        containedLifecycleErrors.push(error);
+        containedLifecycleFailure ??= error;
+      },
+    ),
+  );
+  return Promise.all(observations).then(() => undefined);
+}
+
+async function unmountWithContainedLifecycle(view: {
+  unmount: () => Promise<void>;
+}): Promise<void> {
+  const lifecycleCompletion = beginContainedLifecycleTeardown();
+  let unmountError: unknown;
+  try {
+    await view.unmount();
+  } catch (error) {
+    unmountError = error;
+  }
+  await lifecycleCompletion;
+  await flushMicrotasks();
+  if (unmountError) throw unmountError;
+}
+
+async function cleanupMountedRecorders(): Promise<void> {
+  for (const settle of [...pendingCleanup]) settle();
+  jest.useRealTimers();
+  const lifecycleCompletion = beginContainedLifecycleTeardown();
+  let cleanupError: unknown;
+  try {
+    await cleanup();
+  } catch (error) {
+    cleanupError = error;
+  }
+  await lifecycleCompletion;
+  await flushMicrotasks();
+  await flushRealEventLoop();
+  await flushRealEventLoop();
+  if (cleanupError) throw cleanupError;
 }
 
 function emitStatus(overrides: Partial<RecordingStatus> = {}) {
@@ -304,6 +393,11 @@ function deletedFileUris(): string[] {
 
 beforeEach(() => {
   jest.clearAllMocks();
+  containedLifecycleErrors = [];
+  // Once a destructive teardown mutant has violated the dedicated contract,
+  // do not let its half-invalidated module globals poison later sentinel cases
+  // and turn one deterministic kill into a file-level timeout.
+  if (containedLifecycleFailure) throw containedLifecycleFailure;
   mockSentinelFocused = true;
   mockSentinelFocusRegistrations = [];
   appStateHandlers = [];
@@ -386,8 +480,13 @@ beforeEach(() => {
   asMock(apiFetch).mockResolvedValue({ ok: true });
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);
   jest.spyOn(AppState, 'addEventListener').mockImplementation((_event, handler) => {
-    appStateHandlers.push(handler as (state: AppStateStatus) => void);
-    return { remove: jest.fn() };
+    const appStateHandler = handler as (state: AppStateStatus) => void;
+    appStateHandlers.push(appStateHandler);
+    return {
+      remove: jest.fn(() => {
+        appStateHandlers = appStateHandlers.filter((entry) => entry !== appStateHandler);
+      }),
+    };
   });
   jest.spyOn(AccessibilityInfo, 'isReduceMotionEnabled').mockResolvedValue(false);
   jest.spyOn(AccessibilityInfo, 'announceForAccessibility').mockImplementation(() => undefined);
@@ -395,25 +494,46 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  cleanup();
-  await act(async () => {
-    for (const settle of [...pendingCleanup]) settle();
-    await flushMicrotasks();
-  });
-  pendingCleanup.clear();
-  jest.useRealTimers();
-  if (originalPlatform) Object.defineProperty(Platform, 'OS', originalPlatform);
-  jest.restoreAllMocks();
+  let cleanupError: unknown;
+  try {
+    try {
+      await cleanupMountedRecorders();
+    } catch (error) {
+      cleanupError = error;
+    }
+    // React schedules passive unmount work with setImmediate. Keep Jest's
+    // rejection observer alive until that work and its promise continuations
+    // have completed, so a destructive mutant is a test failure rather than a
+    // worker crash after environment teardown.
+    await flushRealEventLoop();
+    await flushRealEventLoop();
+  } finally {
+    pendingCleanup.clear();
+    if (originalPlatform) Object.defineProperty(Platform, 'OS', originalPlatform);
+    jest.restoreAllMocks();
+  }
+  expect([cleanupError, ...containedLifecycleErrors].filter(Boolean)).toEqual([]);
 });
 
 // The campaign executes this component harness as its own Stryker pass, so a
 // decisive sentinel result is final before the integration pass begins.
 describe('Recorder mutation sentinels', () => {
+  it('ID 1063: null recovery-controller teardown is inert and fully drained', async () => {
+    await renderRecorder();
+    let teardownError: unknown;
+    try {
+      await cleanupMountedRecorders();
+    } catch (error) {
+      teardownError = error;
+    }
+    expect([teardownError, ...containedLifecycleErrors].filter(Boolean)).toEqual([]);
+  });
+
   it('ID 894: a captured post-unmount Start reaches no lock callback', async () => {
     const onInteractionLockChange = jest.fn();
     const { view } = await renderRecorder({ onInteractionLockChange });
     const staleStart = committedPress(START_LABEL);
-    await view.unmount();
+    await unmountWithContainedLifecycle(view);
     await act(async () => flushMicrotasks());
     onInteractionLockChange.mockClear();
     await act(async () => {
@@ -660,7 +780,7 @@ describe('Recorder mutation sentinels', () => {
     });
     expect(reads).toBe(1);
     expect(recorder.record).toHaveBeenCalledTimes(1);
-    await view.unmount();
+    await unmountWithContainedLifecycle(view);
   });
 
   it('audio/stop timeout sentinels: three takes release every single-flight owner', async () => {
@@ -738,7 +858,7 @@ describe('Recorder mutation sentinels', () => {
         deliveredResult,
       };
     } finally {
-      await view?.unmount();
+      if (view) await unmountWithContainedLifecycle(view);
       secondLoad.resolve(null);
       await act(async () => flushMicrotasks(20));
     }

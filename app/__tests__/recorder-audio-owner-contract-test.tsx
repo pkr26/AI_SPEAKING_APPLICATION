@@ -330,6 +330,15 @@ afterEach(() => {
 // outcomes therefore cannot leak into or be overwritten by a later test file.
 describe('Recorder audio-owner mutation contract', () => {
   it('serializes acquisition, restore, notification, and waiter handoff in one lifecycle', async () => {
+    let trackUnmountedAppStateReads = false;
+    let unmountedAppStateReads = 0;
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      get: () => {
+        if (trackUnmountedAppStateReads) unmountedAppStateReads += 1;
+        return 'active';
+      },
+    });
     const permissions = deferred<{ granted: boolean }>();
     asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(permissions.promise);
     const failingRestore = deferred<void>();
@@ -365,12 +374,10 @@ describe('Recorder audio-owner mutation contract', () => {
     };
     const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
     let unmounted = false;
-    let ownerStartSettled = false;
-    let racerStartSettled = false;
     let lateStartSettled = false;
-    let ownerStart!: Promise<unknown>;
-    let racerStart!: Promise<unknown>;
-    let lateStart!: Promise<unknown>;
+    let ownerStart: Promise<unknown> | null = null;
+    let racerStart: Promise<unknown> | null = null;
+    let lateStart: Promise<unknown> | null = null;
     let outcome:
       | {
           ownerRecords: number;
@@ -385,12 +392,8 @@ describe('Recorder audio-owner mutation contract', () => {
     actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
     try {
       const starts = rawPressHandlers(renderer, START_LABEL);
-      ownerStart = Promise.resolve(starts[0]()).finally(() => {
-        ownerStartSettled = true;
-      });
-      racerStart = Promise.resolve(starts[1]()).finally(() => {
-        racerStartSettled = true;
-      });
+      ownerStart = Promise.resolve(starts[0]());
+      racerStart = Promise.resolve(starts[1]());
       await flushMicrotasks(30);
       permissions.resolve({ granted: true });
       await flushMicrotasks(100);
@@ -440,8 +443,12 @@ describe('Recorder audio-owner mutation contract', () => {
       // Unmount while the contender's successful restore is pending. Correct
       // code returns that same promise to lifecycle teardown; ID13 starts a
       // second native restore instead.
-      renderer.unmount();
+      actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+      await act(() => {
+        renderer.unmount();
+      });
       unmounted = true;
+      trackUnmountedAppStateReads = true;
       await flushMicrotasks(40);
       overlappingRestore.resolve();
       await flushMicrotasks(200);
@@ -459,19 +466,26 @@ describe('Recorder audio-owner mutation contract', () => {
       overlappingRestore.resolve();
       permissions.resolve({ granted: true });
       if (!unmounted) {
-        renderer.unmount();
+        actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+        await act(() => {
+          renderer.unmount();
+        });
         unmounted = true;
       }
       await flushMicrotasks(200);
       actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
     }
 
-    const settledOperations = [
-      ownerStartSettled ? ownerStart : null,
-      racerStartSettled ? racerStart : null,
-      lateStartSettled ? lateStart : null,
-    ].filter((operation): operation is Promise<unknown> => operation !== null);
-    await Promise.allSettled(settledOperations);
+    const startedOperations = [ownerStart, racerStart, lateStart].filter(
+      (operation): operation is Promise<unknown> => operation !== null,
+    );
+    // Await every operation we started, not only promises that happened to be
+    // settled when cleanup was sampled. React can run passive unmount cleanup
+    // on a later event-loop turn; leaving one of these chains alive lets its
+    // final endOperation callback execute after Jest has torn down react-native.
+    await Promise.allSettled(startedOperations);
+    await flushMicrotasks(20);
+    expect(unmountedAppStateReads).toBe(0);
 
     expect(outcome).toEqual({
       ownerRecords: 1,

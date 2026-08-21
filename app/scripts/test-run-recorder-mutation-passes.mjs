@@ -165,7 +165,7 @@ test('a pass invocation selects one owned test, one exact range, and a unique te
   assert.equal(incremental.args.includes('--force'), false);
 });
 
-test('cheap-pass barrier builds a killed-only seed before full-worker integration and resumes', async (t) => {
+test('fast cheap barrier gives sentinel and integration the full worker budget', async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'recorder-incremental-runner-test-'));
   const reportDir = path.join(workspace, 'reports');
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -177,6 +177,7 @@ test('cheap-pass barrier builds a killed-only seed before full-worker integratio
   const calls = [];
   let activeCheap = 0;
   let maxActiveCheap = 0;
+  let completedFastCheap = 0;
   let completedCheap = 0;
   let cheapEntered = 0;
   let releaseCheap;
@@ -211,14 +212,22 @@ test('cheap-pass barrier builds a killed-only seed before full-worker integratio
     ...options,
     runPass: async ({ childConcurrency, incrementalFile, mode, pass, reportPath }) => {
       calls.push({ childConcurrency, incrementalFile, mode, passName: pass.passName });
-      if (pass.passName !== 'integration') {
+      if (pass.passName !== 'component-sentinels' && pass.passName !== 'integration') {
         assert.equal(childConcurrency, 1);
         activeCheap += 1;
         maxActiveCheap = Math.max(maxActiveCheap, activeCheap);
         cheapEntered += 1;
-        if (cheapEntered === 4) releaseCheap();
+        if (cheapEntered === 3) releaseCheap();
         await cheapBarrier;
         activeCheap -= 1;
+        completedFastCheap += 1;
+        completedCheap += 1;
+        await fs.writeFile(reportPath, JSON.stringify({ kind: 'cheap-raw', key: pass.key }));
+        return 0;
+      }
+      if (pass.passName === 'component-sentinels') {
+        assert.equal(completedFastCheap, 3);
+        assert.equal(childConcurrency, 4);
         completedCheap += 1;
         await fs.writeFile(reportPath, JSON.stringify({ kind: 'cheap-raw', key: pass.key }));
         return 0;
@@ -234,10 +243,10 @@ test('cheap-pass barrier builds a killed-only seed before full-worker integratio
     },
   });
   assert.equal(first.exitCode, 0);
-  assert.equal(maxActiveCheap, 4);
+  assert.equal(maxActiveCheap, 3);
   assert.deepEqual(
     calls.map(({ childConcurrency }) => childConcurrency),
-    [1, 1, 1, 1, 4],
+    [1, 1, 1, 4, 4],
   );
   const manifest = JSON.parse(await fs.readFile(first.manifestPath, 'utf8'));
   assert.equal(manifest.incrementalSeed.seededCount, 1);
@@ -248,8 +257,9 @@ test('cheap-pass barrier builds a killed-only seed before full-worker integratio
     'orphaned seed evidence should be archived before deterministic regeneration',
   );
   assert.ok(
-    manifest.passes.slice(0, 4).every(({ attempts }) => attempts[0].childConcurrency === 1),
+    manifest.passes.slice(0, 3).every(({ attempts }) => attempts[0].childConcurrency === 1),
   );
+  assert.equal(manifest.passes[3].attempts[0].childConcurrency, 4);
   const integrationAttempt = manifest.passes.at(-1).attempts[0];
   assert.equal(integrationAttempt.childConcurrency, 4);
   assert.equal(integrationAttempt.mode, RECORDER_PASS_MODE_COVERAGE_OFF_INCREMENTAL);
@@ -370,7 +380,7 @@ test('parallel stage manifest rejection aborts and awaits every sibling', async 
     },
     runPass: async ({ pass, reportPath, signal }) => {
       entered += 1;
-      if (entered === 4) releaseFirst();
+      if (entered === 3) releaseFirst();
       await allEntered;
       if (pass.passName === 'pure-contract') {
         await fs.writeFile(reportPath, JSON.stringify({ kind: 'cheap-raw' }));
@@ -390,7 +400,7 @@ test('parallel stage manifest rejection aborts and awaits every sibling', async 
   });
   assert.equal(result.exitCode, 1);
   assert.equal(rejectedWrites, 2);
-  assert.equal(siblingsSettled.length, 3);
+  assert.equal(siblingsSettled.length, 2);
   const manifest = JSON.parse(await fs.readFile(result.manifestPath, 'utf8'));
   assert.equal(manifest.status, 'failed');
   assert.match(manifest.validationError, /injected manifest write failure/);
@@ -543,6 +553,7 @@ test('an external stop reaches the active pass and records a durable stopped out
   const passEntered = new Promise((resolve) => {
     entered = resolve;
   });
+  let teardownDiagnostics;
   const running = runRecorderMutationPasses({
     appDir,
     reportDir,
@@ -560,7 +571,31 @@ test('an external stop reaches the active pass and records a durable stopped out
     runPass: ({ signal }) =>
       new Promise((resolve) => {
         entered();
-        signal.addEventListener('abort', () => resolve(143), { once: true });
+        signal.addEventListener(
+          'abort',
+          () => {
+            void (async () => {
+              const termination = terminateRecorderMutationProcessTree(
+                { pid: 7001 },
+                {
+                  clearTimer: clearImmediate,
+                  killProcess(pid) {
+                    if (pid < 0) {
+                      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+                    }
+                  },
+                  listProcessGroupPids: async () => [7002],
+                  platform: 'darwin',
+                  schedule: setImmediate,
+                },
+              );
+              await termination.leaderExited();
+              teardownDiagnostics = await termination.completion;
+              resolve(143);
+            })();
+          },
+          { once: true },
+        );
       }),
   });
   await passEntered;
@@ -568,6 +603,7 @@ test('an external stop reaches the active pass and records a durable stopped out
   const result = await running;
   assert.equal(result.exitCode, 143);
   assert.equal(result.aborted, true);
+  assert.ok(teardownDiagnostics.some(({ code }) => code === 'EPERM'));
   const manifest = JSON.parse(await fs.readFile(result.manifestPath, 'utf8'));
   assert.equal(manifest.status, 'stopped');
   assert.equal(manifest.passes[0].status, 'stopped');
@@ -764,9 +800,9 @@ test('process-tree cancellation keeps escalation armed after the leader exits', 
         cleared = timer;
       },
       killProcess(pid, signal) {
-        signals.push([pid, signal]);
+        if (signal !== 0) signals.push([pid, signal]);
       },
-      isGroupAlive: () => true,
+      listProcessGroupPids: async () => [1234],
       platform: 'darwin',
       schedule(callback, delay) {
         escalation = callback;
@@ -775,8 +811,9 @@ test('process-tree cancellation keeps escalation armed after the leader exits', 
       stopGraceMs: 250,
     },
   );
+  await Promise.resolve();
   assert.deepEqual(signals, [[-1234, 'SIGTERM']]);
-  termination.leaderExited();
+  await termination.leaderExited();
   assert.equal(cleared, undefined);
   escalation();
   await termination.completion;
@@ -785,6 +822,54 @@ test('process-tree cancellation keeps escalation armed after the leader exits', 
     [-1234, 'SIGKILL'],
   ]);
   assert.equal(cleared.delay, 250);
+});
+
+test('macOS EPERM falls back to exact-PGID members without throwing', async () => {
+  const memberSignals = [];
+  let escalation;
+  const eperm = () => Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+  const termination = terminateRecorderMutationProcessTree(
+    { pid: 4321 },
+    {
+      clearTimer() {},
+      killProcess(pid, signal) {
+        if (pid < 0) throw eperm();
+        if (pid === 4323) throw eperm();
+        memberSignals.push([pid, signal]);
+      },
+      listProcessGroupPids: async (pgid) => {
+        assert.equal(pgid, 4321);
+        return [4321, 4322, 4323];
+      },
+      platform: 'darwin',
+      schedule(callback) {
+        escalation = callback;
+        return { unref() {} };
+      },
+      stopGraceMs: 10,
+    },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(memberSignals, [
+    [4321, 'SIGTERM'],
+    [4322, 'SIGTERM'],
+  ]);
+  await termination.leaderExited();
+  escalation();
+  const diagnostics = await termination.completion;
+  assert.deepEqual(memberSignals, [
+    [4321, 'SIGTERM'],
+    [4322, 'SIGTERM'],
+    [4321, 'SIGKILL'],
+    [4322, 'SIGKILL'],
+  ]);
+  assert.ok(diagnostics.some(({ phase, code }) => phase === 'probe-group' && code === 'EPERM'));
+  assert.ok(diagnostics.some(({ phase, code }) => phase === 'kill-group' && code === 'EPERM'));
+  assert.ok(
+    diagnostics.some(
+      ({ phase, code, pid }) => phase.includes('member') && code === 'EPERM' && pid === 4323,
+    ),
+  );
 });
 
 test('the outcome filename remains stable for manual audit tooling', () => {

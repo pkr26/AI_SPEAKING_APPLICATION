@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, createWriteStream } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -406,13 +406,36 @@ function ignoredMissingProcess(error) {
   return error?.code === 'ESRCH';
 }
 
+function permissionDeniedProcess(error) {
+  return error?.code === 'EPERM';
+}
+
+function listProcessGroupPidsWithPs(processGroupId) {
+  return new Promise((resolve, reject) => {
+    execFile('/bin/ps', ['-axo', 'pid=,pgid='], { encoding: 'utf8' }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      const pids = [];
+      for (const line of stdout.split('\n')) {
+        const [pidText, pgidText] = line.trim().split(/\s+/u);
+        const pid = Number(pidText);
+        const pgid = Number(pgidText);
+        if (Number.isInteger(pid) && pid > 0 && pgid === processGroupId) pids.push(pid);
+      }
+      resolve([...new Set(pids)]);
+    });
+  });
+}
+
 /** TERM a complete Stryker process group, then KILL it after a bounded grace period. */
 export function terminateRecorderMutationProcessTree(
   child,
   {
     clearTimer = clearTimeout,
-    isGroupAlive,
     killProcess = process.kill,
+    listProcessGroupPids = listProcessGroupPidsWithPs,
     platform = process.platform,
     schedule = setTimeout,
     stopGraceMs = RECORDER_MUTATION_STOP_GRACE_MS,
@@ -420,46 +443,100 @@ export function terminateRecorderMutationProcessTree(
 ) {
   let timer;
   let settled = false;
+  const diagnostics = [];
   let resolveCompletion;
   const completion = new Promise((resolve) => {
     resolveCompletion = resolve;
   });
-  const send = (signalName) => {
+  const record = (phase, error, details = {}) => {
+    diagnostics.push({
+      phase,
+      code: error?.code ?? 'UNKNOWN',
+      message: String(error?.message ?? error),
+      ...details,
+    });
+  };
+  const enumerate = async (phase) => {
+    try {
+      const pids = await listProcessGroupPids(child.pid);
+      return pids.filter((pid) => Number.isInteger(pid) && pid > 0 && pid !== process.pid);
+    } catch (error) {
+      record(phase, error, { processGroupId: child.pid });
+      return undefined;
+    }
+  };
+  const signalMembers = async (signalName, phase) => {
+    const pids = await enumerate(`${phase}-enumerate`);
+    if (pids === undefined) return;
+    for (const pid of pids) {
+      try {
+        killProcess(pid, signalName);
+      } catch (error) {
+        if (ignoredMissingProcess(error)) continue;
+        record(phase, error, { pid, signal: signalName });
+      }
+    }
+  };
+  const send = async (signalName, phase) => {
     try {
       if (platform === 'win32') child.kill(signalName);
       else killProcess(-child.pid, signalName);
     } catch (error) {
-      if (!ignoredMissingProcess(error)) throw error;
+      if (ignoredMissingProcess(error)) return;
+      record(phase, error, { processGroupId: child.pid, signal: signalName });
+      // macOS can return EPERM for killpg after the leader exits. Enumerating
+      // the exact PGID and signaling positive PIDs keeps teardown bounded.
+      await signalMembers(signalName, `${phase}-member`);
     }
   };
-  const groupIsAlive =
-    isGroupAlive ??
-    (() => {
-      if (platform === 'win32') return child.exitCode === null && child.signalCode === null;
-      try {
-        killProcess(-child.pid, 0);
-        return true;
-      } catch (error) {
-        if (ignoredMissingProcess(error)) return false;
-        throw error;
+  const groupIsAlive = async () => {
+    if (platform === 'win32') return child.exitCode === null && child.signalCode === null;
+    try {
+      killProcess(-child.pid, 0);
+      return true;
+    } catch (error) {
+      if (ignoredMissingProcess(error)) return false;
+      if (permissionDeniedProcess(error)) {
+        record('probe-group', error, { processGroupId: child.pid, signal: 0 });
+        const pids = await enumerate('probe-enumerate');
+        // Enumeration failure is unknown, not proof that the group is gone.
+        return pids === undefined ? true : pids.length > 0;
       }
-    });
+      record('probe-group', error, { processGroupId: child.pid, signal: 0 });
+      return true;
+    }
+  };
   const settle = () => {
     if (settled) return;
     settled = true;
     clearTimer(timer);
-    resolveCompletion();
+    resolveCompletion(diagnostics);
   };
-  send('SIGTERM');
+  const term = send('SIGTERM', 'term-group');
   timer = schedule(() => {
-    if (groupIsAlive()) send('SIGKILL');
-    settle();
+    void (async () => {
+      try {
+        await term;
+        if (await groupIsAlive()) await send('SIGKILL', 'kill-group');
+      } catch (error) {
+        // Timer callbacks must never take down the mutation parent.
+        record('kill-escalation', error, { processGroupId: child.pid });
+      } finally {
+        settle();
+      }
+    })();
   }, stopGraceMs);
   return {
     completion,
-    leaderExited() {
+    diagnostics,
+    async leaderExited() {
       // The leader can exit while Jest descendants remain in its process group.
-      if (!groupIsAlive()) settle();
+      try {
+        await term;
+        if (!(await groupIsAlive())) settle();
+      } catch (error) {
+        record('leader-exit-probe', error, { processGroupId: child.pid });
+      }
     },
   };
 }
@@ -499,8 +576,13 @@ async function runChildProcess(command, args, { cwd, environment, logPath, signa
       finished = true;
       signal.removeEventListener('abort', stopChild);
       if (termination) {
-        termination.leaderExited();
-        await termination.completion;
+        await termination.leaderExited();
+        const diagnostics = await termination.completion;
+        if (diagnostics.length) {
+          const message = `[recorder-teardown] ${JSON.stringify(diagnostics)}\n`;
+          process.stderr.write(message);
+          log.write(message);
+        }
       }
       await closeLog();
       if (logError) {
@@ -744,9 +826,17 @@ export async function runRecorderMutationPasses({
   const cheapIndexes = plan.passes
     .map((_pass, index) => index)
     .filter((index) => index !== integrationIndex);
+  const sentinelIndexes = cheapIndexes.filter(
+    (index) => plan.passes[index].passName === 'component-sentinels',
+  );
+  const fastCheapIndexes = cheapIndexes.filter((index) => !sentinelIndexes.includes(index));
   if (cheapIndexes.length === 0 || integrationIndex !== plan.passes.length - 1) {
     throw new Error('Recorder mutation plan must place cheap passes before integration');
   }
+  if (sentinelIndexes.length !== 1 || fastCheapIndexes.length !== 3) {
+    throw new Error('Recorder mutation plan must contain three fast cheap passes and one sentinel');
+  }
+  const sentinelIndex = sentinelIndexes[0];
 
   const executionEnvironment = {
     ...environment,
@@ -816,6 +906,8 @@ export async function runRecorderMutationPasses({
   manifest.incrementalOptimization = {
     enabled: incrementalEnabled,
     cheapPassKeys: cheapIndexes.map((index) => plan.passes[index].key),
+    fastCheapPassKeys: fastCheapIndexes.map((index) => plan.passes[index].key),
+    sentinelPassKey: plan.passes[sentinelIndex].key,
     integrationPassKey: plan.passes[integrationIndex].key,
   };
   manifest.publication = null;
@@ -1184,12 +1276,23 @@ export async function runRecorderMutationPasses({
 
   try {
     try {
-      await runStage(cheapIndexes, budget.cheapPassConcurrency, {
+      await runStage(fastCheapIndexes, budget.cheapPassConcurrency, {
         childConcurrency: 1,
         mode: RECORDER_PASS_MODE_COVERAGE_ALL,
       });
     } catch (error) {
       await recordStageFailure(error, 'cheap-pass-stage');
+    }
+
+    if (!stop.signal.aborted && failedPasses.length === 0 && !validationError) {
+      try {
+        await runStage([sentinelIndex], 1, {
+          childConcurrency: budget.integrationConcurrency,
+          mode: RECORDER_PASS_MODE_COVERAGE_ALL,
+        });
+      } catch (error) {
+        await recordStageFailure(error, 'sentinel-stage');
+      }
     }
 
     if (!stop.signal.aborted && failedPasses.length === 0 && incrementalEnabled) {

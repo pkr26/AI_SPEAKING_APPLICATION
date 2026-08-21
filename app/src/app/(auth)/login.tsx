@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Link, router, useLocalSearchParams } from 'expo-router';
+import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
@@ -23,6 +23,7 @@ import { useT } from '../../lib/i18n';
 import { firstParam } from '../../lib/params';
 import { consumeSessionExpiredNotice } from '../../lib/session-notice';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function LoginScreen() {
   const { login } = useAuth();
@@ -31,6 +32,7 @@ export default function LoginScreen() {
   const styles = themedStyles(theme);
   const { colors } = theme;
   const params = useLocalSearchParams<{ notice?: string }>();
+  const navigation = useNavigation();
   // One-shot success banner set by the reset-password screen's redirect.
   const resetDone = firstParam(params.notice) === 'reset';
   const [email, setEmail] = useState('');
@@ -42,6 +44,32 @@ export default function LoginScreen() {
   const [error, setError] = useState<string | null>(null);
   const passwordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const publishNavigationLock = () => {
+    if (!mountedRef.current) return;
+    navigation.setOptions(
+      busyRef.current
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  };
+  useHardwareBack(() => busyRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (busyRef.current && event.data.action.type === 'GO_BACK') event.preventDefault();
+    });
+    return unsubscribe;
+  }, [navigation]);
+  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
+    if (busyRef.current) event.preventDefault();
+  };
 
   // One-shot explanation for a 401-driven sign-out (revoked/expired token).
   useEffect(() => {
@@ -68,12 +96,14 @@ export default function LoginScreen() {
   const handleLogin = async () => {
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
+    publishNavigationLock();
     setBusy(true);
     setError(null);
     try {
       await login(email.trim(), password);
-      router.replace('/');
+      if (mountedRef.current) router.replace('/');
     } catch (err) {
+      if (!mountedRef.current) return;
       if (err instanceof ApiError && err.status === 401) {
         setError(t('error.wrongCredentials'));
       } else {
@@ -81,7 +111,10 @@ export default function LoginScreen() {
       }
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        publishNavigationLock();
+        setBusy(false);
+      }
     }
   };
 
@@ -192,14 +225,24 @@ export default function LoginScreen() {
               style={styles.submitButton}
             />
 
-            <Link href="/forgot-password" style={styles.forgotLink}>
+            <Link
+              href="/forgot-password"
+              accessibilityState={{ disabled: busy }}
+              onPress={blockLinkWhileBusy}
+              style={styles.forgotLink}
+            >
               {t('login.forgot')}
             </Link>
           </View>
 
           <View style={styles.footer}>
             <Text style={styles.footerText}>{t('login.footerPrompt')}</Text>
-            <Link href="/signup" style={styles.footerLink}>
+            <Link
+              href="/signup"
+              accessibilityState={{ disabled: busy }}
+              onPress={blockLinkWhileBusy}
+              style={styles.footerLink}
+            >
               {t('login.footerLink')}
             </Link>
           </View>

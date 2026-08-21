@@ -6,7 +6,7 @@ import { Alert, BackHandler, StyleSheet } from 'react-native';
 
 import DiagnosticScreen from '../src/app/diagnostic';
 import { ApiError, apiFetch, userMessageForError } from '../src/lib/api';
-import { LogoutCleanupError, type useAuth } from '../src/lib/auth';
+import { LogoutCleanupError, type SessionLease, type useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import {
@@ -26,11 +26,19 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
 // Focus is simulated by invoking the effect on mount and its cleanup on
 // unmount, re-running when the callback identity changes (as expo-router does
 // while a screen stays focused).
+interface MockFocusRegistration {
+  callback: () => void | (() => void);
+  cleanup: (() => void) | null;
+}
+
+const mockFocusRegistrations: MockFocusRegistration[] = [];
+
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
   return {
     router: {
       push: jest.fn(),
+      navigate: jest.fn(),
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
@@ -38,8 +46,15 @@ jest.mock('expo-router', () => {
     useLocalSearchParams: () => ({}),
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
+        const registration = { callback, cleanup: null as (() => void) | null };
+        mockFocusRegistrations.push(registration);
         const cleanup = callback();
-        return typeof cleanup === 'function' ? cleanup : undefined;
+        registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        return () => {
+          registration.cleanup?.();
+          const index = mockFocusRegistrations.indexOf(registration);
+          if (index >= 0) mockFocusRegistrations.splice(index, 1);
+        };
       }, [callback]);
     },
   };
@@ -101,6 +116,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn().mockResolvedValue(undefined),
@@ -131,6 +148,7 @@ const mockApiFetch = apiFetch as jest.Mock;
 const mockUserMessageForError = jest.mocked(userMessageForError);
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
+  navigate: jest.Mock;
   replace: jest.Mock;
 };
 
@@ -272,11 +290,31 @@ function capturedPressHandler(accessibilityLabel: string): () => unknown {
   throw new Error(`Pressable "${accessibilityLabel}" not found`);
 }
 
+async function blurScreen(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockFocusRegistrations) {
+      const cleanup = registration.cleanup;
+      registration.cleanup = null;
+      cleanup?.();
+    }
+  });
+}
+
+async function focusScreen(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockFocusRegistrations) {
+      const cleanup = registration.callback();
+      registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+    }
+  });
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockApiFetch.mockReset();
   mockRecorderProps = null;
   mockAuthValue = makeAuth();
+  mockFocusRegistrations.length = 0;
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
   backHandlers = [];
   backSubscriptionRemove = jest.fn();
@@ -418,6 +456,24 @@ describe('diagnostic screen', () => {
     });
   });
 
+  it('renders no stale question while a new identity has cached empty diagnostic data', async () => {
+    const queryClient = makeQueryClient();
+    mockApiFetch.mockResolvedValueOnce(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen(queryClient);
+    await startFreshTest();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+
+    queryClient.setQueryData(['diagnostic-next', 2, OTHER_USER.id], null);
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    mockRecorderProps = null;
+    await rendered.rerenderScreen();
+
+    expect(screen.queryByText('Describe a time you showed courage.')).toBeNull();
+    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
+    expect(mockRecorderProps).toBeNull();
+  });
+
   it('keeps the current diagnostic question visible when recovery refresh fails', async () => {
     const queryClient = makeQueryClient();
     const queryKey = ['diagnostic-next', 1, USER.id] as const;
@@ -509,6 +565,90 @@ describe('diagnostic screen', () => {
     },
   );
 
+  it('does not let an old Recorder release or acquire the new identity lock', async () => {
+    const currentQuestion = new Promise<ReturnType<typeof nextPayload>>(() => undefined);
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockResolvedValueOnce(nextPayload(QUESTION_2, 0))
+      .mockReturnValue(currentQuestion);
+    const rendered = await renderScreen();
+    await startFreshTest();
+    const staleCallbacks = recorderProps();
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+    await startFreshTest();
+    const currentCallbacks = recorderProps();
+    expect(currentCallbacks).not.toBe(staleCallbacks);
+
+    await act(async () => currentCallbacks.onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => staleCallbacks.onInteractionLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => currentCallbacks.onInteractionLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+
+    await act(async () => staleCallbacks.onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+  });
+
+  it.each(['blur', 'session lease'] as const)(
+    'drops queued diagnostic Recorder work after %s ownership is lost',
+    async (boundary) => {
+      const renderLease = { owner: 'diagnostic-render' } as never;
+      let currentLease: unknown = renderLease;
+      mockAuthValue = makeAuth({
+        captureSessionLease: jest.fn(() => currentLease as never),
+        isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+      });
+      mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+      await renderScreen();
+      await startFreshTest();
+      const callbacks = recorderProps();
+      const requestsBeforeBoundary = mockApiFetch.mock.calls.length;
+
+      if (boundary === 'blur') {
+        await blurScreen();
+      } else {
+        currentLease = { owner: 'replacement-session' };
+      }
+      alertSpy.mockClear();
+
+      await act(async () => {
+        callbacks.onResult({
+          passed: true,
+          score: 99,
+          transcript: 'late transcript',
+          feedback: 'late feedback',
+          done: false,
+          nextQuestion: QUESTION_2,
+        });
+        callbacks.onError('late upload failure');
+        callbacks.onRecoveryUnresolved();
+        callbacks.onInteractionLockChange?.(true);
+        await Promise.resolve();
+      });
+
+      expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+      expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+      expect(alertSpy).not.toHaveBeenCalled();
+      expect(mockApiFetch).toHaveBeenCalledTimes(requestsBeforeBoundary);
+      expect(
+        screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+      ).toMatchObject({ disabled: false });
+    },
+  );
+
   it.each(['account', 'session'] as const)(
     'rejects a captured Next Question action after the %s identity changes',
     async (boundary) => {
@@ -591,6 +731,60 @@ describe('diagnostic screen', () => {
       expect(mockRouter.replace).not.toHaveBeenCalled();
     },
   );
+
+  it('binds acknowledgement to the session lease captured by its rendered result card', async () => {
+    const renderLease = { owner: 'answer-card' } as never;
+    let currentLease: unknown = renderLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 88,
+        transcript: 'owned answer',
+        feedback: 'owned feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+
+    currentLease = { owner: 'replacement-session' };
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+
+    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+  });
+
+  it('binds Start Practicing to the session lease captured by the completion card', async () => {
+    const renderLease = { owner: 'completion-card' } as never;
+    let currentLease: unknown = renderLease;
+    const setUser = jest.fn();
+    mockAuthValue = makeAuth({
+      setUser,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2' });
+    const queryClient = makeQueryClient();
+    const removeSpy = jest.spyOn(queryClient, 'removeQueries');
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(queryClient);
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+
+    currentLease = { owner: 'replacement-session' };
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
+
+    expect(setUser).not.toHaveBeenCalled();
+    expect(removeSpy).not.toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['me'] });
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
 
   it('invalidates captured recorder callbacks when the diagnostic screen unmounts', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
@@ -692,15 +886,51 @@ describe('diagnostic screen', () => {
       },
       { backgroundColor: colors.primaryDark },
     );
-    await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
+    const startPracticing = capturedPressHandler(t('diag.startPracticing'));
+    await act(async () => {
+      await startPracticing();
+      await startPracticing();
+    });
     expect(mockAuthValue.setUser).toHaveBeenCalledWith({
       ...USER,
       diagnosticCompleted: true,
       cefrLevel: 'B2',
     });
+    expect(mockAuthValue.setUser).toHaveBeenCalledTimes(1);
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts only the first recorder result until its card is acknowledged', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText('Describe a time you showed courage.');
+
+    const callbacks = recorderProps();
+    await act(async () => {
+      callbacks.onResult({
+        passed: true,
+        score: 80,
+        transcript: 'first',
+        feedback: 'first feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      });
+      callbacks.onResult({
+        passed: false,
+        score: 10,
+        transcript: 'duplicate',
+        feedback: 'duplicate feedback',
+        done: false,
+        nextQuestion: QUESTION_1,
+      });
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
+    expect(recorderProps().questionId).toBe(QUESTION_2.id);
   });
 
   it('stores per-answer outcomes during the test and reveals them only on completion', async () => {
@@ -793,11 +1023,10 @@ describe('diagnostic screen', () => {
     expect(mockRecorderProps?.questionId).toBe(QUESTION_1.id);
   });
 
-  it('never renders a question view around a question the server has taken away', async () => {
-    // Acknowledgement handlers close over the result they were rendered for, so
-    // a queued double tap replays them against whatever state arrives later.
-    // Neither replay may leave the screen half-built. A resumed test is used so
-    // the intro is never started, which keeps the intro branch reachable.
+  it('ignores stale acknowledgement handlers after diagnostic state advances', async () => {
+    // A queued double tap retains the handler for the result it was rendered
+    // against. Once that exact card is claimed, replaying it must not erase a
+    // later canonical completion or restore an obsolete question.
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 2));
     const { queryClient } = await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
@@ -842,34 +1071,18 @@ describe('diagnostic screen', () => {
     });
     expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
 
-    // Replaying the level-less acknowledgement now drops the revealed level
-    // with no question left to fall back to: the screen empties instead of
-    // framing a prompt card around a missing question.
+    // Neither stale handler may mutate the newer completion.
     await act(async () => {
       await replayFinish();
     });
+    expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
 
-    expect(screen.toJSON()).toBeNull();
-    expect(screen.queryByText(t('diag.completeTitle'))).toBeNull();
-    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
-    expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
-
-    // Replaying the older continue action restores its question, but the count
-    // the server dropped is gone: the screen reads as a fresh test and opens on
-    // the intro again instead of counting against progress it no longer has.
     await act(async () => {
       await replayContinue();
     });
-
-    expect(screen.getByText(t('diag.introTitle'))).toBeTruthy();
-    expect(screen.queryByText(t('diag.introCount', { count: 5 }))).toBeNull();
-    await startFreshTest();
-
-    expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
-    expect(screen.getByText(t('header.diagnostic'))).toBeTruthy();
-    for (const current of [1, 2, 3, 4, 5]) {
-      expect(screen.queryByText(t('diag.progress', { current, max: 5 }))).toBeNull();
-    }
+    expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(screen.queryByText('Tell me about a memorable journey.')).toBeNull();
+    expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
   });
 
   it('keeps the unacknowledged answer card when a background refetch advances server state', async () => {
@@ -908,6 +1121,56 @@ describe('diagnostic screen', () => {
     await waitFor(() => expect(mockRecorderProps?.questionId).toBe(QUESTION_2.id));
   });
 
+  it('cancels a pre-answer GET so it cannot rewind state after acknowledgement', async () => {
+    const queryClient = makeQueryClient();
+    let resolveStale!: (value: ReturnType<typeof nextPayload>) => void;
+    const staleRefresh = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+      resolveStale = resolve;
+    });
+    let staleSignal: AbortSignal | undefined;
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockImplementationOnce((_path: string, options?: { signal?: AbortSignal }) => {
+        staleSignal = options?.signal;
+        return staleRefresh;
+      });
+    await renderScreen(queryClient);
+    await startFreshTest();
+    let backgroundRefresh!: Promise<void>;
+
+    await act(async () => {
+      backgroundRefresh = queryClient.refetchQueries({
+        queryKey: ['diagnostic-next', 1, USER.id],
+        exact: true,
+      });
+      await Promise.resolve();
+    });
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 90,
+        transcript: 'accepted answer',
+        feedback: 'accepted feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
+    const staleWasAborted = staleSignal?.aborted;
+
+    await act(async () => {
+      resolveStale(nextPayload(QUESTION_1, 0));
+      await Promise.allSettled([backgroundRefresh]);
+      await Promise.resolve();
+    });
+
+    expect(staleWasAborted).toBe(true);
+    expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
+    expect(recorderProps().questionId).toBe(QUESTION_2.id);
+  });
+
   it('shows the completion view immediately when the test is already done', async () => {
     mockApiFetch.mockResolvedValue({ done: true, level: 'A2' });
     await renderScreen();
@@ -941,6 +1204,26 @@ describe('diagnostic screen', () => {
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('joins repeated retries after cached empty diagnostic data fails in the background', async () => {
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(['diagnostic-next', 1, USER.id], null);
+    const retryRequest = new Promise<unknown>(() => undefined);
+    mockApiFetch
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockReturnValue(retryRequest);
+    await renderScreen(queryClient);
+
+    await screen.findByRole('button', { name: t('common.tryAgain') });
+    const retry = capturedPressHandler(t('common.tryAgain'));
+    await act(async () => {
+      void retry();
+      void retry();
+      await Promise.resolve();
+    });
+
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
   it('falls back to generic copy for non-API load errors', async () => {
     mockApiFetch.mockRejectedValue(new Error('parse failure'));
     await renderScreen();
@@ -970,6 +1253,57 @@ describe('diagnostic screen', () => {
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('replaces a pre-recovery refresh and joins repeated recovery callbacks', async () => {
+    const queryClient = makeQueryClient();
+    let resolveStale!: (value: ReturnType<typeof nextPayload>) => void;
+    const stale = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+      resolveStale = resolve;
+    });
+    let resolveRecovery!: (value: ReturnType<typeof nextPayload>) => void;
+    const recovery = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+      resolveRecovery = resolve;
+    });
+    let staleSignal: AbortSignal | undefined;
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockImplementationOnce((_path: string, options?: { signal?: AbortSignal }) => {
+        staleSignal = options?.signal;
+        return stale;
+      })
+      .mockReturnValueOnce(recovery);
+    await renderScreen(queryClient);
+    await startFreshTest();
+    let backgroundRefresh!: Promise<void>;
+
+    await act(async () => {
+      backgroundRefresh = queryClient.refetchQueries({
+        queryKey: ['diagnostic-next', 1, USER.id],
+        exact: true,
+      });
+      await Promise.resolve();
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      recorderProps().onRecoveryUnresolved();
+      recorderProps().onRecoveryUnresolved();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const callsAfterRecovery = mockApiFetch.mock.calls.length;
+    const staleWasAborted = staleSignal?.aborted;
+
+    await act(async () => {
+      resolveStale(nextPayload(QUESTION_1, 0));
+      resolveRecovery(nextPayload(QUESTION_2, 1));
+      await Promise.allSettled([backgroundRefresh]);
+      await Promise.resolve();
+    });
+    expect(callsAfterRecovery).toBe(3);
+    expect(staleWasAborted).toBe(true);
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+  });
+
   it('navigates to the settings screen from the account action', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
@@ -981,7 +1315,90 @@ describe('diagnostic screen', () => {
       { backgroundColor: colors.primaryLight },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/settings');
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not let a queued logout run after Settings owns the diagnostic action', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const openSettings = capturedPressHandler(t('header.settings'));
+    const logOut = capturedPressHandler(t('common.logOut'));
+
+    await act(async () => {
+      openSettings();
+      void logOut();
+      await Promise.resolve();
+    });
+
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+
+    await blurScreen();
+    await focusScreen();
+    await act(async () => {
+      void logOut();
+      await Promise.resolve();
+    });
+    expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks Settings behind logout and releases the action claim after failure', async () => {
+    let rejectLogout!: (reason: Error) => void;
+    const pendingLogout = new Promise<void>((_resolve, reject) => {
+      rejectLogout = reject;
+    });
+    const logout = jest.fn(() => pendingLogout);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const openSettings = capturedPressHandler(t('header.settings'));
+    const logOut = capturedPressHandler(t('common.logOut'));
+
+    await act(async () => {
+      void logOut();
+      openSettings();
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rejectLogout(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
+
+    await act(async () => openSettings());
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+  });
+
+  it('rejects a logout handler after its render lease is synchronously invalidated', async () => {
+    const renderLease = { owner: 'diagnostic-account-actions' } as never;
+    let currentLease: unknown = renderLease;
+    const logout = jest.fn();
+    mockAuthValue = makeAuth({
+      logout,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const staleLogout = capturedPressHandler(t('common.logOut'));
+
+    currentLease = { owner: 'replacement-session' };
+    await act(async () => {
+      void staleLogout();
+      await Promise.resolve();
+    });
+
+    expect(logout).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(alertSpy).not.toHaveBeenCalled();
   });
 
@@ -999,6 +1416,41 @@ describe('diagnostic screen', () => {
 
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalled();
+  });
+
+  it('dedupes same-frame logout taps and releases the latch after a failure', async () => {
+    let rejectFirst!: (reason: Error) => void;
+    const firstLogout = new Promise<void>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    const logout = jest.fn().mockReturnValueOnce(firstLogout).mockResolvedValueOnce(undefined);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const pressLogout = capturedPressHandler(t('common.logOut'));
+
+    await act(async () => {
+      void pressLogout();
+      void pressLogout();
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      rejectFirst(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+
+    await act(async () => {
+      void pressLogout();
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(2);
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
   it('alerts when logout fails', async () => {
@@ -1069,7 +1521,24 @@ describe('diagnostic screen', () => {
       flattenedStyle(screen.getByRole('button', { name: t('header.settings') })).opacity,
     ).toBeUndefined();
     await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/settings');
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+  });
+
+  it('rejects captured account actions immediately after the Recorder acquires its lock', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const openSettings = capturedPressHandler(t('header.settings'));
+    const logOut = capturedPressHandler(t('common.logOut'));
+
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      void openSettings();
+      void logOut();
+    });
+
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
   });
 
   it('consumes the Android hardware back press so the diagnostic is never popped', async () => {

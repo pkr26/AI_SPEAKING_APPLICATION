@@ -54,6 +54,34 @@ jest.mock('expo-router/react-navigation', () => ({
 
 // ----- expo-router mock -----
 
+const mockSetOptions = jest.fn();
+let mockBeforeRemoveListener:
+  ((event: { data: { action: { type: string } }; preventDefault: () => void }) => void) | null =
+  null;
+const mockAddNavigationListener = jest.fn(
+  (
+    event: string,
+    listener: (event: { data: { action: { type: string } }; preventDefault: () => void }) => void,
+  ) => {
+    if (event === 'beforeRemove') mockBeforeRemoveListener = listener;
+    return () => {
+      if (mockBeforeRemoveListener === listener) mockBeforeRemoveListener = null;
+    };
+  },
+);
+const mockNavigation = {
+  setOptions: mockSetOptions,
+  addListener: mockAddNavigationListener,
+};
+
+let mockHardwareBackHandler: (() => boolean) | null = null;
+
+jest.mock('../src/lib/use-hardware-back', () => ({
+  useHardwareBack: (handler: () => boolean) => {
+    mockHardwareBackHandler = handler;
+  },
+}));
+
 jest.mock('expo-router', () => ({
   router: {
     push: jest.fn(),
@@ -61,6 +89,7 @@ jest.mock('expo-router', () => ({
     back: jest.fn(),
     dismissTo: jest.fn(),
   },
+  useNavigation: () => mockNavigation,
   useLocalSearchParams: () => ({}),
   useFocusEffect: jest.fn(),
 }));
@@ -89,6 +118,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -119,6 +150,16 @@ jest.mock('../src/lib/auth', () => ({
 const mockRouter = jest.requireMock('expo-router').router as {
   replace: jest.Mock;
   back: jest.Mock;
+};
+
+const LOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: false,
+  gestureEnabled: false,
+};
+
+const UNLOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: true,
+  gestureEnabled: true,
 };
 
 let alertSpy: jest.SpyInstance;
@@ -327,8 +368,27 @@ async function pressAlertButton(text: string) {
   await act(async () => button.onPress?.());
 }
 
+function hardwareBackIsHandled(): boolean {
+  if (!mockHardwareBackHandler) throw new Error('No hardware-back handler was registered');
+  return mockHardwareBackHandler();
+}
+
+function dispatchBeforeRemove(type: string): jest.Mock {
+  if (!mockBeforeRemoveListener) throw new Error('No beforeRemove listener was registered');
+  const preventDefault = jest.fn();
+  mockBeforeRemoveListener({ data: { action: { type } }, preventDefault });
+  return preventDefault;
+}
+
+function expectFirstNavigationUpdate(expected: typeof LOCKED_NAVIGATION_OPTIONS): void {
+  expect(mockSetOptions).toHaveBeenCalled();
+  expect(mockSetOptions.mock.calls[0]?.[0]).toEqual(expected);
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
+  mockBeforeRemoveListener = null;
+  mockHardwareBackHandler = null;
   mockAuthValue = makeAuth();
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
 });
@@ -655,6 +715,102 @@ describe('change password screen', () => {
     await waitFor(() => expect(alertSpy).toHaveBeenCalled());
   });
 
+  it('locks only back navigation for exactly the lifetime of a password change', async () => {
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest.fn(() => change.promise);
+    await renderScreen(<ChangePasswordScreen />);
+
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    mockSetOptions.mockClear();
+    await act(async () => {
+      committedPressHandler(updateButton())();
+      // The ref and native header lock must publish before React can commit
+      // the render-time busy state.
+      expect(hardwareBackIsHandled()).toBe(true);
+      expectFirstNavigationUpdate(LOCKED_NAVIGATION_OPTIONS);
+    });
+    expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(1);
+
+    expect(dispatchBeforeRemove('GO_BACK')).toHaveBeenCalledTimes(1);
+    expect(dispatchBeforeRemove('RESET')).not.toHaveBeenCalled();
+
+    mockSetOptions.mockClear();
+    await act(async () => change.resolve(undefined));
+
+    expectFirstNavigationUpdate(UNLOCKED_NAVIGATION_OPTIONS);
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+  });
+
+  it('drops password-change completion effects after the screen unmounts', async () => {
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest.fn(() => change.promise);
+    const rendered = await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+
+    await act(async () => {
+      committedPressHandler(updateButton())();
+    });
+    expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(1);
+    expect(hardwareBackIsHandled()).toBe(true);
+
+    await rendered.unmount();
+    mockSetOptions.mockClear();
+    alertSpy.mockClear();
+    await act(async () => {
+      change.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // busyRef must still be released, but no route-local state, navigation
+    // options, or success dialog may publish from the stale continuation.
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(mockSetOptions).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('drops a late password-change failure and its finalizer after unmount', async () => {
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest.fn(() => change.promise);
+    const rendered = await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    await act(async () => {
+      committedPressHandler(updateButton())();
+    });
+    expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(1);
+
+    await rendered.unmount();
+    mockSetOptions.mockClear();
+    alertSpy.mockClear();
+    await act(async () => {
+      change.reject(new Error('late failure'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockRouter.back).not.toHaveBeenCalled();
+  });
+
+  it('makes the password-success Alert action inert once its screen is gone', async () => {
+    const rendered = await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    await fireEvent.press(updateButton());
+    await waitFor(() => expect(alertSpy).toHaveBeenCalled());
+    const confirm = alertButtons().find((button) => button.text === t('common.ok'))?.onPress;
+    if (!confirm) throw new Error('Password success callback was not registered');
+
+    await rendered.unmount();
+    await act(async () => confirm());
+
+    expect(mockRouter.back).not.toHaveBeenCalled();
+  });
+
   it('changes the password once when Update is pressed twice before a re-render', async () => {
     // canSubmit reads the render-time busy flag, so a second press landing in
     // the same committed render still passes it. The second request would fail
@@ -665,13 +821,23 @@ describe('change password screen', () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
 
+    const preventDefault = jest.fn();
     await act(async () => {
       const press = committedPressHandler(updateButton());
       press();
+      mockBeforeRemoveListener?.({
+        data: { action: { type: 'GO_BACK' } },
+        preventDefault,
+      });
       press();
     });
 
     expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(1);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+    expect(mockSetOptions).toHaveBeenCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
 
     await act(async () => change.resolve(undefined));
     await waitFor(() =>
@@ -867,6 +1033,7 @@ describe('delete account screen', () => {
       t('da.confirmTitle'),
       t('da.confirmBody'),
       expect.any(Array),
+      expect.any(Object),
     );
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
@@ -924,10 +1091,91 @@ describe('delete account screen', () => {
     );
     await fireEvent.press(deleteButton());
 
-    expect(alertSpy).toHaveBeenCalledWith(t('da.confirmTitle'), t('da.confirmBody'), [
-      { text: t('common.cancel'), style: 'cancel' },
-      { text: t('da.confirmDelete'), style: 'destructive', onPress: expect.any(Function) },
-    ]);
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('da.confirmTitle'),
+      t('da.confirmBody'),
+      [
+        { text: t('common.cancel'), style: 'cancel', onPress: expect.any(Function) },
+        { text: t('da.confirmDelete'), style: 'destructive', onPress: expect.any(Function) },
+      ],
+      expect.objectContaining({ cancelable: true, onDismiss: expect.any(Function) }),
+    );
+    expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
+  });
+
+  it('locks only back navigation while deletion confirmation is open', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+
+    await typePassword('password1');
+    mockSetOptions.mockClear();
+    await fireEvent.press(deleteButton());
+
+    expectFirstNavigationUpdate(LOCKED_NAVIGATION_OPTIONS);
+    expect(hardwareBackIsHandled()).toBe(true);
+    expect(deleteButton().props.accessibilityState).toEqual({ disabled: true, busy: false });
+    expect(dispatchBeforeRemove('GO_BACK')).toHaveBeenCalledTimes(1);
+    expect(dispatchBeforeRemove('REPLACE')).not.toHaveBeenCalled();
+
+    mockSetOptions.mockClear();
+    await pressAlertButton(t('common.cancel'));
+
+    expectFirstNavigationUpdate(UNLOCKED_NAVIGATION_OPTIONS);
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+    expect(deleteButton().props.accessibilityState.disabled).toBe(false);
+  });
+
+  it('does not let a cancelled delete confirmation run from its captured callback', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    const cancel = alertButtons().find((button) => button.text === t('common.cancel'))?.onPress;
+    const confirmDelete = alertButtons().find(
+      (button) => button.text === t('da.confirmDelete'),
+    )?.onPress;
+    if (!cancel || !confirmDelete) throw new Error('Delete callbacks were not registered');
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      cancel();
+      confirmDelete();
+      await Promise.resolve();
+    });
+
+    expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenLastCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+    expect(deleteButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
+  });
+
+  it('ignores every captured confirmation callback after unmount', async () => {
+    const rendered = await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+
+    const confirmationCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const buttons = (confirmationCall?.[2] ?? []) as {
+      text?: string;
+      onPress?: () => void;
+    }[];
+    const cancel = buttons.find((button) => button.text === t('common.cancel'))?.onPress;
+    const confirmDelete = buttons.find((button) => button.text === t('da.confirmDelete'))?.onPress;
+    const onDismiss = (confirmationCall?.[3] as { onDismiss?: () => void } | undefined)?.onDismiss;
+    expect(cancel).toEqual(expect.any(Function));
+    expect(confirmDelete).toEqual(expect.any(Function));
+    expect(onDismiss).toEqual(expect.any(Function));
+
+    await rendered.unmount();
+    mockSetOptions.mockClear();
+    await act(async () => {
+      cancel?.();
+      onDismiss?.();
+      confirmDelete?.();
+    });
+
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(mockSetOptions).not.toHaveBeenCalled();
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
 
@@ -951,6 +1199,83 @@ describe('delete account screen', () => {
 
     await pressAlertButton(t('common.ok'));
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
+  });
+
+  it('makes the deletion-success Alert action inert after the protected screen is gone', async () => {
+    const rendered = await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('da.deletedTitle'),
+        t('da.deletedBody'),
+        expect.any(Array),
+      ),
+    );
+    const acknowledge = alertButtons().find((button) => button.text === t('common.ok'))?.onPress;
+    if (!acknowledge) throw new Error('Deletion success callback was not registered');
+
+    await rendered.unmount();
+    await act(async () => acknowledge());
+
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps the deletion result but drops route-local finalizer effects after unmount', async () => {
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
+    const queryClient = makeQueryClient();
+    const clearSpy = jest.spyOn(queryClient, 'clear');
+    const rendered = await renderScreen(<DeleteAccountScreen />, queryClient);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
+    expect(hardwareBackIsHandled()).toBe(true);
+
+    await rendered.unmount();
+    mockSetOptions.mockClear();
+    alertSpy.mockClear();
+    await act(async () => {
+      deletion.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // Account deletion and its native confirmation outlive the protected
+    // route, but stale screen state/options must not be published afterward.
+    expect(clearSpy).toHaveBeenCalledTimes(1);
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('da.deletedTitle'),
+      t('da.deletedBody'),
+      expect.any(Array),
+    );
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('drops a late generic deletion failure and its finalizer after unmount', async () => {
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
+    const rendered = await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
+
+    await rendered.unmount();
+    mockSetOptions.mockClear();
+    alertSpy.mockClear();
+    await act(async () => {
+      deletion.reject(new Error('late failure'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
   it('shows the busy state while deleting', async () => {
@@ -978,6 +1303,42 @@ describe('delete account screen', () => {
         expect.any(Array),
       ),
     );
+  });
+
+  it('keeps deletion locked while pending and opens a fresh confirmation after failure', async () => {
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest
+      .fn()
+      .mockImplementationOnce(() => deletion.promise)
+      .mockResolvedValueOnce(undefined);
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
+    expect(hardwareBackIsHandled()).toBe(true);
+    expect(dispatchBeforeRemove('GO_BACK')).toHaveBeenCalledTimes(1);
+    expect(dispatchBeforeRemove('RESET')).not.toHaveBeenCalled();
+
+    mockSetOptions.mockClear();
+    await act(async () => deletion.reject(new Error('network down')));
+    expect(await screen.findByText(t('da.failed'))).toBeTruthy();
+
+    expectFirstNavigationUpdate(UNLOCKED_NAVIGATION_OPTIONS);
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+
+    const confirmationsBeforeRetry = alertSpy.mock.calls.filter(
+      ([title]) => title === t('da.confirmTitle'),
+    ).length;
+    await fireEvent.press(deleteButton());
+    expect(alertSpy.mock.calls.filter(([title]) => title === t('da.confirmTitle'))).toHaveLength(
+      confirmationsBeforeRetry + 1,
+    );
+    expect(hardwareBackIsHandled()).toBe(true);
+
+    await pressAlertButton(t('common.cancel'));
   });
 
   it('shows a credential error on 401', async () => {
@@ -1034,28 +1395,32 @@ describe('delete account screen', () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
-  it('deletes once when a double tap queues two confirmations', async () => {
-    // Opening the dialog changes no state, so canSubmit is still true when the
-    // second tap lands. A second deletion would fail in the auth transition
-    // guard and show "we could not delete your account" — re-arming the danger
-    // button — while the real deletion is still running.
+  it('opens one locked confirmation and deletes once after a same-frame double tap', async () => {
     const deletion = deferred<void>();
     mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
     await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
 
-    await fireEvent.press(deleteButton());
-    await fireEvent.press(deleteButton());
+    const openConfirmation = committedPressHandler(deleteButton());
+    const preventDefault = jest.fn();
+    await act(async () => {
+      openConfirmation();
+      mockBeforeRemoveListener?.({
+        data: { action: { type: 'GO_BACK' } },
+        preventDefault,
+      });
+      openConfirmation();
+    });
     const confirmations = alertSpy.mock.calls.map(
       (call) =>
         (call[2] as { text?: string; onPress?: () => void }[]).find(
           (button) => button.text === t('da.confirmDelete'),
         )?.onPress,
     );
-    expect(confirmations).toHaveLength(2);
+    expect(confirmations).toHaveLength(1);
+    expect(preventDefault).toHaveBeenCalledTimes(1);
 
     await act(async () => confirmations[0]?.());
-    await act(async () => confirmations[1]?.());
 
     expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(t('da.failed'))).toBeNull();

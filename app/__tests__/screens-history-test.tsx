@@ -56,6 +56,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -152,6 +154,23 @@ function parentOf(node: TestInstance): TestInstance {
   const parent = node.parent;
   if (!parent) throw new Error('Element is not laid out inside a parent view');
   return parent;
+}
+
+function committedPressHandler(node: TestInstance): () => void {
+  type Fiber = {
+    memoizedProps: { onPress?: unknown } | null;
+    return: Fiber | null;
+    type: unknown;
+  };
+  let fiber = (node as unknown as { unstable_fiber: Fiber | null }).unstable_fiber;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.onPress as () => void;
+    }
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
 }
 
 /**
@@ -819,6 +838,66 @@ describe('history screen', () => {
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
   });
 
+  it('walks distinct cursors across three pages before stopping', async () => {
+    const firstCursor = '550e8400-e29b-41d4-a716-446655440061';
+    const secondCursor = '550e8400-e29b-41d4-a716-446655440062';
+    mockGetHistory
+      .mockResolvedValueOnce({ items: [historyItem()], nextCursor: firstCursor })
+      .mockResolvedValueOnce({
+        items: [
+          historyItem({
+            id: '550e8400-e29b-41d4-a716-446655440063',
+            promptWord: 'journey',
+          }),
+        ],
+        nextCursor: secondCursor,
+      })
+      .mockResolvedValueOnce({
+        items: [
+          historyItem({
+            id: '550e8400-e29b-41d4-a716-446655440064',
+            promptWord: 'wisdom',
+          }),
+        ],
+        nextCursor: null,
+      });
+    await renderHistory();
+    await screen.findByText('courage');
+
+    await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+    await screen.findByText('journey');
+    await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+
+    expect(await screen.findByText('wisdom')).toBeTruthy();
+    expect(mockGetHistory).toHaveBeenNthCalledWith(2, firstCursor, expect.anything());
+    expect(mockGetHistory).toHaveBeenNthCalledWith(3, secondCursor, expect.anything());
+    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
+  });
+
+  it('enforces the explicit 500-page walk bound even when another cursor is present', async () => {
+    const client = makeQueryClient(Infinity);
+    const pages = Array.from({ length: 500 }, (_, index) => ({
+      items: index === 0 ? [historyItem()] : [],
+      nextCursor: `cursor-${index + 1}`,
+    }));
+    client.setQueryData(['practice-history', USER.id], {
+      pages,
+      pageParams: Array.from({ length: pages.length }, (_, index) =>
+        index === 0 ? undefined : `cursor-${index}`,
+      ),
+    });
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText('courage')).toBeTruthy();
+    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
+    await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
+    expect(mockGetHistory).not.toHaveBeenCalled();
+  });
+
   it('pages older answers when the list is scrolled to its end', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440054';
     mockGetHistory
@@ -843,6 +922,37 @@ describe('history screen', () => {
 
     expect(mockGetHistory).toHaveBeenCalledWith(cursor, expect.anything());
     expect(await screen.findByText('journey')).toBeTruthy();
+  });
+
+  it('stops pagination when the server repeats an already-consumed cursor', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440054';
+    mockGetHistory
+      .mockResolvedValueOnce({ items: [historyItem()], nextCursor: cursor })
+      .mockResolvedValueOnce({
+        items: [
+          historyItem({
+            id: '550e8400-e29b-41d4-a716-446655440055',
+            promptWord: 'journey',
+            createdAt: '2026-08-13T10:00:00.000Z',
+          }),
+        ],
+        nextCursor: cursor,
+      });
+    await renderHistory();
+    await screen.findByText('courage');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText('journey')).toBeTruthy();
+    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
+
+    await act(async () => {
+      await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
   });
 
   it('stops asking for older answers once the last page is in', async () => {
@@ -892,10 +1002,15 @@ describe('history screen', () => {
     await renderHistory();
     await screen.findByText('courage');
 
+    const committedPress = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+      committedPress();
+      committedPress();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
 
     const footerLabel = screen.getByText(t('history.loadingMore'));
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
@@ -918,6 +1033,92 @@ describe('history screen', () => {
     });
     expect(await screen.findByText('journey')).toBeTruthy();
     expect(screen.queryByText(t('history.loadingMore'))).toBeNull();
+  });
+
+  it('queues Load More behind a loaded-page refresh and then fetches the older cursor', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440065';
+    const client = makeQueryClient();
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [{ items: [historyItem()], nextCursor: cursor }],
+      pageParams: [undefined],
+    });
+    let resolveRefresh!: (value: { items: HistoryItem[]; nextCursor: string }) => void;
+    const refresh = new Promise<{ items: HistoryItem[]; nextCursor: string }>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    let resolveOlder!: (value: { items: HistoryItem[]; nextCursor: null }) => void;
+    const older = new Promise<{ items: HistoryItem[]; nextCursor: null }>((resolve) => {
+      resolveOlder = resolve;
+    });
+    mockGetHistory.mockReturnValueOnce(refresh).mockReturnValueOnce(older);
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText('courage')).toBeTruthy();
+    expect(mockGetHistory).toHaveBeenCalledTimes(1);
+
+    const loadMore = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
+    await act(async () => {
+      loadMore();
+      loadMore();
+      await Promise.resolve();
+    });
+    const callsBeforeRefreshSettled = mockGetHistory.mock.calls.length;
+
+    await act(async () => {
+      resolveRefresh({ items: [historyItem()], nextCursor: cursor });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const callsAfterRefreshSettled = mockGetHistory.mock.calls.length;
+    await act(async () => {
+      resolveOlder({
+        items: [
+          historyItem({
+            id: '550e8400-e29b-41d4-a716-446655440066',
+            promptWord: 'journey',
+            createdAt: '2026-08-13T10:00:00.000Z',
+          }),
+        ],
+        nextCursor: null,
+      });
+      await Promise.resolve();
+    });
+
+    expect(callsBeforeRefreshSettled).toBe(1);
+    expect(callsAfterRefreshSettled).toBe(2);
+    expect(mockGetHistory.mock.calls[1][0]).toBe(cursor);
+    expect(await screen.findByText('journey')).toBeTruthy();
+  });
+
+  it('joins repeated retries after a cached empty page fails in the background', async () => {
+    const client = makeQueryClient();
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [{ items: [], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    const retryRequest = new Promise<{ items: HistoryItem[]; nextCursor: null }>(() => undefined);
+    mockGetHistory
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockReturnValue(retryRequest);
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+
+    const button = await screen.findByRole('button', { name: t('common.tryAgain') });
+    const retry = committedPressHandler(button);
+    await act(async () => {
+      retry();
+      retry();
+      await Promise.resolve();
+    });
+
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
   });
 
   it('renders the cached page for the signed-in learner without refetching', async () => {

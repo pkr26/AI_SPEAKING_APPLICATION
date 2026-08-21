@@ -24,6 +24,26 @@ export {
   utf8ByteLength,
 } from './password-policy';
 
+const sessionLeaseBrand: unique symbol = Symbol('SessionLease');
+
+/**
+ * Opaque snapshot of the active authenticated identity.
+ *
+ * Consumers can retain and later validate a lease, but cannot inspect or forge
+ * its fields. Validation reads AuthProvider's synchronous refs, so a session
+ * transition invalidates old async work before React commits the corresponding
+ * state update.
+ */
+export interface SessionLease {
+  readonly [sessionLeaseBrand]: true;
+}
+
+interface SessionLeaseSnapshot extends SessionLease {
+  readonly epoch: number;
+  readonly token: string | null;
+  readonly userId: string | null;
+}
+
 interface AuthContextValue {
   token: string | null;
   user: User | null;
@@ -36,6 +56,10 @@ interface AuthContextValue {
   retrySessionRestore: () => void;
   /** User-initiated escape from an unreadable store entry: wipe it and continue logged out. */
   resetStoredSession: () => void;
+  /** Captures the current session identity for guarding an async continuation. */
+  captureSessionLease: () => SessionLease;
+  /** True only while the captured session identity is still current. */
+  isSessionLeaseCurrent: (lease: SessionLease) => boolean;
   login: (email: string, password: string) => Promise<User>;
   register: (
     name: string,
@@ -46,7 +70,7 @@ interface AuthContextValue {
   logout: () => Promise<void>;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   deleteAccount: (password: string) => Promise<void>;
-  setUser: (user: User | null) => void;
+  setUser: React.Dispatch<React.SetStateAction<User | null>>;
 }
 
 export class AccountDeletedCleanupError extends Error {
@@ -68,7 +92,7 @@ const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
   const [token, setToken] = useState<string | null>(null);
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUserState] = useState<User | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
   const [isRestoring, setIsRestoring] = useState(true);
   const [restoreError, setRestoreError] = useState<string | null>(null);
@@ -76,8 +100,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const transitionRef = useRef(false);
   const epochRef = useRef(0);
   const tokenRef = useRef<string | null>(null);
+  const userRef = useRef<User | null>(null);
   const pendingCleanupTailRef = useRef<Promise<void>>(Promise.resolve());
   const pendingCleanupFailedRef = useRef(false);
+
+  const setUser = useCallback((nextUser: React.SetStateAction<User | null>) => {
+    // Keep the imperative identity guard ahead of React's asynchronous commit.
+    // Screen continuations must never observe an old user during the gap after
+    // AuthProvider has already requested a session/profile state change.
+    const resolved = typeof nextUser === 'function' ? nextUser(userRef.current) : nextUser;
+    userRef.current = resolved;
+    setUserState(resolved);
+  }, []);
+
+  const captureSessionLease = useCallback(
+    (): SessionLease =>
+      Object.freeze({
+        [sessionLeaseBrand]: true as const,
+        epoch: epochRef.current,
+        token: tokenRef.current,
+        userId: userRef.current?.id ?? null,
+      }) satisfies SessionLeaseSnapshot,
+    [],
+  );
+
+  const isSessionLeaseCurrent = useCallback((lease: SessionLease): boolean => {
+    const snapshot = lease as SessionLeaseSnapshot;
+    return (
+      snapshot[sessionLeaseBrand] === true &&
+      snapshot.epoch === epochRef.current &&
+      snapshot.token === tokenRef.current &&
+      snapshot.userId === (userRef.current?.id ?? null)
+    );
+  }, []);
 
   const schedulePendingCleanup = useCallback(() => {
     const cleanup = pendingCleanupTailRef.current.then(async () => {
@@ -118,7 +173,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(null);
     setRestoreError(null);
     setSessionVersion((version) => version + 1);
-  }, [queryClient]);
+  }, [queryClient, setUser]);
 
   const expireSession = useCallback(
     (rejectedToken?: string) => {
@@ -178,7 +233,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       cancelled = true;
     };
-  }, [queryClient, restoreAttempt]);
+  }, [queryClient, restoreAttempt, setUser]);
 
   useEffect(
     () => () => {
@@ -245,7 +300,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSessionVersion((version) => version + 1);
       return parsed.user;
     },
-    [queryClient, waitForPendingCleanup],
+    [queryClient, setUser, waitForPendingCleanup],
   );
 
   const login = useCallback(
@@ -428,6 +483,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       restoreError,
       retrySessionRestore,
       resetStoredSession,
+      captureSessionLease,
+      isSessionLeaseCurrent,
       login,
       register,
       logout,
@@ -443,11 +500,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       restoreError,
       retrySessionRestore,
       resetStoredSession,
+      captureSessionLease,
+      isSessionLeaseCurrent,
       login,
       register,
       logout,
       changePassword,
       deleteAccount,
+      setUser,
     ],
   );
 

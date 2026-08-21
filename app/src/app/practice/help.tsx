@@ -95,7 +95,7 @@ export default function HelpScreen() {
           </Text>
           <Button
             title={t('common.tryAgain')}
-            onPress={() => void helpQuery.refetch()}
+            onPress={() => void helpQuery.refetch({ cancelRefetch: false })}
             style={styles.retryButton}
           />
         </View>
@@ -146,7 +146,7 @@ export default function HelpScreen() {
             <Button
               title={t('help.startPractice')}
               onPress={() =>
-                router.push({
+                router.navigate({
                   pathname: '/practice/attempt',
                   params: {
                     questionId: validQuestionId,

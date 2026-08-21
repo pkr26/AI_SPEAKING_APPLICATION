@@ -1,6 +1,6 @@
-import React, { useCallback, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
-import { router, useLocalSearchParams, useNavigation } from 'expo-router';
+import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../../components/Button';
@@ -25,36 +25,103 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
  * and the record button. No help, translations, or examples here.
  */
 export default function AttemptScreen() {
-  const { user } = useAuth();
+  const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const queryClient = useQueryClient();
   const navigation = useNavigation();
   const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
-  const [recorderLocked, setRecorderLocked] = useState(false);
+  const [recorderLockState, setRecorderLockState] = useState<{
+    owner: string | null;
+    locked: boolean;
+  }>({ owner: null, locked: false });
   // Render state disables the switch, while this mirror closes the tiny window
   // between Recorder taking ownership of a recording and that disabled render.
   const recorderLockedRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  const focusedRef = useRef(false);
+  const navigationStartedRef = useRef(true);
+  const activeRecorderOwnerRef = useRef<string | null>(null);
+  const resultClaimRef = useRef<string | null>(null);
+  const recoveryExitRef = useRef<string | null>(null);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
   const validQuestionId = isUuid(questionId) ? questionId : null;
   const nativeMode = answerMode === 'native';
+  const userId = user?.id ?? null;
+  const renderOwner = `${sessionVersion}:${userId ?? 'anonymous'}`;
+  const sessionLease = useMemo(() => {
+    void sessionVersion;
+    void userId;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, userId]);
+  const recorderOwner = validQuestionId
+    ? `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`
+    : null;
+  const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
+  const practiceQuestionKey = useMemo(
+    () => ['practice-question', user?.id, user?.cefrLevel] as const,
+    [user?.cefrLevel, user?.id],
+  );
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      focusedRef.current = false;
+      navigationStartedRef.current = true;
+      activeRecorderOwnerRef.current = null;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    activeRecorderOwnerRef.current = recorderOwner;
+    resultClaimRef.current = null;
+    recoveryExitRef.current = null;
+    recorderLockedRef.current = false;
+  }, [recorderOwner]);
+
+  const renderOwnsWork = useCallback(
+    () => mountedRef.current && focusedRef.current && isSessionLeaseCurrent(sessionLease),
+    [isSessionLeaseCurrent, sessionLease],
+  );
+  const recorderOwnsWork = useCallback(
+    (owner: string | null) =>
+      owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
+    [renderOwnsWork],
+  );
+  const publishNavigationLock = useCallback(() => {
+    if (!mountedRef.current || !focusedRef.current) return;
+    navigation.setOptions(
+      recorderLockedRef.current
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  }, [navigation]);
+
+  useFocusEffect(
+    useCallback(() => {
+      focusedRef.current = true;
+      navigationStartedRef.current = false;
+      publishNavigationLock();
+      return () => {
+        focusedRef.current = false;
+        navigationStartedRef.current = true;
+      };
+    }, [publishNavigationLock]),
+  );
 
   // This is the one recorder screen with a visible header back button. While
   // the recorder holds a take (recording, uploading, recovering), header back
   // and the iOS swipe gesture must not pop the screen — blur cleanup would
   // discard it. Restore normal exits as soon as the lock releases.
   useLayoutEffect(() => {
-    navigation.setOptions(
-      recorderLocked
-        ? { headerBackVisible: false, gestureEnabled: false }
-        : { headerBackVisible: true, gestureEnabled: true },
-    );
-  }, [navigation, recorderLocked]);
+    publishNavigationLock();
+  }, [publishNavigationLock, recorderLocked]);
 
   const helpQuery = useQuery({
     queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
@@ -73,18 +140,43 @@ export default function AttemptScreen() {
 
   // Hardware back is a normal exit here, except while a recording, upload, or
   // recovery is active — popping then would let blur cleanup discard the take.
-  useHardwareBack(() => recorderLocked);
+  useHardwareBack(() => recorderLockedRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (recorderLockedRef.current && event.data.action.type === 'GO_BACK') {
+        event.preventDefault();
+      }
+    });
+    return unsubscribe;
+  }, [navigation]);
 
   // A new submission owns the inline space again: clear the old wait line the
   // moment the recorder locks for the next take.
-  const handleLockChange = useCallback((locked: boolean) => {
-    recorderLockedRef.current = locked;
-    setRecorderLocked(locked);
-    if (locked) setRateLimitNotice(null);
-  }, []);
+  const handleLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      recorderLockedRef.current = locked;
+      setRecorderLockState({ owner: recorderOwner, locked });
+      if (locked) setRateLimitNotice(null);
+      publishNavigationLock();
+    },
+    [publishNavigationLock, recorderOwner, recorderOwnsWork],
+  );
 
   const handleResult = (result: PracticeOutcome) => {
-    if (!user || !validQuestionId) return;
+    const owner = recorderOwner;
+    if (
+      !user ||
+      !validQuestionId ||
+      !recorderOwnsWork(owner) ||
+      navigationStartedRef.current ||
+      resultClaimRef.current === owner
+    ) {
+      return;
+    }
+    resultClaimRef.current = owner;
+    navigationStartedRef.current = true;
+    void queryClient.cancelQueries({ queryKey: practiceQuestionKey, exact: true });
     setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, validQuestionId, result);
     showFeedback(validQuestionId, result);
@@ -92,7 +184,44 @@ export default function AttemptScreen() {
   };
 
   const handleError = (message: string) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return;
     Alert.alert(t('diag.assessFailedTitle'), message);
+  };
+
+  const handleRateLimited = (message: string) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return;
+    setRateLimitNotice(message);
+  };
+
+  const handleRecoveryUnresolved = () => {
+    const owner = recorderOwner;
+    if (
+      !user ||
+      !recorderOwnsWork(owner) ||
+      navigationStartedRef.current ||
+      recoveryExitRef.current === owner
+    ) {
+      return;
+    }
+    recoveryExitRef.current = owner;
+    navigationStartedRef.current = true;
+    void queryClient.invalidateQueries({ queryKey: practiceQuestionKey });
+    router.dismissTo('/practice');
+  };
+
+  const handleRecoveryEndpointMismatch = (
+    savedEndpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+  ) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return false;
+    if (savedEndpoint === '/practice/attempt/native') {
+      setAnswerMode('native');
+      return true;
+    }
+    if (savedEndpoint === '/practice/attempt') {
+      setAnswerMode('english');
+      return true;
+    }
+    return false;
   };
 
   // The protected-route gate owns navigation when the session disappears.
@@ -141,7 +270,7 @@ export default function AttemptScreen() {
           </Text>
           <Button
             title={t('common.tryAgain')}
-            onPress={() => void helpQuery.refetch()}
+            onPress={() => void helpQuery.refetch({ cancelRefetch: false })}
             style={styles.retryButton}
           />
         </View>
@@ -186,7 +315,9 @@ export default function AttemptScreen() {
           pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
         ]}
         onPress={() => {
-          if (!recorderLockedRef.current) setAnswerMode(nativeMode ? 'english' : 'native');
+          if (!recorderLockedRef.current && !navigationStartedRef.current && renderOwnsWork()) {
+            setAnswerMode(nativeMode ? 'english' : 'native');
+          }
         }}
       >
         <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
@@ -211,28 +342,9 @@ export default function AttemptScreen() {
           parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
           onResult={handleResult}
           onError={handleError}
-          onRateLimited={setRateLimitNotice}
-          onRecoveryUnresolved={() => {
-            void queryClient.invalidateQueries({
-              queryKey: ['practice-question', user?.id, user?.cefrLevel],
-            });
-            // Practice Mode is always entered from help, so replace() would
-            // swap only this route and leave the abandoned question's help
-            // screen under a second live Practice screen. Pop back to the one
-            // already in the stack, exactly as the feedback card does.
-            router.dismissTo('/practice');
-          }}
-          onRecoveryEndpointMismatch={(savedEndpoint) => {
-            if (savedEndpoint === '/practice/attempt/native') {
-              setAnswerMode('native');
-              return true;
-            }
-            if (savedEndpoint === '/practice/attempt') {
-              setAnswerMode('english');
-              return true;
-            }
-            return false;
-          }}
+          onRateLimited={handleRateLimited}
+          onRecoveryUnresolved={handleRecoveryUnresolved}
+          onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
           onInteractionLockChange={handleLockChange}
         />
       </View>

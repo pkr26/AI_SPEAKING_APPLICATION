@@ -1,4 +1,4 @@
-import React, { useEffect } from 'react';
+import React, { useEffect, useMemo } from 'react';
 import { ActivityIndicator, Text, View } from 'react-native';
 import { Redirect } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
@@ -42,7 +42,18 @@ export default function Gate() {
     retrySessionRestore,
     resetStoredSession,
     setUser,
+    captureSessionLease,
+    isSessionLeaseCurrent,
   } = useAuth();
+
+  const sessionLease = useMemo(() => {
+    // Capture during render. Calling captureSessionLease from the query
+    // continuation would brand stale work with whichever account is current
+    // when the request happens to settle.
+    void sessionVersion;
+    void token;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, token]);
 
   const meQuery = useQuery({
     queryKey: ['me', sessionVersion],
@@ -53,10 +64,10 @@ export default function Gate() {
   });
 
   useEffect(() => {
-    if (meQuery.data) {
+    if (meQuery.data && isSessionLeaseCurrent(sessionLease)) {
       setUser(meQuery.data);
     }
-  }, [meQuery.data, setUser]);
+  }, [isSessionLeaseCurrent, meQuery.data, sessionLease, setUser]);
 
   if (isRestoring) {
     return <LoadingView label={t('gate.restoring')} />;
@@ -110,14 +121,14 @@ export default function Gate() {
         </Text>
         <Button
           title={t('common.tryAgain')}
-          onPress={() => void meQuery.refetch()}
+          onPress={() => void meQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
       </View>
     );
   }
 
-  const profile = user ?? meQuery.data;
+  const profile = user ?? (isSessionLeaseCurrent(sessionLease) ? meQuery.data : undefined);
   if (!profile) {
     return <LoadingView label={t('gate.loadingProfile')} />;
   }

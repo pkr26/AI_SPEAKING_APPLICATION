@@ -28,6 +28,10 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
 let memoryValue: PendingAssessment | null = null;
 let memoryLoaded = false;
 let storageQueue: Promise<void> = Promise.resolve();
+// An unconditional clear is an account/session boundary. Bump this before its
+// queued SecureStore delete begins so a create that was already waiting on a
+// slow read cannot repopulate the slot after logout considers cleanup complete.
+let unconditionalClearGeneration = 0;
 
 function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   const result = storageQueue.then(operation, operation);
@@ -148,6 +152,39 @@ export async function savePendingAssessment(pending: PendingAssessment): Promise
   });
 }
 
+/** Captures the account-cleanup generation a new assessment handoff belongs to. */
+export function capturePendingAssessmentGeneration(): number {
+  return unconditionalClearGeneration;
+}
+
+/**
+ * Atomically installs `candidate` only when no handoff already exists.
+ *
+ * The returned record is authoritative: concurrent creators all observe the
+ * first record, rather than separately reading `null` and overwriting one
+ * another. `null` means an unconditional account/session clear began after the
+ * caller captured `expectedGeneration`; no older submission may write or send.
+ */
+export async function ensurePendingAssessment(
+  candidate: PendingAssessment,
+  expectedGeneration: number,
+): Promise<PendingAssessment | null> {
+  const parsed = parsePendingAssessment(candidate);
+  if (!parsed) throw new Error('Invalid pending assessment metadata');
+  return serializeStorage(async () => {
+    if (expectedGeneration !== unconditionalClearGeneration) return null;
+    const current = await loadPendingUnsafe();
+    if (expectedGeneration !== unconditionalClearGeneration) return null;
+    if (current) return current;
+    await savePendingUnsafe(parsed);
+    // A clear invoked while SecureStore was writing is already queued behind
+    // this operation. Suppress network work now; that clear remains responsible
+    // for deleting the just-finished durable write.
+    if (expectedGeneration !== unconditionalClearGeneration) return null;
+    return parsed;
+  });
+}
+
 export async function loadPendingAssessment(): Promise<PendingAssessment | null> {
   return serializeStorage(loadPendingUnsafe);
 }
@@ -159,6 +196,7 @@ export async function loadPendingAssessment(): Promise<PendingAssessment | null>
  * healed, otherwise session-expiry cleanup would fail and block the next login.
  */
 export async function clearPendingAssessment(expectedRequestId?: string): Promise<void> {
+  if (expectedRequestId === undefined) unconditionalClearGeneration += 1;
   await serializeStorage(async () => {
     if (expectedRequestId !== undefined) {
       const current = await loadPendingUnsafe();
@@ -263,7 +301,9 @@ export async function markPendingAssessmentStage(
     const next = parsePendingAssessment({
       ...current,
       stage,
-      ...(stage === 's3-granted' ? { audioKey } : { audioKey: undefined }),
+      // The parser is the single normalization boundary: it requires the key
+      // for S3 and strips it from every other stage.
+      audioKey,
     });
     if (!next) throw new Error('Invalid pending assessment metadata');
     await savePendingUnsafe(next);

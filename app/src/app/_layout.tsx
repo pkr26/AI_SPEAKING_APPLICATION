@@ -112,8 +112,11 @@ function QueryFocusBridge() {
     const updateFocus = (state: string) => {
       focusManager.setFocused(state === 'active');
     };
-    updateFocus(AppState.currentState ?? 'active');
     const subscription = AppState.addEventListener('change', updateFocus);
+    // Subscribe before sampling. A background transition between those two
+    // operations is then either reflected in currentState or delivered to the
+    // listener, rather than being missed until the next lifecycle event.
+    updateFocus(AppState.currentState ?? 'active');
     return () => {
       subscription.remove();
       focusManager.setFocused(undefined);

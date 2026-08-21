@@ -270,18 +270,20 @@ function withTokenStorageLock<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
+async function readStoredTokenUnsafe(): Promise<string | null> {
+  let stored: string | null;
+  try {
+    stored = await SecureStore.getItemAsync(TOKEN_KEY, TOKEN_STORAGE_OPTIONS);
+  } catch (error) {
+    throw new TokenStorageReadError(error);
+  }
+  tokenSnapshot = stored;
+  tokenSnapshotReady = true;
+  return stored;
+}
+
 export async function getToken(): Promise<string | null> {
-  return withTokenStorageLock(async () => {
-    let stored: string | null;
-    try {
-      stored = await SecureStore.getItemAsync(TOKEN_KEY, TOKEN_STORAGE_OPTIONS);
-    } catch (error) {
-      throw new TokenStorageReadError(error);
-    }
-    tokenSnapshot = stored;
-    tokenSnapshotReady = true;
-    return stored;
-  });
+  return withTokenStorageLock(readStoredTokenUnsafe);
 }
 
 export async function saveToken(token: string): Promise<void> {
@@ -318,7 +320,12 @@ export async function clearToken(expectedToken?: string): Promise<boolean> {
 }
 
 async function tokenForRequest(): Promise<string | null> {
-  return tokenSnapshotReady ? tokenSnapshot : getToken();
+  // Joining the same queue is important even when a snapshot already exists:
+  // a request invoked after saveToken/clearToken must observe that operation,
+  // not race ahead with the snapshot it is replacing.
+  return withTokenStorageLock(async () =>
+    tokenSnapshotReady ? tokenSnapshot : readStoredTokenUnsafe(),
+  );
 }
 
 function boundedSeconds(value: unknown, maxSeconds: number): number | undefined {
@@ -377,7 +384,7 @@ function readResponseBody<T>(
       cancelBody();
       finish(() =>
         reject(
-          externalSignal?.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
+          externalSignal!.reason ?? new DOMException('The operation was aborted.', 'AbortError'),
         ),
       );
     };
@@ -481,8 +488,14 @@ async function fetchWithTimeout(
   externalSignal?: AbortSignal,
 ): Promise<Response> {
   const controller = new AbortController();
-  let timedOut = false;
-  const abortFromCaller = () => controller.abort(externalSignal?.reason);
+  let abortCause: 'caller' | 'timeout' | null = null;
+  const abortFromCaller = () => {
+    // Preserve the first terminal cause. A platform may reject fetch only
+    // after its cancellation has crossed the timeout boundary.
+    if (abortCause !== null) return;
+    abortCause = 'caller';
+    controller.abort(externalSignal!.reason);
+  };
 
   if (externalSignal?.aborted) {
     abortFromCaller();
@@ -491,17 +504,18 @@ async function fetchWithTimeout(
   }
 
   const timeout = setTimeout(() => {
-    timedOut = true;
+    if (abortCause !== null) return;
+    abortCause = 'timeout';
     controller.abort();
   }, timeoutMs);
 
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (error) {
-    if (timedOut) {
+    if (abortCause === 'timeout') {
       throw new ApiError(408, 'The request timed out. Please check your connection and try again.');
     }
-    if (externalSignal?.aborted) throw error;
+    if (abortCause === 'caller') throw error;
     throw new ApiError(0, 'Could not connect to the server. Check your connection and try again.');
   } finally {
     clearTimeout(timeout);
@@ -536,6 +550,15 @@ function handleUnauthorized(status: number, token: string | null, enabled: boole
 export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): Promise<T> {
   const useAuth = options.auth !== false;
   const token = useAuth ? await tokenForRequest() : null;
+  return apiFetchWithToken(path, options, token);
+}
+
+/** Executes one API request with a token already resolved by its caller. */
+async function apiFetchWithToken<T>(
+  path: string,
+  options: ApiFetchOptions,
+  token: string | null,
+): Promise<T> {
   const timeoutMs = options.timeoutMs ?? JSON_TIMEOUT_MS;
   const startedAt = Date.now();
   if (!options.signal?.aborted) options.onRequestStarted?.();
@@ -552,7 +575,10 @@ export async function apiFetch<T>(path: string, options: ApiFetchOptions = {}): 
         ...clientVersionHeader(),
         ...authHeader(token),
       },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
+      // JSON.stringify(undefined) already returns undefined. Reading the body
+      // once also prevents a hostile accessor from changing between a presence
+      // check and serialization.
+      body: JSON.stringify(options.body),
     },
     timeoutMs,
     options.signal,
@@ -776,20 +802,30 @@ export async function apiPostPresignedAudio(
 
   if (Platform.OS !== 'web') {
     const file = new File(audioUri);
+    // Expo exposes size through a live native getter. Snapshot it once so an
+    // evicted/replaced file cannot pass one validation read and a different
+    // limit read (TOCTOU).
+    const fileSize = file.size;
     if (
       !file.exists ||
-      typeof file.size !== 'number' ||
-      !Number.isFinite(file.size) ||
-      file.size <= 0
+      typeof fileSize !== 'number' ||
+      !Number.isFinite(fileSize) ||
+      fileSize <= 0
     ) {
       throw new ApiError(400, 'The recording is unavailable');
     }
-    if (file.size > maxBytes) {
+    if (fileSize > maxBytes) {
       throw new ApiError(413, 'The recording is too large');
     }
     const controller = new AbortController();
-    let timedOut = false;
-    const abortFromCaller = () => controller.abort(options.signal?.reason);
+    let abortCause: 'caller' | 'timeout' | null = null;
+    const abortFromCaller = () => {
+      // Native cancellation can settle asynchronously too. Do not let the
+      // later deadline relabel an earlier learner cancellation as a timeout.
+      if (abortCause !== null) return;
+      abortCause = 'caller';
+      controller.abort(options.signal!.reason);
+    };
     if (options.signal?.aborted) {
       abortFromCaller();
     } else {
@@ -798,7 +834,8 @@ export async function apiPostPresignedAudio(
       });
     }
     const timeout = setTimeout(() => {
-      timedOut = true;
+      if (abortCause !== null) return;
+      abortCause = 'timeout';
       controller.abort();
     }, options.timeoutMs ?? AUDIO_TIMEOUT_MS);
     let result: Awaited<ReturnType<File['upload']>>;
@@ -813,10 +850,10 @@ export async function apiPostPresignedAudio(
         signal: controller.signal,
       });
     } catch (error) {
-      if (timedOut) {
+      if (abortCause === 'timeout') {
         throw new ApiError(408, 'The recording upload timed out');
       }
-      if (options.signal?.aborted) throw error;
+      if (abortCause === 'caller') throw error;
       throw new ApiError(0, 'Could not upload the recording');
     } finally {
       clearTimeout(timeout);
@@ -948,6 +985,10 @@ const EXPORT_MAX_PAGES = 500;
 export async function apiExportUserData(
   signal?: AbortSignal,
 ): Promise<{ user: User; attempts: Record<string, unknown>[] }> {
+  // An export is one logical read even though it spans many HTTP requests.
+  // Pin the initiating session so a logout/new login cannot silently switch
+  // accounts between pages.
+  const token = await tokenForRequest();
   const attempts: Record<string, unknown>[] = [];
   let user: User | null = null;
   let cursor: string | null = null;
@@ -955,8 +996,9 @@ export async function apiExportUserData(
   for (let page = 0; page < EXPORT_MAX_PAGES; page += 1) {
     const cursorParam: string = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
     const data = parseUserDataPage(
-      await apiFetch<unknown>(`/auth/me/data${cursorParam}`, { signal }),
+      await apiFetchWithToken<unknown>(`/auth/me/data${cursorParam}`, { signal }, token),
     );
+    if (user && data.user.id !== user.id) throw new ContractError();
     user ??= data.user;
     attempts.push(...data.attempts);
     if (data.nextCursor === null) return { user, attempts };

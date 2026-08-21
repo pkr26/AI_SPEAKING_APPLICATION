@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { router } from 'expo-router';
+import { router, useNavigation } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 import { useQueryClient } from '@tanstack/react-query';
 
@@ -23,6 +23,7 @@ import {
 } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function DeleteAccountScreen() {
   const { deleteAccount } = useAuth();
@@ -32,25 +33,44 @@ export default function DeleteAccountScreen() {
   const { colors } = theme;
   const queryClient = useQueryClient();
   const headerHeight = useHeaderHeight();
+  const navigation = useNavigation();
   const [password, setPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [passwordFocused, setPasswordFocused] = useState(false);
+  const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const busyRef = useRef(false);
+  const confirmingRef = useRef<symbol | null>(null);
+  const mountedRef = useRef(false);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      confirmingRef.current = null;
+    };
+  }, []);
+
+  useHardwareBack(() => busyRef.current || confirmingRef.current !== null);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (
+        (busyRef.current || confirmingRef.current !== null) &&
+        event.data.action.type === 'GO_BACK'
+      ) {
+        event.preventDefault();
+      }
+    });
+    return unsubscribe;
+  }, [navigation]);
 
   // No length guard: comparablePasswordError only enforces the 72-byte bcrypt
   // ceiling, so it already returns null for an empty password.
   const passwordError = comparablePasswordError(password, t);
-  const canSubmit = password.length > 0 && passwordError === null && !busy;
+  const canSubmit = password.length > 0 && passwordError === null && !busy && !confirming;
 
   const performDelete = async () => {
-    // Two confirmation dialogs can be queued by a double tap (the render-time
-    // canSubmit is still true while a dialog is merely open). Confirming both
-    // would start a second deletion, whose synchronous auth-transition throw
-    // would show "we could not delete your account" over a deletion that is
-    // actually running.
-    if (busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
@@ -58,37 +78,72 @@ export default function DeleteAccountScreen() {
       await deleteAccount(password);
       queryClient.clear();
       Alert.alert(t('da.deletedTitle'), t('da.deletedBody'), [
-        { text: t('common.ok'), onPress: () => router.replace('/') },
+        {
+          text: t('common.ok'),
+          onPress: () => {
+            if (mountedRef.current) router.replace('/');
+          },
+        },
       ]);
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
-        setError(t('da.wrongPassword'));
+        if (mountedRef.current) setError(t('da.wrongPassword'));
       } else if (err instanceof AccountDeletedCleanupError) {
         // The account is gone and the session with it, so the route guard has
         // already unmounted this screen: only a native alert outlives it to
         // deliver the "restart before logging in again" instruction.
         Alert.alert(t('da.deletedTitle'), err.message);
-      } else {
+      } else if (mountedRef.current) {
         setError(userMessageForError(err, t('da.failed')));
       }
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        navigation.setOptions({ headerBackVisible: true, gestureEnabled: true });
+        setBusy(false);
+      }
     }
   };
 
   const handleSubmit = () => {
     // busyRef as well as canSubmit: a keyboard submit is not gated by the
     // button's disabled prop and can land before `busy` has re-rendered.
-    if (!canSubmit || busyRef.current) return;
-    Alert.alert(t('da.confirmTitle'), t('da.confirmBody'), [
-      { text: t('common.cancel'), style: 'cancel' },
+    if (!mountedRef.current || !canSubmit || busyRef.current || confirmingRef.current !== null) {
+      return;
+    }
+    const confirmationOwner = Symbol();
+    confirmingRef.current = confirmationOwner;
+    setConfirming(true);
+    navigation.setOptions({ headerBackVisible: false, gestureEnabled: false });
+    const closeConfirmation = () => {
+      if (confirmingRef.current !== confirmationOwner) return;
+      confirmingRef.current = null;
+      if (!mountedRef.current) return;
+      setConfirming(false);
+      navigation.setOptions({ headerBackVisible: true, gestureEnabled: true });
+    };
+    Alert.alert(
+      t('da.confirmTitle'),
+      t('da.confirmBody'),
+      [
+        { text: t('common.cancel'), style: 'cancel', onPress: closeConfirmation },
+        {
+          text: t('da.confirmDelete'),
+          style: 'destructive',
+          onPress: () => {
+            if (confirmingRef.current !== confirmationOwner) return;
+            confirmingRef.current = null;
+            if (!mountedRef.current) return;
+            setConfirming(false);
+            void performDelete();
+          },
+        },
+      ],
       {
-        text: t('da.confirmDelete'),
-        style: 'destructive',
-        onPress: () => void performDelete(),
+        cancelable: true,
+        onDismiss: closeConfirmation,
       },
-    ]);
+    );
   };
 
   return (

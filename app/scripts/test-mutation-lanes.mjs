@@ -541,7 +541,7 @@ test('runMutation release never removes a lock with another ownership token', as
   assert.deepEqual(JSON.parse(await fs.readFile(lockPath, 'utf8')), replacement);
 });
 
-test('the app Stryker config defaults to two mutation workers', async () => {
+test('the app Stryker config defaults to two workers and bails after a decisive kill', async () => {
   const previousLane = process.env.MUTATION_LANE;
   const previousConcurrency = process.env.MUTATION_CONCURRENCY;
   process.env.MUTATION_LANE = 'recorder';
@@ -551,6 +551,7 @@ test('the app Stryker config defaults to two mutation workers', async () => {
     configUrl.searchParams.set('test', String(Date.now()));
     const { default: config } = await import(configUrl.href);
     assert.equal(config.concurrency, 2);
+    assert.equal(config.jest.config.bail, 1);
   } finally {
     if (previousLane === undefined) delete process.env.MUTATION_LANE;
     else process.env.MUTATION_LANE = previousLane;

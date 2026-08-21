@@ -1,5 +1,5 @@
-import { useInfiniteQuery } from '@tanstack/react-query';
-import React, { useMemo, useState } from 'react';
+import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, SectionList, Text, View } from 'react-native';
 
 import Button from '../components/Button';
@@ -21,6 +21,12 @@ const DATE_LOCALES: Record<UiLanguage, string> = {
 interface DaySection {
   title: string;
   data: HistoryItem[];
+}
+
+const HISTORY_MAX_PAGES = 500;
+
+interface HistoryFetchMeta {
+  fetchMore?: { direction?: 'forward' | 'backward' };
 }
 
 /** Groups newest-first items into day sections using the device's local day. */
@@ -127,16 +133,44 @@ function HistoryRow({ item, t }: { item: HistoryItem; t: Translator }) {
 
 /** Day-grouped, cursor-paged attempt history for the signed-in learner. */
 export default function HistoryScreen() {
-  const { user } = useAuth();
+  const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const { t, language } = useI18n();
   const theme = useTheme();
   const styles = themedStyles(theme);
+  const queryClient = useQueryClient();
+  const mountedRef = useRef(false);
+  const queuedOlderRef = useRef<symbol | null>(null);
+  const userId = user?.id ?? null;
+  const queryKey = useMemo(() => ['practice-history', userId] as const, [userId]);
+  const sessionLease = useMemo(() => {
+    void sessionVersion;
+    void userId;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, userId]);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      queuedOlderRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    queuedOlderRef.current = null;
+  }, [queryKey]);
 
   const historyQuery = useInfiniteQuery({
-    queryKey: ['practice-history', user?.id],
+    queryKey,
     queryFn: async ({ pageParam, signal }) => apiGetPracticeHistory(pageParam, signal),
     initialPageParam: undefined as string | undefined,
-    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    getNextPageParam: (lastPage, allPages) => {
+      const next = lastPage.nextCursor ?? undefined;
+      if (!next || allPages.length >= HISTORY_MAX_PAGES) return undefined;
+      // A malformed server must not keep onEndReached walking the same cursor
+      // (or a cursor cycle) forever and appending duplicate pages.
+      return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
+    },
     enabled: !!user,
     retry: false,
   });
@@ -179,7 +213,7 @@ export default function HistoryScreen() {
         </Text>
         <Button
           title={t('common.tryAgain')}
-          onPress={() => void historyQuery.refetch()}
+          onPress={() => void historyQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
       </View>
@@ -198,9 +232,47 @@ export default function HistoryScreen() {
   }
 
   const loadOlder = () => {
-    if (historyQuery.hasNextPage && !historyQuery.isFetchingNextPage) {
-      void historyQuery.fetchNextPage();
+    if (!historyQuery.hasNextPage || !mountedRef.current || !isSessionLeaseCurrent(sessionLease)) {
+      return;
     }
+    const queryState = queryClient.getQueryState(queryKey);
+    const fetchDirection = (queryState?.fetchMeta as HistoryFetchMeta | null)?.fetchMore?.direction;
+    // fetchMeta changes synchronously when fetchNextPage starts, closing the
+    // same-render gap before isFetchingNextPage can publish a new result.
+    if (
+      historyQuery.isFetchingNextPage ||
+      (queryState?.fetchStatus === 'fetching' && fetchDirection === 'forward')
+    ) {
+      return;
+    }
+
+    if (queryState?.fetchStatus === 'fetching') {
+      if (queuedOlderRef.current !== null) return;
+      const queueToken = Symbol('queued-history-page');
+      queuedOlderRef.current = queueToken;
+      // This is an ordinary loaded-page refresh. Join it without cancellation,
+      // then issue one distinct forward fetch against the refreshed cursor.
+      const joinedRefresh = historyQuery.refetch({ cancelRefetch: false });
+      void joinedRefresh
+        .then((result) => {
+          if (
+            result.isError ||
+            queuedOlderRef.current !== queueToken ||
+            !mountedRef.current ||
+            !isSessionLeaseCurrent(sessionLease)
+          ) {
+            return;
+          }
+          return historyQuery.fetchNextPage({ cancelRefetch: false });
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (queuedOlderRef.current === queueToken) queuedOlderRef.current = null;
+        });
+      return;
+    }
+
+    void historyQuery.fetchNextPage({ cancelRefetch: false }).catch(() => undefined);
   };
   // A rejected page leaves hasNextPage set, so scrolling to the end again would
   // silently re-fire the same failing request; after a failure the next attempt

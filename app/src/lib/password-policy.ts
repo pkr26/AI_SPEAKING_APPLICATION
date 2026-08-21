@@ -16,7 +16,6 @@ export function utf8ByteLength(value: string): number {
     } else if (
       code >= 0xd800 &&
       code <= 0xdbff &&
-      index + 1 < value.length &&
       value.charCodeAt(index + 1) >= 0xdc00 &&
       value.charCodeAt(index + 1) <= 0xdfff
     ) {

@@ -15,6 +15,16 @@ const setItemAsync = SecureStore.setItemAsync as jest.Mock;
 const USER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const OTHER_USER_ID = '650e8400-e29b-41d4-a716-446655440111';
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   getItemAsync.mockImplementation(async () => null);
@@ -66,5 +76,27 @@ describe('markPracticeIntroSeen', () => {
       throw new Error('keychain locked');
     });
     await expect(markPracticeIntroSeen(USER_ID)).resolves.toBeUndefined();
+  });
+
+  it('orders a later seen-check after an in-flight mark', async () => {
+    let stored: string | null = null;
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    setItemAsync.mockImplementationOnce(async () => {
+      writeStarted.resolve();
+      await allowWrite.promise;
+      stored = '1';
+    });
+    getItemAsync.mockImplementation(async () => stored);
+
+    const marking = markPracticeIntroSeen(USER_ID);
+    await writeStarted.promise;
+    const checking = hasSeenPracticeIntro(USER_ID);
+    await Promise.resolve();
+    expect(getItemAsync).not.toHaveBeenCalled();
+
+    allowWrite.resolve();
+    await expect(marking).resolves.toBeUndefined();
+    await expect(checking).resolves.toBe(true);
   });
 });

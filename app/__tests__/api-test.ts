@@ -361,6 +361,60 @@ describe('token storage', () => {
     expect(mockSecureData.get('auth_token')).toBe('jwt-new');
   });
 
+  it('makes a later API request wait for an in-flight token replacement', async () => {
+    await api.saveToken('jwt-old');
+    jest.mocked(SecureStore.setItemAsync).mockClear();
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    jest
+      .mocked(SecureStore.setItemAsync)
+      .mockImplementationOnce(async (key: string, value: string) => {
+        writeStarted.resolve();
+        await allowWrite.promise;
+        mockSecureData.set(key, value);
+      });
+    fetchMock.mockResolvedValue(fakeResponse());
+
+    const saving = api.saveToken('jwt-new');
+    await writeStarted.promise;
+    const request = api.apiFetch('/me');
+    await Promise.resolve();
+    const callsBeforeRelease = fetchMock.mock.calls.length;
+
+    allowWrite.resolve();
+    await saving;
+    await expect(request).resolves.toEqual({});
+    expect(callsBeforeRelease).toBe(0);
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer jwt-new',
+    });
+  });
+
+  it('makes a later API request wait for an in-flight token clear', async () => {
+    await api.saveToken('jwt-old');
+    const deleteStarted = deferred<void>();
+    const allowDelete = deferred<void>();
+    jest.mocked(SecureStore.deleteItemAsync).mockImplementationOnce(async (key: string) => {
+      deleteStarted.resolve();
+      await allowDelete.promise;
+      mockSecureData.delete(key);
+    });
+    fetchMock.mockResolvedValue(fakeResponse());
+
+    const clearing = api.clearToken('jwt-old');
+    await deleteStarted.promise;
+    const request = api.apiFetch('/me');
+    await Promise.resolve();
+    const callsBeforeRelease = fetchMock.mock.calls.length;
+
+    allowDelete.resolve();
+    await expect(clearing).resolves.toBe(true);
+    await expect(request).resolves.toEqual({});
+    expect(callsBeforeRelease).toBe(0);
+    expect(fetchMock.mock.calls[0][1].headers).toEqual({ 'Content-Type': 'application/json' });
+  });
+
   it('does not delete a newer persisted token when the snapshot is stale', async () => {
     await api.saveToken('jwt-old');
     mockSecureData.set('auth_token', 'jwt-new');
@@ -651,6 +705,48 @@ describe('apiFetch', () => {
     expect(fetchMock.mock.calls[0][1].body).toBe('{"name":"x","count":2}');
   });
 
+  it('reads a request body accessor once before serializing it', async () => {
+    fetchMock.mockResolvedValue(fakeResponse());
+    let reads = 0;
+    const options: { method: 'POST'; body?: unknown } = { method: 'POST' };
+    Object.defineProperty(options, 'body', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? { name: 'x' } : undefined;
+      },
+    });
+
+    await api.apiFetch('/items', options);
+
+    expect(reads).toBe(1);
+    expect(fetchMock.mock.calls[0][1].body).toBe('{"name":"x"}');
+  });
+
+  it('subtracts elapsed header time from the response-body timeout budget', async () => {
+    jest.useFakeTimers({ now: 1_000 });
+    const response = deferred<Response>();
+    const fetchStarted = deferred<void>();
+    fetchMock.mockImplementationOnce(async () => {
+      fetchStarted.resolve();
+      return response.promise;
+    });
+    const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+
+    try {
+      const request = api.apiFetch('/budgeted', { timeoutMs: 100 });
+      await fetchStarted.promise;
+      jest.advanceTimersByTime(40);
+      response.resolve(fakeResponse());
+      await request;
+
+      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([100, 60]);
+    } finally {
+      timeoutSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
+
   it('times out a response body that never arrives after successful headers', async () => {
     fetchMock.mockResolvedValue(
       fakeResponse({
@@ -660,7 +756,77 @@ describe('apiFetch', () => {
 
     const error = await catchAsync(api.apiFetch('/body-stalled', { timeoutMs: 10 }));
 
-    expect(error).toMatchObject({ status: 408 });
+    expect(error).toMatchObject({
+      status: 408,
+      message: 'The response timed out. Please check your connection and try again.',
+    });
+  });
+
+  it('preserves a caller reason while a successful response body is still pending', async () => {
+    const caller = new AbortController();
+    const reason = new Error('learner left this screen');
+    const jsonStarted = deferred<void>();
+    const jsonBody = deferred<unknown>();
+    const cancel = jest.fn(async () => undefined);
+    const addSpy = jest.spyOn(caller.signal, 'addEventListener');
+    const removeSpy = jest.spyOn(caller.signal, 'removeEventListener');
+    fetchMock.mockResolvedValueOnce({
+      ...fakeResponse({
+        json: () => {
+          jsonStarted.resolve();
+          return jsonBody.promise;
+        },
+      }),
+      body: { cancel },
+    } as unknown as Response);
+
+    const request = catchAsync(
+      api.apiFetch('/body-abort', {
+        signal: caller.signal,
+        timeoutMs: 60_000,
+      }),
+    );
+    await jsonStarted.promise;
+    caller.abort(reason);
+    jsonBody.resolve({ late: true });
+    await expect(request).resolves.toBe(reason);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const abortAdds = addSpy.mock.calls.filter(([event]) => event === 'abort');
+    const abortRemoves = removeSpy.mock.calls.filter(([event]) => event === 'abort');
+    expect(abortAdds).toHaveLength(2);
+    expect(abortAdds.map(([, , options]) => options)).toEqual([{ once: true }, { once: true }]);
+    expect(abortRemoves).toHaveLength(2);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    addSpy.mockRestore();
+    removeSpy.mockRestore();
+  });
+
+  it('does not start reading a body after a pre-aborted fetch resolves headers', async () => {
+    const caller = new AbortController();
+    const reason = new Error('cancelled before headers');
+    const json = jest.fn(async () => ({ tooLate: true }));
+    caller.abort(reason);
+    fetchMock.mockResolvedValueOnce(fakeResponse({ json }));
+
+    await expect(api.apiFetch('/pre-aborted-body', { signal: caller.signal })).rejects.toBe(reason);
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it('uses the standard AbortError fallback when an aborted signal has a null reason', async () => {
+    const caller = new AbortController();
+    const json = jest.fn(async () => ({ tooLate: true }));
+    caller.abort(null);
+    fetchMock.mockResolvedValueOnce(fakeResponse({ json }));
+
+    await expect(
+      api.apiFetch('/legacy-abort-body', { signal: caller.signal }),
+    ).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'The operation was aborted.',
+    });
+    expect(json).not.toHaveBeenCalled();
   });
 
   it('attaches the bearer token when one is stored', async () => {
@@ -881,6 +1047,62 @@ describe('apiFetch', () => {
     expect((error as Error).name).toBe('AbortError');
   });
 
+  it('does not relabel an earlier caller abort when fetch rejects after the timeout deadline', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const transport = deferred<Response>();
+    const fetchStarted = deferred<void>();
+    const platformAbort = new DOMException('cancelled by platform', 'AbortError');
+    fetchMock.mockImplementationOnce(async () => {
+      fetchStarted.resolve();
+      return transport.promise;
+    });
+
+    try {
+      const request = api.apiFetch('/near-deadline-abort', {
+        signal: controller.signal,
+        timeoutMs: 100,
+      });
+      await fetchStarted.promise;
+      controller.abort(new Error('learner cancelled'));
+      jest.advanceTimersByTime(100);
+      transport.reject(platformAbort);
+
+      await expect(request).rejects.toBe(platformAbort);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not let a later caller abort overwrite an earlier request timeout', async () => {
+    jest.useFakeTimers();
+    const caller = new AbortController();
+    const transport = deferred<Response>();
+    const fetchStarted = deferred<void>();
+    const platformFailure = new Error('transport settled after both aborts');
+    fetchMock.mockImplementationOnce(async () => {
+      fetchStarted.resolve();
+      return transport.promise;
+    });
+
+    try {
+      const request = catchAsync(
+        api.apiFetch('/timeout-wins', { signal: caller.signal, timeoutMs: 100 }),
+      );
+      await fetchStarted.promise;
+      jest.advanceTimersByTime(100);
+      caller.abort(new Error('later learner cancellation'));
+      transport.reject(platformFailure);
+
+      await expect(request).resolves.toMatchObject({
+        status: 408,
+        message: 'The request timed out. Please check your connection and try again.',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('rethrows the raw error when the caller signal was already aborted', async () => {
     const controller = new AbortController();
     const reason = new Error('cancelled before fetch');
@@ -920,6 +1142,31 @@ describe('apiFetch', () => {
     addSpy.mockRestore();
     removeSpy.mockRestore();
   });
+
+  it('removes a completed 204 request timeout and abort listener', async () => {
+    jest.useFakeTimers();
+    const caller = new AbortController();
+    const removeSpy = jest.spyOn(caller.signal, 'removeEventListener');
+    let internalSignal: AbortSignal | undefined;
+    fetchMock.mockImplementationOnce(async (_input: unknown, init?: RequestInit) => {
+      internalSignal = init?.signal ?? undefined;
+      return fakeResponse({ status: 204 });
+    });
+
+    try {
+      await expect(
+        api.apiFetch('/finished', { signal: caller.signal, timeoutMs: 100 }),
+      ).resolves.toBeUndefined();
+      expect(removeSpy).toHaveBeenCalledTimes(1);
+      expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+
+      jest.advanceTimersByTime(100);
+      expect(internalSignal?.aborted).toBe(false);
+    } finally {
+      removeSpy.mockRestore();
+      jest.useRealTimers();
+    }
+  });
 });
 
 describe('error response parsing', () => {
@@ -947,6 +1194,24 @@ describe('error response parsing', () => {
 
     expect(json).toHaveBeenCalledTimes(1);
     expect(error).toMatchObject({ status: 400, code: 'VALIDATION_FAILED' });
+  });
+
+  it('preserves a timeout while reading a non-ok response body', async () => {
+    const cancel = jest.fn(async () => undefined);
+    fetchMock.mockResolvedValueOnce({
+      ...fakeResponse({
+        ok: false,
+        status: 500,
+        json: () => new Promise(() => undefined),
+      }),
+      body: { cancel },
+    } as unknown as Response);
+
+    await expect(api.apiFetch('/stalled-error', { timeoutMs: 10 })).rejects.toMatchObject({
+      status: 408,
+      message: 'The response timed out. Please check your connection and try again.',
+    });
+    expect(cancel).toHaveBeenCalledTimes(1);
   });
 
   it('ignores codes outside the allowlist and falls back to the status mapping', async () => {
@@ -1505,6 +1770,37 @@ describe('apiUploadAudio', () => {
     expect(onRequestStarted).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects a failed local web blob response before starting the API upload', async () => {
+    mockPlatform.OS = 'web';
+    fetchMock.mockResolvedValueOnce(fakeResponse({ ok: false, status: 404 }));
+
+    await expect(
+      api.apiUploadAudio('/practice/attempt', 'blob:https://app/missing', {}),
+    ).rejects.toMatchObject({ status: 404 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not mark a pre-aborted direct upload as started', async () => {
+    const caller = new AbortController();
+    const reason = new Error('cancelled before direct upload');
+    const onRequestStarted = jest.fn();
+    caller.abort(reason);
+    fetchMock.mockRejectedValueOnce(reason);
+
+    await expect(
+      api.apiUploadAudio(
+        '/practice/attempt',
+        'file:///rec/a.m4a',
+        {},
+        {
+          signal: caller.signal,
+          onRequestStarted,
+        },
+      ),
+    ).rejects.toBe(reason);
+    expect(onRequestStarted).not.toHaveBeenCalled();
+  });
+
   it('reports 401 uploads to the unauthorized handler', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
     await api.getToken();
@@ -1537,6 +1833,21 @@ describe('apiUploadAudio', () => {
     expect(error).toMatchObject({
       status: 502,
       message: 'The server returned an invalid response',
+    });
+  });
+
+  it('preserves a 408 when a successful direct-upload response body stalls', async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    await expect(
+      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}, { timeoutMs: 10 }),
+    ).rejects.toMatchObject({
+      status: 408,
+      message: 'The response timed out. Please check your connection and try again.',
     });
   });
 
@@ -1944,6 +2255,73 @@ describe('apiPostPresignedAudio', () => {
     expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
   });
 
+  it('does not relabel an earlier native-upload cancellation after the timeout deadline', async () => {
+    jest.useFakeTimers();
+    const caller = new AbortController();
+    const upload = deferred<Awaited<ReturnType<File['upload']>>>();
+    const uploadStarted = deferred<void>();
+    const platformAbort = new DOMException('cancelled by native upload', 'AbortError');
+    mockFileUpload.mockImplementationOnce(async () => {
+      uploadStarted.resolve();
+      return upload.promise;
+    });
+
+    try {
+      const request = api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
+        'file:///rec/a.m4a',
+        'audio/mp4',
+        maxBytes,
+        { signal: caller.signal, timeoutMs: 100 },
+      );
+      await uploadStarted.promise;
+      caller.abort(new Error('learner cancelled'));
+      jest.advanceTimersByTime(100);
+      upload.reject(platformAbort);
+
+      await expect(request).rejects.toBe(platformAbort);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('does not let a later caller abort overwrite an earlier native-upload timeout', async () => {
+    jest.useFakeTimers();
+    const caller = new AbortController();
+    const upload = deferred<Awaited<ReturnType<File['upload']>>>();
+    const uploadStarted = deferred<void>();
+    const platformFailure = new Error('native upload settled after both aborts');
+    mockFileUpload.mockImplementationOnce(async () => {
+      uploadStarted.resolve();
+      return upload.promise;
+    });
+
+    try {
+      const request = catchAsync(
+        api.apiPostPresignedAudio(
+          uploadUrl,
+          uploadFields,
+          'file:///rec/a.m4a',
+          'audio/mp4',
+          maxBytes,
+          { signal: caller.signal, timeoutMs: 100 },
+        ),
+      );
+      await uploadStarted.promise;
+      jest.advanceTimersByTime(100);
+      caller.abort(new Error('later learner cancellation'));
+      upload.reject(platformFailure);
+
+      await expect(request).resolves.toMatchObject({
+        status: 408,
+        message: 'The recording upload timed out',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('passes an already-aborted caller signal to native upload as aborted', async () => {
     const caller = new AbortController();
     const reason = new Error('already cancelled');
@@ -1990,6 +2368,33 @@ describe('apiPostPresignedAudio', () => {
         maxBytes,
       ),
     ).rejects.toMatchObject({ status: 413, message: 'The recording is too large' });
+    expect(mockFileUpload).not.toHaveBeenCalled();
+  });
+
+  it('validates one stable native file-size snapshot', async () => {
+    let sizeReads = 0;
+    jest.mocked(File).mockImplementationOnce(
+      () =>
+        ({
+          exists: true,
+          get size() {
+            sizeReads += 1;
+            return sizeReads === 1 ? maxBytes + 1 : 5;
+          },
+          upload: mockFileUpload,
+        }) as unknown as File,
+    );
+
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        uploadFields,
+        'file:///rec/a.m4a',
+        'audio/mp4',
+        maxBytes,
+      ),
+    ).rejects.toMatchObject({ status: 413, message: 'The recording is too large' });
+    expect(sizeReads).toBe(1);
     expect(mockFileUpload).not.toHaveBeenCalled();
   });
 
@@ -2545,6 +2950,69 @@ describe('typed endpoint helpers', () => {
       `http://localhost:4000/auth/me/data?cursor=${cursor}`,
       expect.anything(),
     );
+  });
+
+  it('apiExportUserData pins its initiating token across every page', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    await api.saveToken('jwt-export-owner');
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => {
+            await api.saveToken('jwt-new-session');
+            return {
+              user: PROFILE_USER,
+              attempts: [{ id: 'a1' }],
+              nextCursor: cursor,
+            };
+          },
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            user: PROFILE_USER,
+            attempts: [{ id: 'a2' }],
+            nextCursor: null,
+          }),
+        }),
+      );
+
+    await expect(api.apiExportUserData()).resolves.toEqual({
+      user: PROFILE_USER,
+      attempts: [{ id: 'a1' }, { id: 'a2' }],
+    });
+    expect(fetchMock.mock.calls.map(([, init]) => init.headers.Authorization)).toEqual([
+      'Bearer jwt-export-owner',
+      'Bearer jwt-export-owner',
+    ]);
+    await expect(api.getToken()).resolves.toBe('jwt-new-session');
+  });
+
+  it('apiExportUserData rejects pages that claim a different account', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            user: PROFILE_USER,
+            attempts: [{ id: 'a1' }],
+            nextCursor: cursor,
+          }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            user: { ...PROFILE_USER, id: '650e8400-e29b-41d4-a716-446655440111' },
+            attempts: [{ id: 'foreign' }],
+            nextCursor: null,
+          }),
+        }),
+      );
+
+    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   // A screen that unmounts mid-request must be able to cancel the read, so the

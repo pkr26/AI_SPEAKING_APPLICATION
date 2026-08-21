@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, QueryObserver } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 import React from 'react';
@@ -12,7 +12,7 @@ import FeedbackScreen from '../src/app/practice/feedback';
 import HelpScreen from '../src/app/practice/help';
 import PracticeScreen from '../src/app/practice/index';
 import { ApiError, apiFetch, apiSkipPracticeWord } from '../src/lib/api';
-import { LogoutCleanupError, useAuth } from '../src/lib/auth';
+import { LogoutCleanupError, useAuth, type SessionLease } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
@@ -50,25 +50,52 @@ jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 const mockSetOptions = jest.fn();
+type BeforeRemoveEvent = {
+  data: { action: { type: string } };
+  preventDefault: jest.Mock;
+};
+const mockBeforeRemoveListeners = new Set<(event: BeforeRemoveEvent) => void>();
+const mockAddNavigationListener = jest.fn(
+  (event: string, listener: (event: BeforeRemoveEvent) => void) => {
+    if (event === 'beforeRemove') mockBeforeRemoveListeners.add(listener);
+    return () => mockBeforeRemoveListeners.delete(listener);
+  },
+);
+const mockNavigation = { setOptions: mockSetOptions, addListener: mockAddNavigationListener };
 
 // Focus is simulated by invoking the effect on mount and its cleanup on
 // unmount, re-running when the callback identity changes (as expo-router does
 // while a screen stays focused).
+interface MockFocusRegistration {
+  callback: () => void | (() => void);
+  cleanup: (() => void) | null;
+}
+
+const mockFocusRegistrations: MockFocusRegistration[] = [];
+
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
   return {
     router: {
       push: jest.fn(),
+      navigate: jest.fn(),
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
     },
     useLocalSearchParams: () => mockSearchParams,
-    useNavigation: () => ({ setOptions: mockSetOptions }),
+    useNavigation: () => mockNavigation,
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
+        const registration = { callback, cleanup: null as (() => void) | null };
+        mockFocusRegistrations.push(registration);
         const cleanup = callback();
-        return typeof cleanup === 'function' ? cleanup : undefined;
+        registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        return () => {
+          registration.cleanup?.();
+          const index = mockFocusRegistrations.indexOf(registration);
+          if (index >= 0) mockFocusRegistrations.splice(index, 1);
+        };
       }, [callback]);
     },
   };
@@ -88,6 +115,8 @@ jest.mock('expo-haptics', () => ({
 interface CapturedRecorderProps {
   ownerId: string;
   questionId: string;
+  disabled?: boolean;
+  isStartBlocked?: () => boolean;
   endpoint: string;
   parseResult: (data: unknown) => PracticeOutcome;
   onResult: (data: PracticeOutcome) => void;
@@ -129,6 +158,13 @@ const USER: User = {
   diagnosticCompleted: true,
 };
 
+const OTHER_USER: User = {
+  ...USER,
+  id: '550e8400-e29b-41d4-a716-446655440010',
+  name: 'Grace Hopper',
+  email: 'grace@example.com',
+};
+
 let mockAuthValue: AuthValue;
 
 function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
@@ -140,6 +176,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn().mockResolvedValue(undefined),
@@ -204,6 +242,7 @@ const mockApiFetch = apiFetch as jest.Mock;
 const mockSkipWord = apiSkipPracticeWord as jest.Mock;
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
+  navigate: jest.Mock;
   replace: jest.Mock;
   back: jest.Mock;
   dismissTo: jest.Mock;
@@ -270,10 +309,26 @@ const PASSED_RESULT: AttemptResult = {
 let alertSpy: jest.SpyInstance;
 let backHandlers: (() => boolean)[];
 let backSubscriptionRemove: jest.Mock;
+let transientSpies: jest.SpyInstance[];
+
+function trackQueryRefetches(): jest.SpyInstance {
+  const spy = jest.spyOn(QueryObserver.prototype, 'refetch');
+  transientSpies.push(spy);
+  return spy;
+}
 
 function pressHardwareBack(): boolean {
   if (backHandlers.length === 0) throw new Error('No hardware back handler registered');
   return backHandlers[backHandlers.length - 1]();
+}
+
+function dispatchBeforeRemove(type = 'GO_BACK'): jest.Mock {
+  const event: BeforeRemoveEvent = {
+    data: { action: { type } },
+    preventDefault: jest.fn(),
+  };
+  for (const listener of mockBeforeRemoveListeners) listener(event);
+  return event.preventDefault;
 }
 
 const queryClients: QueryClient[] = [];
@@ -336,6 +391,35 @@ function committedPressHandler(node: TestInstance): () => unknown {
     fiber = fiber.return;
   }
   throw new Error('No committed press handler found');
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function blurScreen(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockFocusRegistrations) {
+      const cleanup = registration.cleanup;
+      registration.cleanup = null;
+      cleanup?.();
+    }
+  });
+}
+
+async function focusScreen(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockFocusRegistrations) {
+      const cleanup = registration.callback();
+      registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+    }
+  });
 }
 
 function responderEvent() {
@@ -417,6 +501,9 @@ beforeEach(() => {
   mockPracticeIntro.hasSeenPracticeIntro.mockResolvedValue(true);
   mockPracticeIntro.markPracticeIntroSeen.mockResolvedValue(undefined);
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+  transientSpies = [];
+  mockBeforeRemoveListeners.clear();
+  mockFocusRegistrations.length = 0;
   backHandlers = [];
   backSubscriptionRemove = jest.fn();
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
@@ -433,6 +520,7 @@ afterEach(async () => {
   // Cancel cache-gc timers so the jest process can exit promptly.
   for (const client of queryClients) client.clear();
   queryClients.length = 0;
+  for (const spy of transientSpies) spy.mockRestore();
   alertSpy.mockRestore();
 });
 
@@ -676,13 +764,25 @@ describe('practice home screen', () => {
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: false,
+        gestureEnabled: false,
+      });
+    });
     const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
     expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
     await fireEvent.press(toggle);
     expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
 
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(false);
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: true,
+        gestureEnabled: true,
+      });
+    });
     await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
   });
@@ -721,7 +821,7 @@ describe('practice home screen', () => {
     expect(help.props.accessibilityState).toEqual({ disabled: true });
     expect(flattenedStyle(help)).toMatchObject({ opacity: 0.5 });
     await fireEvent.press(help);
-    expect(mockRouter.push).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     const settings = screen.getByRole('button', { name: t('practice.settings') });
     expect(settings.props.accessibilityState).toEqual({ disabled: true });
@@ -738,7 +838,7 @@ describe('practice home screen', () => {
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel'))).opacity).toBeUndefined();
     await fireEvent.press(screen.getByLabelText(t('practice.helpLabel')));
-    expect(mockRouter.push).toHaveBeenCalledWith({
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/practice/help',
       params: { questionId: QUESTION.id },
     });
@@ -755,10 +855,21 @@ describe('practice home screen', () => {
     );
     // Practice sits above Home now: an idle screen lets the navigator pop back.
     expect(pressHardwareBack()).toBe(false);
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    let immediateBack = false;
+    let immediatePrevent: jest.Mock | null = null;
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      // Exercise the committed handlers before React can paint disabled props.
+      immediateBack = pressHardwareBack();
+      immediatePrevent = dispatchBeforeRemove();
+    });
+    expect(immediateBack).toBe(true);
+    expect(immediatePrevent).toHaveBeenCalledTimes(1);
     expect(pressHardwareBack()).toBe(true);
+    expect(dispatchBeforeRemove('RESET')).not.toHaveBeenCalled();
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(pressHardwareBack()).toBe(false);
+    expect(dispatchBeforeRemove()).not.toHaveBeenCalled();
     expect(mockRouter.back).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
@@ -776,12 +887,26 @@ describe('practice home screen', () => {
       headerBackVisible: true,
       gestureEnabled: true,
     });
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      // The native header/gesture fence must publish before React can commit
+      // the disabled render; a later layout effect is too late for this race.
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: false,
+        gestureEnabled: false,
+      });
+    });
     expect(mockSetOptions).toHaveBeenLastCalledWith({
       headerBackVisible: false,
       gestureEnabled: false,
     });
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(false);
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: true,
+        gestureEnabled: true,
+      });
+    });
     expect(mockSetOptions).toHaveBeenLastCalledWith({
       headerBackVisible: true,
       gestureEnabled: true,
@@ -814,6 +939,75 @@ describe('practice home screen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
+  it('accepts one recorder result when duplicate callbacks arrive before navigation commits', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const callbacks = recorderProps();
+
+    await act(async () => {
+      callbacks.onResult(PASSED_RESULT);
+      callbacks.onResult(PASSED_RESULT);
+    });
+
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(1);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
+    expect(mockRouter.push).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['blur', 'session lease'] as const)(
+    'drops every queued recorder continuation after %s ownership is lost',
+    async (boundary) => {
+      const renderLease = { owner: 'practice-render' } as never;
+      let currentLease: unknown = renderLease;
+      mockAuthValue = makeAuth({
+        captureSessionLease: jest.fn(() => currentLease as never),
+        isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+      });
+      mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+      await renderScreen(<PracticeScreen />);
+      await screen.findByText('Describe a time you showed courage.');
+      const callbacks = recorderProps();
+      const requestsBeforeBoundary = mockApiFetch.mock.calls.length;
+
+      if (boundary === 'blur') {
+        await blurScreen();
+      } else {
+        // No React render occurs here. This is the synchronous Auth epoch gap
+        // that a layout-effect identity mirror cannot close.
+        currentLease = { owner: 'new-session' };
+      }
+      alertSpy.mockClear();
+      mockSetOptions.mockClear();
+      let acceptedEndpointMismatch: boolean | undefined;
+
+      await act(async () => {
+        callbacks.onResult(PASSED_RESULT);
+        callbacks.onResult(PASSED_RESULT);
+        callbacks.onError('late upload failure');
+        callbacks.onRateLimited?.('late wait notice');
+        callbacks.onRecoveryUnresolved();
+        acceptedEndpointMismatch = callbacks.onRecoveryEndpointMismatch?.(
+          '/practice/attempt/native',
+        );
+        callbacks.onInteractionLockChange?.(true);
+        await Promise.resolve();
+      });
+
+      expect(mockPracticeFlow.showFeedback).not.toHaveBeenCalled();
+      expect(mockRouter.push).not.toHaveBeenCalled();
+      expect(alertSpy).not.toHaveBeenCalled();
+      expect(screen.queryByText('late wait notice')).toBeNull();
+      expect(acceptedEndpointMismatch).toBe(false);
+      expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+      expect(mockApiFetch).toHaveBeenCalledTimes(requestsBeforeBoundary);
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      expect(
+        screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+      ).toMatchObject({ disabled: false });
+    },
+  );
+
   it('updates a cached new word to revision after a real scored miss', async () => {
     mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     const queryClient = makeQueryClient();
@@ -845,6 +1039,51 @@ describe('practice home screen', () => {
     });
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, miss);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('cancels an active pre-answer question GET before accepting a scored result', async () => {
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    const staleRefresh = deferred<unknown>();
+    let staleSignal: AbortSignal | undefined;
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockImplementationOnce((_path: string, options?: { signal?: AbortSignal }) => {
+        staleSignal = options?.signal;
+        return staleRefresh.promise;
+      });
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    let backgroundRefresh!: Promise<void>;
+
+    await act(async () => {
+      backgroundRefresh = queryClient.refetchQueries({ queryKey, exact: true });
+      await Promise.resolve();
+    });
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'I tried to answer.',
+      feedback: 'Add more detail.',
+    };
+    await act(async () => recorderProps().onResult(miss));
+    const staleWasAborted = staleSignal?.aborted;
+
+    await act(async () => {
+      staleRefresh.resolve(PRACTICE_QUESTION);
+      await Promise.allSettled([backgroundRefresh]);
+      await Promise.resolve();
+    });
+
+    expect(staleWasAborted).toBe(true);
+    expect(queryClient.getQueryData(queryKey)).toEqual({
+      ...PRACTICE_QUESTION,
+      kind: 'revision',
+      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
+    });
   });
 
   it('does not double-count a scored miss for a word already in revision', async () => {
@@ -895,6 +1134,49 @@ describe('practice home screen', () => {
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 
+  it('replaces a pre-recovery question refresh and deduplicates recovery callbacks', async () => {
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    const staleRefresh = deferred<unknown>();
+    const recoveryRefresh = deferred<unknown>();
+    let staleSignal: AbortSignal | undefined;
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockImplementationOnce((_path: string, options?: { signal?: AbortSignal }) => {
+        staleSignal = options?.signal;
+        return staleRefresh.promise;
+      })
+      .mockReturnValueOnce(recoveryRefresh.promise);
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    let backgroundRefresh!: Promise<void>;
+
+    await act(async () => {
+      backgroundRefresh = queryClient.refetchQueries({ queryKey, exact: true });
+      await Promise.resolve();
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      recorderProps().onRecoveryUnresolved();
+      recorderProps().onRecoveryUnresolved();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const callsAfterRecovery = mockApiFetch.mock.calls.length;
+    const staleWasAborted = staleSignal?.aborted;
+
+    await act(async () => {
+      staleRefresh.resolve(PRACTICE_QUESTION);
+      recoveryRefresh.resolve(NEXT_PRACTICE_QUESTION);
+      await Promise.allSettled([backgroundRefresh]);
+      await Promise.resolve();
+    });
+    expect(callsAfterRecovery).toBe(3);
+    expect(staleWasAborted).toBe(true);
+    expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
+  });
+
   it('keeps a cached question visible when a recovery refresh fails', async () => {
     const queryClient = makeQueryClient();
     const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
@@ -932,14 +1214,36 @@ describe('practice home screen', () => {
       },
       { backgroundColor: colors.primaryDark },
     );
-    await fireEvent.press(screen.getByLabelText(t('practice.helpLabel')));
-    expect(mockRouter.push).toHaveBeenCalledWith({
+    const pressHelp = committedPressHandler(screen.getByLabelText(t('practice.helpLabel')));
+    await act(async () => {
+      pressHelp();
+      pressHelp();
+    });
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/practice/help',
       params: { questionId: QUESTION.id },
     });
   });
 
+  it('rejects a captured navigation handler after the practice screen loses focus', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const view = await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const staleSettingsPress = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.settings') }),
+    );
+
+    await view.unmount();
+    await act(async () => {
+      staleSettingsPress();
+    });
+
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+  });
+
   it('shows a retryable error when the question fails to load', async () => {
+    const refetchSpy = trackQueryRefetches();
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen(<PracticeScreen />);
 
@@ -957,6 +1261,7 @@ describe('practice home screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    expect(refetchSpy).toHaveBeenLastCalledWith({ cancelRefetch: false });
   });
 
   it('uses the practice fallback without also showing a loading state', async () => {
@@ -972,8 +1277,93 @@ describe('practice home screen', () => {
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
-    await fireEvent.press(screen.getByRole('button', { name: t('practice.settings') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/settings');
+    const press = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.settings') }),
+    );
+    await act(async () => {
+      press();
+      press();
+    });
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not let a queued logout run after Settings owns navigation', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const openSettings = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.settings') }),
+    );
+    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
+
+    await act(async () => {
+      openSettings();
+      void logOut();
+      await Promise.resolve();
+    });
+
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+  });
+
+  it('blocks Settings behind logout and releases the shared action claim after failure', async () => {
+    const logoutRequest = deferred<void>();
+    const logout = jest.fn(() => logoutRequest.promise);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const openSettings = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.settings') }),
+    );
+    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
+
+    await act(async () => {
+      void logOut();
+      openSettings();
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      logoutRequest.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
+
+    await act(async () => openSettings());
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+  });
+
+  it('rejects a practice logout handler after its render lease is invalidated', async () => {
+    const renderLease = { owner: 'practice-account-actions' } as never;
+    let currentLease: unknown = renderLease;
+    const logout = jest.fn();
+    mockAuthValue = makeAuth({
+      logout,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const staleLogout = committedPressHandler(
+      screen.getByRole('button', { name: t('common.logOut') }),
+    );
+
+    currentLease = { owner: 'replacement-session' };
+    await act(async () => {
+      void staleLogout();
+      await Promise.resolve();
+    });
+
+    expect(logout).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(alertSpy).not.toHaveBeenCalled();
   });
 
@@ -985,6 +1375,42 @@ describe('practice home screen', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalled();
+  });
+
+  it('serializes same-frame logout taps and releases the latch after a failure', async () => {
+    const firstLogout = deferred<void>();
+    const logout = jest
+      .fn()
+      .mockReturnValueOnce(firstLogout.promise)
+      .mockResolvedValueOnce(undefined);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const press = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
+
+    await act(async () => {
+      press();
+      press();
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstLogout.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody')),
+    );
+
+    await act(async () => {
+      press();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(logout).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
   it('reports a cleanup failure after logout', async () => {
@@ -1101,6 +1527,13 @@ describe('practice attempt screen', () => {
         .accessibilityState,
     ).toEqual({ checked: true, disabled: false });
 
+    await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
+
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
+    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
+    expect(recorderProps().onRecoveryEndpointMismatch?.('/diagnostic/answer')).toBe(false);
+
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
       understood: true,
@@ -1111,13 +1544,6 @@ describe('practice attempt screen', () => {
     await act(async () => recorderProps().onResult(nativeResult));
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, nativeResult);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
-
-    await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
-
-    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
-    expect(recorderProps().onRecoveryEndpointMismatch?.('/diagnostic/answer')).toBe(false);
   });
 
   it('locks the help-entry language switch during recording and submission', async () => {
@@ -1126,7 +1552,13 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />);
     await screen.findByText('Describe a time you showed courage.');
 
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: false,
+        gestureEnabled: false,
+      });
+    });
     const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
     expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
     // The lock is explained, not just enforced, and it is visible as dimming.
@@ -1135,7 +1567,13 @@ describe('practice attempt screen', () => {
     await fireEvent.press(toggle);
     expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
 
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(false);
+      expect(mockSetOptions).toHaveBeenLastCalledWith({
+        headerBackVisible: true,
+        gestureEnabled: true,
+      });
+    });
     const unlocked = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
     expect(unlocked.props.accessibilityHint).toBeUndefined();
     expect(flattenedStyle(unlocked).opacity).toBeUndefined();
@@ -1168,8 +1606,17 @@ describe('practice attempt screen', () => {
 
     expect(pressHardwareBack()).toBe(false);
 
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    let immediateBack = false;
+    let immediatePrevent: jest.Mock | null = null;
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      immediateBack = pressHardwareBack();
+      immediatePrevent = dispatchBeforeRemove();
+    });
+    expect(immediateBack).toBe(true);
+    expect(immediatePrevent).toHaveBeenCalledTimes(1);
     expect(pressHardwareBack()).toBe(true);
+    expect(dispatchBeforeRemove('RESET')).not.toHaveBeenCalled();
 
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(pressHardwareBack()).toBe(false);
@@ -1310,6 +1757,74 @@ describe('practice attempt screen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
+  it('accepts one Practice Mode result when the Recorder repeats its callback', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const callbacks = recorderProps();
+
+    await act(async () => {
+      callbacks.onResult(PASSED_RESULT);
+      callbacks.onResult(PASSED_RESULT);
+    });
+
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(1);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
+    expect(mockRouter.push).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['blur', 'session lease'] as const)(
+    'drops Practice Mode callbacks after %s ownership is lost',
+    async (boundary) => {
+      const renderLease = { owner: 'attempt-render' } as never;
+      let currentLease: unknown = renderLease;
+      mockAuthValue = makeAuth({
+        captureSessionLease: jest.fn(() => currentLease as never),
+        isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+      });
+      mockSearchParams = { questionId: QUESTION.id };
+      mockApiFetch.mockResolvedValue(HELP_CONTENT);
+      const queryClient = makeQueryClient();
+      const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+      await renderScreen(<AttemptScreen />, queryClient);
+      await screen.findByText('Describe a time you showed courage.');
+      const callbacks = recorderProps();
+
+      if (boundary === 'blur') {
+        await blurScreen();
+      } else {
+        currentLease = { owner: 'new-session' };
+      }
+      alertSpy.mockClear();
+      mockSetOptions.mockClear();
+      let acceptedEndpointMismatch: boolean | undefined;
+
+      await act(async () => {
+        callbacks.onResult(PASSED_RESULT);
+        callbacks.onResult(PASSED_RESULT);
+        callbacks.onError('late attempt failure');
+        callbacks.onRateLimited?.('late attempt wait');
+        callbacks.onRecoveryUnresolved();
+        acceptedEndpointMismatch = callbacks.onRecoveryEndpointMismatch?.(
+          '/practice/attempt/native',
+        );
+        callbacks.onInteractionLockChange?.(true);
+        await Promise.resolve();
+      });
+
+      expect(mockPracticeFlow.showFeedback).not.toHaveBeenCalled();
+      expect(mockRouter.push).not.toHaveBeenCalled();
+      expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+      expect(alertSpy).not.toHaveBeenCalled();
+      expect(screen.queryByText('late attempt wait')).toBeNull();
+      expect(acceptedEndpointMismatch).toBe(false);
+      expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+      expect(invalidateSpy).not.toHaveBeenCalled();
+      expect(mockSetOptions).not.toHaveBeenCalled();
+    },
+  );
+
   it('updates a cached new word to revision after a real scored miss', async () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockResolvedValue(HELP_CONTENT);
@@ -1336,6 +1851,51 @@ describe('practice attempt screen', () => {
     });
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, miss);
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
+  });
+
+  it('cancels the underlying active question GET before Practice Mode accepts a miss', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    queryClient.setQueryData(queryKey, PRACTICE_QUESTION);
+    const staleRefresh = deferred<PracticeQuestionPayload>();
+    let staleSignal: AbortSignal | undefined;
+    const backgroundRefresh = queryClient.fetchQuery({
+      queryKey,
+      queryFn: ({ signal }) => {
+        staleSignal = signal;
+        return staleRefresh.promise;
+      },
+      staleTime: 0,
+    });
+    const backgroundSettled = Promise.allSettled([backgroundRefresh]);
+    await renderScreen(<AttemptScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    const miss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'I tried to answer.',
+      feedback: 'Add more detail.',
+    };
+
+    await act(async () => recorderProps().onResult(miss));
+    const staleWasAborted = staleSignal?.aborted;
+    await act(async () => {
+      staleRefresh.resolve(PRACTICE_QUESTION);
+      await backgroundSettled;
+      await Promise.resolve();
+    });
+
+    expect(staleWasAborted).toBe(true);
+    expect(queryClient.getQueryData(queryKey)).toEqual({
+      ...PRACTICE_QUESTION,
+      kind: 'revision',
+      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
+    });
   });
 
   it('does not double-count a scored miss for a word already in revision', async () => {
@@ -1412,6 +1972,7 @@ describe('practice attempt screen', () => {
   });
 
   it('shows a retryable error when the question fails to load', async () => {
+    const refetchSpy = trackQueryRefetches();
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen(<AttemptScreen />);
@@ -1430,6 +1991,7 @@ describe('practice attempt screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    expect(refetchSpy).toHaveBeenLastCalledWith({ cancelRefetch: false });
   });
 
   it('uses the attempt-specific fallback for non-API failures', async () => {
@@ -2199,6 +2761,63 @@ describe('practice feedback screen', () => {
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalledTimes(1);
   });
 
+  it('binds feedback actions to the lease captured by the rendered card', async () => {
+    const renderLease = { owner: 'feedback-render' } as never;
+    let currentLease: unknown = renderLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const queryClient = makeQueryClient();
+    const setDataSpy = jest.spyOn(queryClient, 'setQueryData');
+    await renderScreen(<FeedbackScreen />, queryClient);
+
+    // If the handler captures here instead of at render time, it receives the
+    // replacement lease and incorrectly treats the old card as current.
+    currentLease = { owner: 'replacement-session' };
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+
+    expect(setDataSpy).not.toHaveBeenCalled();
+    expect(mockAuthValue.setUser).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('cancels an active old-question GET before seeding feedback.next', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    queryClient.setQueryData(queryKey, PRACTICE_QUESTION);
+    const staleRefresh = deferred<PracticeQuestionPayload>();
+    let staleSignal: AbortSignal | undefined;
+    const backgroundRefresh = queryClient.fetchQuery({
+      queryKey,
+      queryFn: ({ signal }) => {
+        staleSignal = signal;
+        return staleRefresh.promise;
+      },
+      staleTime: 0,
+    });
+    const backgroundSettled = Promise.allSettled([backgroundRefresh]);
+    await renderScreen(<FeedbackScreen />, queryClient);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    const staleWasAborted = staleSignal?.aborted;
+    await act(async () => {
+      staleRefresh.resolve(PRACTICE_QUESTION);
+      await backgroundSettled;
+      await Promise.resolve();
+    });
+
+    expect(staleWasAborted).toBe(true);
+    expect(queryClient.getQueryData(queryKey)).toEqual(NEXT_PRACTICE_QUESTION);
+  });
+
   it('lets hardware back reuse the one-shot action guard with the primary button', async () => {
     mockPracticeFlow = makePracticeFlow({
       feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
@@ -2347,13 +2966,14 @@ describe('practice help screen', () => {
       { backgroundColor: colors.primaryDark },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('help.startPractice') }));
-    expect(mockRouter.push).toHaveBeenCalledWith({
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/practice/attempt',
       params: { questionId: QUESTION.id },
     });
   });
 
   it('shows a retryable error when help fails to load', async () => {
+    const refetchSpy = trackQueryRefetches();
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen(<HelpScreen />);
@@ -2372,6 +2992,7 @@ describe('practice help screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
+    expect(refetchSpy).toHaveBeenLastCalledWith({ cancelRefetch: false });
   });
 
   it('uses the help-specific fallback for non-API failures', async () => {
@@ -2431,6 +3052,53 @@ describe('skip word', () => {
     expect(alertSpy).not.toHaveBeenCalled();
   });
 
+  it('replaces a pre-skip question refresh after the word is parked', async () => {
+    const queryClient = makeQueryClient();
+    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
+    const staleRefresh = deferred<unknown>();
+    const freshRefresh = deferred<unknown>();
+    let staleSignal: AbortSignal | undefined;
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockImplementationOnce((_path: string, options?: { signal?: AbortSignal }) => {
+        staleSignal = options?.signal;
+        return staleRefresh.promise;
+      })
+      .mockReturnValueOnce(freshRefresh.promise);
+    mockSkipWord.mockResolvedValueOnce(undefined);
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText('Describe a time you showed courage.');
+    let backgroundRefresh!: Promise<void>;
+
+    await act(async () => {
+      backgroundRefresh = queryClient.refetchQueries({ queryKey, exact: true });
+      await Promise.resolve();
+    });
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+    await waitFor(() => expect(mockSkipWord).toHaveBeenCalledWith(QUESTION.id));
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(3));
+    const callsAfterSkip = mockApiFetch.mock.calls.length;
+    const staleWasAborted = staleSignal?.aborted;
+
+    await act(async () => {
+      staleRefresh.resolve(PRACTICE_QUESTION);
+      freshRefresh.resolve(NEXT_PRACTICE_QUESTION);
+      await Promise.allSettled([backgroundRefresh]);
+      await Promise.resolve();
+    });
+    expect(mockSkipWord).toHaveBeenCalledWith(QUESTION.id);
+    expect(callsAfterSkip).toBe(3);
+    expect(staleWasAborted).toBe(true);
+    expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
+      ).toEqual({ disabled: false, busy: false }),
+    );
+  });
+
   it('issues one skip for two same-render activations', async () => {
     let resolveSkip: () => void = () => undefined;
     mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
@@ -2444,17 +3112,162 @@ describe('skip word', () => {
     const press = committedPressHandler(
       screen.getByRole('button', { name: t('practice.skipWord') }),
     );
-    let first!: Promise<unknown>;
-    let second!: Promise<unknown>;
+    const startBlocked = recorderProps().isStartBlocked;
+    expect(startBlocked?.()).toBe(false);
+    let blockedDuringSkip = false;
 
     await act(async () => {
-      first = Promise.resolve(press());
-      second = Promise.resolve(press());
+      void press();
+      blockedDuringSkip = startBlocked?.() ?? false;
+      void press();
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
+    expect(blockedDuringSkip).toBe(true);
+    expect(recorderProps().disabled).toBe(true);
 
-    await act(async () => resolveSkip());
-    await Promise.all([first, second]);
+    await act(async () => {
+      resolveSkip();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(startBlocked?.()).toBe(false));
+  });
+
+  it('locks every question-bound exit in the same frame that a skip starts', async () => {
+    const skipRequest = deferred<void>();
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const skipWord = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    const openHelp = committedPressHandler(screen.getByLabelText(t('practice.helpLabel')));
+    const openSettings = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.settings') }),
+    );
+    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
+    mockSetOptions.mockClear();
+    let prevented!: jest.Mock;
+
+    await act(async () => {
+      void skipWord();
+      openHelp();
+      openSettings();
+      void logOut();
+      prevented = dispatchBeforeRemove();
+      expect(pressHardwareBack()).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+    expect(prevented).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+    expect(screen.getByLabelText(t('practice.helpLabel')).props.accessibilityState).toMatchObject({
+      disabled: true,
+    });
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => {
+      skipRequest.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+      ).toMatchObject({ disabled: false }),
+    );
+    expect(pressHardwareBack()).toBe(false);
+    expect(dispatchBeforeRemove()).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+  });
+
+  it('does no post-skip reconciliation after blur invalidates the render session lease', async () => {
+    const skipRequest = deferred<void>();
+    const renderLease = { owner: 'skip-render' } as never;
+    let currentLease: unknown = renderLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const skipWord = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      void skipWord();
+      await Promise.resolve();
+    });
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+    await blurScreen();
+    currentLease = { owner: 'replacement-session' };
+    alertSpy.mockClear();
+
+    await act(async () => {
+      skipRequest.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The POST may have committed for its original owner, but a continuation
+    // must not issue a GET with the replacement bearer into the old cache key.
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
+      ).toEqual({ disabled: false, busy: false }),
+    );
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('suppresses a rejected skip after its screen has blurred', async () => {
+    const skipRequest = deferred<void>();
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const skipWord = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      void skipWord();
+      await Promise.resolve();
+    });
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+    await blurScreen();
+    alertSpy.mockClear();
+    await act(async () => {
+      skipRequest.reject(new Error('late failure'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await focusScreen();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
+      ).toEqual({ disabled: false, busy: false }),
+    );
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it('disables skipping while the recorder holds the interaction lock', async () => {
@@ -2601,6 +3414,21 @@ describe('level-up celebration', () => {
     return renderScreen(<FeedbackScreen />, queryClient);
   }
 
+  function expectCurrentUserLevelUp(): void {
+    expect(mockAuthValue.setUser).toHaveBeenCalledTimes(1);
+    const update = (mockAuthValue.setUser as jest.Mock).mock.calls[0]?.[0] as unknown;
+    expect(update).toEqual(expect.any(Function));
+    const apply = update as (current: User | null) => User | null;
+    const concurrentlyEdited = {
+      ...USER,
+      name: 'Ada King',
+      nativeLanguage: 'hi' as const,
+    };
+    expect(apply(concurrentlyEdited)).toEqual({ ...concurrentlyEdited, cefrLevel: 'B2' });
+    expect(apply(OTHER_USER)).toBe(OTHER_USER);
+    expect(apply(null)).toBeNull();
+  }
+
   it('celebrates the promotion with localized copy, a hidden emoji, and a success haptic', async () => {
     await renderLevelUpFeedback();
 
@@ -2645,7 +3473,7 @@ describe('level-up celebration', () => {
       B2_PRACTICE_QUESTION,
     );
     expect(queryClient.getQueryData(['practice-question', USER.id, 'B1'])).toBeUndefined();
-    expect(mockAuthValue.setUser).toHaveBeenCalledWith({ ...USER, cefrLevel: 'B2' });
+    expectCurrentUserLevelUp();
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
@@ -2664,7 +3492,7 @@ describe('level-up celebration', () => {
     expect(queryClient.getQueryData(['practice-question', USER.id, 'B2'])).toEqual(
       B2_PRACTICE_QUESTION,
     );
-    expect(mockAuthValue.setUser).toHaveBeenCalledWith({ ...USER, cefrLevel: 'B2' });
+    expectCurrentUserLevelUp();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
   });
 });
@@ -3569,6 +4397,16 @@ describe('feedback outcome wiring', () => {
     feedback: 'We could not detect any speech.',
   };
 
+  const RETRY_RESULT: AttemptResult = {
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    score: 40,
+    transcript: 'I tried.',
+    feedback: 'Keep going.',
+  };
+
   it.each([
     ['hi', 'hi-IN'],
     ['es', 'es-ES'],
@@ -3682,6 +4520,112 @@ describe('feedback outcome wiring', () => {
 
     expect(screen.getByText(t('feedback.masteredTitle'))).toBeTruthy();
     expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledWith('success');
+  });
+
+  it('rejects a queued action from an outcome card that has been replaced', async () => {
+    const firstFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: RETRY_RESULT },
+    });
+    mockPracticeFlow = firstFlow;
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    const staleRetry = committedPressHandler(
+      screen.getByRole('button', { name: t('common.tryAgain') }),
+    );
+
+    const secondFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = secondFlow;
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+    await act(async () => {
+      staleRetry();
+    });
+
+    expect(firstFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(secondFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.back).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(secondFlow.clearFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('re-arms the one-shot action guard when a new outcome replaces an acted card', async () => {
+    const firstFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: RETRY_RESULT },
+    });
+    mockPracticeFlow = firstFlow;
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    expect(firstFlow.clearFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+
+    const secondFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = secondFlow;
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+
+    expect(secondFlow.clearFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('treats a changed question id as a new exact card even when the result object is reused', async () => {
+    const firstFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = firstFlow;
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    const staleNext = committedPressHandler(
+      screen.getByRole('button', { name: t('feedback.nextQuestion') }),
+    );
+
+    const secondFlow = makePracticeFlow({
+      feedback: { questionId: NEXT_QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = secondFlow;
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+    await act(async () => {
+      staleNext();
+    });
+
+    expect(firstFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(secondFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(secondFlow.clearFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('re-arms an acted card when only its question identity changes', async () => {
+    const firstFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = firstFlow;
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(firstFlow.clearFeedback).toHaveBeenCalledTimes(1);
+
+    const secondFlow = makePracticeFlow({
+      feedback: { questionId: NEXT_QUESTION.id, result: PASSED_RESULT },
+    });
+    mockPracticeFlow = secondFlow;
+    await act(async () => {
+      await rerenderScreen(<FeedbackScreen />);
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+
+    expect(secondFlow.clearFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledTimes(2);
   });
 
   it('marks home stats stale when a scored outcome replaces a native one', async () => {

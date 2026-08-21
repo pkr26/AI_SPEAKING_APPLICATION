@@ -177,7 +177,7 @@ function isBoundedNonEmptyString(value: unknown, maxLength: number): value is st
 }
 
 function isNumber(value: unknown): value is number {
-  return typeof value === 'number' && Number.isFinite(value);
+  return Number.isFinite(value);
 }
 
 function isNativeLanguage(value: unknown): value is NativeLanguage {
@@ -294,67 +294,78 @@ export function parsePracticeQuestion(value: unknown): PracticeQuestionPayload {
 }
 
 export function parseDiagnosticNext(value: unknown): DiagnosticNext {
-  if (!isRecord(value) || typeof value.done !== 'boolean') {
+  if (!isRecord(value)) {
     throw new ContractError();
   }
-  if (value.done) {
-    if (!isCefrLevel(value.level) || value.question !== undefined || value.progress !== undefined) {
+  const done = value.done;
+  if (typeof done !== 'boolean') throw new ContractError();
+  const level = value.level;
+  const question = value.question;
+  const rawProgress = value.progress;
+  if (done) {
+    if (!isCefrLevel(level) || question !== undefined || rawProgress !== undefined) {
       throw new ContractError();
     }
-    return { done: true, level: value.level };
+    return { done: true, level };
   }
+  if (!isRecord(rawProgress)) throw new ContractError();
+  const asked = rawProgress.asked;
+  const maxQuestions = rawProgress.maxQuestions;
   if (
-    value.level !== undefined ||
-    !isRecord(value.progress) ||
-    !isNumber(value.progress.asked) ||
-    !Number.isInteger(value.progress.asked) ||
-    value.progress.asked < 0 ||
-    !isNumber(value.progress.maxQuestions) ||
-    !Number.isInteger(value.progress.maxQuestions) ||
-    value.progress.maxQuestions < 1 ||
-    value.progress.maxQuestions > 100 ||
-    value.progress.asked >= value.progress.maxQuestions
+    level !== undefined ||
+    !isNumber(asked) ||
+    !Number.isInteger(asked) ||
+    asked < 0 ||
+    !isNumber(maxQuestions) ||
+    !Number.isInteger(maxQuestions) ||
+    maxQuestions < 1 ||
+    maxQuestions > 100 ||
+    asked >= maxQuestions
   ) {
     throw new ContractError();
   }
   return {
     done: false,
-    question: parseWith(value.question, isQuestion),
-    progress: {
-      asked: value.progress.asked,
-      maxQuestions: value.progress.maxQuestions,
-    },
+    question: parseWith(question, isQuestion),
+    progress: { asked, maxQuestions },
   };
 }
 
 export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerResult {
+  if (!isRecord(value)) throw new ContractError();
+  const passed = value.passed;
+  const score = value.score;
+  const transcript = value.transcript;
+  const feedback = value.feedback;
+  const done = value.done;
   if (
-    !isRecord(value) ||
-    typeof value.passed !== 'boolean' ||
-    !isScore(value.score) ||
-    !isBoundedString(value.transcript, 12_000) ||
-    !isBoundedNonEmptyString(value.feedback, 800) ||
-    typeof value.done !== 'boolean'
+    typeof passed !== 'boolean' ||
+    !isScore(score) ||
+    !isBoundedString(transcript, 12_000) ||
+    !isBoundedNonEmptyString(feedback, 800) ||
+    typeof done !== 'boolean'
   ) {
     throw new ContractError();
   }
   const result: DiagnosticAnswerResult = {
-    passed: value.passed,
-    score: value.score,
-    transcript: value.transcript,
-    feedback: value.feedback,
-    done: value.done,
+    passed,
+    score,
+    transcript,
+    feedback,
+    done,
   };
-  if (value.done) {
-    if (!isCefrLevel(value.level) || value.nextQuestion !== undefined) {
+  const level = value.level;
+  const nextQuestion = value.nextQuestion;
+  if (done) {
+    if (!isCefrLevel(level) || nextQuestion !== undefined) {
       throw new ContractError();
     }
-    result.level = value.level;
+    result.level = level;
   } else {
-    if (value.level !== undefined || value.nextQuestion === undefined) {
+    if (level !== undefined || nextQuestion === undefined) {
       throw new ContractError();
     }
-    result.nextQuestion = parseWith(value.nextQuestion, isQuestion);
+    result.nextQuestion = parseWith(nextQuestion, isQuestion);
   }
   return result;
 }
@@ -391,77 +402,84 @@ export function parseHelpContent(value: unknown): HelpContent {
 }
 
 export function parseAttemptResult(value: unknown): AttemptResult {
+  if (!isRecord(value)) throw new ContractError();
+  // Snapshot every response field once. JSON responses are plain records, but
+  // callers and tests may still hand this public parser accessor-backed input;
+  // validation and rendering must agree on the same observed values.
+  const passed = value.passed;
+  const mastered = value.mastered;
+  const attemptNo = value.attemptNo;
+  const score = value.score;
+  const transcript = value.transcript;
+  const feedback = value.feedback;
+  const levelUpValue = value.levelUp;
+  const noSpeechValue = value.noSpeech;
+  const attemptsLeft = value.attemptsLeft;
+  const finalFeedback = value.finalFeedback;
+  const next = value.next;
   if (
-    !isRecord(value) ||
-    typeof value.passed !== 'boolean' ||
-    typeof value.mastered !== 'boolean' ||
-    !isNumber(value.attemptNo) ||
-    !Number.isInteger(value.attemptNo) ||
-    value.attemptNo < 1 ||
-    value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
-    !isScore(value.score) ||
-    !isBoundedString(value.transcript, 12_000) ||
-    !isBoundedNonEmptyString(value.feedback, 800)
+    typeof passed !== 'boolean' ||
+    typeof mastered !== 'boolean' ||
+    !isNumber(attemptNo) ||
+    !Number.isInteger(attemptNo) ||
+    attemptNo < 1 ||
+    attemptNo > PRACTICE_MAX_ATTEMPTS ||
+    !isScore(score) ||
+    !isBoundedString(transcript, 12_000) ||
+    !isBoundedNonEmptyString(feedback, 800)
   ) {
     throw new ContractError();
   }
   const result: AttemptResult = {
-    passed: value.passed,
-    mastered: value.mastered,
-    attemptNo: value.attemptNo,
-    score: value.score,
-    transcript: value.transcript,
-    feedback: value.feedback,
+    passed,
+    mastered,
+    attemptNo,
+    score,
+    transcript,
+    feedback,
   };
 
   // These flags are derived by the server, not independent model output.
   // Reject an impossible combination instead of rendering misleading mastery
   // state from a corrupted or incompatible response.
-  if (
-    value.passed !== value.score >= PRACTICE_PASS_SCORE ||
-    value.mastered !== value.score >= PRACTICE_MASTER_SCORE
-  ) {
+  if (passed !== score >= PRACTICE_PASS_SCORE || mastered !== score >= PRACTICE_MASTER_SCORE) {
     throw new ContractError();
   }
 
   // A level promotion can only be earned by the attempt that mastered a word.
-  if (value.levelUp !== undefined && !value.mastered) throw new ContractError();
+  if (levelUpValue !== undefined && !mastered) throw new ContractError();
 
   // Silence is a free retry: nothing was scored and the attempt counter did
   // not advance, so attemptsLeft reflects one more attempt than a real miss.
-  if (value.noSpeech !== undefined) {
+  if (noSpeechValue !== undefined) {
     if (
-      value.noSpeech !== true ||
-      value.passed ||
-      value.mastered ||
-      value.score !== 0 ||
-      value.transcript !== '' ||
-      value.finalFeedback !== undefined ||
-      value.next !== undefined ||
-      value.attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (value.attemptNo - 1)
+      noSpeechValue !== true ||
+      passed ||
+      mastered ||
+      score !== 0 ||
+      transcript !== '' ||
+      finalFeedback !== undefined ||
+      next !== undefined ||
+      attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (attemptNo - 1)
     ) {
       throw new ContractError();
     }
     result.noSpeech = true;
-    result.attemptsLeft = value.attemptsLeft as number;
+    result.attemptsLeft = attemptsLeft as number;
     return result;
   }
 
   // The server turns an empty Whisper transcript into the explicit free-retry
   // variant above. A scored response can therefore never have no transcript.
-  if (!isNonEmptyString(value.transcript)) throw new ContractError();
+  if (!isNonEmptyString(transcript)) throw new ContractError();
 
-  if (value.passed) {
-    if (
-      value.attemptsLeft !== undefined ||
-      value.finalFeedback !== undefined ||
-      value.next === undefined
-    ) {
+  if (passed) {
+    if (attemptsLeft !== undefined || finalFeedback !== undefined || next === undefined) {
       throw new ContractError();
     }
-    result.next = parseWith(value.next, isPracticeQuestionPayload);
-    if (value.levelUp !== undefined) {
-      const levelUp = parseWith(value.levelUp, isLevelUp);
+    result.next = parseWith(next, isPracticeQuestionPayload);
+    if (levelUpValue !== undefined) {
+      const levelUp = parseWith(levelUpValue, isLevelUp);
       // The promotion response already serves the next question and progress
       // from the new level; a mismatch would desync the whole practice UI.
       if (result.next.question.cefrLevel !== levelUp.to) throw new ContractError();
@@ -476,12 +494,12 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   // so retrying it is meaningless and the response arrives in the terminal
   // shape instead. `attemptsLeft: 0` selects that branch below, which still
   // demands the full terminal payload, so a miscounted retry cannot slip past.
-  if (value.attemptNo < PRACTICE_MAX_ATTEMPTS && value.attemptsLeft !== 0) {
-    const expectedAttemptsLeft = PRACTICE_MAX_ATTEMPTS - value.attemptNo;
+  if (attemptsLeft !== 0) {
+    const expectedAttemptsLeft = PRACTICE_MAX_ATTEMPTS - attemptNo;
     if (
-      value.attemptsLeft !== expectedAttemptsLeft ||
-      value.finalFeedback !== undefined ||
-      value.next !== undefined
+      attemptsLeft !== expectedAttemptsLeft ||
+      finalFeedback !== undefined ||
+      next !== undefined
     ) {
       throw new ContractError();
     }
@@ -489,16 +507,12 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     return result;
   }
 
-  if (
-    value.attemptsLeft !== 0 ||
-    !isBoundedNonEmptyString(value.finalFeedback, 4_000) ||
-    value.next === undefined
-  ) {
+  if (attemptsLeft !== 0 || !isBoundedNonEmptyString(finalFeedback, 4_000) || next === undefined) {
     throw new ContractError();
   }
   result.attemptsLeft = 0;
-  result.finalFeedback = value.finalFeedback;
-  result.next = parseWith(value.next, isPracticeQuestionPayload);
+  result.finalFeedback = finalFeedback;
+  result.next = parseWith(next, isPracticeQuestionPayload);
   return result;
 }
 
@@ -537,23 +551,33 @@ function isTimestamp(value: unknown): value is string {
 }
 
 export function parsePracticeStats(value: unknown): PracticeStats {
+  if (!isRecord(value)) throw new ContractError();
+  const level = value.level;
+  const rawProgress = value.progress;
+  if (!isRecord(rawProgress)) throw new ContractError();
+  const masteredCount = rawProgress.masteredCount;
+  const learningCount = rawProgress.learningCount;
+  const totalAtLevel = rawProgress.totalAtLevel;
+  const dueCount = rawProgress.dueCount;
+  const streakDays = value.streakDays;
+  const practicedToday = value.practicedToday;
+  const totalAttempts = value.totalAttempts;
+  const lastPracticedAt = value.lastPracticedAt;
   if (
-    !isRecord(value) ||
-    !(isCefrLevel(value.level) || value.level === null) ||
-    !isRecord(value.progress) ||
-    !isCount(value.progress.masteredCount) ||
-    !isCount(value.progress.learningCount) ||
-    !isCount(value.progress.totalAtLevel) ||
+    !(isCefrLevel(level) || level === null) ||
+    !isCount(masteredCount) ||
+    !isCount(learningCount) ||
+    !isCount(totalAtLevel) ||
     // Stats were born after SRS, so dueCount is required here.
-    !isCount(value.progress.dueCount) ||
-    value.progress.masteredCount + value.progress.learningCount > value.progress.totalAtLevel ||
-    value.progress.dueCount > value.progress.masteredCount + value.progress.learningCount ||
-    !isCount(value.streakDays) ||
-    !isCount(value.practicedToday) ||
-    !isCount(value.totalAttempts) ||
+    !isCount(dueCount) ||
+    masteredCount + learningCount > totalAtLevel ||
+    dueCount > masteredCount + learningCount ||
+    !isCount(streakDays) ||
+    !isCount(practicedToday) ||
+    !isCount(totalAttempts) ||
     // Today's attempts are a subset of all attempts.
-    value.practicedToday > value.totalAttempts ||
-    (value.lastPracticedAt !== null && !isTimestamp(value.lastPracticedAt))
+    practicedToday > totalAttempts ||
+    (lastPracticedAt !== null && !isTimestamp(lastPracticedAt))
   ) {
     throw new ContractError();
   }
@@ -561,30 +585,25 @@ export function parsePracticeStats(value: unknown): PracticeStats {
   // all-zero progress snapshot (there is no level to count words against);
   // exactly that shape may carry a null level. A placed level always has at
   // least one question, so totalAtLevel 0 stays contract drift there.
-  if (value.level === null) {
-    if (
-      value.progress.masteredCount !== 0 ||
-      value.progress.learningCount !== 0 ||
-      value.progress.totalAtLevel !== 0 ||
-      value.progress.dueCount !== 0
-    ) {
-      throw new ContractError();
-    }
-  } else if (value.progress.totalAtLevel < 1) {
+  if (level === null) {
+    // With nonnegative counts plus the consistency bounds above, total zero
+    // necessarily forces mastered, learning, and due to zero as well.
+    if (totalAtLevel !== 0) throw new ContractError();
+  } else if (totalAtLevel < 1) {
     throw new ContractError();
   }
   return {
-    level: value.level,
+    level,
     progress: {
-      masteredCount: value.progress.masteredCount,
-      learningCount: value.progress.learningCount,
-      totalAtLevel: value.progress.totalAtLevel,
-      dueCount: value.progress.dueCount,
+      masteredCount,
+      learningCount,
+      totalAtLevel,
+      dueCount,
     },
-    streakDays: value.streakDays,
-    practicedToday: value.practicedToday,
-    totalAttempts: value.totalAttempts,
-    lastPracticedAt: value.lastPracticedAt,
+    streakDays,
+    practicedToday,
+    totalAttempts,
+    lastPracticedAt,
   };
 }
 
@@ -750,7 +769,10 @@ function safeAudioKey(value: string): boolean {
 }
 
 export function audioKeyBelongsToOwner(audioKey: string, ownerId: string): boolean {
-  return safeAudioKey(audioKey) && audioKey.split('/')[1]?.toLowerCase() === ownerId.toLowerCase();
+  // This helper is exported and sits on a security boundary. Fail closed when
+  // JavaScript callers bypass its TypeScript signature with string-like values.
+  if (typeof audioKey !== 'string' || typeof ownerId !== 'string') return false;
+  return safeAudioKey(audioKey) && audioKey.split('/')[1]!.toLowerCase() === ownerId.toLowerCase();
 }
 
 function parseUploadFields(value: unknown): Record<string, string> | null {
@@ -758,7 +780,10 @@ function parseUploadFields(value: unknown): Record<string, string> | null {
   const entries = Object.entries(value);
   if (entries.length < 2 || entries.length > 32) return null;
   let totalLength = 0;
-  const parsed: Record<string, string> = {};
+  // Never let Object.prototype supply a required signed form field when the
+  // runtime has been polluted. Consumers use normal property reads afterward,
+  // so the normalized record itself must have no prototype.
+  const parsed = Object.create(null) as Record<string, string>;
   for (const [key, fieldValue] of entries) {
     if (
       !/^[A-Za-z0-9_.-]{1,128}$/.test(key) ||
@@ -780,39 +805,48 @@ function parseUploadFields(value: unknown): Record<string, string> | null {
 
 export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
   if (!isRecord(value)) throw new ContractError();
-  if (value.mode === 'direct') return { mode: 'direct' };
-  const uploadFields = parseUploadFields(value.uploadFields);
-  const audioKeyExt = isNonEmptyString(value.contentType)
-    ? AUDIO_CONTENT_TYPE_TO_EXT[value.contentType]
+  const mode = value.mode;
+  if (mode === 'direct') return { mode: 'direct' };
+  const uploadUrl = value.uploadUrl;
+  const rawUploadFields = value.uploadFields;
+  const audioKey = value.audioKey;
+  const contentType = value.contentType;
+  const expiresIn = value.expiresIn;
+  const maxBytes = value.maxBytes;
+  const uploadFields = parseUploadFields(rawUploadFields);
+  const audioKeyExt = isNonEmptyString(contentType)
+    ? AUDIO_CONTENT_TYPE_TO_EXT[contentType]
     : undefined;
   if (
-    value.mode === 's3' &&
-    isNonEmptyString(value.uploadUrl) &&
-    safeUploadUrl(value.uploadUrl) &&
-    isNonEmptyString(value.audioKey) &&
-    safeAudioKey(value.audioKey) &&
+    mode === 's3' &&
+    isNonEmptyString(uploadUrl) &&
+    safeUploadUrl(uploadUrl) &&
+    isNonEmptyString(audioKey) &&
+    safeAudioKey(audioKey) &&
     uploadFields !== null &&
-    uploadFields.key === value.audioKey &&
+    Object.hasOwn(uploadFields, 'key') &&
+    uploadFields.key === audioKey &&
     audioKeyExt !== undefined &&
-    value.audioKey.toLowerCase().endsWith(`.${audioKeyExt}`) &&
-    uploadFields['Content-Type'] === value.contentType &&
-    isNumber(value.expiresIn) &&
-    Number.isInteger(value.expiresIn) &&
-    value.expiresIn >= 60 &&
-    value.expiresIn <= 3600 &&
-    isNumber(value.maxBytes) &&
-    Number.isInteger(value.maxBytes) &&
-    value.maxBytes > 0 &&
-    value.maxBytes <= MAX_AUDIO_BYTES
+    audioKey.toLowerCase().endsWith(`.${audioKeyExt}`) &&
+    Object.hasOwn(uploadFields, 'Content-Type') &&
+    uploadFields['Content-Type'] === contentType &&
+    isNumber(expiresIn) &&
+    Number.isInteger(expiresIn) &&
+    expiresIn >= 60 &&
+    expiresIn <= 3600 &&
+    isNumber(maxBytes) &&
+    Number.isInteger(maxBytes) &&
+    maxBytes > 0 &&
+    maxBytes <= MAX_AUDIO_BYTES
   ) {
     return {
       mode: 's3',
-      uploadUrl: value.uploadUrl,
+      uploadUrl,
       uploadFields,
-      audioKey: value.audioKey,
-      contentType: value.contentType,
-      expiresIn: value.expiresIn,
-      maxBytes: value.maxBytes,
+      audioKey,
+      contentType,
+      expiresIn,
+      maxBytes,
     };
   }
   throw new ContractError();

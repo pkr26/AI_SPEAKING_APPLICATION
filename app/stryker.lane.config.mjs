@@ -57,6 +57,12 @@ export default {
       testMatch: lane.testFiles.map((testFile) => `<rootDir>/${testFile}`),
       testPathIgnorePatterns: ['/node_modules/'],
       testTimeout: 30_000,
+      // Every static mutant runs the complete owning test file. Once one test
+      // has decisively killed a mutant, continuing through hundreds of tests
+      // can only poison shared native/module state and misclassify that kill as
+      // a Stryker timeout. Ordinary Jest keeps its normal non-bailing config;
+      // this applies only inside mutation workers.
+      bail: 1,
     },
     enableFindRelatedTests: true,
   },

@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Alert,
   KeyboardAvoidingView,
@@ -9,7 +9,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { router } from 'expo-router';
+import { router, useNavigation } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 
 import Button from '../../components/Button';
@@ -22,6 +22,7 @@ import {
 } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 type FieldName = 'current' | 'next' | 'confirm';
 
@@ -32,6 +33,7 @@ export default function ChangePasswordScreen() {
   const styles = themedStyles(theme);
   const { colors } = theme;
   const headerHeight = useHeaderHeight();
+  const navigation = useNavigation();
   const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -46,6 +48,21 @@ export default function ChangePasswordScreen() {
   const newPasswordRef = useRef<TextInput>(null);
   const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
+  const mountedRef = useRef(false);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  useHardwareBack(() => busyRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (busyRef.current && event.data.action.type === 'GO_BACK') event.preventDefault();
+    });
+    return unsubscribe;
+  }, [navigation]);
 
   const newPasswordError = newPassword.length > 0 ? passwordPolicyError(newPassword, t) : null;
   // No length guard, unlike newPasswordError above: passwordPolicyError reports
@@ -73,14 +90,22 @@ export default function ChangePasswordScreen() {
     // the button while the real request is still in flight.
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
+    navigation.setOptions({ headerBackVisible: false, gestureEnabled: false });
     setBusy(true);
     setError(null);
     try {
       await changePassword(currentPassword, newPassword);
+      if (!mountedRef.current) return;
       Alert.alert(t('cp.updatedTitle'), t('cp.updatedBody'), [
-        { text: t('common.ok'), onPress: () => router.back() },
+        {
+          text: t('common.ok'),
+          onPress: () => {
+            if (mountedRef.current) router.back();
+          },
+        },
       ]);
     } catch (err) {
+      if (!mountedRef.current) return;
       if (err instanceof ApiError && err.status === 401) {
         setError(t('cp.wrongCurrent'));
       } else {
@@ -88,7 +113,10 @@ export default function ChangePasswordScreen() {
       }
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        navigation.setOptions({ headerBackVisible: true, gestureEnabled: true });
+        setBusy(false);
+      }
     }
   };
 

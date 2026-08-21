@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { router, useNavigation } from 'expo-router';
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { router, useFocusEffect, useNavigation } from 'expo-router';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
@@ -23,7 +23,7 @@ import {
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function PracticeScreen() {
-  const { user, logout } = useAuth();
+  const { user, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -31,7 +31,10 @@ export default function PracticeScreen() {
   const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
-  const [recorderLocked, setRecorderLocked] = useState(false);
+  const [recorderLockState, setRecorderLockState] = useState<{
+    owner: string | null;
+    locked: boolean;
+  }>({ owner: null, locked: false });
   // The Recorder reports a lock during its own commit. Keep a synchronous
   // mirror as well as render state so a second, same-frame tap cannot skip the
   // question, switch modes, or navigate away before React disables the control.
@@ -42,12 +45,40 @@ export default function PracticeScreen() {
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
   const logoutBusyRef = useRef(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const navigationStartedRef = useRef(true);
+  const mountedRef = useRef(true);
+  const focusedRef = useRef(false);
+  const activeRenderOwnerRef = useRef<string | null>(null);
+  const activeRecorderOwnerRef = useRef<string | null>(null);
+  const resultClaimRef = useRef<string | null>(null);
+  const recoveryRefreshRef = useRef<string | null>(null);
   // First-practice-visit one-shot explainer of the mastery rules. The stored
   // flag is keyed by account so a stale read from a previous session's user
   // can never show or hide the card for the wrong learner; while unknown
   // (null) nothing renders, so the card cannot flash for returning learners.
   const [introState, setIntroState] = useState<{ userId: string; seen: boolean } | null>(null);
   const userId = user?.id ?? null;
+  const renderOwner = `${sessionVersion}:${userId ?? 'anonymous'}`;
+  const sessionLease = useMemo(() => {
+    void sessionVersion;
+    void userId;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, userId]);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      focusedRef.current = false;
+      navigationStartedRef.current = true;
+      activeRenderOwnerRef.current = null;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    activeRenderOwnerRef.current = renderOwner;
+  }, [renderOwner]);
   useEffect(() => {
     let active = true;
     if (!userId) return undefined;
@@ -66,9 +97,12 @@ export default function PracticeScreen() {
     void markPracticeIntroSeen(userId);
   };
   const nativeMode = answerMode === 'native';
-
+  const questionQueryKey = useMemo(
+    () => ['practice-question', user?.id, user?.cefrLevel] as const,
+    [user?.cefrLevel, user?.id],
+  );
   const questionQuery = useQuery({
-    queryKey: ['practice-question', user?.id, user?.cefrLevel],
+    queryKey: questionQueryKey,
     queryFn: async ({ signal }) =>
       parsePracticeQuestion(await apiFetch<unknown>('/practice/question', { signal })),
     enabled: !!user,
@@ -79,30 +113,114 @@ export default function PracticeScreen() {
   const question = questionQuery.data?.question;
   const kind = questionQuery.data?.kind;
   const progress = questionQuery.data?.progress;
+  const recorderOwner = question
+    ? `${renderOwner}:${question.id}:${nativeMode ? 'native' : 'english'}`
+    : null;
+  const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
+
+  useLayoutEffect(() => {
+    activeRecorderOwnerRef.current = recorderOwner;
+    resultClaimRef.current = null;
+    recoveryRefreshRef.current = null;
+    recorderLockedRef.current = false;
+  }, [recorderOwner]);
+
+  const renderOwnsWork = useCallback(
+    () =>
+      mountedRef.current &&
+      focusedRef.current &&
+      activeRenderOwnerRef.current === renderOwner &&
+      isSessionLeaseCurrent(sessionLease),
+    [isSessionLeaseCurrent, renderOwner, sessionLease],
+  );
+
+  const recorderOwnsWork = useCallback(
+    (owner: string | null) =>
+      owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
+    [renderOwnsWork],
+  );
+
+  const interactionLocked = recorderLocked || skipBusy || logoutBusy;
+  const interactionLockedNow = useCallback(
+    () => recorderLockedRef.current || skipBusyRef.current || logoutBusyRef.current,
+    [],
+  );
+  const publishNavigationLock = useCallback(() => {
+    if (!mountedRef.current || !focusedRef.current) return;
+    navigation.setOptions(
+      interactionLockedNow()
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  }, [interactionLockedNow, navigation]);
 
   // Practice now sits above Home. Leaving is a normal exit, except while a
   // recording, upload, or recovery is active — popping then would let blur
   // cleanup discard the take. Hardware back, header back, and the iOS swipe
   // gesture all follow the same lock.
-  useHardwareBack(() => recorderLocked);
+  useHardwareBack(interactionLockedNow);
+  useFocusEffect(
+    useCallback(() => {
+      focusedRef.current = true;
+      navigationStartedRef.current = false;
+      publishNavigationLock();
+      return () => {
+        focusedRef.current = false;
+        navigationStartedRef.current = true;
+      };
+    }, [publishNavigationLock]),
+  );
+  const claimNavigation = useCallback(() => {
+    if (navigationStartedRef.current || interactionLockedNow() || !renderOwnsWork()) return false;
+    navigationStartedRef.current = true;
+    return true;
+  }, [interactionLockedNow, renderOwnsWork]);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      // Header back and the native swipe gesture dispatch GO_BACK. Read the
+      // synchronous recorder ref so an event already queued in the lock's
+      // pre-render window cannot discard the take. Route-gate resets and the
+      // recorder's deliberate dismiss flows remain free to remove the screen.
+      if (interactionLockedNow() && event.data.action.type === 'GO_BACK') {
+        event.preventDefault();
+      }
+    });
+    return unsubscribe;
+  }, [interactionLockedNow, navigation]);
   useLayoutEffect(() => {
-    navigation.setOptions(
-      recorderLocked
-        ? { headerBackVisible: false, gestureEnabled: false }
-        : { headerBackVisible: true, gestureEnabled: true },
-    );
-  }, [navigation, recorderLocked]);
+    publishNavigationLock();
+  }, [interactionLocked, publishNavigationLock]);
 
   // A new submission owns the inline space again: clear the old wait line the
   // moment the recorder locks for the next take.
-  const handleLockChange = useCallback((locked: boolean) => {
-    recorderLockedRef.current = locked;
-    setRecorderLocked(locked);
-    if (locked) setRateLimitNotice(null);
-  }, []);
+  const handleLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      recorderLockedRef.current = locked;
+      // Close the pre-render window for native header/gesture exits as well as
+      // the custom controls below. Recorder publishes its lock synchronously,
+      // so the navigator can consume it before React commits disabled props.
+      setRecorderLockState({ owner: recorderOwner, locked });
+      if (locked) setRateLimitNotice(null);
+      publishNavigationLock();
+    },
+    [publishNavigationLock, recorderOwner, recorderOwnsWork],
+  );
 
   const handleResult = (result: PracticeOutcome) => {
-    if (!user || !question) return;
+    const owner = recorderOwner;
+    if (
+      !user ||
+      !question ||
+      !recorderOwnsWork(owner) ||
+      navigationStartedRef.current ||
+      resultClaimRef.current === owner
+    ) {
+      return;
+    }
+    resultClaimRef.current = owner;
+    navigationStartedRef.current = true;
+    void queryClient.cancelQueries({ queryKey: questionQueryKey, exact: true });
     setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, question.id, result);
     showFeedback(question.id, result);
@@ -110,50 +228,118 @@ export default function PracticeScreen() {
   };
 
   const handleError = (message: string) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return;
     Alert.alert(t('diag.assessFailedTitle'), message);
   };
 
+  const handleRateLimited = (message: string) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return;
+    setRateLimitNotice(message);
+  };
+
+  const handleRecoveryUnresolved = () => {
+    const owner = recorderOwner;
+    if (
+      !recorderOwnsWork(owner) ||
+      navigationStartedRef.current ||
+      recoveryRefreshRef.current === owner
+    ) {
+      return;
+    }
+    recoveryRefreshRef.current = owner;
+    const refresh = questionQuery.refetch();
+    void refresh.then(
+      () => {
+        if (recoveryRefreshRef.current === owner) recoveryRefreshRef.current = null;
+      },
+      () => {
+        if (recoveryRefreshRef.current === owner) recoveryRefreshRef.current = null;
+      },
+    );
+  };
+
+  const handleRecoveryEndpointMismatch = (
+    savedEndpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+  ) => {
+    if (!recorderOwnsWork(recorderOwner) || navigationStartedRef.current) return false;
+    if (savedEndpoint === '/practice/attempt/native') {
+      setAnswerMode('native');
+      return true;
+    }
+    if (savedEndpoint === '/practice/attempt') {
+      setAnswerMode('english');
+      return true;
+    }
+    return false;
+  };
+
   const handleSkip = async () => {
-    if (!question || skipBusyRef.current || recorderLockedRef.current) return;
+    const owner = recorderOwner;
+    if (
+      !question ||
+      !recorderOwnsWork(owner) ||
+      navigationStartedRef.current ||
+      skipBusyRef.current ||
+      recorderLockedRef.current ||
+      logoutBusyRef.current
+    ) {
+      return;
+    }
     skipBusyRef.current = true;
     setSkipBusy(true);
+    publishNavigationLock();
     try {
       await apiSkipPracticeWord(question.id);
+      if (!recorderOwnsWork(owner) || navigationStartedRef.current) return;
       setRateLimitNotice(null);
       // refetch() swallows its own failure: without this check the just-parked
       // word would stay on screen with no error shown.
       const refetched = await questionQuery.refetch();
-      if (refetched.isError) {
+      if (refetched.isError && recorderOwnsWork(owner) && !navigationStartedRef.current) {
         Alert.alert(
           t('practice.skipFailedTitle'),
           userMessageForError(refetched.error, t('practice.skipFailed')),
         );
       }
     } catch (error) {
-      Alert.alert(
-        t('practice.skipFailedTitle'),
-        userMessageForError(error, t('practice.skipFailed')),
-      );
+      if (recorderOwnsWork(owner) && !navigationStartedRef.current) {
+        Alert.alert(
+          t('practice.skipFailedTitle'),
+          userMessageForError(error, t('practice.skipFailed')),
+        );
+      }
     } finally {
       skipBusyRef.current = false;
-      setSkipBusy(false);
+      if (mountedRef.current && activeRenderOwnerRef.current === renderOwner) {
+        setSkipBusy(false);
+        publishNavigationLock();
+      }
     }
   };
 
   const handleLogout = async () => {
-    if (recorderLockedRef.current || logoutBusyRef.current) return;
+    if (!claimNavigation()) return;
     logoutBusyRef.current = true;
+    setLogoutBusy(true);
+    publishNavigationLock();
+    let rearm = false;
     try {
       await logout();
-      router.replace('/');
+      if (mountedRef.current && focusedRef.current) router.replace('/');
     } catch (error) {
       if (error instanceof LogoutCleanupError) {
         Alert.alert(t('logout.cleanupTitle'), error.message);
-      } else {
+      } else if (renderOwnsWork()) {
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
+        rearm = true;
       }
     } finally {
       logoutBusyRef.current = false;
+      if (mountedRef.current && activeRenderOwnerRef.current === renderOwner) {
+        setLogoutBusy(false);
+        if (rearm) navigationStartedRef.current = false;
+        publishNavigationLock();
+      }
     }
   };
 
@@ -193,7 +379,7 @@ export default function PracticeScreen() {
             </Text>
             <Button
               title={t('common.tryAgain')}
-              onPress={() => void questionQuery.refetch()}
+              onPress={() => void questionQuery.refetch({ cancelRefetch: false })}
               style={styles.retryButton}
             />
           </View>
@@ -225,17 +411,17 @@ export default function PracticeScreen() {
               accessibilityRole="button"
               accessibilityLabel={t('practice.helpLabel')}
               accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-              accessibilityState={{ disabled: recorderLocked }}
-              disabled={recorderLocked}
+              accessibilityState={{ disabled: interactionLocked }}
+              disabled={interactionLocked}
               hitSlop={4}
               style={({ pressed }) => [
                 styles.helpButton,
-                recorderLocked && styles.controlDisabled,
+                interactionLocked && styles.controlDisabled,
                 pressed && styles.helpButtonPressed,
               ]}
               onPress={() => {
-                if (recorderLockedRef.current) return;
-                router.push({
+                if (!claimNavigation()) return;
+                router.navigate({
                   pathname: '/practice/help',
                   params: { questionId: question.id },
                 });
@@ -296,16 +482,18 @@ export default function PracticeScreen() {
               accessibilityRole="switch"
               accessibilityLabel={t('practice.answerInMyLanguage')}
               accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-              accessibilityState={{ checked: nativeMode, disabled: recorderLocked }}
-              disabled={recorderLocked}
+              accessibilityState={{ checked: nativeMode, disabled: interactionLocked }}
+              disabled={interactionLocked}
               style={({ pressed }) => [
                 styles.modeToggle,
                 nativeMode && styles.modeToggleOn,
-                recorderLocked && styles.modeToggleDisabled,
+                interactionLocked && styles.modeToggleDisabled,
                 pressed && (nativeMode ? styles.modeTogglePressedOn : styles.modeTogglePressed),
               ]}
               onPress={() => {
-                if (!recorderLockedRef.current) setAnswerMode(nativeMode ? 'english' : 'native');
+                if (!interactionLockedNow() && renderOwnsWork()) {
+                  setAnswerMode(nativeMode ? 'english' : 'native');
+                }
               }}
             >
               <Text style={[styles.modeToggleText, nativeMode && styles.modeToggleTextOn]}>
@@ -326,23 +514,15 @@ export default function PracticeScreen() {
                 key={nativeMode ? 'native' : 'english'}
                 ownerId={user.id}
                 questionId={question.id}
+                disabled={skipBusy || logoutBusy}
+                isStartBlocked={() => skipBusyRef.current || logoutBusyRef.current}
                 endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
                 parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
                 onResult={handleResult}
                 onError={handleError}
-                onRateLimited={setRateLimitNotice}
-                onRecoveryUnresolved={() => void questionQuery.refetch()}
-                onRecoveryEndpointMismatch={(savedEndpoint) => {
-                  if (savedEndpoint === '/practice/attempt/native') {
-                    setAnswerMode('native');
-                    return true;
-                  }
-                  if (savedEndpoint === '/practice/attempt') {
-                    setAnswerMode('english');
-                    return true;
-                  }
-                  return false;
-                }}
+                onRateLimited={handleRateLimited}
+                onRecoveryUnresolved={handleRecoveryUnresolved}
+                onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
                 onInteractionLockChange={handleLockChange}
               />
             </View>
@@ -350,10 +530,10 @@ export default function PracticeScreen() {
             <Pressable
               accessibilityRole="button"
               accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-              accessibilityState={{ disabled: recorderLocked || skipBusy, busy: skipBusy }}
-              disabled={recorderLocked || skipBusy}
+              accessibilityState={{ disabled: interactionLocked, busy: skipBusy }}
+              disabled={interactionLocked}
               hitSlop={4}
-              style={[styles.skipButton, (recorderLocked || skipBusy) && styles.controlDisabled]}
+              style={[styles.skipButton, interactionLocked && styles.controlDisabled]}
               onPress={() => void handleSkip()}
             >
               <Text style={styles.skipButtonText}>{t('practice.skipWord')}</Text>
@@ -366,12 +546,12 @@ export default function PracticeScreen() {
         <Pressable
           accessibilityRole="button"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          accessibilityState={{ disabled: recorderLocked }}
-          disabled={recorderLocked}
+          accessibilityState={{ disabled: interactionLocked }}
+          disabled={interactionLocked}
           hitSlop={4}
-          style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
+          style={[styles.footerButton, interactionLocked && styles.controlDisabled]}
           onPress={() => {
-            if (!recorderLockedRef.current) router.push('/settings');
+            if (claimNavigation()) router.navigate('/settings');
           }}
         >
           <Text style={styles.footerButtonText}>{t('practice.settings')}</Text>
@@ -379,10 +559,10 @@ export default function PracticeScreen() {
         <Pressable
           accessibilityRole="button"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          accessibilityState={{ disabled: recorderLocked }}
-          disabled={recorderLocked}
+          accessibilityState={{ disabled: interactionLocked }}
+          disabled={interactionLocked}
           hitSlop={4}
-          style={[styles.footerButton, recorderLocked && styles.controlDisabled]}
+          style={[styles.footerButton, interactionLocked && styles.controlDisabled]}
           onPress={() => void handleLogout()}
         >
           <Text style={styles.footerButtonText}>{t('common.logOut')}</Text>

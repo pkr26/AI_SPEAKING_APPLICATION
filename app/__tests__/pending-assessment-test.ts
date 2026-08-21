@@ -220,6 +220,7 @@ describe('pending assessment edge cases', () => {
     { ...pending, stage: 'bogus' },
     { ...pending, stage: 's3-granted' },
     { ...pending, stage: 's3-granted', audioKey: '' },
+    { ...pending, stage: 's3-granted', audioKey: [audioKey] },
     { ...pending, stage: 's3-granted', audioKey: '../another-user/a.m4a' },
     {
       ...pending,
@@ -294,7 +295,10 @@ describe('pending assessment edge cases', () => {
   });
 
   it('accepts a missing legacy recovery counter and every bounded integer value', () => {
-    expect(parsePendingAssessment(pending)).toEqual(pending);
+    const withoutOptionalFields = parsePendingAssessment(pending);
+    expect(withoutOptionalFields).toEqual(pending);
+    expect(Object.hasOwn(withoutOptionalFields!, 'cancelRequested')).toBe(false);
+    expect(Object.hasOwn(withoutOptionalFields!, 'recoveryPostAttempts')).toBe(false);
     for (const recoveryPostAttempts of [0, 1, 2, 3]) {
       expect(parsePendingAssessment({ ...pending, recoveryPostAttempts })).toEqual({
         ...pending,
@@ -699,6 +703,139 @@ describe('pending assessment edge cases', () => {
     ).rejects.toThrow('Invalid pending assessment metadata');
     expect(secureStore.setItemAsync).not.toHaveBeenCalled();
     expect(await mod.loadPendingAssessment()).toEqual({ ...pending, stage: 'prepared' });
+  });
+
+  it('atomically lets only the first of two concurrent creators install a handoff', async () => {
+    const { secureStore, mod } = loadFresh();
+    const first = { ...pending, stage: 'prepared' as const };
+    const second = {
+      ...first,
+      requestId: '550e8400-e29b-41d4-a716-446655440004',
+    };
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    setItem.mockClear();
+    const generation = mod.capturePendingAssessmentGeneration();
+
+    const creatingFirst = mod.ensurePendingAssessment(first, generation);
+    const creatingSecond = mod.ensurePendingAssessment(second, generation);
+
+    await expect(Promise.all([creatingFirst, creatingSecond])).resolves.toEqual([first, first]);
+    expect(setItem).toHaveBeenCalledTimes(1);
+    expect(await mod.loadPendingAssessment()).toEqual(first);
+  });
+
+  it('does not recreate a handoff when an unconditional clear starts during its deferred read', async () => {
+    const { secureStore, mod } = loadFresh();
+    const read = deferred<string | null>();
+    const getItem = jest.mocked(secureStore.getItemAsync);
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    const deleteItem = jest.mocked(secureStore.deleteItemAsync);
+    getItem.mockImplementationOnce(async () => read.promise);
+    setItem.mockClear();
+    deleteItem.mockClear();
+    const generation = mod.capturePendingAssessmentGeneration();
+    const candidate = { ...pending, stage: 'prepared' as const };
+
+    const creating = mod.ensurePendingAssessment(candidate, generation);
+    await Promise.resolve();
+    const readsBeforeClear = getItem.mock.calls.length;
+    const clearing = mod.clearPendingAssessment();
+    const generationAfterClear = mod.capturePendingAssessmentGeneration();
+
+    read.resolve(null);
+    await expect(creating).resolves.toBeNull();
+    await expect(clearing).resolves.toBeUndefined();
+
+    expect(readsBeforeClear).toBe(1);
+    expect(generationAfterClear).toBe(generation + 1);
+    expect(setItem).not.toHaveBeenCalled();
+    expect(deleteItem).toHaveBeenCalledTimes(1);
+    expect(await mod.loadPendingAssessment()).toBeNull();
+  });
+
+  it('rejects an invalid atomic candidate before touching secure storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    const getItem = jest.mocked(secureStore.getItemAsync);
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    getItem.mockClear();
+    setItem.mockClear();
+
+    await expect(
+      mod.ensurePendingAssessment(
+        { ...pending, requestId: 'not-a-request-id' },
+        mod.capturePendingAssessmentGeneration(),
+      ),
+    ).rejects.toThrow('Invalid pending assessment metadata');
+    expect(getItem).not.toHaveBeenCalled();
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  it('rejects an already stale creator before reading or writing secure storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    const staleGeneration = mod.capturePendingAssessmentGeneration();
+    await mod.clearPendingAssessment();
+    const getItem = jest.mocked(secureStore.getItemAsync);
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    getItem.mockClear();
+    setItem.mockClear();
+
+    await expect(
+      mod.ensurePendingAssessment({ ...pending, stage: 'prepared' }, staleGeneration),
+    ).resolves.toBeNull();
+    expect(getItem).not.toHaveBeenCalled();
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  it('rejects a creator made stale by a failed unconditional clear without reading storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    const staleGeneration = mod.capturePendingAssessmentGeneration();
+    const deleteItem = jest.mocked(secureStore.deleteItemAsync);
+    deleteItem.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(mod.clearPendingAssessment()).rejects.toThrow('keychain unavailable');
+    const getItem = jest.mocked(secureStore.getItemAsync);
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    getItem.mockClear();
+    setItem.mockClear();
+
+    await expect(
+      mod.ensurePendingAssessment({ ...pending, stage: 'prepared' }, staleGeneration),
+    ).resolves.toBeNull();
+    expect(getItem).not.toHaveBeenCalled();
+    expect(setItem).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a creator whose secure write is overtaken by an unconditional clear', async () => {
+    const { secureStore, mod } = loadFresh();
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    const setItem = jest.mocked(secureStore.setItemAsync);
+    setItem.mockImplementationOnce(async (key: string, value: string) => {
+      writeStarted.resolve();
+      await allowWrite.promise;
+      mockStorage.set(key, value);
+    });
+    const generation = mod.capturePendingAssessmentGeneration();
+    const candidate = { ...pending, stage: 'prepared' as const };
+
+    const creating = mod.ensurePendingAssessment(candidate, generation);
+    await writeStarted.promise;
+    const clearing = mod.clearPendingAssessment();
+    allowWrite.resolve();
+
+    await expect(creating).resolves.toBeNull();
+    await expect(clearing).resolves.toBeUndefined();
+    expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+  });
+
+  it('does not invalidate creators when conditionally clearing one request', async () => {
+    const { mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+    const generation = mod.capturePendingAssessmentGeneration();
+
+    await mod.clearPendingAssessment(pending.requestId);
+
+    expect(mod.capturePendingAssessmentGeneration()).toBe(generation);
   });
 
   it('serializes a deferred save before a concurrently requested clear', async () => {

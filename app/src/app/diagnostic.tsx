@@ -1,6 +1,6 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, ScrollView, Text, View } from 'react-native';
-import { router } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../components/Button';
@@ -25,7 +25,8 @@ interface AnswerRecord {
 }
 
 export default function DiagnosticScreen() {
-  const { user, setUser, logout, sessionVersion } = useAuth();
+  const { user, setUser, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } =
+    useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -33,6 +34,10 @@ export default function DiagnosticScreen() {
   const userId = user?.id ?? null;
   const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;
   const activeIdentityRef = useRef<string | null>(identityKey);
+  const sessionLease = useMemo(() => {
+    void identityKey;
+    return captureSessionLease();
+  }, [captureSessionLease, identityKey]);
 
   const [question, setQuestion] = useState<Question | null>(null);
   const [progress, setProgress] = useState<{
@@ -49,17 +54,46 @@ export default function DiagnosticScreen() {
   const [recorderLocked, setRecorderLocked] = useState(false);
   const recorderLockedRef = useRef(false);
   const logoutBusyRef = useRef(false);
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const practiceStartRef = useRef(false);
+  const mountedRef = useRef(true);
+  const focusedRef = useRef(false);
+  const accountActionRef = useRef(true);
+  const activeRecorderOwnerRef = useRef<string | null>(null);
+  const recoveryRefreshRef = useRef<string | null>(null);
   // Mirrors the on-screen answer card for the /next effect below (effects must
   // not depend on `result`, or clearing it would reapply the stale question).
+  // Mutate it at the same time as state: a passive-effect mirror leaves a
+  // commit-sized window where a background refetch or a queued acknowledgement
+  // can still act on the result React has already accepted.
   const resultRef = useRef<DiagnosticAnswerResult | null>(null);
-  useEffect(() => {
-    resultRef.current = result;
-  }, [result]);
 
   // The diagnostic is a root-like screen: Android hardware back would pop it
   // mid-test, and the stale question then costs a 409 mismatch and minutes of
   // recovery lock on re-entry.
   useHardwareBack(() => true);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      focusedRef.current = false;
+      accountActionRef.current = true;
+      activeIdentityRef.current = null;
+      activeRecorderOwnerRef.current = null;
+    };
+  }, []);
+
+  useFocusEffect(
+    useCallback(() => {
+      focusedRef.current = true;
+      accountActionRef.current = false;
+      return () => {
+        focusedRef.current = false;
+        accountActionRef.current = true;
+      };
+    }, []),
+  );
 
   useLayoutEffect(() => {
     // Local diagnostic progress is sensitive account data and is not stored in
@@ -68,10 +102,18 @@ export default function DiagnosticScreen() {
     setStateIdentity(identityKey);
     setQuestion(null);
     setProgress(null);
+    resultRef.current = null;
     setResult(null);
     setLevel(null);
     setIntroStarted(false);
     setAnswers([]);
+    practiceStartRef.current = false;
+    recorderLockedRef.current = false;
+    setRecorderLocked(false);
+    logoutBusyRef.current = false;
+    setLogoutBusy(false);
+    accountActionRef.current = !focusedRef.current;
+    recoveryRefreshRef.current = null;
     return () => {
       if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;
     };
@@ -87,12 +129,16 @@ export default function DiagnosticScreen() {
   useEffect(() => {
     const data = nextQuery.data;
     if (!data || !userId) return;
+    if (activeIdentityRef.current !== identityKey || !isSessionLeaseCurrent(sessionLease)) {
+      return;
+    }
     if (resultRef.current) return;
     // An unacknowledged answer card outranks a background refetch: the stale
     // /next response (pre-answer state) must not skip the learner past the
     // result they have not acknowledged. advance() applies the next question
     // locally when they continue.
     setStateIdentity(identityKey);
+    resultRef.current = null;
     setResult(null);
     if (data.done) {
       setQuestion(null);
@@ -103,16 +149,44 @@ export default function DiagnosticScreen() {
       setQuestion(data.question);
       setProgress(data.progress);
     }
-  }, [identityKey, nextQuery.data, userId]);
+  }, [identityKey, isSessionLeaseCurrent, nextQuery.data, sessionLease, userId]);
 
   const stateIsCurrent = stateIdentity === identityKey;
   const currentQuestion = stateIsCurrent ? question : null;
   const currentProgress = stateIsCurrent ? progress : null;
   const currentResult = stateIsCurrent ? result : null;
   const currentLevel = stateIsCurrent ? level : null;
+  const recorderOwner = currentQuestion ? `${identityKey}:${currentQuestion.id}` : null;
+
+  useLayoutEffect(() => {
+    activeRecorderOwnerRef.current = recorderOwner;
+    recoveryRefreshRef.current = null;
+    recorderLockedRef.current = false;
+    setRecorderLocked(false);
+  }, [recorderOwner]);
+
+  const renderOwnsWork = useCallback(
+    () =>
+      mountedRef.current &&
+      focusedRef.current &&
+      activeIdentityRef.current === identityKey &&
+      isSessionLeaseCurrent(sessionLease),
+    [identityKey, isSessionLeaseCurrent, sessionLease],
+  );
+
+  const recorderOwnsWork = useCallback(
+    (owner: string | null) =>
+      owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
+    [renderOwnsWork],
+  );
 
   const handleResult = (data: DiagnosticAnswerResult) => {
-    if (activeIdentityRef.current !== identityKey) return;
+    if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
+    resultRef.current = data;
+    void queryClient.cancelQueries({
+      queryKey: ['diagnostic-next', sessionVersion, userId],
+      exact: true,
+    });
     setResult(data);
     // Remember the per-answer outcome for the completion reveal. A resumed
     // test only lists the answers given in this session.
@@ -120,39 +194,94 @@ export default function DiagnosticScreen() {
   };
 
   const handleError = (message: string) => {
-    if (activeIdentityRef.current !== identityKey) return;
+    if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
     Alert.alert(t('diag.assessFailedTitle'), message);
   };
 
   const handleRecoveryUnresolved = () => {
-    if (activeIdentityRef.current !== identityKey) return;
-    void nextQuery.refetch();
+    const owner = recorderOwner;
+    if (
+      !recorderOwnsWork(owner) ||
+      resultRef.current !== null ||
+      recoveryRefreshRef.current === owner
+    ) {
+      return;
+    }
+    recoveryRefreshRef.current = owner;
+    const refresh = nextQuery.refetch();
+    void refresh.then(
+      () => {
+        if (recoveryRefreshRef.current === owner) recoveryRefreshRef.current = null;
+      },
+      () => {
+        if (recoveryRefreshRef.current === owner) recoveryRefreshRef.current = null;
+      },
+    );
   };
 
-  const handleRecorderLockChange = useCallback((locked: boolean) => {
-    recorderLockedRef.current = locked;
-    setRecorderLocked(locked);
-  }, []);
+  const handleRecorderLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      if (locked && resultRef.current !== null) return;
+      recorderLockedRef.current = locked;
+      setRecorderLocked(locked);
+    },
+    [recorderOwner, recorderOwnsWork],
+  );
+
+  const handleSettings = () => {
+    if (
+      !renderOwnsWork() ||
+      recorderLockedRef.current ||
+      logoutBusyRef.current ||
+      accountActionRef.current
+    ) {
+      return;
+    }
+    accountActionRef.current = true;
+    router.navigate('/settings');
+  };
 
   const handleLogout = async () => {
-    if (recorderLockedRef.current || logoutBusyRef.current) return;
+    if (
+      !renderOwnsWork() ||
+      recorderLockedRef.current ||
+      logoutBusyRef.current ||
+      accountActionRef.current
+    ) {
+      return;
+    }
+    accountActionRef.current = true;
     logoutBusyRef.current = true;
+    setLogoutBusy(true);
+    let rearm = false;
     try {
       await logout();
-      router.replace('/');
+      if (mountedRef.current && focusedRef.current) router.replace('/');
     } catch (error) {
       if (error instanceof LogoutCleanupError) {
         Alert.alert(t('logout.cleanupTitle'), error.message);
-      } else {
+      } else if (renderOwnsWork()) {
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
+        rearm = true;
       }
     } finally {
       logoutBusyRef.current = false;
+      if (mountedRef.current && activeIdentityRef.current === identityKey) {
+        setLogoutBusy(false);
+        if (rearm) accountActionRef.current = false;
+      }
     }
   };
 
   const advance = () => {
-    if (activeIdentityRef.current !== identityKey || !currentResult) return;
+    if (!renderOwnsWork() || !currentResult || resultRef.current !== currentResult) {
+      return;
+    }
+    // Claim this exact card synchronously. A second tap delivered against the
+    // old committed handler, or an even older handler replayed after a refetch,
+    // is now a no-op rather than rewinding diagnostic state.
+    resultRef.current = null;
     if (currentResult.done) {
       const determinedLevel = currentResult.level ?? null;
       setLevel(determinedLevel);
@@ -165,7 +294,10 @@ export default function DiagnosticScreen() {
   };
 
   const startPracticing = () => {
-    if (activeIdentityRef.current !== identityKey || !user || !currentLevel) return;
+    if (practiceStartRef.current || !renderOwnsWork() || !user || !currentLevel) {
+      return;
+    }
+    practiceStartRef.current = true;
     // Keep the diagnostic route protected until the completion screen has
     // actually been acknowledged; changing this earlier removes the screen.
     // A cross-device diagnostic restart can leave a cached pre-placement
@@ -206,7 +338,7 @@ export default function DiagnosticScreen() {
           <Button
             title={t('common.tryAgain')}
             fullWidth
-            onPress={() => void nextQuery.refetch()}
+            onPress={() => void nextQuery.refetch({ cancelRefetch: false })}
             style={styles.primaryAction}
           />
         </View>
@@ -268,6 +400,7 @@ export default function DiagnosticScreen() {
   // The intro shows once per fresh test, before the first question. A resumed
   // test (asked > 0) goes straight to its question.
   const showIntro = !introStarted && !currentResult && (currentProgress?.asked ?? 0) === 0;
+  const accountActionsLocked = recorderLocked || logoutBusy;
 
   // ----- Question view -----
   return (
@@ -281,17 +414,15 @@ export default function DiagnosticScreen() {
           variant="secondary"
           size="sm"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={recorderLocked}
-          onPress={() => {
-            if (!recorderLockedRef.current) router.push('/settings');
-          }}
+          disabled={accountActionsLocked}
+          onPress={handleSettings}
         />
         <Button
           title={t('common.logOut')}
           variant="secondary"
           size="sm"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={recorderLocked}
+          disabled={accountActionsLocked}
           onPress={() => void handleLogout()}
         />
       </View>

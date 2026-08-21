@@ -39,14 +39,15 @@ import {
 } from '../lib/api';
 import { translate, useT, type MessageKey } from '../lib/i18n';
 import {
+  capturePendingAssessmentGeneration,
   clearPendingAssessment,
   claimPendingAssessmentRecoveryPost,
+  ensurePendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   refundPendingAssessmentRecoveryPost,
-  savePendingAssessment,
   type AssessmentEndpoint,
   type PendingAssessment,
 } from '../lib/pending-assessment';
@@ -54,11 +55,15 @@ import { createThemedStyles, useTheme } from '../lib/theme';
 import { ContractError } from '../lib/types';
 import Button from './Button';
 
-type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering';
+export type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering';
 
 interface RecorderProps<T> {
   ownerId: string;
   questionId: string;
+  /** Externally disables recorder actions while a sibling mutation is active. */
+  disabled?: boolean;
+  /** Ref-safe guard for a Start/Re-record handler captured before that mutation. */
+  isStartBlocked?: () => boolean;
   /** Assessment endpoint that accepts audio + questionId + retry-stable requestId. */
   endpoint: AssessmentEndpoint;
   parseResult: (data: unknown) => T;
@@ -78,11 +83,28 @@ interface RecorderProps<T> {
   onRecoveryEndpointMismatch?: (endpoint: AssessmentEndpoint) => boolean;
 }
 
+interface RecordingCompletion {
+  status: RecordingStatus;
+  takeGeneration: number;
+}
+
+interface TerminalEventQuarantine {
+  takeGeneration: number;
+  uri: string | null;
+}
+
+interface AssessmentIdentity {
+  ownerId: string;
+  endpoint: AssessmentEndpoint;
+  questionId: string;
+}
+
 let activeRecoveryOwner: symbol | null = null;
 let activeAudioSessionOwner: symbol | null = null;
 let activeAudioSessionReleasePromise: Promise<void> | null = null;
 let resolveActiveAudioSessionRelease: (() => void) | null = null;
 const liveRecorderUris = new Set<string>();
+let recordingCacheJanitorHasRun = false;
 let audioModeQueue: Promise<void> = Promise.resolve();
 
 const MAX_RECORDING_SECONDS = 120;
@@ -91,6 +113,7 @@ const RECOVERY_LEASE_MS = 5 * 60_000;
 const RECOVERY_RECORD_TTL_MS = 25 * 60 * 60_000;
 const RECOVERY_REQUEST_TIMEOUT_MS = 5_000;
 const MAX_CAPACITY_RETRIES = 3;
+const CAPACITY_RETRY_ATTEMPTS = [0, 1, 2, 3] as const;
 const CAPACITY_RETRY_MAX_DELAY_MS = 30_000;
 const RECOVERY_POLL_MS = 2_000;
 const NOT_FOUND_CONFIRMATIONS = 3;
@@ -103,8 +126,9 @@ const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
 const PERMISSION_PROMPT_RESUME_MS = 2_000;
 /** Briefly await the native completion event that carries stop failures. */
 const RECORDING_EVENT_WAIT_MS = 500;
+const MAX_TERMINAL_EVENT_QUARANTINES = 4;
 
-function monotonicNow(): number {
+export function monotonicNow(): number {
   return typeof performance === 'undefined' ? Date.now() : performance.now();
 }
 
@@ -178,8 +202,8 @@ const SPEECH_RECORDING_OPTIONS = {
   },
 };
 
-function formatElapsed(durationMillis: number): string {
-  const safeDuration = Number.isFinite(durationMillis) && durationMillis > 0 ? durationMillis : 0;
+export function formatElapsed(durationMillis: number): string {
+  const safeDuration = Number.isFinite(durationMillis) ? Math.max(0, durationMillis) : 0;
   const totalSeconds = Math.floor(safeDuration / 1000);
   const minutes = Math.floor(totalSeconds / 60);
   const seconds = totalSeconds % 60;
@@ -187,13 +211,405 @@ function formatElapsed(durationMillis: number): string {
 }
 
 /** Maps a recorder metering reading (dBFS, ≤ 0) onto filled meter segments. */
-function activeMeterSegments(metering: number | undefined): number {
-  if (typeof metering !== 'number' || !Number.isFinite(metering)) return 0;
-  const level = Math.min(1, Math.max(0, (metering + METER_RANGE_DB) / METER_RANGE_DB));
+export function activeMeterSegments(metering: number | undefined): number {
+  if (!Number.isFinite(metering)) return 0;
+  const finiteMetering = metering as number;
+  const level = Math.min(1, Math.max(0, (finiteMetering + METER_RANGE_DB) / METER_RANGE_DB));
   return Math.round(level * METER_SEGMENT_COUNT);
 }
 
-function recorderStateChanged(previous: RecorderState, next: RecorderState): boolean {
+export function assessmentIdentityMatches(
+  current: AssessmentIdentity,
+  ownerId: string,
+  endpoint: AssessmentEndpoint,
+  questionId: string,
+): boolean {
+  return (
+    current.ownerId === ownerId &&
+    current.endpoint === endpoint &&
+    current.questionId === questionId
+  );
+}
+
+export function recorderContextIsActive(
+  mounted: boolean,
+  focused: boolean,
+  appState: string | null,
+): boolean {
+  return mounted && focused && appState === 'active';
+}
+
+export function terminalEventQuarantineIndex(
+  quarantines: readonly TerminalEventQuarantine[],
+  eventUri: string | null,
+  recorderStillRecording: boolean,
+  takeGeneration: number,
+): number {
+  if (eventUri !== null) {
+    return quarantines.findIndex(
+      (entry) =>
+        entry.uri === eventUri ||
+        (recorderStillRecording && entry.uri === null && entry.takeGeneration < takeGeneration),
+    );
+  }
+  if (!recorderStillRecording) return -1;
+  return quarantines.findIndex((entry) => entry.takeGeneration < takeGeneration);
+}
+
+export function rememberTerminalEventQuarantine(
+  quarantines: TerminalEventQuarantine[],
+  quarantine: TerminalEventQuarantine,
+): void {
+  if (quarantines.some((entry) => entry.takeGeneration === quarantine.takeGeneration)) return;
+  quarantines.push(quarantine);
+  if (quarantines.length > MAX_TERMINAL_EVENT_QUARANTINES) quarantines.shift();
+}
+
+export function canBeginRecorderOperation(
+  supersede: boolean,
+  hasOwner: boolean,
+  inFlightCount: number,
+): boolean {
+  return supersede || (!hasOwner && inFlightCount === 0);
+}
+
+export function canResumeRecorderOperation(
+  hasOwner: boolean,
+  tokenIsInFlight: boolean,
+  inFlightCount: number,
+): boolean {
+  return !hasOwner && tokenIsInFlight && inFlightCount === 1;
+}
+
+export function shouldRunDeferredRecovery(
+  inFlightCount: number,
+  mounted: boolean,
+  unmounting: boolean,
+  focused: boolean,
+  appState: string | null,
+  phase: Phase,
+): boolean {
+  return (
+    inFlightCount === 0 &&
+    !unmounting &&
+    recorderContextIsActive(mounted, focused, appState) &&
+    (phase === 'idle' || phase === 'recovering')
+  );
+}
+
+function recoveryPhaseIsEligible(phase: Phase): boolean {
+  return phase === 'idle' || phase === 'recovering';
+}
+
+export function canStartRecoveryAttempt(
+  hasAttempt: boolean,
+  recovering: boolean,
+  hasUpload: boolean,
+  contextIsActive: boolean,
+  identityIsCurrent: boolean,
+  phase: Phase,
+): boolean {
+  return (
+    !hasAttempt &&
+    !recovering &&
+    !hasUpload &&
+    contextIsActive &&
+    identityIsCurrent &&
+    recoveryPhaseIsEligible(phase)
+  );
+}
+
+export function canContinueRecoveryLoad(
+  hasPending: boolean,
+  operationIsCurrent: boolean,
+  hasUpload: boolean,
+  contextIsActive: boolean,
+  identityIsCurrent: boolean,
+  phase: Phase,
+  anotherOwner: boolean,
+): boolean {
+  return (
+    hasPending &&
+    operationIsCurrent &&
+    !hasUpload &&
+    contextIsActive &&
+    identityIsCurrent &&
+    recoveryPhaseIsEligible(phase) &&
+    !anotherOwner
+  );
+}
+
+export function canReleaseMissingRecovery(
+  phase: Phase,
+  operationIsCurrent: boolean,
+  hasUpload: boolean,
+  contextIsActive: boolean,
+  identityIsCurrent: boolean,
+  anotherOwner: boolean,
+): boolean {
+  return (
+    phase === 'recovering' &&
+    operationIsCurrent &&
+    !hasUpload &&
+    contextIsActive &&
+    identityIsCurrent &&
+    !anotherOwner
+  );
+}
+
+export function recoveryAttemptIsCurrent(
+  generationMatches: boolean,
+  recovering: boolean,
+  ownsLease: boolean,
+  operationIsCurrent: boolean,
+  signalAborted: boolean,
+  identityIsCurrent: boolean,
+  contextIsActive: boolean,
+): boolean {
+  return (
+    generationMatches &&
+    recovering &&
+    ownsLease &&
+    operationIsCurrent &&
+    !signalAborted &&
+    identityIsCurrent &&
+    contextIsActive
+  );
+}
+
+export function pendingAssessmentCanUpload(
+  pending: PendingAssessment,
+  ownerId: string,
+  endpoint: AssessmentEndpoint,
+  questionId: string,
+  requestId: string,
+): boolean {
+  return (
+    pending.requestId === requestId &&
+    assessmentIdentityMatches(pending, ownerId, endpoint, questionId) &&
+    pending.stage === 'prepared' &&
+    pending.cancelRequested !== true &&
+    (pending.recoveryPostAttempts ?? 0) === 0
+  );
+}
+
+export function shouldRetryCapacityFailure(
+  error: unknown,
+  signalAborted: boolean,
+  retries: number,
+): error is ApiError {
+  return (
+    !signalAborted &&
+    error instanceof ApiError &&
+    error.status === 503 &&
+    error.code === 'CAPACITY_BUSY' &&
+    retries < MAX_CAPACITY_RETRIES
+  );
+}
+
+export function previewStatusReachedEnd(status: {
+  didJustFinish: boolean;
+  playing: boolean;
+  duration: number;
+  currentTime: number;
+}): boolean {
+  return (
+    status.didJustFinish ||
+    (!status.playing && status.duration > 0 && status.currentTime >= status.duration - 0.05)
+  );
+}
+
+export function autoStopTapIsWithinGrace(elapsedMillis: number): boolean {
+  return elapsedMillis >= 0 && elapsedMillis < AUTO_STOP_TAP_GRACE_MS;
+}
+
+export function nativeStopFailed(
+  completion: Pick<RecordingStatus, 'hasError' | 'mediaServicesDidReset'> | null,
+  platform: string,
+  stopResult: unknown,
+): boolean {
+  const androidResult =
+    stopResult && typeof stopResult === 'object' ? (stopResult as { url?: unknown }) : null;
+  return (
+    completion?.hasError === true ||
+    completion?.mediaServicesDidReset === true ||
+    (platform === 'android' && androidResult !== null && typeof androidResult.url !== 'string')
+  );
+}
+
+export function completedTakeIsValid(
+  stopFailed: boolean,
+  uri: string | null,
+  durationMillis: number,
+  fileIsUsable: boolean,
+): boolean {
+  return !stopFailed && uri !== null && durationMillis >= 500 && fileIsUsable;
+}
+
+export function rejectedStopTakeCanBeAdopted(
+  uri: string | null,
+  completionHasError: boolean,
+  mediaServicesDidReset: boolean,
+  recorderIsRecording: boolean,
+  fileIsUsable: boolean,
+  durationMillis: number,
+  lifecycleIsCurrent: boolean,
+): boolean {
+  return (
+    uri !== null &&
+    !completionHasError &&
+    !mediaServicesDidReset &&
+    !recorderIsRecording &&
+    fileIsUsable &&
+    durationMillis >= 500 &&
+    lifecycleIsCurrent
+  );
+}
+
+export function recoveryDurationForRecordAge(ageMillis: number): number {
+  return ageMillis > RECOVERY_RECORD_TTL_MS ? 0 : RECOVERY_LEASE_MS;
+}
+
+export function recoveryAbsenceIsConfirmed(confirmations: number, elapsedMillis: number): boolean {
+  return confirmations >= NOT_FOUND_CONFIRMATIONS && elapsedMillis >= 10_000;
+}
+
+export function canAttemptS3RecoveryPost(
+  absenceConfirmed: boolean,
+  now: number,
+  nextAttemptAt: number,
+  stage: PendingAssessment['stage'],
+  audioKey: string | undefined,
+): boolean {
+  return (
+    absenceConfirmed &&
+    now >= nextAttemptAt &&
+    stage === 's3-granted' &&
+    typeof audioKey === 'string' &&
+    audioKey.length > 0
+  );
+}
+
+export function recorderControlsAreDisabled(
+  disabled: boolean,
+  busy: boolean,
+  operationActive: boolean,
+): boolean {
+  return disabled || busy || operationActive;
+}
+
+export function recoveryRetryIsVisible(phase: Phase, retryNeeded: boolean): boolean {
+  return phase === 'recovering' && retryNeeded;
+}
+
+export function capacityRetryDelayMillis(retryAfterSeconds: unknown): number {
+  const seconds = Number.isFinite(retryAfterSeconds) ? (retryAfterSeconds as number) : 5;
+  return Math.min(CAPACITY_RETRY_MAX_DELAY_MS, Math.max(1_000, Math.round(seconds * 1_000)));
+}
+
+export function recoveryRetryDelayMillis(error: unknown): number | null {
+  if (
+    !(error instanceof ApiError) ||
+    (error.status !== 429 && error.status !== 503) ||
+    !Number.isFinite(error.retryAfterSeconds)
+  ) {
+    return null;
+  }
+  return Math.min(
+    RECOVERY_LEASE_MS,
+    Math.max(RECOVERY_POLL_MS, Math.ceil((error.retryAfterSeconds as number) * 1_000)),
+  );
+}
+
+export function automaticRecoveryPostIsAllowed(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 0 || error.status === 408);
+}
+
+export function shouldRunRecordingCacheJanitor(
+  platform: string,
+  hasRun: boolean,
+  audioSessionOwned: boolean,
+): boolean {
+  return platform !== 'web' && !hasRun && !audioSessionOwned;
+}
+
+export function recordingCacheEntryShouldBeDeleted(
+  isFile: boolean,
+  isLive: boolean,
+  name: string,
+): boolean {
+  return isFile && !isLive && name.startsWith('recording-');
+}
+
+export function audioSessionCanBeAcquired(activeOwner: symbol | null, instanceId: symbol): boolean {
+  return activeOwner === null || activeOwner === instanceId;
+}
+
+export function audioSessionIsOwnedBy(activeOwner: symbol | null, instanceId: symbol): boolean {
+  return activeOwner === instanceId;
+}
+
+export function recordingStatusIsTerminal(
+  status: Pick<RecordingStatus, 'isFinished' | 'hasError' | 'mediaServicesDidReset'>,
+): boolean {
+  return (
+    status.isFinished === true || status.hasError === true || status.mediaServicesDidReset === true
+  );
+}
+
+export function shouldPublishRecordingStatus(
+  suppressed: boolean,
+  mounted: boolean,
+  unmounting: boolean,
+): boolean {
+  return !suppressed && mounted && !unmounting;
+}
+
+export function shouldMarkRecordingObserved(phase: Phase, isRecording: boolean): boolean {
+  return phase === 'recording' && isRecording;
+}
+
+export function recordingCompletionCanBeAdopted(
+  phase: Phase,
+  operationInFlight: boolean,
+  mediaServicesDidReset: boolean,
+  recorderIsRecording: boolean,
+  completionFinished: boolean,
+  recordingWasObserved: boolean,
+  recorderCanRecord: boolean,
+): boolean {
+  return (
+    phase === 'recording' &&
+    !operationInFlight &&
+    !mediaServicesDidReset &&
+    !recorderIsRecording &&
+    (completionFinished || (recordingWasObserved && !recorderCanRecord))
+  );
+}
+
+export function recordingTerminalFailureShouldInterrupt(
+  phase: Phase,
+  operationInFlight: boolean,
+  completion: Pick<RecordingStatus, 'hasError' | 'mediaServicesDidReset'> | null,
+): boolean {
+  return (
+    phase === 'recording' &&
+    !operationInFlight &&
+    completion !== null &&
+    (completion.hasError === true || completion.mediaServicesDidReset === true)
+  );
+}
+
+export function recorderOperationIsCurrent(
+  operationIsCurrent: boolean,
+  lifecycleMatches: boolean,
+  identityMatches: boolean,
+  contextIsActive: boolean,
+): boolean {
+  return operationIsCurrent && lifecycleMatches && identityMatches && contextIsActive;
+}
+
+export function recorderStateChanged(previous: RecorderState, next: RecorderState): boolean {
   return (
     previous.canRecord !== next.canRecord ||
     previous.isRecording !== next.isRecording ||
@@ -230,23 +646,22 @@ function useScopedAudioRecorderState(
 }
 
 async function restoreAudioMode(): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      await serializeAudioMode(() =>
-        setAudioModeAsync({
-          allowsRecording: false,
-          allowsBackgroundRecording: false,
-          playsInSilentMode: true,
-          shouldPlayInBackground: false,
-        }),
-      );
-      return;
-    } catch (error) {
-      lastError = error;
-    }
+  const restore = () =>
+    serializeAudioMode(() =>
+      setAudioModeAsync({
+        allowsRecording: false,
+        allowsBackgroundRecording: false,
+        playsInSilentMode: true,
+        shouldPlayInBackground: false,
+      }),
+    );
+  try {
+    await restore();
+    return;
+  } catch {
+    // Retry once; the second failure propagates to the owning cleanup path.
   }
-  throw lastError;
+  await restore();
 }
 
 /**
@@ -259,7 +674,7 @@ async function restoreAudioMode(): Promise<void> {
  * The timer declaration is hoisted above the listener for the same reason as
  * in sleepAbortable: clearTimeout must never read it in its dead zone.
  */
-function waitForForeground(timeoutMs: number): Promise<void> {
+export function waitForForeground(timeoutMs: number): Promise<void> {
   if (AppState.currentState === 'active') return Promise.resolve();
   return new Promise((resolve) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -276,8 +691,61 @@ function waitForForeground(timeoutMs: number): Promise<void> {
   });
 }
 
-function deleteRecording(uri: string | null): void {
+export function preparedRecorderNeedsWebStart(platform: string, isRecording: boolean): boolean {
+  return platform === 'web' && !isRecording;
+}
+
+export function recordingCompletionNeedsWait(platform: string): boolean {
+  return platform !== 'web';
+}
+
+export function operationCanPublish(mounted: boolean, unmounting: boolean): boolean {
+  return mounted && !unmounting;
+}
+
+export function operationShouldUnlock(
+  mounted: boolean,
+  unmounting: boolean,
+  stillActive: boolean,
+  phase: Phase,
+  locked: boolean,
+): boolean {
+  return mounted && !unmounting && !stillActive && phase === 'idle' && locked;
+}
+
+export function nextRecordingTakeGeneration(current: number): number {
+  return current + 1;
+}
+
+export function recordingStartIsBlocked(
+  externallyBlocked: boolean,
+  recovering: boolean,
+  phase: Phase,
+): boolean {
+  return (
+    externallyBlocked ||
+    recovering ||
+    phase === 'recording' ||
+    phase === 'uploading' ||
+    phase === 'recovering'
+  );
+}
+
+export function previewToggleCanStart(operationInFlight: boolean, phase: Phase): boolean {
+  return !operationInFlight && phase === 'recorded';
+}
+
+export function previewCanPlayAfterRewind(
+  operationInFlight: boolean,
+  phase: Phase,
+  hasPlayer: boolean,
+): boolean {
+  return !operationInFlight && phase === 'recorded' && hasPlayer;
+}
+
+export function deleteRecording(uri: string | null): void {
   if (!uri) return;
+  liveRecorderUris.delete(uri);
   if (uri.startsWith('blob:')) {
     try {
       URL.revokeObjectURL(uri);
@@ -295,7 +763,12 @@ function deleteRecording(uri: string | null): void {
   }
 }
 
-function recordingFileExists(uri: string): boolean {
+function registerLiveRecorderUri(uri: string | null): void {
+  if (!uri) return;
+  liveRecorderUris.add(uri);
+}
+
+export function recordingFileExists(uri: string): boolean {
   // Web blob URIs carry no file metadata; only native URIs can be verified.
   if (!uri.startsWith('file:')) return true;
   try {
@@ -305,29 +778,65 @@ function recordingFileExists(uri: string): boolean {
   }
 }
 
-function completedRecordingIsUsable(uri: string): boolean {
+/**
+ * Expo's recorder properties cross the native bridge and can throw after the
+ * underlying recorder has been released. Cleanup and terminal-status paths
+ * must never let that secondary read skip audio-session restoration.
+ */
+export function readRecorderUri(recorder: Pick<AudioRecorder, 'uri'>): string | null {
+  try {
+    return recorder.uri;
+  } catch {
+    return null;
+  }
+}
+
+/** Fail closed when native state can no longer prove that recording stopped. */
+export function readRecorderIsRecording(recorder: Pick<AudioRecorder, 'isRecording'>): boolean {
+  try {
+    return recorder.isRecording;
+  } catch {
+    return true;
+  }
+}
+
+export function completedRecordingIsUsable(uri: string): boolean {
   if (!uri.startsWith('file:')) return true;
   try {
     const file = new File(uri);
-    return (
-      file.exists && typeof file.size === 'number' && Number.isFinite(file.size) && file.size > 0
-    );
+    const exists = file.exists;
+    const size = file.size;
+    return exists && Number.isFinite(size) && (size as number) > 0;
   } catch {
     return false;
   }
 }
 
 function cleanupOrphanedRecordingCache(): void {
-  if (Platform.OS === 'web') return;
+  if (
+    !shouldRunRecordingCacheJanitor(
+      Platform.OS,
+      recordingCacheJanitorHasRun,
+      activeAudioSessionOwner !== null,
+    )
+  ) {
+    return;
+  }
+  // The first safe mount owns process-start cleanup. Re-running this on later
+  // Recorder mounts creates a deletion race with a URI native preparation has
+  // created but React has not rendered yet.
+  recordingCacheJanitorHasRun = true;
   try {
     for (const directoryName of ['Audio', 'ExpoAudio']) {
       const directory = new Directory(Paths.cache, directoryName);
       if (!directory.exists) continue;
       for (const entry of directory.list()) {
         if (
-          entry instanceof File &&
-          !liveRecorderUris.has(entry.uri) &&
-          entry.name.startsWith('recording-')
+          recordingCacheEntryShouldBeDeleted(
+            entry instanceof File,
+            liveRecorderUris.has(entry.uri),
+            entry.name,
+          )
         ) {
           entry.delete();
         }
@@ -342,6 +851,8 @@ function cleanupOrphanedRecordingCache(): void {
 export default function Recorder<T>({
   ownerId,
   questionId,
+  disabled = false,
+  isStartBlocked,
   endpoint,
   parseResult,
   onResult,
@@ -353,8 +864,13 @@ export default function Recorder<T>({
 }: RecorderProps<T>) {
   const mountedRef = useRef(true);
   const unmountingRef = useRef(false);
-  const recordingCompletionRef = useRef<RecordingStatus | null>(null);
-  const recordingStatusWaitersRef = useRef(new Set<(status: RecordingStatus | null) => void>());
+  const recordingCompletionRef = useRef<RecordingCompletion | null>(null);
+  const recordingStatusWaitersRef = useRef(
+    new Set<(completion: RecordingCompletion | null) => void>(),
+  );
+  const recordingTakeGenerationRef = useRef(0);
+  const terminalEventQuarantineRef = useRef<TerminalEventQuarantine[]>([]);
+  const currentRecorderRef = useRef<AudioRecorder | null>(null);
   const suppressRecordingStatusRef = useRef(false);
   const [recordingStatusVersion, setRecordingStatusVersion] = useState(0);
   const [phase, setPhase] = useState<Phase>('idle');
@@ -362,11 +878,35 @@ export default function Recorder<T>({
   // recorder identity changes, so it must stay referentially stable and read
   // mutable state exclusively through refs.
   const handleRecordingStatus = useCallback((status: RecordingStatus) => {
-    if (status.isFinished || status.hasError || status.mediaServicesDidReset) {
-      recordingCompletionRef.current = status;
-      for (const resolve of recordingStatusWaitersRef.current) resolve(status);
+    if (recordingStatusIsTerminal(status)) {
+      const takeGeneration = recordingTakeGenerationRef.current;
+      let recorderStillRecording = false;
+      try {
+        recorderStillRecording = currentRecorderRef.current?.isRecording === true;
+      } catch {
+        // URI matching below still quarantines ordinary completion events.
+      }
+      const quarantineIndex = terminalEventQuarantineIndex(
+        terminalEventQuarantineRef.current,
+        status.url,
+        recorderStillRecording,
+        takeGeneration,
+      );
+      if (quarantineIndex >= 0) {
+        terminalEventQuarantineRef.current.splice(quarantineIndex, 1);
+        return;
+      }
+      const completion = { status, takeGeneration };
+      recordingCompletionRef.current = completion;
+      for (const resolve of recordingStatusWaitersRef.current) resolve(completion);
       recordingStatusWaitersRef.current.clear();
-      if (!suppressRecordingStatusRef.current && mountedRef.current && !unmountingRef.current) {
+      if (
+        shouldPublishRecordingStatus(
+          suppressRecordingStatusRef.current,
+          mountedRef.current,
+          unmountingRef.current,
+        )
+      ) {
         setRecordingStatusVersion((version) => version + 1);
       }
     }
@@ -398,10 +938,11 @@ export default function Recorder<T>({
   const operationOwnerRef = useRef<symbol | null>(null);
   const operationsInFlightRef = useRef(new Set<symbol>());
   const activeUriRef = useRef<string | null>(null);
+  const ownedTakeUrisRef = useRef(new Set<string>());
   const uploadControllerRef = useRef<AbortController | null>(null);
   const recoveryControllerRef = useRef<AbortController | null>(null);
   const nativeStopPromiseRef = useRef<Promise<unknown> | null>(null);
-  const audioRestorePromiseRef = useRef<Promise<boolean> | null>(null);
+  const audioRestorePromiseRef = useRef<Promise<void> | null>(null);
   const lifecycleStopPromiseRef = useRef<Promise<void> | null>(null);
   const focusedRef = useRef(false);
   const lifecycleEpochRef = useRef(0);
@@ -424,6 +965,9 @@ export default function Recorder<T>({
     response: { granted: boolean; canAskAgain?: boolean };
   } | null>(null);
   const startRecordingRef = useRef<() => Promise<void>>(async () => undefined);
+  const stopRecordingRef = useRef<(reason?: 'user' | 'auto') => Promise<void>>(
+    async () => undefined,
+  );
   // The requestId of a submission the learner cancelled after its assessment
   // POST went out. Recovery honors that cancel once it proves the server
   // committed nothing, instead of resubmitting the answer they stopped.
@@ -434,13 +978,29 @@ export default function Recorder<T>({
   const waitStartedAtRef = useRef<number | null>(null);
   const previewPlayerRef = useRef<AudioPlayer | null>(null);
   const previewListenerRef = useRef<{ remove: () => void } | null>(null);
+  const previewRewindPromiseRef = useRef<Promise<void> | null>(null);
+  const previewPlayRequestedRef = useRef(false);
   const webAutoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveringRef = useRef(false);
+  const recoveryAttemptRef = useRef<symbol | null>(null);
+  const deferredRecoveryRequestedRef = useRef(false);
+  const recoverPendingRef = useRef<() => Promise<void>>(async () => undefined);
   const recoveryGenerationRef = useRef(0);
   const instanceIdRef = useRef(Symbol('recorder-recovery'));
+  const callbacksRef = useRef({
+    disabled,
+    isStartBlocked,
+    onError,
+    onInteractionLockChange,
+    onRateLimited,
+    onRecoveryEndpointMismatch,
+    onRecoveryUnresolved,
+    onResult,
+    parseResult,
+  });
   const acquireAudioSession = useCallback(() => {
     const instanceId = instanceIdRef.current;
-    if (activeAudioSessionOwner !== null && activeAudioSessionOwner !== instanceId) return false;
+    if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) return false;
     if (activeAudioSessionOwner === null) {
       activeAudioSessionOwner = instanceId;
       activeAudioSessionReleasePromise = new Promise((resolve) => {
@@ -449,26 +1009,22 @@ export default function Recorder<T>({
     }
     return true;
   }, []);
-  const restoreOwnedAudioMode = useCallback(async (notify = true): Promise<boolean> => {
+  const restoreOwnedAudioMode = useCallback(async (notify = true): Promise<void> => {
     if (audioRestorePromiseRef.current) return audioRestorePromiseRef.current;
     const instanceId = instanceIdRef.current;
-    if (activeAudioSessionOwner !== instanceId) return true;
+    if (!audioSessionIsOwnedBy(activeAudioSessionOwner, instanceId)) return;
     const promise = (async () => {
       try {
         await restoreAudioMode();
-        return true;
       } catch {
         if (
           notify &&
-          mountedRef.current &&
-          focusedRef.current &&
-          AppState.currentState === 'active'
+          recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState)
         ) {
           callbacksRef.current.onError(translate('recorder.errAudioReset'));
         }
-        return false;
       } finally {
-        if (activeAudioSessionOwner === instanceId) {
+        if (audioSessionIsOwnedBy(activeAudioSessionOwner, instanceId)) {
           activeAudioSessionOwner = null;
           const resolveRelease = resolveActiveAudioSessionRelease;
           resolveActiveAudioSessionRelease = null;
@@ -482,20 +1038,12 @@ export default function Recorder<T>({
     audioRestorePromiseRef.current = promise;
     return promise;
   }, []);
-  const callbacksRef = useRef({
-    onError,
-    onInteractionLockChange,
-    onRateLimited,
-    onRecoveryEndpointMismatch,
-    onRecoveryUnresolved,
-    onResult,
-    parseResult,
-  });
   const identityRef = useRef({ ownerId, endpoint, questionId });
-  const currentRecorderRef = useRef(recorder);
 
   useLayoutEffect(() => {
     callbacksRef.current = {
+      disabled,
+      isStartBlocked,
       onError,
       onInteractionLockChange,
       onRateLimited,
@@ -505,6 +1053,8 @@ export default function Recorder<T>({
       parseResult,
     };
   }, [
+    disabled,
+    isStartBlocked,
     onError,
     onInteractionLockChange,
     onRateLimited,
@@ -523,9 +1073,12 @@ export default function Recorder<T>({
   }, [recorder]);
 
   useLayoutEffect(() => {
-    const uri = recorder.uri;
-    if (uri) liveRecorderUris.add(uri);
-  }, [recorder.uri]);
+    registerLiveRecorderUri(readRecorderUri(recorder));
+    // The cache janitor is process-once and runs in this mount's passive phase.
+    // Later prepare/record/adoption paths register every URI they create, so a
+    // recorder-object replacement has no second janitor consumer to protect.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // null until the first notification, so the screen still learns the initial
   // unlocked state.
@@ -533,7 +1086,7 @@ export default function Recorder<T>({
   const interactionLockCallbackRef = useRef(onInteractionLockChange);
 
   const publishOperation = useCallback(() => {
-    if (!mountedRef.current || unmountingRef.current) return;
+    if (!operationCanPublish(mountedRef.current, unmountingRef.current)) return;
     setOperationActive(true);
     if (lockedRef.current !== true) {
       lockedRef.current = true;
@@ -544,8 +1097,11 @@ export default function Recorder<T>({
   const beginOperation = useCallback(
     (supersede = false, publish = true): symbol | null => {
       if (
-        !supersede &&
-        (operationOwnerRef.current !== null || operationsInFlightRef.current.size > 0)
+        !canBeginRecorderOperation(
+          supersede,
+          operationOwnerRef.current !== null,
+          operationsInFlightRef.current.size,
+        )
       ) {
         return null;
       }
@@ -561,9 +1117,11 @@ export default function Recorder<T>({
   const resumeOperation = useCallback(
     (token: symbol): boolean => {
       if (
-        operationOwnerRef.current !== null ||
-        !operationsInFlightRef.current.has(token) ||
-        operationsInFlightRef.current.size !== 1
+        !canResumeRecorderOperation(
+          operationOwnerRef.current !== null,
+          operationsInFlightRef.current.has(token),
+          operationsInFlightRef.current.size,
+        )
       ) {
         return false;
       }
@@ -583,14 +1141,37 @@ export default function Recorder<T>({
     // effect may never observe operationActive=true. Balance the synchronous
     // begin notification explicitly when the final operation leaves idle.
     if (
-      mountedRef.current &&
-      !unmountingRef.current &&
-      !stillActive &&
-      phaseRef.current === 'idle' &&
-      lockedRef.current === true
+      operationShouldUnlock(
+        mountedRef.current,
+        unmountingRef.current,
+        stillActive,
+        phaseRef.current,
+        lockedRef.current === true,
+      )
     ) {
       lockedRef.current = false;
       callbacksRef.current.onInteractionLockChange?.(false);
+    }
+    if (!stillActive && deferredRecoveryRequestedRef.current) {
+      deferredRecoveryRequestedRef.current = false;
+      // A foreground/focus request can arrive while a lifecycle-invalidated
+      // operation is still unwinding non-abortable SecureStore work. Retry once
+      // after that final token leaves; re-check in the microtask so a same-turn
+      // recording/upload transition wins without creating a recovery loop.
+      void Promise.resolve().then(() => {
+        if (
+          shouldRunDeferredRecovery(
+            operationsInFlightRef.current.size,
+            mountedRef.current,
+            unmountingRef.current,
+            focusedRef.current,
+            AppState.currentState,
+            phaseRef.current,
+          )
+        ) {
+          void recoverPendingRef.current();
+        }
+      });
     }
   }, []);
 
@@ -602,6 +1183,17 @@ export default function Recorder<T>({
   const operationIsInFlight = useCallback(() => operationsInFlightRef.current.size > 0, []);
 
   const readCancelPersistence = useCallback(() => cancelPersistenceRef.current, []);
+
+  const startIsBlocked = useCallback(() => {
+    if (callbacksRef.current.disabled) return true;
+    try {
+      return callbacksRef.current.isStartBlocked?.() === true;
+    } catch {
+      // A sibling mutation guard is a safety boundary; fail closed if its owner
+      // disappears while a stale press handler is being delivered.
+      return true;
+    }
+  }, []);
 
   useLayoutEffect(() => {
     const locked = phase !== 'idle' || operationActive;
@@ -619,10 +1211,7 @@ export default function Recorder<T>({
   }, [onInteractionLockChange, operationActive, phase]);
 
   useEffect(() => {
-    unmountingRef.current = false;
     return () => {
-      unmountingRef.current = true;
-      lockedRef.current = false;
       interactionLockCallbackRef.current?.(false);
     };
   }, []);
@@ -654,6 +1243,8 @@ export default function Recorder<T>({
   );
 
   const releasePreviewPlayer = useCallback(() => {
+    previewRewindPromiseRef.current = null;
+    previewPlayRequestedRef.current = false;
     try {
       previewListenerRef.current?.remove();
     } catch {
@@ -671,17 +1262,28 @@ export default function Recorder<T>({
   }, []);
 
   const clearWebAutoStopTimer = useCallback(() => {
-    if (webAutoStopTimerRef.current !== null) {
-      clearTimeout(webAutoStopTimerRef.current);
-      webAutoStopTimerRef.current = null;
-    }
+    clearTimeout(webAutoStopTimerRef.current ?? undefined);
+    webAutoStopTimerRef.current = null;
   }, []);
 
   const discardRecording = useCallback((candidateUri?: string | null) => {
+    const candidates = new Set(ownedTakeUrisRef.current);
     const activeUri = activeUriRef.current;
-    deleteRecording(activeUri);
-    if (candidateUri !== activeUri) deleteRecording(candidateUri ?? null);
+    if (activeUri) candidates.add(activeUri);
+    if (candidateUri) candidates.add(candidateUri);
+    ownedTakeUrisRef.current.clear();
     activeUriRef.current = null;
+    for (const uri of candidates) deleteRecording(uri);
+  }, []);
+
+  const adoptOwnedRecording = useCallback((uri: string) => {
+    for (const candidateUri of ownedTakeUrisRef.current) {
+      if (candidateUri !== uri) deleteRecording(candidateUri);
+    }
+    ownedTakeUrisRef.current.clear();
+    ownedTakeUrisRef.current.add(uri);
+    registerLiveRecorderUri(uri);
+    activeUriRef.current = uri;
   }, []);
 
   const clearRequestTracking = useCallback(async (requestId: string) => {
@@ -697,6 +1299,8 @@ export default function Recorder<T>({
   const invalidateRecovery = useCallback(() => {
     recoveryGenerationRef.current += 1;
     recoveringRef.current = false;
+    recoveryAttemptRef.current = null;
+    deferredRecoveryRequestedRef.current = false;
     recoveryControllerRef.current?.abort();
     recoveryControllerRef.current = null;
     if (activeRecoveryOwner === instanceIdRef.current) {
@@ -715,40 +1319,77 @@ export default function Recorder<T>({
     return promise;
   }, [recorder]);
 
-  const waitForRecordingCompletion = useCallback(async (): Promise<RecordingStatus | null> => {
-    if (recordingCompletionRef.current) return recordingCompletionRef.current;
-    return new Promise((resolve) => {
-      let settled = false;
-      const finish = (status: RecordingStatus | null) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        recordingStatusWaitersRef.current.delete(finish);
-        resolve(status);
-      };
-      const timer = setTimeout(() => finish(null), RECORDING_EVENT_WAIT_MS);
-      recordingStatusWaitersRef.current.add(finish);
-    });
-  }, []);
+  const waitForRecordingCompletion = useCallback(
+    async (
+      takeGeneration: number,
+      candidateUri: string | null,
+    ): Promise<RecordingStatus | null> => {
+      const existing = recordingCompletionRef.current;
+      if (existing?.takeGeneration === takeGeneration) return existing.status;
+      return new Promise((resolve) => {
+        let settled = false;
+        const finish = (completion: RecordingCompletion | null) => {
+          if (settled || (completion && completion.takeGeneration !== takeGeneration)) return;
+          settled = true;
+          clearTimeout(timer);
+          recordingStatusWaitersRef.current.delete(finish);
+          resolve(completion?.status ?? null);
+        };
+        const timer = setTimeout(() => {
+          rememberTerminalEventQuarantine(terminalEventQuarantineRef.current, {
+            takeGeneration,
+            uri: candidateUri,
+          });
+          finish(null);
+        }, RECORDING_EVENT_WAIT_MS);
+        recordingStatusWaitersRef.current.add(finish);
+      });
+    },
+    [],
+  );
 
-  const disposePreparedRecording = useCallback(async () => {
+  const disposePreparedRecording = useCallback(async (): Promise<readonly string[]> => {
     suppressRecordingStatusRef.current = true;
     clearWebAutoStopTimer();
+    const takeGeneration = recordingTakeGenerationRef.current;
+    const ownedUris = new Set<string>();
+    const rememberUri = (uri: string | null | undefined) => {
+      if (uri) ownedUris.add(uri);
+    };
+    const candidateUri = readRecorderUri(recorder);
+    rememberUri(candidateUri);
     try {
       // Android's stop path resets even when MediaRecorder.stop throws. Web's
       // inactive MediaRecorder must be started first so its stop event releases
-      // getUserMedia tracks. iOS permits a no-op stop while merely prepared.
-      if (Platform.OS === 'web' && !recorder.isRecording) recorder.record();
-      await stopNativeRecording();
-      if (Platform.OS !== 'web') await waitForRecordingCompletion();
-    } catch {
-      // The best available SDK cleanup was attempted; URI deletion and audio
-      // mode restoration still run at the caller.
-      if (Platform.OS !== 'web') await waitForRecordingCompletion();
+      // getUserMedia tracks. Priming can itself throw, but that must never skip
+      // the independent best-effort stop attempt. iOS permits a no-op stop while
+      // merely prepared.
+      if (preparedRecorderNeedsWebStart(Platform.OS, readRecorderIsRecording(recorder))) {
+        try {
+          recorder.record();
+        } catch {
+          // Still attempt stop below: the prepared web stream may own live tracks.
+        }
+      }
+      try {
+        await stopNativeRecording();
+      } catch {
+        // URI deletion and audio-mode restoration still run at the caller.
+      }
+      if (recordingCompletionNeedsWait(Platform.OS)) {
+        const completion = await waitForRecordingCompletion(takeGeneration, candidateUri);
+        rememberUri(completion?.url);
+      }
     } finally {
+      const taggedCompletion = recordingCompletionRef.current;
+      if (taggedCompletion?.takeGeneration === takeGeneration) {
+        rememberUri(taggedCompletion.status.url);
+      }
+      rememberUri(readRecorderUri(recorder));
       recordingCompletionRef.current = null;
       suppressRecordingStatusRef.current = false;
     }
+    return [...ownedUris];
   }, [clearWebAutoStopTimer, recorder, stopNativeRecording, waitForRecordingCompletion]);
 
   const stopForLifecycle = useCallback(() => {
@@ -761,13 +1402,15 @@ export default function Recorder<T>({
       lifecycleEpochRef.current += 1;
       invalidateRecovery();
       clearWebAutoStopTimer();
-      let candidateUri: string | null = null;
+      const takeGeneration = recordingTakeGenerationRef.current;
+      let candidateUri = readRecorderUri(recorder);
       let recorderWasRecording = phaseRef.current === 'recording';
-      try {
-        candidateUri = recorder.uri;
-        recorderWasRecording ||= recorder.isRecording;
-      } catch {
-        // Expo may already have released the shared object; continue with refs.
+      if (!recorderWasRecording) {
+        try {
+          recorderWasRecording = recorder.isRecording;
+        } catch {
+          // A released idle recorder has nothing left that can be stopped.
+        }
       }
       let nativeStop: Promise<unknown> | null = null;
       if (recorderWasRecording) {
@@ -789,20 +1432,20 @@ export default function Recorder<T>({
       if (recorderWasRecording) {
         try {
           await nativeStop;
-          if (Platform.OS !== 'web') await waitForRecordingCompletion();
-          const completedUri = recordingCompletionRef.current?.url;
+          const completion = recordingCompletionNeedsWait(Platform.OS)
+            ? await waitForRecordingCompletion(takeGeneration, candidateUri)
+            : null;
+          const completedUri = completion?.url;
           if (completedUri) {
             candidateUri = completedUri;
           } else {
-            try {
-              candidateUri = recorder.uri ?? candidateUri;
-            } catch {
-              // The captured/event URI remains the best cleanup candidate.
-            }
+            candidateUri = readRecorderUri(recorder) ?? candidateUri;
           }
         } catch {
           // Native cleanup continues below.
-          if (Platform.OS !== 'web') await waitForRecordingCompletion();
+          if (recordingCompletionNeedsWait(Platform.OS)) {
+            await waitForRecordingCompletion(takeGeneration, candidateUri);
+          }
         } finally {
           recordingCompletionRef.current = null;
           suppressRecordingStatusRef.current = false;
@@ -812,7 +1455,6 @@ export default function Recorder<T>({
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
       autoStoppedAtRef.current = null;
-      if (mountedRef.current) setRecordedDurationMillis(0);
       updatePhase('idle');
       await restoreOwnedAudioMode();
     })().finally(() => {
@@ -850,9 +1492,7 @@ export default function Recorder<T>({
   const recoverPending = useCallback(async () => {
     const instanceId = instanceIdRef.current;
     const identityIsCurrent = () =>
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
       currentRecorderRef.current === recorder;
     if (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId) {
       if (phaseRef.current === 'recovering' && mountedRef.current) {
@@ -861,23 +1501,33 @@ export default function Recorder<T>({
       return;
     }
     if (
-      recoveringRef.current ||
-      operationIsInFlight() ||
-      uploadControllerRef.current !== null ||
-      !mountedRef.current ||
-      !focusedRef.current ||
-      AppState.currentState !== 'active' ||
-      !identityIsCurrent() ||
-      (phaseRef.current !== 'idle' && phaseRef.current !== 'recovering')
+      !canStartRecoveryAttempt(
+        recoveryAttemptRef.current !== null,
+        recoveringRef.current,
+        uploadControllerRef.current !== null,
+        recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+        identityIsCurrent(),
+        phaseRef.current,
+      )
     ) {
+      return;
+    }
+    if (operationIsInFlight()) {
+      // Lifecycle invalidation aborts transports immediately, but SecureStore
+      // reads/writes cannot be aborted. Remember this eligible foreground/focus
+      // request and run it once the stale operation's final token leaves.
+      deferredRecoveryRequestedRef.current = true;
       return;
     }
 
     const operationToken = beginOperation(false, false);
     if (!operationToken) return;
-    let operationHandedToRecovery = false;
+    const recoveryAttempt = Symbol('recorder-recovery-attempt');
+    recoveryAttemptRef.current = recoveryAttempt;
+    deferredRecoveryRequestedRef.current = false;
     const finishLoading = () => {
-      if (!operationHandedToRecovery) endOperation(operationToken);
+      if (recoveryAttemptRef.current === recoveryAttempt) recoveryAttemptRef.current = null;
+      endOperation(operationToken);
     };
 
     let pending: PendingAssessment | null;
@@ -885,27 +1535,26 @@ export default function Recorder<T>({
       pending = await loadPendingAssessment();
     } catch {
       if (
-        mountedRef.current &&
-        focusedRef.current &&
-        AppState.currentState === 'active' &&
+        recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState) &&
         identityIsCurrent() &&
-        (phaseRef.current === 'idle' || phaseRef.current === 'recovering')
+        recoveryPhaseIsEligible(phaseRef.current)
       ) {
         failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUnavailable'));
       }
       finishLoading();
       return;
     }
+    const anotherRecoveryOwner = activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId;
     if (
-      !pending ||
-      !operationIsCurrent(operationToken) ||
-      uploadControllerRef.current !== null ||
-      !mountedRef.current ||
-      !focusedRef.current ||
-      AppState.currentState !== 'active' ||
-      !identityIsCurrent() ||
-      (phaseRef.current !== 'idle' && phaseRef.current !== 'recovering') ||
-      (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId)
+      !canContinueRecoveryLoad(
+        pending !== null,
+        operationIsCurrent(operationToken),
+        uploadControllerRef.current !== null,
+        recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+        identityIsCurrent(),
+        phaseRef.current,
+        anotherRecoveryOwner,
+      )
     ) {
       // An ambiguous submission enters 'recovering' before calling this. If
       // the tombstone is already gone there is nothing to reconcile, so
@@ -913,20 +1562,19 @@ export default function Recorder<T>({
       // 'recovering' with no UI escape short of a remount.
       if (
         !pending &&
-        phaseRef.current === 'recovering' &&
-        operationIsCurrent(operationToken) &&
-        uploadControllerRef.current === null &&
-        mountedRef.current &&
-        focusedRef.current &&
-        AppState.currentState === 'active' &&
-        identityIsCurrent() &&
-        (activeRecoveryOwner === null || activeRecoveryOwner === instanceId)
+        canReleaseMissingRecovery(
+          phaseRef.current,
+          operationIsCurrent(operationToken),
+          uploadControllerRef.current !== null,
+          recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+          identityIsCurrent(),
+          anotherRecoveryOwner,
+        )
       ) {
         updatePhase('idle');
         callbacksRef.current.onError(translate('recorder.errNothingToConfirm'));
       }
-      const leaseHeldElsewhere =
-        pending !== null && activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId;
+      const leaseHeldElsewhere = pending !== null && anotherRecoveryOwner;
       finishLoading();
       if (leaseHeldElsewhere) {
         updatePhase('recovering');
@@ -935,23 +1583,69 @@ export default function Recorder<T>({
       return;
     }
 
-    // The answer mode is session-scoped, while the interrupted handoff is
-    // durable. Restore the saved practice endpoint before taking ownership so
-    // the remounted Recorder uses the matching parser and can display the
-    // replay instead of discarding a valid response as a route mismatch.
-    if (
-      pending.ownerId === ownerId &&
-      pending.questionId === questionId &&
-      pending.endpoint !== endpoint &&
-      callbacksRef.current.onRecoveryEndpointMismatch?.(pending.endpoint)
-    ) {
+    // `canContinueRecoveryLoad` proves this, but TypeScript cannot carry a
+    // nullability predicate through the helper's boolean result.
+    if (pending === null) {
       finishLoading();
       return;
     }
 
+    // The answer mode is session-scoped, while the interrupted handoff is
+    // durable. Restore the saved practice endpoint before taking ownership so
+    // the remounted Recorder uses the matching parser and can display the
+    // replay instead of discarding a valid response as a route mismatch.
+    const endpointMismatch =
+      pending.ownerId === ownerId &&
+      pending.questionId === questionId &&
+      pending.endpoint !== endpoint;
+    if (endpointMismatch) {
+      let endpointRestored: boolean;
+      try {
+        endpointRestored =
+          callbacksRef.current.onRecoveryEndpointMismatch?.(pending.endpoint) === true;
+      } catch {
+        const shouldReport =
+          recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState) &&
+          identityIsCurrent() &&
+          recoveryPhaseIsEligible(phaseRef.current);
+        // This callback runs before the live recovery try/finally. Release the
+        // storage-read token explicitly so a screen callback can never wedge all
+        // later Recorder operations or retain an implicit recovery attempt.
+        finishLoading();
+        if (shouldReport) {
+          failRecoveryAwaitingRetry(translate('recorder.errRecoveryMismatch'));
+        }
+        return;
+      }
+      if (endpointRestored) {
+        finishLoading();
+        return;
+      }
+      // The endpoint callback belongs to the screen and is therefore a
+      // re-entrancy boundary: a rejecting callback may still blur, navigate,
+      // replace the native recorder, or otherwise invalidate this load. Recheck
+      // every ownership dimension before this stale continuation can acquire the
+      // global recovery lease or create a transport after lifecycle abort ran.
+      const anotherOwnerAfterCallback =
+        activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId;
+      if (
+        !canContinueRecoveryLoad(
+          true,
+          operationIsCurrent(operationToken),
+          uploadControllerRef.current !== null,
+          recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+          identityIsCurrent(),
+          phaseRef.current,
+          anotherOwnerAfterCallback,
+        )
+      ) {
+        finishLoading();
+        return;
+      }
+    }
+
     activeRecoveryOwner = instanceId;
     recoveringRef.current = true;
-    operationHandedToRecovery = true;
     publishOperation();
     const recoveryController = new AbortController();
     recoveryControllerRef.current = recoveryController;
@@ -960,15 +1654,15 @@ export default function Recorder<T>({
     if (mountedRef.current) setRecoveryRetryNeeded(false);
     const generation = ++recoveryGenerationRef.current;
     const isCurrent = () =>
-      recoveryGenerationRef.current === generation &&
-      recoveringRef.current &&
-      activeRecoveryOwner === instanceId &&
-      operationIsCurrent(operationToken) &&
-      !recoveryController.signal.aborted &&
-      identityIsCurrent() &&
-      mountedRef.current &&
-      focusedRef.current &&
-      AppState.currentState === 'active';
+      recoveryAttemptIsCurrent(
+        recoveryGenerationRef.current === generation,
+        recoveringRef.current,
+        activeRecoveryOwner === instanceId,
+        operationIsCurrent(operationToken),
+        recoveryController.signal.aborted,
+        identityIsCurrent(),
+        recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+      );
     updatePhase('recovering');
     try {
       if (pending.ownerId !== ownerId) {
@@ -1021,7 +1715,7 @@ export default function Recorder<T>({
         if (!isCurrent()) return;
         try {
           if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-            throw new Error('Pending assessment disappeared');
+            throw new Error();
           }
         } catch {
           if (!isCurrent()) return;
@@ -1056,8 +1750,14 @@ export default function Recorder<T>({
       // describes the original handoff, not the current recovery attempt; an
       // The server retains completed replays for 48 hours; this client retires
       // automatic recovery sooner and still performs one final status read.
-      const recoveryDuration =
-        recoveryStartedAt - pending.createdAt > RECOVERY_RECORD_TTL_MS ? 0 : RECOVERY_LEASE_MS;
+      const recoveryDuration = recoveryDurationForRecordAge(recoveryStartedAt - pending.createdAt);
+      // Every ordinary iteration waits at least RECOVERY_POLL_MS; the only
+      // immediate continue is the one bounded fresh-key re-upload. Keep an
+      // independent count outside the loop body so a future control-flow bug
+      // can neither spin synchronously nor flood status requests while a fake
+      // or stalled monotonic clock remains unchanged.
+      let recoveryPollsRemaining =
+        Math.ceil(recoveryDuration / RECOVERY_POLL_MS) + MAX_S3_REUPLOADS + 2;
       let firstStatusRead = true;
       let nextS3ResubmissionAt = 0;
       let s3Reuploads = 0;
@@ -1100,7 +1800,10 @@ export default function Recorder<T>({
           return false;
         }
       };
-      while (firstStatusRead || monotonicNow() - recoveryStartedMonotonic <= recoveryDuration) {
+      while (
+        recoveryPollsRemaining-- > 0 &&
+        (firstStatusRead || monotonicNow() - recoveryStartedMonotonic <= recoveryDuration)
+      ) {
         firstStatusRead = false;
         let nextPollDelayMs = RECOVERY_POLL_MS;
         try {
@@ -1136,7 +1839,7 @@ export default function Recorder<T>({
             if (!routeMatches) {
               try {
                 if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-                  throw new Error('Pending assessment disappeared');
+                  throw new Error();
                 }
               } catch {
                 if (isCurrent()) {
@@ -1159,7 +1862,7 @@ export default function Recorder<T>({
             } catch {
               try {
                 if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-                  throw new Error('Pending assessment disappeared');
+                  throw new Error();
                 }
               } catch {
                 if (isCurrent()) {
@@ -1179,7 +1882,7 @@ export default function Recorder<T>({
             if (!isCurrent()) return;
             try {
               if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-                throw new Error('Pending assessment disappeared');
+                throw new Error();
               }
             } catch {
               if (isCurrent()) {
@@ -1210,9 +1913,10 @@ export default function Recorder<T>({
               await finishUnresolved(translate('recorder.errAlreadyAnswered'), true);
               return;
             }
-            const absenceConfirmed =
-              notFoundCount >= NOT_FOUND_CONFIRMATIONS &&
-              monotonicNow() - recoveryStartedMonotonic >= 10_000;
+            const absenceConfirmed = recoveryAbsenceIsConfirmed(
+              notFoundCount,
+              monotonicNow() - recoveryStartedMonotonic,
+            );
             // This handoff only entered recovery because the learner cancelled
             // after the assessment POST went out, when it might still have
             // committed. Confirmed absence proves it did not, so honor the
@@ -1232,10 +1936,13 @@ export default function Recorder<T>({
             // get a small, bounded exponential retry budget; every retry keeps
             // the same request UUID and object key.
             if (
-              absenceConfirmed &&
-              monotonicNow() >= nextS3ResubmissionAt &&
-              pending.stage === 's3-granted' &&
-              currentAudioKey
+              canAttemptS3RecoveryPost(
+                absenceConfirmed,
+                monotonicNow(),
+                nextS3ResubmissionAt,
+                pending.stage,
+                currentAudioKey,
+              )
             ) {
               let recoveryPostClaimed: boolean;
               try {
@@ -1248,7 +1955,7 @@ export default function Recorder<T>({
               }
               if (!isCurrent()) {
                 if (recoveryPostClaimed) {
-                  await refundPendingAssessmentRecoveryPost(pending.requestId).catch(() => false);
+                  await refundPendingAssessmentRecoveryPost(pending.requestId).catch(() => {});
                 }
                 return;
               }
@@ -1285,7 +1992,7 @@ export default function Recorder<T>({
                 }
                 try {
                   if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
-                    throw new Error('Pending assessment disappeared');
+                    throw new Error();
                   }
                 } catch {
                   if (isCurrent()) {
@@ -1301,7 +2008,7 @@ export default function Recorder<T>({
                 return;
               } catch (retryError) {
                 if (!recoveryPostStarted) {
-                  await refundPendingAssessmentRecoveryPost(pending.requestId).catch(() => false);
+                  await refundPendingAssessmentRecoveryPost(pending.requestId).catch(() => {});
                   if (isCurrent()) {
                     await finishUnresolved(
                       userMessageForError(retryError, translate('recorder.errNotSent')),
@@ -1340,7 +2047,7 @@ export default function Recorder<T>({
                   // invokes as `void recoverPending()` — an unhandled rejection
                   // that strands the recorder in `recovering` with no message.
                   if (uri !== null && routeMatches && recordingFileExists(uri)) {
-                    let refunded = false;
+                    let refunded: boolean;
                     try {
                       refunded = await refundPendingAssessmentRecoveryPost(pending.requestId);
                     } catch {
@@ -1406,21 +2113,11 @@ export default function Recorder<T>({
             // The version gate rejects every route before any claim is made,
             // so polling it out is pointless: surface the upgrade message and
             // keep the take instead of burning the lease and deleting it.
-            await finishUnresolved(
-              userMessageForError(error, translate('recorder.errRejected')),
-              true,
-            );
+            await finishUnresolved(translate('error.upgradeRequired'), true);
             return;
-          } else if (
-            error instanceof ApiError &&
-            (error.status === 429 || error.status === 503) &&
-            error.retryAfterSeconds !== undefined &&
-            Number.isFinite(error.retryAfterSeconds)
-          ) {
-            nextPollDelayMs = Math.min(
-              RECOVERY_LEASE_MS,
-              Math.max(RECOVERY_POLL_MS, Math.ceil(error.retryAfterSeconds * 1_000)),
-            );
+          } else {
+            const retryDelay = recoveryRetryDelayMillis(error);
+            if (retryDelay !== null) nextPollDelayMs = retryDelay;
           }
           // Offline, timeout, and transient server errors retain the durable
           // request UUID until the five-minute ownership lease expires.
@@ -1428,19 +2125,16 @@ export default function Recorder<T>({
         try {
           await sleepAbortable(nextPollDelayMs, recoveryController.signal);
         } catch {
-          return;
+          // Abort invalidates isCurrent(); the single guard below owns exit.
         }
         if (!isCurrent()) return;
       }
       await finishUnresolved(translate('recorder.errRecoveryExpired'), false);
     } finally {
-      if (recoveryGenerationRef.current === generation) {
-        recoveringRef.current = false;
-        if (activeRecoveryOwner === instanceId) activeRecoveryOwner = null;
-      }
-      if (recoveryControllerRef.current === recoveryController) {
-        recoveryControllerRef.current = null;
-      }
+      recoveryAttemptRef.current = null;
+      recoveringRef.current = false;
+      if (activeRecoveryOwner === instanceId) activeRecoveryOwner = null;
+      recoveryControllerRef.current = null;
       endOperation(operationToken);
     }
   }, [
@@ -1458,6 +2152,10 @@ export default function Recorder<T>({
     recorder,
     updatePhase,
   ]);
+
+  useLayoutEffect(() => {
+    recoverPendingRef.current = recoverPending;
+  }, [recoverPending]);
 
   useFocusEffect(
     useCallback(() => {
@@ -1491,10 +2189,12 @@ export default function Recorder<T>({
           const deferredPermission = deferredPermissionResponseRef.current;
           if (deferredPermission) {
             deferredPermissionResponseRef.current = null;
-            const identityMatches =
-              deferredPermission.ownerId === identityRef.current.ownerId &&
-              deferredPermission.endpoint === identityRef.current.endpoint &&
-              deferredPermission.questionId === identityRef.current.questionId;
+            const identityMatches = assessmentIdentityMatches(
+              deferredPermission,
+              identityRef.current.ownerId,
+              identityRef.current.endpoint,
+              identityRef.current.questionId,
+            );
             if (identityMatches && mountedRef.current && focusedRef.current) {
               if (deferredPermission.response.granted) {
                 await startRecordingRef.current();
@@ -1591,7 +2291,7 @@ export default function Recorder<T>({
 
   // Light tap on record start and on a take being saved; failures are ignored
   // because haptics are unavailable on some devices and on web.
-  const hapticPhaseRef = useRef<Phase>('idle');
+  const hapticPhaseRef = useRef<Phase>(phase);
   useEffect(() => {
     const previous = hapticPhaseRef.current;
     hapticPhaseRef.current = phase;
@@ -1623,34 +2323,41 @@ export default function Recorder<T>({
       pulse.setValue(1);
       return;
     }
-    const loop = Animated.loop(
-      Animated.sequence([
-        Animated.timing(pulse, {
-          toValue: 1.3,
-          duration: 550,
-          useNativeDriver: true,
-        }),
-        Animated.timing(pulse, {
-          toValue: 1,
-          duration: 550,
-          useNativeDriver: true,
-        }),
-      ]),
-    );
+    const pulseSteps = [
+      { toValue: 1.3, duration: 550, useNativeDriver: true },
+      { toValue: 1, duration: 550, useNativeDriver: true },
+    ];
+    if (
+      pulseSteps.length !== 2 ||
+      pulseSteps.some(
+        (step) =>
+          !Number.isFinite(step.toValue) ||
+          !Number.isFinite(step.duration) ||
+          step.duration <= 0 ||
+          step.useNativeDriver !== true,
+      )
+    ) {
+      pulse.setValue(1);
+      return;
+    }
+    const animations = pulseSteps.map((step) => Animated.timing(pulse, step));
+    if (animations.length === 0) {
+      pulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(Animated.sequence(animations));
     loop.start();
     return () => loop.stop();
   }, [phase, pulse, reduceMotion]);
 
   const adoptCompletedRecording = useCallback(
     (uri: string, durationMillis: number) => {
-      const safeDurationMillis =
-        Number.isFinite(durationMillis) && durationMillis > 0 ? durationMillis : 0;
+      const safeDurationMillis = Number.isFinite(durationMillis) ? durationMillis : 0;
       clearWebAutoStopTimer();
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
       if (safeDurationMillis < 500 || !completedRecordingIsUsable(uri)) {
         discardRecording(uri);
-        if (mountedRef.current) setRecordedDurationMillis(0);
         updatePhase('idle');
         callbacksRef.current.onError(
           translate(safeDurationMillis < 500 ? 'recorder.errTooShort' : 'recorder.errSaveFailed'),
@@ -1658,25 +2365,32 @@ export default function Recorder<T>({
         void restoreOwnedAudioMode();
         return;
       }
-      activeUriRef.current = uri;
+      adoptOwnedRecording(uri);
       autoStoppedAtRef.current = monotonicNow();
       setRecordedDurationMillis(Math.min(MAX_RECORDING_SECONDS * 1000, safeDurationMillis));
       updatePhase('recorded');
       void restoreOwnedAudioMode();
     },
-    [clearWebAutoStopTimer, discardRecording, restoreOwnedAudioMode, updatePhase],
+    [
+      adoptOwnedRecording,
+      clearWebAutoStopTimer,
+      discardRecording,
+      restoreOwnedAudioMode,
+      updatePhase,
+    ],
   );
 
   // Native completion/error/reset is authoritative. The guarded polling
   // fallback remains for SDK implementations that omit the event, but a paused
   // recorder (`canRecord=true`) can never be mistaken for an auto-stop.
   useEffect(() => {
-    const completion = recordingCompletionRef.current;
+    const taggedCompletion = recordingCompletionRef.current;
+    const completion =
+      taggedCompletion?.takeGeneration === recordingTakeGenerationRef.current
+        ? taggedCompletion.status
+        : null;
     if (
-      phaseRef.current === 'recording' &&
-      !operationIsInFlight() &&
-      completion &&
-      (completion.hasError || completion.mediaServicesDidReset)
+      recordingTerminalFailureShouldInterrupt(phaseRef.current, operationIsInFlight(), completion)
     ) {
       recordingCompletionRef.current = null;
       recordingInterruptionHandledRef.current = true;
@@ -1684,23 +2398,27 @@ export default function Recorder<T>({
       void stopForLifecycle();
       return;
     }
-    if (phaseRef.current === 'recording' && recorderState.isRecording) {
+    if (shouldMarkRecordingObserved(phaseRef.current, recorderState.isRecording)) {
       hasObservedRecordingRef.current = true;
       return;
     }
     if (
-      phaseRef.current === 'recording' &&
-      !operationIsInFlight() &&
-      !recorderState.mediaServicesDidReset &&
-      !recorderState.isRecording &&
-      (completion?.isFinished === true ||
-        (hasObservedRecordingRef.current && recorderState.canRecord === false))
+      recordingCompletionCanBeAdopted(
+        phaseRef.current,
+        operationIsInFlight(),
+        recorderState.mediaServicesDidReset,
+        recorderState.isRecording,
+        completion?.isFinished === true,
+        hasObservedRecordingRef.current,
+        recorderState.canRecord,
+      )
     ) {
-      const uri = completion?.url ?? recorder.uri ?? recorderState.url;
+      const uri = completion?.url ?? readRecorderUri(recorder) ?? recorderState.url;
       if (uri) {
-        const wallDuration = recordingStartedAtRef.current
-          ? monotonicNow() - recordingStartedAtRef.current
-          : 0;
+        const recordingStartedAt = recordingStartedAtRef.current;
+        const rawWallDuration =
+          recordingStartedAt !== null ? monotonicNow() - recordingStartedAt : 0;
+        const wallDuration = Number.isFinite(rawWallDuration) ? Math.max(0, rawWallDuration) : 0;
         const nativeDuration = Number.isFinite(recorderState.durationMillis)
           ? Math.max(0, recorderState.durationMillis)
           : 0;
@@ -1711,7 +2429,7 @@ export default function Recorder<T>({
   }, [
     adoptCompletedRecording,
     operationIsInFlight,
-    recorder.uri,
+    recorder,
     recorderState,
     recordingStatusVersion,
     stopForLifecycle,
@@ -1730,12 +2448,7 @@ export default function Recorder<T>({
   }, [recorderState.mediaServicesDidReset, stopForLifecycle]);
 
   const startRecording = async () => {
-    if (
-      recoveringRef.current ||
-      phaseRef.current === 'recording' ||
-      phaseRef.current === 'uploading' ||
-      phaseRef.current === 'recovering'
-    ) {
+    if (recordingStartIsBlocked(startIsBlocked(), recoveringRef.current, phaseRef.current)) {
       return;
     }
     const operationToken = beginOperation();
@@ -1743,19 +2456,30 @@ export default function Recorder<T>({
     let lifecycleEpoch = lifecycleEpochRef.current;
     const startIdentity = { ownerId, endpoint, questionId, recorder };
     const identityIsCurrent = () =>
-      identityRef.current.ownerId === startIdentity.ownerId &&
-      identityRef.current.endpoint === startIdentity.endpoint &&
-      identityRef.current.questionId === startIdentity.questionId &&
-      currentRecorderRef.current === startIdentity.recorder;
+      assessmentIdentityMatches(
+        identityRef.current,
+        startIdentity.ownerId,
+        startIdentity.endpoint,
+        startIdentity.questionId,
+      ) && currentRecorderRef.current === startIdentity.recorder;
     const isCurrentLifecycle = () =>
-      operationIsCurrent(operationToken) &&
-      lifecycleEpoch === lifecycleEpochRef.current &&
-      identityIsCurrent() &&
-      mountedRef.current &&
-      focusedRef.current &&
-      AppState.currentState === 'active';
+      recorderOperationIsCurrent(
+        operationIsCurrent(operationToken),
+        lifecycleEpoch === lifecycleEpochRef.current,
+        identityIsCurrent(),
+        recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState),
+      );
     const previousUri = activeUriRef.current;
+    const deleteOwnedCandidates = (...candidateUris: (string | null | undefined)[]) => {
+      for (const candidateUri of new Set(candidateUris)) {
+        if (candidateUri && candidateUri !== previousUri) {
+          ownedTakeUrisRef.current.delete(candidateUri);
+          deleteRecording(candidateUri);
+        }
+      }
+    };
     let prepared = false;
+    let preparedCandidateUri: string | null = null;
     let recoverAfterStart = false;
     releasePreviewPlayer();
     if (mountedRef.current) setPermissionDenied(false);
@@ -1831,29 +2555,45 @@ export default function Recorder<T>({
       await activeAudioSessionReleasePromise;
       if (!isCurrentLifecycle()) return;
       if (!acquireAudioSession()) {
-        throw new Error('Another recorder still owns the global audio session');
+        throw new Error();
       }
-      await serializeAudioMode(() =>
-        setAudioModeAsync({
-          allowsRecording: true,
-          allowsBackgroundRecording: false,
-          playsInSilentMode: true,
-          shouldPlayInBackground: false,
-        }),
-      );
+      if (!audioSessionIsOwnedBy(activeAudioSessionOwner, instanceIdRef.current)) {
+        throw new Error();
+      }
+      const recordingAudioMode = {
+        allowsRecording: true,
+        allowsBackgroundRecording: false,
+        playsInSilentMode: true,
+        shouldPlayInBackground: false,
+      };
+      if (
+        recordingAudioMode.allowsRecording !== true ||
+        recordingAudioMode.allowsBackgroundRecording !== false ||
+        recordingAudioMode.playsInSilentMode !== true ||
+        recordingAudioMode.shouldPlayInBackground !== false
+      ) {
+        throw new Error();
+      }
+      await serializeAudioMode(() => setAudioModeAsync(recordingAudioMode));
       if (!isCurrentLifecycle()) {
         await restoreOwnedAudioMode(false);
         return;
       }
+      recordingTakeGenerationRef.current = nextRecordingTakeGeneration(
+        recordingTakeGenerationRef.current,
+      );
+      recordingCompletionRef.current = null;
       await recorder.prepareToRecordAsync();
       prepared = true;
+      preparedCandidateUri = readRecorderUri(recorder);
+      registerLiveRecorderUri(preparedCandidateUri);
+      if (preparedCandidateUri) ownedTakeUrisRef.current.add(preparedCandidateUri);
       if (!isCurrentLifecycle()) {
-        await disposePreparedRecording();
-        if (recorder.uri !== previousUri) deleteRecording(recorder.uri);
+        const disposedUris = await disposePreparedRecording();
+        deleteOwnedCandidates(preparedCandidateUri, ...disposedUris);
         await restoreOwnedAudioMode(false);
         return;
       }
-      recordingCompletionRef.current = null;
       recordingInterruptionHandledRef.current = false;
       recordingStartedAtRef.current = monotonicNow();
       hasObservedRecordingRef.current = false;
@@ -1863,19 +2603,41 @@ export default function Recorder<T>({
         recorder.record();
         webAutoStopTimerRef.current = setTimeout(() => {
           webAutoStopTimerRef.current = null;
-          void stopRecording('auto');
+          void stopRecordingRef.current('auto');
         }, MAX_RECORDING_SECONDS * 1_000);
       } else {
         recorder.record({ forDuration: MAX_RECORDING_SECONDS });
       }
+      const liveRecordingUri = readRecorderUri(recorder);
+      registerLiveRecorderUri(liveRecordingUri);
+      if (liveRecordingUri) ownedTakeUrisRef.current.add(liveRecordingUri);
+      // A native/web implementation may rotate its cache URI when recording
+      // actually begins. Once the live URI is known, the distinct prepared
+      // candidate is obsolete: delete it now so it cannot remain pinned in the
+      // process-wide live-URI set or leak on disk.
+      if (liveRecordingUri) {
+        for (const candidateUri of [...ownedTakeUrisRef.current]) {
+          if (candidateUri !== liveRecordingUri) {
+            ownedTakeUrisRef.current.delete(candidateUri);
+            deleteRecording(candidateUri);
+          }
+        }
+        ownedTakeUrisRef.current.add(liveRecordingUri);
+      }
       prepared = false;
-      deleteRecording(previousUri);
+      if (!liveRecordingUri && previousUri && previousUri !== preparedCandidateUri) {
+        ownedTakeUrisRef.current.delete(previousUri);
+        deleteRecording(previousUri);
+      }
       activeUriRef.current = null;
-      if (mountedRef.current) setRecordedDurationMillis(0);
       updatePhase('recording');
     } catch {
-      if (prepared) await disposePreparedRecording();
-      if (recorder.uri !== previousUri) deleteRecording(recorder.uri);
+      if (prepared) {
+        const disposedUris = await disposePreparedRecording();
+        deleteOwnedCandidates(preparedCandidateUri, ...disposedUris);
+      } else {
+        deleteOwnedCandidates(readRecorderUri(recorder));
+      }
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
       clearWebAutoStopTimer();
@@ -1889,50 +2651,53 @@ export default function Recorder<T>({
       if (recoverAfterStart) void recoverPending();
     }
   };
-  startRecordingRef.current = startRecording;
+  useLayoutEffect(() => {
+    startRecordingRef.current = startRecording;
+  });
 
   const stopRecording = async (reason: 'user' | 'auto' = 'user') => {
     if (phaseRef.current !== 'recording') return;
     const operationToken = beginOperation();
     if (!operationToken) return;
     clearWebAutoStopTimer();
-    const lifecycleEpoch = lifecycleEpochRef.current;
+    const takeGeneration = recordingTakeGenerationRef.current;
+    const stopCandidateUri = readRecorderUri(recorder);
+    // Every lifecycle-epoch bump first supersedes the active operation, so
+    // operation-token currency already proves the epoch is current here.
     const isCurrentLifecycle = () =>
       operationIsCurrent(operationToken) &&
-      lifecycleEpoch === lifecycleEpochRef.current &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
       currentRecorderRef.current === recorder &&
-      mountedRef.current &&
-      focusedRef.current &&
-      AppState.currentState === 'active';
+      recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState);
+    const recordingStartedAt = recordingStartedAtRef.current;
+    const rawWallDuration = recordingStartedAt !== null ? monotonicNow() - recordingStartedAt : 0;
     const durationBeforeStop = Math.max(
       Number.isFinite(recorderState.durationMillis) ? Math.max(0, recorderState.durationMillis) : 0,
-      recordingStartedAtRef.current ? monotonicNow() - recordingStartedAtRef.current : 0,
+      Number.isFinite(rawWallDuration) ? Math.max(0, rawWallDuration) : 0,
     );
     try {
       const stopResult = await stopNativeRecording();
+      const taggedCompletion = recordingCompletionRef.current;
       const completion =
-        recordingCompletionRef.current ??
-        (Platform.OS === 'web' ? null : await waitForRecordingCompletion());
+        taggedCompletion?.takeGeneration === takeGeneration
+          ? taggedCompletion.status
+          : !recordingCompletionNeedsWait(Platform.OS)
+            ? null
+            : await waitForRecordingCompletion(
+                takeGeneration,
+                stopCandidateUri ?? readRecorderUri(recorder),
+              );
       recordingCompletionRef.current = null;
-      const androidResult =
-        stopResult && typeof stopResult === 'object' ? (stopResult as { url?: unknown }) : null;
-      const stopFailed =
-        completion?.hasError === true ||
-        completion?.mediaServicesDidReset === true ||
-        (Platform.OS === 'android' &&
-          androidResult !== null &&
-          typeof androidResult.url !== 'string');
-      const uri = completion?.url ?? recorder.uri;
+      const stopFailed = nativeStopFailed(completion, Platform.OS, stopResult);
+      const uri = completion?.url ?? readRecorderUri(recorder);
       if (!isCurrentLifecycle()) {
         discardRecording(uri);
         return;
       }
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
-      if (stopFailed || !uri || durationBeforeStop < 500 || !completedRecordingIsUsable(uri)) {
+      const fileIsUsable = uri !== null && completedRecordingIsUsable(uri);
+      if (!completedTakeIsValid(stopFailed, uri, durationBeforeStop, fileIsUsable)) {
         discardRecording(uri);
         updatePhase('idle');
         callbacksRef.current.onError(
@@ -1944,7 +2709,7 @@ export default function Recorder<T>({
         );
         return;
       }
-      activeUriRef.current = uri;
+      adoptOwnedRecording(uri!);
       if (reason === 'auto') autoStoppedAtRef.current = monotonicNow();
       setRecordedDurationMillis(Math.min(MAX_RECORDING_SECONDS * 1_000, durationBeforeStop));
       updatePhase('recorded');
@@ -1952,21 +2717,29 @@ export default function Recorder<T>({
       // recorder.stop() can reject when the 2:00 auto-stop already finalized
       // this take natively. A completed file is a valid answer; keep it, and
       // only discard when no saved recording actually exists.
-      const completion = recordingCompletionRef.current;
+      const taggedCompletion = recordingCompletionRef.current;
+      const completion =
+        taggedCompletion?.takeGeneration === takeGeneration ? taggedCompletion.status : null;
       recordingCompletionRef.current = null;
-      const uri = completion?.url ?? recorder.uri;
+      const uri = completion?.url ?? readRecorderUri(recorder);
+      const completionHasError = completion?.hasError === true;
+      const mediaServicesDidReset = completion?.mediaServicesDidReset === true;
+      const recorderIsRecording = readRecorderIsRecording(recorder);
       recordingStartedAtRef.current = null;
       hasObservedRecordingRef.current = false;
+      const fileIsUsable = uri !== null && completedRecordingIsUsable(uri);
       if (
-        uri &&
-        completion?.hasError !== true &&
-        completion?.mediaServicesDidReset !== true &&
-        !recorder.isRecording &&
-        completedRecordingIsUsable(uri) &&
-        durationBeforeStop >= 500 &&
-        isCurrentLifecycle()
+        rejectedStopTakeCanBeAdopted(
+          uri,
+          completionHasError,
+          mediaServicesDidReset,
+          recorderIsRecording,
+          fileIsUsable,
+          durationBeforeStop,
+          isCurrentLifecycle(),
+        )
       ) {
-        activeUriRef.current = uri;
+        adoptOwnedRecording(uri!);
         if (reason === 'auto') autoStoppedAtRef.current = monotonicNow();
         setRecordedDurationMillis(Math.min(MAX_RECORDING_SECONDS * 1000, durationBeforeStop));
         updatePhase('recorded');
@@ -1982,12 +2755,16 @@ export default function Recorder<T>({
       endOperation(operationToken);
     }
   };
+  useLayoutEffect(() => {
+    stopRecordingRef.current = stopRecording;
+  });
 
   const submit = async () => {
     if (phaseRef.current !== 'recorded') return;
+    const pendingGeneration = capturePendingAssessmentGeneration();
     const operationToken = beginOperation();
     if (!operationToken) return;
-    const uri = activeUriRef.current ?? recorder.uri;
+    const uri = activeUriRef.current ?? readRecorderUri(recorder);
     // Unreachable by design: every path that clears activeUriRef also leaves
     // the recorded phase (pinned by the identity-change and lifecycle tests).
     // Kept as fail-closed defense; the missing-FILE case is handled as a
@@ -2006,17 +2783,13 @@ export default function Recorder<T>({
     cancelPersistenceRef.current = null;
     cancelledSubmissionRequestIdRef.current = null;
     updatePhase('uploading');
-    const lifecycleEpoch = lifecycleEpochRef.current;
+    // Every lifecycle-epoch bump first installs a superseding operation token,
+    // so token currency already proves the epoch cannot have changed.
     const isCurrentSubmission = () =>
       operationIsCurrent(operationToken) &&
-      lifecycleEpoch === lifecycleEpochRef.current &&
-      identityRef.current.ownerId === ownerId &&
-      identityRef.current.endpoint === endpoint &&
-      identityRef.current.questionId === questionId &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
       currentRecorderRef.current === recorder &&
-      mountedRef.current &&
-      focusedRef.current &&
-      AppState.currentState === 'active';
+      recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState);
     const controller = new AbortController();
     uploadControllerRef.current = controller;
     const canContinueSubmission = () => {
@@ -2031,38 +2804,37 @@ export default function Recorder<T>({
     try {
       const requestId = requestIdRef.current ?? Crypto.randomUUID();
       requestIdRef.current = requestId;
-      const existing = await loadPendingAssessment();
-      if (!canContinueSubmission()) return;
+      const pending: PendingAssessment = {
+        ownerId,
+        endpoint,
+        questionId,
+        requestId,
+        createdAt: Date.now(),
+        stage: 'prepared',
+      };
+      let authoritativePending: PendingAssessment | null;
+      try {
+        authoritativePending = await ensurePendingAssessment(pending, pendingGeneration);
+        if (!canContinueSubmission()) return;
+      } catch {
+        if (!canContinueSubmission()) return;
+        requestIdRef.current = null;
+        updatePhase('recorded');
+        callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
+        return;
+      }
+      if (!authoritativePending) {
+        requestIdRef.current = null;
+        updatePhase('recorded');
+        callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
+        return;
+      }
       if (
-        existing &&
-        (existing.requestId !== requestId ||
-          existing.ownerId !== ownerId ||
-          existing.endpoint !== endpoint ||
-          existing.questionId !== questionId)
+        !pendingAssessmentCanUpload(authoritativePending, ownerId, endpoint, questionId, requestId)
       ) {
         recoverAfterUpload = true;
         updatePhase('recovering');
         return;
-      }
-      if (!existing) {
-        const pending: PendingAssessment = {
-          ownerId,
-          endpoint,
-          questionId,
-          requestId,
-          createdAt: Date.now(),
-          stage: 'prepared',
-        };
-        try {
-          await savePendingAssessment(pending);
-          if (!canContinueSubmission()) return;
-        } catch {
-          if (!canContinueSubmission()) return;
-          requestIdRef.current = null;
-          updatePhase('recorded');
-          callbacksRef.current.onError(translate('recorder.errInfoNotSavedNotUploaded'));
-          return;
-        }
       }
       // Ask the API where the audio goes: a size-constrained S3 POST form in production,
       // direct multipart to the API in local dev. The assessment requestId is
@@ -2080,8 +2852,12 @@ export default function Recorder<T>({
       // 503s (including pool saturation during persistence) can follow provider
       // spend and therefore require polling or an explicit learner retry.
       const postAssessment = async (): Promise<unknown> => {
-        let capacityRetries = 0;
-        for (;;) {
+        let lastCapacityError: unknown;
+        // The iteration source is a fixed tuple rather than a mutable counter.
+        // That provides an independent hard bound even if retry classification
+        // or bookkeeping regresses, and prevents a malformed response from
+        // turning this paid-work path into a tight infinite loop.
+        for (const capacityRetries of CAPACITY_RETRY_ATTEMPTS) {
           try {
             // Once the assessment POST is issued, a user cancel can no longer
             // simply return to 'recorded': the server may have committed the
@@ -2112,32 +2888,23 @@ export default function Recorder<T>({
               },
             );
           } catch (error) {
-            if (
-              controller.signal.aborted ||
-              !(error instanceof ApiError) ||
-              error.status !== 503 ||
-              error.code !== 'CAPACITY_BUSY' ||
-              capacityRetries >= MAX_CAPACITY_RETRIES
-            ) {
+            if (!shouldRetryCapacityFailure(error, controller.signal.aborted, capacityRetries)) {
               throw error;
             }
+            lastCapacityError = error;
             // A received 503 is a definite pre-commit refusal. While waiting
             // for its Retry-After there is no assessment request in flight, so
             // Cancel can return the take immediately without reconciliation.
             assessmentPostedRef.current = false;
-            capacityRetries += 1;
-            const retryAfterSeconds =
-              error.retryAfterSeconds !== undefined && Number.isFinite(error.retryAfterSeconds)
-                ? error.retryAfterSeconds
-                : 5;
-            const delayMs = Math.min(
-              CAPACITY_RETRY_MAX_DELAY_MS,
-              Math.max(1_000, Math.round(retryAfterSeconds * 1_000)),
-            );
+            const delayMs = capacityRetryDelayMillis(error.retryAfterSeconds);
             await sleepAbortable(delayMs, controller.signal);
             if (!canContinueSubmission()) throw error;
           }
         }
+        // Production reaches this only if the retry predicate and the fixed
+        // attempt budget drift apart. Fail closed rather than returning an
+        // undefined assessment response or continuing forever.
+        throw lastCapacityError ?? new Error();
       };
       if (grant.mode === 's3') {
         if (!(await markPendingAssessmentStage(requestId, 's3-granted', grant.audioKey))) {
@@ -2174,7 +2941,6 @@ export default function Recorder<T>({
         raw = await postAssessment();
       }
       if (!canContinueSubmission()) {
-        recoverAfterUpload = true;
         return;
       }
       if (cancelRequestedRef.current) {
@@ -2192,7 +2958,7 @@ export default function Recorder<T>({
         discardRecording();
         try {
           if (!(await markPendingAssessmentForReconciliation(requestId))) {
-            throw new Error('Pending assessment disappeared');
+            throw new Error();
           }
         } catch {
           if (!canContinueSubmission()) return;
@@ -2210,7 +2976,7 @@ export default function Recorder<T>({
       discardRecording();
       try {
         if (!(await markPendingAssessmentForReconciliation(requestId))) {
-          throw new Error('Pending assessment disappeared');
+          throw new Error();
         }
       } catch {
         if (!canContinueSubmission()) return;
@@ -2296,8 +3062,7 @@ export default function Recorder<T>({
         // the attempt commits. Poll all of them, but reserve automatic recovery
         // POSTs only for transport status 0/408. A received HTTP response or
         // parser failure must not multiply paid work when status later reads 404.
-        const automaticRecoveryPostAllowed =
-          error instanceof ApiError && (error.status === 0 || error.status === 408);
+        const automaticRecoveryPostAllowed = automaticRecoveryPostIsAllowed(error);
         if (!automaticRecoveryPostAllowed) {
           const requestId = requestIdRef.current;
           if (requestId) {
@@ -2333,15 +3098,13 @@ export default function Recorder<T>({
       if (
         settledPhase === 'uploading' &&
         operationIsCurrent(operationToken) &&
-        lifecycleEpoch === lifecycleEpochRef.current &&
         mountedRef.current
       ) {
         updatePhase('recovering');
-        recoverAfterUpload = true;
       }
-      if (readCancelPersistence()?.requestId === requestIdRef.current) {
-        cancelPersistenceRef.current = null;
-      }
+      // This submission owns the only live operation token, so no newer
+      // submission can replace its cancel marker before this finally runs.
+      cancelPersistenceRef.current = null;
       endOperation(operationToken);
       if (recoverAfterUpload) void recoverPending();
     }
@@ -2351,14 +3114,14 @@ export default function Recorder<T>({
 
   const handleMicPress = () => {
     if (isRecording) return stopRecording();
+    if (startIsBlocked()) return Promise.resolve();
     // The 2:00 native auto-stop can flip the phase to 'recorded' just as the
     // learner taps to stop; treating that tap as a re-record would destroy
     // the take they just captured. Ignore mic presses briefly after an
     // auto-stop; the explicit Re-record action stays available.
     if (
       autoStoppedAtRef.current !== null &&
-      monotonicNow() - autoStoppedAtRef.current >= 0 &&
-      monotonicNow() - autoStoppedAtRef.current < AUTO_STOP_TAP_GRACE_MS
+      autoStopTapIsWithinGrace(monotonicNow() - autoStoppedAtRef.current)
     ) {
       return Promise.resolve();
     }
@@ -2392,8 +3155,8 @@ export default function Recorder<T>({
     void recoverPending();
   };
 
-  const togglePreview = () => {
-    if (operationIsInFlight() || phaseRef.current !== 'recorded') return;
+  const togglePreview = async () => {
+    if (!previewToggleCanStart(operationIsInFlight(), phaseRef.current)) return;
     if (previewPlaying) {
       try {
         previewPlayerRef.current?.pause();
@@ -2404,6 +3167,30 @@ export default function Recorder<T>({
       }
       setPreviewPlaying(false);
       return;
+    }
+    const pendingRewind = previewRewindPromiseRef.current;
+    if (pendingRewind) {
+      const pendingPlayer = previewPlayerRef.current;
+      if (previewPlayRequestedRef.current) return;
+      previewPlayRequestedRef.current = true;
+      try {
+        await pendingRewind;
+      } catch {
+        // The rewind owner releases the player and reports the failure once.
+        return;
+      } finally {
+        previewPlayRequestedRef.current = false;
+      }
+      if (
+        previewPlayerRef.current !== pendingPlayer ||
+        !previewCanPlayAfterRewind(
+          operationIsInFlight(),
+          phaseRef.current,
+          previewPlayerRef.current !== null,
+        )
+      ) {
+        return;
+      }
     }
     if (!previewPlayerRef.current) {
       const uri = activeUriRef.current;
@@ -2420,21 +3207,44 @@ export default function Recorder<T>({
       }
       try {
         previewListenerRef.current = player.addListener('playbackStatusUpdate', (status) => {
+          if (previewPlayerRef.current !== player) return;
           if (status.error) {
+            releasePreviewPlayer();
+            callbacksRef.current.onError(translate('recorder.errPlayFailed'));
+            return;
+          }
+          const reachedEnd = previewStatusReachedEnd(status);
+          if (!reachedEnd) return;
+          // Rewind so Play starts the take from the beginning next time.
+          if (previewRewindPromiseRef.current) return;
+          let rewind: Promise<void>;
+          try {
+            rewind = Promise.resolve(player.seekTo(0));
+          } catch {
             if (previewPlayerRef.current === player) {
               releasePreviewPlayer();
               callbacksRef.current.onError(translate('recorder.errPlayFailed'));
             }
             return;
           }
-          const reachedEnd =
-            status.didJustFinish ||
-            (!status.playing &&
-              status.duration > 0 &&
-              status.currentTime >= status.duration - 0.05);
-          if (!reachedEnd) return;
-          // Rewind so Play starts the take from the beginning next time.
-          void player.seekTo(0).catch(() => undefined);
+          previewRewindPromiseRef.current = rewind;
+          void rewind.then(
+            () => {
+              if (previewRewindPromiseRef.current === rewind) {
+                previewRewindPromiseRef.current = null;
+              }
+            },
+            () => {
+              if (
+                previewRewindPromiseRef.current === rewind &&
+                previewPlayerRef.current === player
+              ) {
+                previewRewindPromiseRef.current = null;
+                releasePreviewPlayer();
+                callbacksRef.current.onError(translate('recorder.errPlayFailed'));
+              }
+            },
+          );
           if (mountedRef.current && previewPlayerRef.current === player) {
             setPreviewPlaying(false);
           }
@@ -2450,8 +3260,10 @@ export default function Recorder<T>({
         return;
       }
     }
+    const player = previewPlayerRef.current;
+    if (!player) return;
     try {
-      previewPlayerRef.current.play();
+      player.play();
       setPreviewPlaying(true);
     } catch {
       releasePreviewPlayer();
@@ -2460,6 +3272,8 @@ export default function Recorder<T>({
   };
 
   const busy = phase === 'uploading' || phase === 'recovering';
+  const controlsDisabled = recorderControlsAreDisabled(disabled, busy, operationActive);
+  const reviewActionsDisabled = recorderControlsAreDisabled(disabled, false, operationActive);
   const elapsed = formatElapsed(
     phase === 'recorded' ? recordedDurationMillis : (recorderState.durationMillis ?? 0),
   );
@@ -2486,6 +3300,7 @@ export default function Recorder<T>({
                   callbacksRef.current.onError(translate('recorder.openSettingsFailed')),
                 );
               }}
+              disabled={disabled}
               style={styles.settingsButton}
             />
           )}
@@ -2502,12 +3317,12 @@ export default function Recorder<T>({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={isRecording ? t('recorder.stopLabel') : t('recorder.startLabel')}
-          accessibilityState={{ disabled: busy || operationActive }}
-          disabled={busy || operationActive}
+          accessibilityState={{ disabled: controlsDisabled }}
+          disabled={controlsDisabled}
           onPress={handleMicPress}
           style={({ pressed }) => [
             styles.recordButton,
-            (busy || operationActive || pressed) && styles.recordButtonDimmed,
+            (controlsDisabled || pressed) && styles.recordButtonDimmed,
           ]}
         >
           <View style={isRecording ? styles.stopIcon : styles.micDot} />
@@ -2586,15 +3401,17 @@ export default function Recorder<T>({
               size="sm"
               accessibilityHint={t('recorder.cancelHint')}
               onPress={cancelUpload}
+              disabled={disabled}
               style={styles.cancelButton}
             />
           )}
-          {phase === 'recovering' && recoveryRetryNeeded && (
+          {recoveryRetryIsVisible(phase, recoveryRetryNeeded) && (
             <Button
               title={t('common.tryAgain')}
               variant="secondary"
               size="sm"
               onPress={retryRecovery}
+              disabled={disabled}
               style={styles.cancelButton}
             />
           )}
@@ -2608,18 +3425,18 @@ export default function Recorder<T>({
             variant="secondary"
             accessibilityLabel={previewPlaying ? t('recorder.pauseLabel') : t('recorder.playLabel')}
             onPress={togglePreview}
-            disabled={operationActive}
+            disabled={reviewActionsDisabled}
           />
           <Button
             title={t('recorder.submit')}
             onPress={() => void submit()}
-            disabled={operationActive}
+            disabled={reviewActionsDisabled}
           />
           <Button
             title={t('recorder.rerecord')}
             variant="quiet"
             onPress={() => void startRecording()}
-            disabled={operationActive}
+            disabled={reviewActionsDisabled}
           />
         </View>
       )}

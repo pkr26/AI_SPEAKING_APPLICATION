@@ -67,14 +67,57 @@ jest.mock('react-native/Libraries/Components/Keyboard/KeyboardAvoidingView', () 
 
 // ----- expo-router mock -----
 
+const mockSetOptions = jest.fn();
+let mockBeforeRemoveListener:
+  ((event: { data: { action: { type: string } }; preventDefault: () => void }) => void) | null =
+  null;
+const mockAddNavigationListener = jest.fn(
+  (
+    event: string,
+    listener: (event: { data: { action: { type: string } }; preventDefault: () => void }) => void,
+  ) => {
+    if (event === 'beforeRemove') mockBeforeRemoveListener = listener;
+    return () => {
+      if (mockBeforeRemoveListener === listener) mockBeforeRemoveListener = null;
+    };
+  },
+);
+const mockNavigation = {
+  setOptions: mockSetOptions,
+  addListener: mockAddNavigationListener,
+};
+let mockHardwareBackHandler: (() => boolean) | null = null;
+const mockLinkNavigate = jest.fn();
+
+jest.mock('../src/lib/use-hardware-back', () => ({
+  useHardwareBack: (handler: () => boolean) => {
+    mockHardwareBackHandler = handler;
+  },
+}));
+
 function MockLink({
   children,
   href,
   accessibilityRole,
+  onPress,
   ...textProps
 }: TextProps & { children: React.ReactNode; href: string }) {
+  const handlePress = () => {
+    let prevented = false;
+    onPress?.({
+      preventDefault: () => {
+        prevented = true;
+      },
+    } as never);
+    if (!prevented) mockLinkNavigate(href);
+  };
   return (
-    <Text {...textProps} accessibilityRole={accessibilityRole ?? 'link'} {...{ href }}>
+    <Text
+      {...textProps}
+      accessibilityRole={accessibilityRole ?? 'link'}
+      onPress={handlePress}
+      {...{ href }}
+    >
       {children}
     </Text>
   );
@@ -92,6 +135,7 @@ jest.mock('expo-router', () => {
       dismissTo: jest.fn(),
     },
     useLocalSearchParams: () => mockSearchParams,
+    useNavigation: () => mockNavigation,
     // Signup scopes its language preview to focus; run the effect on mount and
     // its cleanup on unmount, the way expo-router does on navigation.
     useFocusEffect: (callback: () => void | (() => void)) => {
@@ -128,6 +172,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn().mockResolvedValue(USER),
     register: jest.fn().mockResolvedValue(USER),
     logout: jest.fn(),
@@ -162,9 +208,33 @@ const mockRouter = jest.requireMock('expo-router').router as {
   dismissTo: jest.Mock;
 };
 
+const LOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: false,
+  gestureEnabled: false,
+};
+
+const UNLOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: true,
+  gestureEnabled: true,
+};
+
+function hardwareBackIsHandled(): boolean {
+  if (!mockHardwareBackHandler) throw new Error('No hardware-back handler was registered');
+  return mockHardwareBackHandler();
+}
+
+function dispatchBeforeRemove(type: string): jest.Mock {
+  if (!mockBeforeRemoveListener) throw new Error('No beforeRemove listener was registered');
+  const preventDefault = jest.fn();
+  mockBeforeRemoveListener({ data: { action: { type } }, preventDefault });
+  return preventDefault;
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockSearchParams = {};
+  mockBeforeRemoveListener = null;
+  mockHardwareBackHandler = null;
   mockAuthValue = makeAuth();
   mockedConsumeSessionExpiredNotice.mockResolvedValue(false);
   // The preview test below mounts the real I18nProvider, whose effect moves the
@@ -688,23 +758,102 @@ describe('login screen', () => {
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
+  it('locks native exits and Links while login is pending, then unlocks for a retry', async () => {
+    const firstLogin = deferred<User>();
+    const login = jest.fn().mockReturnValueOnce(firstLogin.promise).mockResolvedValueOnce(USER);
+    mockAuthValue.login = login;
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', 'password1');
+    const submit = committedPressHandler(logInButton());
+    const forgotBeforeBusy = screen.getByRole('link', { name: t('login.forgot') });
+    const openForgot = committedPressHandler(forgotBeforeBusy);
+    let preventedBack!: jest.Mock;
+    let resetRemoval!: jest.Mock;
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      void submit();
+      openForgot();
+      preventedBack = dispatchBeforeRemove('GO_BACK');
+      resetRemoval = dispatchBeforeRemove('RESET');
+      expect(hardwareBackIsHandled()).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(preventedBack).toHaveBeenCalledTimes(1);
+    expect(login).toHaveBeenCalledTimes(1);
+    expect(resetRemoval).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(LOCKED_NAVIGATION_OPTIONS);
+    const forgot = screen.getByRole('link', { name: t('login.forgot') });
+    const signup = screen.getByRole('link', { name: t('login.footerLink') });
+    expect(forgot.props.accessibilityState).toMatchObject({ disabled: true });
+    expect(signup.props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.press(forgot);
+    await fireEvent.press(signup);
+    expect(mockLinkNavigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      firstLogin.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(t('login.failed'))).toBeTruthy();
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+
+    await fireEvent.press(logInButton());
+    await waitFor(() => expect(login).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'publishes no login %s continuation after external unmount',
+    async (outcome) => {
+      const loginRequest = deferred<User>();
+      mockAuthValue.login = jest.fn(() => loginRequest.promise);
+      const view = await render(<LoginScreen />);
+      await fillLogin('ada@example.com', 'password1');
+      const submit = committedPressHandler(logInButton());
+      await act(async () => {
+        void submit();
+        await Promise.resolve();
+      });
+      expect(mockAuthValue.login).toHaveBeenCalledTimes(1);
+
+      await view.unmount();
+      mockSetOptions.mockClear();
+      mockRouter.replace.mockClear();
+      await act(async () => {
+        if (outcome === 'success') loginRequest.resolve(USER);
+        else loginRequest.reject(new Error('late failure'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      expect(mockRouter.replace).not.toHaveBeenCalled();
+    },
+  );
+
   it('submits login once for two same-render activations', async () => {
     const login = deferred<User>();
     mockAuthValue.login = jest.fn(() => login.promise);
     await render(<LoginScreen />);
     await fillLogin('ada@example.com', 'password1');
     const press = committedPressHandler(logInButton());
-    let first!: Promise<unknown>;
-    let second!: Promise<unknown>;
-
     await act(async () => {
-      first = Promise.resolve(press());
-      second = Promise.resolve(press());
+      void press();
+      void press();
     });
     expect(mockAuthValue.login).toHaveBeenCalledTimes(1);
 
-    await act(async () => login.resolve(USER));
-    await Promise.all([first, second]);
+    await act(async () => {
+      login.resolve(USER);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
   it('shows a credential error on 401', async () => {
@@ -1348,6 +1497,90 @@ describe('signup screen', () => {
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
+  it('locks native exits and the login Link while registration is pending, then retries', async () => {
+    const firstRegistration = deferred<User>();
+    const register = jest
+      .fn()
+      .mockReturnValueOnce(firstRegistration.promise)
+      .mockResolvedValueOnce(USER);
+    mockAuthValue.register = register;
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    const submit = committedPressHandler(signUpButton('te'));
+    const loginBeforeBusy = screen.getByRole('link', {
+      name: translateFor('te', 'signup.footerLink'),
+    });
+    const openLogin = committedPressHandler(loginBeforeBusy);
+    let preventedBack!: jest.Mock;
+    let resetRemoval!: jest.Mock;
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      void submit();
+      openLogin();
+      preventedBack = dispatchBeforeRemove('GO_BACK');
+      resetRemoval = dispatchBeforeRemove('RESET');
+      expect(hardwareBackIsHandled()).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(preventedBack).toHaveBeenCalledTimes(1);
+    expect(register).toHaveBeenCalledTimes(1);
+    expect(resetRemoval).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(LOCKED_NAVIGATION_OPTIONS);
+    const loginLink = screen.getByRole('link', {
+      name: translateFor('te', 'signup.footerLink'),
+    });
+    expect(loginLink.props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.press(loginLink);
+    expect(mockLinkNavigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      firstRegistration.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(translateFor('te', 'signup.failed'))).toBeTruthy();
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+
+    await fireEvent.press(signUpButton('te'));
+    await waitFor(() => expect(register).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'publishes no registration %s continuation after external unmount',
+    async (outcome) => {
+      const registration = deferred<User>();
+      mockAuthValue.register = jest.fn(() => registration.promise);
+      const view = await render(<SignupScreen />);
+      await fillSignup('Ada', 'ada@example.com', 'password1');
+      await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+      const submit = committedPressHandler(signUpButton('te'));
+      await act(async () => {
+        void submit();
+        await Promise.resolve();
+      });
+      expect(mockAuthValue.register).toHaveBeenCalledTimes(1);
+
+      await view.unmount();
+      mockSetOptions.mockClear();
+      mockRouter.replace.mockClear();
+      await act(async () => {
+        if (outcome === 'success') registration.resolve(USER);
+        else registration.reject(new Error('late failure'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      expect(mockRouter.replace).not.toHaveBeenCalled();
+    },
+  );
+
   it('submits registration once for two same-render activations', async () => {
     const registration = deferred<User>();
     mockAuthValue.register = jest.fn(() => registration.promise);
@@ -1355,17 +1588,18 @@ describe('signup screen', () => {
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const press = committedPressHandler(signUpButton('te'));
-    let first!: Promise<unknown>;
-    let second!: Promise<unknown>;
-
     await act(async () => {
-      first = Promise.resolve(press());
-      second = Promise.resolve(press());
+      void press();
+      void press();
     });
     expect(mockAuthValue.register).toHaveBeenCalledTimes(1);
 
-    await act(async () => registration.resolve(USER));
-    await Promise.all([first, second]);
+    await act(async () => {
+      registration.resolve(USER);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
 
   it('shows a duplicate-account error on 409', async () => {

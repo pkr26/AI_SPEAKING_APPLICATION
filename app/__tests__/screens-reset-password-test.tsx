@@ -42,14 +42,57 @@ jest.mock('react-native/Libraries/Components/Keyboard/KeyboardAvoidingView', () 
 
 // ----- expo-router mock -----
 
+const mockSetOptions = jest.fn();
+let mockBeforeRemoveListener:
+  ((event: { data: { action: { type: string } }; preventDefault: () => void }) => void) | null =
+  null;
+const mockAddNavigationListener = jest.fn(
+  (
+    event: string,
+    listener: (event: { data: { action: { type: string } }; preventDefault: () => void }) => void,
+  ) => {
+    if (event === 'beforeRemove') mockBeforeRemoveListener = listener;
+    return () => {
+      if (mockBeforeRemoveListener === listener) mockBeforeRemoveListener = null;
+    };
+  },
+);
+const mockNavigation = {
+  setOptions: mockSetOptions,
+  addListener: mockAddNavigationListener,
+};
+let mockHardwareBackHandler: (() => boolean) | null = null;
+const mockLinkNavigate = jest.fn();
+
+jest.mock('../src/lib/use-hardware-back', () => ({
+  useHardwareBack: (handler: () => boolean) => {
+    mockHardwareBackHandler = handler;
+  },
+}));
+
 function MockLink({
   children,
   href,
   accessibilityRole,
+  onPress,
   ...textProps
 }: TextProps & { children: React.ReactNode; href: string }) {
+  const handlePress = () => {
+    let prevented = false;
+    onPress?.({
+      preventDefault: () => {
+        prevented = true;
+      },
+    } as never);
+    if (!prevented) mockLinkNavigate(href);
+  };
   return (
-    <Text {...textProps} accessibilityRole={accessibilityRole ?? 'link'} {...{ href }}>
+    <Text
+      {...textProps}
+      accessibilityRole={accessibilityRole ?? 'link'}
+      onPress={handlePress}
+      {...{ href }}
+    >
       {children}
     </Text>
   );
@@ -57,17 +100,27 @@ function MockLink({
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
-jest.mock('expo-router', () => ({
-  router: {
-    push: jest.fn(),
-    navigate: jest.fn(),
-    replace: jest.fn(),
-    back: jest.fn(),
-    dismissTo: jest.fn(),
-  },
-  useLocalSearchParams: () => mockSearchParams,
-  Link: MockLink,
-}));
+jest.mock('expo-router', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  return {
+    router: {
+      push: jest.fn(),
+      navigate: jest.fn(),
+      replace: jest.fn(),
+      back: jest.fn(),
+      dismissTo: jest.fn(),
+    },
+    useLocalSearchParams: () => mockSearchParams,
+    useNavigation: () => mockNavigation,
+    useFocusEffect: (callback: () => void | (() => void)) => {
+      ReactActual.useEffect(() => {
+        const cleanup = callback();
+        return typeof cleanup === 'function' ? cleanup : undefined;
+      }, [callback]);
+    },
+    Link: MockLink,
+  };
+});
 
 jest.mock('../src/lib/session-notice', () => ({
   consumeSessionExpiredNotice: jest.fn(async () => false),
@@ -103,6 +156,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn().mockResolvedValue(USER),
     register: jest.fn(),
     logout: jest.fn(),
@@ -127,6 +182,28 @@ const mockRouter = jest.requireMock('expo-router').router as {
   replace: jest.Mock;
   dismissTo: jest.Mock;
 };
+
+const LOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: false,
+  gestureEnabled: false,
+};
+
+const UNLOCKED_NAVIGATION_OPTIONS = {
+  headerBackVisible: true,
+  gestureEnabled: true,
+};
+
+function hardwareBackIsHandled(): boolean {
+  if (!mockHardwareBackHandler) throw new Error('No hardware-back handler was registered');
+  return mockHardwareBackHandler();
+}
+
+function dispatchBeforeRemove(type: string): jest.Mock {
+  if (!mockBeforeRemoveListener) throw new Error('No beforeRemove listener was registered');
+  const preventDefault = jest.fn();
+  mockBeforeRemoveListener({ data: { action: { type } }, preventDefault });
+  return preventDefault;
+}
 
 type SemanticStyle = Record<string, unknown>;
 
@@ -170,10 +247,12 @@ function scrollContentStyle(): SemanticStyle {
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
@@ -264,10 +343,12 @@ function spyOnTextInputFocus(element: TestInstance): jest.Mock {
 beforeEach(() => {
   jest.clearAllMocks();
   mockSearchParams = {};
+  mockBeforeRemoveListener = null;
+  mockHardwareBackHandler = null;
   mockAuthValue = makeAuth();
-  mockForgot.mockResolvedValue(undefined);
-  mockReset.mockResolvedValue(undefined);
-  mockedConsumeNotice.mockResolvedValue(false);
+  mockForgot.mockReset().mockResolvedValue(undefined);
+  mockReset.mockReset().mockResolvedValue(undefined);
+  mockedConsumeNotice.mockReset().mockResolvedValue(false);
 });
 
 afterEach(async () => {
@@ -321,6 +402,24 @@ describe('forgot-password screen', () => {
     expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/reset-password',
       params: { email: 'ada@example.com' },
+    });
+  });
+
+  it('prefills the address that received the code when the field changes in flight', async () => {
+    const request = deferred<void>();
+    mockForgot.mockReturnValue(request.promise);
+    await render(<ForgotPasswordScreen />);
+    const input = screen.getByLabelText(t('login.emailLabel'));
+    await fireEvent.changeText(input, 'first@example.com');
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await fireEvent.changeText(input, 'second@example.com');
+    await act(async () => request.resolve(undefined));
+
+    await fireEvent.press(await screen.findByRole('button', { name: t('reset.continue') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
+      pathname: '/reset-password',
+      params: { email: 'first@example.com' },
     });
   });
 
@@ -505,6 +604,84 @@ describe('forgot-password screen', () => {
     expect(screen.getByText(t('reset.sentTitle'))).toBeTruthy();
   });
 
+  it('locks native exits and Back to login while a reset email is pending, then retries', async () => {
+    const firstRequest = deferred<void>();
+    mockForgot.mockReturnValueOnce(firstRequest.promise).mockResolvedValueOnce(undefined);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    const submit = committedPressHandler(
+      screen.getByRole('button', { name: t('reset.submitRequest') }),
+    );
+    const backBeforeBusy = screen.getByRole('link', { name: t('reset.backToLogin') });
+    const goBackToLogin = committedPressHandler(backBeforeBusy);
+    let preventedBack!: jest.Mock;
+    let resetRemoval!: jest.Mock;
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      void submit();
+      goBackToLogin();
+      preventedBack = dispatchBeforeRemove('GO_BACK');
+      resetRemoval = dispatchBeforeRemove('RESET');
+      expect(hardwareBackIsHandled()).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(preventedBack).toHaveBeenCalledTimes(1);
+    expect(mockForgot).toHaveBeenCalledTimes(1);
+    expect(resetRemoval).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(LOCKED_NAVIGATION_OPTIONS);
+    const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
+    expect(backToLogin.props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.press(backToLogin);
+    expect(mockLinkNavigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      firstRequest.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(t('reset.requestFailed'))).toBeTruthy();
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    expect(mockForgot).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'publishes no forgot-password %s continuation after external unmount',
+    async (outcome) => {
+      const request = deferred<void>();
+      mockForgot.mockReturnValue(request.promise);
+      const view = await render(<ForgotPasswordScreen />);
+      await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+      const submit = committedPressHandler(
+        screen.getByRole('button', { name: t('reset.submitRequest') }),
+      );
+      await act(async () => {
+        void submit();
+        await Promise.resolve();
+      });
+      expect(mockForgot).toHaveBeenCalledTimes(1);
+
+      await view.unmount();
+      mockSetOptions.mockClear();
+      mockRouter.navigate.mockClear();
+      await act(async () => {
+        if (outcome === 'success') request.resolve(undefined);
+        else request.reject(new Error('late failure'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      expect(mockRouter.navigate).not.toHaveBeenCalled();
+    },
+  );
+
   it('sends one reset-request email for two same-render activations', async () => {
     const pending = deferred<void>();
     mockForgot.mockReturnValue(pending.promise);
@@ -513,21 +690,22 @@ describe('forgot-password screen', () => {
     const press = committedPressHandler(
       screen.getByRole('button', { name: t('reset.submitRequest') }),
     );
-    let first!: Promise<unknown>;
-    let second!: Promise<unknown>;
-
     await act(async () => {
-      first = Promise.resolve(press());
-      second = Promise.resolve(press());
+      void press();
+      void press();
     });
     expect(mockForgot).toHaveBeenCalledTimes(1);
 
-    await act(async () => pending.resolve());
-    await Promise.all([first, second]);
+    await act(async () => {
+      pending.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
   });
 
   it('re-enables the request form and centers the error after a failure', async () => {
-    mockForgot.mockRejectedValue(new Error('offline'));
+    mockForgot.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(undefined);
     await render(<ForgotPasswordScreen />);
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
     await act(async () => {
@@ -542,6 +720,12 @@ describe('forgot-password screen', () => {
       screen.getByRole('button', { name: t('reset.submitRequest') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
     expect(screen.queryByText(t('reset.submitRequestBusy'))).toBeNull();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+    expect(mockForgot).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
   });
 
   it('keeps a back-to-login escape on the neutral sent state', async () => {
@@ -946,6 +1130,91 @@ describe('reset-password screen', () => {
     );
   });
 
+  it('locks native exits and Back to login while spending a reset code, then retries', async () => {
+    const firstReset = deferred<void>();
+    mockReset.mockReturnValueOnce(firstReset.promise).mockResolvedValueOnce(undefined);
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillValidForm();
+    const submit = committedPressHandler(
+      screen.getByRole('button', { name: t('reset.submitNew') }),
+    );
+    const backBeforeBusy = screen.getByRole('link', { name: t('reset.backToLogin') });
+    const goBackToLogin = committedPressHandler(backBeforeBusy);
+    let preventedBack!: jest.Mock;
+    let resetRemoval!: jest.Mock;
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      void submit();
+      goBackToLogin();
+      preventedBack = dispatchBeforeRemove('GO_BACK');
+      resetRemoval = dispatchBeforeRemove('RESET');
+      expect(hardwareBackIsHandled()).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(preventedBack).toHaveBeenCalledTimes(1);
+    expect(mockReset).toHaveBeenCalledTimes(1);
+    expect(resetRemoval).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(LOCKED_NAVIGATION_OPTIONS);
+    const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
+    expect(backToLogin.props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.press(backToLogin);
+    expect(mockLinkNavigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      firstReset.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(await screen.findByText(t('cp.failed'))).toBeTruthy();
+    expect(hardwareBackIsHandled()).toBe(false);
+    expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
+    expect(mockSetOptions).toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+    expect(mockReset).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
+        pathname: '/login',
+        params: { notice: 'reset' },
+      }),
+    );
+  });
+
+  it.each(['success', 'failure'] as const)(
+    'publishes no reset-password %s continuation after external unmount',
+    async (outcome) => {
+      const reset = deferred<void>();
+      mockReset.mockReturnValue(reset.promise);
+      mockSearchParams = { email: 'ada@example.com' };
+      const view = await render(<ResetPasswordScreen />);
+      await fillValidForm();
+      const submit = committedPressHandler(
+        screen.getByRole('button', { name: t('reset.submitNew') }),
+      );
+      await act(async () => {
+        void submit();
+        await Promise.resolve();
+      });
+      expect(mockReset).toHaveBeenCalledTimes(1);
+
+      await view.unmount();
+      mockSetOptions.mockClear();
+      mockRouter.dismissTo.mockClear();
+      await act(async () => {
+        if (outcome === 'success') reset.resolve(undefined);
+        else reset.reject(new Error('late failure'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+    },
+  );
+
   it('spends a reset code once for two same-render activations', async () => {
     const pending = deferred<void>();
     mockReset.mockReturnValue(pending.promise);
@@ -953,22 +1222,28 @@ describe('reset-password screen', () => {
     await render(<ResetPasswordScreen />);
     await fillValidForm();
     const press = committedPressHandler(screen.getByRole('button', { name: t('reset.submitNew') }));
-    let first!: Promise<unknown>;
-    let second!: Promise<unknown>;
-
     await act(async () => {
-      first = Promise.resolve(press());
-      second = Promise.resolve(press());
+      void press();
+      void press();
     });
     expect(mockReset).toHaveBeenCalledTimes(1);
 
-    await act(async () => pending.resolve());
-    await Promise.all([first, second]);
+    await act(async () => {
+      pending.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
+        pathname: '/login',
+        params: { notice: 'reset' },
+      }),
+    );
   });
 
   it('re-enables the form with the fallback copy after an unexpected failure', async () => {
     mockSearchParams = { email: 'ada@example.com' };
-    mockReset.mockRejectedValue(new Error('offline'));
+    mockReset.mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce(undefined);
     await render(<ResetPasswordScreen />);
     await fillValidForm();
 
@@ -984,6 +1259,17 @@ describe('reset-password screen', () => {
       screen.getByRole('button', { name: t('reset.submitNew') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+    });
+    expect(mockReset).toHaveBeenCalledTimes(2);
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
+        pathname: '/login',
+        params: { notice: 'reset' },
+      }),
+    );
   });
 
   it.each([

@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { router } from 'expo-router';
-import React, { useEffect } from 'react';
+import { router, useFocusEffect } from 'expo-router';
+import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
   Pressable,
@@ -33,12 +33,39 @@ function DecorativeEmoji({ children, style }: { children: string; style: StylePr
  * count, today's activity, and the session summary tallied while practicing.
  */
 export default function HomeScreen() {
-  const { user, setUser } = useAuth();
+  const { user, setUser, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { sessionTally, resetSessionTally } = usePracticeFlow();
   const queryClient = useQueryClient();
+  const sessionLease = useMemo(() => {
+    // These values define when a new render belongs to a new session even
+    // though the imperative capture function itself is referentially stable.
+    void sessionVersion;
+    void user?.id;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, user?.id]);
+  // Fail closed until the focus lifecycle explicitly grants this mounted route
+  // navigation ownership. A tap delivered before the passive focus effect runs
+  // must not navigate from a screen that is already being replaced.
+  const navigationStartedRef = useRef(true);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => {
+        navigationStartedRef.current = true;
+      };
+    }, []),
+  );
+  const navigateOnce = useCallback(
+    (destination: '/practice' | '/history' | '/settings') => {
+      if (navigationStartedRef.current || !isSessionLeaseCurrent(sessionLease)) return;
+      navigationStartedRef.current = true;
+      router.navigate(destination);
+    },
+    [isSessionLeaseCurrent, sessionLease],
+  );
 
   const statsQuery = useQuery({
     queryKey: ['practice-stats', user?.id],
@@ -55,11 +82,21 @@ export default function HomeScreen() {
   // practice route. Adopt the authoritative state and retire caches whose
   // level/question identity is no longer valid.
   useEffect(() => {
-    if (!user?.diagnosticCompleted || stats?.level !== null) return;
+    if (
+      !user?.diagnosticCompleted ||
+      stats?.level !== null ||
+      !isSessionLeaseCurrent(sessionLease)
+    ) {
+      return;
+    }
     queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
     queryClient.removeQueries({ queryKey: ['practice-question'] });
-    setUser({ ...user, diagnosticCompleted: false, cefrLevel: null });
-  }, [queryClient, setUser, stats?.level, user]);
+    setUser((current) =>
+      current?.id === user.id
+        ? { ...current, diagnosticCompleted: false, cefrLevel: null }
+        : current,
+    );
+  }, [isSessionLeaseCurrent, queryClient, sessionLease, setUser, stats?.level, user]);
 
   // Home is the root of the signed-in stack: while the entry gate is still
   // beneath it, Android hardware back must not pop back onto the gate (which
@@ -161,7 +198,7 @@ export default function HomeScreen() {
           <Button
             title={t('common.tryAgain')}
             fullWidth
-            onPress={() => void statsQuery.refetch()}
+            onPress={() => void statsQuery.refetch({ cancelRefetch: false })}
             style={styles.primaryAction}
           />
         </View>
@@ -244,7 +281,7 @@ export default function HomeScreen() {
       <Button
         title={t('home.startPractice')}
         fullWidth
-        onPress={() => router.push('/practice')}
+        onPress={() => navigateOnce('/practice')}
         style={styles.primaryAction}
       />
 
@@ -253,13 +290,13 @@ export default function HomeScreen() {
           title={t('header.history')}
           variant="quiet"
           size="sm"
-          onPress={() => router.push('/history')}
+          onPress={() => navigateOnce('/history')}
         />
         <Button
           title={t('header.settings')}
           variant="quiet"
           size="sm"
-          onPress={() => router.push('/settings')}
+          onPress={() => navigateOnce('/settings')}
         />
       </View>
     </ScrollView>

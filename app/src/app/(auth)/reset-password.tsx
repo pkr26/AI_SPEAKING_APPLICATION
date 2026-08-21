@@ -1,5 +1,5 @@
-import { Link, router, useLocalSearchParams } from 'expo-router';
-import React, { useRef, useState } from 'react';
+import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -17,6 +17,7 @@ import { MAX_EMAIL_LENGTH, MAX_PASSWORD_UTF8_BYTES, passwordPolicyError } from '
 import { useT } from '../../lib/i18n';
 import { firstParam } from '../../lib/params';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 const MAX_RESET_CODE_LENGTH = 128;
 
@@ -26,6 +27,7 @@ const MAX_RESET_CODE_LENGTH = 128;
  */
 export default function ResetPasswordScreen() {
   const t = useT();
+  const navigation = useNavigation();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
@@ -40,6 +42,32 @@ export default function ResetPasswordScreen() {
   const codeRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const publishNavigationLock = () => {
+    if (!mountedRef.current) return;
+    navigation.setOptions(
+      busyRef.current
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  };
+  useHardwareBack(() => busyRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (busyRef.current && event.data.action.type === 'GO_BACK') event.preventDefault();
+    });
+    return unsubscribe;
+  }, [navigation]);
+  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
+    if (busyRef.current) event.preventDefault();
+  };
 
   const trimmedEmail = email.trim();
   const trimmedCode = code.trim();
@@ -55,6 +83,7 @@ export default function ResetPasswordScreen() {
   const handleSubmit = async () => {
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
+    publishNavigationLock();
     setBusy(true);
     setError(null);
     try {
@@ -63,12 +92,17 @@ export default function ResetPasswordScreen() {
       // dismissTo, not replace: the code is spent, so the request step and its
       // "check your email" state must leave the stack with this screen instead
       // of staying one back-gesture away with a code that now fails.
-      router.dismissTo({ pathname: '/login', params: { notice: 'reset' } });
+      if (mountedRef.current) {
+        router.dismissTo({ pathname: '/login', params: { notice: 'reset' } });
+      }
     } catch (err) {
-      setError(userMessageForError(err, t('cp.failed')));
+      if (mountedRef.current) setError(userMessageForError(err, t('cp.failed')));
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        publishNavigationLock();
+        setBusy(false);
+      }
     }
   };
 
@@ -185,7 +219,12 @@ export default function ResetPasswordScreen() {
             style={styles.submitButton}
           />
 
-          <Link href="/login" style={styles.footerLink}>
+          <Link
+            href="/login"
+            accessibilityState={{ disabled: busy }}
+            onPress={blockLinkWhileBusy}
+            style={styles.footerLink}
+          >
             {t('reset.backToLogin')}
           </Link>
         </ScrollView>

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
@@ -20,11 +20,19 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
 const te = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('te', key, params);
 
+interface MockFocusRegistration {
+  callback: () => void | (() => void);
+  cleanup: (() => void) | null;
+}
+
+const mockHomeFocusRegistrations: MockFocusRegistration[] = [];
+
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
   return {
     router: {
       push: jest.fn(),
+      navigate: jest.fn(),
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
@@ -32,8 +40,15 @@ jest.mock('expo-router', () => {
     },
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
+        const registration = { callback, cleanup: null as (() => void) | null };
+        mockHomeFocusRegistrations.push(registration);
         const cleanup = callback();
-        return typeof cleanup === 'function' ? cleanup : undefined;
+        registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        return () => {
+          registration.cleanup?.();
+          const index = mockHomeFocusRegistrations.indexOf(registration);
+          if (index >= 0) mockHomeFocusRegistrations.splice(index, 1);
+        };
       }, [callback]);
     },
   };
@@ -61,6 +76,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -107,6 +124,7 @@ jest.mock('../src/lib/api', () => ({
 const mockGetStats = apiGetPracticeStats as jest.Mock;
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
+  navigate: jest.Mock;
   replace: jest.Mock;
   back: jest.Mock;
   canGoBack: jest.Mock;
@@ -164,6 +182,40 @@ function parentOf(node: TestInstance): TestInstance {
   return parent;
 }
 
+function committedPressHandler(node: TestInstance): () => unknown {
+  type Fiber = {
+    memoizedProps?: { onPress?: unknown };
+    return: Fiber | null;
+  };
+  let fiber = node.unstable_fiber as Fiber | null;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.onPress as () => unknown;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
+}
+
+async function blurHome(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockHomeFocusRegistrations) {
+      const cleanup = registration.cleanup;
+      registration.cleanup = null;
+      cleanup?.();
+    }
+  });
+}
+
+async function focusHome(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockHomeFocusRegistrations) {
+      const cleanup = registration.callback();
+      registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+    }
+  });
+}
+
 /**
  * ScrollView renders as the host `RCTScrollView`, which keeps
  * `contentContainerStyle` as a prop instead of applying it to a child view.
@@ -190,6 +242,7 @@ beforeEach(() => {
   // Home is the whole signed-in stack unless a test puts a route beneath it;
   // clearAllMocks keeps recorded return values, so re-arm the default here.
   mockRouter.canGoBack.mockReturnValue(false);
+  mockHomeFocusRegistrations.length = 0;
   backHandlers = [];
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
     backHandlers.push(handler as () => boolean);
@@ -198,6 +251,11 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  // Unsubscribe Home before clearing its query cache. RNTL's automatic cleanup
+  // can run after this file's hook, which otherwise leaves a live observer for
+  // TanStack's timer-batched clear notification and produces a cross-test act
+  // warning under slower/full-suite scheduling.
+  cleanup();
   await act(async () => {
     for (const client of queryClients) client.clear();
     // TanStack batches cache-observer notifications through a timer; clearing
@@ -216,10 +274,33 @@ afterEach(async () => {
 describe('home screen', () => {
   it('shows a loading state while stats load', async () => {
     mockGetStats.mockReturnValue(new Promise(() => undefined));
-    await renderHome();
+    const queryClient = makeQueryClient();
+    const removeSpy = jest.spyOn(queryClient, 'removeQueries');
+    await renderHome(queryClient);
 
     expect(screen.getByText(t('home.loading'))).toBeTruthy();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
+    expect(removeSpy).not.toHaveBeenCalled();
+    expect(mockAuthValue.setUser).not.toHaveBeenCalled();
+  });
+
+  it('recaptures the auth lease when the session version changes for the same user', async () => {
+    const captureSessionLease = jest.fn(() => ({}) as never);
+    mockAuthValue = makeAuth({ captureSessionLease });
+    mockGetStats.mockReturnValue(new Promise(() => undefined));
+    const queryClient = makeQueryClient();
+    const tree = () => (
+      <QueryClientProvider client={queryClient}>
+        <HomeScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    expect(captureSessionLease).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ sessionVersion: 2, captureSessionLease });
+    await rendered.rerender(tree());
+
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
   });
 
   it('shows a retryable error when stats cannot load', async () => {
@@ -247,6 +328,51 @@ describe('home screen', () => {
     // the error state replaces the loading state rather than joining it.
     expect(screen.queryByText(/socket hang up/)).toBeNull();
     expect(screen.queryByText(t('home.loading'))).toBeNull();
+  });
+
+  it('joins repeated retries after cached empty stats fail in the background', async () => {
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(['practice-stats', USER.id], null);
+    let resolveRetry!: (stats: PracticeStats) => void;
+    const retryRequest = new Promise<PracticeStats>((resolve) => {
+      resolveRetry = resolve;
+    });
+    mockGetStats
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockReturnValue(retryRequest);
+    await renderHome(queryClient);
+
+    const retryButton = await screen.findByRole('button', { name: t('common.tryAgain') });
+    const retry = committedPressHandler(retryButton);
+    await act(async () => {
+      void retry();
+      void retry();
+      await Promise.resolve();
+      resolveRetry(STATS);
+      // refetch() is intentionally voided by the button contract. Drain the
+      // query promise and both batched observer-notification turns here instead
+      // of leaving a mounted observer pending for global suite teardown.
+      await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(mockGetStats).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('B1')).toBeTruthy();
+  });
+
+  it('keeps cached stats visible when their background refresh fails', async () => {
+    const queryClient = makeQueryClient();
+    queryClient.setQueryData(['practice-stats', USER.id], STATS);
+    mockGetStats.mockRejectedValue(new ApiError(500, 'background failure'));
+    await renderHome(queryClient);
+
+    await waitFor(() =>
+      expect(queryClient.getQueryState(['practice-stats', USER.id])?.status).toBe('error'),
+    );
+    expect(screen.getByText('B1')).toBeTruthy();
+    expect(screen.queryByText(t('home.loadFailedTitle'))).toBeNull();
+    expect(screen.getByRole('button', { name: t('home.startPractice') })).toBeTruthy();
   });
 
   it('renders level, mastery progress, streak, due chip, and today line from stats', async () => {
@@ -312,6 +438,7 @@ describe('home screen', () => {
     const client = makeQueryClient();
     client.setQueryData(['diagnostic-next', 1, USER.id], { done: true, level: 'B1' });
     client.setQueryData(['practice-question', USER.id, USER.cefrLevel], { stale: true });
+    client.setQueryData(['unrelated-sentinel'], { keep: true });
     mockGetStats.mockResolvedValue({
       level: null,
       progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
@@ -329,14 +456,21 @@ describe('home screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    await waitFor(() => {
-      expect(mockAuthValue.setUser).toHaveBeenCalledWith({
-        ...USER,
-        diagnosticCompleted: false,
-        cefrLevel: null,
-      });
+    await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(expect.any(Function)));
+    const updateUser = jest.mocked(mockAuthValue.setUser).mock.calls[0][0] as (
+      current: User | null,
+    ) => User | null;
+    expect(updateUser({ ...USER, name: 'Newest profile name' })).toEqual({
+      ...USER,
+      name: 'Newest profile name',
+      diagnosticCompleted: false,
+      cefrLevel: null,
     });
+    const otherUser = { ...USER, id: '550e8400-e29b-41d4-a716-446655440099' };
+    expect(updateUser(otherUser)).toBe(otherUser);
+    expect(updateUser(null)).toBeNull();
     expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+    expect(screen.getByLabelText(t('gate.loadingProfile'))).toBeTruthy();
     expect(screen.queryByRole('button', { name: t('home.startPractice') })).toBeNull();
     expect(
       client.getQueryCache().find({
@@ -350,6 +484,40 @@ describe('home screen', () => {
         exact: true,
       }),
     ).toBeUndefined();
+    expect(client.getQueryData(['unrelated-sentinel'])).toEqual({ keep: true });
+  });
+
+  it('does not adopt a cross-device placement reset after its auth lease goes stale', async () => {
+    let leaseCurrent = true;
+    mockAuthValue = makeAuth({ isSessionLeaseCurrent: jest.fn(() => leaseCurrent) });
+    const queryClient = makeQueryClient();
+    const removeSpy = jest.spyOn(queryClient, 'removeQueries');
+    let resolveStats: (stats: PracticeStats) => void = () => undefined;
+    mockGetStats.mockReturnValue(
+      new Promise<PracticeStats>((resolve) => {
+        resolveStats = resolve;
+      }),
+    );
+    const staleStats: PracticeStats = {
+      level: null,
+      progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      streakDays: 0,
+      practicedToday: 0,
+      totalAttempts: 0,
+      lastPracticedAt: null,
+    };
+
+    await renderHome(queryClient);
+    await waitFor(() => expect(mockGetStats).toHaveBeenCalledTimes(1));
+    leaseCurrent = false;
+    await act(async () => {
+      resolveStats(staleStats);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(mockAuthValue.isSessionLeaseCurrent).toHaveBeenCalled());
+    expect(removeSpy).not.toHaveBeenCalled();
+    expect(mockAuthValue.setUser).not.toHaveBeenCalled();
   });
 
   it('drops the revision suffix from the mastery line when nothing is in revision', async () => {
@@ -376,6 +544,17 @@ describe('home screen', () => {
       width: '30%',
       backgroundColor: colors.success,
     });
+  });
+
+  it('renders a zero-width mastery fill when the level total is defensively zero', async () => {
+    mockGetStats.mockResolvedValue({
+      ...STATS,
+      progress: { ...STATS.progress, masteredCount: 0, totalAtLevel: 0 },
+    });
+    await renderHome();
+
+    const bar = await screen.findByRole('progressbar', { name: t('home.masteryLabel') });
+    expect(flattenedStyle(bar.children[0] as TestInstance).width).toBe('0%');
   });
 
   it('uses the streak-start prompt and singular lines at low counts', async () => {
@@ -412,19 +591,40 @@ describe('home screen', () => {
     expect(screen.queryByText(te('home.streakMany', { count: 1 }))).toBeNull();
   });
 
-  it('navigates to practice, history, and settings', async () => {
+  it.each([
+    [t('home.startPractice'), '/practice'],
+    [t('header.history'), '/history'],
+    [t('header.settings'), '/settings'],
+  ] as const)('navigates once from %s after a rapid double tap', async (label, destination) => {
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
     await screen.findByText('B1');
 
+    const press = committedPressHandler(screen.getByRole('button', { name: label }));
+    await act(async () => {
+      press();
+      press();
+    });
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
+  });
+
+  it('rejects a queued navigation after blur and accepts it after refocus', async () => {
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+    const staleNavigation = committedPressHandler(
+      screen.getByRole('button', { name: t('home.startPractice') }),
+    );
+
+    await blurHome();
+    void staleNavigation();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await focusHome();
     await fireEvent.press(screen.getByRole('button', { name: t('home.startPractice') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/practice');
-
-    await fireEvent.press(screen.getByRole('button', { name: t('header.history') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/history');
-
-    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
-    expect(mockRouter.push).toHaveBeenCalledWith('/settings');
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/practice');
   });
 
   it('shows the session summary card and dismisses it into the tally reset', async () => {

@@ -13,22 +13,37 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: 'ai-english-coach.practice-intro',
 };
 
+let storageQueue: Promise<void> = Promise.resolve();
+
+function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
+  const result = storageQueue.then(operation, operation);
+  storageQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 function storageKey(userId: string): string {
   return `${STORAGE_KEY_PREFIX}${userId}`;
 }
 
 export async function hasSeenPracticeIntro(userId: string): Promise<boolean> {
-  try {
-    return (await SecureStore.getItemAsync(storageKey(userId), STORAGE_OPTIONS)) !== null;
-  } catch {
-    return true;
-  }
+  return serializeStorage(async () => {
+    try {
+      return (await SecureStore.getItemAsync(storageKey(userId), STORAGE_OPTIONS)) !== null;
+    } catch {
+      return true;
+    }
+  });
 }
 
 export async function markPracticeIntroSeen(userId: string): Promise<void> {
-  try {
-    await SecureStore.setItemAsync(storageKey(userId), '1', STORAGE_OPTIONS);
-  } catch {
-    // Best effort: the explainer may show once more on the next visit.
-  }
+  await serializeStorage(async () => {
+    try {
+      await SecureStore.setItemAsync(storageKey(userId), '1', STORAGE_OPTIONS);
+    } catch {
+      // Best effort: the explainer may show once more on the next visit.
+    }
+  });
 }

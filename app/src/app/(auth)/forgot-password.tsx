@@ -1,5 +1,5 @@
-import { Link, router } from 'expo-router';
-import React, { useRef, useState } from 'react';
+import { Link, router, useNavigation } from 'expo-router';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -8,6 +8,7 @@ import { apiForgotPassword, userMessageForError } from '../../lib/api';
 import { MAX_EMAIL_LENGTH } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 /**
  * Password reset, step 1: email entry. A successful request always advances to
@@ -16,38 +17,73 @@ import { createThemedStyles, useTheme } from '../../lib/theme';
  */
 export default function ForgotPasswordScreen() {
   const t = useT();
+  const navigation = useNavigation();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
   const [email, setEmail] = useState('');
   const [emailFocused, setEmailFocused] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [sent, setSent] = useState(false);
+  const [sentEmail, setSentEmail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const busyRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const publishNavigationLock = () => {
+    if (!mountedRef.current) return;
+    navigation.setOptions(
+      busyRef.current
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  };
+  useHardwareBack(() => busyRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (busyRef.current && event.data.action.type === 'GO_BACK') event.preventDefault();
+    });
+    return unsubscribe;
+  }, [navigation]);
+  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
+    if (busyRef.current) event.preventDefault();
+  };
 
   const trimmedEmail = email.trim();
   const canSubmit = trimmedEmail.length > 0 && trimmedEmail.length <= MAX_EMAIL_LENGTH && !busy;
 
   const handleSubmit = async () => {
     if (!canSubmit || busyRef.current) return;
+    const requestedEmail = trimmedEmail;
     busyRef.current = true;
+    publishNavigationLock();
     setBusy(true);
     setError(null);
     try {
-      await apiForgotPassword(trimmedEmail);
-      setSent(true);
+      await apiForgotPassword(requestedEmail);
+      // The field remains editable while the request is in flight. Pin the
+      // address that actually received the code so a late edit cannot prefill
+      // the next step with a different account.
+      if (mountedRef.current) setSentEmail(requestedEmail);
     } catch (err) {
       // Only transport/rate-limit failures surface; the 204 contract itself
       // never distinguishes existing from unknown accounts.
-      setError(userMessageForError(err, t('reset.requestFailed')));
+      if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        publishNavigationLock();
+        setBusy(false);
+      }
     }
   };
 
-  if (sent) {
+  if (sentEmail) {
     return (
       <SafeAreaView style={styles.flex}>
         <ScrollView contentContainerStyle={styles.container}>
@@ -63,11 +99,16 @@ export default function ForgotPasswordScreen() {
           <Button
             title={t('reset.continue')}
             onPress={() =>
-              router.navigate({ pathname: '/reset-password', params: { email: trimmedEmail } })
+              router.navigate({ pathname: '/reset-password', params: { email: sentEmail } })
             }
             style={styles.submitButton}
           />
-          <Link href="/login" style={styles.footerLink}>
+          <Link
+            href="/login"
+            accessibilityState={{ disabled: busy }}
+            onPress={blockLinkWhileBusy}
+            style={styles.footerLink}
+          >
             {t('reset.backToLogin')}
           </Link>
         </ScrollView>
@@ -121,7 +162,12 @@ export default function ForgotPasswordScreen() {
             style={styles.submitButton}
           />
 
-          <Link href="/login" style={styles.footerLink}>
+          <Link
+            href="/login"
+            accessibilityState={{ disabled: busy }}
+            onPress={blockLinkWhileBusy}
+            style={styles.footerLink}
+          >
             {t('reset.backToLogin')}
           </Link>
         </ScrollView>

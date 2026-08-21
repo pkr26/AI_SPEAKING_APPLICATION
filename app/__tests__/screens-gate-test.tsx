@@ -16,7 +16,7 @@ import NotFoundScreen from '../src/app/+not-found';
 import RootLayout, { ErrorBoundary } from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
-import type { useAuth } from '../src/lib/auth';
+import type { SessionLease, useAuth } from '../src/lib/auth';
 import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -124,6 +124,8 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    captureSessionLease: jest.fn(() => ({}) as never),
+    isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
     register: jest.fn(),
     logout: jest.fn(),
@@ -201,6 +203,23 @@ async function renderGate(queryClient = makeQueryClient()) {
     queryClient,
     rerenderGate: () => rendered.rerender(tree()),
   };
+}
+
+/** Reads the currently committed callback so two taps can land before React
+ * publishes the refetching render. */
+function committedPressHandler(node: TestInstance): () => unknown {
+  type Fiber = {
+    memoizedProps?: { onPress?: unknown };
+    return: Fiber | null;
+  };
+  let fiber = node.unstable_fiber as Fiber | null;
+  while (fiber) {
+    if (typeof fiber.memoizedProps?.onPress === 'function') {
+      return fiber.memoizedProps.onPress as () => unknown;
+    }
+    fiber = fiber.return;
+  }
+  throw new Error('No committed press handler found');
 }
 
 type SemanticStyle = Record<string, unknown>;
@@ -500,6 +519,39 @@ describe('root layout route guards', () => {
       await rendered.unmount();
       expect(remove).toHaveBeenCalledTimes(1);
       expect(setFocusedSpy).toHaveBeenLastCalledWith(undefined);
+    } finally {
+      addListenerSpy.mockRestore();
+      setFocusedSpy.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
+  });
+
+  it('does not miss a background transition while installing the focus bridge', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      value: 'active',
+    });
+    const remove = jest.fn();
+    const addListenerSpy = jest.spyOn(AppState, 'addEventListener').mockImplementation(() => {
+      // Model the transition in the exact setup gap. Subscribing first means
+      // the subsequent currentState sample observes it.
+      Object.defineProperty(AppState, 'currentState', {
+        configurable: true,
+        value: 'background',
+      });
+      return { remove } as ReturnType<typeof AppState.addEventListener>;
+    });
+    const setFocusedSpy = jest.spyOn(focusManager, 'setFocused');
+
+    try {
+      const rendered = await render(<RootLayout />);
+      expect(setFocusedSpy).toHaveBeenCalledWith(false);
+      await rendered.unmount();
     } finally {
       addListenerSpy.mockRestore();
       setFocusedSpy.mockRestore();
@@ -871,6 +923,40 @@ describe('index gate', () => {
     expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
   });
 
+  it('does not commit or route from /auth/me after the render-captured lease expires', async () => {
+    let resolveProfile!: (value: unknown) => void;
+    const profile = new Promise<unknown>((resolve) => {
+      resolveProfile = resolve;
+    });
+    const renderLease = { owner: 'gate-render' } as never;
+    let currentLease: unknown = renderLease;
+    const setUser = jest.fn();
+    mockAuthValue = makeAuth({
+      user: null,
+      setUser,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockReturnValue(profile);
+    await renderGate();
+    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(mockAuthValue.captureSessionLease).toHaveBeenCalledTimes(1);
+
+    // Invalidate Auth synchronously without granting React a rerender first.
+    // A query-key/sessionVersion guard alone cannot cover this interval.
+    currentLease = { owner: 'replacement-session' };
+    await act(async () => {
+      resolveProfile({ user: USER });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(setUser).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('redirect')).toBeNull();
+    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+  });
+
   it('shows a signing-out spinner when the stored token is rejected', async () => {
     mockAuthValue = makeAuth({ user: null });
     mockApiFetch.mockRejectedValue(new ApiError(401, 'unauthorized'));
@@ -911,6 +997,32 @@ describe('index gate', () => {
     });
     await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(fetched));
     expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
+    expect(mockApiFetch).toHaveBeenCalledTimes(2);
+  });
+
+  it('joins repeated retries after a cached empty profile fails in the background', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    const queryClient = makeQueryClient();
+    // `null` is hostile cached input, but it is still defined query data. That
+    // distinction makes TanStack cancel and restart an active refetch unless
+    // the screen explicitly opts into joining it.
+    queryClient.setQueryData(['me', 1], null);
+    const retryRequest = new Promise<unknown>(() => undefined);
+    mockApiFetch
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockReturnValue(retryRequest);
+    await renderGate(queryClient);
+
+    const button = await screen.findByRole('button', { name: t('common.tryAgain') });
+    const retry = committedPressHandler(button);
+    await act(async () => {
+      void retry();
+      void retry();
+      await Promise.resolve();
+    });
+
+    // One failed background fetch plus one joined manual retry. The second tap
+    // must not abort that retry and create a third profile request.
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
   });
 

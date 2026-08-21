@@ -9,6 +9,7 @@ import {
   getDailyReminder,
   isReminderHour,
   parseDailyReminder,
+  refreshDailyReminderLanguage,
   type DailyReminder,
 } from '../src/lib/daily-reminder';
 import { dictionaries } from '../src/lib/i18n';
@@ -125,6 +126,31 @@ describe('getDailyReminder', () => {
   it('returns the stored hour', async () => {
     getItemAsync.mockImplementation(async () => JSON.stringify({ hour: 8 }));
     await expect(getDailyReminder()).resolves.toEqual({ hour: 8 });
+  });
+
+  it('waits for an earlier in-flight enable before reading storage', async () => {
+    let persisted: string | null = null;
+    getItemAsync.mockImplementation(async () => persisted);
+    setItemAsync.mockImplementation(async (_key: string, value: string) => {
+      persisted = value;
+    });
+    const scheduled = deferred<string>();
+    const scheduleStarted = deferred<void>();
+    mockScheduleNotificationAsync.mockImplementationOnce(async () => {
+      scheduleStarted.resolve();
+      return scheduled.promise;
+    });
+
+    const enabling = enableDailyReminder(19);
+    await scheduleStarted.promise;
+    const reading = getDailyReminder();
+    await Promise.resolve();
+    const readsBeforeRelease = getItemAsync.mock.calls.length;
+
+    scheduled.resolve('notification-id');
+    await expect(enabling).resolves.toBe('enabled');
+    await expect(reading).resolves.toEqual({ hour: 19 });
+    expect(readsBeforeRelease).toBe(0);
   });
 
   it.each([
@@ -385,6 +411,7 @@ describe('disableDailyReminder', () => {
       throw new Error('os error');
     });
     await expect(disableDailyReminder()).rejects.toThrow('os error');
+    expect(setItemAsync).not.toHaveBeenCalled();
   });
 });
 
@@ -434,5 +461,64 @@ describe('cancelDailyReminderQuietly', () => {
     expect(setItemAsync.mock.invocationCallOrder[0]).toBeLessThan(
       deleteItemAsync.mock.invocationCallOrder[0],
     );
+  });
+});
+
+describe('refreshDailyReminderLanguage', () => {
+  it('reads and re-schedules an enabled reminder inside one queued transaction', async () => {
+    withPersistedReminder({ hour: 8 });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({ hour: 8 });
+
+    expect(mockScheduleNotificationAsync).toHaveBeenCalledWith(
+      expect.objectContaining({
+        content: {
+          title: dictionaries.hi['reminder.notificationTitle'],
+          body: dictionaries.hi['reminder.notificationBody'],
+        },
+        trigger: expect.objectContaining({ hour: 8 }),
+      }),
+    );
+    await expect(getDailyReminder()).resolves.toEqual({ hour: 8 });
+  });
+
+  it('returns null without scheduling when reminders are off', async () => {
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toBeNull();
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+  });
+
+  it('lets a logout cancellation queued during refresh remain authoritative', async () => {
+    withPersistedReminder({ hour: 19 });
+    const scheduled = deferred<string>();
+    const scheduleStarted = deferred<void>();
+    mockScheduleNotificationAsync.mockImplementationOnce(async () => {
+      scheduleStarted.resolve();
+      return scheduled.promise;
+    });
+
+    const refreshing = refreshDailyReminderLanguage('hi');
+    await scheduleStarted.promise;
+    const loggingOut = cancelDailyReminderQuietly();
+    await Promise.resolve();
+    await Promise.resolve();
+    // Logout cannot cut through the atomic read/cancel/schedule/write refresh.
+    const deletesBeforeRelease = deleteItemAsync.mock.calls.length;
+
+    scheduled.resolve('notification-id');
+    await expect(refreshing).resolves.toEqual({ hour: 19 });
+    await expect(loggingOut).resolves.toBeUndefined();
+    expect(deletesBeforeRelease).toBe(0);
+    await expect(getDailyReminder()).resolves.toBeNull();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns null when permission was revoked and leaves no stored preference', async () => {
+    withPersistedReminder({ hour: 19 });
+    mockGetPermissionsAsync.mockResolvedValue({ granted: false });
+    mockRequestPermissionsAsync.mockResolvedValue({ granted: false });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toBeNull();
+    await expect(getDailyReminder()).resolves.toBeNull();
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
   });
 });

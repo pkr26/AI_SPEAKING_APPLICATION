@@ -198,6 +198,38 @@ describe('question and diagnostic contract parsers', () => {
     );
   });
 
+  it('validates one stable snapshot of diagnostic progress getters', () => {
+    let askedReads = 0;
+    const invalidProgress = { maxQuestions: 6 } as { asked: number; maxQuestions: number };
+    Object.defineProperty(invalidProgress, 'asked', {
+      enumerable: true,
+      get: () => {
+        askedReads += 1;
+        return askedReads === 1 ? Number.POSITIVE_INFINITY : 0;
+      },
+    });
+    expectContractError(() =>
+      parseDiagnosticNext({ done: false, question, progress: invalidProgress }),
+    );
+    expect(askedReads).toBe(1);
+
+    let maximumReads = 0;
+    const validProgress = { asked: 0 } as { asked: number; maxQuestions: number };
+    Object.defineProperty(validProgress, 'maxQuestions', {
+      enumerable: true,
+      get: () => {
+        maximumReads += 1;
+        return maximumReads < 3 ? 1 : 0;
+      },
+    });
+    expect(parseDiagnosticNext({ done: false, question, progress: validProgress })).toEqual({
+      done: false,
+      question,
+      progress: { asked: 0, maxQuestions: 1 },
+    });
+    expect(maximumReads).toBe(1);
+  });
+
   it('accepts valid diagnostic answers and rejects malformed optional values', () => {
     const answer = {
       passed: true,
@@ -218,6 +250,34 @@ describe('question and diagnostic contract parsers', () => {
     expectContractError(() =>
       parseDiagnosticAnswerResult({ ...answer, done: true, level: undefined }),
     );
+  });
+
+  it('uses the first next-question snapshot in a diagnostic answer', () => {
+    let reads = 0;
+    const answer = {
+      passed: true,
+      score: 82,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: false,
+    } as Record<string, unknown>;
+    Object.defineProperty(answer, 'nextQuestion', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? question : undefined;
+      },
+    });
+
+    expect(parseDiagnosticAnswerResult(answer)).toEqual({
+      passed: true,
+      score: 82,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: false,
+      nextQuestion: question,
+    });
+    expect(reads).toBe(1);
   });
 
   it('enforces diagnostic-next discriminants one forbidden field at a time', () => {
@@ -882,6 +942,77 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() => parseAttemptResult({ ...final, next: undefined }));
   });
 
+  it.each(['passed', 'mastered'] as const)(
+    'rejects the first non-boolean %s snapshot even if a later getter read changes it',
+    (field) => {
+      let reads = 0;
+      const result = {
+        passed: true,
+        mastered: true,
+        attemptNo: 1,
+        score: 90,
+        transcript: 'A complete answer.',
+        feedback: 'Great.',
+        next: practicePayload,
+      } as Record<string, unknown>;
+      Object.defineProperty(result, field, {
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          return reads === 1 ? 'yes' : true;
+        },
+      });
+
+      expectContractError(() => parseAttemptResult(result));
+      expect(reads).toBe(1);
+    },
+  );
+
+  it('rejects the first invalid attempts-left snapshot on the final attempt', () => {
+    let reads = 0;
+    const result = {
+      passed: false,
+      mastered: false,
+      attemptNo: 3,
+      score: 50,
+      transcript: 'A short final answer.',
+      feedback: 'Try again.',
+    } as Record<string, unknown>;
+    Object.defineProperty(result, 'attemptsLeft', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? 1 : 0;
+      },
+    });
+
+    expectContractError(() => parseAttemptResult(result));
+    expect(reads).toBe(1);
+  });
+
+  it.each([
+    ['passed', { passed: true, mastered: true, attemptNo: 1, score: 90 }],
+    ['final', { passed: false, mastered: false, attemptNo: 3, score: 50, attemptsLeft: 0 }],
+  ] as const)('uses one stable next payload for a %s result', (_variant, fields) => {
+    let reads = 0;
+    const result = {
+      transcript: 'A complete answer.',
+      feedback: 'Feedback.',
+      ...(fields.passed ? {} : { finalFeedback: 'Review the example and continue.' }),
+      ...fields,
+    } as Record<string, unknown>;
+    Object.defineProperty(result, 'next', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? practicePayload : undefined;
+      },
+    });
+
+    expect(parseAttemptResult(result)).toMatchObject({ next: practicePayload });
+    expect(reads).toBe(1);
+  });
+
   it.each([
     ['a passing score marked failed', { passed: false, mastered: false, score: 60 }],
     ['a failing score marked passed', { passed: true, mastered: false, score: 59 }],
@@ -1111,6 +1242,21 @@ describe('audio upload grant parser', () => {
     expect(parseAudioUploadGrant(s3)).toEqual(s3);
   });
 
+  it('parses one stable snapshot of a signed audio key', () => {
+    let reads = 0;
+    const grant = { ...s3 } as Record<string, unknown>;
+    Object.defineProperty(grant, 'audioKey', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+        return reads === 1 ? audioKey : undefined;
+      },
+    });
+
+    expect(parseAudioUploadGrant(grant)).toEqual(s3);
+    expect(reads).toBe(1);
+  });
+
   it('strips unknown fields from grants', () => {
     expect(parseAudioUploadGrant({ mode: 'direct', extra: 'x' })).toEqual({
       mode: 'direct',
@@ -1278,6 +1424,19 @@ describe('audio upload grant parser', () => {
     }
   });
 
+  it('does not inherit required multipart fields from a polluted object prototype', () => {
+    const pollutedPrototype = {
+      key: audioKey,
+      'Content-Type': 'audio/mp4',
+    };
+    const uploadFields = Object.assign(Object.create(pollutedPrototype) as Record<string, string>, {
+      Policy: 'signed-policy',
+      'x-amz-algorithm': 'AWS4-HMAC-SHA256',
+    });
+
+    expectContractError(() => parseAudioUploadGrant({ ...s3, uploadFields }));
+  });
+
   it('rejects array, whitespace-only, and non-string multipart fields independently', () => {
     expectContractError(() =>
       parseAudioUploadGrant({
@@ -1392,6 +1551,15 @@ describe('audio key ownership', () => {
     expect(
       audioKeyBelongsToOwner(`audio-uploads/${otherOwnerId}/${recordingId}.m4a`, ownerId),
     ).toBe(false);
+  });
+
+  it('rejects a string-like forged key without invoking an unsafe missing segment method', () => {
+    const forged = {
+      toString: () => ownedKey,
+    } as unknown as string;
+
+    expect(() => audioKeyBelongsToOwner(forged, ownerId)).not.toThrow();
+    expect(audioKeyBelongsToOwner(forged, ownerId)).toBe(false);
   });
 
   it.each([
@@ -1624,6 +1792,77 @@ describe('practice stats parser', () => {
     };
     expect(parsePracticeStats(prePlacement)).toEqual(prePlacement);
   });
+
+  it.each(['masteredCount', 'learningCount'] as const)(
+    'rejects a null level from one stable nonzero %s snapshot',
+    (field) => {
+      let totalReads = 0;
+      let counterReads = 0;
+      const progress = {
+        masteredCount: 0,
+        learningCount: 0,
+        dueCount: 0,
+      } as {
+        masteredCount: number;
+        learningCount: number;
+        totalAtLevel: number;
+        dueCount: number;
+      };
+      Object.defineProperty(progress, field, {
+        enumerable: true,
+        get: () => {
+          counterReads += 1;
+          return counterReads === 1 ? 1 : 0;
+        },
+      });
+      Object.defineProperty(progress, 'totalAtLevel', {
+        enumerable: true,
+        get: () => {
+          totalReads += 1;
+          return totalReads < 3 ? 1 : 0;
+        },
+      });
+
+      expectContractError(() => parsePracticeStats({ ...stats, level: null, progress }));
+      expect(counterReads).toBe(1);
+      expect(totalReads).toBe(1);
+    },
+  );
+
+  it.each(['totalAtLevel', 'dueCount'] as const)(
+    'returns the first zero %s snapshot for pre-placement stats',
+    (field) => {
+      let reads = 0;
+      const progress = {
+        masteredCount: 0,
+        learningCount: 0,
+        totalAtLevel: 0,
+        dueCount: 0,
+      };
+      Object.defineProperty(progress, field, {
+        enumerable: true,
+        get: () => {
+          reads += 1;
+          return reads < 3 ? 0 : 1;
+        },
+      });
+      const value = {
+        ...stats,
+        level: null,
+        progress,
+        streakDays: 0,
+        practicedToday: 0,
+        totalAttempts: 0,
+        lastPracticedAt: null,
+      };
+
+      expect(parsePracticeStats(value)).toEqual({
+        ...value,
+        progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      });
+      expect(reads).toBe(1);
+    },
+  );
 
   it.each([
     [

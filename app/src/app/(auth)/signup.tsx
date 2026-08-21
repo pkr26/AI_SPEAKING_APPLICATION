@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Link, router, useFocusEffect } from 'expo-router';
+import { Link, router, useFocusEffect, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
@@ -23,6 +23,7 @@ import {
 import { translateFor, useI18n, type MessageParams, type MessageKey } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
   { code: 'te', english: 'Telugu', native: 'తెలుగు' },
@@ -33,6 +34,7 @@ const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
 
 export default function SignupScreen() {
   const { register } = useAuth();
+  const navigation = useNavigation();
   const { language: contextLanguage, setPreviewLanguage } = useI18n();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -48,6 +50,32 @@ export default function SignupScreen() {
   const emailRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
+  const mountedRef = useRef(true);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  const publishNavigationLock = () => {
+    if (!mountedRef.current) return;
+    navigation.setOptions(
+      busyRef.current
+        ? { headerBackVisible: false, gestureEnabled: false }
+        : { headerBackVisible: true, gestureEnabled: true },
+    );
+  };
+  useHardwareBack(() => busyRef.current);
+  useEffect(() => {
+    const unsubscribe = navigation.addListener('beforeRemove', (event) => {
+      if (busyRef.current && event.data.action.type === 'GO_BACK') event.preventDefault();
+    });
+    return unsubscribe;
+  }, [navigation]);
+  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
+    if (busyRef.current) event.preventDefault();
+  };
 
   // Live preview: tapping a language chip switches this screen's UI language
   // immediately, before any account exists. The chosen language is also pushed
@@ -81,12 +109,14 @@ export default function SignupScreen() {
   const handleSignup = async () => {
     if (!canSubmit || !nativeLanguage || busyRef.current) return;
     busyRef.current = true;
+    publishNavigationLock();
     setBusy(true);
     setError(null);
     try {
       await register(name.trim(), email.trim(), password, nativeLanguage);
-      router.replace('/');
+      if (mountedRef.current) router.replace('/');
     } catch (err) {
+      if (!mountedRef.current) return;
       if (err instanceof ApiError && err.status === 409) {
         setError(t('error.emailTaken'));
       } else {
@@ -94,7 +124,10 @@ export default function SignupScreen() {
       }
     } finally {
       busyRef.current = false;
-      setBusy(false);
+      if (mountedRef.current) {
+        publishNavigationLock();
+        setBusy(false);
+      }
     }
   };
 
@@ -239,7 +272,12 @@ export default function SignupScreen() {
 
           <View style={styles.footer}>
             <Text style={styles.footerText}>{t('signup.footerPrompt')}</Text>
-            <Link href="/login" style={styles.footerLink}>
+            <Link
+              href="/login"
+              accessibilityState={{ disabled: busy }}
+              onPress={blockLinkWhileBusy}
+              style={styles.footerLink}
+            >
               {t('signup.footerLink')}
             </Link>
           </View>

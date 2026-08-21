@@ -19,6 +19,16 @@ const EXPECTED_OPTIONS = {
   keychainService: 'ai-english-coach.session-notice',
 };
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockedGetItem.mockResolvedValue(null);
@@ -48,6 +58,40 @@ describe('session expired notice', () => {
     await expect(markSessionExpiredNotice()).rejects.toThrow('keychain unavailable');
   });
 
+  it('keeps the storage queue usable after a persist failure', async () => {
+    mockedSetItem.mockRejectedValueOnce(new Error('keychain unavailable'));
+    await expect(markSessionExpiredNotice()).rejects.toThrow('keychain unavailable');
+    mockedGetItem.mockResolvedValueOnce('1');
+
+    await expect(consumeSessionExpiredNotice()).resolves.toBe(true);
+  });
+
+  it('orders login consumption after an in-flight expiry mark', async () => {
+    let stored: string | null = null;
+    const writeStarted = deferred<void>();
+    const allowWrite = deferred<void>();
+    mockedSetItem.mockImplementationOnce(async () => {
+      writeStarted.resolve();
+      await allowWrite.promise;
+      stored = '1';
+    });
+    mockedGetItem.mockImplementation(async () => stored);
+    mockedDeleteItem.mockImplementation(async () => {
+      stored = null;
+    });
+
+    const marking = markSessionExpiredNotice();
+    await writeStarted.promise;
+    const consuming = consumeSessionExpiredNotice();
+    await Promise.resolve();
+    expect(mockedGetItem).not.toHaveBeenCalled();
+
+    allowWrite.resolve();
+    await expect(marking).resolves.toBeUndefined();
+    await expect(consuming).resolves.toBe(true);
+    expect(stored).toBeNull();
+  });
+
   it('consumes a stored flag exactly once', async () => {
     mockedGetItem.mockResolvedValueOnce('1');
 
@@ -56,6 +100,19 @@ describe('session expired notice', () => {
     expect(mockedDeleteItem).toHaveBeenCalledWith('session_expired_notice_v1', EXPECTED_OPTIONS);
 
     await expect(consumeSessionExpiredNotice()).resolves.toBe(false);
+  });
+
+  it('allows only one of two concurrent consumers to claim the one-shot flag', async () => {
+    let stored: string | null = '1';
+    mockedGetItem.mockImplementation(async () => stored);
+    mockedDeleteItem.mockImplementation(async () => {
+      stored = null;
+    });
+
+    await expect(
+      Promise.all([consumeSessionExpiredNotice(), consumeSessionExpiredNotice()]),
+    ).resolves.toEqual([true, false]);
+    expect(mockedDeleteItem).toHaveBeenCalledTimes(1);
   });
 
   it('reports no notice when nothing was stored', async () => {

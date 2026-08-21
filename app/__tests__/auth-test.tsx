@@ -15,6 +15,7 @@ import {
   AccountDeletedCleanupError,
   AuthProvider,
   LogoutCleanupError,
+  type SessionLease,
   useAuth,
 } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
@@ -760,6 +761,55 @@ describe('expireSession via the unauthorized handler', () => {
     expect(text('token')).toBe('tok-new');
   });
 
+  it('waits for cleanup appended while a new session is waiting on the prior cleanup', async () => {
+    await renderAuth(null);
+    const firstCleanup = deferred<void>();
+    const appendedCleanup = deferred<void>();
+    mockedClearPendingAssessment
+      .mockReturnValueOnce(firstCleanup.promise)
+      .mockReturnValueOnce(appendedCleanup.promise);
+
+    await act(async () => {
+      auth!.resetStoredSession();
+    });
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-must-not-save'));
+    let login!: Promise<User>;
+    let settled = false;
+    await act(async () => {
+      login = auth!.login('a@example.com', 'secret1');
+      void login.then(
+        () => {
+          settled = true;
+        },
+        () => {
+          settled = true;
+        },
+      );
+      await Promise.resolve();
+      auth!.resetStoredSession();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      firstCleanup.resolve();
+      await firstCleanup.promise;
+      await Promise.resolve();
+    });
+    const settledBeforeRelease = settled;
+    const saveCallsBeforeRelease = mockedSaveToken.mock.calls.length;
+
+    let loginError: unknown;
+    await act(async () => {
+      appendedCleanup.resolve();
+      await appendedCleanup.promise;
+      loginError = await login.catch((error: unknown) => error);
+    });
+    expect(settledBeforeRelease).toBe(false);
+    expect(saveCallsBeforeRelease).toBe(0);
+    expect(loginError).toMatchObject({ message: 'The account operation was cancelled.' });
+    expect(mockedSaveToken).not.toHaveBeenCalled();
+  });
+
   it('retries a failed old-account cleanup before saving a new session', async () => {
     await renderLoggedIn();
     mockedSaveToken.mockClear();
@@ -1364,6 +1414,170 @@ describe('epoch race guards', () => {
     write.resolve();
     await expect(login).rejects.toThrow('The account operation was cancelled.');
     expect(mockedClearToken).toHaveBeenLastCalledWith('tok-late');
+  });
+});
+
+describe('session leases', () => {
+  function captureCurrentLease() {
+    const lease = auth!.captureSessionLease();
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+    return lease;
+  }
+
+  it('keeps a lease current across a same-user profile update', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const renamed = { ...USER, name: 'Updated Name' };
+
+    await act(async () => {
+      auth!.setUser(renamed);
+      // The imperative user mirror updates in the setter itself; this assertion
+      // runs before React commits the context update.
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+    });
+
+    expect(auth!.user).toEqual(renamed);
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+  });
+
+  it('keeps the synchronous user mirror correct for a functional profile update', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+
+    await act(async () => {
+      auth!.setUser((current) => ({ ...current!, name: 'Functionally Updated' }));
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+    });
+
+    expect(auth!.user?.name).toBe('Functionally Updated');
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+  });
+
+  it('captures and validates the logged-out session identity', async () => {
+    await renderAuth(null);
+
+    const lease = auth!.captureSessionLease();
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+  });
+
+  it('rejects an unbranded copy of an otherwise-current lease', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const unbranded = Object.fromEntries(Object.entries(lease)) as unknown as SessionLease;
+
+    expect(auth!.isSessionLeaseCurrent(unbranded)).toBe(false);
+  });
+
+  it('rejects a branded lease whose token snapshot does not match', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const wrongToken = { ...lease, token: 'tok-other' } as SessionLease;
+
+    expect(auth!.isSessionLeaseCurrent(wrongToken)).toBe(false);
+  });
+
+  it('invalidates a lease immediately when the context user identity changes', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const otherUser = {
+      ...USER,
+      id: '550e8400-e29b-41d4-a716-446655440099',
+      email: 'other@example.com',
+    };
+
+    await act(async () => {
+      auth!.setUser(otherUser);
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    });
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    expect(auth!.isSessionLeaseCurrent(auth!.captureSessionLease())).toBe(true);
+  });
+
+  it('invalidates an old lease as soon as logout begins, before its request settles', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const response = deferred<unknown>();
+    mockedApiFetch.mockReturnValueOnce(response.promise);
+    let logout!: Promise<void>;
+
+    await act(async () => {
+      logout = auth!.logout();
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      response.resolve(undefined);
+      await logout;
+    });
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+  });
+
+  it('invalidates an old lease as soon as password rotation begins', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const response = deferred<unknown>();
+    mockedApiFetch.mockReturnValueOnce(response.promise);
+    let rotation!: Promise<void>;
+
+    await act(async () => {
+      rotation = auth!.changePassword('secret1', 'secret2');
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      response.resolve(authResponse('tok-rotated'));
+      await rotation;
+    });
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    expect(auth!.isSessionLeaseCurrent(auth!.captureSessionLease())).toBe(true);
+  });
+
+  it('invalidates an old lease as soon as account deletion begins', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+    const response = deferred<unknown>();
+    mockedApiFetch.mockReturnValueOnce(response.promise);
+    let deletion!: Promise<void>;
+
+    await act(async () => {
+      deletion = auth!.deleteAccount('secret1');
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      response.resolve(undefined);
+      await deletion;
+    });
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+  });
+
+  it('invalidates an old lease synchronously when the stored session is reset', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+
+    await act(async () => {
+      auth!.resetStoredSession();
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    });
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+  });
+
+  it('invalidates an old lease synchronously when a 401 expires the session', async () => {
+    await renderLoggedIn();
+    const lease = captureCurrentLease();
+
+    await act(async () => {
+      registeredUnauthorizedHandler()('tok-1');
+      expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    });
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
   });
 });
 

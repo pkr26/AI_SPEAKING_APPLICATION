@@ -64,8 +64,8 @@ export function parseDailyReminder(value: unknown): DailyReminder | null {
   return isReminderHour(hour) ? { hour } : null;
 }
 
-/** The stored reminder preference; unreadable or invalid storage reads as off. */
-export async function getDailyReminder(): Promise<DailyReminder | null> {
+/** The stored reminder preference; caller must already own reminderQueue. */
+async function getDailyReminderUnsafe(): Promise<DailyReminder | null> {
   let stored: string | null;
   try {
     stored = await SecureStore.getItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
@@ -78,6 +78,11 @@ export async function getDailyReminder(): Promise<DailyReminder | null> {
   } catch {
     return null;
   }
+}
+
+/** The stored reminder preference; unreadable or invalid storage reads as off. */
+export function getDailyReminder(): Promise<DailyReminder | null> {
+  return withReminderLock(getDailyReminderUnsafe);
 }
 
 /**
@@ -166,6 +171,20 @@ export function enableDailyReminder(
   return withReminderLock(() => enableDailyReminderUnsafe(hour, language));
 }
 
+/**
+ * Rebuilds an enabled reminder's notification copy in `language` without a
+ * read-then-enable gap that logout could interleave. Returns the surviving
+ * preference, or null when reminders are off/permission is denied.
+ */
+export function refreshDailyReminderLanguage(language: UiLanguage): Promise<DailyReminder | null> {
+  return withReminderLock(async () => {
+    const stored = await getDailyReminderUnsafe();
+    if (!stored) return null;
+    const outcome = await enableDailyReminderUnsafe(stored.hour, language);
+    return outcome === 'enabled' ? stored : null;
+  });
+}
+
 /** Cancels the reminder and forgets the stored preference. */
 async function disableDailyReminderUnsafe(): Promise<void> {
   const Notifications = notifications();
@@ -173,7 +192,7 @@ async function disableDailyReminderUnsafe(): Promise<void> {
   // and the schedule consistently ON. If the OS cancel fails after the delete
   // succeeded, restore the just-read preference so the two cannot durably
   // disagree that way either — the same compensation shape as the enable path.
-  const previous = await getDailyReminder();
+  const previous = await getDailyReminderUnsafe();
   await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
   try {
     await Notifications.cancelAllScheduledNotificationsAsync();

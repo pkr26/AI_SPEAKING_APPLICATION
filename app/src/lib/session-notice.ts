@@ -12,9 +12,23 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: 'ai-english-coach.session-notice',
 };
 
+// Expiry persists this flag immediately before the login route consumes it.
+// SecureStore offers no transaction/order guarantee, so keep mark/read/delete
+// in invocation order and leave the queue usable after a keychain failure.
+let storageQueue: Promise<void> = Promise.resolve();
+
+function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
+  const result = storageQueue.then(operation, operation);
+  storageQueue = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 /** Best-effort persist; an unavailable credential store must not block expiry. */
 export async function markSessionExpiredNotice(): Promise<void> {
-  await SecureStore.setItemAsync(STORAGE_KEY, '1', STORAGE_OPTIONS);
+  await serializeStorage(() => SecureStore.setItemAsync(STORAGE_KEY, '1', STORAGE_OPTIONS));
 }
 
 /**
@@ -22,17 +36,19 @@ export async function markSessionExpiredNotice(): Promise<void> {
  * Read or delete failures report false so login never blocks on the store.
  */
 export async function consumeSessionExpiredNotice(): Promise<boolean> {
-  let stored: string | null;
-  try {
-    stored = await SecureStore.getItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
-  } catch {
-    return false;
-  }
-  if (stored === null) return false;
-  try {
-    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
-  } catch {
-    // The flag stays behind and shows once more; still show it now.
-  }
-  return true;
+  return serializeStorage(async () => {
+    let stored: string | null;
+    try {
+      stored = await SecureStore.getItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
+    } catch {
+      return false;
+    }
+    if (stored === null) return false;
+    try {
+      await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
+    } catch {
+      // The flag stays behind and shows once more; still show it now.
+    }
+    return true;
+  });
 }

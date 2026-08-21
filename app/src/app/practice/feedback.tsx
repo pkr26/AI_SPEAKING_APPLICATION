@@ -1,6 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { ScrollView, Text, View, type StyleProp, type TextStyle } from 'react-native';
-import { router } from 'expo-router';
+import { router, useFocusEffect } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
@@ -22,6 +22,11 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
 
 type Variant =
   'native' | 'native-nospeech' | 'nospeech' | 'levelup' | 'mastered' | 'passed' | 'retry' | 'final';
+
+interface FeedbackCard {
+  questionId: string;
+  result: PracticeOutcome;
+}
 
 const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
   te: 'te-IN',
@@ -51,7 +56,7 @@ function DecorativeEmoji({ children, style }: { children: string; style: StylePr
  */
 export default function FeedbackScreen() {
   const insets = useSafeAreaInsets();
-  const { user, setUser } = useAuth();
+  const { user, setUser, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -62,10 +67,45 @@ export default function FeedbackScreen() {
   // screen. Latch the outcome so the card slides away as itself instead of
   // flipping to the no-result state for the whole transition; a freshly
   // submitted outcome replaces the latched one.
-  const [result, setResult] = useState<PracticeOutcome | null>(null);
-  if (feedback && feedback.result !== result) setResult(feedback.result);
-  const questionId = feedback?.questionId ?? null;
-  const actedRef = useRef(false);
+  const [card, setCard] = useState<FeedbackCard | null>(() =>
+    feedback ? { questionId: feedback.questionId, result: feedback.result } : null,
+  );
+  if (feedback && (feedback.questionId !== card?.questionId || feedback.result !== card?.result)) {
+    setCard({ questionId: feedback.questionId, result: feedback.result });
+  }
+  const result = card?.result ?? null;
+  const questionId = card?.questionId ?? null;
+  const sessionLease = useMemo(() => {
+    void sessionVersion;
+    void user?.id;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, user?.id]);
+  const mountedRef = useRef(true);
+  const focusedRef = useRef(false);
+  const activeCardRef = useRef<FeedbackCard | null>(card);
+  const actedCardRef = useRef<FeedbackCard | null>(null);
+
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      focusedRef.current = false;
+      activeCardRef.current = null;
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    activeCardRef.current = card;
+  }, [card]);
+
+  useFocusEffect(
+    React.useCallback(() => {
+      focusedRef.current = true;
+      return () => {
+        focusedRef.current = false;
+      };
+    }, []),
+  );
 
   const variant: Variant | null = !result
     ? null
@@ -90,7 +130,7 @@ export default function FeedbackScreen() {
   useEffect(() => {
     if (variant !== 'mastered' && variant !== 'levelup') return;
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
-  }, [variant]);
+  }, [result, variant]);
 
   // Every scored English attempt changes the home stats and the history list.
   // Both queries stay mounted beneath this stack, so invalidating here means
@@ -100,50 +140,64 @@ export default function FeedbackScreen() {
     if (!scoredAttempt) return;
     void queryClient.invalidateQueries({ queryKey: ['practice-stats'] });
     void queryClient.invalidateQueries({ queryKey: ['practice-history'] });
-  }, [scoredAttempt, queryClient]);
+  }, [queryClient, result, scoredAttempt]);
 
   /** One navigation per feedback card: a double-tap on Try Again or Next
    * Question must not pop or advance the practice stack twice. */
-  const runOnce = (action: () => void) => {
-    if (actedRef.current) return;
-    actedRef.current = true;
+  const runOnce = (expectedCard: FeedbackCard | null, action: () => void) => {
+    if (
+      !expectedCard ||
+      !mountedRef.current ||
+      !focusedRef.current ||
+      activeCardRef.current !== expectedCard ||
+      actedCardRef.current === expectedCard ||
+      !isSessionLeaseCurrent(sessionLease)
+    ) {
+      return;
+    }
+    actedCardRef.current = expectedCard;
     action();
   };
 
   const backToPractice = () =>
-    runOnce(() => {
+    runOnce(card, () => {
       clearFeedback();
       router.dismissTo('/practice');
     });
 
   const tryInEnglish = () =>
-    runOnce(() => {
+    runOnce(card, () => {
       setAnswerMode('english');
       clearFeedback();
       router.dismissTo('/practice');
     });
 
   const retry = () =>
-    runOnce(() => {
+    runOnce(card, () => {
       clearFeedback();
       router.back();
     });
 
   const goToNextQuestion = () => {
     if (!user || !result) return;
-    runOnce(() => {
+    runOnce(card, () => {
+      const currentQuestionKey = ['practice-question', user.id, user.cefrLevel] as const;
+      void queryClient.cancelQueries({ queryKey: currentQuestionKey, exact: true });
       if (!isNativeOutcome(result) && result.levelUp && result.next) {
+        const nextLevel = result.levelUp.to;
         // The promotion response already carries the next question and
         // progress from the NEW level: adopt the level locally first so the
         // practice screen's cache key and level badge match what it renders.
-        queryClient.setQueryData(['practice-question', user.id, result.levelUp.to], result.next);
-        setUser({ ...user, cefrLevel: result.levelUp.to });
+        queryClient.setQueryData(['practice-question', user.id, nextLevel], result.next);
+        setUser((current) =>
+          current?.id === user.id ? { ...current, cefrLevel: nextLevel } : current,
+        );
         void queryClient.invalidateQueries({ queryKey: ['me'] });
       } else if (!isNativeOutcome(result) && result.next) {
-        queryClient.setQueryData(['practice-question', user.id, user.cefrLevel], result.next);
+        queryClient.setQueryData(currentQuestionKey, result.next);
       } else {
         void queryClient.invalidateQueries({
-          queryKey: ['practice-question', user.id, user.cefrLevel],
+          queryKey: currentQuestionKey,
         });
       }
       clearFeedback();
@@ -153,7 +207,7 @@ export default function FeedbackScreen() {
 
   const openHelp = () => {
     if (!questionId) return;
-    runOnce(() => {
+    runOnce(card, () => {
       clearFeedback();
       router.dismissTo('/practice');
       router.push({ pathname: '/practice/help', params: { questionId } });

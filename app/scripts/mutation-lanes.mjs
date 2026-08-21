@@ -30,7 +30,16 @@ function lane(mutate, testFiles) {
  * where the assertion belongs.
  */
 export const mutationLanes = Object.freeze({
-  recorder: lane(['src/components/Recorder.tsx'], ['__tests__/recorder-test.tsx']),
+  recorder: lane(
+    ['src/components/Recorder.tsx'],
+    [
+      '__tests__/recorder-contract-test.ts',
+      '__tests__/recorder-audio-owner-contract-test.tsx',
+      '__tests__/recorder-recovery-loop-contract-test.tsx',
+      '__tests__/recorder-mutation-sentinels-test.tsx',
+      '__tests__/recorder-test.tsx',
+    ],
+  ),
   i18n: lane(['src/lib/i18n.tsx'], ['__tests__/i18n-test.tsx']),
   types: lane(['src/lib/types.ts'], ['__tests__/types-test.ts']),
   api: lane(['src/lib/api.ts'], ['__tests__/api-test.ts']),

@@ -17,12 +17,20 @@ if (!laneName || !lane) {
 
 const reportDirectory = process.env.MUTATION_REPORT_DIR || 'reports/mutation';
 const concurrency = Number(process.env.MUTATION_CONCURRENCY || '2');
+const requestedTestFiles = process.env.MUTATION_TEST_FILES?.split(',').filter(Boolean) ?? [];
 
 if (!Number.isInteger(concurrency) || concurrency < 1) {
   throw new Error(
     `MUTATION_CONCURRENCY must be a positive integer (received ${JSON.stringify(process.env.MUTATION_CONCURRENCY)})`,
   );
 }
+if (requestedTestFiles.some((testFile) => !lane.testFiles.includes(testFile))) {
+  throw new Error(
+    `MUTATION_TEST_FILES must contain only tests owned by lane ${laneName} ` +
+      `(received ${JSON.stringify(requestedTestFiles)})`,
+  );
+}
+const activeTestFiles = requestedTestFiles.length ? requestedTestFiles : lane.testFiles;
 
 /**
  * `testMatch` — not Stryker's `testFiles` — is what actually pins a lane to its
@@ -54,15 +62,9 @@ export default {
     projectType: 'custom',
     configFile: 'package.json',
     config: {
-      testMatch: lane.testFiles.map((testFile) => `<rootDir>/${testFile}`),
+      testMatch: activeTestFiles.map((testFile) => `<rootDir>/${testFile}`),
       testPathIgnorePatterns: ['/node_modules/'],
       testTimeout: 30_000,
-      // Every static mutant runs the complete owning test file. Once one test
-      // has decisively killed a mutant, continuing through hundreds of tests
-      // can only poison shared native/module state and misclassify that kill as
-      // a Stryker timeout. Ordinary Jest keeps its normal non-bailing config;
-      // this applies only inside mutation workers.
-      bail: 1,
     },
     enableFindRelatedTests: true,
   },
@@ -79,13 +81,19 @@ export default {
   ],
   ignoreStatic: false,
   coverageAnalysis: 'all',
+  force: false,
   timeoutMS: 60_000,
   timeoutFactor: 2.5,
   concurrency,
   tempDirName: `.stryker-${laneName}-tmp`,
   cleanTempDir: 'always',
-  reporters: ['clear-text', 'progress', 'html', 'json'],
+  // `json` is written only after the lane finishes. The event recorder writes
+  // each tested mutant immediately, so a stopped diagnostic run still retains
+  // the exact timeout/survivor IDs and locations instead of only aggregate
+  // progress counts.
+  reporters: ['clear-text', 'progress', 'html', 'json', 'event-recorder'],
   clearTextReporter: { maxTestsToLog: 0, allowEmojis: false },
+  eventReporter: { baseDir: path.join(reportDirectory, `${laneName}-events`) },
   htmlReporter: { fileName: path.join(reportDirectory, `${laneName}.html`) },
   jsonReporter: { fileName: path.join(reportDirectory, `${laneName}.json`) },
   // No break threshold: pass/fail belongs to scripts/merge-mutation-reports.mjs,

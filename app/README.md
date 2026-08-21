@@ -78,15 +78,26 @@ environment, source, and owning tests still match the current workspace. A
 missing or stale sidecar makes the merge fail closed and names the lane to
 rerun. Every production source file is a shared input because one lane can
 execute code owned by another: changing any production source or shared
-mutation-tooling input requires a full campaign. An owning-test-only change may
-be handled by rerunning every lane that names that test. The runner also rejects
-duplicate lane arguments and uses the app-root `.mutation-campaign.lock` to keep
-independent processes from colliding even when they select different report
-directories. Locks are never reclaimed automatically because an orphan Stryker
-child may still be active even after the recorded parent exits. After an
-interrupted run, verify that neither the recorded parent nor any Stryker child
-is alive before removing the lock manually. Invalid locks fail closed in the
-same way.
+mutation-execution input requires a full campaign. An owning-test-only change
+may be handled by rerunning every lane that names that test. The reviewed
+equivalence registry is deliberately separate from execution provenance:
+changing it permits rerunning
+`node scripts/merge-mutation-reports.mjs` against the still-current lane
+reports, without repeating Stryker. `app-summary.json` records a deterministic
+fingerprint of the exact merger and equivalence policy that produced its strict
+gate result. Source, test, Stryker config, dependency, lane runner, and Recorder
+pass-runner/pass-merger changes still invalidate the affected execution report.
+The app merger and its transitive policy-fingerprint helper also remain
+execution inputs because the Recorder runner imports the merger's workspace
+validator and HTML renderer while publishing canonical lane artifacts.
+
+The runner also rejects duplicate lane arguments and uses the app-root
+`.mutation-campaign.lock` to keep independent processes from colliding even
+when they select different report directories. Locks are never reclaimed
+automatically because an orphan Stryker child may still be active even after
+the recorded parent exits. After an interrupted run, verify that neither the
+recorded parent nor any Stryker child is alive before removing the lock
+manually. Invalid locks fail closed in the same way.
 
 Two settings in `stryker.lane.config.mjs` are load-bearing and explained in
 full there: each lane pins jest's `testMatch` (Stryker's `testFiles` only

@@ -1,10 +1,11 @@
 import {
   focusManager,
+  notifyManager,
   QueryClient,
   QueryClientProvider,
   useQueryClient,
 } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { AppState, type AppStateStatus, StyleSheet, Text, useColorScheme } from 'react-native';
@@ -176,6 +177,16 @@ const mockApiFetch = apiFetch as jest.Mock;
 
 const queryClients: QueryClient[] = [];
 
+beforeAll(() => {
+  // Keep query notifications in the same controlled turn as the operation
+  // under test; the production scheduler is restored after this file.
+  notifyManager.setScheduler((notify) => notify());
+});
+
+afterAll(() => {
+  notifyManager.setScheduler((notify) => setTimeout(notify, 0));
+});
+
 function makeQueryClient(): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -262,12 +273,16 @@ async function expectPressFeedback(
 }
 
 afterEach(async () => {
-  // Flush TanStack Query's batched notifications inside act().
+  // Unsubscribe every rendered gate before clearing its query cache. RNTL's
+  // automatic cleanup can run after this hook, leaving a live observer for a
+  // timer-batched clear notification under full-suite scheduling.
+  cleanup();
   await act(async () => {
+    for (const client of queryClients) client.clear();
+    // TanStack can schedule a second notification from the first batch.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  // Cancel cache-gc timers so the jest process can exit promptly.
-  for (const client of queryClients) client.clear();
   queryClients.length = 0;
 });
 

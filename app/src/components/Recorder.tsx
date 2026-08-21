@@ -1000,14 +1000,13 @@ export default function Recorder<T>({
   });
   const acquireAudioSession = useCallback(() => {
     const instanceId = instanceIdRef.current;
-    if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) return false;
+    if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) throw new Error();
     if (activeAudioSessionOwner === null) {
       activeAudioSessionOwner = instanceId;
       activeAudioSessionReleasePromise = new Promise((resolve) => {
         resolveActiveAudioSessionRelease = resolve;
       });
     }
-    return true;
   }, []);
   const restoreOwnedAudioMode = useCallback(async (notify = true): Promise<void> => {
     if (audioRestorePromiseRef.current) return audioRestorePromiseRef.current;
@@ -1268,8 +1267,6 @@ export default function Recorder<T>({
 
   const discardRecording = useCallback((candidateUri?: string | null) => {
     const candidates = new Set(ownedTakeUrisRef.current);
-    const activeUri = activeUriRef.current;
-    if (activeUri) candidates.add(activeUri);
     if (candidateUri) candidates.add(candidateUri);
     ownedTakeUrisRef.current.clear();
     activeUriRef.current = null;
@@ -2554,26 +2551,13 @@ export default function Recorder<T>({
       await audioRestorePromiseRef.current;
       await activeAudioSessionReleasePromise;
       if (!isCurrentLifecycle()) return;
-      if (!acquireAudioSession()) {
-        throw new Error();
-      }
-      if (!audioSessionIsOwnedBy(activeAudioSessionOwner, instanceIdRef.current)) {
-        throw new Error();
-      }
+      acquireAudioSession();
       const recordingAudioMode = {
         allowsRecording: true,
         allowsBackgroundRecording: false,
         playsInSilentMode: true,
         shouldPlayInBackground: false,
       };
-      if (
-        recordingAudioMode.allowsRecording !== true ||
-        recordingAudioMode.allowsBackgroundRecording !== false ||
-        recordingAudioMode.playsInSilentMode !== true ||
-        recordingAudioMode.shouldPlayInBackground !== false
-      ) {
-        throw new Error();
-      }
       await serializeAudioMode(() => setAudioModeAsync(recordingAudioMode));
       if (!isCurrentLifecycle()) {
         await restoreOwnedAudioMode(false);

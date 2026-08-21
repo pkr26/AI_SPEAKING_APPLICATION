@@ -10,6 +10,7 @@ import {
   createMutationLaneProvenance,
   writeMutationLaneProvenance,
 } from './mutation-provenance.mjs';
+import { runRecorderMutationPasses } from './run-recorder-mutation-passes.mjs';
 
 const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultAppDirectory = path.resolve(scriptsDirectory, '..');
@@ -38,13 +39,26 @@ async function runStrykerLane({ laneName, reportDir, appDir, environment }) {
   });
 }
 
+/** Recorder is isolated into validated one-test passes; every other lane keeps its prior runner. */
+export async function runDefaultMutationLane(
+  options,
+  { runRecorder = runRecorderMutationPasses, runStryker = runStrykerLane } = {},
+) {
+  if (options.laneName !== 'recorder') return runStryker(options);
+  const result = await runRecorder(options);
+  if (result.exitCode !== 0 && result.artifactDir) {
+    console.error(`Recorder pass artifacts were preserved at ${result.artifactDir}`);
+  }
+  return result.exitCode;
+}
+
 async function removeExpectedReports(reportDir, laneNames) {
   await fs.mkdir(reportDir, { recursive: true });
   const fileNames = [
     ...laneNames.flatMap((laneName) => [
-      `${laneName}.json`,
-      `${laneName}.html`,
-      `${laneName}.provenance.json`,
+      ...(laneName === 'recorder'
+        ? []
+        : [`${laneName}.json`, `${laneName}.html`, `${laneName}.provenance.json`]),
     ]),
     'app.json',
     'app.html',
@@ -151,7 +165,7 @@ export async function runMutation({
   parallelLanes,
   merge = true,
   validateManifest = assertMutationLaneManifest,
-  runLane = runStrykerLane,
+  runLane = runDefaultMutationLane,
   mergeReports = mergeMutationReports,
 } = {}) {
   const effectiveParallelLanes = parsePositiveInteger(
@@ -159,9 +173,10 @@ export async function runMutation({
     'MUTATION_PARALLEL_LANES',
     1,
   );
+  const recorderRequested = laneNames.includes('recorder');
   const effectiveEnvironment = {
     ...environment,
-    MUTATION_PARALLEL_LANES: String(effectiveParallelLanes),
+    MUTATION_PARALLEL_LANES: String(recorderRequested ? 1 : effectiveParallelLanes),
   };
   await validateManifest({ appDir });
   const repeatedLaneNames = laneNames.filter(
@@ -184,10 +199,18 @@ export async function runMutation({
     const startedAt = Date.now();
     const failedLanes = [];
     const queue = [...laneNames];
-    const workerCount = Math.min(effectiveParallelLanes, queue.length || 1);
+    // Recorder owns its own total-worker budget and process-group stop signal.
+    // Serialize the outer campaign whenever it is present so sibling lanes
+    // cannot exceed that budget or outlive a user stop.
+    const workerCount = recorderRequested ? 1 : Math.min(effectiveParallelLanes, queue.length || 1);
+    if (recorderRequested && effectiveParallelLanes > 1) {
+      console.log('Recorder requested: serializing outer mutation lanes despite parallel setting.');
+    }
+    let stopRequested = false;
 
     async function worker() {
       for (let laneName = queue.shift(); laneName !== undefined; laneName = queue.shift()) {
+        if (stopRequested) return;
         console.log(`\n=== App mutation lane: ${laneName} ===`);
         let exitCode;
         try {
@@ -224,8 +247,16 @@ export async function runMutation({
         }
         if (exitCode !== 0) {
           failedLanes.push({ laneName, exitCode });
+          if (exitCode === 130 || exitCode === 143) {
+            stopRequested = true;
+            queue.length = 0;
+            console.error(`Mutation campaign stop propagated from lane ${laneName}.`);
+          }
           console.error(
-            `Mutation lane ${laneName} exited with status ${exitCode}; continuing with the remaining lanes.`,
+            `Mutation lane ${laneName} exited with status ${exitCode}; ` +
+              (stopRequested
+                ? 'the campaign is stopping.'
+                : 'continuing with the remaining lanes.'),
           );
         }
       }
@@ -236,7 +267,7 @@ export async function runMutation({
     let mergeError;
     let strictGateError;
     let summary;
-    if (merge) {
+    if (merge && failedLanes.length === 0) {
       try {
         const merged = await mergeReports({ reportDir, environment: effectiveEnvironment });
         summary = merged.summary;
@@ -250,9 +281,13 @@ export async function runMutation({
         mergeError = error;
         console.error('Mutation lane reports could not be consolidated', error);
       }
-    } else {
+    } else if (!merge) {
       console.log(
         '\nSkipping the merge: run `node scripts/merge-mutation-reports.mjs` once every lane has reported.',
+      );
+    } else {
+      console.error(
+        '\nSkipping the app merge because at least one lane failed; prior canonical reports remain untrusted for this run.',
       );
     }
 

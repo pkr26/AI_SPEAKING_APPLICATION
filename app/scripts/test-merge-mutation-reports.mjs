@@ -15,6 +15,11 @@ import {
 } from './merge-mutation-reports.mjs';
 import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
 import {
+  createMutationMergePolicyProvenance,
+  mutationMergePolicyFiles,
+  mutationMergePolicySchemaVersion,
+} from './mutation-merge-policy.mjs';
+import {
   assertMutationLaneProvenance,
   createMutationLaneProvenance,
   mutationSharedInputFiles,
@@ -65,6 +70,11 @@ const twoLaneManifest = {
   },
   laneNames: ['first', 'second'],
   expectedFiles: ['src/a.ts', 'src/b.ts'],
+  mergePolicy: {
+    schemaVersion: mutationMergePolicySchemaVersion,
+    files: [...mutationMergePolicyFiles].toSorted(),
+    fingerprint: 'a'.repeat(64),
+  },
   // The real allowlist describes real source; fixtures supply their own.
   equivalences: [],
 };
@@ -134,6 +144,7 @@ test('merging renumbers mutants and rewrites every test reference', () => {
   assert.equal(summary.laneCount, 2);
   assert.equal(summary.staticMutants, 1);
   assert.equal(summary.dynamicMutants, 2);
+  assert.deepEqual(summary.mergePolicy, twoLaneManifest.mergePolicy);
   assert.equal(summary.strictMutationGatePassed, false);
   assert.equal(summary.mutationScore, (2 / 3) * 100);
   assert.deepEqual(
@@ -142,6 +153,76 @@ test('merging renumbers mutants and rewrites every test reference', () => {
       ['first', 1, 0],
       ['second', 2, 1],
     ],
+  );
+});
+
+test('the app merge policy fingerprint pins merger and reviewed-equivalence contents', async (t) => {
+  const appDir = await fs.mkdtemp(path.join(os.tmpdir(), 'app-mutation-merge-policy-'));
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  for (const fileName of mutationMergePolicyFiles) {
+    const absolutePath = path.join(appDir, fileName);
+    await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+    await fs.writeFile(absolutePath, `// ${fileName}`);
+  }
+
+  const first = await createMutationMergePolicyProvenance({ appDir });
+  const repeated = await createMutationMergePolicyProvenance({ appDir });
+  assert.deepEqual(repeated, first);
+  assert.match(first.fingerprint, /^[a-f0-9]{64}$/u);
+  assert.deepEqual(first.files, [...mutationMergePolicyFiles].toSorted());
+  assert.equal(
+    mutationSharedInputFiles.includes('scripts/mutation-equivalents.mjs'),
+    false,
+    'reviewed equivalences must not stale an already-produced lane report',
+  );
+  assert.equal(
+    mutationSharedInputFiles.includes('scripts/merge-mutation-reports.mjs'),
+    true,
+    'the Recorder runner imports app-merger helpers during canonical lane publication',
+  );
+  assert.equal(
+    mutationSharedInputFiles.includes('scripts/mutation-merge-policy.mjs'),
+    true,
+    'the Recorder runner transitively loads the merge-policy helper',
+  );
+
+  await fs.appendFile(path.join(appDir, 'scripts/mutation-equivalents.mjs'), '\n// reviewed');
+  const equivalenceChange = await createMutationMergePolicyProvenance({ appDir });
+  assert.notEqual(equivalenceChange.fingerprint, first.fingerprint);
+
+  await fs.appendFile(path.join(appDir, 'scripts/merge-mutation-reports.mjs'), '\n// gate change');
+  const mergerChange = await createMutationMergePolicyProvenance({ appDir });
+  assert.notEqual(mergerChange.fingerprint, equivalenceChange.fingerprint);
+});
+
+test('merging rejects missing or malformed merge policy provenance', () => {
+  const reports = twoLaneReports();
+  assert.throws(
+    () =>
+      mergeMutationReportData({
+        reportsByLane: reports,
+        ...twoLaneManifest,
+        mergePolicy: undefined,
+      }),
+    /merge policy provenance is invalid/,
+  );
+  assert.throws(
+    () =>
+      mergeMutationReportData({
+        reportsByLane: reports,
+        ...twoLaneManifest,
+        mergePolicy: { ...twoLaneManifest.mergePolicy, fingerprint: 'not-a-sha256' },
+      }),
+    /merge policy provenance is invalid/,
+  );
+  assert.throws(
+    () =>
+      mergeMutationReportData({
+        reportsByLane: reports,
+        ...twoLaneManifest,
+        mergePolicy: { ...twoLaneManifest.mergePolicy, files: ['scripts/only-one.mjs'] },
+      }),
+    /merge policy provenance is invalid/,
   );
 });
 

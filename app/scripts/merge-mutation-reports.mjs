@@ -6,6 +6,11 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
 import {
+  createMutationMergePolicyProvenance,
+  mutationMergePolicyFiles,
+  mutationMergePolicySchemaVersion,
+} from './mutation-merge-policy.mjs';
+import {
   assertMutationLaneManifest,
   duplicates,
   expectedMutationFiles,
@@ -48,6 +53,22 @@ function isRecord(value) {
 
 function own(object, key) {
   return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+function assertMergePolicyProvenance(value) {
+  if (
+    !isRecord(value) ||
+    value.schemaVersion !== mutationMergePolicySchemaVersion ||
+    !Array.isArray(value.files) ||
+    value.files.length === 0 ||
+    value.files.some((fileName) => typeof fileName !== 'string' || fileName.length === 0) ||
+    duplicates(value.files).length > 0 ||
+    !isDeepStrictEqual(value.files, [...mutationMergePolicyFiles].toSorted()) ||
+    typeof value.fingerprint !== 'string' ||
+    !/^[a-f0-9]{64}$/u.test(value.fingerprint)
+  ) {
+    throw new Error('Mutation merge policy provenance is invalid');
+  }
 }
 
 function sortedDifference(first, second) {
@@ -296,6 +317,7 @@ export function mergeMutationReportData({
   lanes,
   laneNames,
   expectedFiles,
+  mergePolicy,
   equivalences = equivalentMutants,
 }) {
   if (!isRecord(reportsByLane))
@@ -308,6 +330,7 @@ export function mergeMutationReportData({
   ) {
     throw new Error('Mutation lane manifest arguments are invalid');
   }
+  assertMergePolicyProvenance(mergePolicy);
   assertExactKeys(Object.keys(lanes), laneNames, 'Mutation lane names');
   assertExactKeys(Object.keys(reportsByLane), laneNames, 'Mutation lane reports');
   assertExactKeys(
@@ -436,6 +459,11 @@ export function mergeMutationReportData({
   );
   const summary = {
     schemaVersion: 1,
+    mergePolicy: {
+      schemaVersion: mergePolicy.schemaVersion,
+      files: [...mergePolicy.files],
+      fingerprint: mergePolicy.fingerprint,
+    },
     laneCount: laneNames.length,
     fileCount: expectedFiles.length,
     testFileCount: orderedTestFileNames.length,
@@ -578,11 +606,13 @@ export async function mergeMutationReports({
     laneNames: mutationLaneNames,
     appDir: appDirectory,
   });
+  const mergePolicy = await createMutationMergePolicyProvenance({ appDir: appDirectory });
   const merged = mergeMutationReportData({
     reportsByLane,
     lanes: mutationLanes,
     laneNames: mutationLaneNames,
     expectedFiles: expectedMutationFiles,
+    mergePolicy,
   });
   const jsonPath = path.join(reportDirectory, 'app.json');
   const summaryPath = path.join(reportDirectory, 'app-summary.json');

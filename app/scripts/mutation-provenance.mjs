@@ -7,10 +7,11 @@ import { expectedMutationFiles } from './mutation-lanes.mjs';
 const mutationProvenanceSchemaVersion = 1;
 
 /**
- * Inputs shared by every lane. Every production source is included because a
- * lane can execute imported code owned by another lane; changing any one of
- * them therefore invalidates the whole incremental campaign. An owning-test
- * change remains lane-local.
+ * Execution inputs shared by every lane. Every production source is included
+ * because a lane can execute imported code owned by another lane; changing any
+ * one of them therefore invalidates the whole incremental campaign. An
+ * owning-test change remains lane-local. The reviewed-equivalence registry is
+ * post-run policy and is fingerprinted in app-summary.json instead.
  */
 export const mutationSharedInputFiles = Object.freeze([
   // jest-expo reads app.json, so config-plugin changes must stale retained
@@ -19,14 +20,18 @@ export const mutationSharedInputFiles = Object.freeze([
   'package.json',
   'package-lock.json',
   'stryker.lane.config.mjs',
+  // The Recorder pass runner imports this module's workspace validator and
+  // HTML renderer while publishing its canonical lane artifacts, including
+  // the merge-policy helper that module loads transitively.
+  'scripts/merge-mutation-reports.mjs',
+  'scripts/merge-recorder-mutation-passes.mjs',
+  'scripts/mutation-merge-policy.mjs',
   'scripts/mutation-lanes.mjs',
   'scripts/mutation-provenance.mjs',
+  'scripts/recorder-killed-incremental-seed.mjs',
+  'scripts/recorder-mutation-plan.mjs',
+  'scripts/run-recorder-mutation-passes.mjs',
   'scripts/run-mutation.mjs',
-  // These decide whether a completed campaign is accepted. Changing either
-  // the report validator or its reviewed-equivalence policy must invalidate
-  // retained lane reports just like changing Stryker's lane config.
-  'scripts/merge-mutation-reports.mjs',
-  'scripts/mutation-equivalents.mjs',
   ...expectedMutationFiles,
 ]);
 
@@ -46,6 +51,11 @@ function canonicalEnvironment(environment) {
     LC_ALL: value('LC_ALL'),
     MUTATION_CONCURRENCY: value('MUTATION_CONCURRENCY') || '2',
     MUTATION_PARALLEL_LANES: value('MUTATION_PARALLEL_LANES') || '1',
+    MUTATION_RECORDER_KILLED_ONLY_INCREMENTAL:
+      value('MUTATION_RECORDER_KILLED_ONLY_INCREMENTAL') || 'true',
+    MUTATION_RECORDER_PARALLEL_PASSES: value('MUTATION_RECORDER_PARALLEL_PASSES') || '4',
+    MUTATION_RECORDER_TOTAL_WORKERS:
+      value('MUTATION_RECORDER_TOTAL_WORKERS') || value('MUTATION_CONCURRENCY') || '2',
     NODE_ENV: value('NODE_ENV'),
     NODE_OPTIONS: value('NODE_OPTIONS'),
     TZ: value('TZ'),

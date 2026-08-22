@@ -1,5 +1,11 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react-native/pure';
-import { AudioModule, setAudioModeAsync, useAudioRecorder, type RecordingStatus } from 'expo-audio';
+import {
+  AudioModule,
+  createAudioPlayer,
+  setAudioModeAsync,
+  useAudioRecorder,
+  type RecordingStatus,
+} from 'expo-audio';
 import * as Crypto from 'expo-crypto';
 import { Directory, File } from 'expo-file-system';
 import React from 'react';
@@ -291,6 +297,52 @@ async function unmountWithContainedLifecycle(view: {
   if (unmountError) throw unmountError;
 }
 
+async function unmountWithoutLifecyclePrearm(view: {
+  unmount: () => Promise<void>;
+}): Promise<void> {
+  const originalFinally = Promise.prototype.finally;
+  const lifecyclePromises: Promise<unknown>[] = [];
+  // eslint-disable-next-line no-extend-native -- restored before the first await
+  Object.defineProperty(Promise.prototype, 'finally', {
+    configurable: true,
+    writable: true,
+    value(this: Promise<unknown>, onfinally?: (() => void) | null) {
+      const result = originalFinally.call(this, onfinally);
+      lifecyclePromises.push(result);
+      return result;
+    },
+  });
+  let unmountPromise: Promise<void>;
+  try {
+    unmountPromise = view.unmount();
+  } finally {
+    // eslint-disable-next-line no-extend-native -- restore the captured native method
+    Object.defineProperty(Promise.prototype, 'finally', {
+      configurable: true,
+      writable: true,
+      value: originalFinally,
+    });
+  }
+  const observations = lifecyclePromises.map((promise) =>
+    promise.then(
+      () => undefined,
+      (error: unknown) => {
+        containedLifecycleErrors.push(error);
+        containedLifecycleFailure ??= error;
+      },
+    ),
+  );
+  let unmountError: unknown;
+  try {
+    await unmountPromise;
+  } catch (error) {
+    unmountError = error;
+  }
+  await Promise.all(observations);
+  await flushRealEventLoop();
+  if (unmountError) throw unmountError;
+}
+
 async function cleanupMountedRecorders(): Promise<void> {
   for (const settle of [...pendingCleanup]) settle();
   jest.useRealTimers();
@@ -391,6 +443,22 @@ function deletedFileUris(): string[] {
     .filter((uri): uri is string => typeof uri === 'string');
 }
 
+function createReplacementRecorder(uri: string | null = null): MockRecorder {
+  const replacement: MockRecorder = {
+    getStatus: jest.fn(() => liveState),
+    prepareToRecordAsync: jest.fn(async () => undefined),
+    record: jest.fn(() => {
+      replacement.isRecording = true;
+    }),
+    stop: jest.fn(async () => {
+      replacement.isRecording = false;
+    }),
+    uri,
+    isRecording: false,
+  };
+  return replacement;
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   containedLifecycleErrors = [];
@@ -444,6 +512,14 @@ beforeEach(() => {
   asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: true });
   asMock(AudioModule.requestRecordingPermissionsAsync).mockResolvedValue({ granted: true });
   asMock(setAudioModeAsync).mockResolvedValue(undefined);
+  asMock(createAudioPlayer).mockReset();
+  asMock(createAudioPlayer).mockImplementation(() => ({
+    play: jest.fn(),
+    pause: jest.fn(),
+    remove: jest.fn(),
+    seekTo: jest.fn(async () => undefined),
+    addListener: jest.fn(() => ({ remove: jest.fn() })),
+  }));
   asMock(Crypto.randomUUID).mockReturnValue(REQUEST_ID);
   asMock(Directory).mockImplementation(() => ({ exists: true, list: jest.fn(() => []) }));
   asMock(File).mockImplementation((uri: string) => ({
@@ -529,11 +605,13 @@ describe('Recorder mutation sentinels', () => {
     expect([teardownError, ...containedLifecycleErrors].filter(Boolean)).toEqual([]);
   });
 
-  it('ID 894: a captured post-unmount Start reaches no lock callback', async () => {
+  it('ID 891: a captured post-unmount Start reaches no lock callback', async () => {
     const onInteractionLockChange = jest.fn();
     const { view } = await renderRecorder({ onInteractionLockChange });
     const staleStart = committedPress(START_LABEL);
-    await unmountWithContainedLifecycle(view);
+    // Unlike general mutant-safe teardown, this must not pre-arm an AppState
+    // stop while mounted: doing so leaves lockedRef=true and masks ID 891.
+    await unmountWithoutLifecyclePrearm(view);
     await act(async () => flushMicrotasks());
     onInteractionLockChange.mockClear();
     await act(async () => {
@@ -542,6 +620,22 @@ describe('Recorder mutation sentinels', () => {
     });
     expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
     expect(onInteractionLockChange).not.toHaveBeenCalledWith(true);
+  });
+
+  it('ID 1220: the preliminary recovery read never publishes an interaction lock', async () => {
+    const pending = deferred<PendingAssessment | null>();
+    asMock(loadPendingAssessment).mockReturnValue(pending.promise);
+    const onInteractionLockChange = jest.fn();
+
+    await renderRecorder({ onInteractionLockChange });
+    await act(async () => flushMicrotasks());
+
+    expect(onInteractionLockChange).not.toHaveBeenCalledWith(true);
+    await act(async () => {
+      pending.resolve(null);
+      await flushMicrotasks();
+    });
+    expect(onInteractionLockChange.mock.calls).toEqual([[false]]);
   });
 
   it('IDs 1120/1123: disposal retains an event URL when the getter disappears', async () => {
@@ -592,6 +686,87 @@ describe('Recorder mutation sentinels', () => {
         response: { score: 90 },
       });
       await flushMicrotasks();
+    });
+  });
+
+  it('IDs 1317/1321: endpoint callback re-entry preserves a replacement recovery owner', async () => {
+    mockSentinelFocused = false;
+    const replacementRequestId = OTHER_QUESTION_ID;
+    const status = deferred<unknown>();
+    let loadCall = 0;
+    asMock(loadPendingAssessment).mockImplementation(() => {
+      loadCall += 1;
+      const record = pendingRecord(
+        loadCall === 1
+          ? { endpoint: '/practice/attempt/native' }
+          : { requestId: replacementRequestId },
+      );
+      // The replacement is deliberately returned as a raw value while the
+      // callback below compresses resolved awaits into the same re-entrant turn.
+      return loadCall === 1 ? Promise.resolve(record) : (record as never);
+    });
+    asMock(apiFetch).mockReturnValue(status.promise);
+    let replacementFocus: FocusRegistration | undefined;
+    const onRecoveryEndpointMismatch = jest.fn(() => {
+      if (!replacementFocus) throw new Error('Replacement focus registration missing');
+      const originalResolve = Promise.resolve;
+      Object.defineProperty(Promise, 'resolve', {
+        configurable: true,
+        writable: true,
+        value(value: unknown) {
+          if (value instanceof Promise) return originalResolve.call(Promise, value);
+          return {
+            then(
+              onFulfilled: (resolved: unknown) => unknown,
+              onRejected?: (error: unknown) => unknown,
+            ) {
+              try {
+                return originalResolve.call(Promise, onFulfilled(value));
+              } catch (error) {
+                return onRejected
+                  ? originalResolve.call(Promise, onRejected(error))
+                  : Promise.reject(error);
+              }
+            },
+          } as Promise<unknown>;
+        },
+      });
+      try {
+        replacementFocus.cleanup = replacementFocus.callback();
+      } finally {
+        Object.defineProperty(Promise, 'resolve', {
+          configurable: true,
+          writable: true,
+          value: originalResolve,
+        });
+      }
+      return false;
+    });
+    await render(
+      <>
+        <Recorder key="stale" {...props({ onRecoveryEndpointMismatch })} />
+        <Recorder key="replacement" {...props()} />
+      </>,
+    );
+    await act(async () => flushMicrotasks());
+    const staleFocus = mockSentinelFocusRegistrations[0];
+    replacementFocus = mockSentinelFocusRegistrations[1];
+    if (!staleFocus || !replacementFocus) throw new Error('Focus registrations missing');
+
+    staleFocus.cleanup = staleFocus.callback();
+    await act(async () => flushMicrotasks(100));
+
+    expect(onRecoveryEndpointMismatch).toHaveBeenCalledWith('/practice/attempt/native');
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(asMock(apiFetch).mock.calls[0][0]).toContain(replacementRequestId);
+    await act(async () => {
+      status.resolve({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 91 },
+      });
+      await flushMicrotasks(100);
     });
   });
 
@@ -654,7 +829,7 @@ describe('Recorder mutation sentinels', () => {
     expect(deletedFileUris()).not.toContain(RECORDING_URI);
   });
 
-  it('ID 2300: a new take must be observed before a leftover URI can be adopted', async () => {
+  it('IDs 2268/2300: a new take must be observed before a leftover URI can be adopted', async () => {
     jest.useFakeTimers();
     const leftoverUri = 'file:///recordings/unobserved-new-take.m4a';
     await renderRecorder();
@@ -665,7 +840,10 @@ describe('Recorder mutation sentinels', () => {
     recorder.record.mockImplementationOnce(() => {
       recorder.isRecording = true;
       recorder.uri = leftoverUri;
-      recorderState = { ...recorderState, canRecord: true, isRecording: true };
+      // The native object starts, but this SDK variant never publishes the
+      // intermediate recording status. Adoption must require a real observed
+      // status rather than the optimistic reset immediately before record().
+      recorderState = { ...recorderState, canRecord: true, isRecording: false };
     });
     await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
     recorder.isRecording = false;
@@ -706,7 +884,58 @@ describe('Recorder mutation sentinels', () => {
     expect(recorder.prepareToRecordAsync).not.toHaveBeenCalled();
   });
 
-  it('ID 2337: a preparation failure deletes the URI it created before rejecting', async () => {
+  it('ID 2238: a failed stale clear reports nothing into the replacement identity', async () => {
+    const clear = deferred<void>();
+    asMock(clearPendingAssessment).mockReturnValue(clear.promise);
+    const onError = jest.fn();
+    const { view, recorderProps } = await renderRecorder({ onError });
+    await recordAndStop();
+    await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+    await act(async () => flushMicrotasks());
+    onError.mockClear();
+    recorder.prepareToRecordAsync.mockClear();
+
+    let staleStart!: Promise<void>;
+    await act(() => {
+      staleStart = Promise.resolve(committedPress(START_LABEL)()).then(() => undefined);
+    });
+    await view.rerender(<Recorder {...recorderProps} questionId={OTHER_QUESTION_ID} />);
+    await act(async () => {
+      clear.reject(new Error('stale clear failed'));
+      await staleStart;
+    });
+
+    expect(onError).not.toHaveBeenCalled();
+    expect(recorder.prepareToRecordAsync).not.toHaveBeenCalled();
+  });
+
+  it('IDs 2187/2188/2206: a prompt response belongs only to its current identity', async () => {
+    const prompt = deferred<{ granted: boolean; canAskAgain: boolean }>();
+    asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
+      granted: false,
+      canAskAgain: true,
+    });
+    asMock(AudioModule.requestRecordingPermissionsAsync).mockReturnValue(prompt.promise);
+    const { view, recorderProps } = await renderRecorder();
+    let staleStart!: Promise<void>;
+    await act(() => {
+      staleStart = Promise.resolve(committedPress(START_LABEL)()).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(AudioModule.requestRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
+
+    await view.rerender(<Recorder {...recorderProps} questionId={OTHER_QUESTION_ID} />);
+    await act(async () => {
+      prompt.resolve({ granted: false, canAskAgain: false });
+      await staleStart;
+      await flushMicrotasks();
+    });
+
+    expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+    expect(recorder.record).not.toHaveBeenCalled();
+  });
+
+  it('IDs 2311/2337: a preparation failure deletes its URI and cannot fabricate review', async () => {
     const failedUri = 'file:///recordings/pre-prepare-failure.m4a';
     recorder.prepareToRecordAsync.mockImplementationOnce(async () => {
       recorder.uri = failedUri;
@@ -718,10 +947,125 @@ describe('Recorder mutation sentinels', () => {
 
     expect(recorderProps.onError).toHaveBeenCalledWith(t('recorder.errStartFailed'));
     expect(asMock(File).mock.calls.some(([uri]) => uri === failedUri)).toBe(true);
+    expect(screen.queryByRole('button', { name: SUBMIT_TEXT })).toBeNull();
+    expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
   });
 
-  it('IDs 2486-2488: a submission result delivered after identity change is inert', async () => {
+  it('ID 2258: recorder replacement has one notifying lifecycle restore owner', async () => {
+    const setup = deferred<void>();
+    asMock(setAudioModeAsync).mockImplementation(
+      ({ allowsRecording }: { allowsRecording: boolean }) =>
+        allowsRecording ? setup.promise : Promise.reject(new Error('restore failed')),
+    );
+    let activeRecorder = recorder;
+    asMock(useAudioRecorder).mockImplementation(
+      (_options: unknown, listener?: (status: RecordingStatus) => void) => {
+        statusListener = listener;
+        return activeRecorder;
+      },
+    );
+    const onError = jest.fn();
+    const { view, recorderProps } = await renderRecorder({ onError });
+    let staleStart!: Promise<void>;
+    await act(() => {
+      staleStart = Promise.resolve(committedPress(START_LABEL)()).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(setAudioModeAsync).toHaveBeenCalledWith(
+      expect.objectContaining({ allowsRecording: true }),
+    );
+
+    for (const registration of mockSentinelFocusRegistrations) registration.cleanup = undefined;
+    activeRecorder = createReplacementRecorder();
+    await view.rerender(<Recorder {...recorderProps} />);
+    await act(async () => {
+      setup.resolve();
+      await staleStart;
+      await flushMicrotasks();
+    });
+
+    expect(
+      onError.mock.calls.filter(([message]) => message === t('recorder.errAudioReset')),
+    ).toHaveLength(1);
+  });
+
+  it('ID 2266: prepared recorder replacement shares the lifecycle restore owner', async () => {
+    const prepare = deferred<void>();
+    recorder.prepareToRecordAsync.mockReturnValue(prepare.promise);
+    recorder.stop.mockResolvedValue(undefined);
+    asMock(setAudioModeAsync).mockImplementation(
+      ({ allowsRecording }: { allowsRecording: boolean }) =>
+        allowsRecording ? Promise.resolve() : Promise.reject(new Error('restore failed')),
+    );
+    let activeRecorder = recorder;
+    asMock(useAudioRecorder).mockImplementation(
+      (_options: unknown, listener?: (status: RecordingStatus) => void) => {
+        statusListener = listener;
+        return activeRecorder;
+      },
+    );
+    const onError = jest.fn();
+    const { view, recorderProps } = await renderRecorder({ onError });
+    let staleStart!: Promise<void>;
+    await act(() => {
+      staleStart = Promise.resolve(committedPress(START_LABEL)()).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(recorder.prepareToRecordAsync).toHaveBeenCalledTimes(1);
+
+    recorder.uri = 'file:///recordings/stale-prepared.m4a';
+    for (const registration of mockSentinelFocusRegistrations) registration.cleanup = undefined;
+    activeRecorder = createReplacementRecorder();
+    await view.rerender(<Recorder {...recorderProps} />);
+    await act(async () => {
+      prepare.resolve();
+      await staleStart;
+      await flushMicrotasks();
+    });
+
+    expect(
+      onError.mock.calls.filter(([message]) => message === t('recorder.errAudioReset')),
+    ).toHaveLength(1);
+  });
+
+  it('ID 2340: an old recorder Stop cannot commit after recorder replacement', async () => {
+    let activeRecorder = recorder;
+    asMock(useAudioRecorder).mockImplementation(
+      (_options: unknown, listener?: (status: RecordingStatus) => void) => {
+        statusListener = listener;
+        return activeRecorder;
+      },
+    );
+    const { view, recorderProps } = await renderRecorder();
+    await startRecording();
+    recorderState.durationMillis = 5_000;
+    const nativeStop = deferred<void>();
+    recorder.stop.mockImplementation(() => nativeStop.promise);
+    let staleStop!: Promise<void>;
+    await act(() => {
+      staleStop = Promise.resolve(committedPress(STOP_LABEL)()).then(() => undefined);
+    });
+    await flushMicrotasks();
+
+    const staleUri = 'file:///recordings/stale-stop.m4a';
+    recorder.uri = staleUri;
+    for (const registration of mockSentinelFocusRegistrations) registration.cleanup = undefined;
+    activeRecorder = createReplacementRecorder();
+    await view.rerender(<Recorder {...recorderProps} />);
+    await act(async () => {
+      nativeStop.resolve();
+      await staleStop;
+      await flushMicrotasks();
+    });
+
+    expect(deletedFileUris()).toContain(staleUri);
+    expect(screen.queryByRole('button', { name: SUBMIT_TEXT })).toBeNull();
+  });
+
+  it('IDs 2451/2453/2454: delayed cancel cannot authorize a stale submission', async () => {
     const response = deferred<unknown>();
+    const cancelMark = deferred<boolean>();
+    asMock(markPendingAssessmentCancelled).mockReturnValue(cancelMark.promise);
     asMock(apiUploadAudio).mockImplementation(
       async (
         _endpoint: string,
@@ -733,16 +1077,31 @@ describe('Recorder mutation sentinels', () => {
         return response.promise;
       },
     );
-    const { view, recorderProps } = await renderRecorder();
+    const onError = jest.fn();
+    const { view, recorderProps } = await renderRecorder({ onError });
     await recordAndStop();
-    await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+    let staleSubmit!: Promise<void>;
+    await act(() => {
+      staleSubmit = Promise.resolve(
+        committedNodePress(screen.getByRole('button', { name: SUBMIT_TEXT }))(),
+      ).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(apiUploadAudio).toHaveBeenCalledTimes(1);
+    await fireEvent.press(screen.getByRole('button', { name: t('common.cancel') }));
     await view.rerender(<Recorder {...recorderProps} questionId={OTHER_QUESTION_ID} />);
+    onError.mockClear();
     await act(async () => {
       response.resolve({ ok: true });
       await flushMicrotasks();
+      cancelMark.resolve(true);
+      await staleSubmit;
+      await flushMicrotasks(100);
     });
+
     expect(recorderProps.onResult).not.toHaveBeenCalled();
     expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+    expect(onError).not.toHaveBeenCalled();
   });
 
   it('ID 2692: missing request tracking does not fabricate a failed clear', async () => {
@@ -926,5 +1285,52 @@ describe('Recorder mutation sentinels', () => {
       await stop;
     });
     expect(settled).toBe(true);
+  });
+
+  it('IDs 2834/2835/2836: a re-entrant stale rewind cannot clear a replacement player', async () => {
+    type PreviewStatus = { didJustFinish?: boolean; error?: unknown };
+    let oldStatusListener: ((status: PreviewStatus) => void) | undefined;
+    const oldPlayer = {
+      play: jest.fn(),
+      pause: jest.fn(),
+      remove: jest.fn(),
+      seekTo: jest.fn<Promise<void>, [number]>(),
+      addListener: jest.fn((_event: string, listener: (status: PreviewStatus) => void) => {
+        oldStatusListener = listener;
+        return { remove: jest.fn() };
+      }),
+    };
+    const replacementPlayer = {
+      play: jest.fn(),
+      pause: jest.fn(),
+      remove: jest.fn(),
+      seekTo: jest.fn(async () => undefined),
+      addListener: jest.fn(() => ({ remove: jest.fn() })),
+    };
+    asMock(createAudioPlayer).mockReturnValueOnce(oldPlayer).mockReturnValue(replacementPlayer);
+    let stalePlay!: () => unknown;
+    const onError = jest.fn(() => {
+      void Promise.resolve(stalePlay());
+    });
+    await renderRecorder({ onError });
+    await recordAndStop();
+    stalePlay = committedPress(t('recorder.playLabel'));
+    await act(async () => {
+      await Promise.resolve(stalePlay());
+      await flushMicrotasks();
+    });
+    if (!oldStatusListener) throw new Error('Old preview listener was not installed');
+
+    oldPlayer.seekTo.mockImplementation(() => {
+      oldStatusListener?.({ error: new Error('old player failed re-entrantly') });
+      return Promise.resolve();
+    });
+    await act(async () => {
+      oldStatusListener?.({ didJustFinish: true });
+      await flushMicrotasks(100);
+    });
+
+    expect(replacementPlayer.play).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText(t('recorder.pauseLabel'))).toBeTruthy();
   });
 });

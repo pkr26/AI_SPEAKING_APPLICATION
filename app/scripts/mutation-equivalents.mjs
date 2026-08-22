@@ -39,10 +39,10 @@ function exactLocations(...coordinates) {
   return Object.freeze(locations);
 }
 
-// Mechanically derived from the unresolved mutants in the 18 fresh lane
-// reports. This table is deliberately one-to-one with the reviewed entries
-// below; module initialization fails if an entry is added, removed, or changes
-// its declared count without updating its exact node locations.
+// Locations for the non-Recorder entries mechanically derived from the 18-lane
+// campaign. Recorder's newer canonical review keeps each location beside its
+// report ID below. Module initialization accounts for both sources so an entry
+// cannot be added or removed without an exact pinned node location.
 const equivalentMutantLocations = Object.freeze([
   exactLocations(51, 18, 53, 6),
   exactLocations(52, 16, 52, 21),
@@ -128,124 +128,1702 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(640, 52, 640, 74),
   exactLocations(444, 13, 444, 39),
   exactLocations(629, 7, 629, 36),
-  exactLocations(105, 25, 108, 6),
-  exactLocations(1165, 15, 1169, 6),
-  exactLocations(1166, 19, 1166, 25),
-  exactLocations(1167, 46, 1167, 71),
-  exactLocations(1373, 77, 1373, 81, 1388, 77, 1388, 81),
-  exactLocations(103, 31, 103, 59, 103, 61, 103, 73),
-  exactLocations(105, 9, 105, 23),
-  exactLocations(145, 7, 145, 35),
-  exactLocations(178, 11, 180, 4),
-  exactLocations(204, 74, 204, 79),
-  exactLocations(208, 56, 208, 61),
-  exactLocations(216, 29, 216, 33),
-  exactLocations(220, 42, 220, 47),
-  exactLocations(224, 37, 224, 42),
-  exactLocations(225, 38, 225, 43),
-  exactLocations(232, 31, 239, 4),
-  exactLocations(240, 30, 240, 63),
-  exactLocations(278, 32, 278, 77),
-  exactLocations(279, 9, 279, 27, 1037, 13, 1037, 31),
-  exactLocations(
-    283,
-    6,
-    283,
-    8,
-    296,
-    6,
-    296,
-    8,
-    303,
-    6,
-    303,
-    8,
-    313,
-    6,
-    313,
-    8,
-    321,
-    6,
-    321,
-    8,
-    881,
-    6,
-    881,
-    8,
-  ),
-  exactLocations(291, 7, 291, 21),
-  exactLocations(295, 9, 295, 27),
-  exactLocations(310, 13, 312, 6),
-  exactLocations(326, 11, 326, 51),
-  exactLocations(339, 7, 339, 37),
-  exactLocations(355, 41, 355, 46, 1081, 41, 1081, 46, 1117, 41, 1117, 46, 1133, 41, 1133, 46),
-  exactLocations(358, 11, 358, 29, 358, 11, 358, 29, 1082, 11, 1082, 29, 1082, 11, 1082, 29),
-  exactLocations(362, 11, 362, 54),
-  exactLocations(379, 7, 379, 43, 409, 7, 409, 43),
-  exactLocations(385, 40, 385, 74, 415, 40, 415, 74),
-  exactLocations(425, 9, 425, 45),
-  exactLocations(430, 42, 430, 76),
-  exactLocations(453, 28, 453, 32, 1171, 28, 1171, 32),
-  exactLocations(458, 7, 458, 41),
-  exactLocations(477, 13, 477, 25, 487, 13, 487, 25, 779, 25, 779, 37),
-  exactLocations(
-    502,
-    29,
-    502,
-    61,
-    607,
-    35,
-    607,
-    67,
-    631,
-    35,
-    631,
-    67,
-    652,
-    33,
-    652,
-    65,
-    723,
-    37,
-    723,
-    69,
-    1327,
-    29,
-    1327,
-    61,
-    1345,
-    27,
-    1345,
-    59,
-  ),
-  exactLocations(551, 36, 551, 41, 557, 36, 557, 41),
-  exactLocations(568, 17, 570, 10),
-  exactLocations(711, 85, 711, 90),
-  exactLocations(813, 13, 813, 47),
-  exactLocations(849, 28, 849, 33),
-  exactLocations(864, 11, 864, 29, 1027, 9, 1027, 27),
-  exactLocations(865, 11, 865, 29, 865, 11, 865, 29),
-  exactLocations(865, 58, 865, 63),
-  exactLocations(873, 13, 873, 19),
-  exactLocations(878, 16, 878, 21),
-  exactLocations(886, 9, 886, 29),
-  exactLocations(886, 19, 886, 29),
-  exactLocations(889, 49, 889, 71),
-  exactLocations(898, 11, 898, 29),
-  exactLocations(917, 40, 917, 46),
-  exactLocations(926, 43, 926, 49),
-  exactLocations(928, 9, 928, 44),
-  exactLocations(970, 9, 970, 41),
-  exactLocations(1098, 7, 1099, 46),
-  exactLocations(1098, 7, 1098, 51),
-  exactLocations(1165, 9, 1165, 13),
-  exactLocations(1172, 34, 1172, 39, 1361, 38, 1361, 43),
-  exactLocations(1245, 17, 1245, 43),
-  exactLocations(1360, 13, 1360, 40),
-  exactLocations(1525, 13, 1525, 53, 1525, 13, 1525, 53),
-  exactLocations(1525, 13, 1525, 53),
-  exactLocations(1682, 23, 1684, 4),
 ]);
+
+const recorderEquivalentMutantGroups = Object.freeze([
+  {
+    reason:
+      'These guards only keep a null or undefined sentinel out of URI sets. Every consumer either compares against a real string URI or rechecks truthiness before deletion, so inserting the sentinel cannot alter ownership, cleanup, or rendered state.',
+    mutants: [
+      ['733', 'ConditionalExpression', 'if (!uri) return;', 'false', 767, 7, 767, 11],
+      [
+        '1042',
+        'ConditionalExpression',
+        'if (candidateUri) candidates.add(candidateUri);',
+        'true',
+        1270,
+        9,
+        1270,
+        21,
+      ],
+      ['1103', 'ConditionalExpression', 'if (uri) ownedUris.add(uri);', 'true', 1354, 11, 1354, 14],
+      [
+        '2261',
+        'ConditionalExpression',
+        'if (preparedCandidateUri) ownedTakeUrisRef.current.add(preparedCandidateUri);',
+        'true',
+        2574,
+        11,
+        2574,
+        31,
+      ],
+    ],
+  },
+  {
+    reason:
+      'On the only mount for which recordingCacheJanitorHasRun is false, no audio owner can predate the passive janitor; if another Recorder already acquired the session, its earlier mount already set the process-once flag. The owner operand therefore cannot decide the result.',
+    mutants: [
+      [
+        '774',
+        'ConditionalExpression',
+        'activeAudioSessionOwner !== null,',
+        'false',
+        820,
+        7,
+        820,
+        39,
+      ],
+    ],
+  },
+  {
+    reason:
+      'The mount layout effect writes the authoritative mounted and unmounting values before passive effects, native events, or promise continuations can consume these refs. Their render-time seeds are overwritten before any observable branch.',
+    mutants: [
+      ['793', 'BooleanLiteral', 'const mountedRef = useRef(true);', 'false', 865, 29, 865, 33],
+      ['794', 'BooleanLiteral', 'const unmountingRef = useRef(false);', 'true', 866, 32, 866, 37],
+    ],
+  },
+  {
+    reason:
+      'The later AppState mount effect writes mountedRef true before external app-state events or async continuations can publish. Writing false in this earlier mount assignment is therefore overwritten before it can be the sole lifecycle currency.',
+    mutants: [
+      ['1177', 'BooleanLiteral', 'mountedRef.current = true;', 'false', 1480, 26, 1480, 30],
+    ],
+  },
+  {
+    reason:
+      'permissionNeedsSettings is hidden until permissionDenied, previewPlaying is hidden outside recorded, and the initial idle announcement produces no message. Each seed is reset before its first visible phase, so its mutated initial value cannot render or notify.',
+    mutants: [
+      [
+        '828',
+        'BooleanLiteral',
+        'const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);',
+        'true',
+        931,
+        74,
+        931,
+        79,
+      ],
+      [
+        '830',
+        'BooleanLiteral',
+        'const [previewPlaying, setPreviewPlaying] = useState(false);',
+        'true',
+        935,
+        56,
+        935,
+        61,
+      ],
+      [
+        '1975',
+        'StringLiteral',
+        "const announcedPhaseRef = useRef<Phase>('idle');",
+        '""',
+        2300,
+        43,
+        2300,
+        49,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Each ref is consulted only after the recording, submission, interruption, or preview operation that owns it synchronously initializes it. The idle component never consumes these seeds, so changing their initial booleans is unobservable.',
+    mutants: [
+      [
+        '833',
+        'BooleanLiteral',
+        'const hasObservedRecordingRef = useRef(false);',
+        'true',
+        950,
+        42,
+        950,
+        47,
+      ],
+      [
+        '834',
+        'BooleanLiteral',
+        'const recordingInterruptionHandledRef = useRef(false);',
+        'true',
+        951,
+        50,
+        951,
+        55,
+      ],
+      [
+        '836',
+        'BooleanLiteral',
+        'const cancelRequestedRef = useRef(false);',
+        'true',
+        955,
+        37,
+        955,
+        42,
+      ],
+      [
+        '837',
+        'BooleanLiteral',
+        'const assessmentPostedRef = useRef(false);',
+        'true',
+        956,
+        38,
+        956,
+        43,
+      ],
+      [
+        '839',
+        'BooleanLiteral',
+        'const previewPlayRequestedRef = useRef(false);',
+        'true',
+        982,
+        42,
+        982,
+        47,
+      ],
+    ],
+  },
+  {
+    reason:
+      'useLayoutEffect replaces the callback and identity snapshots in the same commit before focus or passive effects, user input, native events, or promise continuations can invoke their consumers. The initial object literal is therefore dead.',
+    mutants: [
+      [
+        '842',
+        'ObjectLiteral',
+        'const callbacksRef = useRef({\n    disabled,\n    isStartBlocked,\n    onError,\n    onInteractionLockChange,\n    onRateLimited,\n    onRecoveryEndpointMismatch,\n    onRecoveryUnresolved,\n    onResult,\n    parseResult,\n  });',
+        '{}',
+        990,
+        31,
+        1000,
+        4,
+      ],
+      [
+        '878',
+        'ObjectLiteral',
+        'const identityRef = useRef({ ownerId, endpoint, questionId });',
+        '{}',
+        1040,
+        30,
+        1040,
+        63,
+      ],
+    ],
+  },
+  {
+    reason:
+      'The injected array element is a string with no uri or takeGeneration property. Every quarantine predicate compares those properties with a real URI or numeric generation, so it never matches and is eventually shifted out without side effects.',
+    mutants: [
+      [
+        '795',
+        'ArrayDeclaration',
+        'const terminalEventQuarantineRef = useRef<TerminalEventQuarantine[]>([]);',
+        '["Stryker was here"]',
+        872,
+        72,
+        872,
+        74,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Replacing optional access can only throw when the target is nullish, and every listed access is inside a try/catch whose fallback already leaves the same false or cleared state. Non-null targets execute identically.',
+    mutants: [
+      [
+        '804',
+        'OptionalChaining',
+        'recorderStillRecording = currentRecorderRef.current?.isRecording === true;',
+        'currentRecorderRef.current.isRecording',
+        885,
+        34,
+        885,
+        73,
+      ],
+      [
+        '1030',
+        'OptionalChaining',
+        'previewListenerRef.current?.remove();',
+        'previewListenerRef.current.remove',
+        1248,
+        7,
+        1248,
+        41,
+      ],
+      ['1032', 'OptionalChaining', 'player?.remove();', 'player.remove', 1256, 7, 1256, 21],
+    ],
+  },
+  {
+    reason:
+      'These values are used only as change or freshness tokens: the state version merely forces a render, while generations and epochs are compared only for equality with captured values. Incrementing or decrementing creates the same distinct token.',
+    mutants: [
+      [
+        '819',
+        'ArithmeticOperator',
+        'setRecordingStatusVersion((version) => version + 1);',
+        'version - 1',
+        910,
+        48,
+        910,
+        59,
+      ],
+      [
+        '1060',
+        'AssignmentOperator',
+        'recoveryGenerationRef.current += 1;',
+        'recoveryGenerationRef.current -= 1',
+        1297,
+        5,
+        1297,
+        39,
+      ],
+      [
+        '1132',
+        'AssignmentOperator',
+        'lifecycleEpochRef.current += 1;',
+        'lifecycleEpochRef.current -= 1',
+        1399,
+        7,
+        1399,
+        37,
+      ],
+      [
+        '1334',
+        'UpdateOperator',
+        'const generation = ++recoveryGenerationRef.current;',
+        '--recoveryGenerationRef.current',
+        1652,
+        24,
+        1652,
+        55,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Stryker substitutes one constant dependency array for another. React compares the same constant element on every render, so callback or effect identity and execution cadence are unchanged.',
+    mutants: [
+      ['820', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 913, 6, 913, 8],
+      ['852', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1010, 6, 1010, 8],
+      ['877', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1039, 6, 1039, 8],
+      ['888', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1080, 6, 1080, 8],
+      ['902', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1094, 6, 1094, 8],
+      ['957', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1175, 6, 1175, 8],
+      ['962', 'ArrayDeclaration', '[],', '["Stryker was here"]', 1179, 5, 1179, 7],
+      [
+        '968',
+        'ArrayDeclaration',
+        'const operationIsInFlight = useCallback(() => operationsInFlightRef.current.size > 0, []);',
+        '["Stryker was here"]',
+        1182,
+        89,
+        1182,
+        91,
+      ],
+      [
+        '970',
+        'ArrayDeclaration',
+        'const readCancelPersistence = useCallback(() => cancelPersistenceRef.current, []);',
+        '["Stryker was here"]',
+        1184,
+        81,
+        1184,
+        83,
+      ],
+      ['983', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1195, 6, 1195, 8],
+      ['1006', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1216, 6, 1216, 8],
+      ['1020', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1227, 6, 1227, 8],
+      ['1036', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1261, 6, 1261, 8],
+      ['1039', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1266, 6, 1266, 8],
+      ['1043', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1274, 6, 1274, 8],
+      ['1049', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1284, 6, 1284, 8],
+      ['1058', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1294, 6, 1294, 8],
+      ['1068', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 1306, 6, 1306, 8],
+      ['1098', 'ArrayDeclaration', '[],', '["Stryker was here"]', 1345, 5, 1345, 7],
+      ['1836', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 2174, 6, 2174, 8],
+      ['1922', 'ArrayDeclaration', '}, []);', '["Stryker was here"]', 2255, 6, 2255, 8],
+    ],
+  },
+  {
+    reason:
+      'Every removed dependency is itself a useCallback with stable identity. Replacing the dependency list with an empty array therefore cannot alter callback or effect recreation, cleanup timing, or captured values.',
+    mutants: [
+      ['915', 'ArrayDeclaration', '[publishOperation],', '[]', 1113, 5, 1113, 23],
+      ['926', 'ArrayDeclaration', '[publishOperation],', '[]', 1131, 5, 1131, 23],
+      ['1026', 'ArrayDeclaration', '[updatePhase],', '[]', 1241, 5, 1241, 18],
+      [
+        '1931',
+        'ArrayDeclaration',
+        'useEffect(() => () => releasePreviewPlayer(), [releasePreviewPlayer]);',
+        '[]',
+        2263,
+        49,
+        2263,
+        71,
+      ],
+      [
+        '2073',
+        'ArrayDeclaration',
+        '[\n      adoptOwnedRecording,\n      clearWebAutoStopTimer,\n      discardRecording,\n      restoreOwnedAudioMode,\n      updatePhase,\n    ],',
+        '[]',
+        2371,
+        5,
+        2377,
+        6,
+      ],
+    ],
+  },
+  {
+    reason:
+      'audioSessionCanBeAcquired plus the awaited global release promise ensures recording start reaches acquisition only with a null owner; Recorder phase and operation currency exclude re-acquiring a session already owned by this instance. The null test is always true.',
+    mutants: [
+      [
+        '848',
+        'ConditionalExpression',
+        'if (activeAudioSessionOwner === null) {',
+        'true',
+        1004,
+        9,
+        1004,
+        41,
+      ],
+    ],
+  },
+  {
+    reason:
+      'restoreOwnedAudioMode returns before constructing work unless this instance owns the session. Acquisition remains serialized behind its release promise and only one restore promise exists, so the owner, resolver, and promise-identity guards are guaranteed.',
+    mutants: [
+      [
+        '870',
+        'ConditionalExpression',
+        'if (audioSessionIsOwnedBy(activeAudioSessionOwner, instanceId)) {',
+        'true',
+        1026,
+        13,
+        1026,
+        71,
+      ],
+      ['872', 'OptionalChaining', 'resolveRelease?.();', 'resolveRelease()', 1031, 11, 1031, 29],
+      [
+        '875',
+        'ConditionalExpression',
+        'if (audioRestorePromiseRef.current === promise) audioRestorePromiseRef.current = null;',
+        'true',
+        1035,
+        11,
+        1035,
+        53,
+      ],
+    ],
+  },
+  {
+    reason:
+      'operationOwnerRef is non-null only while the in-flight set is non-empty. Ordinary begin is already rejected by the count and superseding begin ignores both checks, so the owner boolean cannot independently decide admission.',
+    mutants: [
+      [
+        '909',
+        'ConditionalExpression',
+        'operationOwnerRef.current !== null,',
+        'false',
+        1101,
+        11,
+        1101,
+        45,
+      ],
+    ],
+  },
+  {
+    reason:
+      'resumeOperation is called only after the permission-dialog lifecycle stop has cleared ownership while retaining that one operation token. The call site first proves the token is not current, so the in-flight, count-one, and no-owner preconditions hold and the rejection block is unreachable.',
+    mutants: [
+      [
+        '918',
+        'ConditionalExpression',
+        '!canResumeRecorderOperation(\n          operationOwnerRef.current !== null,\n          operationsInFlightRef.current.has(token),\n          operationsInFlightRef.current.size,\n        )',
+        'false',
+        1119,
+        9,
+        1123,
+        10,
+      ],
+      [
+        '920',
+        'ConditionalExpression',
+        'operationOwnerRef.current !== null,',
+        'false',
+        1120,
+        11,
+        1120,
+        45,
+      ],
+      ['923', 'BlockStatement', ') {\n        return false;\n      }', '{}', 1124, 9, 1126, 8],
+      ['924', 'BooleanLiteral', 'return false;', 'true', 1125, 16, 1125, 21],
+    ],
+  },
+  {
+    reason:
+      'A stale token can finish only beneath a newer superseding lifecycle token. Clearing ownership early still leaves another in-flight token, so count-based admission remains blocked, the lock remains active, and lifecycle cleanup has no later owner-current read. The defensive identity guard is unobservable.',
+    mutants: [
+      [
+        '929',
+        'ConditionalExpression',
+        'if (operationOwnerRef.current === token) operationOwnerRef.current = null;',
+        'true',
+        1136,
+        9,
+        1136,
+        44,
+      ],
+    ],
+  },
+  {
+    reason:
+      'These predicates and latches only suppress React state updates after detach. React 19 discards updates to an unmounted fiber, and while context is current the predicate is already true, so rendered state and callbacks are identical.',
+    mutants: [
+      [
+        '936',
+        'ConditionalExpression',
+        'if (mountedRef.current) setOperationActive(stillActive);',
+        'true',
+        1138,
+        9,
+        1138,
+        27,
+      ],
+      ['1018', 'ConditionalExpression', 'if (mountedRef.current) {', 'true', 1223, 9, 1223, 27],
+      [
+        '1024',
+        'ConditionalExpression',
+        'if (mountedRef.current) setRecoveryRetryNeeded(true);',
+        'true',
+        1238,
+        11,
+        1238,
+        29,
+      ],
+      [
+        '1034',
+        'ConditionalExpression',
+        'if (mountedRef.current) setPreviewPlaying(false);',
+        'true',
+        1260,
+        9,
+        1260,
+        27,
+      ],
+      [
+        '1276',
+        'ConditionalExpression',
+        'if (mountedRef.current) setRecoveryRetryNeeded(true);',
+        'true',
+        1578,
+        13,
+        1578,
+        31,
+      ],
+      [
+        '1332',
+        'ConditionalExpression',
+        'if (mountedRef.current) setRecoveryRetryNeeded(false);',
+        'true',
+        1651,
+        9,
+        1651,
+        27,
+      ],
+      [
+        '1918',
+        'ConditionalExpression',
+        'if (active) setReduceMotion(enabled);',
+        'true',
+        2247,
+        13,
+        2247,
+        19,
+      ],
+      ['1921', 'BooleanLiteral', 'active = false;', 'true', 2252, 16, 2252, 21],
+      [
+        '2153',
+        'ConditionalExpression',
+        'if (mountedRef.current) setPermissionDenied(false);',
+        'true',
+        2482,
+        9,
+        2482,
+        27,
+      ],
+    ],
+  },
+  {
+    reason:
+      'waitStartedAtRef is stamped exactly when entering uploading or recovering and cleared outside them. The interval exists only in those wait phases, so the nullable guard and phase ternary cannot select a different observable value.',
+    mutants: [
+      [
+        '1011',
+        'ConditionalExpression',
+        "next === 'uploading' || next === 'recovering' ? monotonicNow() : null;",
+        'true',
+        1222,
+        7,
+        1222,
+        52,
+      ],
+      [
+        '1944',
+        'ConditionalExpression',
+        'if (startedAt !== null) setWaitElapsedMillis(monotonicNow() - startedAt);',
+        'true',
+        2272,
+        11,
+        2272,
+        29,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Callers consume these catch results only in boolean positions. Removing return false yields undefined, which is equally falsy; the cancellation catch likewise takes the same branch for false and undefined.',
+    mutants: [
+      ['1056', 'BlockStatement', '} catch {\n      return false;\n    }', '{}', 1291, 13, 1293, 6],
+      [
+        '1472',
+        'BlockStatement',
+        '} catch {\n          return false;\n        }',
+        '{}',
+        1796,
+        17,
+        1798,
+        10,
+      ],
+      [
+        '2748',
+        'ArrowFunction',
+        'const promise = markPendingAssessmentCancelled(requestId).catch(() => false);',
+        '() => undefined',
+        3128,
+        71,
+        3128,
+        82,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Each ref is assigned the sole in-flight promise and later calls return that same promise until its finally handler settles. No second promise can replace it, so the identity cleanup check is always true.',
+    mutants: [
+      [
+        '1074',
+        'ConditionalExpression',
+        'if (nativeStopPromiseRef.current === promise) {',
+        'true',
+        1311,
+        11,
+        1311,
+        51,
+      ],
+      [
+        '1172',
+        'ConditionalExpression',
+        'if (lifecycleStopPromiseRef.current === promise) {',
+        'true',
+        1459,
+        11,
+        1459,
+        54,
+      ],
+    ],
+  },
+  {
+    reason:
+      'One waiter is registered for one take generation and deletes itself on its first timeout or completion. Later calls can only target an already-settled Promise, where repeated clear, delete, and resolve operations are idempotent; another generation cannot own this waiter.',
+    mutants: [
+      [
+        '1086',
+        'ConditionalExpression',
+        'if (settled || (completion && completion.takeGeneration !== takeGeneration)) return;',
+        'false',
+        1329,
+        15,
+        1329,
+        86,
+      ],
+      [
+        '1088',
+        'LogicalOperator',
+        'if (settled || (completion && completion.takeGeneration !== takeGeneration)) return;',
+        'settled && completion && completion.takeGeneration !== takeGeneration',
+        1329,
+        15,
+        1329,
+        86,
+      ],
+      [
+        '1089',
+        'ConditionalExpression',
+        'if (settled || (completion && completion.takeGeneration !== takeGeneration)) return;',
+        'false',
+        1329,
+        27,
+        1329,
+        85,
+      ],
+      ['1093', 'BooleanLiteral', 'settled = true;', 'false', 1330, 21, 1330, 25],
+    ],
+  },
+  {
+    reason:
+      'Prepared-recorder disposal runs under an operation while no recording is adoptable. A terminal callback published without suppression can only bump the status version; the consuming effect rejects it through its phase and operation guards.',
+    mutants: [
+      [
+        '1100',
+        'BooleanLiteral',
+        'suppressRecordingStatusRef.current = true;',
+        'false',
+        1349,
+        42,
+        1349,
+        46,
+      ],
+    ],
+  },
+  {
+    reason:
+      'beginOperation(true) cannot return null, and the recovery path calls ordinary begin only after synchronously proving that no operation is in flight. Both null-token returns are unreachable defensive branches.',
+    mutants: [
+      [
+        '1129',
+        'ConditionalExpression',
+        'if (!operationToken) return Promise.resolve();',
+        'false',
+        1397,
+        9,
+        1397,
+        24,
+      ],
+      ['1223', 'ConditionalExpression', 'if (!operationToken) return;', 'false', 1521, 9, 1521, 24],
+    ],
+  },
+  {
+    reason:
+      'hasObservedRecordingRef is read only while recording. Every transition into recording resets it before publication, and these sites immediately leave or are outside that phase, so their additional false assignment cannot affect a later take.',
+    mutants: [
+      [
+        '1168',
+        'BooleanLiteral',
+        'hasObservedRecordingRef.current = false;',
+        'true',
+        1453,
+        41,
+        1453,
+        46,
+      ],
+      [
+        '2054',
+        'BooleanLiteral',
+        'hasObservedRecordingRef.current = false;',
+        'true',
+        2355,
+        41,
+        2355,
+        46,
+      ],
+      [
+        '2306',
+        'BooleanLiteral',
+        'hasObservedRecordingRef.current = false;',
+        'true',
+        2626,
+        41,
+        2626,
+        46,
+      ],
+      [
+        '2362',
+        'BooleanLiteral',
+        'hasObservedRecordingRef.current = false;',
+        'true',
+        2682,
+        41,
+        2682,
+        46,
+      ],
+      [
+        '2408',
+        'BooleanLiteral',
+        'hasObservedRecordingRef.current = false;',
+        'true',
+        2713,
+        41,
+        2713,
+        46,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Unmount cleanup sets unmounting true and mounted false together. Operation publication checks both, focus cleanup removes active context, and remaining mounted-only reads guard React state updates discarded after detach; either individual assignment is redundant.',
+    mutants: [
+      ['1180', 'BooleanLiteral', 'unmountingRef.current = true;', 'false', 1483, 31, 1483, 35],
+      ['1181', 'BooleanLiteral', 'mountedRef.current = false;', 'true', 1484, 28, 1484, 33],
+    ],
+  },
+  {
+    reason:
+      'Replacing the native recorder triggers layout cleanup and a superseding lifecycle operation before stale work can continue. Current operation and identity currency therefore already imply that currentRecorder is the captured recorder.',
+    mutants: [
+      [
+        '1188',
+        'ConditionalExpression',
+        'currentRecorderRef.current === recorder;',
+        'true',
+        1493,
+        7,
+        1493,
+        46,
+      ],
+      [
+        '2458',
+        'ConditionalExpression',
+        'currentRecorderRef.current === recorder &&',
+        'true',
+        2775,
+        7,
+        2775,
+        46,
+      ],
+    ],
+  },
+  {
+    reason:
+      'This branch runs only while another instance owns recovery. Setting the retry flag outside recovering is hidden, and an active recovering instance is mounted by the context gate; weakening the phase and mounted conjunction cannot alter visible UI.',
+    mutants: [
+      [
+        '1198',
+        'ConditionalExpression',
+        "if (phaseRef.current === 'recovering' && mountedRef.current) {",
+        'true',
+        1495,
+        11,
+        1495,
+        44,
+      ],
+      [
+        '1201',
+        'ConditionalExpression',
+        "if (phaseRef.current === 'recovering' && mountedRef.current) {",
+        'true',
+        1495,
+        11,
+        1495,
+        66,
+      ],
+      [
+        '1202',
+        'LogicalOperator',
+        "if (phaseRef.current === 'recovering' && mountedRef.current) {",
+        "phaseRef.current === 'recovering' || mountedRef.current",
+        1495,
+        11,
+        1495,
+        66,
+      ],
+    ],
+  },
+  {
+    reason:
+      'A live upload owns an in-flight operation and the uploading phase, which independently make recovery ineligible or its token stale. A current recovery load cannot concurrently own an upload controller, so these controller predicates are redundant.',
+    mutants: [
+      [
+        '1212',
+        'ConditionalExpression',
+        'uploadControllerRef.current !== null,',
+        'false',
+        1504,
+        9,
+        1504,
+        45,
+      ],
+      [
+        '1252',
+        'ConditionalExpression',
+        'uploadControllerRef.current !== null,',
+        'false',
+        1549,
+        9,
+        1549,
+        45,
+      ],
+      [
+        '1260',
+        'ConditionalExpression',
+        'uploadControllerRef.current !== null,',
+        'false',
+        1565,
+        11,
+        1565,
+        47,
+      ],
+      [
+        '1326',
+        'ConditionalExpression',
+        'uploadControllerRef.current !== null,',
+        'false',
+        1632,
+        11,
+        1632,
+        47,
+      ],
+    ],
+  },
+  {
+    reason:
+      'No second recovery attempt can start while this loading operation token remains in flight. The attempt ref is therefore this exact symbol or already null from invalidation, and assigning null unconditionally cannot clear a newer attempt.',
+    mutants: [
+      [
+        '1228',
+        'ConditionalExpression',
+        'if (recoveryAttemptRef.current === recoveryAttempt) recoveryAttemptRef.current = null;',
+        'true',
+        1526,
+        11,
+        1526,
+        57,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Before this continuation acquires the global recovery lease, this instance cannot already own it: self-ownership implies recovering and operation state rejected by the entry guards. Any non-null owner is necessarily another instance.',
+    mutants: [
+      [
+        '1244',
+        'ConditionalExpression',
+        'const anotherRecoveryOwner = activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId;',
+        'true',
+        1544,
+        66,
+        1544,
+        100,
+      ],
+      [
+        '1320',
+        'ConditionalExpression',
+        'activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId;',
+        'true',
+        1627,
+        41,
+        1627,
+        75,
+      ],
+    ],
+  },
+  {
+    reason:
+      'canContinueRecoveryLoad returned true immediately above only when pending is non-null. No assignment intervenes, so the null condition and its type-narrowing fallback block are unreachable.',
+    mutants: [
+      ['1278', 'ConditionalExpression', 'if (pending === null) {', 'false', 1585, 9, 1585, 25],
+      [
+        '1281',
+        'BlockStatement',
+        'if (pending === null) {\n      finishLoading();\n      return;\n    }',
+        '{}',
+        1585,
+        27,
+        1588,
+        6,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Recovery invalidation changes generation, ownership, recovering state, operation currency, and abort state together. If generation or lease ownership differs, another remaining predicate already makes isCurrent false.',
+    mutants: [
+      [
+        '1337',
+        'ConditionalExpression',
+        'recoveryGenerationRef.current === generation,',
+        'true',
+        1655,
+        9,
+        1655,
+        53,
+      ],
+      [
+        '1340',
+        'ConditionalExpression',
+        'activeRecoveryOwner === instanceId,',
+        'true',
+        1657,
+        9,
+        1657,
+        43,
+      ],
+    ],
+  },
+  {
+    reason:
+      'canContinueRecoveryLoad already proved operation and lifecycle currency, and the reconcile-stage callback is reached without an intervening await. Callback re-entry is followed immediately by the separate post-callback isCurrent guard before effects.',
+    mutants: [
+      ['1363', 'ConditionalExpression', 'if (!isCurrent()) return;', 'false', 1678, 13, 1678, 25],
+    ],
+  },
+  {
+    reason:
+      'The validated prepared-stage path reaches this check without an await or re-entry. releaseUnclaimedHandoff then performs the sole await and immediately rechecks isCurrent before publishing, so the outer guard is redundant.',
+    mutants: [
+      ['1396', 'ConditionalExpression', 'if (!isCurrent()) return;', 'false', 1703, 13, 1703, 25],
+    ],
+  },
+  {
+    reason:
+      'These mutations make the re-upload helper return true instead of false after stale currency is detected. Its sole caller immediately rechecks isCurrent before changing counters or continuing, so the truthy stale result cannot publish.',
+    mutants: [
+      ['1450', 'BooleanLiteral', 'if (!isCurrent()) return false;', 'true', 1777, 36, 1777, 41],
+      ['1469', 'BooleanLiteral', 'if (!isCurrent()) return false;', 'true', 1785, 36, 1785, 41],
+    ],
+  },
+  {
+    reason:
+      'This call occurs only inside the not-routeMatches branch. finishUnresolved independently tests not-routeMatches when choosing whether a recording can be retained, so changing allowRecordedRetry cannot change the selected branch.',
+    mutants: [
+      [
+        '1678',
+        'BooleanLiteral',
+        "await finishUnresolved(translate('recorder.errInterruptedSaved'), false);",
+        'true',
+        1980,
+        85,
+        1980,
+        90,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Each weakened guard can only fall into finishUnresolved or an adjacent error route whose first possible effect is another isCurrent check. The stale continuation therefore returns before publishing state, callbacks, or durable changes.',
+    mutants: [
+      ['1703', 'ConditionalExpression', 'if (isCurrent()) {', 'true', 2009, 23, 2009, 34],
+      ['1764', 'ConditionalExpression', 'if (!isCurrent()) return;', 'false', 2064, 25, 2064, 37],
+    ],
+  },
+  {
+    reason:
+      'These branches handle ApiError classes for which userMessageForError resolves a code or status-specific localized message. The supplied generic fallback is never selected, so replacing its text has no effect.',
+    mutants: [
+      [
+        '1772',
+        'StringLiteral',
+        "userMessageForError(retryError, translate('recorder.errRejected')),",
+        '""',
+        2074,
+        63,
+        2074,
+        85,
+      ],
+      [
+        '1777',
+        'StringLiteral',
+        "userMessageForError(retryError, translate('recorder.errNotSent')),",
+        '""',
+        2082,
+        63,
+        2082,
+        84,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Deferred permission data is cleared synchronously on identity change and consumed only after focus and mount resume. A retained response therefore matches the current identity, while focus already implies a mounted consumer.',
+    mutants: [
+      [
+        '1855',
+        'ConditionalExpression',
+        'if (identityMatches && mountedRef.current && focusedRef.current) {',
+        'true',
+        2195,
+        17,
+        2195,
+        54,
+      ],
+      [
+        '1856',
+        'LogicalOperator',
+        'if (identityMatches && mountedRef.current && focusedRef.current) {',
+        'identityMatches || mountedRef.current',
+        2195,
+        17,
+        2195,
+        54,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Entering recorded always follows paths that already released preview, while every other phase releases it. Calling release on the recorded transition is therefore a no-op, and removing or changing the recorded exception has no observable effect.',
+    mutants: [
+      [
+        '1925',
+        'ConditionalExpression',
+        "if (phase !== 'recorded') releasePreviewPlayer();",
+        'true',
+        2260,
+        9,
+        2260,
+        29,
+      ],
+      [
+        '1927',
+        'StringLiteral',
+        "if (phase !== 'recorded') releasePreviewPlayer();",
+        '""',
+        2260,
+        19,
+        2260,
+        29,
+      ],
+    ],
+  },
+  {
+    reason:
+      'The effect depends only on phase, so React never reruns it with an unchanged phase. The ref is assigned on every run, making the equality early return unreachable.',
+    mutants: [
+      [
+        '1977',
+        'ConditionalExpression',
+        'if (announcedPhaseRef.current === phase) return;',
+        'false',
+        2302,
+        9,
+        2302,
+        44,
+      ],
+    ],
+  },
+  {
+    reason:
+      'pulseSteps is a local fixed two-element literal with finite values, positive 550 ms durations, and true native-driver flags; map consequently creates two animations. Its validation and empty-array fallbacks are unreachable current-source redundancy.',
+    mutants: [
+      ['2023', 'ConditionalExpression', 'pulseSteps.length !== 2 ||', 'false', 2328, 7, 2328, 30],
+      [
+        '2025',
+        'ConditionalExpression',
+        'pulseSteps.length !== 2 ||\n      pulseSteps.some(\n        (step) =>\n          !Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||\n          step.useNativeDriver !== true,\n      )',
+        'false',
+        2328,
+        7,
+        2335,
+        8,
+      ],
+      [
+        '2027',
+        'LogicalOperator',
+        'pulseSteps.length !== 2 ||\n      pulseSteps.some(\n        (step) =>\n          !Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||\n          step.useNativeDriver !== true,\n      )',
+        'pulseSteps.length !== 2 && pulseSteps.some(step => !Number.isFinite(step.toValue) || !Number.isFinite(step.duration) || step.duration <= 0 || step.useNativeDriver !== true)',
+        2328,
+        7,
+        2335,
+        8,
+      ],
+      [
+        '2029',
+        'ArrowFunction',
+        '(step) =>\n          !Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||\n          step.useNativeDriver !== true,',
+        '() => undefined',
+        2330,
+        9,
+        2334,
+        40,
+      ],
+      [
+        '2031',
+        'ConditionalExpression',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||',
+        'false',
+        2331,
+        11,
+        2332,
+        42,
+      ],
+      [
+        '2032',
+        'LogicalOperator',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||',
+        '!Number.isFinite(step.toValue) && !Number.isFinite(step.duration)',
+        2331,
+        11,
+        2332,
+        42,
+      ],
+      [
+        '2033',
+        'ConditionalExpression',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||',
+        'false',
+        2331,
+        11,
+        2333,
+        29,
+      ],
+      [
+        '2034',
+        'LogicalOperator',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||',
+        '(!Number.isFinite(step.toValue) || !Number.isFinite(step.duration)) && step.duration <= 0',
+        2331,
+        11,
+        2333,
+        29,
+      ],
+      [
+        '2035',
+        'ConditionalExpression',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||\n          step.useNativeDriver !== true,',
+        'false',
+        2331,
+        11,
+        2334,
+        40,
+      ],
+      [
+        '2037',
+        'LogicalOperator',
+        '!Number.isFinite(step.toValue) ||\n          !Number.isFinite(step.duration) ||\n          step.duration <= 0 ||\n          step.useNativeDriver !== true,',
+        '(!Number.isFinite(step.toValue) || !Number.isFinite(step.duration) || step.duration <= 0) && step.useNativeDriver !== true',
+        2331,
+        11,
+        2334,
+        40,
+      ],
+      ['2039', 'ConditionalExpression', 'step.duration <= 0 ||', 'false', 2333, 11, 2333, 29],
+      [
+        '2040',
+        'EqualityOperator',
+        'step.duration <= 0 ||',
+        'step.duration < 0',
+        2333,
+        11,
+        2333,
+        29,
+      ],
+      [
+        '2042',
+        'ConditionalExpression',
+        'step.useNativeDriver !== true,',
+        'false',
+        2334,
+        11,
+        2334,
+        40,
+      ],
+      [
+        '2045',
+        'BlockStatement',
+        ') {\n      pulse.setValue(1);\n      return;\n    }',
+        '{}',
+        2336,
+        7,
+        2339,
+        6,
+      ],
+      [
+        '2047',
+        'ConditionalExpression',
+        'if (animations.length === 0) {',
+        'false',
+        2341,
+        9,
+        2341,
+        32,
+      ],
+      [
+        '2050',
+        'BlockStatement',
+        'if (animations.length === 0) {\n      pulse.setValue(1);\n      return;\n    }',
+        '{}',
+        2341,
+        34,
+        2344,
+        6,
+      ],
+    ],
+  },
+  {
+    reason:
+      'These duration reads occur only after a successful recording start set the timestamp before publishing the recording phase. Lifecycle cleanup first makes the operation stale, so the nullable fallback cannot be selected by current work.',
+    mutants: [
+      [
+        '2103',
+        'ConditionalExpression',
+        'recordingStartedAt !== null ? monotonicNow() - recordingStartedAt : 0;',
+        'true',
+        2417,
+        11,
+        2417,
+        38,
+      ],
+      [
+        '2343',
+        'ConditionalExpression',
+        'const rawWallDuration = recordingStartedAt !== null ? monotonicNow() - recordingStartedAt : 0;',
+        'true',
+        2657,
+        29,
+        2657,
+        56,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Every lifecycle epoch change first installs a superseding operation token. Current operation-token currency therefore already proves the captured epoch equals the live epoch, making this equality operand redundant.',
+    mutants: [
+      [
+        '2140',
+        'ConditionalExpression',
+        'lifecycleEpoch === lifecycleEpochRef.current,',
+        'true',
+        2465,
+        9,
+        2465,
+        53,
+      ],
+    ],
+  },
+  {
+    reason:
+      'When no prompt was required, response is the current permission and app context is already active; the extra foreground wait resolves immediately and adopting the same epoch is a no-op. When prompted, the original branch already runs.',
+    mutants: [['2184', 'ConditionalExpression', 'if (prompted) {', 'true', 2500, 11, 2500, 19]],
+  },
+  {
+    reason:
+      'isCurrentLifecycle was checked immediately before this denied-permission branch and includes recorderContextIsActive, which proves mountedRef.current. The nested mounted condition is always true.',
+    mutants: [
+      ['2213', 'ConditionalExpression', 'if (mountedRef.current) {', 'true', 2520, 13, 2520, 31],
+    ],
+  },
+  {
+    reason:
+      'When a live URI exists it is added unconditionally again at the end of the following normalization block, and Set insertion is idempotent. When it is null, adding or skipping the sentinel has no string-URI cleanup effect.',
+    mutants: [
+      [
+        '2279',
+        'ConditionalExpression',
+        'if (liveRecordingUri) ownedTakeUrisRef.current.add(liveRecordingUri);',
+        'false',
+        2597,
+        11,
+        2597,
+        27,
+      ],
+      [
+        '2280',
+        'ConditionalExpression',
+        'if (liveRecordingUri) ownedTakeUrisRef.current.add(liveRecordingUri);',
+        'true',
+        2597,
+        11,
+        2597,
+        27,
+      ],
+    ],
+  },
+  {
+    reason:
+      'After record succeeds, the remaining statements are non-throwing ref and Set updates plus guarded phase publication; the catch cannot observe prepared again. Its reset value is dead.',
+    mutants: [['2290', 'BooleanLiteral', 'prepared = false;', 'true', 2611, 18, 2611, 23]],
+  },
+  {
+    reason:
+      'The stop reason is used only to distinguish the literal auto value. Every other value follows the user-stop path, so an empty string and the user default are behaviorally identical.',
+    mutants: [
+      [
+        '2323',
+        'StringLiteral',
+        "const stopRecording = async (reason: 'user' | 'auto' = 'user') => {",
+        '""',
+        2642,
+        58,
+        2642,
+        64,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Identity changes synchronously start a superseding lifecycle operation before stale work can continue. A current operation token therefore already implies assessment identity still matches, so weakening this conjunction admits no distinct state.',
+    mutants: [
+      [
+        '2334',
+        'LogicalOperator',
+        'operationIsCurrent(operationToken) &&\n      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&',
+        'operationIsCurrent(operationToken) || assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId)',
+        2652,
+        7,
+        2653,
+        84,
+      ],
+      [
+        '2452',
+        'LogicalOperator',
+        'operationIsCurrent(operationToken) &&\n      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&',
+        'operationIsCurrent(operationToken) || assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId)',
+        2773,
+        7,
+        2774,
+        84,
+      ],
+    ],
+  },
+  {
+    reason:
+      'completedTakeIsValid receives the URI separately and rejects null before considering fileIsUsable. Forcing the preceding URI non-null operand true cannot make a null completion valid.',
+    mutants: [
+      [
+        '2363',
+        'ConditionalExpression',
+        'const fileIsUsable = uri !== null && completedRecordingIsUsable(uri);',
+        'true',
+        2683,
+        28,
+        2683,
+        40,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Recorded phase is established only after adopting a non-null active URI, and every URI-clearing path leaves recorded. These documented fail-closed branches are unreachable, so deleting or changing their body cannot affect a valid state.',
+    mutants: [
+      ['2442', 'ConditionalExpression', 'if (!uri) {', 'false', 2757, 9, 2757, 13],
+      [
+        '2444',
+        'BlockStatement',
+        "if (!uri) {\n      updatePhase('idle');\n      callbacksRef.current.onError(translate('recorder.errNoRecording'));\n      endOperation(operationToken);\n      return;\n    }",
+        '{}',
+        2757,
+        15,
+        2762,
+        6,
+      ],
+      ['2445', 'StringLiteral', "updatePhase('idle');", '""', 2758, 19, 2758, 25],
+      [
+        '2446',
+        'StringLiteral',
+        "callbacksRef.current.onError(translate('recorder.errNoRecording'));",
+        '""',
+        2759,
+        46,
+        2759,
+        71,
+      ],
+      ['2791', 'ConditionalExpression', 'if (!uri) return;', 'false', 3184, 11, 3184, 15],
+    ],
+  },
+  {
+    reason:
+      'These errors are handled solely through controller.signal.aborted and cancellation currency; no catch reads the message, name, or thrown object. Falsy-reason operator differences and string changes are unobservable.',
+    mutants: [
+      [
+        '2464',
+        'LogicalOperator',
+        "controller.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')",
+        "controller.signal.reason && new DOMException('The operation was aborted.', 'AbortError')",
+        2782,
+        11,
+        2782,
+        99,
+      ],
+      [
+        '2465',
+        'StringLiteral',
+        "controller.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')",
+        '""',
+        2782,
+        56,
+        2782,
+        84,
+      ],
+      [
+        '2466',
+        'StringLiteral',
+        "controller.signal.reason ?? new DOMException('The operation was aborted.', 'AbortError')",
+        '""',
+        2782,
+        86,
+        2782,
+        98,
+      ],
+      [
+        '2574',
+        'StringLiteral',
+        "throw new DOMException('The operation was aborted.', 'AbortError');",
+        '""',
+        2933,
+        32,
+        2933,
+        60,
+      ],
+      [
+        '2575',
+        'StringLiteral',
+        "throw new DOMException('The operation was aborted.', 'AbortError');",
+        '""',
+        2933,
+        62,
+        2933,
+        74,
+      ],
+    ],
+  },
+  {
+    reason:
+      'The fixed retry loop reaches its terminal throw only after assigning the caught capacity error on every consumed attempt. lastCapacityError is therefore truthy and both fallback operators throw that same object.',
+    mutants: [
+      [
+        '2528',
+        'LogicalOperator',
+        'throw lastCapacityError ?? new Error();',
+        'lastCapacityError && new Error()',
+        2891,
+        15,
+        2891,
+        47,
+      ],
+    ],
+  },
+  {
+    reason:
+      'A cancel can reach these post-request branches only through cancelUpload after assessmentPosted and requestId are set, which creates cancelPersistence. The null and fallback arms are unreachable.',
+    mutants: [
+      [
+        '2573',
+        'ConditionalExpression',
+        'if (cancelPersistence) await cancelPersistence.promise;',
+        'true',
+        2932,
+        13,
+        2932,
+        30,
+      ],
+      [
+        '2623',
+        'BooleanLiteral',
+        'const cancelMarked = cancelPersistence ? await cancelPersistence.promise : false;',
+        'true',
+        2984,
+        86,
+        2984,
+        91,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Before any later submission reads the marker, submit synchronously resets cancelRequestedRef to false; lifecycle and recovery currency own the current exit. Leaving these cleanup assignments true cannot leak into an observable next operation.',
+    mutants: [
+      ['2624', 'BooleanLiteral', 'cancelRequestedRef.current = false;', 'true', 2985, 40, 2985, 45],
+      ['2636', 'BooleanLiteral', 'cancelRequestedRef.current = false;', 'true', 2999, 38, 2999, 43],
+    ],
+  },
+  {
+    reason:
+      'Submit assigns requestIdRef before its first network await, and every site that clears it returns immediately. These continuing cancellation or recovery branches therefore always have a requestId, so their fallback and guard are unreachable.',
+    mutants: [
+      [
+        '2635',
+        'BooleanLiteral',
+        'const cleared = requestId ? await clearRequestTracking(requestId) : true;',
+        'false',
+        2998,
+        77,
+        2998,
+        81,
+      ],
+      ['2687', 'ConditionalExpression', 'if (requestId) {', 'true', 3052, 15, 3052, 24],
+    ],
+  },
+  {
+    reason:
+      'Only one submission operation can exist. Its controller remains the unique ref value until this finally, or lifecycle cleanup has already set the ref to null; assigning null under either identity outcome produces the same state.',
+    mutants: [
+      [
+        '2702',
+        'ConditionalExpression',
+        'if (uploadControllerRef.current === controller) {',
+        'true',
+        3068,
+        11,
+        3068,
+        53,
+      ],
+    ],
+  },
+  {
+    reason:
+      'startRecording begins by evaluating the same startIsBlocked condition before acquiring an operation or touching native state. The press handler check is a duplicate and cannot change effects.',
+    mutants: [
+      [
+        '2724',
+        'ConditionalExpression',
+        'if (startIsBlocked()) return Promise.resolve();',
+        'false',
+        3101,
+        9,
+        3101,
+        25,
+      ],
+    ],
+  },
+  {
+    reason:
+      'Uploading phase is entered only after installing this submission controller, and finally leaves or hands off the phase when detaching it. The documented null-controller return is unreachable.',
+    mutants: [
+      ['2739', 'ConditionalExpression', 'if (!controller) return;', 'false', 3122, 9, 3122, 20],
+    ],
+  },
+  {
+    reason:
+      'The rewind promise owner handles rejection by releasing the player and reporting once. After finally clears the request flag, the following identity and playability guard returns, so this duplicate catch return has no effect.',
+    mutants: [
+      [
+        '2773',
+        'BlockStatement',
+        '} catch {\n        // The rewind owner releases the player and reports the failure once.\n        return;\n      } finally {',
+        '{}',
+        3162,
+        15,
+        3165,
+        8,
+      ],
+    ],
+  },
+  {
+    reason:
+      'A pending rewind is created only for the installed preview player. The preceding identity check requires the ref still equal that captured player, so the non-null operand is guaranteed.',
+    mutants: [
+      [
+        '2783',
+        'ConditionalExpression',
+        'previewPlayerRef.current !== null,',
+        'true',
+        3173,
+        11,
+        3173,
+        44,
+      ],
+    ],
+  },
+  {
+    reason:
+      'If createAudioPlayer throws, continuing reaches addListener on the unset local; the second catch performs best-effort cleanup and emits the same single play-failed callback. The two paths converge.',
+    mutants: [
+      [
+        '2794',
+        'BlockStatement',
+        "} catch {\n        callbacksRef.current.onError(translate('recorder.errPlayFailed'));\n        return;\n      }",
+        '{}',
+        3188,
+        15,
+        3191,
+        8,
+      ],
+    ],
+  },
+  {
+    reason:
+      'releasePreviewPlayer clears rewind and player refs together, while installation associates both with the same player. Their equality predicates move in lockstep, so weakening either alone or changing and to or cannot select another cleanup target.',
+    mutants: [
+      [
+        '2814',
+        'ConditionalExpression',
+        'if (previewPlayerRef.current === player) {',
+        'true',
+        3208,
+        17,
+        3208,
+        52,
+      ],
+      [
+        '2824',
+        'ConditionalExpression',
+        'previewRewindPromiseRef.current === rewind &&',
+        'true',
+        3223,
+        17,
+        3223,
+        59,
+      ],
+      [
+        '2828',
+        'LogicalOperator',
+        'previewRewindPromiseRef.current === rewind &&\n                previewPlayerRef.current === player',
+        'previewRewindPromiseRef.current === rewind || previewPlayerRef.current === player',
+        3223,
+        17,
+        3224,
+        52,
+      ],
+      [
+        '2829',
+        'ConditionalExpression',
+        'previewPlayerRef.current === player',
+        'true',
+        3224,
+        17,
+        3224,
+        52,
+      ],
+    ],
+  },
+  {
+    reason:
+      'After pending-rewind handling, a null player enters the creation branch, which either returns on failure or assigns previewPlayerRef. The final local player is non-null whenever execution reaches play.',
+    mutants: [
+      ['2844', 'ConditionalExpression', 'if (!player) return;', 'false', 3248, 9, 3248, 16],
+    ],
+  },
+]);
+/**
+ * Recorder IDs are audit labels from the completed canonical report. Runtime
+ * matching intentionally ignores them and remains pinned to mutator,
+ * replacement, source text, and exact start/end location.
+ */
+const recorderReviewedMutantIds = new Set();
+const recorderEquivalentMutants = Object.freeze(
+  recorderEquivalentMutantGroups.flatMap(({ reason, mutants }) =>
+    mutants.map(
+      ([
+        reviewedMutantId,
+        mutator,
+        original,
+        replacement,
+        startLine,
+        startColumn,
+        endLine,
+        endColumn,
+      ]) => {
+        if (recorderReviewedMutantIds.has(reviewedMutantId)) {
+          throw new Error(`Recorder equivalence review repeats mutant ID ${reviewedMutantId}`);
+        }
+        recorderReviewedMutantIds.add(reviewedMutantId);
+        return {
+          file: 'src/components/Recorder.tsx',
+          reviewedMutantId,
+          mutator,
+          original,
+          replacements: [replacement],
+          reason,
+          locations: exactLocations(startLine, startColumn, endLine, endColumn),
+        };
+      },
+    ),
+  ),
+);
+
+if (recorderReviewedMutantIds.size !== 178) {
+  throw new Error(
+    `Recorder equivalence review has ${recorderReviewedMutantIds.size} mutants; expected 178`,
+  );
+}
 
 export const equivalentMutants = Object.freeze(
   [
@@ -968,534 +2546,9 @@ export const equivalentMutants = Object.freeze(
       reason:
         'The following !Number.isFinite(file.size) is already true for every non-number, so this clause cannot change which files are rejected. It narrows the type for the size comparison below.',
     },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BlockStatement',
-      original: 'if (signal.aborted) {\n      rejectAbort();\n      return;\n    }',
-      replacements: ['{}'],
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BlockStatement',
-      original:
-        "if (!uri) {\n      updatePhase('idle');\n      callbacksRef.current.onError(translate('recorder.errNoRecording'));\n      return;\n    }",
-      replacements: ['{}'],
-      reason:
-        'A documented, unreachable fail-closed block: every path that clears activeUriRef also leaves the recorded phase, so uri is non-null wherever this runs. It is annotated "Unreachable by design" in the source.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "updatePhase('idle');",
-      replacements: ['""'],
-      reason:
-        'A documented, unreachable fail-closed block: every path that clears activeUriRef also leaves the recorded phase, so uri is non-null wherever this runs. It is annotated "Unreachable by design" in the source.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "callbacksRef.current.onError(translate('recorder.errNoRecording'));",
-      replacements: ['""'],
-      reason:
-        'A documented, unreachable fail-closed block: every path that clears activeUriRef also leaves the recorded phase, so uri is non-null wherever this runs. It is annotated "Unreachable by design" in the source.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const cleared = requestId ? await clearRequestTracking(requestId) : true;',
-      replacements: ['false'],
-      count: 2,
-      reason:
-        'requestIdRef.current is assigned before any await in submit, and the only sites that null it return immediately, so requestId is never nullish at these branches.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "reject(new DOMException('The operation was aborted.', 'AbortError'));",
-      replacements: ['""'],
-      count: 2,
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (signal.aborted) {',
-      replacements: ['false'],
-      reason:
-        'sleepAbortable is only called from the capacity-retry loop, which checks controller.signal.aborted synchronously immediately before, so signal.aborted is always false on entry and the pre-abort path is dead. The DOMException message and name are never read: the rejection is caught where controller.signal.aborted short-circuits before any inspection. Removing the listener and its once flag are unobservable because an AbortSignal fires at most once and rejecting a settled promise is a no-op.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: "if (typeof metering !== 'number' || !Number.isFinite(metering)) return 0;",
-      replacements: ['false'],
-      reason:
-        'Number.isFinite is already false for every non-number, so the typeof test cannot change the outcome; it narrows the type for the arithmetic below.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BlockStatement',
-      original: '} catch {\n    return false;\n  }',
-      replacements: ['{}'],
-      reason:
-        'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);',
-      replacements: ['true'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const [previewPlaying, setPreviewPlaying] = useState(false);',
-      replacements: ['true'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const mountedRef = useRef(true);',
-      replacements: ['false'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const hasObservedRecordingRef = useRef(false);',
-      replacements: ['true'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const cancelRequestedRef = useRef(false);',
-      replacements: ['true'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'const assessmentPostedRef = useRef(false);',
-      replacements: ['true'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ObjectLiteral',
-      original:
-        'const callbacksRef = useRef({\n    onError,\n    onRateLimited,\n    onRecoveryEndpointMismatch,\n    onRecoveryUnresolved,\n    onResult,\n    parseResult,\n  });',
-      replacements: ['{}'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ObjectLiteral',
-      original: 'const identityRef = useRef({ ownerId, endpoint, questionId });',
-      replacements: ['{}'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original:
-        "waitStartedAtRef.current = next === 'uploading' || next === 'recovering' ? Date.now() : null;",
-      replacements: ['true'],
-      reason:
-        'waitStartedAtRef is only read while the phase is uploading or recovering, and the same updatePhase statement sets both, so a value written in any other phase is never rendered.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (mountedRef.current) {',
-      replacements: ['true'],
-      count: 2,
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ArrayDeclaration',
-      original: '}, []);',
-      replacements: ['["Stryker was here"]'],
-      count: 6,
-      reason:
-        'A constant dependency literal compares equal on every render under Object.is, so React runs the effect (or rebuilds the callback) exactly as often either way.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'OptionalChaining',
-      original: 'player?.remove();',
-      replacements: ['player.remove'],
-      reason:
-        'The TypeError a nullish player would raise is swallowed by the surrounding try/catch, so the optional chain cannot change the observable outcome.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (mountedRef.current) setPreviewPlaying(false);',
-      replacements: ['true'],
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BlockStatement',
-      original: '} catch {\n      return false;\n    }',
-      replacements: ['{}'],
-      reason:
-        'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (nativeStopPromiseRef.current === promise) {',
-      replacements: ['true'],
-      reason:
-        'The ref is assigned synchronously after the promise is created and the function early-returns while one is in flight, so only one promise can exist at settle time and the identity check always matches.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'AssignmentOperator',
-      original: 'lifecycleEpochRef.current += 1;',
-      replacements: ['lifecycleEpochRef.current -= 1'],
-      reason:
-        'lifecycleEpoch is only ever compared for equality, and both directions produce a fresh distinct value.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'hasObservedRecordingRef.current = false;',
-      replacements: ['true'],
-      count: 4,
-      reason:
-        'hasObservedRecordingRef is only read while phaseRef.current is "recording", and the sole transition into that phase resets it first, so these defensive resets are unobservable.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (mountedRef.current) setRecordedDurationMillis(0);',
-      replacements: ['true', 'false'],
-      count: 4,
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (lifecycleStopPromiseRef.current === promise) {',
-      replacements: ['true'],
-      reason:
-        'Same single-in-flight argument as the native stop promise: the identity check can only ever match.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'uploadControllerRef.current !== null ||',
-      replacements: ['false'],
-      count: 2,
-      reason:
-        'uploadControllerRef.current is non-null exactly between updatePhase("uploading") and submit\'s finally, and operationRef.current is true for precisely that span, so the controller operand can never be the deciding one.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: '(activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId)',
-      replacements: ['true'],
-      count: 2,
-      reason:
-        'activeRecoveryOwner === instanceId is unreachable here: the lease is only taken together with recoveringRef and operationRef, and every release clears them together, so owner-is-self implies operationRef.current, which the enclosing guards already reject.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'uploadControllerRef.current === null &&',
-      replacements: ['true'],
-      reason:
-        'uploadControllerRef.current is non-null exactly between updatePhase("uploading") and submit\'s finally, and operationRef.current is true for precisely that span, so the controller operand can never be the deciding one.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: '(activeRecoveryOwner === null || activeRecoveryOwner === instanceId)',
-      replacements: ['false'],
-      reason:
-        'activeRecoveryOwner === instanceId is unreachable here: the lease is only taken together with recoveringRef and operationRef, and every release clears them together, so owner-is-self implies operationRef.current, which the enclosing guards already reject.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'operationRef.current = true;',
-      replacements: ['false'],
-      count: 2,
-      reason:
-        'In recoverPending the operation lock is redundant with recoveringRef and the recovering phase; in submit it is redundant with updatePhase("uploading") three synchronous lines later.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'activeRecoveryOwner === instanceId &&',
-      replacements: ['true'],
-      reason:
-        'activeRecoveryOwner === instanceId is unreachable here: the lease is only taken together with recoveringRef and operationRef, and every release clears them together, so owner-is-self implies operationRef.current, which the enclosing guards already reject.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!isCurrent()) return;',
-      replacements: ['false'],
-      count: 3,
-      reason:
-        "Only microtasks separate this guard from the caller's own identical guard, so no macrotask can interleave and both branches return with no side effect.",
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "throw new Error('Pending assessment disappeared');",
-      replacements: ['""'],
-      count: 7,
-      reason:
-        'Each throw is caught by the immediately enclosing catch, which ignores the error object entirely.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'if (!isCurrent()) return false;',
-      replacements: ['true'],
-      count: 2,
-      reason:
-        "Only microtasks separate this guard from the caller's own identical guard, so no macrotask can interleave and both branches return with no side effect.",
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BlockStatement',
-      original: '} catch {\n          return false;\n        }',
-      replacements: ['{}'],
-      reason:
-        'The return value is read only in a truthiness position, so returning undefined instead of false is indistinguishable.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: "await finishUnresolved(translate('recorder.errInterruptedSaved'), false);",
-      replacements: ['true'],
-      reason:
-        'This call sits inside if (!routeMatches), and finishUnresolved tests !allowRecordedRetry || !activeUriRef.current || !routeMatches — the third operand is already true, so the flag cannot change the branch taken.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (activeRecoveryOwner === instanceId) activeRecoveryOwner = null;',
-      replacements: ['true'],
-      reason:
-        'activeRecoveryOwner === instanceId is unreachable here: the lease is only taken together with recoveringRef and operationRef, and every release clears them together, so owner-is-self implies operationRef.current, which the enclosing guards already reject.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'mountedRef.current = false;',
-      replacements: ['true'],
-      reason:
-        'The useFocusEffect cleanup runs first on unmount and clears focusedRef; every guard reading mountedRef also reads focusedRef, and the remaining readers only gate setState, which React 19 discards after unmount.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (mountedRef.current) setPermissionDenied(false);',
-      replacements: ['true'],
-      count: 2,
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (mountedRef.current) setPermissionNeedsSettings(false);',
-      replacements: ['true', 'false'],
-      count: 2,
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'if (mountedRef.current) setPermissionNeedsSettings(false);',
-      replacements: ['true'],
-      reason:
-        'permissionNeedsSettings is always written together with permissionDenied, and the settings button renders inside the banner that permissionDenied controls.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (active) setReduceMotion(enabled);',
-      replacements: ['true'],
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'active = false;',
-      replacements: ['true'],
-      reason:
-        'Guards a state update after unmount. React 19 discards updates aimed at a detached fiber silently — no warning, no act complaint, no state change — so no test can observe the difference.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: "if (phase !== 'recorded') releasePreviewPlayer();",
-      replacements: ['true'],
-      reason:
-        'The effect only runs on a phase change, and entering the recorded phase always follows a phase that has already released the player.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "if (phase !== 'recorded') releasePreviewPlayer();",
-      replacements: ['""'],
-      reason:
-        'Same as the ConditionalExpression on this line: the player has already been released on every path that reaches it.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ArrayDeclaration',
-      original: 'useEffect(() => () => releasePreviewPlayer(), [releasePreviewPlayer]);',
-      replacements: ['[]'],
-      reason:
-        'A constant dependency literal compares equal on every render under Object.is, so React runs the effect (or rebuilds the callback) exactly as often either way.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (startedAt !== null) setWaitElapsedMillis(Date.now() - startedAt);',
-      replacements: ['true'],
-      reason:
-        'Same wait-clock invariant: startedAt is non-null exactly when this interval runs in a wait phase.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "const hapticPhaseRef = useRef<Phase>('idle');",
-      replacements: ['""'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'StringLiteral',
-      original: "const announcedPhaseRef = useRef<Phase>('idle');",
-      replacements: ['""'],
-      reason:
-        'A useState/useRef seed that is overwritten before any consumer can read it, so its initial value is dead.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (announcedPhaseRef.current === phase) return;',
-      replacements: ['false'],
-      reason:
-        "The effect's dependency list is [phase], so it never re-runs with an unchanged phase and the dedupe guard can never fire.",
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: "if (phaseRef.current === 'recording' && recorderState.isRecording) {",
-      replacements: ['true'],
-      reason:
-        'Setting hasObservedRecordingRef outside the recording phase is unobservable, because the only transition into recording resets it to false first.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'LogicalOperator',
-      original:
-        'lifecycleEpoch === lifecycleEpochRef.current &&\n      identityRef.current.ownerId === ownerId &&',
-      replacements: [
-        'lifecycleEpoch === lifecycleEpochRef.current || identityRef.current.ownerId === ownerId',
-      ],
-      reason:
-        'Dropping the epoch check in stopRecording lets a superseded stop adopt its take, but the stopForLifecycle that bumped the epoch is awaiting the same native stop promise and immediately re-discards the recording and returns to idle, so the final observable state is identical.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'lifecycleEpoch === lifecycleEpochRef.current &&',
-      replacements: ['true'],
-      reason:
-        'Same as the LogicalOperator on this line: a superseded stop is undone by the lifecycle stop that superseded it before anything is rendered.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!uri) {',
-      replacements: ['false'],
-      reason:
-        'A documented, unreachable fail-closed block: every path that clears activeUriRef also leaves the recorded phase, so uri is non-null wherever this runs. It is annotated "Unreachable by design" in the source.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'BooleanLiteral',
-      original: 'cancelRequestedRef.current = false;',
-      replacements: ['true'],
-      count: 2,
-      reason:
-        'cancelRequestedRef is reset before any await of the next submission, so leaving it set here cannot leak into a later run.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!controller.signal.aborted) assessmentPostedRef.current = true;',
-      replacements: ['true'],
-      reason:
-        'sleepAbortable rejects on abort, so the retry loop never re-enters with an aborted signal.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!cancelRequestedRef.current) return;',
-      replacements: ['false'],
-      reason:
-        'Every non-user abort originates in stopForLifecycle, which increments the lifecycle epoch first, so the submission-currency guard just above already fails.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'isRecording && styles.recordButtonActive,',
-      replacements: ['true', 'false'],
-      count: 2,
-      reason:
-        'recordButtonActive sets backgroundColor to the same colors.danger the base recordButton already uses, so the flattened style is identical whichever way the conditional resolves.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'LogicalOperator',
-      original: 'isRecording && styles.recordButtonActive,',
-      replacements: ['isRecording || styles.recordButtonActive'],
-      reason:
-        'Same no-op style: StyleSheet.flatten skips the boolean the || variant produces, leaving the rendered style unchanged.',
-    },
-    {
-      file: 'src/components/Recorder.tsx',
-      mutator: 'ObjectLiteral',
-      original: 'recordButtonActive: {\n    backgroundColor: colors.danger,\n  },',
-      replacements: ['{}'],
-      reason:
-        'recordButtonActive is byte-identical to the base recordButton fill, so emptying it changes no rendered style.',
-    },
+    ...recorderEquivalentMutants,
   ].map((entry, index) => {
-    const locations = equivalentMutantLocations[index];
+    const locations = entry.locations ?? equivalentMutantLocations[index];
     const expected = entry.count ?? 1;
     if (locations === undefined || locations.length !== expected) {
       throw new Error(
@@ -1514,9 +2567,13 @@ export const equivalentMutants = Object.freeze(
   }),
 );
 
-if (equivalentMutantLocations.length !== equivalentMutants.length) {
+if (
+  equivalentMutantLocations.length + recorderEquivalentMutants.length !==
+  equivalentMutants.length
+) {
   throw new Error(
-    `Equivalent mutant location table has ${equivalentMutantLocations.length} entries for ` +
+    `Equivalent mutant location sources account for ` +
+      `${equivalentMutantLocations.length + recorderEquivalentMutants.length} entries for ` +
       `${equivalentMutants.length} registry entries`,
   );
 }

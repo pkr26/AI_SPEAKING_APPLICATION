@@ -528,14 +528,16 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
   }
 });
 
-test('the Recorder review pins 186 equivalents without exempting sentinel kills or final gaps', () => {
+test('the Recorder review pins 187 equivalents without exempting sentinel kills or final gaps', () => {
   const recorderEntries = equivalentMutants.filter(
     (entry) => entry.file === 'src/components/Recorder.tsx',
   );
   const reviewedIds = recorderEntries.map((entry) => entry.reviewedMutantId);
-  assert.equal(recorderEntries.length, 186);
-  assert.equal(new Set(reviewedIds).size, 186, 'canonical Recorder IDs must be unique');
+  assert.equal(recorderEntries.length, 187);
+  assert.equal(new Set(reviewedIds).size, 187, 'canonical Recorder IDs must be unique');
   assert.ok(reviewedIds.every((id) => /^\d+$/u.test(id)));
+
+  assert.ok(reviewedIds.includes('1896'), 'reviewed post-unmount setter invariant is missing');
 
   const reclassifiedInvariantIds = ['1220', '2187', '2188', '2206', '2258', '2266', '2311', '2340'];
   for (const id of reclassifiedInvariantIds) {

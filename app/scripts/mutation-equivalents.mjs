@@ -883,6 +883,13 @@ const recorderEquivalentMutantGroups = Object.freeze([
   },
   {
     reason:
+      'On unmount, the earlier layout-effect cleanup has already set unmounting true and mounted false before this passive cleanup runs. On a passive-effect dependency refresh, React runs cleanup and the replacement setup together before async continuations, and setup immediately restores mounted true. This duplicate false assignment is never the sole lifecycle guard.',
+    mutants: [
+      ['1896', 'BooleanLiteral', 'mountedRef.current = false;', 'true', 2220, 28, 2220, 33],
+    ],
+  },
+  {
+    reason:
       'Replacing the native recorder triggers layout cleanup and a superseding lifecycle operation before stale work can continue. Current operation and identity currency therefore already imply that currentRecorder is the captured recorder.',
     mutants: [
       [
@@ -1905,9 +1912,9 @@ const recorderEquivalentMutants = Object.freeze(
   ),
 );
 
-if (recorderReviewedMutantIds.size !== 186) {
+if (recorderReviewedMutantIds.size !== 187) {
   throw new Error(
-    `Recorder equivalence review has ${recorderReviewedMutantIds.size} mutants; expected 186`,
+    `Recorder equivalence review has ${recorderReviewedMutantIds.size} mutants; expected 187`,
   );
 }
 

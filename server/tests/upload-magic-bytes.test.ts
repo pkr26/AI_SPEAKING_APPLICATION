@@ -21,6 +21,8 @@ const FTYP = Buffer.from('00000018667479704d34412000000000', 'hex'); // ISO BMFF
 const WAV = Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]), Buffer.from('WAVEfmt ')]);
 const ID3 = Buffer.concat([Buffer.from('ID3'), Buffer.from([4, 0, 0, 0, 0, 0, 0, 0, 0])]);
 const MP3_FRAME = Buffer.from([0xff, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]);
+const EXACT_MP3_FRAME_HEADER = Buffer.from([0xff, 0xfb, 0x90, 0x00]);
+const RESERVED_MPEG_VERSION = Buffer.from([0xff, 0xeb, 0x90, 0x00]);
 const ADTS = Buffer.from([0xff, 0xf1, 0x50, 0x80, 1, 2, 3, 4, 5, 6, 7, 8]);
 const OGG = Buffer.concat([Buffer.from('OggS'), Buffer.alloc(8)]);
 const WEBM = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x93, 0x42, 0x82, 0x88]);
@@ -46,6 +48,7 @@ describe('verifyAudioMagicBytes', () => {
     ['a.wav', WAV],
     ['a.mp3', ID3],
     ['a.mp3', MP3_FRAME],
+    ['a.mp3', EXACT_MP3_FRAME_HEADER],
     ['a.ogg', OGG],
     ['a.oga', OGG],
     ['a.webm', WEBM],
@@ -73,6 +76,7 @@ describe('verifyAudioMagicBytes', () => {
     ['a.mp3', Buffer.from([0x00, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7, 8]), 'frame sync without 0xff'],
     ['a.mp3', Buffer.from([0xff, 0x1f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), 'frame sync without the 0xe0 mask'],
     ['a.mp3', MP3_FRAME.subarray(0, 3), 'truncated MPEG frame header'],
+    ['a.mp3', RESERVED_MPEG_VERSION, 'reserved MPEG version bits'],
     ['a.mp3', ADTS, 'ADTS/AAC sync bytes are not an MP3 frame'],
     ['a.m4b', FTYP, 'unsupported audiobook extension'],
     ['a.aac', ADTS, 'unsupported raw AAC extension'],

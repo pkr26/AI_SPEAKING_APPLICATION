@@ -6,6 +6,7 @@ import { assertMutant, summarizeMutants } from './merge-mutation-reports.mjs';
 const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 const defaultServerDirectory = path.resolve(scriptsDirectory, '..');
 const defaultReportPath = path.join(defaultServerDirectory, 'reports', 'mutation', 'catalog.json');
+export const catalogOracleTestFile = 'tests/seed-catalog-mutation.test.ts';
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -41,7 +42,16 @@ async function expectedCatalogSourceFiles(serverDir = defaultServerDirectory) {
  * were never actually judged. Re-apply the code campaign's strict gate to the
  * catalog report: every mutant must be Killed, Timeout, or Ignored.
  */
-export async function checkCatalogReport({ reportPath = defaultReportPath, serverDir = defaultServerDirectory } = {}) {
+export async function checkCatalogReport({
+  reportPath = defaultReportPath,
+  serverDir = defaultServerDirectory,
+  readWorkspaceFile = fs.readFile,
+  beforeFinalWorkspaceCheck,
+} = {}) {
+  if (typeof readWorkspaceFile !== 'function') throw new Error('readWorkspaceFile must be a function');
+  if (beforeFinalWorkspaceCheck !== undefined && typeof beforeFinalWorkspaceCheck !== 'function') {
+    throw new Error('beforeFinalWorkspaceCheck must be a function');
+  }
   let raw;
   try {
     raw = await fs.readFile(reportPath, 'utf8');
@@ -58,6 +68,9 @@ export async function checkCatalogReport({ reportPath = defaultReportPath, serve
   }
   if (!isRecord(report) || !isRecord(report.files)) {
     throw new Error(`Catalog mutation report at ${reportPath} has no files object`);
+  }
+  if (!isRecord(report.testFiles)) {
+    throw new Error(`Catalog mutation report at ${reportPath} has no testFiles object`);
   }
 
   // Fail closed on file coverage: the report must cover exactly the current
@@ -80,26 +93,60 @@ export async function checkCatalogReport({ reportPath = defaultReportPath, serve
   }
 
   const mutants = [];
+  const workspaceSnapshot = new Map();
   for (const [fileName, file] of Object.entries(report.files)) {
     if (!isRecord(file) || !Array.isArray(file.mutants)) {
       throw new Error(`Catalog mutation report file ${fileName} has no mutants array`);
     }
+    if (file.mutants.length === 0) {
+      throw new Error(`Catalog mutation report file ${fileName} contains no mutants`);
+    }
     if (typeof file.source !== 'string') {
       throw new Error(`Catalog mutation report file ${fileName} has no embedded source`);
     }
-    const currentSource = await fs.readFile(path.join(serverDir, fileName), 'utf8');
+    const sourcePath = path.join(serverDir, fileName);
+    const currentSource = await readWorkspaceFile(sourcePath, 'utf8');
     if (file.source !== currentSource) {
       throw new Error(
         `Catalog mutation report file ${fileName} embeds stale source that no longer matches the workspace`,
       );
     }
+    workspaceSnapshot.set(sourcePath, currentSource);
     file.mutants.forEach((mutant, index) => {
       assertMutant(mutant, `Catalog file ${fileName} mutants[${index}]`);
       mutants.push(mutant);
     });
   }
-  if (mutants.length === 0) {
-    throw new Error(`Catalog mutation report at ${reportPath} contains no mutants`);
+  const reportedTestFiles = Object.keys(report.testFiles);
+  if (reportedTestFiles.length !== 1 || reportedTestFiles[0] !== catalogOracleTestFile) {
+    throw new Error(
+      `Catalog mutation report test files must be exactly ${catalogOracleTestFile} (received ${reportedTestFiles.join(', ') || 'none'})`,
+    );
+  }
+  const oracleTest = report.testFiles[catalogOracleTestFile];
+  if (!isRecord(oracleTest) || typeof oracleTest.source !== 'string' || !Array.isArray(oracleTest.tests)) {
+    throw new Error(`Catalog mutation report has invalid test metadata for ${catalogOracleTestFile}`);
+  }
+  if (oracleTest.tests.length === 0) {
+    throw new Error(`Catalog mutation report contains no tests for ${catalogOracleTestFile}`);
+  }
+  const oraclePath = path.join(serverDir, catalogOracleTestFile);
+  const currentOracleSource = await readWorkspaceFile(oraclePath, 'utf8');
+  if (oracleTest.source !== currentOracleSource) {
+    throw new Error(`Catalog mutation report embeds stale test source for ${catalogOracleTestFile}`);
+  }
+  workspaceSnapshot.set(oraclePath, currentOracleSource);
+
+  // Re-read every source after validation. An editor can otherwise change a
+  // file just after its turn in the loop and let a stale report pass because
+  // no later operation consults that file again.
+  await beforeFinalWorkspaceCheck?.();
+  for (const [sourcePath, expectedSource] of workspaceSnapshot) {
+    if ((await readWorkspaceFile(sourcePath, 'utf8')) !== expectedSource) {
+      throw new Error(
+        `Catalog mutation campaign input changed during report validation: ${path.relative(serverDir, sourcePath)}`,
+      );
+    }
   }
 
   const summary = summarizeMutants(mutants);

@@ -46,13 +46,51 @@ describe('requireAuth', () => {
   };
 
   it('rejects a missing header, malformed schemes, and bearer values with extra credentials', async () => {
-    for (const header of [undefined, 'Basic abc123', 'Bearer', 'bearer validlooking', 'Bearer token another-token']) {
+    for (const header of [
+      undefined,
+      'Basic abc123',
+      'Bearer',
+      'bearer validlooking',
+      'Bearer token another-token',
+      'Basic Bearer validlooking',
+    ]) {
       const res = await me(header as string | undefined);
       expect(res.status).toBe(401);
       expect(res.body).toEqual({
         error: 'Missing or invalid Authorization header',
         code: 'UNAUTHENTICATED',
       });
+    }
+  });
+
+  it('accepts multiple RFC-compatible spaces between Bearer and the token', async () => {
+    const { res: registration } = await registerUser(a);
+    const response = await me(`Bearer  ${registration.body.token as string}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body.user.id).toBe(registration.body.user.id);
+  });
+
+  it('rejects a non-string authorization value before token verification', async () => {
+    const verify = vi.spyOn(jwt, 'verify');
+    const req = {
+      headers: { authorization: ['Bearer structurally-valid-token'] },
+    } as unknown as AuthedRequest;
+    const res = { status: vi.fn(), json: vi.fn() };
+    res.status.mockReturnValue(res);
+    const next = vi.fn();
+
+    try {
+      await requireAuth(req, res as never, next);
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Missing or invalid Authorization header',
+        code: 'UNAUTHENTICATED',
+      });
+      expect(verify).not.toHaveBeenCalled();
+      expect(next).not.toHaveBeenCalled();
+    } finally {
+      verify.mockRestore();
     }
   });
 
@@ -155,6 +193,7 @@ describe('requireAuth', () => {
     const verify = vi.spyOn(jwt, 'verify').mockReturnValueOnce({
       sub: { toString: () => userId },
       tv: 1,
+      exp: Math.floor(Date.now() / 1000) + 3600,
     } as never);
     const query = vi.spyOn(pool, 'query');
     const req = { headers: { authorization: 'Bearer structurally-valid-token' } } as AuthedRequest;
@@ -414,6 +453,7 @@ describe('errorHandler', () => {
     a.get('/request-size-invalid', (_req, _res, next) => next({ type: 'request.size.invalid' }));
     // Parser-shaped failures the generic 4xx fallback must NOT claim.
     a.get('/parser-server-status', (_req, _res, next) => next({ status: 500, expose: true }));
+    a.get('/parser-status-below-client-range', (_req, _res, next) => next({ status: 399, expose: true }));
     a.get('/parser-not-exposed', (_req, _res, next) => next({ status: 400, expose: false }));
     a.get('/parser-status-not-a-number', (_req, _res, next) => next({ status: '429', expose: true }));
     a.get(
@@ -574,6 +614,7 @@ describe('errorHandler', () => {
 
   it.each([
     ['a parser status outside the client range', '/parser-server-status'],
+    ['a parser status below the client range', '/parser-status-below-client-range'],
     ['an error the parser did not mark exposable', '/parser-not-exposed'],
     ['a parser status that is not a number', '/parser-status-not-a-number'],
   ])('keeps %s on the logged 500 path', async (_condition, path) => {

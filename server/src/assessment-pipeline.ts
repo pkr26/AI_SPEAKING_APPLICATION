@@ -4,7 +4,6 @@ import { z } from 'zod';
 import { AssessOptions } from './assess';
 import { verifyAudioDuration } from './audio-inspection';
 import {
-  completeSubmittedPresignedAudioReplay,
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
   isOwnedAudioKey,
@@ -135,8 +134,8 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
  * - inner finally: the per-question claim is always cleared once taken, and a
  *   request that did not complete abandons its durable request claim so the
  *   same requestId stays retryable;
- * - each successful response owns a small finally that finalizes its S3
- *   object even when a disconnected response never emits `finish`;
+ * - each successful fresh-owner response owns a small finally that finalizes
+ *   its S3 object even when a disconnected response never emits `finish`;
  * - outer finally: the local audio file is always unlinked. Error-path S3
  *   finalization stays with the response listener because the error handler
  *   sets the real status only after this handler unwinds; reading the stale
@@ -166,7 +165,7 @@ export async function runAssessmentSubmission<Claim, Result>(
     // 500 (PostgreSQL text rejects a NUL byte). A key the download would refuse
     // is also a key no cleanup may ever consult. Direct mode has none.
     const rawAudioKey = (req.body as { audioKey?: unknown }).audioKey;
-    const audioKey = typeof rawAudioKey === 'string' && isOwnedAudioKey(user.id, rawAudioKey) ? rawAudioKey : undefined;
+    const audioKey = isOwnedAudioKey(user.id, rawAudioKey) ? rawAudioKey : undefined;
     const { rows: qRows } = await pool.query<QuestionRow>(
       `SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`,
       [questionId],
@@ -175,15 +174,9 @@ export async function runAssessmentSubmission<Claim, Result>(
     if (!question) throw hooks.questionMissingError();
     const requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId, audioKey);
     if (requestClaim.kind === 'completed') {
-      completeSubmittedPresignedAudioReplay(res);
-      try {
-        return res.json(requestClaim.response);
-      } finally {
-        // Direct-upload mode has no registered cleanup, where finalization is
-        // deliberately a no-op; keeping this unconditional avoids divergent
-        // response-finally semantics between ingress modes.
-        await finalizeSubmittedPresignedAudio(res);
-      }
+      // Completed replays retain their object for the bucket lifecycle: an
+      // active delete near tombstone expiry could race a newly rebound owner.
+      return res.json(requestClaim.response);
     }
     ownSubmittedPresignedAudio(res);
 
@@ -215,7 +208,13 @@ export async function runAssessmentSubmission<Claim, Result>(
           // 'close' never fires twice. Re-spend the pair now that paid
           // capacity is consumed (fail-open inside the store). The sentinel
           // inside respendAssessmentBudget makes a second path a no-op.
-          if (res.closed || res.destroyed || req.socket.destroyed) {
+          if (
+            res.locals.assessmentTransportClosed ||
+            res.locals.assessmentTransportFailed ||
+            res.closed ||
+            res.destroyed ||
+            req.socket.destroyed
+          ) {
             hooks.respendAssessmentBudget(req, res);
           }
         },

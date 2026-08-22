@@ -11,6 +11,8 @@ import {
   duplicates,
   expectedCodeMutationFiles,
 } from './mutation-lanes.mjs';
+import { acquireMutationCampaignLock } from './mutation-campaign-lock.mjs';
+import { assertMutationReportProvenance } from './mutation-provenance.mjs';
 
 const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 const serverDirectory = path.resolve(scriptsDirectory, '..');
@@ -173,6 +175,9 @@ function assertReportShape(report, laneName, definition) {
     }
     if (!Array.isArray(sourceFile.mutants)) {
       throw new Error(`Source file ${sourceFileName} in lane ${laneName} has no mutants array`);
+    }
+    if (sourceFile.mutants.length === 0) {
+      throw new Error(`Source file ${sourceFileName} in lane ${laneName} contains no mutants`);
     }
   }
 
@@ -493,30 +498,49 @@ async function readLaneReports(reportDirectory) {
  * before writing the merged artifact so a stale report, or a source edit made
  * while a long campaign ran, fails closed rather than looking green.
  */
-async function assertReportsMatchWorkspace(reportsByLane) {
+async function assertReportsMatchWorkspace(
+  reportsByLane,
+  readWorkspaceFile = fs.readFile,
+  workspaceDir = serverDirectory,
+) {
+  const snapshot = new Map();
   for (const laneName of codeMutationLaneNames) {
     const definition = codeMutationLanes[laneName];
     const report = reportsByLane[laneName];
     for (const sourceFileName of definition.mutate) {
-      const currentSource = await fs.readFile(path.join(serverDirectory, sourceFileName), 'utf8');
+      const sourcePath = path.join(workspaceDir, sourceFileName);
+      const currentSource = await readWorkspaceFile(sourcePath, 'utf8');
       if (report.files[sourceFileName].source !== currentSource) {
         throw new Error(
           `Mutation report for lane ${laneName} embeds stale source for ${sourceFileName} that no longer matches the workspace`,
         );
       }
+      snapshot.set(sourcePath, currentSource);
     }
     for (const testFileName of definition.testFiles) {
-      const currentSource = await fs.readFile(path.join(serverDirectory, testFileName), 'utf8');
+      const testPath = path.join(workspaceDir, testFileName);
+      const currentSource = await readWorkspaceFile(testPath, 'utf8');
       if (report.testFiles[testFileName].source !== currentSource) {
         throw new Error(
           `Mutation report for lane ${laneName} embeds stale test source for ${testFileName} that no longer matches the workspace`,
         );
       }
+      snapshot.set(testPath, currentSource);
+    }
+  }
+  return snapshot;
+}
+
+async function assertWorkspaceSnapshotUnchanged(snapshot, readWorkspaceFile, workspaceDir = serverDirectory) {
+  for (const [filePath, expectedSource] of snapshot) {
+    const currentSource = await readWorkspaceFile(filePath, 'utf8');
+    if (currentSource !== expectedSource) {
+      throw new Error(`Mutation campaign input changed during report merge: ${path.relative(workspaceDir, filePath)}`);
     }
   }
 }
 
-async function writeArtifactsAtomically(artifacts) {
+async function writeArtifactsAtomically(artifacts, { validateBeforeCommit, validateAfterCommit }) {
   const temporaryArtifacts = artifacts.map(({ filePath, contents }, index) => ({
     filePath,
     contents,
@@ -526,7 +550,15 @@ async function writeArtifactsAtomically(artifacts) {
     await Promise.all(
       temporaryArtifacts.map(({ temporaryPath, contents }) => fs.writeFile(temporaryPath, contents, 'utf8')),
     );
+    await validateBeforeCommit();
     for (const { filePath, temporaryPath } of temporaryArtifacts) await fs.rename(temporaryPath, filePath);
+    await validateAfterCommit();
+  } catch (error) {
+    // Never leave a partially written or now-stale canonical report looking
+    // authoritative. The lane reports remain available for diagnosis and a
+    // fresh merge after the workspace stabilizes.
+    await Promise.all(artifacts.map(({ filePath }) => fs.rm(filePath, { force: true })));
+    throw error;
   } finally {
     await Promise.all(temporaryArtifacts.map(({ temporaryPath }) => fs.rm(temporaryPath, { force: true })));
   }
@@ -538,20 +570,45 @@ async function writeArtifactsAtomically(artifacts) {
  */
 export async function mergeMutationReports({
   reportDir = process.env.MUTATION_REPORT_DIR || defaultReportDirectory,
+  serverDir = serverDirectory,
   writeHtml = true,
+  readWorkspaceFile = fs.readFile,
+  beforeArtifactCommit,
+  afterArtifactCommit,
+  environment = process.env,
+  runtime,
+  stableInputFiles,
 } = {}) {
   if (typeof reportDir !== 'string' || reportDir.length === 0) throw new Error('reportDir must be a non-empty string');
   if (typeof writeHtml !== 'boolean') throw new Error('writeHtml must be a boolean');
-  await assertMutationLaneManifest({ serverDir: serverDirectory });
+  if (typeof readWorkspaceFile !== 'function') throw new Error('readWorkspaceFile must be a function');
+  if (beforeArtifactCommit !== undefined && typeof beforeArtifactCommit !== 'function') {
+    throw new Error('beforeArtifactCommit must be a function');
+  }
+  if (afterArtifactCommit !== undefined && typeof afterArtifactCommit !== 'function') {
+    throw new Error('afterArtifactCommit must be a function');
+  }
+  await assertMutationLaneManifest({ serverDir });
   const reportDirectory = path.resolve(reportDir);
   const reportsByLane = await readLaneReports(reportDirectory);
+  const validateProvenance = () =>
+    assertMutationReportProvenance({
+      reportDir: reportDirectory,
+      serverDir,
+      campaign: 'code',
+      laneNames: codeMutationLaneNames,
+      environment,
+      ...(runtime === undefined ? {} : { runtime }),
+      ...(stableInputFiles === undefined ? {} : { stableInputFiles }),
+    });
+  await validateProvenance();
   const merged = mergeMutationReportData({
     reportsByLane,
     lanes: codeMutationLanes,
     laneNames: codeMutationLaneNames,
     expectedFiles: expectedCodeMutationFiles,
   });
-  await assertReportsMatchWorkspace(reportsByLane);
+  const workspaceSnapshot = await assertReportsMatchWorkspace(reportsByLane, readWorkspaceFile, serverDir);
   const jsonPath = path.join(reportDirectory, 'code.json');
   const summaryPath = path.join(reportDirectory, 'code-summary.json');
   const htmlPath = path.join(reportDirectory, 'code.html');
@@ -560,7 +617,18 @@ export async function mergeMutationReports({
     { filePath: summaryPath, contents: `${JSON.stringify(merged.summary, null, 2)}\n` },
   ];
   if (writeHtml) artifacts.push({ filePath: htmlPath, contents: await createMutationReportHtml(merged.report) });
-  await writeArtifactsAtomically(artifacts);
+  await writeArtifactsAtomically(artifacts, {
+    validateBeforeCommit: async () => {
+      await beforeArtifactCommit?.();
+      await validateProvenance();
+      await assertWorkspaceSnapshotUnchanged(workspaceSnapshot, readWorkspaceFile, serverDir);
+    },
+    validateAfterCommit: async () => {
+      await afterArtifactCommit?.();
+      await validateProvenance();
+      await assertWorkspaceSnapshotUnchanged(workspaceSnapshot, readWorkspaceFile, serverDir);
+    },
+  });
   return {
     ...merged,
     paths: { json: jsonPath, summary: summaryPath, html: writeHtml ? htmlPath : undefined },
@@ -593,12 +661,31 @@ async function main() {
     process.stdout.write('Usage: node scripts/merge-mutation-reports.mjs [--report-dir <directory>] [--no-html]\n');
     return;
   }
-  const result = await mergeMutationReports(options);
+  const result = await runStandaloneMutationMerge(options);
   const score = result.summary.mutationScore;
   process.stdout.write(
     `Merged ${result.summary.mutantCount} mutants from ${result.summary.laneCount} lanes (${score === null ? 'n/a' : `${score.toFixed(2)}%`}).\n` +
       `JSON: ${result.paths.json}\nSummary: ${result.paths.summary}${result.paths.html ? `\nHTML: ${result.paths.html}` : ''}\n`,
   );
+}
+
+/** The direct merge CLI is a canonical writer and must share the campaign lock. */
+export async function runStandaloneMutationMerge({
+  serverDir = serverDirectory,
+  reportDir = process.env.MUTATION_REPORT_DIR || defaultReportDirectory,
+  mergeReports = mergeMutationReports,
+  ...mergeOptions
+} = {}) {
+  const releaseCampaignLock = await acquireMutationCampaignLock({
+    serverDir,
+    reportDir,
+    campaign: 'standalone code report merge',
+  });
+  try {
+    return await mergeReports({ serverDir, reportDir, ...mergeOptions });
+  } finally {
+    await releaseCampaignLock();
+  }
 }
 
 const invokedPath = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : undefined;

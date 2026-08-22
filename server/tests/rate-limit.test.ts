@@ -3,6 +3,8 @@ import { randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import fs from 'fs/promises';
+import { createServer, request as createHttpRequest } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'os';
 import path from 'path';
 import express from 'express';
@@ -15,7 +17,14 @@ import { JANITOR_BATCH_SIZE } from '../src/janitor';
 import { logger } from '../src/logger';
 import { shedRequestsTotal } from '../src/metrics';
 import { AuthedRequest, errorHandler, HttpError, UserRow, validate } from '../src/middleware';
-import { buildLimiters, normalizeLoginEmail, rateLimitIpKey, requestIpRateLimitKey } from '../src/rate-limit';
+import {
+  buildLimiters,
+  normalizeLoginEmail,
+  rateLimitIpKey,
+  requestIpRateLimitKey,
+  withAssessmentExactWindowRefund,
+  withExactWindowFinishRefund,
+} from '../src/rate-limit';
 import { cleanupRateLimitWindows, PostgresRateLimitStore } from '../src/postgres-rate-limit-store';
 import { submittedAudioFileIsOwned } from '../src/upload';
 import { fakeM4aBuffer, pool } from './helpers';
@@ -116,6 +125,25 @@ describe('rate limiters', () => {
     expect(requestIpRateLimitKey({ ip: '203.0.113.42' })).toBe(ipKeyGenerator('203.0.113.42'));
     expect(requestIpRateLimitKey({ ip: '2001:db8:abcd:1234::1' })).toBe(ipKeyGenerator('2001:db8:abcd:1234::1'));
     expect(requestIpRateLimitKey({ ip: undefined })).toBe(ipKeyGenerator(''));
+  });
+
+  it('skips the email-keyed limiter when JSON parsing leaves the request body undefined', async () => {
+    config.rateLimit.loginAccountWindowMs = 60_000;
+    config.rateLimit.loginAccountMax = 1;
+    const namespace = 'login-account:60000:1';
+    const a = express();
+    a.use(express.json());
+    a.use((req, _res, next) => {
+      req.body = undefined;
+      next();
+    });
+    a.use(buildLimiters().loginAccount);
+    a.post('/x', (_req, res) => res.status(204).end());
+
+    const response = await request(a).post('/x');
+
+    expect(response.status).toBe(204);
+    expect(await storedHits(namespace)).toBe(0);
   });
 
   it('skips unusable forgot-password identifiers and isolates each valid normalized email key', async () => {
@@ -398,7 +426,7 @@ describe('rate limiters', () => {
       res.status(502).json({ error: 'Assessment provider unavailable; please try again', code: 'PROVIDER_FAILED' });
     });
 
-    const decrement = vi.spyOn(PostgresRateLimitStore.prototype, 'decrement');
+    const decrement = vi.spyOn(PostgresRateLimitStore.prototype, 'decrementWithinWindow');
     try {
       expect((await request(a).get('/reserved-failure')).status).toBe(502);
       // Refunds run fire-and-forget on response finish; give one a chance to
@@ -622,6 +650,440 @@ describe('rate limiters', () => {
     }
   });
 
+  it('keeps every store failure contract intact even when the warning logger throws', async () => {
+    const store = new PostgresRateLimitStore('store-logger-failure', 60_000);
+    const failure = new Error('database unavailable');
+    const query = vi.spyOn(pool, 'query').mockRejectedValue(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('logger unavailable');
+    });
+    try {
+      await expect(store.increment('learner')).rejects.toMatchObject({ status: 503, code: 'POOL_SATURATED' });
+      await expect(store.decrement('learner')).resolves.toBeUndefined();
+      await expect(store.decrementWithinWindow('learner', new Date())).resolves.toBeUndefined();
+      await expect(store.incrementWithinWindow('learner', new Date())).resolves.toBeUndefined();
+      await expect(store.resetKey('learner')).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(5);
+      expect(warn).toHaveBeenNthCalledWith(
+        3,
+        { err: failure, namespace: 'store-logger-failure' },
+        'rate-limit exact-window refund failed',
+      );
+    } finally {
+      warn.mockRestore();
+      query.mockRestore();
+    }
+  });
+
+  describe('exact-window refund wrappers', () => {
+    type RefundResponse = EventEmitter & {
+      locals: Record<string, unknown>;
+      writableEnded: boolean;
+      closed: boolean;
+      destroyed: boolean;
+      statusCode: number;
+    };
+
+    function fakeRefundResponse({
+      locals = {},
+      writableEnded = false,
+      closed = false,
+      destroyed = false,
+      statusCode = 400,
+    }: {
+      locals?: Record<string, unknown>;
+      writableEnded?: boolean;
+      closed?: boolean;
+      destroyed?: boolean;
+      statusCode?: number;
+    } = {}): RefundResponse {
+      return Object.assign(new EventEmitter(), { locals, writableEnded, closed, destroyed, statusCode });
+    }
+
+    function fakeRefundRequest(socketDestroyed = false): AuthedRequest {
+      return { socket: { destroyed: socketDestroyed } } as unknown as AuthedRequest;
+    }
+
+    function publishingLimiter(requestPropertyName: string, key: string, resetTime: Date): express.RequestHandler {
+      return (req, _res, next) => {
+        (req as unknown as Record<string, unknown>)[requestPropertyName] = {
+          limit: 5,
+          used: 1,
+          remaining: 4,
+          key,
+          resetTime,
+        };
+        next();
+      };
+    }
+
+    it('refunds one exact window at most once across close, error, finish, and promise settlement', async () => {
+      const store = new PostgresRateLimitStore('refund-once', 60_000);
+      const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+      const resetTime = new Date(Date.now() + 60_000);
+      const req = fakeRefundRequest();
+      const res = fakeRefundResponse();
+      const next = vi.fn();
+      const wrapped = withAssessmentExactWindowRefund({
+        limiter: publishingLimiter('refundOnceRateLimit', 'refund-once-key', resetTime),
+        store,
+        requestPropertyName: 'refundOnceRateLimit',
+        refundFinished: () => true,
+      });
+
+      try {
+        wrapped(req, res as never, next);
+        res.emit('close');
+        res.emit('error', new Error('transport failed after close'));
+        res.emit('finish');
+        await Promise.resolve();
+
+        expect(next).toHaveBeenCalledOnce();
+        expect(res.locals.assessmentTransportClosed).toBe(true);
+        expect(res.locals.assessmentTransportFailed).toBe(true);
+        expect(decrement).toHaveBeenCalledOnce();
+        expect(decrement).toHaveBeenCalledWith('refund-once-key', resetTime);
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+
+    it.each([
+      ['unfinished', false, true],
+      ['already ended', true, false],
+    ] as const)(
+      'records an %s close and refunds only while unfinished',
+      async (_caseName, writableEnded, shouldRefund) => {
+        const store = new PostgresRateLimitStore(`close-${writableEnded}`, 60_000);
+        const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+        const resetTime = new Date(Date.now() + 60_000);
+        const req = fakeRefundRequest();
+        const res = fakeRefundResponse({ writableEnded });
+        const wrapped = withAssessmentExactWindowRefund({
+          limiter: publishingLimiter('closeRateLimit', 'close-key', resetTime),
+          store,
+          requestPropertyName: 'closeRateLimit',
+          refundFinished: () => false,
+        });
+
+        try {
+          wrapped(req, res as never, vi.fn());
+          // Let the wrapper's promise-based post-limiter observation drain.
+          // The later unfinished close must therefore be handled by the close
+          // listener itself, not rescued by a pending observation microtask.
+          if (!writableEnded) await Promise.resolve();
+          res.emit('close');
+          await Promise.resolve();
+
+          expect(res.locals.assessmentTransportClosed).toBe(true);
+          if (shouldRefund) expect(decrement).toHaveBeenCalledWith('close-key', resetTime);
+          else expect(decrement).not.toHaveBeenCalled();
+        } finally {
+          decrement.mockRestore();
+        }
+      },
+    );
+
+    it('records and refunds a response error even after end was requested', async () => {
+      const store = new PostgresRateLimitStore('response-error', 60_000);
+      const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+      const resetTime = new Date(Date.now() + 60_000);
+      const req = fakeRefundRequest();
+      const res = fakeRefundResponse({ writableEnded: true });
+      const wrapped = withAssessmentExactWindowRefund({
+        limiter: publishingLimiter('errorRateLimit', 'error-key', resetTime),
+        store,
+        requestPropertyName: 'errorRateLimit',
+        refundFinished: () => false,
+      });
+
+      try {
+        wrapped(req, res as never, vi.fn());
+        res.emit('error', new Error('response transport failed'));
+        await Promise.resolve();
+
+        expect(res.locals.assessmentTransportFailed).toBe(true);
+        expect(decrement).toHaveBeenCalledOnce();
+        expect(decrement).toHaveBeenCalledWith('error-key', resetTime);
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+
+    it.each(['recorded-close', 'recorded-error', 'response-closed', 'response-destroyed', 'socket-destroyed'] as const)(
+      'refunds when the limiter mounts after the missed transport state %s',
+      async (transportState) => {
+        const store = new PostgresRateLimitStore(`missed-${transportState}`, 60_000);
+        const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+        const resetTime = new Date(Date.now() + 60_000);
+        const req = fakeRefundRequest(transportState === 'socket-destroyed');
+        const res = fakeRefundResponse({
+          locals:
+            transportState === 'recorded-close'
+              ? { assessmentTransportClosed: true }
+              : transportState === 'recorded-error'
+                ? { assessmentTransportFailed: true }
+                : {},
+          closed: transportState === 'response-closed',
+          destroyed: transportState === 'response-destroyed',
+        });
+        const wrapped = withAssessmentExactWindowRefund({
+          limiter: publishingLimiter('missedRateLimit', 'missed-key', resetTime),
+          store,
+          requestPropertyName: 'missedRateLimit',
+          refundFinished: () => false,
+        });
+
+        try {
+          wrapped(req, res as never, vi.fn());
+          await Promise.resolve();
+
+          expect(decrement).toHaveBeenCalledOnce();
+          expect(decrement).toHaveBeenCalledWith('missed-key', resetTime);
+        } finally {
+          decrement.mockRestore();
+        }
+      },
+    );
+
+    it('does not refund a missed close state after the response has ended', async () => {
+      const store = new PostgresRateLimitStore('missed-finished-close', 60_000);
+      const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+      const resetTime = new Date(Date.now() + 60_000);
+      const req = fakeRefundRequest(true);
+      const res = fakeRefundResponse({
+        locals: { assessmentTransportClosed: true },
+        writableEnded: true,
+        closed: true,
+        destroyed: true,
+      });
+      const wrapped = withAssessmentExactWindowRefund({
+        limiter: publishingLimiter('finishedCloseRateLimit', 'finished-close-key', resetTime),
+        store,
+        requestPropertyName: 'finishedCloseRateLimit',
+        refundFinished: () => false,
+      });
+
+      try {
+        wrapped(req, res as never, vi.fn());
+        await Promise.resolve();
+        expect(decrement).not.toHaveBeenCalled();
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+
+    it('completes an event-before-increment refund from promise settlement even when the limiter never calls next', async () => {
+      const store = new PostgresRateLimitStore('late-promise-refund', 60_000);
+      const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+      const resetTime = new Date(Date.now() + 60_000);
+      const req = fakeRefundRequest();
+      const res = fakeRefundResponse();
+      const next = vi.fn();
+      let settleLimiter!: () => void;
+      const limiter = ((rawReq: express.Request) =>
+        new Promise<void>((resolve) => {
+          settleLimiter = () => {
+            (rawReq as unknown as Record<string, unknown>).latePromiseRateLimit = {
+              limit: 5,
+              used: 1,
+              remaining: 4,
+              key: 'late-promise-key',
+              resetTime,
+            };
+            resolve();
+          };
+        })) as unknown as express.RequestHandler;
+      const wrapped = withAssessmentExactWindowRefund({
+        limiter,
+        store,
+        requestPropertyName: 'latePromiseRateLimit',
+        refundFinished: () => false,
+      });
+
+      try {
+        wrapped(req, res as never, next);
+        res.emit('close');
+        expect(decrement).not.toHaveBeenCalled();
+        settleLimiter();
+
+        await vi.waitFor(() => expect(decrement).toHaveBeenCalledWith('late-promise-key', resetTime));
+        expect(next).not.toHaveBeenCalled();
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+
+    it('keeps credential refunds finish-only despite pre-existing transport failure state', async () => {
+      const store = new PostgresRateLimitStore('credential-finish-only', 60_000);
+      const decrement = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+      const resetTime = new Date(Date.now() + 60_000);
+      const req = fakeRefundRequest(true);
+      const res = fakeRefundResponse({
+        locals: { assessmentTransportClosed: true, assessmentTransportFailed: true },
+        closed: true,
+        destroyed: true,
+      });
+      const wrapped = withExactWindowFinishRefund({
+        limiter: publishingLimiter('credentialRateLimit', 'credential-key', resetTime),
+        store,
+        requestPropertyName: 'credentialRateLimit',
+        refundFinished: () => true,
+      });
+
+      try {
+        wrapped(req, res as never, vi.fn());
+        expect(res.listenerCount('close')).toBe(0);
+        expect(res.listenerCount('error')).toBe(0);
+        res.emit('close');
+        await Promise.resolve();
+        expect(decrement).not.toHaveBeenCalled();
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+
+    it.each([
+      ['successful response', 200, true],
+      ['exact client-error boundary', 400, false],
+    ] as const)('password-account refund predicate handles the %s at %i', async (_caseName, status, refunds) => {
+      config.rateLimit.passwordWindowMs = 60_000;
+      config.rateLimit.passwordMax = 100;
+      const decrement = vi
+        .spyOn(PostgresRateLimitStore.prototype, 'decrementWithinWindow')
+        .mockResolvedValue(undefined);
+      const a = express();
+      a.use((req, _res, next) => {
+        (req as AuthedRequest).user = { id: `password-boundary-${status}` } as AuthedRequest['user'];
+        next();
+      });
+      a.use(buildLimiters().passwordAccount);
+      a.get('/x', (_req, res) => res.status(status).end());
+
+      try {
+        expect((await request(a).get('/x')).status).toBe(status);
+        if (refunds) await vi.waitFor(() => expect(decrement).toHaveBeenCalledOnce());
+        else {
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(decrement).not.toHaveBeenCalled();
+        }
+      } finally {
+        decrement.mockRestore();
+      }
+    });
+  });
+
+  it('refunds a downstream limiter even when it mounts after the one-shot close event', async () => {
+    const firstStore = new PostgresRateLimitStore('late-close-first', 60_000);
+    const secondStore = new PostgresRateLimitStore('late-close-second', 60_000);
+    const firstRefund = vi.spyOn(firstStore, 'decrementWithinWindow').mockResolvedValue(undefined);
+    const secondRefund = vi.spyOn(secondStore, 'decrementWithinWindow').mockResolvedValue(undefined);
+    const firstReset = new Date(Date.now() + 60_000);
+    const secondReset = new Date(Date.now() + 120_000);
+    let releaseFirst!: () => void;
+    const firstGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const firstRaw = ((req: express.Request, _res: express.Response, next: express.NextFunction) =>
+      firstGate.then(() => {
+        (req as unknown as Record<string, unknown>).firstRateLimit = {
+          limit: 5,
+          used: 1,
+          remaining: 4,
+          resetTime: firstReset,
+          key: 'first-key',
+        };
+        next();
+      })) as unknown as express.RequestHandler;
+    const secondRaw = ((req: express.Request, _res: express.Response, next: express.NextFunction) => {
+      (req as unknown as Record<string, unknown>).secondRateLimit = {
+        limit: 5,
+        used: 1,
+        remaining: 4,
+        resetTime: secondReset,
+        key: 'second-key',
+      };
+      next();
+    }) as express.RequestHandler;
+    const first = withAssessmentExactWindowRefund({
+      limiter: firstRaw,
+      store: firstStore,
+      requestPropertyName: 'firstRateLimit',
+      refundFinished: () => false,
+    });
+    const second = withAssessmentExactWindowRefund({
+      limiter: secondRaw,
+      store: secondStore,
+      requestPropertyName: 'secondRateLimit',
+      refundFinished: () => false,
+    });
+    const req = { socket: { destroyed: false } } as express.Request;
+    const res = new EventEmitter() as EventEmitter & {
+      locals: Record<string, unknown>;
+      writableEnded: boolean;
+      closed: boolean;
+      destroyed: boolean;
+    };
+    res.locals = {};
+    res.writableEnded = false;
+    res.closed = false;
+    res.destroyed = false;
+    const finalNext = vi.fn();
+
+    first(req, res as never, (error?: unknown) => {
+      if (error !== undefined) return finalNext(error);
+      second(req, res as never, finalNext);
+    });
+    // Only the first wrapper exists at this point; the first limiter is still
+    // waiting on its increment-equivalent gate.
+    res.closed = true;
+    res.emit('close');
+    releaseFirst();
+
+    await vi.waitFor(() => {
+      expect(firstRefund).toHaveBeenCalledWith('first-key', firstReset);
+      expect(secondRefund).toHaveBeenCalledWith('second-key', secondReset);
+    });
+    expect(finalNext).toHaveBeenCalledOnce();
+  });
+
+  it('refunds when a limiter settles after the request socket was already destroyed', async () => {
+    const store = new PostgresRateLimitStore('late-socket-close', 60_000);
+    const refund = vi.spyOn(store, 'decrementWithinWindow').mockResolvedValue(undefined);
+    const resetTime = new Date(Date.now() + 60_000);
+    const raw = ((req: express.Request, _res: express.Response, next: express.NextFunction) => {
+      (req as unknown as Record<string, unknown>).socketCloseRateLimit = {
+        limit: 5,
+        used: 1,
+        remaining: 4,
+        resetTime,
+        key: 'socket-key',
+      };
+      next();
+    }) as express.RequestHandler;
+    const wrapped = withAssessmentExactWindowRefund({
+      limiter: raw,
+      store,
+      requestPropertyName: 'socketCloseRateLimit',
+      refundFinished: () => false,
+    });
+    const req = { socket: { destroyed: true } } as express.Request;
+    const res = new EventEmitter() as EventEmitter & {
+      locals: Record<string, unknown>;
+      writableEnded: boolean;
+      closed: boolean;
+      destroyed: boolean;
+    };
+    res.locals = {};
+    res.writableEnded = false;
+    res.closed = false;
+    res.destroyed = false;
+
+    wrapped(req, res as never, vi.fn());
+
+    await vi.waitFor(() => expect(refund).toHaveBeenCalledWith('socket-key', resetTime));
+  });
+
   describe('assessAbortGuard', () => {
     function fakeResponse(locals: Record<string, unknown>, writableEnded = false) {
       const res = new EventEmitter() as EventEmitter & {
@@ -644,8 +1106,8 @@ describe('rate limiters', () => {
         const req = {
           ip: '127.0.0.1',
           user: { id: 'user-1' },
-          assessRateLimit: { resetTime: assessResetTime },
-          assessIpDailyRateLimit: { resetTime: ipDailyResetTime },
+          assessRateLimit: { key: 'observed-assess-key', resetTime: assessResetTime },
+          assessIpDailyRateLimit: { key: 'observed-ip-key', resetTime: ipDailyResetTime },
         } as unknown as AuthedRequest;
         const res = fakeResponse({ assessmentCapacityReserved: true });
         const next = vi.fn();
@@ -655,12 +1117,145 @@ describe('rate limiters', () => {
 
         res.emit('close');
         await vi.waitFor(() => expect(resp).toHaveBeenCalledTimes(2));
+        expect(res.locals.assessmentTransportClosed).toBe(true);
         expect(resp.mock.calls).toEqual([
-          ['user:user-1', assessResetTime],
-          [ipKeyGenerator('127.0.0.1'), ipDailyResetTime],
+          ['observed-assess-key', assessResetTime],
+          ['observed-ip-key', ipDailyResetTime],
         ]);
       } finally {
         resp.mockRestore();
+      }
+    });
+
+    it('re-spends both counters on a response error even after end was requested', async () => {
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
+      try {
+        const limiters = buildLimiters();
+        const req = {
+          ip: '127.0.0.1',
+          user: { id: 'user-error' },
+          assessRateLimit: { key: 'error-assess-key', resetTime: new Date() },
+          assessIpDailyRateLimit: { key: 'error-ip-key', resetTime: new Date() },
+        } as unknown as AuthedRequest;
+        // express-rate-limit's error refund is unconditional; unlike its close
+        // refund, writableEnded does not suppress it.
+        const res = fakeResponse({ assessmentCapacityReserved: true }, true);
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+
+        res.emit('error', new Error('response transport failed'));
+        await vi.waitFor(() => expect(resp).toHaveBeenCalledTimes(2));
+        expect(res.locals.assessmentTransportFailed).toBe(true);
+      } finally {
+        resp.mockRestore();
+      }
+    });
+
+    it('records an error that arrives before capacity without prematurely re-spending', async () => {
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
+      try {
+        const limiters = buildLimiters();
+        const assessResetTime = new Date(Date.now() + 60_000);
+        const ipDailyResetTime = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const req = {
+          ip: '127.0.0.1',
+          user: { id: 'user-error-first' },
+          assessRateLimit: { key: 'error-first-assess-key', resetTime: assessResetTime },
+          assessIpDailyRateLimit: { key: 'error-first-ip-key', resetTime: ipDailyResetTime },
+        } as unknown as AuthedRequest;
+        const res = fakeResponse({});
+        limiters.assessAbortGuard(req, res as never, vi.fn());
+
+        res.emit('error', new Error('response failed before reservation'));
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(res.locals.assessmentTransportFailed).toBe(true);
+        expect(resp).not.toHaveBeenCalled();
+
+        // Once the reservation commits, the pipeline's reservation hook
+        // legitimately replaces the earlier refund on both observed windows.
+        res.locals.assessmentCapacityReserved = true;
+        limiters.respendAssessmentBudget(req, res as never);
+        await vi.waitFor(() => expect(resp).toHaveBeenCalledTimes(2));
+        expect(resp.mock.calls).toEqual([
+          ['error-first-assess-key', assessResetTime],
+          ['error-first-ip-key', ipDailyResetTime],
+        ]);
+      } finally {
+        resp.mockRestore();
+      }
+    });
+
+    it('never synthesizes counter keys when a limiter observation is absent', async () => {
+      const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
+      try {
+        const limiters = buildLimiters();
+        const req = { ip: '127.0.0.1', user: { id: 'missing-observation' } } as unknown as AuthedRequest;
+        const res = fakeResponse({});
+
+        expect(() => limiters.respendAssessmentBudget(req, res as never)).not.toThrow();
+        expect(res.locals.assessmentBudgetRespent).toBe(true);
+        expect(resp).not.toHaveBeenCalled();
+      } finally {
+        resp.mockRestore();
+      }
+    });
+
+    it('nets real socket-abort refunds and re-spends to one charged hit on both exact windows', async () => {
+      const savedCap = config.assessIpDailyCap;
+      config.rateLimit.assessWindowMs = 62_345;
+      config.rateLimit.assessMax = 9;
+      config.assessIpDailyCap = 87_654;
+      const limiters = buildLimiters();
+      const a = express();
+      let routeReached!: () => void;
+      const reached = new Promise<void>((resolve) => {
+        routeReached = resolve;
+      });
+      a.use((req, _res, next) => {
+        (req as AuthedRequest).user = { id: 'real-abort-user' } as AuthedRequest['user'];
+        next();
+      });
+      a.get('/abort', limiters.assess, limiters.assessIpDaily, limiters.assessAbortGuard, (_req, res) => {
+        res.locals.assessmentCapacityReserved = true;
+        routeReached();
+        // Deliberately remain open until the real client destroys its socket.
+      });
+      const server = createServer(a);
+      let clientRequest: ReturnType<typeof createHttpRequest> | undefined;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen(0, '127.0.0.1', resolve);
+        });
+        const address = server.address() as AddressInfo;
+        const clientDone = new Promise<void>((resolve) => {
+          clientRequest = createHttpRequest({ host: '127.0.0.1', port: address.port, path: '/abort' });
+          let settled = false;
+          const settle = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          clientRequest.once('error', settle);
+          clientRequest.once('close', settle);
+          clientRequest.end();
+        });
+
+        await reached;
+        if (!clientRequest) throw new Error('abort test client request was not created');
+        clientRequest.destroy();
+        await clientDone;
+        await vi.waitFor(async () => {
+          expect(await storedHits('assess:62345:9')).toBe(1);
+          expect(await storedHits('assess-ip-daily:87654')).toBe(1);
+        });
+      } finally {
+        clientRequest?.destroy();
+        config.assessIpDailyCap = savedCap;
+        if (server.listening) {
+          await new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+          });
+        }
       }
     });
 
@@ -702,7 +1297,12 @@ describe('rate limiters', () => {
       const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
-        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const req = {
+          ip: '127.0.0.1',
+          user: { id: 'user-1' },
+          assessRateLimit: { key: 'once-assess-key', resetTime: new Date() },
+          assessIpDailyRateLimit: { key: 'once-ip-key', resetTime: new Date() },
+        } as unknown as AuthedRequest;
         const res = fakeResponse({});
         limiters.assessAbortGuard(req, res as never, vi.fn());
         res.emit('close');
@@ -732,7 +1332,12 @@ describe('rate limiters', () => {
       const resp = vi.spyOn(PostgresRateLimitStore.prototype, 'incrementWithinWindow').mockResolvedValue(undefined);
       try {
         const limiters = buildLimiters();
-        const req = { ip: '127.0.0.1', user: { id: 'user-1' } } as unknown as AuthedRequest;
+        const req = {
+          ip: '127.0.0.1',
+          user: { id: 'user-1' },
+          assessRateLimit: { key: 'once-assess-key', resetTime: new Date() },
+          assessIpDailyRateLimit: { key: 'once-ip-key', resetTime: new Date() },
+        } as unknown as AuthedRequest;
         const res = fakeResponse({ assessmentCapacityReserved: true });
         limiters.assessAbortGuard(req, res as never, vi.fn());
 
@@ -801,6 +1406,28 @@ describe('rate limiters', () => {
     const { rows } = await pool.query<{ hits: number }>(
       "SELECT hits FROM rate_limit_windows WHERE namespace = 'store-window-guard'",
     );
+    expect(Number(rows[0].hits)).toBe(1);
+  });
+
+  it("refunds only the request's observed window, never a successor renewed in place", async () => {
+    const namespace = 'store-refund-window-identity';
+    const store = new PostgresRateLimitStore(namespace, 60_000);
+    const observed = await store.increment('learner');
+
+    // Model the exact check/update race: this old response already decided to
+    // refund, then a rival renewed the same physical row into its successor
+    // window before the UPDATE acquired the row lock.
+    await pool.query(
+      `UPDATE rate_limit_windows
+       SET hits = 1, reset_at = reset_at + interval '60 seconds'
+       WHERE namespace = $1`,
+      [namespace],
+    );
+    await store.decrementWithinWindow('learner', observed.resetTime);
+
+    const { rows } = await pool.query<{ hits: number }>('SELECT hits FROM rate_limit_windows WHERE namespace = $1', [
+      namespace,
+    ]);
     expect(Number(rows[0].hits)).toBe(1);
   });
 
@@ -942,11 +1569,15 @@ describe('assessment reservation after client disconnect', () => {
     closed = false,
     destroyed = false,
     socketDestroyed = false,
+    transportClosed = false,
+    transportFailed = false,
     emitCloseDuringAssessment = false,
   }: {
     closed?: boolean;
     destroyed?: boolean;
     socketDestroyed?: boolean;
+    transportClosed?: boolean;
+    transportFailed?: boolean;
     emitCloseDuringAssessment?: boolean;
   }) {
     const limiters = buildLimiters();
@@ -976,7 +1607,10 @@ describe('assessment reservation after client disconnect', () => {
       destroyed: boolean;
       json: ReturnType<typeof vi.fn>;
     };
-    res.locals = {};
+    res.locals = {
+      ...(transportClosed ? { assessmentTransportClosed: true } : {}),
+      ...(transportFailed ? { assessmentTransportFailed: true } : {}),
+    };
     res.writableEnded = false;
     res.closed = closed;
     res.destroyed = destroyed;
@@ -1026,6 +1660,8 @@ describe('assessment reservation after client disconnect', () => {
     ['response closed', { closed: true }],
     ['response destroyed', { destroyed: true }],
     ['request socket destroyed', { socketDestroyed: true }],
+    ['recorded response close', { transportClosed: true }],
+    ['recorded response error', { transportFailed: true }],
   ] as const)('re-spends both hits when capacity commits after the %s', async (_condition, state) => {
     const { req, res, respend } = await submissionHarness(state);
     expect(res.locals.assessmentCapacityReserved).toBe(true);

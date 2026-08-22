@@ -63,22 +63,25 @@ export async function claimAssessmentRequest(
     if (owner.rowCount !== 1) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
-    // Only this claim's own expired row can block the insert below, so the
-    // delete is scoped to it. An unscoped sweep here would scan and row-lock
-    // every stale row cluster-wide on the hottest path; the hourly janitor
-    // (cleanupAssessmentRequests) owns the global sweep.
+    // Only this request UUID or submitted object can block the insert below,
+    // so expiry cleanup stays scoped to those two identities. Including the
+    // object identity is load-bearing: after a failed worker outlives its
+    // lease, a retry may legitimately bind the same key under a replacement
+    // request UUID. An unscoped sweep here would scan and row-lock every stale
+    // row cluster-wide on the hottest path; the hourly janitor owns that.
     await client.query(
       `DELETE FROM assessment_requests
-       WHERE user_id = $1 AND request_id = $2
+       WHERE user_id = $1
+         AND (request_id = $2 OR ($3::text IS NOT NULL AND audio_key = $3))
          AND ((status = 'processing' AND started_at < now() - interval '5 minutes')
            OR (status = 'completed' AND completed_at < now() - ${COMPLETED_RETENTION_INTERVAL_SQL}))`,
-      [userId, requestId],
+      [userId, requestId, audioKey ?? null],
     );
     const requestClaimId = randomUUID();
     const inserted = await client.query(
       `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, audio_key)
        VALUES ($1, $2, $3, $4, $5, 'processing', $6)
-       ON CONFLICT (user_id, request_id) DO NOTHING`,
+       ON CONFLICT DO NOTHING`,
       [userId, requestId, requestClaimId, context, questionId, audioKey ?? null],
     );
     if (inserted.rowCount === 1) {
@@ -95,6 +98,22 @@ export async function claimAssessmentRequest(
     );
     const row = existing.rows[0];
     if (!row) {
+      // The request UUID is free, so a failed insert can only have collided
+      // with the unique S3-object binding. A presigned object is one logical
+      // assessment input: admitting a second requestId would duplicate paid
+      // work and let either response delete the other worker's input.
+      if (audioKey) {
+        const existingAudio = await client.query<{ status: 'processing' | 'completed' }>(
+          `SELECT status
+           FROM assessment_requests
+           WHERE user_id = $1 AND audio_key = $2
+           FOR UPDATE`,
+          [userId, audioKey],
+        );
+        if (existingAudio.rows[0]) {
+          throw new HttpError(409, 'Audio upload was already submitted', 'REQUEST_ID_REUSED');
+        }
+      }
       // The conflicting row vanished between the failed insert and this read,
       // so the identifier is immediately free again — not permanently burned.
       // Report it with the sibling branch's in-flight retry hint.

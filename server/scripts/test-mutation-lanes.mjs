@@ -34,6 +34,23 @@ async function writeManifestFixture() {
   return fixture;
 }
 
+async function writeOrchestratorReport(reportDir, laneName) {
+  await fs.mkdir(reportDir, { recursive: true });
+  await fs.writeFile(
+    path.join(reportDir, `${laneName}.json`),
+    JSON.stringify({
+      config: {
+        testRunner: 'vitest',
+        coverageAnalysis: 'perTest',
+        timeoutMS: 90_000,
+        mutate: codeMutationLanes[laneName].mutate,
+        testFiles: codeMutationLanes[laneName].testFiles,
+        tempDirName: `.stryker-${laneName}-tmp`,
+      },
+    }),
+  );
+}
+
 test('manifest validation rejects a newly added unassigned production file', async (context) => {
   const fixture = await writeManifestFixture();
   context.after(() => fs.rm(fixture, { recursive: true, force: true }));
@@ -98,6 +115,7 @@ test('the orchestrator continues after a lane failure, merges last, and returns 
     validateManifest: async () => events.push('validated'),
     runLane: async ({ laneName }) => {
       events.push(laneName);
+      await writeOrchestratorReport(reportDir, laneName);
       return laneName === 'db' ? 7 : 0;
     },
     mergeReports: async () => {
@@ -113,6 +131,90 @@ test('the orchestrator continues after a lane failure, merges last, and returns 
   assert.equal(result.exitCode, 1);
 });
 
+test('the orchestrator rejects duplicate lane requests before locking, running, or merging', async (context) => {
+  const serverDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-invalid-'));
+  const reportDir = path.join(serverDir, 'reports');
+  context.after(() => fs.rm(serverDir, { recursive: true, force: true }));
+  const events = [];
+
+  await assert.rejects(
+    runMutationCode({
+      serverDir,
+      reportDir,
+      laneNames: ['config', 'db', 'config', 'db'],
+      validateManifest: async () => events.push('validated'),
+      runLane: async () => {
+        events.push('ran');
+        return 0;
+      },
+      mergeReports: async () => {
+        events.push('merged');
+        return { summary: { strictMutationGatePassed: true, statusCounts: {} } };
+      },
+    }),
+    /Mutation lanes requested more than once: config, db/,
+  );
+
+  assert.deepEqual(events, []);
+  await assert.rejects(fs.stat(path.join(serverDir, '.mutation-campaign.lock')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(reportDir), { code: 'ENOENT' });
+});
+
+test('the orchestrator rejects unknown and inherited lane names before workspace mutation', async (context) => {
+  const serverDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-invalid-'));
+  const reportDir = path.join(serverDir, 'reports');
+  context.after(() => fs.rm(serverDir, { recursive: true, force: true }));
+  let validations = 0;
+
+  for (const laneName of ['notALane', 'constructor']) {
+    let ran = false;
+    await assert.rejects(
+      runMutationCode({
+        serverDir,
+        reportDir,
+        laneNames: [laneName],
+        validateManifest: async () => {
+          validations += 1;
+        },
+        runLane: async () => {
+          ran = true;
+          return 0;
+        },
+        mergeReports: async () => ({ summary: { strictMutationGatePassed: true, statusCounts: {} } }),
+      }),
+      new RegExp(`Unknown mutation lane requested: ${laneName}`),
+    );
+    assert.equal(ran, false);
+  }
+
+  assert.equal(validations, 0);
+  await assert.rejects(fs.stat(path.join(serverDir, '.mutation-campaign.lock')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(reportDir), { code: 'ENOENT' });
+});
+
+test('the orchestrator rejects an empty lane campaign before validation or workspace mutation', async (context) => {
+  const serverDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-invalid-'));
+  const reportDir = path.join(serverDir, 'reports');
+  context.after(() => fs.rm(serverDir, { recursive: true, force: true }));
+  let validated = false;
+
+  await assert.rejects(
+    runMutationCode({
+      serverDir,
+      reportDir,
+      laneNames: [],
+      validateManifest: async () => {
+        validated = true;
+      },
+    }),
+    /must request at least one configured lane/,
+  );
+
+  assert.equal(validated, false);
+  await assert.rejects(fs.stat(path.join(serverDir, '.mutation-campaign.lock')), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(reportDir), { code: 'ENOENT' });
+});
+
 test('the orchestrator rejects unresolved or invalid mutant statuses after writing merged artifacts', async (context) => {
   const reportDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-'));
   context.after(() => fs.rm(reportDir, { recursive: true, force: true }));
@@ -122,7 +224,10 @@ test('the orchestrator rejects unresolved or invalid mutant statuses after writi
     reportDir,
     laneNames: ['config'],
     validateManifest: async () => undefined,
-    runLane: async () => 0,
+    runLane: async ({ laneName }) => {
+      await writeOrchestratorReport(reportDir, laneName);
+      return 0;
+    },
     mergeReports: async () => ({
       summary: {
         strictMutationGatePassed: false,
@@ -147,7 +252,10 @@ test('the orchestrator reports a strict merge failure even when all lanes pass',
     reportDir,
     laneNames: ['config'],
     validateManifest: async () => undefined,
-    runLane: async () => 0,
+    runLane: async ({ laneName }) => {
+      await writeOrchestratorReport(reportDir, laneName);
+      return 0;
+    },
     mergeReports: async () => {
       throw failure;
     },
@@ -157,4 +265,61 @@ test('the orchestrator reports a strict merge failure even when all lanes pass',
   assert.equal(result.mergeError, failure);
   assert.equal(result.strictGateError, undefined);
   assert.equal(result.exitCode, 1);
+});
+
+test('a subset run deletes every unrequested lane report before it can be reused', async (context) => {
+  const reportDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-subset-'));
+  context.after(() => fs.rm(reportDir, { recursive: true, force: true }));
+  await fs.writeFile(path.join(reportDir, 'db.json'), 'stale db report');
+  await fs.writeFile(path.join(reportDir, 'db.provenance.json'), 'stale db provenance');
+
+  const result = await runMutationCode({
+    serverDir: serverDirectory,
+    reportDir,
+    laneNames: ['config'],
+    validateManifest: async () => undefined,
+    runLane: async ({ laneName }) => {
+      await writeOrchestratorReport(reportDir, laneName);
+      return 0;
+    },
+    mergeReports: async () => {
+      await assert.rejects(fs.stat(path.join(reportDir, 'db.json')), { code: 'ENOENT' });
+      await assert.rejects(fs.stat(path.join(reportDir, 'db.provenance.json')), { code: 'ENOENT' });
+      return { summary: { strictMutationGatePassed: true, statusCounts: {} } };
+    },
+  });
+
+  assert.equal(result.exitCode, 0);
+});
+
+test('a signaled code lane stops the campaign and deliberately preserves the workspace lock', async (context) => {
+  const serverDir = await fs.mkdtemp(path.join(os.tmpdir(), 'mutation-orchestrator-signaled-'));
+  const reportDir = path.join(serverDir, 'reports');
+  const inputFile = 'campaign-input.txt';
+  await fs.writeFile(path.join(serverDir, inputFile), 'stable input');
+  context.after(() => fs.rm(serverDir, { recursive: true, force: true }));
+  const started = [];
+
+  const result = await runMutationCode({
+    serverDir,
+    reportDir,
+    laneNames: ['config', 'db'],
+    stableInputFiles: [inputFile],
+    validateManifest: async () => undefined,
+    runLane: async ({ laneName }) => {
+      started.push(laneName);
+      return 143;
+    },
+    mergeReports: async () => {
+      throw new Error('merge must not succeed after a signal');
+    },
+  });
+
+  assert.deepEqual(started, ['config']);
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(result.failedLanes, [{ laneName: 'config', exitCode: 143 }]);
+  const lockPath = path.join(serverDir, '.mutation-campaign.lock');
+  await assert.doesNotReject(fs.stat(lockPath));
+  const owner = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+  assert.match(owner.campaign, /code lanes/);
 });

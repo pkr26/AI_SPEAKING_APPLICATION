@@ -119,6 +119,14 @@ describe('metrics initialization', () => {
     }
   });
 
+  it('keeps every allowlisted HTTP method in its bounded metric label', async () => {
+    const { metricMethod } = await import('../src/metrics');
+
+    for (const method of ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+      expect(metricMethod(method.toLowerCase())).toBe(method);
+    }
+  });
+
   it('collects live pool and capacity values and records the exact matched route labels', async () => {
     const { httpMetricsMiddleware } = await import('../src/metrics');
 

@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
 import { assertSafeDestructiveDatabase } from '../db/database-safety';
@@ -287,6 +287,339 @@ describe('migration integrity', () => {
     } finally {
       await client.query('ROLLBACK');
       client.release();
+    }
+  });
+
+  it('repairs legacy duplicate audio bindings before enforcing one logical owner per S3 key', async () => {
+    const client = await pool.connect();
+    const schema = `audio_binding_upgrade_${randomUUID().replace(/-/g, '')}`;
+    const userA = randomUUID();
+    const userB = randomUUID();
+    const questionId = randomUUID();
+    const sharedKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const completedKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const liveKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const expiredCompletedKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const processingBoundaryKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const completedBoundaryKey = `audio-uploads/${userA}/${randomUUID()}.m4a`;
+    const retainedSharedCompletion = randomUUID();
+    const retainedCompletedRequest = randomUUID();
+    const retainedLiveRequest = randomUUID();
+    const processingBoundaryRequest = randomUUID();
+    const completedBoundaryRequest = randomUUID();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query(`CREATE TABLE assessment_requests (
+        user_id UUID NOT NULL,
+        request_id UUID NOT NULL,
+        claim_id UUID NOT NULL,
+        context TEXT NOT NULL,
+        question_id UUID NOT NULL,
+        status TEXT NOT NULL,
+        response_body JSONB,
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        audio_key TEXT,
+        PRIMARY KEY (user_id, request_id)
+      )`);
+      const insertRequest = async ({
+        userId = userA,
+        requestId = randomUUID(),
+        status,
+        ageMinutes,
+        audioKey,
+      }: {
+        userId?: string;
+        requestId?: string;
+        status: 'processing' | 'completed';
+        ageMinutes: number;
+        audioKey: string | null;
+      }) =>
+        client.query(
+          `INSERT INTO assessment_requests
+             (user_id, request_id, claim_id, context, question_id, status, response_body,
+              started_at, completed_at, audio_key)
+           VALUES ($1, $2, $3, 'practice', $4, $5,
+                   CASE WHEN $5 = 'completed' THEN '{"done":true}'::jsonb ELSE NULL END,
+                   now() - ($6 * interval '1 minute'),
+                   CASE WHEN $5 = 'completed' THEN now() - ($6 * interval '1 minute') ELSE NULL END,
+                   $7)`,
+          [userId, requestId, randomUUID(), questionId, status, ageMinutes, audioKey],
+        );
+
+      // A completed tombstone must beat an expired processing lease.
+      await insertRequest({
+        requestId: retainedSharedCompletion,
+        status: 'completed',
+        ageMinutes: 1,
+        audioKey: sharedKey,
+      });
+      await insertRequest({ status: 'processing', ageMinutes: 6, audioKey: sharedKey });
+      // With no live worker, newest completion owns the binding.
+      await insertRequest({ status: 'completed', ageMinutes: 2, audioKey: completedKey });
+      await insertRequest({
+        requestId: retainedCompletedRequest,
+        status: 'completed',
+        ageMinutes: 1,
+        audioKey: completedKey,
+      });
+      // One live worker may safely outlive an expired processing duplicate.
+      await insertRequest({ requestId: retainedLiveRequest, status: 'processing', ageMinutes: 1, audioKey: liveKey });
+      await insertRequest({ status: 'processing', ageMinutes: 6, audioKey: liveKey });
+      await insertRequest({ status: 'completed', ageMinutes: 49 * 60, audioKey: expiredCompletedKey });
+      await insertRequest({
+        requestId: processingBoundaryRequest,
+        status: 'processing',
+        ageMinutes: 5,
+        audioKey: processingBoundaryKey,
+      });
+      await insertRequest({
+        requestId: completedBoundaryRequest,
+        status: 'completed',
+        ageMinutes: 48 * 60,
+        audioKey: completedBoundaryKey,
+      });
+      // The same key remains independently ownable by another learner.
+      await insertRequest({ userId: userB, status: 'processing', ageMinutes: 1, audioKey: sharedKey });
+      await insertRequest({ status: 'processing', ageMinutes: 0, audioKey: null });
+      await insertRequest({ status: 'processing', ageMinutes: 0, audioKey: null });
+
+      const sql = fs.readFileSync(
+        path.join(__dirname, '../db/migrations/013_assessment_audio_key_uniqueness.sql'),
+        'utf8',
+      );
+      const writerLockAt = sql.indexOf('LOCK TABLE assessment_requests IN SHARE ROW EXCLUSIVE MODE');
+      const normalizationAt = sql.indexOf('UPDATE assessment_requests');
+      const uniqueIndexAt = sql.indexOf('CREATE UNIQUE INDEX uq_assessment_requests_user_audio_key');
+      expect(writerLockAt).toBeGreaterThanOrEqual(0);
+      expect(writerLockAt).toBeLessThan(normalizationAt);
+      expect(writerLockAt).toBeLessThan(uniqueIndexAt);
+      await client.query(sql);
+
+      const retained = await client.query<{ user_id: string; request_id: string; audio_key: string }>(
+        `SELECT user_id, request_id, audio_key
+         FROM assessment_requests
+         WHERE audio_key IS NOT NULL
+         ORDER BY user_id, audio_key`,
+      );
+      expect(retained.rows).toEqual(
+        expect.arrayContaining([
+          { user_id: userA, request_id: retainedSharedCompletion, audio_key: sharedKey },
+          { user_id: userA, request_id: retainedCompletedRequest, audio_key: completedKey },
+          { user_id: userA, request_id: retainedLiveRequest, audio_key: liveKey },
+          { user_id: userA, request_id: processingBoundaryRequest, audio_key: processingBoundaryKey },
+          { user_id: userA, request_id: completedBoundaryRequest, audio_key: completedBoundaryKey },
+          { user_id: userB, request_id: expect.any(String), audio_key: sharedKey },
+        ]),
+      );
+      expect(retained.rows).toHaveLength(6);
+
+      const cleared = await client.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM assessment_requests WHERE user_id = $1 AND audio_key IS NULL',
+        [userA],
+      );
+      expect(cleared.rows[0].n).toBe(6); // two expired leases, one expired completion/loser, and two unbound rows
+
+      await client.query('SAVEPOINT duplicate_audio_key');
+      try {
+        await expect(
+          client.query(
+            `INSERT INTO assessment_requests
+               (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
+             VALUES ($1, $2, $3, 'practice', $4, 'processing', now(), $5)`,
+            [userA, randomUUID(), randomUUID(), questionId, sharedKey],
+          ),
+        ).rejects.toMatchObject({ code: '23505' });
+      } finally {
+        await client.query('ROLLBACK TO SAVEPOINT duplicate_audio_key');
+      }
+    } finally {
+      await client.query('ROLLBACK');
+      client.release();
+    }
+  });
+
+  it.each([
+    ['a live worker plus a completed owner', 'completed', 'processing'],
+    ['two live processing workers', 'processing', 'processing'],
+  ] as const)('fails migration 013 instead of collapsing %s', async (_caseName, firstStatus, secondStatus) => {
+    const client = await pool.connect();
+    const schema = `audio_binding_conflict_${randomUUID().replace(/-/g, '')}`;
+    const userId = randomUUID();
+    const questionId = randomUUID();
+    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query(`CREATE TABLE assessment_requests (
+        user_id UUID NOT NULL,
+        request_id UUID NOT NULL,
+        claim_id UUID NOT NULL,
+        context TEXT NOT NULL,
+        question_id UUID NOT NULL,
+        status TEXT NOT NULL,
+        response_body JSONB,
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        audio_key TEXT,
+        PRIMARY KEY (user_id, request_id)
+      )`);
+      await client.query(
+        `INSERT INTO assessment_requests
+           (user_id, request_id, claim_id, context, question_id, status, response_body,
+            started_at, completed_at, audio_key)
+         VALUES
+           ($1, $2, $3, 'practice', $4, $5,
+             CASE WHEN $5 = 'completed' THEN '{"done":true}'::jsonb ELSE NULL END,
+             now(), CASE WHEN $5 = 'completed' THEN now() ELSE NULL END, $6),
+           ($1, $7, $8, 'practice', $4, $9,
+             CASE WHEN $9 = 'completed' THEN '{"done":true}'::jsonb ELSE NULL END,
+             now(), CASE WHEN $9 = 'completed' THEN now() ELSE NULL END, $6)`,
+        [
+          userId,
+          randomUUID(),
+          randomUUID(),
+          questionId,
+          firstStatus,
+          audioKey,
+          randomUUID(),
+          randomUUID(),
+          secondStatus,
+        ],
+      );
+      const sql = fs.readFileSync(
+        path.join(__dirname, '../db/migrations/013_assessment_audio_key_uniqueness.sql'),
+        'utf8',
+      );
+
+      await expect(client.query(sql)).rejects.toMatchObject({
+        code: '55000',
+        message: expect.stringContaining('cannot safely deduplicate live assessment audio owners'),
+      });
+    } finally {
+      await client.query('ROLLBACK');
+      client.release();
+    }
+  });
+
+  it('takes the migration-013 writer lock before normalization can yield to concurrent inserts', async () => {
+    const schema = `audio_binding_lock_${randomUUID().replace(/-/g, '')}`;
+    const triggerFunction = `pause_audio_normalization_${randomUUID().replace(/-/g, '')}`;
+    const triggerName = `pause_audio_normalization_${randomUUID().replace(/-/g, '')}`;
+    const barrierName = `migration-013-test-${randomUUID()}`;
+    const owner = await pool.connect();
+    const blocker = await pool.connect();
+    const rival = await pool.connect();
+    let ownerTransactionOpen = false;
+    let barrierHeld = false;
+    let migrationOutcome: Promise<unknown> | undefined;
+    let rivalInsertOutcome: Promise<unknown> | undefined;
+    try {
+      await pool.query(`CREATE SCHEMA "${schema}"`);
+      await pool.query(`CREATE TABLE "${schema}".assessment_requests (
+        user_id UUID NOT NULL,
+        request_id UUID NOT NULL,
+        claim_id UUID NOT NULL,
+        context TEXT NOT NULL,
+        question_id UUID NOT NULL,
+        status TEXT NOT NULL,
+        response_body JSONB,
+        started_at TIMESTAMPTZ NOT NULL,
+        completed_at TIMESTAMPTZ,
+        audio_key TEXT,
+        PRIMARY KEY (user_id, request_id)
+      )`);
+      await pool.query(`CREATE FUNCTION "${schema}"."${triggerFunction}"() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          PERFORM pg_advisory_xact_lock(hashtext('${barrierName}'));
+          RETURN NEW;
+        END
+      $$`);
+      await pool.query(`CREATE TRIGGER "${triggerName}"
+        BEFORE UPDATE ON "${schema}".assessment_requests
+        FOR EACH ROW EXECUTE FUNCTION "${schema}"."${triggerFunction}"()`);
+      const userId = randomUUID();
+      const questionId = randomUUID();
+      await pool.query(
+        `INSERT INTO "${schema}".assessment_requests
+           (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
+         VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
+        [userId, randomUUID(), randomUUID(), questionId, `audio-uploads/${userId}/${randomUUID()}.m4a`],
+      );
+
+      await blocker.query('SELECT pg_advisory_lock(hashtext($1))', [barrierName]);
+      barrierHeld = true;
+      const blockerPid = (await blocker.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const ownerPid = (await owner.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const rivalPid = (await rival.query<{ pid: number }>('SELECT pg_backend_pid() AS pid')).rows[0].pid;
+      const sql = fs.readFileSync(
+        path.join(__dirname, '../db/migrations/013_assessment_audio_key_uniqueness.sql'),
+        'utf8',
+      );
+
+      await owner.query('BEGIN');
+      ownerTransactionOpen = true;
+      await owner.query(`SET LOCAL search_path TO "${schema}", public`);
+      migrationOutcome = owner.query(sql).then(
+        () => ({ status: 'fulfilled' as const }),
+        (error: unknown) => ({ status: 'rejected' as const, error }),
+      );
+      await vi.waitFor(
+        async () => {
+          const blocked = await pool.query(
+            'SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND $2::integer = ANY(pg_blocking_pids(pid))',
+            [ownerPid, blockerPid],
+          );
+          expect(blocked.rowCount).toBe(1);
+        },
+        { timeout: 5_000, interval: 10 },
+      );
+
+      rivalInsertOutcome = rival
+        .query(
+          `INSERT INTO "${schema}".assessment_requests
+             (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
+           VALUES ($1, $2, $3, 'practice', $4, 'processing', now(), $5)`,
+          [userId, randomUUID(), randomUUID(), questionId, `audio-uploads/${userId}/${randomUUID()}.m4a`],
+        )
+        .then(
+          (result) => ({ status: 'fulfilled' as const, result }),
+          (error: unknown) => ({ status: 'rejected' as const, error }),
+        );
+      await vi.waitFor(
+        async () => {
+          const blocked = await pool.query(
+            'SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND $2::integer = ANY(pg_blocking_pids(pid))',
+            [rivalPid, ownerPid],
+          );
+          expect(blocked.rowCount).toBe(1);
+        },
+        { timeout: 5_000, interval: 10 },
+      );
+
+      const unlocked = await blocker.query<{ unlocked: boolean }>(
+        'SELECT pg_advisory_unlock(hashtext($1)) AS unlocked',
+        [barrierName],
+      );
+      expect(unlocked.rows[0].unlocked).toBe(true);
+      barrierHeld = false;
+      await expect(migrationOutcome).resolves.toEqual({ status: 'fulfilled' });
+      await owner.query('COMMIT');
+      ownerTransactionOpen = false;
+      await expect(rivalInsertOutcome).resolves.toMatchObject({ status: 'fulfilled', result: { rowCount: 1 } });
+    } finally {
+      if (barrierHeld)
+        await blocker.query('SELECT pg_advisory_unlock(hashtext($1))', [barrierName]).catch(() => undefined);
+      if (ownerTransactionOpen) await owner.query('ROLLBACK').catch(() => undefined);
+      await migrationOutcome?.catch(() => undefined);
+      await rivalInsertOutcome?.catch(() => undefined);
+      owner.release();
+      blocker.release();
+      rival.release();
+      await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     }
   });
 });

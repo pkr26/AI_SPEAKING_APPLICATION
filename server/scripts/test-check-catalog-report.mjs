@@ -7,6 +7,7 @@ import { checkCatalogReport } from './check-catalog-report.mjs';
 
 const AGGREGATOR_SOURCE = "export * from './seed-data/a1';\n";
 const MODULE_SOURCE = 'export {};\n';
+const ORACLE_SOURCE = "it('matches the catalog', () => {});\n";
 
 function mutant(status, id) {
   return {
@@ -33,6 +34,12 @@ function report(statuses, { aggregatorStatuses = ['Ignored'] } = {}) {
       'db/seed-data.ts': fileEntry(AGGREGATOR_SOURCE, aggregatorStatuses),
       'db/seed-data/a1.ts': fileEntry(MODULE_SOURCE, statuses),
     },
+    testFiles: {
+      'tests/seed-catalog-mutation.test.ts': {
+        source: ORACLE_SOURCE,
+        tests: [{ id: '0', name: 'matches the catalog' }],
+      },
+    },
   };
 }
 
@@ -47,6 +54,8 @@ async function writeServerFixture(directory) {
   await fs.mkdir(path.join(directory, 'db', 'seed-data'), { recursive: true });
   await fs.writeFile(path.join(directory, 'db', 'seed-data.ts'), AGGREGATOR_SOURCE);
   await fs.writeFile(path.join(directory, 'db', 'seed-data', 'a1.ts'), MODULE_SOURCE);
+  await fs.mkdir(path.join(directory, 'tests'), { recursive: true });
+  await fs.writeFile(path.join(directory, 'tests', 'seed-catalog-mutation.test.ts'), ORACLE_SOURCE);
 }
 
 test('the catalog strict gate passes when every mutant is killed, timed out, or ignored', async (context) => {
@@ -111,7 +120,15 @@ test('the catalog strict gate fails closed on missing, malformed, or empty repor
       reportPath: await writeReport(directory, report([], { aggregatorStatuses: [] })),
       serverDir: directory,
     }),
-    /contains no mutants/,
+    /file db\/seed-data\.ts contains no mutants/,
+  );
+
+  await assert.rejects(
+    checkCatalogReport({
+      reportPath: await writeReport(directory, report([], { aggregatorStatuses: ['Killed'] })),
+      serverDir: directory,
+    }),
+    /file db\/seed-data\/a1\.ts contains no mutants/,
   );
 
   const invalidStatus = report(['Killed']);
@@ -161,5 +178,46 @@ test('the catalog strict gate fails closed on stale or missing embedded source',
   await assert.rejects(
     checkCatalogReport({ reportPath: await writeReport(directory, noSource), serverDir: directory }),
     /has no embedded source/,
+  );
+
+  const staleTest = report(['Killed']);
+  staleTest.testFiles['tests/seed-catalog-mutation.test.ts'].source = '// stale oracle\n';
+  await assert.rejects(
+    checkCatalogReport({ reportPath: await writeReport(directory, staleTest), serverDir: directory }),
+    /embeds stale test source/,
+  );
+
+  const unexpectedTest = report(['Killed']);
+  unexpectedTest.testFiles['tests/another.test.ts'] = {
+    source: '',
+    tests: [{ id: '1', name: 'unexpected' }],
+  };
+  await assert.rejects(
+    checkCatalogReport({ reportPath: await writeReport(directory, unexpectedTest), serverDir: directory }),
+    /test files must be exactly/,
+  );
+});
+
+test('the catalog strict gate detects workspace drift during report validation', async (context) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'catalog-gate-'));
+  context.after(() => fs.rm(directory, { recursive: true, force: true }));
+  await writeServerFixture(directory);
+  const reportPath = await writeReport(directory, report(['Killed']));
+  const driftTarget = path.join(directory, 'db', 'seed-data', 'a1.ts');
+  let finalCheck = false;
+
+  await assert.rejects(
+    checkCatalogReport({
+      reportPath,
+      serverDir: directory,
+      beforeFinalWorkspaceCheck: async () => {
+        finalCheck = true;
+      },
+      readWorkspaceFile: async (filePath, encoding) => {
+        const source = await fs.readFile(filePath, encoding);
+        return finalCheck && path.resolve(filePath) === driftTarget ? `${source}// concurrent edit\n` : source;
+      },
+    }),
+    /Catalog mutation campaign input changed during report validation: db\/seed-data\/a1\.ts/,
   );
 });

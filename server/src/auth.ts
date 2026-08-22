@@ -252,23 +252,41 @@ export function createAuthRouter(limiters: Limiters) {
       // sending mail, so saturating the budget neither spams the mailbox nor
       // reveals anything through the response.
       if (res.locals.forgotEmailThrottled) return res.status(204).end();
-      const { rows } = await pool.query<UserRow>('SELECT * FROM users WHERE email = $1', [email]);
-      const user = rows[0];
-      if (!user) return res.status(204).end();
-
-      const token = randomBytes(RESET_TOKEN_BYTES).toString('hex');
-      const tokenHash = createHash('sha256').update(token).digest('hex');
-      // One active token per user: a repeat request replaces (revokes) the
-      // previous code instead of accumulating parallel valid codes.
-      await pool.query(
-        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-         VALUES ($1, $2, now() + interval '${RESET_TOKEN_TTL_MINUTES} minutes')
-         ON CONFLICT (user_id) DO UPDATE SET
-           token_hash = EXCLUDED.token_hash,
-           expires_at = EXCLUDED.expires_at,
-           created_at = now()`,
-        [user.id, tokenHash],
-      );
+      let token: string | undefined;
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        // All reset-token writers lock the parent first. Besides keeping the
+        // lock order consistent with reset/change/delete, this closes the
+        // SELECT-then-INSERT race where account deletion (and immediate
+        // re-registration of the email) could leave this request inserting a
+        // token for the deleted UUID and leaking a 23503 as a non-uniform 500.
+        const lockedUser = await client.query<{ id: string }>('SELECT id FROM users WHERE email = $1 FOR UPDATE', [
+          email,
+        ]);
+        const userId = lockedUser.rows[0]?.id;
+        if (userId) {
+          token = randomBytes(RESET_TOKEN_BYTES).toString('hex');
+          const tokenHash = createHash('sha256').update(token).digest('hex');
+          // One active token per user: a repeat request replaces (revokes) the
+          // previous code instead of accumulating parallel valid codes.
+          await client.query(
+            `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+             VALUES ($1, $2, now() + interval '${RESET_TOKEN_TTL_MINUTES} minutes')
+             ON CONFLICT (user_id) DO UPDATE SET
+               token_hash = EXCLUDED.token_hash,
+               expires_at = EXCLUDED.expires_at,
+               created_at = now()`,
+            [userId, tokenHash],
+          );
+        }
+        await client.query('COMMIT');
+      } catch (err) {
+        return await rollbackTransaction(client, { value: err });
+      } finally {
+        releaseTransactionClient(client);
+      }
+      if (!token) return res.status(204).end();
       // The token travels only through the mailer (log or webhook), never in
       // this response. sendMail never rejects; failures are logged inside it.
       void sendMail({

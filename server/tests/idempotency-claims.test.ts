@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import {
   ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS,
   AssessmentRequestInFlightError,
+  abandonAssessmentRequest,
   claimAssessmentRequest,
   completeAssessmentRequest,
   getAssessmentRequestStatus,
@@ -312,6 +313,46 @@ describe('claimAssessmentRequest ownership and replay', () => {
     }
   });
 
+  it('returns a retryable in-flight 409 when an audio-key conflict disappears before it can be read', async () => {
+    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK') return undefined;
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
+        if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
+        if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
+        if (text.includes('SELECT context, question_id, status, response_body')) return { rows: [] };
+        if (text.includes('SELECT status') && text.includes('audio_key = $2')) return { rows: [] };
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    try {
+      await expect(
+        claimAssessmentRequest(userId, randomUUID(), 'practice', questionId, audioKey),
+      ).rejects.toMatchObject({
+        name: 'AssessmentRequestInFlightError',
+        status: 409,
+        message: 'Assessment is still processing',
+        code: 'REQUEST_IN_FLIGHT',
+        extra: { retryAfterSeconds: 2 },
+      });
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+        'BEGIN',
+        'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
+        expect.stringContaining('DELETE FROM assessment_requests'),
+        expect.stringContaining('INSERT INTO assessment_requests'),
+        expect.stringContaining('SELECT context, question_id, status, response_body'),
+        expect.stringContaining('SELECT status'),
+        'ROLLBACK',
+      ]);
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      connect.mockRestore();
+    }
+  });
+
   it('records the submitted audio key on the processing claim for cleanup arbitration', async () => {
     const requestId = randomUUID();
     const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
@@ -330,6 +371,10 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
     await completeAssessmentRequest(pool, userId, requestId, claim.claimId, { passed: true });
     await expect(isAudioKeyClaimedForProcessing(userId, audioKey)).resolves.toBe(false);
+    await expect(claimAssessmentRequest(userId, requestId, 'practice', questionId, audioKey)).resolves.toEqual({
+      kind: 'completed',
+      response: { passed: true },
+    });
 
     // An expired processing row no longer protects the object either.
     const staleKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
@@ -348,6 +393,68 @@ describe('claimAssessmentRequest ownership and replay', () => {
       [userId, keyless],
     );
     expect(keylessRow.rows[0].audio_key).toBeNull();
+  });
+
+  it('binds one S3 object to one requestId across processing and completed states', async () => {
+    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const ownerRequestId = randomUUID();
+    const owner = await claimAssessmentRequest(userId, ownerRequestId, 'practice', questionId, audioKey);
+    if (owner.kind !== 'claimed') throw new Error('expected a fresh owner claim');
+
+    await expect(
+      claimAssessmentRequest(userId, randomUUID(), 'practice', otherQuestionId, audioKey),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Audio upload was already submitted',
+      code: 'REQUEST_ID_REUSED',
+    });
+
+    await completeAssessmentRequest(pool, userId, ownerRequestId, owner.claimId, { passed: true });
+    await expect(
+      claimAssessmentRequest(userId, randomUUID(), 'diagnostic', questionId, audioKey),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Audio upload was already submitted',
+      code: 'REQUEST_ID_REUSED',
+    });
+  });
+
+  it('releases an abandoned audio binding and replaces a stale binding without touching another key', async () => {
+    const abandonedKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const abandonedRequestId = randomUUID();
+    const abandoned = await claimAssessmentRequest(userId, abandonedRequestId, 'practice', questionId, abandonedKey);
+    if (abandoned.kind !== 'claimed') throw new Error('expected a fresh abandoned claim');
+    await abandonAssessmentRequest(userId, abandonedRequestId, abandoned.claimId);
+
+    const reboundAbandonedRequestId = randomUUID();
+    await expect(
+      claimAssessmentRequest(userId, reboundAbandonedRequestId, 'practice', questionId, abandonedKey),
+    ).resolves.toMatchObject({ kind: 'claimed' });
+
+    const staleKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const staleRequestId = randomUUID();
+    await pool.query(
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
+      [userId, staleRequestId, randomUUID(), questionId, staleKey],
+    );
+    const replacementRequestId = randomUUID();
+    await expect(
+      claimAssessmentRequest(userId, replacementRequestId, 'practice', otherQuestionId, staleKey),
+    ).resolves.toMatchObject({ kind: 'claimed' });
+    const bindings = await pool.query<{ request_id: string }>(
+      `SELECT request_id
+       FROM assessment_requests
+       WHERE user_id = $1 AND audio_key = $2`,
+      [userId, staleKey],
+    );
+    expect(bindings.rows).toEqual([{ request_id: replacementRequestId }]);
+    const untouched = await pool.query<{ request_id: string }>(
+      'SELECT request_id FROM assessment_requests WHERE user_id = $1 AND audio_key = $2',
+      [userId, abandonedKey],
+    );
+    expect(untouched.rows).toEqual([{ request_id: reboundAbandonedRequestId }]);
   });
 
   it('rolls back and releases the claim transaction after a query failure', async () => {

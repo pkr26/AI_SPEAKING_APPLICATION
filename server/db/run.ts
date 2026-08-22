@@ -74,13 +74,33 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
   adminUrl.pathname = '/postgres';
   const admin = databaseClient(adminUrl.toString());
   await admin.connect();
+  let creationLockHeld = false;
   let operationFailed = false;
   try {
     await setOperationTimeouts(admin);
+    // CREATE DATABASE cannot run inside a transaction, so serialize the
+    // existence check + create pair with a session advisory lock. Without
+    // this, two concurrent local setup processes can both observe a missing
+    // database and one then fails with duplicate_database. The statement
+    // timeout set above bounds the wait; the database-name key lets unrelated
+    // local databases bootstrap independently.
+    await admin.query("SELECT pg_advisory_lock(hashtext('ai_english_create_database'), hashtext($1))", [dbName]);
+    creationLockHeld = true;
     const { rows } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
     if (rows.length === 0) {
-      await admin.query(`CREATE DATABASE "${dbName.replace(/"/g, '""')}"`);
-      log(`created database "${dbName}"`);
+      try {
+        await admin.query(`CREATE DATABASE "${dbName.replace(/"/g, '""')}"`);
+        log(`created database "${dbName}"`);
+      } catch (error) {
+        // The advisory lock coordinates this runner, but an external creator
+        // need not honor it. Accept duplicate_database only after proving the
+        // requested database now exists; every other create error remains the
+        // primary failure.
+        if ((error as { code?: unknown }).code !== '42P04') throw error;
+        const raced = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [dbName]);
+        if (raced.rows.length === 0) throw error;
+        log(`database "${dbName}" already exists`);
+      }
     } else {
       log(`database "${dbName}" already exists`);
     }
@@ -88,7 +108,13 @@ export async function ensureDatabase(dbUrl: string, log: (msg: string) => void =
     operationFailed = true;
     throw error;
   } finally {
-    await cleanupPreservingPrimaryError([() => admin.end()], operationFailed);
+    const cleanupActions: Array<() => Promise<unknown>> = [() => admin.end()];
+    if (creationLockHeld) {
+      cleanupActions.unshift(() =>
+        admin.query("SELECT pg_advisory_unlock(hashtext('ai_english_create_database'), hashtext($1))", [dbName]),
+      );
+    }
+    await cleanupPreservingPrimaryError(cleanupActions, operationFailed);
   }
 }
 

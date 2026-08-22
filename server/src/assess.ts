@@ -91,10 +91,26 @@ function observeMockProviderCalls(): void {
 // unwinds through its normal timeout/error path (abandoning its idempotency
 // claim) instead of pinning the drain for a full provider deadline.
 const inFlightAssessmentControllers = new Set<AbortController>();
+let assessmentShutdownStarted: true | undefined;
 
-export function abortInFlightAssessments(): number {
+export interface AbortInFlightAssessmentOptions {
+  /**
+   * Permanently close this process's provider gate. The HTTP lifecycle uses
+   * this at drain start so a request that is still awaiting its quota
+   * transaction (or finishing audio inspection) cannot register a new
+   * provider call just after the one-time controller sweep.
+   */
+  preventNew?: boolean;
+}
+
+export function abortInFlightAssessments({ preventNew = false }: AbortInFlightAssessmentOptions = {}): number {
+  if (preventNew) assessmentShutdownStarted = true;
   for (const controller of inFlightAssessmentControllers) controller.abort();
   return inFlightAssessmentControllers.size;
+}
+
+function assessmentShutdownError(): HttpError {
+  return new HttpError(503, 'Assessment service is shutting down; please try again', 'PROVIDER_FAILED');
 }
 
 // --- OpenAI client (module singleton, created on first real use) ------------
@@ -290,11 +306,19 @@ async function callProvider<T>(
 ): Promise<T> {
   acquireAiSlot();
   try {
+    // close() stops new HTTP requests, but an already-accepted request may not
+    // reach the provider skeleton until after the shutdown abort sweep. Reject
+    // it before reserving quota when the process drain has already started.
+    if (assessmentShutdownStarted) throw assessmentShutdownError();
     // Reserve quota only after an AI slot is available. Capacity rejections do
     // not consume a learner's daily allowance, while every provider attempt
     // still receives an atomic, cross-instance reservation before it starts.
     await assertDailyAssessmentCapacity(userId);
     options.onCapacityReserved?.();
+    // Shutdown can start while the quota transaction is awaiting PostgreSQL.
+    // The reservation has committed, so notify the limiter hook above, but do
+    // not begin fresh paid provider work during the drain.
+    if (assessmentShutdownStarted) throw assessmentShutdownError();
     if (config.mockAi) {
       observeMockProviderCalls();
       return spec.mockResult();
@@ -302,6 +326,9 @@ async function callProvider<T>(
     const client = getOpenAI();
     const controller = new AbortController();
     inFlightAssessmentControllers.add(controller);
+    // No await separates the shutdown check above from registration. A signal
+    // cannot interleave with that synchronous handoff; after registration the
+    // shutdown sweep finds this controller in the set.
     const deadline = setTimeout(() => controller.abort(), config.openaiTimeoutMs);
     deadline.unref();
     // Held in a local so an abort/early failure can never leak the fd: the

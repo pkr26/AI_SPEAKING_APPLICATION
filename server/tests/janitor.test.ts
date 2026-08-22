@@ -15,7 +15,27 @@ vi.mock('../src/logger', () => ({
   logger: { warn: runtime.warn },
 }));
 
-import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from '../src/janitor';
+import { JANITOR_BATCH_SIZE, JANITOR_MAX_BATCHES_PER_TICK, runExclusiveBatchedDelete } from '../src/janitor';
+
+function mockFullBatchesWithCapTripwire() {
+  let deleteCount = 0;
+  runtime.query.mockImplementation(async (text: string) => {
+    if (text === 'SELECT pg_try_advisory_lock(hashtext($1)) AS locked') {
+      return { rows: [{ locked: true }] };
+    }
+    if (text === 'DELETE BATCH') {
+      deleteCount += 1;
+      if (deleteCount > JANITOR_MAX_BATCHES_PER_TICK) {
+        throw new Error('janitor exceeded its finite per-tick batch cap');
+      }
+      return { rowCount: JANITOR_BATCH_SIZE };
+    }
+    if (text === 'SELECT pg_advisory_unlock(hashtext($1))') {
+      return { rows: [{ pg_advisory_unlock: true }] };
+    }
+    throw new Error(`unexpected janitor SQL: ${text}`);
+  });
+}
 
 describe('runExclusiveBatchedDelete', () => {
   beforeEach(() => {
@@ -63,6 +83,41 @@ describe('runExclusiveBatchedDelete', () => {
     expect(runtime.warn).not.toHaveBeenCalled();
   });
 
+  it('stops after the finite per-tick batch cap even when every delete reports a full batch', async () => {
+    mockFullBatchesWithCapTripwire();
+
+    await expect(runExclusiveBatchedDelete('janitor:test', 'DELETE BATCH')).resolves.toBe(
+      JANITOR_BATCH_SIZE * JANITOR_MAX_BATCHES_PER_TICK,
+    );
+
+    const deleteCalls = runtime.query.mock.calls.filter(([text]) => text === 'DELETE BATCH');
+    expect(deleteCalls).toHaveLength(JANITOR_MAX_BATCHES_PER_TICK);
+    expect(runtime.warn).toHaveBeenCalledWith(
+      {
+        lockName: 'janitor:test',
+        removed: JANITOR_BATCH_SIZE * JANITOR_MAX_BATCHES_PER_TICK,
+        maxBatches: JANITOR_MAX_BATCHES_PER_TICK,
+      },
+      'janitor batch cap reached; cleanup will continue on a later tick',
+    );
+    expect(runtime.query).toHaveBeenLastCalledWith('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:test']);
+    expect(runtime.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it('returns capped progress and unlocks even when the cap warning logger throws', async () => {
+    mockFullBatchesWithCapTripwire();
+    runtime.warn.mockImplementationOnce(() => {
+      throw new Error('logger failed');
+    });
+
+    await expect(runExclusiveBatchedDelete('janitor:test', 'DELETE BATCH')).resolves.toBe(
+      JANITOR_BATCH_SIZE * JANITOR_MAX_BATCHES_PER_TICK,
+    );
+
+    expect(runtime.query).toHaveBeenLastCalledWith('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:test']);
+    expect(runtime.release).toHaveBeenCalledWith(undefined);
+  });
+
   it('treats a missing rowCount as a zero-row terminal batch', async () => {
     runtime.query
       .mockResolvedValueOnce({ rows: [{ locked: true }] })
@@ -107,6 +162,21 @@ describe('runExclusiveBatchedDelete', () => {
       { err: poisonedWith, lockName: 'janitor:test' },
       'janitor advisory unlock failed; poisoning the pool client',
     );
+  });
+
+  it('still poisons the client when reporting an unlock failure also throws', async () => {
+    const unlockError = new Error('unlock failed');
+    runtime.query
+      .mockResolvedValueOnce({ rows: [{ locked: true }] })
+      .mockResolvedValueOnce({ rowCount: 1 })
+      .mockRejectedValueOnce(unlockError);
+    runtime.warn.mockImplementationOnce(() => {
+      throw new Error('logger failed');
+    });
+
+    await expect(runExclusiveBatchedDelete('janitor:test', 'DELETE BATCH')).resolves.toBe(1);
+
+    expect(runtime.release).toHaveBeenCalledWith(unlockError);
   });
 
   it('preserves a primary delete failure while still unlocking and releasing', async () => {

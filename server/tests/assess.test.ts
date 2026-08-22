@@ -908,3 +908,76 @@ describe('assessNativeComprehension (OpenAI path)', () => {
     });
   });
 });
+
+// This is intentionally last: preventNew models the process's one-way
+// shutdown transition, so no later assessment in this module may run.
+describe('assessment shutdown gate', () => {
+  it('does not lose shutdown while a capacity reservation is committing', async () => {
+    const snap = snapshotConfig();
+    config.mockAi = false;
+    config.openaiApiKey = 'sk-test-key';
+    let finishCommit!: () => void;
+    const commit = new Promise<void>((resolve) => {
+      finishCommit = resolve;
+    });
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (
+          text === 'BEGIN' ||
+          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))" ||
+          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))" ||
+          text === 'INSERT INTO assessment_usage (user_id) VALUES ($1)'
+        ) {
+          return { rows: [], rowCount: 1 };
+        }
+        if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') {
+          return { rows: [{ '?column?': 1 }], rowCount: 1 };
+        }
+        if (text.includes('count(*)::int AS global_n')) {
+          return {
+            rows: [{ global_n: 0, global_oldest: null, user_n: 0, user_oldest: null }],
+            rowCount: 1,
+          };
+        }
+        if (text === 'COMMIT') return commit;
+        if (text === 'ROLLBACK') return { rows: [], rowCount: null };
+        throw new Error(`unexpected capacity query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const onCapacityReserved = vi.fn();
+    const assessment = assessSpeaking(audioPath, QUESTION, userId, { onCapacityReserved });
+
+    try {
+      await vi.waitFor(() => expect(client.query).toHaveBeenCalledWith('COMMIT'));
+      // No provider controller exists yet, but this must still close the gate
+      // for the continuation that is waiting on COMMIT.
+      expect(abortInFlightAssessments({ preventNew: true })).toBe(0);
+      finishCommit();
+
+      await expect(assessment).rejects.toMatchObject({
+        status: 503,
+        message: 'Assessment service is shutting down; please try again',
+        code: 'PROVIDER_FAILED',
+      });
+      expect(onCapacityReserved).toHaveBeenCalledOnce();
+      expect(openaiMocks.transcribe).not.toHaveBeenCalled();
+      expect(openaiMocks.parse).not.toHaveBeenCalled();
+      expect(client.release).toHaveBeenCalledOnce();
+
+      // Requests reaching the provider skeleton after drain start fail before
+      // another database reservation or provider call is attempted.
+      connect.mockClear();
+      await expect(assessSpeaking(audioPath, QUESTION, userId)).rejects.toMatchObject({
+        status: 503,
+        code: 'PROVIDER_FAILED',
+      });
+      expect(connect).not.toHaveBeenCalled();
+    } finally {
+      finishCommit();
+      restoreConfig(snap);
+      connect.mockRestore();
+    }
+  });
+});

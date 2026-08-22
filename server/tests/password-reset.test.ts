@@ -4,6 +4,7 @@ import { createServer, type Server } from 'http';
 import type { AddressInfo } from 'net';
 import bcrypt from 'bcrypt';
 import express from 'express';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { cleanupPasswordResetTokens, createAuthRouter } from '../src/auth';
 import { config } from '../src/config';
@@ -21,6 +22,16 @@ afterEach(() => {
 });
 
 const RESET_INVALID_BODY = { error: 'Reset code is invalid or expired', code: 'RESET_INVALID' };
+
+const passLimiter = (_req: express.Request, _res: express.Response, next: express.NextFunction) => next();
+
+function directAuthApp() {
+  const direct = express();
+  direct.use(express.json());
+  direct.use('/auth', createAuthRouter({ forgotPasswordEmail: passLimiter, passwordAccount: passLimiter } as never));
+  direct.use(errorHandler);
+  return direct;
+}
 
 /** Capture the 32-hex reset code the log-mode mailer writes for `email`. */
 function captureMailedToken(): { tokenFor: (email: string) => string; calls: () => number } {
@@ -91,6 +102,39 @@ describe('POST /auth/forgot-password', () => {
     expect(invalid.body).toEqual({ error: 'email: a valid email is required', code: 'VALIDATION_FAILED' });
   });
 
+  it('rolls back, releases, and preserves a failed forgot-password transaction', async () => {
+    const primaryError = new Error('forgot-password lookup failed');
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK') return { rows: [] };
+        if (text.startsWith('SELECT id FROM users WHERE email = $1 FOR UPDATE')) throw primaryError;
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+
+    try {
+      const response = await request(directAuthApp())
+        .post('/auth/forgot-password')
+        .send({ email: uniqueEmail('forgot-transaction-failure') });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual([
+        'BEGIN',
+        expect.stringContaining('SELECT id FROM users WHERE email = $1 FOR UPDATE'),
+        'ROLLBACK',
+      ]);
+      expect(client.release).toHaveBeenCalledOnce();
+      expect(error).toHaveBeenCalledWith({ err: primaryError, requestId: undefined }, 'unhandled error');
+    } finally {
+      error.mockRestore();
+      connect.mockRestore();
+    }
+  });
+
   it('keeps exactly one active token per user: a repeat request revokes the previous code', async () => {
     const mailer = captureMailedToken();
     const { body: reg } = await registerUser(a);
@@ -118,6 +162,76 @@ describe('POST /auth/forgot-password', () => {
       .post('/auth/reset-password')
       .send({ email, token: secondToken, newPassword: 'brandNew1pass' });
     expect(freshReset.status).toBe(204);
+  });
+
+  it('stays uniformly 204 when deletion and email re-registration win during token issuance', async () => {
+    const mailer = captureMailedToken();
+    const { res, body: reg } = await registerUser(a);
+    const userId = res.body.user.id as string;
+    const email = reg.email as string;
+    const blocker = await pool.connect();
+    const originalConnect = pool.connect.bind(pool);
+    let transactionOpen = false;
+    let parentLockStarted = false;
+    const connect = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+      if (typeof callback === 'function') return originalConnect(callback as never);
+      return originalConnect().then((client: PoolClient) => {
+        const mutable = client as unknown as {
+          query: (...args: unknown[]) => unknown;
+          release: (error?: Error | boolean) => void;
+        };
+        const actualQuery = mutable.query;
+        const actualRelease = mutable.release;
+        mutable.query = (query: unknown, ...args: unknown[]) => {
+          const text = typeof query === 'string' ? query : (query as { text?: unknown } | null)?.text;
+          if (text === 'SELECT id FROM users WHERE email = $1 FOR UPDATE') parentLockStarted = true;
+          return actualQuery.call(client, query, ...args);
+        };
+        mutable.release = (error?: Error | boolean) => {
+          mutable.query = actualQuery;
+          mutable.release = actualRelease;
+          actualRelease.call(client, error);
+        };
+        return client;
+      });
+    }) as typeof pool.connect);
+
+    try {
+      await blocker.query('BEGIN');
+      transactionOpen = true;
+      await blocker.query('DELETE FROM users WHERE id = $1', [userId]);
+
+      const responsePromise = Promise.resolve(request(a).post('/auth/forgot-password').send({ email }));
+      await vi.waitFor(() => expect(parentLockStarted).toBe(true), { timeout: 15_000, interval: 10 });
+
+      await blocker.query('COMMIT');
+      transactionOpen = false;
+      // Reuse the just-freed email while the forgot-password SELECT is
+      // resuming from its deleted-row lock wait. Its statement snapshot must
+      // neither target this replacement account nor surface the old UUID's FK
+      // failure.
+      const [response, replacement] = await Promise.all([
+        responsePromise,
+        pool.query<{ id: string }>(
+          `INSERT INTO users (name, email, password_hash, native_language)
+           VALUES ('Replacement', $1, 'not-used', 'te') RETURNING id`,
+          [email],
+        ),
+      ]);
+
+      expect(response.status).toBe(204);
+      expect(response.body).toEqual({});
+      expect(mailer.calls()).toBe(0);
+      const token = await pool.query('SELECT 1 FROM password_reset_tokens WHERE user_id = $1', [
+        replacement.rows[0].id,
+      ]);
+      expect(token.rowCount).toBe(0);
+      await pool.query('DELETE FROM users WHERE id = $1', [replacement.rows[0].id]);
+    } finally {
+      connect.mockRestore();
+      if (transactionOpen) await blocker.query('ROLLBACK');
+      blocker.release();
+    }
   });
 
   it('silently stops issuing once the per-email budget is exhausted while still answering 204', async () => {
@@ -305,6 +419,80 @@ describe('POST /auth/reset-password', () => {
     expect(ok.status).toBe(204);
   });
 
+  it.each([
+    {
+      condition: 'the locked user row disappeared',
+      missingResult: 'locked-user' as const,
+      expectedQueries: ['BEGIN', expect.stringContaining('SELECT id FROM users WHERE id = $1 FOR UPDATE'), 'ROLLBACK'],
+    },
+    {
+      condition: 'the guarded password update affected no row',
+      missingResult: 'updated-user' as const,
+      expectedQueries: [
+        'BEGIN',
+        expect.stringContaining('SELECT id FROM users WHERE id = $1 FOR UPDATE'),
+        expect.stringContaining('DELETE FROM password_reset_tokens'),
+        expect.stringContaining('UPDATE users SET password_hash'),
+        'ROLLBACK',
+      ],
+    },
+  ])('returns the uniform reset error when $condition', async ({ missingResult, expectedQueries }) => {
+    const userId = '11111111-1111-4111-8111-111111111111';
+    const email = uniqueEmail(`reset-${missingResult}`);
+    const token = 'known-reset-token';
+    const tokenHash = createHash('sha256').update(token).digest('hex');
+    const query = vi
+      .spyOn(pool, 'query')
+      .mockResolvedValueOnce({
+        rows: [
+          {
+            id: userId,
+            name: 'Reset Guard',
+            email,
+            password_hash: 'old-hash',
+            native_language: 'te',
+            cefr_level: null,
+            diagnostic_completed: false,
+            token_version: 1,
+            created_at: new Date().toISOString(),
+          },
+        ],
+      } as never)
+      .mockResolvedValueOnce({ rows: [{ token_hash: tokenHash }] } as never);
+    const client = {
+      query: vi.fn(async (text: string) => {
+        if (text === 'BEGIN' || text === 'ROLLBACK' || text === 'COMMIT') return { rows: [] };
+        if (text.startsWith('SELECT id FROM users WHERE id = $1 FOR UPDATE')) {
+          return missingResult === 'locked-user' ? { rows: [], rowCount: 0 } : { rows: [{ id: userId }], rowCount: 1 };
+        }
+        if (text.startsWith('DELETE FROM password_reset_tokens')) return { rows: [], rowCount: 1 };
+        if (text.startsWith('UPDATE users SET password_hash')) {
+          return { rows: [], rowCount: missingResult === 'updated-user' ? 0 : 1 };
+        }
+        throw new Error(`unexpected query: ${text}`);
+      }),
+      release: vi.fn(),
+    };
+    const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const hash = vi.spyOn(bcrypt, 'hash').mockResolvedValue('replacement-hash' as never);
+
+    try {
+      const response = await request(directAuthApp())
+        .post('/auth/reset-password')
+        .send({ email, token, newPassword: 'replacementPass1' });
+
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual(RESET_INVALID_BODY);
+      expect(client.query.mock.calls.map(([text]) => text)).toEqual(expectedQueries);
+      expect(client.query).not.toHaveBeenCalledWith('COMMIT');
+      expect(client.release).toHaveBeenCalledOnce();
+    } finally {
+      hash.mockRestore();
+      connect.mockRestore();
+      query.mockRestore();
+    }
+  });
+
   it('begins, rolls back, and releases the reset transaction when the user update fails', async () => {
     const userId = '11111111-1111-4111-8111-111111111111';
     const email = uniqueEmail('reset-transaction-failure');
@@ -381,8 +569,9 @@ describe('mailer resilience', () => {
 
   it('never rejects the best-effort log delivery path when the logger transport fails', async () => {
     config.mail.mode = 'log';
+    const infoFailure = new Error('log transport failed');
     const info = vi.spyOn(logger, 'info').mockImplementation((() => {
-      throw new Error('log transport failed');
+      throw infoFailure;
     }) as never);
     const error = vi.spyOn(logger, 'error').mockImplementation((() => {
       throw new Error('error log transport failed');
@@ -390,6 +579,11 @@ describe('mailer resilience', () => {
 
     try {
       await expect(sendMail({ to: 'learner@example.com', subject: 'Reset', text: 'code' })).resolves.toBeUndefined();
+      expect(error).toHaveBeenCalledOnce();
+      expect(error).toHaveBeenCalledWith(
+        { err: infoFailure, to: 'learner@example.com', subject: 'Reset' },
+        'mail delivery failed unexpectedly',
+      );
     } finally {
       error.mockRestore();
       info.mockRestore();

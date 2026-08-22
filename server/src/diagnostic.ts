@@ -137,7 +137,12 @@ async function clearDiagnosticClaim(userId: string, claimId: string): Promise<vo
   } catch (err) {
     // Preserve the route's real result/error; ownership expires after five
     // minutes even when cleanup temporarily cannot reach PostgreSQL.
-    logger.warn({ err, userId, claimId }, 'failed to clear diagnostic assessment claim');
+    try {
+      logger.warn({ err, userId, claimId }, 'failed to clear diagnostic assessment claim');
+    } catch {
+      // A broken logger must not violate this hook's never-throw contract: the
+      // pipeline still has to abandon its request claim after this returns.
+    }
   }
 }
 
@@ -260,9 +265,6 @@ export function createDiagnosticRouter(limiters: Limiters) {
     '/next',
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      if (user.diagnostic_completed) {
-        return res.json({ done: true, level: user.cefr_level });
-      }
       // Store the served question so /answer can reject anything else.
       const client = await pool.connect();
       try {

@@ -93,6 +93,10 @@ function addedSignalListener(signal: 'SIGTERM' | 'SIGINT'): NodeJS.SignalsListen
 beforeEach(() => {
   vi.resetModules();
   vi.clearAllMocks();
+  runtime.logger.info.mockImplementation(() => undefined);
+  runtime.logger.warn.mockImplementation(() => undefined);
+  runtime.logger.error.mockImplementation(() => undefined);
+  runtime.logger.fatal.mockImplementation(() => undefined);
   runtime.trustProxy = false;
   runtime.dbPoolMax = 20;
   runtime.poolQuery.mockResolvedValue({ rows: [{ max_connections: '100' }] });
@@ -133,6 +137,30 @@ afterEach(() => {
 });
 
 describe('server lifecycle failure handling', () => {
+  it('keeps startup and graceful shutdown authoritative when informational logging throws', async () => {
+    runtime.trustProxy = 2;
+    runtime.dbPoolMax = 100;
+    runtime.logger.info.mockImplementation((() => {
+      throw new Error('info logger failed');
+    }) as never);
+    runtime.logger.warn.mockImplementation((() => {
+      throw new Error('warning logger failed');
+    }) as never);
+    runtime.logger.error.mockImplementation((() => {
+      throw new Error('error logger failed');
+    }) as never);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
+    expect(runtime.server.close).toHaveBeenCalledOnce();
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+  });
+
   it('warns at boot when TRUST_PROXY is configured, and stays silent at zero hops', async () => {
     runtime.trustProxy = 2;
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
@@ -258,6 +286,28 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
   });
 
+  it('contains synchronous and asynchronous janitor failures even when warning logging throws', async () => {
+    const synchronousError = new Error('synchronous cleanup failure');
+    const asynchronousError = new Error('asynchronous cleanup failure');
+    runtime.cleanupUploads.mockImplementationOnce(() => {
+      throw synchronousError;
+    });
+    runtime.cleanupRequests.mockRejectedValueOnce(asynchronousError);
+    runtime.logger.warn.mockImplementation((() => {
+      throw new Error('warning logger failed');
+    }) as never);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(runtime.logger.warn).toHaveBeenCalledWith({ err: synchronousError }, 'upload janitor failed');
+    expect(runtime.logger.warn).toHaveBeenCalledWith({ err: asynchronousError }, 'assessment replay janitor failed');
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
   it('logs exact positive janitor results and stays quiet when no stale records were removed', async () => {
     vi.useFakeTimers();
     runtime.cleanupUploads.mockResolvedValueOnce(2);
@@ -301,6 +351,37 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.logger.info).not.toHaveBeenCalled();
     // The second upload tick removed nothing: the counter must not move.
     expect((await janitorCounts()).uploads).toBe(2);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it('never overlaps a slow janitor with its next interval tick', async () => {
+    vi.useFakeTimers();
+    let finishUploadCleanup!: (removed: number) => void;
+    runtime.cleanupUploads.mockImplementationOnce(
+      () =>
+        new Promise<number>((resolve) => {
+          finishUploadCleanup = resolve;
+        }),
+    );
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.cleanupUploads).toHaveBeenCalledOnce();
+
+    // setInterval fires, but the boot sweep still owns this janitor. Starting
+    // another filesystem walk here would race its stats/unlinks and let slow
+    // ticks accumulate without a bound.
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(runtime.cleanupUploads).toHaveBeenCalledOnce();
+
+    finishUploadCleanup(0);
+    await Promise.resolve();
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(15 * 60 * 1000);
+    expect(runtime.cleanupUploads).toHaveBeenCalledTimes(2);
 
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
@@ -570,7 +651,97 @@ describe('server lifecycle failure handling', () => {
       { err: poolError },
       'error closing pg pool after dependency startup failure',
     );
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
     expect(runtime.server.listen).not.toHaveBeenCalled();
+  });
+
+  it('forces one failed exit when a fatal pool drain never settles', async () => {
+    vi.useFakeTimers();
+    const dependencyError = new Error('schema unavailable');
+    let finishPool!: () => void;
+    runtime.assertSchema.mockRejectedValueOnce(dependencyError);
+    runtime.poolEnd.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishPool = resolve;
+        }),
+    );
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    runtime.logger.error.mockImplementationOnce((() => {
+      throw new Error('fatal timeout logger failed');
+    }) as never);
+
+    await import('../src/index');
+    // Flush the dependency rejection without waitFor: under fake timers,
+    // waitFor advances the clock and would consume part of the 140s deadline
+    // before the boundary assertion below.
+    for (let index = 0; index < 5; index += 1) await Promise.resolve();
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+
+    await vi.advanceTimersByTimeAsync(139_999);
+    expect(exit).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(runtime.logger.error).toHaveBeenCalledWith('fatal shutdown timed out — forcing exit');
+    expect(exit).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledWith(1);
+
+    // A late pool completion must not produce a second exit after the force
+    // deadline won the race.
+    finishPool();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(exit).toHaveBeenCalledOnce();
+  });
+
+  it('still exits after a fatal pool rejection when error logging throws', async () => {
+    const dependencyError = new Error('schema unavailable');
+    const poolError = new Error('pool close failed');
+    runtime.assertSchema.mockRejectedValueOnce(dependencyError);
+    runtime.poolEnd.mockRejectedValueOnce(poolError);
+    runtime.logger.fatal.mockImplementationOnce((() => {
+      throw new Error('fatal logger failed');
+    }) as never);
+    runtime.logger.error.mockImplementationOnce((() => {
+      throw new Error('pool error logger failed');
+    }) as never);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.error).toHaveBeenCalledWith(
+      { err: poolError },
+      'error closing pg pool after dependency startup failure',
+    );
+    expect(exit).toHaveBeenCalledOnce();
+  });
+
+  it('cancels the fatal force timer when the pool drain wins', async () => {
+    vi.useFakeTimers();
+    const dependencyError = new Error('schema unavailable');
+    let finishPool!: () => void;
+    runtime.assertSchema.mockRejectedValueOnce(dependencyError);
+    runtime.poolEnd.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishPool = resolve;
+        }),
+    );
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.poolEnd).toHaveBeenCalledOnce());
+    finishPool();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(exit).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(clearTimeoutSpy).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(140_000);
+    expect(exit).toHaveBeenCalledOnce();
+    expect(runtime.logger.error).not.toHaveBeenCalledWith('fatal shutdown timed out — forcing exit');
   });
 
   it('fails closed when the forced audio-inspector startup check rejects', async () => {
@@ -658,6 +829,7 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.server.close).toHaveBeenCalledOnce();
     expect(runtime.server.closeIdleConnections).toHaveBeenCalledOnce();
     expect(runtime.abortAssessments).toHaveBeenCalledOnce();
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
   });
 
   it('still aborts in-flight assessments when shutdown starts before listen, without touching sockets', async () => {
@@ -675,6 +847,7 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
 
     expect(runtime.abortAssessments).toHaveBeenCalledOnce();
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
     expect(runtime.server.close).not.toHaveBeenCalled();
     expect(runtime.server.closeIdleConnections).not.toHaveBeenCalled();
     releaseSchema();
@@ -694,6 +867,7 @@ describe('server lifecycle failure handling', () => {
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
     expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: listenError }, 'HTTP server failed');
     expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
   });
 
   it('still exits 1 when the pool drain after an HTTP server error fails', async () => {

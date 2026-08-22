@@ -4,6 +4,7 @@ import fs from 'fs/promises';
 import { EventEmitter } from 'events';
 import { createServer } from 'http';
 import { PassThrough, Readable } from 'stream';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -39,11 +40,11 @@ vi.mock('@aws-sdk/s3-presigned-post', () => ({
 
 import { config } from '../src/config';
 import {
-  completeSubmittedPresignedAudioReplay,
   createAudioSizeCap,
   discardPresignedAudio,
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
+  ownSubmittedPresignedAudio,
   preserveSubmittedPresignedAudio,
   resolvePresignedAudio,
 } from '../src/audio-upload';
@@ -115,6 +116,7 @@ function directS3Request(userId: string, audioKey = ownedKey(userId)): AuthedReq
 }
 
 beforeEach(() => {
+  vi.restoreAllMocks();
   sendMock.mockReset();
   createPresignedPostMock.mockReset();
   createPresignedPostMock.mockImplementation(
@@ -231,10 +233,8 @@ describe('submitted S3 cleanup lifecycle', () => {
     expect(() => preserveSubmittedPresignedAudio(res)).not.toThrow();
   });
 
-  it('ignores replay completion and finalization when no submitted-audio cleanup was registered', async () => {
-    const res = {} as Parameters<typeof completeSubmittedPresignedAudioReplay>[0];
-
-    expect(() => completeSubmittedPresignedAudioReplay(res)).not.toThrow();
+  it('ignores finalization when no submitted-audio cleanup was registered', async () => {
+    const res = {} as Parameters<typeof finalizeSubmittedPresignedAudio>[0];
     await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
   });
 
@@ -253,7 +253,29 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     try {
       discardSubmittedPresignedAudio(req, res, vi.fn());
+      ownSubmittedPresignedAudio(res);
       preserveSubmittedPresignedAudio(res);
+      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+
+      expect(ownershipQuery).not.toHaveBeenCalled();
+      expect(sendMock).not.toHaveBeenCalled();
+    } finally {
+      ownershipQuery.mockRestore();
+    }
+  });
+
+  it('defaults an unowned submission to preservation even when a response still has the default 200 status', async () => {
+    const userId = randomUUID();
+    const req = directS3Request(userId);
+    const res = {
+      statusCode: 200,
+      writableFinished: true,
+      once: vi.fn().mockReturnThis(),
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+    const ownershipQuery = vi.spyOn(pool, 'query');
+
+    try {
+      discardSubmittedPresignedAudio(req, res, vi.fn());
       await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
 
       expect(ownershipQuery).not.toHaveBeenCalled();
@@ -307,6 +329,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     sendMock.mockResolvedValue({});
 
     discardSubmittedPresignedAudio(req, res as never, vi.fn());
+    ownSubmittedPresignedAudio(res as never);
     expect(once.mock.calls.map(([event]) => event)).toEqual(['finish', 'close']);
 
     res.emit('finish');
@@ -321,6 +344,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     sendMock.mockResolvedValue({});
 
     discardSubmittedPresignedAudio(req, res as never, vi.fn());
+    ownSubmittedPresignedAudio(res as never);
     res.emit('close');
 
     await vi.waitFor(() => expect(sendMock).toHaveBeenCalledOnce());
@@ -349,6 +373,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     listeners.get('close')?.();
     expect(sendMock).not.toHaveBeenCalled();
 
+    ownSubmittedPresignedAudio(res);
     sendMock.mockResolvedValue({});
     await finalizeSubmittedPresignedAudio(res);
     await finalizeSubmittedPresignedAudio(res);
@@ -407,19 +432,20 @@ describe('submitted S3 cleanup lifecycle', () => {
       user: { id: userId },
     } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
     const res = {
-      statusCode: 502,
+      statusCode: 200,
       writableFinished: true,
       once: vi.fn().mockReturnThis(),
     } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
 
     discardSubmittedPresignedAudio(req, res, vi.fn());
+    ownSubmittedPresignedAudio(res);
     await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
     expect(sendMock).not.toHaveBeenCalled();
     await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
   });
 
-  it.each([409, 429, 500, 502, 503, 504])(
-    'preserves the submitted object on a retryable %s without an ownership lookup',
+  it.each([199, 300, 400, 403, 404, 409, 413, 415, 429, 500, 502, 503, 504])(
+    'preserves an owned submitted object on non-success status %s without an ownership lookup',
     async (statusCode) => {
       const userId = randomUUID();
       const req = {
@@ -439,11 +465,12 @@ describe('submitted S3 cleanup lifecycle', () => {
       const ownershipQuery = vi.spyOn(pool, 'query');
       try {
         discardSubmittedPresignedAudio(req, res, vi.fn());
+        ownSubmittedPresignedAudio(res);
         for (const listener of listeners.get('finish') ?? []) listener();
 
-        // Await the same finalizer that the response listener started. 409/429
-        // and every retryable 5xx must preserve without looking up ownership or
-        // deleting an object the client's same-key retry re-submits.
+        // Await the same finalizer that the response listener started. Every
+        // non-success must preserve without a racy ownership-check/delete gap;
+        // the bucket lifecycle bounds storage for terminal failures.
         await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
         expect(res.statusCode).toBe(statusCode);
         expect(ownershipQuery).not.toHaveBeenCalled();
@@ -488,10 +515,41 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     try {
       discardSubmittedPresignedAudio(req, res, vi.fn());
+      ownSubmittedPresignedAudio(res);
       await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
       expect(query).toHaveBeenCalledOnce();
       expect(sendMock).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith({ err: ownershipError, userId }, 'failed to verify S3 audio cleanup ownership');
+    } finally {
+      warn.mockRestore();
+      query.mockRestore();
+    }
+  });
+
+  it('keeps fire-and-forget cleanup fulfilled when the warning logger throws', async () => {
+    const userId = randomUUID();
+    const audioKey = ownedKey(userId);
+    const req = directS3Request(userId, audioKey);
+    const res = {
+      statusCode: 200,
+      writableFinished: true,
+      once: vi.fn().mockReturnThis(),
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+    const ownershipError = new Error('ownership lookup failed');
+    const query = vi.spyOn(pool, 'query').mockRejectedValueOnce(ownershipError as never);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('logger transport failed');
+    });
+
+    try {
+      discardSubmittedPresignedAudio(req, res, vi.fn());
+      ownSubmittedPresignedAudio(res);
+      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      expect(sendMock).not.toHaveBeenCalled();
+
+      sendMock.mockRejectedValueOnce(new Error('delete failed'));
+      await expect(discardPresignedAudio(userId, audioKey)).resolves.toBeUndefined();
+      expect(warn).toHaveBeenCalledTimes(2);
     } finally {
       warn.mockRestore();
       query.mockRestore();
@@ -533,6 +591,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     );
 
     discardSubmittedPresignedAudio(req, res, vi.fn());
+    ownSubmittedPresignedAudio(res);
     const first = finalizeSubmittedPresignedAudio(res);
     const second = finalizeSubmittedPresignedAudio(res);
 
@@ -1108,6 +1167,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
     sendMock.mockImplementation((command: { kind: string }) => {
       if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
       return Promise.resolve({});
@@ -1116,11 +1176,16 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const res = await request(a)
       .post('/diagnostic/answer')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId, requestId: randomUUID(), audioKey });
+      .send({ questionId, requestId, audioKey });
 
     expect(res.status).toBe(200);
     expect(typeof res.body.score).toBe('number');
     expect(typeof res.body.done).toBe('boolean');
+    const storedClaim = await pool.query<{ audio_key: string | null }>(
+      'SELECT audio_key FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(storedClaim.rows).toEqual([{ audio_key: audioKey }]);
 
     // The delete consults the claim table before firing, so await it.
     await vi.waitFor(() => {
@@ -1132,7 +1197,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     expect(deleteCommand.input.Key).toBe(audioKey);
   });
 
-  it('replays a completed request before downloading audio and still discards the newly submitted object', async () => {
+  it('replays a completed request without another storage operation', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1162,12 +1227,37 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
     expect(replay.status).toBe(200);
     expect(replay.body).toEqual(first.body);
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it('deletes newly submitted audio after the client disconnects during a completed replay', async () => {
+  it('replays a completed request without deleting a different, unbound submitted key', async () => {
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const boundAudioKey = ownedKey(userId);
+    const freshAudioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    const replayBody = { score: 87, done: false };
+    await pool.query(
+      `INSERT INTO assessment_requests
+           (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at, audio_key)
+         VALUES ($1, $2, $3, 'diagnostic', $4, 'completed', $5::jsonb, now(), $6)`,
+      [userId, requestId, randomUUID(), questionId, JSON.stringify(replayBody), boundAudioKey],
+    );
+    sendMock.mockResolvedValue({});
+
+    const replay = await request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId, requestId, audioKey: freshAudioKey });
+
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual(replayBody);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('never schedules a late delete after disconnecting during a completed replay', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1175,9 +1265,9 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const replayBody = { score: 91, done: false };
     await pool.query(
       `INSERT INTO assessment_requests
-           (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at)
-         VALUES ($1, $2, $3, 'diagnostic', $4, 'completed', $5::jsonb, now())`,
-      [userId, requestId, randomUUID(), questionId, JSON.stringify(replayBody)],
+           (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at, audio_key)
+         VALUES ($1, $2, $3, 'diagnostic', $4, 'completed', $5::jsonb, now(), $6)`,
+      [userId, requestId, randomUUID(), questionId, JSON.stringify(replayBody), audioKey],
     );
     sendMock.mockResolvedValue({});
 
@@ -1186,12 +1276,18 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     // below proves the route, rather than an unrelated request phase, is
     // waiting on this exact transaction before the socket is aborted.
     const lockClient = await pool.connect();
+    const originalConnect = pool.connect.bind(pool);
     const server = createServer(a);
     let lockTransactionOpen = false;
     let responseFinished = false;
     let responseWritableFinishedOnClose: boolean | undefined;
     let abortClient: (() => void) | undefined;
     let clientOutcome: Promise<'fulfilled' | 'rejected'> | undefined;
+    let connectSpy: ReturnType<typeof vi.spyOn> | undefined;
+    let markRouteSettled!: () => void;
+    const routeSettled = new Promise<void>((resolve) => {
+      markRouteSettled = resolve;
+    });
 
     try {
       const lockBackend = await lockClient.query<{ pid: number }>('SELECT pg_backend_pid() AS pid');
@@ -1205,6 +1301,36 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
            FOR UPDATE`,
         [userId, requestId],
       );
+
+      // Resolve only after the completed-replay claim client releases. Its
+      // release schedules a setImmediate, so the replay continuation must
+      // finish before this test proceeds.
+      connectSpy = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+        if (typeof callback === 'function') return originalConnect(callback as never);
+        return originalConnect().then((client: PoolClient) => {
+          const mutable = client as unknown as {
+            query: (...args: unknown[]) => unknown;
+            release: (error?: Error | boolean) => void;
+          };
+          const actualQuery = mutable.query;
+          const actualRelease = mutable.release;
+          let replayRowRead = false;
+          mutable.query = (query: unknown, ...args: unknown[]) => {
+            const text = typeof query === 'string' ? query : (query as { text?: unknown } | null)?.text;
+            if (typeof text === 'string' && text.includes('SELECT context') && text.includes('assessment_requests')) {
+              replayRowRead = true;
+            }
+            return actualQuery.call(client, query, ...args);
+          };
+          mutable.release = (error?: Error | boolean) => {
+            mutable.query = actualQuery;
+            mutable.release = actualRelease;
+            actualRelease.call(client, error);
+            if (replayRowRead) setImmediate(markRouteSettled);
+          };
+          return client;
+        });
+      }) as typeof pool.connect);
 
       server.prependListener('request', (incoming, outgoing) => {
         if (incoming.url === '/diagnostic/answer') {
@@ -1260,16 +1386,16 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       await lockClient.query('COMMIT');
       lockTransactionOpen = false;
       await expect(clientOutcome).resolves.toBe('rejected');
+      await routeSettled;
 
-      // `close` already fired without a finished response, so only the
-      // completed-replay route finally can discard this object now.
-      await vi.waitFor(() => expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']), {
-        timeout: 5_000,
-      });
-      expect(sendMock.mock.calls[0][0].input.Key).toBe(audioKey);
+      // Completed replays deliberately leave cleanup to the bucket lifecycle:
+      // a delete begun near the 48-hour replay boundary could outlive its
+      // tombstone and remove a newly rebound worker's input.
+      expect(sendMock).not.toHaveBeenCalled();
       expect(responseFinished).toBe(false);
     } finally {
       abortClient?.();
+      connectSpy?.mockRestore();
       if (lockTransactionOpen) {
         await lockClient.query('ROLLBACK').catch(() => undefined);
       }
@@ -1479,7 +1605,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     }
   });
 
-  it('deletes a submitted object when diagnostic completion rejects the request before download', async () => {
+  it('preserves a submitted object when diagnostic completion rejects before durable ownership', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1493,14 +1619,13 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error).toBe('Diagnostic already completed');
-    // Error-path finalization runs from the response-finish listener, which
-    // sees the real status the error handler set.
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    // A terminal rejection is still unbound. Deleting it here would race a
+    // different valid request that claims the key after a cleanup lookup.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it('deletes an owned object when body validation rejects the request before the route handler', async () => {
+  it('preserves an owned key when body validation rejects before the route handler', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1512,9 +1637,8 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .send({ questionId, requestId: 'not-a-uuid', audioKey });
 
     expect(res.status).toBe(400);
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
   it('returns 400 for a key owned by another user without touching S3', async () => {
@@ -1544,10 +1668,8 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       error: 'audio upload not found or expired',
       code: 'AUDIO_UPLOAD_MISSING',
     });
-    // Drain the deferred cleanup delete so it cannot leak into the next test.
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
   });
 
   it('returns 413 when the object exceeds the audio size cap', async () => {
@@ -1563,10 +1685,8 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
     expect(res.status).toBe(413);
-    // Drain the deferred cleanup delete so it cannot leak into the next test.
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
   });
 
   it('returns 415 when the downloaded object is not real audio', async () => {
@@ -1582,10 +1702,8 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ questionId, requestId: randomUUID(), audioKey: ownedKey(userId) });
     expect(res.status).toBe(415);
-    // Drain the deferred cleanup delete so it cannot leak into the next test.
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get']);
   });
 
   it('keeps a retryable S3 failure object so the same requestId/key can be claimed again without a re-upload', async () => {
@@ -1669,7 +1787,9 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
     const userId = registration.body.user.id as string;
-    await completeDiagnosticInS3Mode(a, token, userId);
+    // This read-route cleanup test does not need another five-request
+    // diagnostic journey; seed the equivalent eligible state directly.
+    await pool.query("UPDATE users SET cefr_level = 'A1', diagnostic_completed = true WHERE id = $1", [userId]);
     sendMock.mockClear();
     sendMock.mockResolvedValue({});
 
@@ -1731,7 +1851,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     }
   });
 
-  it('validates a malformed requestId before the route and deletes the owned object', async () => {
+  it('validates a malformed requestId before the route and preserves the unbound object', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
@@ -1749,12 +1869,11 @@ describe('POST /practice/attempt (S3 mode)', () => {
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('requestId must be a valid UUID');
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
-  it('deletes the owned object when a non-string requestId fails body validation', async () => {
+  it('preserves the unbound object when a non-string requestId fails body validation', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
@@ -1772,9 +1891,8 @@ describe('POST /practice/attempt (S3 mode)', () => {
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('requestId');
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
   });
 
   it('validates a non-string audioKey before the route and leaves no durable request claim', async () => {
@@ -1830,7 +1948,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     expect(claims.rows[0].count).toBe(0);
   });
 
-  it('returns 404 for a valid unknown question before download and deletes the owned object', async () => {
+  it('returns 404 for a valid unknown question and preserves the unbound object', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
@@ -1848,9 +1966,8 @@ describe('POST /practice/attempt (S3 mode)', () => {
 
     expect(response.status).toBe(404);
     expect(response.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
-    await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['delete']);
-    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(sendMock).not.toHaveBeenCalled();
     const claims = await pool.query<{ count: number }>(
       'SELECT count(*)::int AS count FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
       [userId, requestId],
@@ -1899,7 +2016,9 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
     const userId = registration.body.user.id as string;
-    await completeDiagnosticInS3Mode(a, token, userId);
+    // Keep this focused mutation oracle to one S3 assessment. Diagnostic S3
+    // journeys are covered above and only add shared async/auth state here.
+    await pool.query("UPDATE users SET cefr_level = 'A1', diagnostic_completed = true WHERE id = $1", [userId]);
     sendMock.mockClear();
     const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(next.status).toBe(200);

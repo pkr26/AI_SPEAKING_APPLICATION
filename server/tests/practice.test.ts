@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import fs from 'fs/promises';
 import { config } from '../src/config';
@@ -220,19 +221,38 @@ describe('practice', () => {
       translations: { ...question.rows[0].translations },
     };
     delete malformedQuestion.translations.te;
-    const originalQuery = pool.query.bind(pool);
-    vi.spyOn(pool, 'query').mockImplementation(((...args: unknown[]) => {
-      const [text, values] = args;
-      if (
-        typeof text === 'string' &&
-        text.includes('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1') &&
-        Array.isArray(values) &&
-        values[0] === questionId
-      ) {
-        return Promise.resolve({ rows: [malformedQuestion] });
-      }
-      return Reflect.apply(originalQuery, undefined, args);
-    }) as typeof pool.query);
+    const originalConnect = pool.connect.bind(pool);
+    vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+      if (typeof callback === 'function') return originalConnect(callback as never);
+      return originalConnect().then((client: PoolClient) => {
+        const mutable = client as unknown as {
+          query: (...args: unknown[]) => unknown;
+          release: (error?: Error | boolean) => void;
+        };
+        const actualQuery = mutable.query;
+        const actualRelease = mutable.release;
+        mutable.query = (...args: unknown[]) => {
+          const [text, values] = args;
+          if (
+            typeof text === 'string' &&
+            text.includes(
+              'SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1',
+            ) &&
+            Array.isArray(values) &&
+            values[0] === questionId
+          ) {
+            return Promise.resolve({ rows: [malformedQuestion] });
+          }
+          return actualQuery.call(client, ...args);
+        };
+        mutable.release = (error?: Error | boolean) => {
+          mutable.query = actualQuery;
+          mutable.release = actualRelease;
+          actualRelease.call(client, error);
+        };
+        return client;
+      });
+    }) as typeof pool.connect);
 
     const response = await request(a)
       .get(`/practice/question/${questionId}/help`)
@@ -588,7 +608,9 @@ describe('practice', () => {
       }
       return Reflect.apply(originalQuery, undefined, args);
     }) as typeof pool.query);
-    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('warning logger failed');
+    });
     const unlink = vi.spyOn(fs, 'unlink');
 
     const response = await answerForm(

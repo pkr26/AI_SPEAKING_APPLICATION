@@ -18,7 +18,7 @@ const server = createServer(app);
 // A nonzero hop count is only safe behind a proxy chain that strips
 // client-supplied forwarding headers on exactly this many hops.
 if (config.trustProxy) {
-  logger.warn(
+  logLifecycleWarning(
     { trustProxy: config.trustProxy },
     'TRUST_PROXY is set: the hop count must exactly match the deployment proxy chain; if this port is reachable directly, clients can spoof X-Forwarded-For to reset per-IP rate-limit budgets',
   );
@@ -90,15 +90,71 @@ const janitorDefinitions: JanitorDefinition[] = [
 ];
 
 let janitorTimers: NodeJS.Timeout[] | undefined;
+const runningJanitors = new Set<JanitorDefinition>();
+let shuttingDown = false;
+
+type LifecycleLogPayload = Record<string, unknown> | string;
+
+function logLifecycleInfo(payload: LifecycleLogPayload, message?: string): void {
+  try {
+    if (message === undefined) logger.info(payload);
+    else logger.info(payload, message);
+  } catch {
+    // Logging is observational; it must never become lifecycle control flow.
+  }
+}
+
+function logLifecycleWarning(payload: LifecycleLogPayload, message: string): void {
+  try {
+    logger.warn(payload, message);
+  } catch {
+    // Logging is observational; it must never become lifecycle control flow.
+  }
+}
+
+function logLifecycleFatal(payload: LifecycleLogPayload, message: string): void {
+  try {
+    logger.fatal(payload, message);
+  } catch {
+    // Fatal draining/exiting below remains authoritative.
+  }
+}
+
+function logJanitorFailure(definition: JanitorDefinition, err: unknown): void {
+  logLifecycleWarning({ err }, definition.failureMessage);
+}
+
+function logShutdownError(payload: LifecycleLogPayload, message?: string): void {
+  try {
+    if (message === undefined) logger.error(payload);
+    else logger.error(payload, message);
+  } catch {
+    // Exiting is authoritative. A failed logger must never suppress a forced
+    // exit or turn a contained pool rejection into an unhandled rejection.
+  }
+}
 
 function runJanitor(definition: JanitorDefinition): void {
-  void definition
-    .cleanup()
+  // setInterval does not wait for an async callback. Keep one local invocation
+  // per janitor so a slow filesystem sweep cannot overlap itself, and so a
+  // timer callback already queued when shutdown begins cannot start new work.
+  if (shuttingDown || runningJanitors.has(definition)) return;
+  runningJanitors.add(definition);
+  let cleanup: Promise<number>;
+  try {
+    cleanup = definition.cleanup();
+  } catch (err) {
+    runningJanitors.delete(definition);
+    logJanitorFailure(definition, err);
+    return;
+  }
+  void cleanup
     .then((removed) => {
       janitorRemovedTotal.inc({ janitor: definition.janitor }, removed);
-      if (removed > 0) logger.info({ removed }, definition.successMessage);
+      if (removed > 0) logLifecycleInfo({ removed }, definition.successMessage);
     })
-    .catch((err) => logger.warn({ err }, definition.failureMessage));
+    .catch((err) => logJanitorFailure(definition, err))
+    .finally(() => runningJanitors.delete(definition));
 }
 
 function startJanitors(): void {
@@ -112,8 +168,6 @@ function startJanitors(): void {
   });
 }
 
-let shuttingDown = false;
-
 function clearJanitors() {
   const timers = janitorTimers;
   janitorTimers = undefined;
@@ -121,33 +175,60 @@ function clearJanitors() {
   for (const timer of timers) clearInterval(timer);
 }
 
+/**
+ * Fatal paths cannot trust an unbounded pool drain: a leaked checkout would
+ * otherwise leave a failed process alive forever and prevent the supervisor
+ * from replacing it. Preserve the pool error log when available, but force one
+ * failed exit at the same configured upper bound as graceful shutdown.
+ */
+function drainPoolAfterFatal(poolFailureMessage: string): void {
+  let exited = false;
+  function exitOnce(timedOut: boolean): void {
+    if (exited) return;
+    exited = true;
+    clearTimeout(forceTimer);
+    if (timedOut) logShutdownError('fatal shutdown timed out — forcing exit');
+    process.exit(1);
+  }
+
+  const forceTimer = setTimeout(() => exitOnce(true), config.shutdownDrainMs);
+  void pool
+    .end()
+    .catch((poolErr) => logShutdownError({ err: poolErr }, poolFailureMessage))
+    .finally(() => exitOnce(false));
+}
+
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearJanitors();
-  logger.info({ signal }, 'shutting down');
+  // Latch the provider gate before touching sockets or the pool. An accepted
+  // request may still be between audio inspection and provider registration;
+  // the latch prevents it from escaping this one-time controller sweep.
+  abortInFlightAssessments({ preventNew: true });
 
   // Hard stop if the drain takes too long. SHUTDOWN_DRAIN_MS defaults above
   // the whole-request budget (server.requestTimeout) so the slowest
   // legitimate in-flight assessment can still finish before the force exit.
   const forceTimer = setTimeout(() => {
-    logger.error('graceful shutdown timed out — forcing exit');
+    logShutdownError('graceful shutdown timed out — forcing exit');
     process.exit(1);
   }, config.shutdownDrainMs);
   forceTimer.unref();
+  logLifecycleInfo({ signal }, 'shutting down');
 
   const finishShutdown = (err?: Error) => {
-    if (err) logger.error({ err }, 'error closing HTTP server');
+    if (err) logShutdownError({ err }, 'error closing HTTP server');
     pool
       .end()
       .then(() => {
         clearTimeout(forceTimer);
-        logger.info('shutdown complete');
+        logLifecycleInfo('shutdown complete');
         process.exit(err ? 1 : 0);
       })
       .catch((poolErr) => {
         clearTimeout(forceTimer);
-        logger.error({ err: poolErr }, 'error closing pg pool');
+        logShutdownError({ err: poolErr }, 'error closing pg pool');
         process.exit(1);
       });
   };
@@ -164,9 +245,6 @@ function shutdown(signal: string) {
   } else {
     finishShutdown();
   }
-  // Abort in-flight provider calls so paid work dies fast and each route
-  // unwinds through its normal timeout path, abandoning its idempotency claim.
-  abortInFlightAssessments();
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
@@ -185,16 +263,14 @@ server.on('error', (err) => {
   // signal path grants them — including paid assessments that already spent
   // provider money and a daily-capacity reservation.
   if (server.listening && (err as NodeJS.ErrnoException).syscall === 'accept') {
-    logger.error({ err }, 'accept failed; dropped one incoming connection');
+    logShutdownError({ err }, 'accept failed; dropped one incoming connection');
     return;
   }
   shuttingDown = true;
   clearJanitors();
-  logger.fatal({ err }, 'HTTP server failed');
-  pool
-    .end()
-    .catch((poolErr) => logger.error({ err: poolErr }, 'error closing pg pool after HTTP server failure'))
-    .finally(() => process.exit(1));
+  abortInFlightAssessments({ preventNew: true });
+  drainPoolAfterFatal('error closing pg pool after HTTP server failure');
+  logLifecycleFatal({ err }, 'HTTP server failed');
 });
 
 /**
@@ -209,13 +285,13 @@ async function warnIfPoolOversized(): Promise<void> {
     const { rows } = await pool.query<{ max_connections: string }>('SHOW max_connections');
     const maxConnections = Number(rows[0].max_connections);
     if (Number.isInteger(maxConnections) && maxConnections > 0 && config.dbPoolMax > maxConnections - 3) {
-      logger.error(
+      logShutdownError(
         { dbPoolMax: config.dbPoolMax, maxConnections },
         'DB_POOL_MAX leaves fewer than 3 database connections for admin, migration, and readiness clients; reduce DB_POOL_MAX or raise max_connections',
       );
     }
   } catch (err) {
-    logger.warn({ err }, 'could not verify DB_POOL_MAX against server max_connections');
+    logLifecycleWarning({ err }, 'could not verify DB_POOL_MAX against server max_connections');
   }
 }
 
@@ -228,16 +304,17 @@ Promise.all([assertDatabaseSchemaCurrent(), assertAudioInspectorAvailable({ forc
     if (shuttingDown) return;
     startJanitors();
     server.listen(config.port, () => {
-      logger.info({ port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv }, 'AI English API listening');
+      logLifecycleInfo(
+        { port: config.port, mockAi: config.mockAi, nodeEnv: config.nodeEnv },
+        'AI English API listening',
+      );
     });
   })
   .catch((err) => {
     if (shuttingDown) return;
     shuttingDown = true;
     clearJanitors();
-    logger.fatal({ err }, 'required service dependency is unavailable; refusing to start');
-    pool
-      .end()
-      .catch((poolErr) => logger.error({ err: poolErr }, 'error closing pg pool after dependency startup failure'))
-      .finally(() => process.exit(1));
+    abortInFlightAssessments({ preventNew: true });
+    drainPoolAfterFatal('error closing pg pool after dependency startup failure');
+    logLifecycleFatal({ err }, 'required service dependency is unavailable; refusing to start');
   });

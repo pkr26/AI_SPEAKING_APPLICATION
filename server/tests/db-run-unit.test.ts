@@ -72,6 +72,7 @@ describe('database deployment runner', () => {
     const log = vi.fn();
     const client = provideClient(async (sql) => {
       if (sql.startsWith('SELECT set_config')) return { rows: [] };
+      if (sql.includes('pg_advisory_lock') || sql.includes('pg_advisory_unlock')) return { rows: [] };
       if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [] };
       if (sql === 'CREATE DATABASE "release_""candidate""_test"') return { rows: [] };
       throw new Error(`unexpected query: ${sql}`);
@@ -88,6 +89,24 @@ describe('database deployment runner', () => {
     expect(client.connect).toHaveBeenCalledOnce();
     expect(client.query).toHaveBeenCalledWith("SELECT set_config('statement_timeout', $1, false)", ['600000']);
     expect(client.query).toHaveBeenCalledWith("SELECT set_config('lock_timeout', $1, false)", ['30000']);
+    expect(client.query).toHaveBeenCalledWith(
+      "SELECT pg_advisory_lock(hashtext('ai_english_create_database'), hashtext($1))",
+      ['release_"candidate"_test'],
+    );
+    expect(client.query).toHaveBeenCalledWith(
+      "SELECT pg_advisory_unlock(hashtext('ai_english_create_database'), hashtext($1))",
+      ['release_"candidate"_test'],
+    );
+    const statements = client.query.mock.calls.map(([sql]) => String(sql));
+    expect(
+      statements.indexOf("SELECT pg_advisory_lock(hashtext('ai_english_create_database'), hashtext($1))"),
+    ).toBeLessThan(statements.indexOf('SELECT 1 FROM pg_database WHERE datname = $1'));
+    expect(statements.indexOf('SELECT 1 FROM pg_database WHERE datname = $1')).toBeLessThan(
+      statements.indexOf('CREATE DATABASE "release_""candidate""_test"'),
+    );
+    expect(statements.indexOf('CREATE DATABASE "release_""candidate""_test"')).toBeLessThan(
+      statements.indexOf("SELECT pg_advisory_unlock(hashtext('ai_english_create_database'), hashtext($1))"),
+    );
     expect(client.end).toHaveBeenCalledOnce();
     expect(log).toHaveBeenCalledWith('created database "release_"candidate"_test"');
   });
@@ -97,6 +116,7 @@ describe('database deployment runner', () => {
     const log = vi.fn();
     const client = provideClient(async (sql) => {
       if (sql.startsWith('SELECT set_config')) return { rows: [] };
+      if (sql.includes('pg_advisory_lock') || sql.includes('pg_advisory_unlock')) return { rows: [] };
       if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [{ exists: 1 }] };
       throw new Error(`unexpected query: ${sql}`);
     });
@@ -112,6 +132,7 @@ describe('database deployment runner', () => {
     const bootstrapError = new Error('create database failed');
     const client = provideClient(async (sql) => {
       if (sql.startsWith('SELECT set_config')) return { rows: [] };
+      if (sql.includes('pg_advisory_lock') || sql.includes('pg_advisory_unlock')) return { rows: [] };
       if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [] };
       if (sql.startsWith('CREATE DATABASE')) throw bootstrapError;
       throw new Error(`unexpected query: ${sql}`);
@@ -119,6 +140,82 @@ describe('database deployment runner', () => {
     client.end.mockRejectedValueOnce(new Error('admin disconnect failed'));
 
     await expect(ensureDatabase('postgres://localhost:5432/bootstrap_test')).rejects.toBe(bootstrapError);
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('accepts a non-cooperating create winner only after rechecking the database catalog', async () => {
+    const duplicate = Object.assign(new Error('duplicate database'), { code: '42P04' });
+    const log = vi.fn();
+    let catalogReads = 0;
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config') || sql.includes('pg_advisory_lock')) return { rows: [] };
+      if (sql.startsWith('SELECT 1 FROM pg_database')) {
+        catalogReads += 1;
+        return { rows: catalogReads === 1 ? [] : [{ exists: 1 }] };
+      }
+      if (sql.startsWith('CREATE DATABASE')) throw duplicate;
+      if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/raced_test', log)).resolves.toBeUndefined();
+    expect(catalogReads).toBe(2);
+    const catalogQueries = client.query.mock.calls.filter(
+      ([sql]) => sql === 'SELECT 1 FROM pg_database WHERE datname = $1',
+    );
+    expect(catalogQueries).toEqual([
+      ['SELECT 1 FROM pg_database WHERE datname = $1', ['raced_test']],
+      ['SELECT 1 FROM pg_database WHERE datname = $1', ['raced_test']],
+    ]);
+    expect(log).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledWith('database "raced_test" already exists');
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('does not hide duplicate_database when the catalog recheck finds no winner', async () => {
+    const duplicate = Object.assign(new Error('duplicate database'), { code: '42P04' });
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config') || sql.includes('pg_advisory_lock')) return { rows: [] };
+      if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [] };
+      if (sql.startsWith('CREATE DATABASE')) throw duplicate;
+      if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/raced_test')).rejects.toBe(duplicate);
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('propagates a failed catalog recheck after an external duplicate_database race', async () => {
+    const duplicate = Object.assign(new Error('duplicate database'), { code: '42P04' });
+    const catalogFailure = new Error('catalog unavailable');
+    let catalogReads = 0;
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config') || sql.includes('pg_advisory_lock')) return { rows: [] };
+      if (sql.startsWith('SELECT 1 FROM pg_database')) {
+        catalogReads += 1;
+        if (catalogReads === 2) throw catalogFailure;
+        return { rows: [] };
+      }
+      if (sql.startsWith('CREATE DATABASE')) throw duplicate;
+      if (sql.includes('pg_advisory_unlock')) return { rows: [] };
+      throw new Error(`unexpected query: ${sql}`);
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/raced_test')).rejects.toBe(catalogFailure);
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('propagates setup advisory-unlock failure after an otherwise successful database check', async () => {
+    const unlockFailure = new Error('setup unlock failed');
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config') || sql.includes('pg_advisory_lock')) return { rows: [] };
+      if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [{ exists: 1 }] };
+      if (sql.includes('pg_advisory_unlock')) throw unlockFailure;
+      throw new Error(`unexpected query: ${sql}`);
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/existing_test')).rejects.toBe(unlockFailure);
     expect(client.end).toHaveBeenCalledOnce();
   });
 
@@ -136,11 +233,53 @@ describe('database deployment runner', () => {
   it('accepts the postgresql protocol used by node-postgres', async () => {
     const client = provideClient(async (sql) => {
       if (sql.startsWith('SELECT set_config')) return { rows: [] };
+      if (sql.includes('pg_advisory_lock') || sql.includes('pg_advisory_unlock')) return { rows: [] };
       if (sql.startsWith('SELECT 1 FROM pg_database')) return { rows: [{ exists: 1 }] };
       throw new Error(`unexpected query: ${sql}`);
     });
 
     await expect(ensureDatabase('postgresql://localhost:5432/existing_test')).resolves.toBeUndefined();
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('preserves a create failure while releasing its setup lock and disconnecting', async () => {
+    const createError = Object.assign(new Error('create database failed'), { code: 'XX000' });
+    const cleanupCalls: string[] = [];
+    let catalogReads = 0;
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config') || sql.includes('pg_advisory_lock')) return { rows: [] };
+      if (sql.startsWith('SELECT 1 FROM pg_database')) {
+        catalogReads += 1;
+        return { rows: catalogReads === 1 ? [] : [{ exists: 1 }] };
+      }
+      if (sql.startsWith('CREATE DATABASE')) throw createError;
+      if (sql.includes('pg_advisory_unlock')) {
+        cleanupCalls.push('unlock');
+        throw new Error('unlock failed');
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    });
+    client.end.mockImplementationOnce(async () => {
+      cleanupCalls.push('disconnect');
+      throw new Error('disconnect failed');
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/bootstrap_test')).rejects.toBe(createError);
+    expect(catalogReads).toBe(1);
+    expect(cleanupCalls).toEqual(['unlock', 'disconnect']);
+    expect(client.end).toHaveBeenCalledOnce();
+  });
+
+  it('does not unlock a setup lease that failed before advisory-lock ownership', async () => {
+    const lockError = new Error('setup lock unavailable');
+    const client = provideClient(async (sql) => {
+      if (sql.startsWith('SELECT set_config')) return { rows: [] };
+      if (sql.includes("pg_advisory_lock(hashtext('ai_english_create_database')")) throw lockError;
+      throw new Error(`unexpected query: ${sql}`);
+    });
+
+    await expect(ensureDatabase('postgres://localhost:5432/bootstrap_test')).rejects.toBe(lockError);
+    expect(client.query.mock.calls.some(([sql]) => String(sql).includes('pg_advisory_unlock'))).toBe(false);
     expect(client.end).toHaveBeenCalledOnce();
   });
 

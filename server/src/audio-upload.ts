@@ -8,7 +8,7 @@ import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
 import { RequestHandler, Response, Router } from 'express';
 import { z } from 'zod';
 import { config } from './config';
-import { isAssessmentRequestProcessing, isAudioKeyClaimedForProcessing } from './idempotency';
+import { isAudioKeyClaimedForProcessing } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
@@ -22,23 +22,24 @@ const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
 // ERR_STREAM_PREMATURE_CLOSE/ECONNRESET after the SDK call already resolved,
 // so it never gets $metadata — hence classification is by explicit filesystem
 // errno rather than by "looks like a plain Node error".
-const LOCAL_DISK_ERROR_CODES = new Set([
-  'EACCES',
-  'EDQUOT',
-  'EFBIG',
-  'EEXIST',
-  'EIO',
-  'EMFILE',
-  'ENFILE',
-  'ENOSPC',
-  'EPERM',
-  'EROFS',
-]);
+function isLocalDiskErrorCode(code: unknown): boolean {
+  return (
+    code === 'EACCES' ||
+    code === 'EDQUOT' ||
+    code === 'EFBIG' ||
+    code === 'EEXIST' ||
+    code === 'EIO' ||
+    code === 'EMFILE' ||
+    code === 'ENFILE' ||
+    code === 'ENOSPC' ||
+    code === 'EPERM' ||
+    code === 'EROFS'
+  );
+}
 
 interface SubmittedAudioCleanup {
   userId: string;
   audioKey: string;
-  requestId?: string;
   preserve: boolean;
   finalizing?: Promise<void>;
 }
@@ -46,6 +47,17 @@ interface SubmittedAudioCleanup {
 type AudioCleanupResponse = Response & {
   [SUBMITTED_AUDIO_CLEANUP]?: SubmittedAudioCleanup;
 };
+
+// Response-event cleanup is deliberately fire-and-forget. Observability must
+// never turn a best-effort ownership check or DeleteObject failure into an
+// unhandled rejection if the logger transport itself is broken.
+function warnAudioCleanup(context: Record<string, unknown>, message: string): void {
+  try {
+    logger.warn(context, message);
+  } catch {
+    // The bucket lifecycle remains the final cleanup fallback.
+  }
+}
 
 // Return the canonical extension for a content type. The first allowlisted
 // extension wins, so e.g. audio/mp4 maps to .m4a. Looking directly through the
@@ -63,7 +75,8 @@ export function contentTypeToExt(contentType: string): string | undefined {
  * learner can never have the API fetch another learner's object — or an
  * arbitrary bucket object — through the assessment pipeline.
  */
-export function isOwnedAudioKey(userId: string, key: string): boolean {
+export function isOwnedAudioKey(userId: string, key: unknown): key is string {
+  if (typeof key !== 'string') return false;
   const exts = AUDIO_EXTS.join('|');
   return new RegExp(
     `^${KEY_PREFIX}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
@@ -196,8 +209,8 @@ export function createAudioUploadRouter(limiters: Limiters) {
 }
 
 /**
- * Best-effort deletion for a user-owned transient object. This is also used
- * when an idempotent response can be replayed without downloading the object.
+ * Best-effort deletion for a user-owned transient object after a successful
+ * fresh owner no longer needs it.
  */
 export async function discardPresignedAudio(userId: string, audioKey: string): Promise<void> {
   if (!isOwnedAudioKey(userId, audioKey) || !config.s3.bucket) return;
@@ -209,7 +222,7 @@ export async function discardPresignedAudio(userId: string, audioKey: string): P
       abortSignal: controller.signal,
     });
   } catch (err) {
-    logger.warn({ err, userId, audioKey }, 'failed to delete S3 audio object');
+    warnAudioCleanup({ err, userId, audioKey }, 'failed to delete S3 audio object');
   } finally {
     clearTimeout(timer);
   }
@@ -224,16 +237,7 @@ export function preserveSubmittedPresignedAudio(res: Response): void {
 /** The worker holding the claim may delete once its processing is complete. */
 export function ownSubmittedPresignedAudio(res: Response): void {
   const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
-  if (cleanup) {
-    cleanup.requestId = undefined;
-    cleanup.preserve = false;
-  }
-}
-
-/** A completed replay no longer has an owner that could need this object. */
-export function completeSubmittedPresignedAudioReplay(res: Response): void {
-  const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
-  if (cleanup) cleanup.requestId = undefined;
+  if (cleanup) cleanup.preserve = false;
 }
 
 /** Idempotently discard after the owning route no longer needs the object. */
@@ -244,37 +248,29 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
   if (cleanup.preserve) return Promise.resolve();
 
   cleanup.finalizing = (async () => {
-    // A conflict/rate refusal is not definitive: an owner may be processing
-    // before it can insert the shared claim under DB-pool saturation. Every
-    // 5xx is likewise retryable by contract (including provider/storage 502
-    // and 504). For an unfinished request, its idempotency row is abandoned
-    // so the client re-posts this exact key. Deleting in that window races a blind same-key retry:
-    // the retry can re-claim between the ownership read and DeleteObject, then
-    // lose its audio to that late delete. Retain instead; the mandatory bucket
-    // lifecycle bounds the transient object exactly as it already does for
-    // 409/429.
-    if (res.statusCode === 409 || res.statusCode === 429 || res.statusCode >= 500) {
+    // Only a successful fresh route owner may delete. Every replay or rejected
+    // request either has no new durable binding or abandons
+    // it before the error response finishes. A check-then-DeleteObject cleanup
+    // for that unbound key has an unavoidable cross-replica gap: a valid retry
+    // can claim the key after the check and lose it to the late delete. Retain
+    // all non-success outcomes and let the mandatory bucket lifecycle collect
+    // them. This covers terminal 4xx as well as retryable 409/429/5xx; client
+    // behavior is not a synchronization primitive.
+    if (res.statusCode < 200 || res.statusCode >= 300) {
       return;
     }
-    // A duplicate can be stopped before claimAssessmentRequest (for example by
-    // the assessment limiter). Consult the shared claim table before deleting:
-    // preserve while this request's own claim is still processing, and also
-    // while ANY non-expired processing claim for this user references the same
-    // object — a duplicate submitted under a different (or malformed)
-    // requestId, or a blind same-key retry that re-claimed before a failed
-    // request's post-response delete landed, must never delete the object out
-    // from under its live owner.
+    // Keep a final defensive check for a live worker. The durable unique
+    // object binding prevents a new request from appearing after this lookup;
+    // this query covers a worker whose processing transaction is already live
+    // when a successful owner reaches cleanup.
     try {
-      if (cleanup.requestId && (await isAssessmentRequestProcessing(cleanup.userId, cleanup.requestId))) {
-        return;
-      }
       if (await isAudioKeyClaimedForProcessing(cleanup.userId, cleanup.audioKey)) {
         return;
       }
     } catch (err) {
       // Fail closed for data safety: retain transient audio when ownership
       // cannot be established. The required bucket lifecycle bounds storage.
-      logger.warn({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
+      warnAudioCleanup({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
       return;
     }
     await discardPresignedAudio(cleanup.userId, cleanup.audioKey);
@@ -283,33 +279,32 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
 }
 
 /**
- * Register exactly one best-effort deletion before assessment body validation.
- * This covers malformed requests, idempotent replays, state/authorization
- * failures, missing objects, and successful/provider-error retention decisions
- * without racing route cleanup.
+ * Register exactly one cleanup decision before assessment body validation.
+ * It defaults to preservation: only a fresh durable owner can later opt into
+ * best-effort deletion. Completed replays stay preserved because a deletion
+ * begun near their 48-hour retention boundary could outlive the tombstone and
+ * race a newly rebound request. That makes
+ * malformed and pre-route requests safe without a racy ownership lookup.
  */
 export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next) => {
   const req = rawReq as AuthedRequest;
-  const body = req.body as { audioKey?: unknown; requestId?: unknown } | undefined;
+  const body = req.body as { audioKey?: unknown } | undefined;
   if (!body || !req.user) {
     return next();
   }
   const audioKey = body.audioKey;
-  if (typeof audioKey !== 'string' || !isOwnedAudioKey(req.user.id, audioKey)) {
+  if (!isOwnedAudioKey(req.user.id, audioKey)) {
     return next();
   }
 
-  const requestId = z.string().uuid().optional().catch(undefined).parse(body.requestId);
   (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP] = {
     userId: req.user.id,
     audioKey,
-    requestId,
-    preserve: false,
+    preserve: true,
   };
-  // Finalize on a microtask so synchronous finish listeners can mark a
-  // pre-route 409/429 as non-definitive before ownership is evaluated. An
-  // error after a client abort intentionally retains the object (no `finish`
-  // fires): that is the same-key retry window, bounded by the bucket lifecycle.
+  // Finalize on a microtask so every synchronous finish listener observes the
+  // completed response first. An error after a client abort intentionally
+  // retains the object (no `finish` fires); the bucket lifecycle bounds it.
   res.once('finish', () => queueMicrotask(() => void finalizeSubmittedPresignedAudio(res)));
   // `close` can precede route/claim resolution when a client disconnects. In
   // that case retain the object for the active worker and let the mandatory S3
@@ -392,11 +387,7 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
     // with a distinct log line. AWS SDK errors carry $metadata and keep the
     // 502, and so does every transport errno the download stream can raise.
     const systemError = err as NodeJS.ErrnoException & { $metadata?: unknown };
-    if (
-      systemError.$metadata === undefined &&
-      typeof systemError.code === 'string' &&
-      LOCAL_DISK_ERROR_CODES.has(systemError.code)
-    ) {
+    if (systemError.$metadata === undefined && isLocalDiskErrorCode(systemError.code)) {
       logger.error({ err, userId: authed.user!.id }, 'failed to store downloaded audio on local disk');
       throw new HttpError(500, 'Internal server error', 'INTERNAL');
     }

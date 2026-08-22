@@ -12,6 +12,17 @@ interface CounterRow {
   reset_at: Date | string;
 }
 
+// Refund/reset/re-spend callbacks are deliberately fire-and-forget. A broken
+// logging transport must not turn the catch path itself into an unhandled
+// rejection (or replace increment's contracted retryable 503).
+function warnStoreFailure(payload: Record<string, unknown>, message: string): void {
+  try {
+    logger.warn(payload, message);
+  } catch {
+    // The counter operation's fail-safe behavior remains authoritative.
+  }
+}
+
 /**
  * PostgreSQL-backed fixed-window counters for multi-replica enforcement.
  * Each middleware gets its own instance/namespace; all API replicas share the
@@ -61,7 +72,7 @@ export class PostgresRateLimitStore implements Store {
       // Without its counter the limiter cannot admit the request safely, but a
       // database brownout here is backpressure, not an application fault: fail
       // closed as a retryable 503 instead of an unhandled 500.
-      logger.warn({ err, namespace: this.namespace }, 'rate-limit increment failed; shedding request');
+      warnStoreFailure({ err, namespace: this.namespace }, 'rate-limit increment failed; shedding request');
       shedRequestsTotal.inc({ reason: 'store_brownout' });
       throw new HttpError(503, 'Server is busy, please try again shortly', { retryAfterSeconds: 5 }, 'POOL_SATURATED');
     }
@@ -73,12 +84,11 @@ export class PostgresRateLimitStore implements Store {
     };
   }
 
-  // The window guard keeps a late refund (response finishing after the window
-  // rolled over) from touching the row once it has expired. One accepted
-  // residue: a refund landing in the sub-millisecond gap AFTER a new-window
-  // increment rolled reset_at forward still passes the guard and takes back
-  // one of the new window's hits (bounded ±1 per rollover, self-healing at
-  // expiry). Closing that gap would need per-hit window bookkeeping.
+  // Store-interface fallback for callers that do not retain the window they
+  // incremented. Application limiters use decrementWithinWindow below: a
+  // liveness-only guard cannot distinguish the old window from a successor
+  // that another request renewed in place between the response-time expiry
+  // check and this UPDATE.
   // The try/catch is load-bearing: express-rate-limit invokes decrement
   // fire-and-forget without handling rejections, so a database brownout here
   // would otherwise surface as an unhandled rejection and terminate the
@@ -93,7 +103,29 @@ export class PostgresRateLimitStore implements Store {
         [this.namespace, this.hash(key)],
       );
     } catch (err) {
-      logger.warn({ err, namespace: this.namespace }, 'rate-limit refund failed');
+      warnStoreFailure({ err, namespace: this.namespace }, 'rate-limit refund failed');
+    }
+  }
+
+  /**
+   * Refund exactly the fixed window observed by the incrementing request.
+   * Matching the millisecond-truncated reset timestamp closes the rollover
+   * TOCTOU in decrement(): an old response queued on the row lock can never
+   * subtract a hit from the successor window after it wakes.
+   */
+  async decrementWithinWindow(key: string, observedResetAt: Date | undefined): Promise<void> {
+    try {
+      await pool.query(
+        `UPDATE rate_limit_windows
+         SET hits = GREATEST(hits - 1, 0)
+         WHERE namespace = $1
+           AND key_hash = $2
+           AND reset_at > clock_timestamp()
+           AND date_trunc('milliseconds', reset_at) = $3`,
+        [this.namespace, this.hash(key), observedResetAt],
+      );
+    } catch (err) {
+      warnStoreFailure({ err, namespace: this.namespace }, 'rate-limit exact-window refund failed');
     }
   }
 
@@ -125,7 +157,7 @@ export class PostgresRateLimitStore implements Store {
         [this.namespace, this.hash(key), observedResetAt],
       );
     } catch (err) {
-      logger.warn({ err, namespace: this.namespace }, 'rate-limit re-spend failed');
+      warnStoreFailure({ err, namespace: this.namespace }, 'rate-limit re-spend failed');
     }
   }
 
@@ -136,7 +168,7 @@ export class PostgresRateLimitStore implements Store {
         this.hash(key),
       ]);
     } catch (err) {
-      logger.warn({ err, namespace: this.namespace }, 'rate-limit key reset failed');
+      warnStoreFailure({ err, namespace: this.namespace }, 'rate-limit key reset failed');
     }
   }
 }

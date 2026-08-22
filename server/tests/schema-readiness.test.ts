@@ -79,7 +79,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('012_assessment_request_audio_key.sql');
+    expect(manifest.at(-1)?.name).toBe('013_assessment_audio_key_uniqueness.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -89,7 +89,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '012_assessment_request_audio_key.sql',
+      latestMigration: '013_assessment_audio_key_uniqueness.sql',
     });
     expect(query.mock.calls[0]).toEqual(['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"']);
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
@@ -123,7 +123,7 @@ describe('database schema readiness', () => {
 
     // The reported migration is still this release's latest packaged one.
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '012_assessment_request_audio_key.sql',
+      latestMigration: '013_assessment_audio_key_uniqueness.sql',
     });
   });
 
@@ -145,7 +145,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: exactMinimum });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '012_assessment_request_audio_key.sql',
+      latestMigration: '013_assessment_audio_key_uniqueness.sql',
     });
   });
 
@@ -204,7 +204,7 @@ describe('database schema readiness', () => {
 
     try {
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '012_assessment_request_audio_key.sql',
+        latestMigration: '013_assessment_audio_key_uniqueness.sql',
       });
       expect(query.mock.calls).toEqual([
         ['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"', []],
@@ -230,5 +230,16 @@ describe('database schema readiness', () => {
     expect(response.status).toBe(503);
     expect(response.body).toEqual({ ok: false, error: 'required service dependency unavailable', code: 'INTERNAL' });
     expect(JSON.stringify(response.body)).not.toContain(sensitiveDetail);
+  });
+
+  it('loads the packaged manifest from the release db/migrations directory', async () => {
+    const readdir = vi.spyOn(fs, 'readdirSync');
+    try {
+      vi.resetModules();
+      await import('../src/schema-readiness');
+      expect(readdir).toHaveBeenCalledWith(path.resolve(__dirname, '..', 'db', 'migrations'));
+    } finally {
+      readdir.mockRestore();
+    }
   });
 });

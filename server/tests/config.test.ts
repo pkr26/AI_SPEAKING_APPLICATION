@@ -244,6 +244,9 @@ describe('config env validation', () => {
       baseEnv({ CORS_ORIGINS: ' HTTPS://APP.EXAMPLE:443/ , http://localhost:8081,https://app.example ' }),
     );
     expect(config.corsOrigins).toEqual(['https://app.example', 'http://localhost:8081']);
+    expect(
+      (await loadConfig(baseEnv({ CORS_ORIGINS: 'https://a.example,   ,https://b.example' }))).corsOrigins,
+    ).toEqual(['https://a.example', 'https://b.example']);
 
     for (const invalid of [
       '*',
@@ -257,6 +260,10 @@ describe('config env validation', () => {
     ]) {
       await expectInvalid(baseEnv({ CORS_ORIGINS: invalid }), 'CORS_ORIGINS');
     }
+
+    const message = 'must contain only complete http(s) origins (for example https://app.example)';
+    await expectSingleInvalidIssue(baseEnv({ CORS_ORIGINS: 'not a url' }), 'CORS_ORIGINS', message);
+    await expectSingleInvalidIssue(baseEnv({ CORS_ORIGINS: 'ftp://app.example' }), 'CORS_ORIGINS', message);
   });
 
   it('rejects a missing/empty DATABASE_URL and a short JWT_SECRET', async () => {

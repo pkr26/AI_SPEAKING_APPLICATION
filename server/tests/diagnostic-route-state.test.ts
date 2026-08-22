@@ -518,6 +518,49 @@ describe('diagnostic completion race', () => {
       expect(state.rows[0]).toEqual({ current_question_id: null });
     },
   );
+
+  it('GET /next observes a restart that commits after requireAuth read the completed placement', async () => {
+    const { token, userId } = await registerDiagnosticUser();
+    await pool.query("UPDATE users SET cefr_level = 'A1', diagnostic_completed = true WHERE id = $1", [userId]);
+    await pool.query(
+      `UPDATE diagnostic_state
+       SET low_idx = 6, high_idx = 5, questions_asked = 3, current_question_id = NULL
+       WHERE user_id = $1`,
+      [userId],
+    );
+
+    const { response, statements } = await withUsersRowRace({
+      userId,
+      parentLock: NEXT_PARENT_LOCK,
+      startRequest: () => request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`),
+      mutateBeforeRelease: async (blocker) => {
+        await blocker.query(
+          `UPDATE diagnostic_state
+           SET low_idx = 0, high_idx = 5, questions_asked = 0,
+               current_question_id = NULL, processing_question_id = NULL,
+               processing_started_at = NULL, processing_claim_id = NULL
+           WHERE user_id = $1`,
+          [userId],
+        );
+        await blocker.query('UPDATE users SET cefr_level = NULL, diagnostic_completed = false WHERE id = $1', [userId]);
+      },
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({
+      done: false,
+      question: { id: expect.any(String), cefrLevel: 'B1' },
+      progress: { asked: 0, maxQuestions: 5 },
+    });
+    expect(statements).toEqual([
+      'BEGIN',
+      NEXT_PARENT_LOCK,
+      'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE',
+      expect.stringContaining('FROM questions WHERE cefr_level = $1 ORDER BY random() LIMIT 1'),
+      'UPDATE diagnostic_state SET current_question_id = $1 WHERE user_id = $2',
+      'COMMIT',
+    ]);
+  });
 });
 
 describe('diagnostic account deletion races', () => {

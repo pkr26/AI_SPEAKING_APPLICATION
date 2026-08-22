@@ -109,6 +109,11 @@ describe('isOwnedAudioKey', () => {
     expect(isOwnedAudioKey(userId, `audio-uploads/${userId}/123E4567-E89B-42D3-A456-426614174001.WEBM`)).toBe(true);
   });
 
+  it('rejects non-string values even when they coerce to an owned key', () => {
+    const ownedKey = `audio-uploads/${userId}/123e4567-e89b-42d3-a456-426614174001.m4a`;
+    expect(isOwnedAudioKey(userId, { toString: () => ownedKey })).toBe(false);
+  });
+
   it('rejects keys owned by another user', () => {
     const other = '123e4567-e89b-42d3-a456-426614174999';
     expect(isOwnedAudioKey(userId, `audio-uploads/${other}/123e4567-e89b-42d3-a456-426614174001.m4a`)).toBe(false);

@@ -4,3 +4,9 @@ coverage/
 uploads/
 .env*
 !.env.example
+
+# mutation testing
+.mutation-campaign.lock
+.stryker-tmp/
+.stryker-*-tmp/
+reports/

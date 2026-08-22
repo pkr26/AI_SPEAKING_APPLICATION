@@ -11,6 +11,11 @@ const MIN_AUDIO_DURATION_SECONDS = 0.5;
 export const MAX_AUDIO_DURATION_SECONDS = 120.5;
 const INSPECTION_TIMEOUT_MS = 10_000;
 const AVAILABILITY_TIMEOUT_MS = 2_000;
+// SIGKILL/forced termination is normally followed by `close` immediately, but
+// retain ownership briefly so a slow child cannot overlap a replacement. The
+// fallback keeps a missing/broken close event from hanging a request forever;
+// capacity then remains quarantined separately until `exit`/`close` arrives.
+const CHILD_REAP_TIMEOUT_MS = 1_000;
 const AVAILABILITY_SUCCESS_TTL_MS = 30_000;
 const AVAILABILITY_FAILURE_TTL_MS = 2_000;
 const MAX_DIAGNOSTIC_BYTES = 65_536;
@@ -33,10 +38,33 @@ function maxDecodedBytes(): number {
 // rather than queueing and retaining uploaded files/assessment claims while a
 // process slot is unavailable.
 let inspectionsInFlight = 0;
+let unreapedNativeChildren = 0;
 
 /** Live slot count backing the audio_inspection_slots_in_use gauge (metrics.ts). */
 export function getAudioInspectionSlotsInUse(): number {
   return inspectionsInFlight;
+}
+
+/**
+ * Transfer capacity ownership to a child that ignored the bounded reap wait.
+ * The request may now settle, but new native work must fail closed until the
+ * OS reports that this process is gone. `exit` normally precedes `close`; the
+ * idempotent listener pair also covers mocks and unusual stream teardown.
+ */
+function retainInspectionCapacityUntilChildExit(child: ReturnType<typeof spawn>): void {
+  if (child.exitCode !== null) return;
+  if (child.signalCode !== null) return;
+  inspectionsInFlight++;
+  unreapedNativeChildren++;
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    inspectionsInFlight--;
+    unreapedNativeChildren--;
+  };
+  child.once('exit', release);
+  child.once('close', release);
 }
 
 // Exported for the release-contract tests; production code only ever reaches
@@ -171,12 +199,13 @@ async function inspectDecodedDuration(filePath: string): Promise<number> {
   return decodeMeasuredDuration(filePath, inputFormat, movSafetyOptions);
 }
 
-// Descriptor/IO exhaustion while opening the upload is a host-side fault (the
-// process hit its fd limit, the disk is failing), not a verdict on the
-// learner's media: these errnos take the same 'unavailable' path as a native
-// tool that cannot be started, so the take stays retryable instead of being
-// permanently rejected as unreadable.
-const TRANSIENT_OPEN_ERROR_CODES = new Set(['EAGAIN', 'EIO', 'EMFILE', 'ENFILE']);
+// Keep this classification on the runtime path instead of in module-static
+// collection state: every host-fault branch stays directly executable and
+// independently testable, while unknown/missing codes still fail closed as
+// unusable input.
+function isTransientOpenErrorCode(code: unknown): boolean {
+  return code === 'EAGAIN' || code === 'EIO' || code === 'EMFILE' || code === 'ENFILE';
+}
 
 /**
  * Open the private upload for one native stage. A FIFO or blocking device
@@ -209,7 +238,7 @@ function openPrivateInput(filePath: string): number {
       }
     }
     const { code } = error as NodeJS.ErrnoException;
-    if (code !== undefined && TRANSIENT_OPEN_ERROR_CODES.has(code)) {
+    if (isTransientOpenErrorCode(code)) {
       throw new InspectionError('unavailable');
     }
     // Everything else (a non-regular object, ELOOP from the O_NOFOLLOW open,
@@ -285,60 +314,86 @@ function verifySingleAudioStream(filePath: string, inputFormat: string, movSafet
     // spawn(2) duplicated the descriptor into the child before returning.
     closeInput();
 
+    const stdout = child.stdout;
+    const stderr = child.stderr;
     let settled = false;
+    let terminating = false;
+    let pendingError!: Error;
+    let reapTimeout: NodeJS.Timeout | undefined;
     let listingBytes = 0;
     let diagnosticBytes = 0;
     let listing = '';
-    const finish = (error?: Error) => {
-      if (settled) return;
+    const settle = (error?: Error) => {
       settled = true;
       clearTimeout(timeout);
-      if (!child.killed) child.kill('SIGKILL');
+      clearTimeout(reapTimeout);
       if (error) reject(error);
       else resolve();
     };
-    const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
+    const terminate = (error: Error) => {
+      if (settled || terminating) return;
+      terminating = true;
+      pendingError = error;
+      clearTimeout(timeout);
+      stdout?.removeAllListeners('data');
+      stderr?.removeAllListeners('data');
+      reapTimeout = setTimeout(() => {
+        retainInspectionCapacityUntilChildExit(child);
+        settle(error);
+      }, CHILD_REAP_TIMEOUT_MS);
+      reapTimeout.unref();
+      try {
+        if (!child.killed) child.kill('SIGKILL');
+      } catch {
+        // The bounded reap fallback below still settles the inspection.
+      }
+    };
+    const timeout = setTimeout(() => terminate(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
     timeout.unref();
+    child.once('error', () => {
+      // Attach before validating the expected pipe handles. Even if the
+      // runtime violates that invariant, a later ChildProcess error must be
+      // consumed rather than becoming an uncaught EventEmitter exception.
+      terminate(new InspectionError('unavailable'));
+    });
+    child.once('close', (code) => {
+      if (terminating) {
+        settle(pendingError);
+        return;
+      }
+      if (code !== 0) {
+        settle(new InvalidInspectionError());
+        return;
+      }
+      const streamIndex = listing.trim();
+      if (!/^\d+$/.test(streamIndex)) {
+        settle(new InvalidInspectionError());
+        return;
+      }
+      settle();
+    });
 
-    const stdout = child.stdout;
-    const stderr = child.stderr;
+    // Child stdio can emit its own 'error' independently of the ChildProcess
+    // object (for example under descriptor exhaustion). Attach to whichever
+    // expected pipes exist before checking the pair, so one malformed/missing
+    // sibling cannot leave the other stream's late error unhandled.
+    stdout?.on('error', () => terminate(new InspectionError('unavailable')));
+    stderr?.on('error', () => terminate(new InspectionError('unavailable')));
     if (!stdout || !stderr) {
-      finish(new InspectionError('unavailable'));
+      terminate(new InspectionError('unavailable'));
       return;
     }
     stdout.on('data', (chunk: Buffer) => {
       listingBytes += chunk.length;
       if (listingBytes > MAX_STREAM_LISTING_BYTES) {
-        finish(new InvalidInspectionError());
+        terminate(new InvalidInspectionError());
         return;
       }
       listing += chunk.toString('utf8');
     });
     stderr.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
-      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
-    });
-    // Child stdio can emit its own 'error' independently of the ChildProcess
-    // object (for example under descriptor exhaustion). Without these
-    // listeners EventEmitter treats that host fault as an uncaught exception.
-    stdout.on('error', () => finish(new InspectionError('unavailable')));
-    stderr.on('error', () => finish(new InspectionError('unavailable')));
-    child.once('error', () => {
-      // A ChildProcess error here is an inability to start/control the
-      // configured prober, not evidence that the learner's media is bad.
-      finish(new InspectionError('unavailable'));
-    });
-    child.once('close', (code) => {
-      if (code !== 0) {
-        finish(new InvalidInspectionError());
-        return;
-      }
-      const streamIndex = listing.trim();
-      if (!/^\d+$/.test(streamIndex)) {
-        finish(new InvalidInspectionError());
-        return;
-      }
-      finish();
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) terminate(new InvalidInspectionError());
     });
   });
 }
@@ -420,61 +475,77 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
     // spawn(2) duplicated the descriptor into the child before returning.
     closeInput();
 
-    let settled = false;
-    let overlong = false;
-    let diagnosticBytes = 0;
-    let decodedBytes = 0;
-
-    const stop = () => {
-      if (!child.killed) child.kill('SIGKILL');
-    };
-    const finish = (duration: number | Error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      stop();
-      if (duration instanceof Error) reject(duration);
-      else resolve(duration);
-    };
-    const countDecodedBytes = (chunk: Buffer) => {
-      decodedBytes += chunk.length;
-      if (decodedBytes > maxDecodedBytes()) {
-        overlong = true;
-        stop();
-      }
-    };
-
-    const timeout = setTimeout(() => finish(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
-    timeout.unref();
-
     // Data is counted and immediately discarded; learner audio is never
     // accumulated in application memory.
     const stdout = child.stdout;
     const stderr = child.stderr;
+    let settled = false;
+    let terminating = false;
+    let pendingOutcome!: number | Error;
+    let reapTimeout: NodeJS.Timeout | undefined;
+    let diagnosticBytes = 0;
+    let decodedBytes = 0;
+
+    const stop = () => {
+      try {
+        if (!child.killed) child.kill('SIGKILL');
+      } catch {
+        // The bounded reap fallback still settles the inspection.
+      }
+    };
+    const settle = (duration: number | Error) => {
+      settled = true;
+      clearTimeout(timeout);
+      clearTimeout(reapTimeout);
+      if (duration instanceof Error) reject(duration);
+      else resolve(duration);
+    };
+    const terminate = (outcome: number | Error) => {
+      if (settled || terminating) return;
+      terminating = true;
+      pendingOutcome = outcome;
+      clearTimeout(timeout);
+      stdout?.removeAllListeners('data');
+      stderr?.removeAllListeners('data');
+      reapTimeout = setTimeout(() => {
+        retainInspectionCapacityUntilChildExit(child);
+        settle(outcome);
+      }, CHILD_REAP_TIMEOUT_MS);
+      reapTimeout.unref();
+      stop();
+    };
+    const countDecodedBytes = (chunk: Buffer) => {
+      decodedBytes += chunk.length;
+      if (decodedBytes > maxDecodedBytes()) terminate(MAX_AUDIO_DURATION_SECONDS + 1);
+    };
+
+    const timeout = setTimeout(() => terminate(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
+    timeout.unref();
+    child.once('error', () => {
+      // Register before the pipe invariant check for the same reason as the
+      // probe stage: a killed malformed child may still report one error.
+      terminate(new InspectionError('unavailable'));
+    });
+    child.once('close', (code) => {
+      if (terminating) {
+        settle(pendingOutcome);
+      } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
+        settle(new InvalidInspectionError());
+      } else {
+        settle(decodedBytes / decodedBytesPerSecond());
+      }
+    });
+
+    stdout?.on('error', () => terminate(new InspectionError('unavailable')));
+    stderr?.on('error', () => terminate(new InspectionError('unavailable')));
     if (!stdout || !stderr) {
-      finish(new InspectionError('unavailable'));
+      terminate(new InspectionError('unavailable'));
       return;
     }
     stdout.on('data', countDecodedBytes);
     stderr.on('data', (chunk: Buffer) => {
       diagnosticBytes += chunk.length;
-      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) finish(new InvalidInspectionError());
-    });
-    stdout.on('error', () => finish(new InspectionError('unavailable')));
-    stderr.on('error', () => finish(new InspectionError('unavailable')));
-    child.once('error', () => {
-      // A ChildProcess error here is an inability to start/control the
-      // configured inspector, not evidence that the learner's media is bad.
-      finish(new InspectionError('unavailable'));
-    });
-    child.once('close', (code) => {
-      if (overlong) {
-        finish(MAX_AUDIO_DURATION_SECONDS + 1);
-      } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
-        finish(new InvalidInspectionError());
-      } else {
-        finish(decodedBytes / decodedBytesPerSecond());
-      }
+      if (diagnosticBytes > MAX_DIAGNOSTIC_BYTES) terminate(new InvalidInspectionError());
     });
   });
 }
@@ -513,33 +584,67 @@ function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToo
       return;
     }
     const versionStream = child.stdout;
-    if (!versionStream) {
-      // stdio is explicitly piped above. Treat a violated runtime invariant as
-      // dependency failure instead of accepting a tool we could not identify.
-      if (!child.killed) child.kill('SIGKILL');
-      reject(new Error(`${label} availability check returned unexpected output`));
-      return;
-    }
+    // Attach immediately after spawn. If the expected stdout pipe is missing,
+    // killing that malformed child can still produce an asynchronous error;
+    // leaving it listenerless would crash the process after this promise had
+    // already rejected cleanly.
     let settled = false;
+    let terminating = false;
+    let pendingError!: Error;
     let versionOutput = '';
     let versionBytes = 0;
-    const finish = (error?: Error) => {
-      if (settled) return;
+    let reapTimeout: NodeJS.Timeout | undefined;
+    const settle = (error?: Error) => {
       settled = true;
       clearTimeout(timeout);
-      if (!child.killed) child.kill('SIGKILL');
+      clearTimeout(reapTimeout);
       if (error) reject(error);
       else resolve();
     };
+    const terminate = (error: Error) => {
+      if (settled || terminating) return;
+      terminating = true;
+      pendingError = error;
+      clearTimeout(timeout);
+      versionStream?.removeAllListeners('data');
+      reapTimeout = setTimeout(() => {
+        retainInspectionCapacityUntilChildExit(child);
+        settle(error);
+      }, CHILD_REAP_TIMEOUT_MS);
+      reapTimeout.unref();
+      try {
+        if (!child.killed) child.kill('SIGKILL');
+      } catch {
+        // The bounded reap fallback still settles readiness.
+      }
+    };
     const timeout = setTimeout(
-      () => finish(new Error(`${label} availability check timed out`)),
+      () => terminate(new Error(`${label} availability check timed out`)),
       AVAILABILITY_TIMEOUT_MS,
     );
     timeout.unref();
+    child.once('error', () => terminate(new Error(`${label} is unavailable`)));
+    child.once('close', (code) => {
+      if (terminating) {
+        settle(pendingError);
+        return;
+      }
+      // The configured executable must identify itself at the very beginning
+      // of its bounded stdout. A later, injected-looking line is insufficient.
+      const identifiesExpectedTool = identifiesExpectedMediaTool(identity, versionOutput);
+      if (code === 0 && identifiesExpectedTool) settle();
+      else settle(new Error(`${label} is unavailable`));
+    });
+    if (!versionStream) {
+      // stdio is explicitly piped above. Treat a violated runtime invariant as
+      // dependency failure instead of accepting a tool we could not identify.
+      terminate(new Error(`${label} availability check returned unexpected output`));
+      return;
+    }
     versionStream.on('data', (chunk: Buffer) => {
       versionBytes += chunk.length;
       if (versionBytes > MAX_VERSION_BYTES) {
-        finish(new Error(`${label} availability check returned unexpected output`));
+        terminate(new Error(`${label} availability check returned unexpected output`));
         return;
       }
       versionOutput += chunk.toString('utf8');
@@ -547,15 +652,7 @@ function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToo
     // A piped stdio stream can fail after spawn succeeds. Handle it here so
     // a host-side descriptor fault becomes a bounded readiness failure rather
     // than an unhandled EventEmitter error that terminates the process.
-    versionStream.on('error', () => finish(new Error(`${label} is unavailable`)));
-    child.once('error', () => finish(new Error(`${label} is unavailable`)));
-    child.once('close', (code) => {
-      // The configured executable must identify itself at the very beginning
-      // of its bounded stdout. A later, injected-looking line is insufficient.
-      const identifiesExpectedTool = identifiesExpectedMediaTool(identity, versionOutput);
-      if (code === 0 && identifiesExpectedTool) finish();
-      else finish(new Error(`${label} is unavailable`));
-    });
+    versionStream.on('error', () => terminate(new Error(`${label} is unavailable`)));
   });
 }
 
@@ -582,6 +679,12 @@ async function runAudioInspectorAvailabilityCheck(): Promise<void> {
  * detecting runtime loss quickly.
  */
 export function assertAudioInspectorAvailable({ force = false }: { force?: boolean } = {}): Promise<void> {
+  // A child that did not acknowledge forced termination is a stronger signal
+  // than a recently cached success. Do not accumulate more version probes
+  // while the OS may still own a previous native process.
+  if (unreapedNativeChildren > 0) {
+    return Promise.reject(new Error('Audio inspector process has not terminated'));
+  }
   const now = Date.now();
   if (!force && availabilityCache && availabilityCache.expiresAt > now) {
     return availabilityCache.error ? Promise.reject(availabilityCache.error) : Promise.resolve();

@@ -256,6 +256,29 @@ describe('practice stuck cases', () => {
         await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [userId, questionId]);
       }
     });
+
+    it('stops before the claim-row read when account deletion lands after the silence result', async () => {
+      const { token, userId, level } = await freshUser();
+      const questionId = await someQuestion(level);
+      speakMock.mockImplementationOnce(async () => {
+        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+        return SILENCE;
+      });
+
+      const { result, leases } = await observePoolLeases(() =>
+        answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId),
+      );
+
+      expect(result.status).toBe(409);
+      expect(result.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+      const persistence = leases.find(
+        ({ statements }) =>
+          statements.includes('SELECT 1 FROM users WHERE id = $1 FOR UPDATE') && statements.at(-1) === 'ROLLBACK',
+      );
+      expect(persistence).toBeDefined();
+      expect(persistence!.statements).toEqual(['BEGIN', 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE', 'ROLLBACK']);
+      expect(persistence!.release).toHaveBeenCalledOnce();
+    });
   });
 
   describe('native-language answers (case 02)', () => {
@@ -292,6 +315,34 @@ describe('practice stuck cases', () => {
       );
       expect(counts.rows[0]).toEqual({ attempts: 0, progress: 0 });
       expectCompletedPersistenceLease(leases);
+    });
+
+    it('stops before the claim-row read when account deletion lands after the native result', async () => {
+      const { token, userId, level } = await freshUser();
+      const questionId = await someQuestion(level);
+      nativeMock.mockImplementationOnce(async () => {
+        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+        return {
+          understood: true,
+          transcript: 'అర్థమైంది.',
+          modelAnswer: 'A model answer.',
+          feedback: 'Good comprehension.',
+        };
+      });
+
+      const { result, leases } = await observePoolLeases(() =>
+        answerForm(request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`), questionId),
+      );
+
+      expect(result.status).toBe(409);
+      expect(result.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+      const persistence = leases.find(
+        ({ statements }) =>
+          statements.includes('SELECT 1 FROM users WHERE id = $1 FOR UPDATE') && statements.at(-1) === 'ROLLBACK',
+      );
+      expect(persistence).toBeDefined();
+      expect(persistence!.statements).toEqual(['BEGIN', 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE', 'ROLLBACK']);
+      expect(persistence!.release).toHaveBeenCalledOnce();
     });
 
     it('appends the authored native example when the answer misses the question', async () => {

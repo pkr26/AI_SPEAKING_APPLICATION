@@ -29,6 +29,7 @@ export default {
     '/dist',
     '/uploads',
     '/reports',
+    '/.mutation-campaign.lock',
     '/.stryker-tmp',
     '/.stryker-catalog-tmp',
     '/.stryker-*-tmp',

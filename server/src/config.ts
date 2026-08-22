@@ -59,8 +59,7 @@ const corsOrigins = z
         url.hostname.includes('*') ||
         url.pathname !== '/' ||
         url.search ||
-        url.hash ||
-        url.origin === 'null'
+        url.hash
       ) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

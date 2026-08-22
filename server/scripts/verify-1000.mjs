@@ -4,6 +4,7 @@
 //
 // Usage:
 //   LOAD_DATABASE_URL=postgres://localhost:5432/ai_english_load1000 \
+//   LOAD_RATE_LIMIT_GLOBAL_STORE=memory \
 //     node scripts/verify-1000.mjs [path/to/ledger.json]
 //
 // Defaults to the newest ledger in reports/load1000/. Global count checks
@@ -17,7 +18,12 @@ import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 
 const DATABASE_URL = process.env.LOAD_DATABASE_URL || 'postgres://localhost:5432/ai_english_load1000';
+const GLOBAL_RATE_LIMIT_STORE = process.env.LOAD_RATE_LIMIT_GLOBAL_STORE || 'memory';
 const REPORTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'reports', 'load1000');
+
+if (GLOBAL_RATE_LIMIT_STORE !== 'memory' && GLOBAL_RATE_LIMIT_STORE !== 'postgres') {
+  throw new Error("LOAD_RATE_LIMIT_GLOBAL_STORE must be 'memory' or 'postgres'");
+}
 
 const ledgerArg = process.argv[2];
 let ledgerPath = ledgerArg;
@@ -270,7 +276,15 @@ try {
   const nsMap = Object.fromEntries(namespaces.rows.map((r) => [r.ns, Number(r.hits)]));
   // The upload-grant limiter only mounts in S3 mode (audio-upload.ts), so its
   // namespace is legitimately absent under the direct-upload test server.
-  for (const required of ['global', 'auth', 'register', 'login-account', 'assess', 'assess-ip-daily']) {
+  // The coarse global flood brake defaults to an in-process MemoryStore and
+  // must write no PostgreSQL row in that mode; operators testing the optional
+  // shared store opt in through LOAD_RATE_LIMIT_GLOBAL_STORE=postgres.
+  check(
+    `rate_limit_windows: global ${GLOBAL_RATE_LIMIT_STORE} store matches persistence`,
+    GLOBAL_RATE_LIMIT_STORE === 'postgres' ? nsMap.global !== undefined : nsMap.global === undefined,
+    JSON.stringify(nsMap),
+  );
+  for (const required of ['auth', 'register', 'login-account', 'assess', 'assess-ip-daily']) {
     check(`rate_limit_windows: namespace "${required}" present`, nsMap[required] !== undefined, JSON.stringify(nsMap));
   }
   check(

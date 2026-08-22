@@ -62,6 +62,41 @@ interface Queryable {
   query<T>(text: string, values?: unknown[]): Promise<{ rows: T[] }>;
 }
 
+interface CurrentPracticeUser {
+  cefr_level: string | null;
+  diagnostic_completed: boolean;
+  native_language: string;
+}
+
+/**
+ * Run a read that must agree with the learner's current placement/profile.
+ * Practice writers all lock users first with FOR UPDATE, so a compatible
+ * parent-first FOR SHARE lock gives the multi-query read one coherent state
+ * without serializing it against other readers.
+ */
+async function withCurrentPracticeUser<T>(
+  userId: string,
+  read: (client: Queryable, user: CurrentPracticeUser) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows } = await client.query<CurrentPracticeUser>(
+      'SELECT cefr_level, diagnostic_completed, native_language FROM users WHERE id = $1 FOR SHARE',
+      [userId],
+    );
+    const user = rows[0];
+    if (!user) throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    const result = await read(client, user);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    return await rollbackTransaction(client, { value: err });
+  } finally {
+    releaseTransactionClient(client);
+  }
+}
+
 function questionColumns(): string {
   return `q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"`;
 }
@@ -320,7 +355,12 @@ async function clearPracticeClaim(userId: string, questionId: string, claimId: s
       claimId,
     ]);
   } catch (err) {
-    logger.warn({ err, userId, questionId, claimId }, 'failed to clear practice assessment claim');
+    try {
+      logger.warn({ err, userId, questionId, claimId }, 'failed to clear practice assessment claim');
+    } catch {
+      // Preserve the route's real result/error and let the pipeline continue
+      // to its request-claim abandonment even when observability is impaired.
+    }
   }
 }
 
@@ -647,13 +687,18 @@ export function createPracticeRouter(limiters: Limiters) {
 
   router.get(
     '/question',
-    requireCompletedDiagnostic,
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const pick = await pickPracticeNext(user.id, user.cefr_level!);
-      if (!pick) throw new HttpError(500, 'No questions available for this level');
-      const progress = await practiceProgressSnapshot(user.id, user.cefr_level!);
-      res.json({ question: pick.question, kind: pick.kind, progress });
+      const body = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
+        if (!currentUser.diagnostic_completed || !currentUser.cefr_level) {
+          throw new HttpError(403, 'Diagnostic not completed');
+        }
+        const pick = await pickPracticeNext(user.id, currentUser.cefr_level, client);
+        if (!pick) throw new HttpError(500, 'No questions available for this level');
+        const progress = await practiceProgressSnapshot(user.id, currentUser.cefr_level, client);
+        return { question: pick.question, kind: pick.kind, progress };
+      });
+      res.json(body);
     }),
   );
 
@@ -663,7 +708,6 @@ export function createPracticeRouter(limiters: Limiters) {
   // selection deliberately ignores skips.
   router.post(
     '/skip',
-    requireCompletedDiagnostic,
     validate({ body: skipBodySchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
@@ -755,79 +799,87 @@ export function createPracticeRouter(limiters: Limiters) {
     '/stats',
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const level = user.cefr_level;
-      const progress = level
-        ? await practiceProgressSnapshot(user.id, level)
-        : { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 };
-      // Streak = consecutive UTC calendar days with at least one practice
-      // attempt, anchored on the most recent practiced day and counted only
-      // when that anchor is today or yesterday (one quiet day is allowed
-      // before the streak dies). Gaps-and-islands over the distinct day list:
-      // the run starting at the latest day is exactly the rows where
-      // day = latest - (rank - 1).
-      const { rows } = await pool.query<{
-        streakDays: number;
-        practicedToday: number;
-        totalAttempts: number;
-        lastPracticedAt: string | null;
-      }>(
-        `WITH practice_days AS (
-           SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date AS day
-           FROM attempts
-           WHERE user_id = $1 AND context = 'practice'
-         ),
-         ranked AS (
-           SELECT day,
-                  max(day) OVER () AS latest,
-                  row_number() OVER (ORDER BY day DESC) AS rn
-           FROM practice_days
-         )
-         SELECT
-           (SELECT count(*)::int FROM ranked
-            WHERE latest >= (now() AT TIME ZONE 'UTC')::date - 1
-              AND day = latest - (rn - 1)::int) AS "streakDays",
-           (SELECT count(*)::int FROM attempts
-            WHERE user_id = $1 AND context = 'practice'
-              AND (created_at AT TIME ZONE 'UTC')::date = (now() AT TIME ZONE 'UTC')::date) AS "practicedToday",
-           (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS "totalAttempts",
-           (SELECT max(created_at) FROM attempts WHERE user_id = $1 AND context = 'practice') AS "lastPracticedAt"`,
-        [user.id],
-      );
-      const stats = rows[0];
-      res.json({
-        level,
-        progress,
-        streakDays: stats.streakDays,
-        practicedToday: stats.practicedToday,
-        totalAttempts: stats.totalAttempts,
-        lastPracticedAt: stats.lastPracticedAt,
+      const body = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
+        const level = currentUser.cefr_level;
+        const progress = level
+          ? await practiceProgressSnapshot(user.id, level, client)
+          : { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 };
+        // Streak = consecutive UTC calendar days with at least one practice
+        // attempt, anchored on the most recent practiced day and counted only
+        // when that anchor is today or yesterday (one quiet day is allowed
+        // before the streak dies). Gaps-and-islands over the distinct day list:
+        // the run starting at the latest day is exactly the rows where
+        // day = latest - (rank - 1).
+        const { rows } = await client.query<{
+          streakDays: number;
+          practicedToday: number;
+          totalAttempts: number;
+          lastPracticedAt: string | null;
+        }>(
+          `WITH practice_days AS (
+             SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date AS day
+             FROM attempts
+             WHERE user_id = $1 AND context = 'practice'
+           ),
+           ranked AS (
+             SELECT day,
+                    max(day) OVER () AS latest,
+                    row_number() OVER (ORDER BY day DESC) AS rn
+             FROM practice_days
+           )
+           SELECT
+             (SELECT count(*)::int FROM ranked
+              WHERE latest >= (now() AT TIME ZONE 'UTC')::date - 1
+                AND day = latest - (rn - 1)::int) AS "streakDays",
+             (SELECT count(*)::int FROM attempts
+              WHERE user_id = $1 AND context = 'practice'
+                AND (created_at AT TIME ZONE 'UTC')::date = (now() AT TIME ZONE 'UTC')::date) AS "practicedToday",
+             (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS "totalAttempts",
+             (SELECT max(created_at) FROM attempts WHERE user_id = $1 AND context = 'practice') AS "lastPracticedAt"`,
+          [user.id],
+        );
+        const stats = rows[0];
+        return {
+          level,
+          progress,
+          streakDays: stats.streakDays,
+          practicedToday: stats.practicedToday,
+          totalAttempts: stats.totalAttempts,
+          lastPracticedAt: stats.lastPracticedAt,
+        };
       });
+      res.json(body);
     }),
   );
 
   router.get(
     '/question/:id/help',
-    requireCompletedDiagnostic,
     validate({ params: helpParamsSchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const { rows } = await pool.query<QuestionRow>(`SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`, [
-        req.params.id,
-      ]);
-      const q = rows[0];
-      if (!q) throw new HttpError(404, 'Question not found');
-      if (q.cefr_level !== user.cefr_level) {
-        throw new HttpError(403, 'Question is not available at your level');
-      }
-      const t = q.translations[user.native_language];
-      if (!t) throw new HttpError(404, 'Translation not available for this question');
-      const payload = {
-        promptWord: q.prompt_word,
-        promptWordNative: t.word,
-        questionText: q.question_text,
-        questionTextNative: t.question,
-        examples: t.examples,
-      };
+      const payload = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
+        if (!currentUser.diagnostic_completed || !currentUser.cefr_level) {
+          throw new HttpError(403, 'Diagnostic not completed');
+        }
+        const { rows } = await client.query<QuestionRow>(
+          `SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`,
+          [req.params.id],
+        );
+        const q = rows[0];
+        if (!q) throw new HttpError(404, 'Question not found');
+        if (q.cefr_level !== currentUser.cefr_level) {
+          throw new HttpError(403, 'Question is not available at your level');
+        }
+        const t = q.translations[currentUser.native_language];
+        if (!t) throw new HttpError(404, 'Translation not available for this question');
+        return {
+          promptWord: q.prompt_word,
+          promptWordNative: t.word,
+          questionText: q.question_text,
+          questionTextNative: t.question,
+          examples: t.examples,
+        };
+      });
       // Content is static per (question, language), but the language comes
       // from the caller's profile while the URL does not: a stored response
       // must never be reused after a language switch or an account swap on

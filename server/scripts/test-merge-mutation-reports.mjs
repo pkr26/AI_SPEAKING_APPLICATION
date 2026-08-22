@@ -7,6 +7,11 @@ import test from 'node:test';
 
 import { createMutationReportHtml, mergeMutationReportData, mergeMutationReports } from './merge-mutation-reports.mjs';
 import { codeMutationLaneNames, codeMutationLanes, expectedCodeMutationFiles } from './mutation-lanes.mjs';
+import {
+  createMutationExecutionIdentity,
+  createMutationReportProvenance,
+  writeMutationReportProvenance,
+} from './mutation-provenance.mjs';
 
 const thresholds = Object.freeze({ high: 95, low: 90, break: 90 });
 const framework = Object.freeze({ name: 'StrykerJS', version: '9.6.1' });
@@ -160,6 +165,10 @@ test('rejects dangling test references and unexpected source files', () => {
     mutants: [],
   };
   assert.throws(() => mergeMutationReportData(unexpectedSource), /Unexpected: src\/unexpected\.ts/);
+
+  const emptyExpectedSource = focusedFixtures();
+  emptyExpectedSource.reportsByLane.alpha.files['src/a.ts'].mutants = [];
+  assert.throws(() => mergeMutationReportData(emptyExpectedSource), /src\/a\.ts.*contains no mutants/);
 });
 
 test('escapes report data before embedding it into self-contained HTML', async () => {
@@ -192,25 +201,37 @@ async function fullManifestReport(laneName) {
         {
           language: 'typescript',
           source: await fs.readFile(path.join(serverDirectory, sourceFileName), 'utf8'),
-          mutants:
-            index === 0
-              ? [
-                  {
-                    id: '0',
-                    mutatorName: 'StringLiteral',
-                    replacement: '""',
-                    status: laneName === codeMutationLaneNames[0] ? 'Killed' : 'NoCoverage',
-                    coveredBy: [firstTestId],
-                    ...(laneName === codeMutationLaneNames[0] ? { killedBy: [firstTestId] } : {}),
-                    location: mutationLocation(1),
-                  },
-                ]
-              : [],
+          mutants: [
+            {
+              id: String(index),
+              mutatorName: 'StringLiteral',
+              replacement: '""',
+              status: laneName === codeMutationLaneNames[0] ? 'Killed' : 'NoCoverage',
+              coveredBy: [firstTestId],
+              ...(laneName === codeMutationLaneNames[0] ? { killedBy: [firstTestId] } : {}),
+              location: mutationLocation(1),
+            },
+          ],
         },
       ]),
     ),
   );
   return report({ files, tests: testFiles, performance: undefined });
+}
+
+async function writeLaneProvenance(reportDirectory, laneName) {
+  const executionIdentity = await createMutationExecutionIdentity({ serverDir: serverDirectory });
+  const provenance = await createMutationReportProvenance({
+    campaign: 'code',
+    laneName,
+    reportPath: path.join(reportDirectory, `${laneName}.json`),
+    executionIdentity,
+  });
+  await writeMutationReportProvenance({ reportDir: reportDirectory, provenance });
+}
+
+async function writeAllLaneProvenance(reportDirectory) {
+  for (const laneName of codeMutationLaneNames) await writeLaneProvenance(reportDirectory, laneName);
 }
 
 test('requires every manifest lane before writing consolidated JSON, summary, and self-contained HTML', async (context) => {
@@ -236,6 +257,7 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
     JSON.stringify(await fullManifestReport(missingLane)),
     'utf8',
   );
+  await writeAllLaneProvenance(reportDirectory);
   const result = await mergeMutationReports({ reportDir: reportDirectory });
   const [mergedJson, summaryJson, html] = await Promise.all([
     fs.readFile(result.paths.json, 'utf8').then(JSON.parse),
@@ -246,7 +268,7 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
   assert.deepEqual(Object.keys(mergedJson.files), expectedCodeMutationFiles);
   assert.equal(summaryJson.laneCount, codeMutationLaneNames.length);
   assert.equal(summaryJson.fileCount, expectedCodeMutationFiles.length);
-  assert.equal(summaryJson.mutantCount, codeMutationLaneNames.length);
+  assert.equal(summaryJson.mutantCount, expectedCodeMutationFiles.length);
   assert.match(html, /<mutation-test-report-app/);
 
   const staleSourceLane = codeMutationLaneNames[0];
@@ -254,6 +276,7 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
   const staleSourceFile = codeMutationLanes[staleSourceLane].mutate[0];
   staleSource.files[staleSourceFile].source = '// stale source\n';
   await fs.writeFile(path.join(reportDirectory, `${staleSourceLane}.json`), JSON.stringify(staleSource), 'utf8');
+  await writeLaneProvenance(reportDirectory, staleSourceLane);
   await assert.rejects(
     mergeMutationReports({ reportDir: reportDirectory }),
     /embeds stale source .* no longer matches the workspace/,
@@ -263,8 +286,69 @@ test('requires every manifest lane before writing consolidated JSON, summary, an
   const staleTestFile = codeMutationLanes[staleSourceLane].testFiles[0];
   staleTest.testFiles[staleTestFile].source = '// stale test\n';
   await fs.writeFile(path.join(reportDirectory, `${staleSourceLane}.json`), JSON.stringify(staleTest), 'utf8');
+  await writeLaneProvenance(reportDirectory, staleSourceLane);
   await assert.rejects(
     mergeMutationReports({ reportDir: reportDirectory }),
     /embeds stale test source .* no longer matches the workspace/,
   );
+
+  // Restore the lane report, then simulate an editor changing one input after
+  // the pre-commit validation but while canonical artifacts are being
+  // renamed. The post-commit snapshot check must fail and remove every
+  // canonical artifact rather than leave a green report behind.
+  await fs.writeFile(
+    path.join(reportDirectory, `${staleSourceLane}.json`),
+    JSON.stringify(await fullManifestReport(staleSourceLane)),
+    'utf8',
+  );
+  await writeLaneProvenance(reportDirectory, staleSourceLane);
+  const driftTarget = path.join(serverDirectory, staleSourceFile);
+  let commitStarted = false;
+  let targetReadsDuringCommit = 0;
+  await assert.rejects(
+    mergeMutationReports({
+      reportDir: reportDirectory,
+      beforeArtifactCommit: async () => {
+        commitStarted = true;
+      },
+      readWorkspaceFile: async (filePath, encoding) => {
+        const source = await fs.readFile(filePath, encoding);
+        if (commitStarted && path.resolve(filePath) === driftTarget) {
+          targetReadsDuringCommit += 1;
+          if (targetReadsDuringCommit >= 2) return `${source}// concurrent edit\n`;
+        }
+        return source;
+      },
+    }),
+    new RegExp(`Mutation campaign input changed during report merge: ${staleSourceFile.replace(/[.\\/]/g, '\\$&')}`),
+  );
+  assert.equal(targetReadsDuringCommit, 2);
+  for (const artifact of ['code.json', 'code-summary.json', 'code.html']) {
+    await assert.rejects(fs.stat(path.join(reportDirectory, artifact)), { code: 'ENOENT' });
+  }
+
+  const tamperedLanePath = path.join(reportDirectory, `${staleSourceLane}.json`);
+  await assert.rejects(
+    mergeMutationReports({
+      reportDir: reportDirectory,
+      beforeArtifactCommit: () => fs.appendFile(tamperedLanePath, '\n'),
+    }),
+    /provenance .* does not match its current JSON report/i,
+  );
+  for (const artifact of ['code.json', 'code-summary.json', 'code.html']) {
+    await assert.rejects(fs.stat(path.join(reportDirectory, artifact)), { code: 'ENOENT' });
+  }
+
+  await fs.writeFile(tamperedLanePath, JSON.stringify(await fullManifestReport(staleSourceLane)), 'utf8');
+  await writeLaneProvenance(reportDirectory, staleSourceLane);
+  await assert.rejects(
+    mergeMutationReports({
+      reportDir: reportDirectory,
+      afterArtifactCommit: () => fs.appendFile(tamperedLanePath, '\n'),
+    }),
+    /provenance .* does not match its current JSON report/i,
+  );
+  for (const artifact of ['code.json', 'code-summary.json', 'code.html']) {
+    await assert.rejects(fs.stat(path.join(reportDirectory, artifact)), { code: 'ENOENT' });
+  }
 });

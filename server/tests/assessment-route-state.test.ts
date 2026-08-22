@@ -1,5 +1,6 @@
 import { randomUUID } from 'crypto';
 import fs from 'fs/promises';
+import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { logger } from '../src/logger';
@@ -99,6 +100,138 @@ async function registerInitialDiagnosticQuestion(): Promise<{
   return { token, userId, questionId: next.body.question.id as string };
 }
 
+/**
+ * Commit a user-state mutation after the generic assessment-request claim has
+ * committed but before the route takes its diagnostic question claim.
+ */
+async function withMutationAfterRequestClaim<T>(mutate: () => Promise<unknown>, run: () => PromiseLike<T>): Promise<T> {
+  const originalConnect = pool.connect.bind(pool);
+  let mutated = false;
+  const connect = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+    if (typeof callback === 'function') return originalConnect(callback as never);
+    return originalConnect().then((client: PoolClient) => {
+      const mutable = client as unknown as {
+        query: (...args: unknown[]) => unknown;
+        release: (error?: Error | boolean) => void;
+      };
+      const actualQuery = mutable.query;
+      const actualRelease = mutable.release;
+      let insertedRequestClaim = false;
+      mutable.query = async (...args: unknown[]) => {
+        const text = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: unknown } | null)?.text;
+        const result = (await actualQuery.call(client, ...args)) as { rowCount?: number | null };
+        if (typeof text === 'string' && text.includes('INSERT INTO assessment_requests') && result.rowCount === 1) {
+          insertedRequestClaim = true;
+        }
+        if (text === 'COMMIT' && insertedRequestClaim && !mutated) {
+          mutated = true;
+          await mutate();
+        }
+        return result;
+      };
+      mutable.release = (error?: Error | boolean) => {
+        mutable.query = actualQuery;
+        mutable.release = actualRelease;
+        actualRelease.call(client, error);
+      };
+      return client;
+    });
+  }) as typeof pool.connect);
+
+  try {
+    const result = await Promise.resolve(run());
+    expect(mutated).toBe(true);
+    return result;
+  } finally {
+    connect.mockRestore();
+  }
+}
+
+describe('diagnostic user-state handoff gaps', () => {
+  it('abandons the request when account deletion lands between request claim and question claim', async () => {
+    const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
+    const requestId = randomUUID();
+
+    const response = await withMutationAfterRequestClaim(
+      () => pool.query('DELETE FROM users WHERE id = $1', [userId]),
+      () => fixedRequestForm('/diagnostic/answer', token, questionId, requestId),
+    );
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+    expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
+    const remnants = await pool.query<{ users: number; state: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM users WHERE id = $1) AS users,
+         (SELECT count(*)::int FROM diagnostic_state WHERE user_id = $1) AS state`,
+      [userId],
+    );
+    expect(remnants.rows[0]).toEqual({ users: 0, state: 0 });
+  });
+
+  it('abandons the request when completion lands between request claim and question claim', async () => {
+    const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
+    const requestId = randomUUID();
+
+    const response = await withMutationAfterRequestClaim(
+      () => pool.query("UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1", [userId]),
+      () => fixedRequestForm('/diagnostic/answer', token, questionId, requestId),
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'Diagnostic already completed', code: 'DIAGNOSTIC_DONE' });
+    expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
+    const state = await pool.query<{ processing_claim_id: string | null }>(
+      'SELECT processing_claim_id FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
+    expect(state.rows[0]).toEqual({ processing_claim_id: null });
+  });
+
+  it('rolls back persistence when account deletion lands after the provider result', async () => {
+    const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
+    const requestId = randomUUID();
+    const triggerName = `test_delete_diagnostic_provider_owner_${randomUUID().replaceAll('-', '')}`;
+    const functionName = `${triggerName}_fn`;
+
+    await withTemporaryDatabaseArtifacts(
+      [
+        {
+          text: `
+            CREATE FUNCTION ${functionName}() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+              IF NEW.user_id = '${userId}'::uuid THEN
+                DELETE FROM users WHERE id = NEW.user_id;
+              END IF;
+              RETURN NEW;
+            END $$
+          `,
+        },
+        {
+          text: `
+            CREATE TRIGGER ${triggerName}
+            AFTER INSERT ON assessment_usage
+            FOR EACH ROW EXECUTE FUNCTION ${functionName}()
+          `,
+        },
+      ],
+      [
+        { text: `DROP TRIGGER IF EXISTS ${triggerName} ON assessment_usage` },
+        { text: `DROP FUNCTION IF EXISTS ${functionName}()` },
+      ],
+      async () => {
+        const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
+
+        expect(response.status).toBe(409);
+        expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
+        expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
+        const user = await pool.query('SELECT 1 FROM users WHERE id = $1', [userId]);
+        expect(user.rowCount).toBe(0);
+      },
+    );
+  });
+});
+
 describe('diagnostic failure cleanup', () => {
   it('abandons the request and clears the durable question claim after assessment fails', async () => {
     const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
@@ -159,7 +292,9 @@ describe('diagnostic failure cleanup', () => {
     const attemptFunction = `${attemptTrigger}_fn`;
     const cleanupTrigger = `test_fail_diagnostic_cleanup_${randomUUID().replaceAll('-', '')}`;
     const cleanupFunction = `${cleanupTrigger}_fn`;
-    const warn = vi.spyOn(logger, 'warn');
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('warning logger failed');
+    });
 
     try {
       await withTemporaryDatabaseArtifacts(
@@ -220,6 +355,7 @@ describe('diagnostic failure cleanup', () => {
 
           expect(response.status).toBe(500);
           expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+          expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
           const state = await pool.query<{ processing_claim_id: string }>(
             'SELECT processing_claim_id FROM diagnostic_state WHERE user_id = $1',
             [userId],

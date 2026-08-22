@@ -47,7 +47,7 @@ function skipInvalidEmail(req: ParsedEmailRequest): boolean {
 
 /** express-rate-limit invokes this only after skipInvalidEmail returned false. */
 function validEmailRateLimitKey(req: ParsedEmailRequest): string {
-  const email = normalizeLoginEmail(req.body?.email)!;
+  const email = normalizeLoginEmail(req.body!.email)!;
   return `email:${email}`;
 }
 
@@ -60,6 +60,109 @@ type AssessRateLimitedRequest = AuthedRequest & {
   assessRateLimit?: RateLimitInfo;
   assessIpDailyRateLimit?: RateLimitInfo;
 };
+
+interface ExactWindowRefundOptions {
+  limiter: RequestHandler;
+  store: PostgresRateLimitStore;
+  requestPropertyName: string;
+  refundFinished: (req: AuthedRequest, res: Response) => boolean;
+}
+
+/**
+ * express-rate-limit's Store#decrement receives only a key, so it cannot tell
+ * whether a row was renewed into a successor window after the request's hit.
+ * Keep a synchronous one-shot refund decision and apply it through the exact
+ * resetTime this request observed. The decision can precede the limiter's
+ * async increment; later observations safely complete it once and only once.
+ */
+function createExactWindowRefundController(
+  req: AuthedRequest,
+  store: PostgresRateLimitStore,
+  requestPropertyName: string,
+): { requestRefund: () => void; refundIfObserved: () => void } {
+  let refundRequested = false;
+  let refunded = false;
+  const refundIfObserved = () => {
+    if (!refundRequested || refunded) return;
+    const info = (req as unknown as Record<string, unknown>)[requestPropertyName] as RateLimitInfo | undefined;
+    if (!info) return;
+    // Set synchronously before the fire-and-forget counter update: finish,
+    // close, error, and promise settlement can all land in the same turn.
+    refunded = true;
+    void store.decrementWithinWindow(info.key, info.resetTime);
+  };
+  return {
+    requestRefund: () => {
+      refundRequested = true;
+      refundIfObserved();
+    },
+    refundIfObserved,
+  };
+}
+
+function invokeLimiterWithRefundObservation(
+  limiter: RequestHandler,
+  req: AuthedRequest,
+  res: Response,
+  next: Parameters<RequestHandler>[2],
+  observeRefund: () => void,
+): void {
+  const result = limiter(req, res, (error?: unknown) => {
+    observeRefund();
+    if (error !== undefined) next(error);
+    else next();
+  }) as unknown;
+  void Promise.resolve(result).then(observeRefund, next);
+}
+
+/** Credential budgets refund successful, finished responses only. */
+export function withExactWindowFinishRefund(options: ExactWindowRefundOptions): RequestHandler {
+  return (rawReq, res, next) => {
+    const req = rawReq as AuthedRequest;
+    const refund = createExactWindowRefundController(req, options.store, options.requestPropertyName);
+    res.once('finish', () => {
+      if (options.refundFinished(req, res)) refund.requestRefund();
+    });
+    invokeLimiterWithRefundObservation(options.limiter, req, res, next, refund.refundIfObserved);
+  };
+}
+
+/** Assessment budgets also refund unfinished close/error transport failures. */
+export function withAssessmentExactWindowRefund(options: ExactWindowRefundOptions): RequestHandler {
+  return (rawReq, res, next) => {
+    const req = rawReq as AuthedRequest;
+    const refund = createExactWindowRefundController(req, options.store, options.requestPropertyName);
+    const requestMissedTransportRefund = () => {
+      if (
+        !res.writableEnded &&
+        (res.locals.assessmentTransportClosed === true || res.closed || res.destroyed || req.socket.destroyed)
+      ) {
+        refund.requestRefund();
+      }
+      if (res.locals.assessmentTransportFailed === true) refund.requestRefund();
+    };
+    const observeRefund = () => {
+      requestMissedTransportRefund();
+      refund.refundIfObserved();
+    };
+
+    res.once('finish', () => {
+      if (options.refundFinished(req, res)) refund.requestRefund();
+    });
+    res.once('close', () => {
+      res.locals.assessmentTransportClosed = true;
+      if (!res.writableEnded) refund.requestRefund();
+    });
+    res.once('error', () => {
+      res.locals.assessmentTransportFailed = true;
+      refund.requestRefund();
+    });
+    // A prior assessment limiter may have observed the one-shot event while
+    // this downstream limiter was still waiting to mount.
+    requestMissedTransportRefund();
+    invokeLimiterWithRefundObservation(options.limiter, req, res, next, observeRefund);
+  };
+}
 
 /**
  * Security-sensitive limiters use PostgreSQL counters so every API replica
@@ -129,22 +232,30 @@ export function buildLimiters() {
   // attacker saturating the account budget cannot lock out the real owner;
   // only failures are throttled. The per-IP auth limiter above still bounds
   // the bcrypt work this always-verify policy pays per source.
-  const loginAccount = rateLimit({
+  const loginAccountStore = new PostgresRateLimitStore(
+    `login-account:${config.rateLimit.loginAccountWindowMs}:${config.rateLimit.loginAccountMax}`,
+    config.rateLimit.loginAccountWindowMs,
+  );
+  const loginAccountRequestProperty = 'loginAccountRateLimit';
+  const loginAccountLimiter = rateLimit({
     ...common,
     ...silentBudgetHeaders,
     windowMs: config.rateLimit.loginAccountWindowMs,
     limit: config.rateLimit.loginAccountMax,
-    store: new PostgresRateLimitStore(
-      `login-account:${config.rateLimit.loginAccountWindowMs}:${config.rateLimit.loginAccountMax}`,
-      config.rateLimit.loginAccountWindowMs,
-    ),
+    store: loginAccountStore,
     skip: skipInvalidEmail,
     keyGenerator: validEmailRateLimitKey,
+    requestPropertyName: loginAccountRequestProperty,
     handler: (_req, res, next) => {
       res.locals.loginAccountThrottled = true;
       next();
     },
-    skipSuccessfulRequests: true,
+  });
+  const loginAccount = withExactWindowFinishRefund({
+    limiter: loginAccountLimiter,
+    store: loginAccountStore,
+    requestPropertyName: loginAccountRequestProperty,
+    refundFinished: (_req, res) => res.statusCode < 400,
   });
 
   // Password-confirmation routes (change-password, account deletion) run
@@ -152,15 +263,17 @@ export function buildLimiters() {
   // distributed IPs could otherwise brute-force the account password online.
   // Same always-verify shape as loginAccount: over-budget requests still check
   // the password, and only failures are throttled.
-  const passwordAccount = rateLimit({
+  const passwordAccountStore = new PostgresRateLimitStore(
+    `password-account:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
+    config.rateLimit.passwordWindowMs,
+  );
+  const passwordAccountRequestProperty = 'passwordAccountRateLimit';
+  const passwordAccountLimiter = rateLimit({
     ...common,
     ...silentBudgetHeaders,
     windowMs: config.rateLimit.passwordWindowMs,
     limit: config.rateLimit.passwordMax,
-    store: new PostgresRateLimitStore(
-      `password-account:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
-      config.rateLimit.passwordWindowMs,
-    ),
+    store: passwordAccountStore,
     // Mounted after requireAuth; the user is always present. The IP fallback
     // only protects against a future route that forgets that ordering.
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
@@ -168,7 +281,13 @@ export function buildLimiters() {
       res.locals.passwordAccountThrottled = true;
       next();
     },
-    skipSuccessfulRequests: true,
+    requestPropertyName: passwordAccountRequestProperty,
+  });
+  const passwordAccount = withExactWindowFinishRefund({
+    limiter: passwordAccountLimiter,
+    store: passwordAccountStore,
+    requestPropertyName: passwordAccountRequestProperty,
+    refundFinished: (_req, res) => res.statusCode < 400,
   });
 
   // Password-reset requests follow the normalized TARGET email across source
@@ -248,8 +367,9 @@ export function buildLimiters() {
   // Assessment endpoints are expensive (upload + AI) — per-user, not per-IP,
   // so shared networks don't let one user exhaust another's budget. Failed
   // (>=400) requests that never reached paid work are refunded on response
-  // finish. The store's decrement is window-guarded and fail-safe (the same
-  // refund path the login limiter already relies on). Note that a silence
+  // finish. Refunds are pinned to the reset timestamp observed by that exact
+  // request, so a rollover can never subtract a successor window's hit. Note
+  // that a silence
   // (empty-transcript) response deliberately keeps its hit even though the
   // practice attempt counter treats it as a free retry: the Whisper
   // transcription that detected the silence already spent real provider money.
@@ -257,16 +377,20 @@ export function buildLimiters() {
     `assess:${config.rateLimit.assessWindowMs}:${config.rateLimit.assessMax}`,
     config.rateLimit.assessWindowMs,
   );
-  const assess = rateLimit({
+  const assessLimiter = rateLimit({
     ...common,
     windowMs: config.rateLimit.assessWindowMs,
     limit: config.rateLimit.assessMax,
     store: assessStore,
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     requestPropertyName: 'assessRateLimit',
-    skipFailedRequests: true,
-    requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Assessment rate limit reached, please slow down', code: 'RATE_LIMITED' },
+  });
+  const assess = withAssessmentExactWindowRefund({
+    limiter: assessLimiter,
+    store: assessStore,
+    requestPropertyName: 'assessRateLimit',
+    refundFinished: (req, res) => !assessmentSpentPaidWork(req, res),
   });
 
   // Per-user daily caps reset with every re-registered account, so a spender
@@ -282,23 +406,28 @@ export function buildLimiters() {
     `assess-ip-daily:${config.assessIpDailyCap}`,
     24 * 60 * 60 * 1000,
   );
-  const assessIpDaily = rateLimit({
+  const assessIpDailyLimiter = rateLimit({
     ...common,
     windowMs: 24 * 60 * 60 * 1000,
     limit: config.assessIpDailyCap,
     store: assessIpDailyStore,
     keyGenerator: requestIpRateLimitKey,
     requestPropertyName: 'assessIpDailyRateLimit',
-    skipFailedRequests: true,
-    requestWasSuccessful: assessmentSpentPaidWork,
     message: { error: 'Daily assessment limit reached for this network', code: 'NETWORK_DAILY_LIMIT' },
   });
+  const assessIpDaily = withAssessmentExactWindowRefund({
+    limiter: assessIpDailyLimiter,
+    store: assessIpDailyStore,
+    requestPropertyName: 'assessIpDailyRateLimit',
+    refundFinished: (req, res) => !assessmentSpentPaidWork(req, res),
+  });
 
-  // express-rate-limit refunds an aborted request unconditionally on 'close'
-  // (its requestWasSuccessful predicate is only consulted on 'finish'). That
-  // refund is legitimate before paid work — but once the daily-capacity
-  // reservation has committed, the paid pipeline runs to completion whether or
-  // not the caller stays connected, so an abort must keep both hits. Re-spend
+  // The exact-window wrapper refunds an aborted request on an unfinished
+  // 'close' and on a response 'error'. That refund is legitimate before paid
+  // work — but once
+  // the daily-capacity reservation has committed, the paid pipeline runs to
+  // completion whether or not the caller stays connected, so a transport
+  // failure must keep both hits. Re-spend
   // is guarded by the exact window each limiter observed for this request
   // (incrementWithinWindow): an abort landing after that window expired got no
   // refund, so nothing is taken back either — and because the store renews an
@@ -317,14 +446,29 @@ export function buildLimiters() {
     if (res.locals.assessmentBudgetRespent) return;
     res.locals.assessmentBudgetRespent = true;
     const observed = req as AssessRateLimitedRequest;
-    void assessStore.incrementWithinWindow(userOrIpRateLimitKey(req), observed.assessRateLimit?.resetTime);
-    void assessIpDailyStore.incrementWithinWindow(rateLimitIpKey(req.ip), observed.assessIpDailyRateLimit?.resetTime);
+    if (observed.assessRateLimit) {
+      void assessStore.incrementWithinWindow(observed.assessRateLimit.key, observed.assessRateLimit.resetTime);
+    }
+    if (observed.assessIpDailyRateLimit) {
+      void assessIpDailyStore.incrementWithinWindow(
+        observed.assessIpDailyRateLimit.key,
+        observed.assessIpDailyRateLimit.resetTime,
+      );
+    }
   };
 
-  // Mounted after the two assessment limiters, this re-spends the pair of
-  // hits the close handler is about to return.
+  // Mounted after the two assessment limiters, this mirrors every transport
+  // event on which the exact-window wrapper can refund. The durable locals markers
+  // close the event-before-reservation race without relying on Node's response
+  // flags having updated by the time the provider reservation callback runs.
   const assessAbortGuard: RequestHandler = (req, res, next) => {
-    res.on('close', () => {
+    res.once('error', () => {
+      res.locals.assessmentTransportFailed = true;
+      if (!res.locals.assessmentCapacityReserved) return;
+      respendAssessmentBudget(req as AuthedRequest, res);
+    });
+    res.once('close', () => {
+      res.locals.assessmentTransportClosed = true;
       if (res.writableEnded || !res.locals.assessmentCapacityReserved) return;
       respendAssessmentBudget(req as AuthedRequest, res);
     });

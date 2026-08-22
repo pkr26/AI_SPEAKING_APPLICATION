@@ -1140,6 +1140,87 @@ describe('Recorder mutation sentinels', () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
+  it('ID 2567: an inactive dip after response blocks parsing the stale submission', async () => {
+    const response = deferred<unknown>();
+    asMock(apiUploadAudio).mockImplementation(
+      async (
+        _endpoint: string,
+        _uri: string,
+        _fields: unknown,
+        options?: { onRequestStarted?: () => void },
+      ) => {
+        options?.onRequestStarted?.();
+        return response.promise;
+      },
+    );
+    const { recorderProps } = await renderRecorder();
+    await recordAndStop();
+    let staleSubmit!: Promise<void>;
+    await act(() => {
+      staleSubmit = Promise.resolve(
+        committedNodePress(screen.getByRole('button', { name: SUBMIT_TEXT }))(),
+      ).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(apiUploadAudio).toHaveBeenCalledTimes(1);
+
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      writable: true,
+      value: 'inactive',
+    });
+    await act(async () => {
+      response.resolve({ score: 97 });
+      await staleSubmit;
+      await flushMicrotasks();
+    });
+
+    expect(recorderProps.parseResult).not.toHaveBeenCalled();
+    expect(recorderProps.onResult).not.toHaveBeenCalled();
+    expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+  });
+
+  it('ID 2663: an inactive dip during clear suppresses stale rejection output', async () => {
+    const clear = deferred<void>();
+    asMock(clearPendingAssessment).mockReturnValue(clear.promise);
+    asMock(apiUploadAudio).mockImplementation(
+      async (
+        _endpoint: string,
+        _uri: string,
+        _fields: unknown,
+        options?: { onRequestStarted?: () => void },
+      ) => {
+        options?.onRequestStarted?.();
+        throw new ApiError(413, 'too large');
+      },
+    );
+    const onError = jest.fn();
+    await renderRecorder({ onError });
+    await recordAndStop();
+    let staleSubmit!: Promise<void>;
+    await act(() => {
+      staleSubmit = Promise.resolve(
+        committedNodePress(screen.getByRole('button', { name: SUBMIT_TEXT }))(),
+      ).then(() => undefined);
+    });
+    await flushMicrotasks();
+    expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
+    onError.mockClear();
+
+    Object.defineProperty(AppState, 'currentState', {
+      configurable: true,
+      writable: true,
+      value: 'inactive',
+    });
+    await act(async () => {
+      clear.resolve();
+      await staleSubmit;
+      await flushMicrotasks();
+    });
+
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('ID 2692: missing request tracking does not fabricate a failed clear', async () => {
     // Hostile UUID output exercises the defensive no-requestId branch without
     // reaching SecureStore. The production UUID provider cannot do this, but

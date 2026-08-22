@@ -609,11 +609,12 @@ describe('Recorder mutation sentinels', () => {
     const onInteractionLockChange = jest.fn();
     const { view } = await renderRecorder({ onInteractionLockChange });
     const staleStart = committedPress(START_LABEL);
+    onInteractionLockChange.mockClear();
     // Unlike general mutant-safe teardown, this must not pre-arm an AppState
     // stop while mounted: doing so leaves lockedRef=true and masks ID 891.
     await unmountWithoutLifecyclePrearm(view);
     await act(async () => flushMicrotasks());
-    onInteractionLockChange.mockClear();
+    expect(onInteractionLockChange).not.toHaveBeenCalledWith(true);
     await act(async () => {
       await Promise.resolve(staleStart());
       await flushMicrotasks();
@@ -829,11 +830,14 @@ describe('Recorder mutation sentinels', () => {
     expect(deletedFileUris()).not.toContain(RECORDING_URI);
   });
 
-  it('IDs 2268/2300: a new take must be observed before a leftover URI can be adopted', async () => {
+  it('ID 2268: optimistic reset is not proof that a new take was observed', async () => {
     jest.useFakeTimers();
+    // Return immutable snapshots for this state-transition contract. The
+    // default live Proxy deliberately avoids rerenders when old/new reads alias,
+    // which would prevent the fallback adoption effect from observing either
+    // side of the canRecord transition.
+    recorder.getStatus.mockImplementation(() => ({ ...recorderState }));
     const leftoverUri = 'file:///recordings/unobserved-new-take.m4a';
-    await renderRecorder();
-    await recordAndStop();
     recorder.prepareToRecordAsync.mockImplementationOnce(async () => {
       recorder.uri = leftoverUri;
     });
@@ -844,6 +848,38 @@ describe('Recorder mutation sentinels', () => {
       // intermediate recording status. Adoption must require a real observed
       // status rather than the optimistic reset immediately before record().
       recorderState = { ...recorderState, canRecord: true, isRecording: false };
+    });
+    await renderRecorder();
+    await startRecording();
+    recorder.isRecording = false;
+    recorderState = {
+      ...recorderState,
+      canRecord: false,
+      isRecording: false,
+      durationMillis: 5_000,
+      url: null,
+    };
+
+    await act(async () => {
+      jest.advanceTimersByTime(400);
+      await flushMicrotasks();
+    });
+
+    expect(screen.queryByRole('button', { name: SUBMIT_TEXT })).toBeNull();
+  });
+
+  it('ID 2300: a new take must be observed before a leftover URI can be adopted', async () => {
+    jest.useFakeTimers();
+    const leftoverUri = 'file:///recordings/unobserved-new-take.m4a';
+    await renderRecorder();
+    await recordAndStop();
+    recorder.prepareToRecordAsync.mockImplementationOnce(async () => {
+      recorder.uri = leftoverUri;
+    });
+    recorder.record.mockImplementationOnce(() => {
+      recorder.isRecording = true;
+      recorder.uri = leftoverUri;
+      recorderState = { ...recorderState, canRecord: true, isRecording: true };
     });
     await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
     recorder.isRecording = false;

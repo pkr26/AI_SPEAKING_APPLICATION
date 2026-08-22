@@ -803,6 +803,22 @@ const recorderEquivalentMutantGroups = Object.freeze([
   },
   {
     reason:
+      'recoverPending calls beginOperation only after operationIsInFlight synchronously proved the owner set empty. With no current owner or token, superseding and ordinary begin have identical admission and ownership effects, so the first false argument is redundant.',
+    mutants: [
+      [
+        '1220',
+        'BooleanLiteral',
+        'const operationToken = beginOperation(false, false);',
+        'true',
+        1520,
+        43,
+        1520,
+        48,
+      ],
+    ],
+  },
+  {
+    reason:
       'hasObservedRecordingRef is read only while recording. Every transition into recording resets it before publication, and these sites immediately leave or are outside that phase, so their additional false assignment cannot affect a later take.',
     mutants: [
       [
@@ -877,6 +893,16 @@ const recorderEquivalentMutantGroups = Object.freeze([
         1493,
         7,
         1493,
+        46,
+      ],
+      [
+        '2340',
+        'ConditionalExpression',
+        'currentRecorderRef.current === recorder &&',
+        'true',
+        2654,
+        7,
+        2654,
         46,
       ],
       [
@@ -1395,9 +1421,53 @@ const recorderEquivalentMutantGroups = Object.freeze([
   },
   {
     reason:
+      'After a permission prompt, identity, mount, focus, app activity, operation ownership, and the adopted lifecycle epoch are checked in correlated stages. Invalid context either returns or defers before native work, and the final isCurrentLifecycle guard repeats the full proof; weakening these earlier prompt guards cannot publish.',
+    mutants: [
+      [
+        '2187',
+        'ConditionalExpression',
+        'if (!identityIsCurrent() || !mountedRef.current || !focusedRef.current) {',
+        'false',
+        2503,
+        13,
+        2503,
+        56,
+      ],
+      [
+        '2188',
+        'LogicalOperator',
+        'if (!identityIsCurrent() || !mountedRef.current || !focusedRef.current) {',
+        '!identityIsCurrent() && !mountedRef.current',
+        2503,
+        13,
+        2503,
+        56,
+      ],
+      [
+        '2206',
+        'ConditionalExpression',
+        'if (!isCurrentLifecycle()) return;',
+        'false',
+        2518,
+        11,
+        2518,
+        32,
+      ],
+    ],
+  },
+  {
+    reason:
       'isCurrentLifecycle was checked immediately before this denied-permission branch and includes recorderContextIsActive, which proves mountedRef.current. The nested mounted condition is always true.',
     mutants: [
       ['2213', 'ConditionalExpression', 'if (mountedRef.current) {', 'true', 2520, 13, 2520, 31],
+    ],
+  },
+  {
+    reason:
+      'These branches are reached only after a lifecycle supersession made start stale. That lifecycle stop has already created the notifying audio-restore promise; restoreOwnedAudioMode returns the same in-flight promise before reading this notify argument, so false and true are identical.',
+    mutants: [
+      ['2258', 'BooleanLiteral', 'await restoreOwnedAudioMode(false);', 'true', 2563, 37, 2563, 42],
+      ['2266', 'BooleanLiteral', 'await restoreOwnedAudioMode(false);', 'true', 2578, 37, 2578, 42],
     ],
   },
   {
@@ -1430,6 +1500,22 @@ const recorderEquivalentMutantGroups = Object.freeze([
     reason:
       'After record succeeds, the remaining statements are non-throwing ref and Set updates plus guarded phase publication; the catch cannot observe prepared again. Its reset value is dead.',
     mutants: [['2290', 'BooleanLiteral', 'prepared = false;', 'true', 2611, 18, 2611, 23]],
+  },
+  {
+    reason:
+      'Start cleanup preserves the prior active URI whenever it is non-null, so activeUriRef equals previousUri in every recorded fallback case. If both are null, forcing only the equality true still leaves the trailing previousUri falsy and selects idle. The phase result is unchanged.',
+    mutants: [
+      [
+        '2311',
+        'ConditionalExpression',
+        "updatePhase(activeUriRef.current === previousUri && previousUri ? 'recorded' : 'idle');",
+        'true',
+        2630,
+        21,
+        2630,
+        57,
+      ],
+    ],
   },
   {
     reason:
@@ -1819,9 +1905,9 @@ const recorderEquivalentMutants = Object.freeze(
   ),
 );
 
-if (recorderReviewedMutantIds.size !== 178) {
+if (recorderReviewedMutantIds.size !== 186) {
   throw new Error(
-    `Recorder equivalence review has ${recorderReviewedMutantIds.size} mutants; expected 178`,
+    `Recorder equivalence review has ${recorderReviewedMutantIds.size} mutants; expected 186`,
   );
 }
 

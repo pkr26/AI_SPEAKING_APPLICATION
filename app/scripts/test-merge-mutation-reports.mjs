@@ -528,6 +528,89 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
   }
 });
 
+test('the Recorder review pins 186 equivalents without exempting sentinel kills or final gaps', () => {
+  const recorderEntries = equivalentMutants.filter(
+    (entry) => entry.file === 'src/components/Recorder.tsx',
+  );
+  const reviewedIds = recorderEntries.map((entry) => entry.reviewedMutantId);
+  assert.equal(recorderEntries.length, 186);
+  assert.equal(new Set(reviewedIds).size, 186, 'canonical Recorder IDs must be unique');
+  assert.ok(reviewedIds.every((id) => /^\d+$/u.test(id)));
+
+  const reclassifiedInvariantIds = ['1220', '2187', '2188', '2206', '2258', '2266', '2311', '2340'];
+  for (const id of reclassifiedInvariantIds) {
+    assert.ok(reviewedIds.includes(id), `reviewed invariant ${id} is missing`);
+  }
+
+  const sentinelKilledIds = [
+    '1317',
+    '1321',
+    '2238',
+    '2451',
+    '2453',
+    '2454',
+    '2834',
+    '2835',
+    '2836',
+  ];
+  const finalGapIds = ['891', '2268'];
+  const unexplainedOldCanonicalIds = [...sentinelKilledIds, ...finalGapIds];
+  assert.equal(unexplainedOldCanonicalIds.length, 11);
+  for (const id of unexplainedOldCanonicalIds) {
+    assert.equal(reviewedIds.includes(id), false, `mutant ${id} must remain unexplained`);
+  }
+
+  const formerBehavioralGapIds = [
+    '891',
+    '1220',
+    '1317',
+    '1321',
+    '2187',
+    '2188',
+    '2206',
+    '2238',
+    '2258',
+    '2266',
+    '2268',
+    '2311',
+    '2340',
+    '2451',
+    '2453',
+    '2454',
+    '2834',
+    '2835',
+    '2836',
+  ];
+  assert.deepEqual(
+    [...reclassifiedInvariantIds, ...unexplainedOldCanonicalIds].toSorted(),
+    formerBehavioralGapIds.toSorted(),
+  );
+
+  const simplificationIds = [
+    '2023',
+    '2025',
+    '2027',
+    '2029',
+    '2031',
+    '2032',
+    '2033',
+    '2034',
+    '2035',
+    '2037',
+    '2039',
+    '2040',
+    '2042',
+    '2045',
+    '2047',
+    '2050',
+  ];
+  for (const id of simplificationIds) {
+    const entry = recorderEntries.find((candidate) => candidate.reviewedMutantId === id);
+    assert.ok(entry, `reviewed simplification ${id} is missing`);
+    assert.match(entry.reason, /fixed two-element literal/u);
+  }
+});
+
 test('the strict gate rejects statuses that Stryker excludes from its own score', () => {
   for (const status of [
     'Survived',

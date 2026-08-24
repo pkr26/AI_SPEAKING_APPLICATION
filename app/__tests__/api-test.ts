@@ -88,6 +88,9 @@ class MockFormData {
 }
 
 const fetchMock = jest.fn();
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const MUTATION_WATCHDOG_MS = 500;
 
 globalThis.fetch = fetchMock as unknown as typeof fetch;
 globalThis.FormData = MockFormData as unknown as typeof FormData;
@@ -162,6 +165,40 @@ async function catchAsync(promise: Promise<unknown>): Promise<unknown> {
   }
 }
 
+function settleWithin<T>(promise: Promise<T>, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = nativeSetTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} did not settle within the mutation watchdog`));
+    }, MUTATION_WATCHDOG_MS);
+    void Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        nativeClearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        nativeClearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+async function captureWithin(promise: Promise<unknown>, label: string): Promise<unknown> {
+  try {
+    await settleWithin(promise, label);
+    return undefined;
+  } catch (error) {
+    return error;
+  }
+}
+
 function catchSync(run: () => unknown): unknown {
   try {
     run();
@@ -181,10 +218,145 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-beforeAll(() => {
+async function expectBarrierBeforeSettlement<T>(
+  barrier: Promise<void>,
+  operation: Promise<T>,
+): Promise<void> {
+  await Promise.race([
+    barrier,
+    Promise.resolve(operation).then(
+      () => {
+        throw new Error('operation settled before reaching the test barrier');
+      },
+      (error: unknown) => {
+        throw error;
+      },
+    ),
+  ]);
+}
+
+async function assertMutationLiveness(): Promise<void> {
+  const plainError = new api.ApiError(418, 'watchdog');
+  if (plainError.name !== 'ApiError' || plainError.status !== 418) {
+    throw new Error('ApiError constructor did not retain its required fields');
+  }
+  const detailedError = new api.ApiError(429, 'watchdog', 2, {
+    code: 'RATE_LIMITED',
+    retryAfterHours: 1,
+  });
+  if (detailedError.code !== 'RATE_LIMITED' || detailedError.retryAfterHours !== 1) {
+    throw new Error('ApiError constructor did not retain its optional fields');
+  }
+
+  await settleWithin(api.saveToken('watchdog-token'), 'token save');
+  if (mockSecureData.get('auth_token') !== 'watchdog-token') {
+    throw new Error('Token save did not reach secure storage');
+  }
+  const cleared = await settleWithin(api.clearToken('watchdog-token'), 'conditional token clear');
+  if (!cleared || mockSecureData.has('auth_token')) {
+    throw new Error('Conditional token clear did not remove its matching token');
+  }
+
+  fetchMock.mockResolvedValueOnce(fakeResponse({ json: async () => ({ alive: true }) }));
+  const success = await settleWithin(
+    api.apiFetch<{ alive: boolean }>('/mutation-watchdog/success', { timeoutMs: 100 }),
+    'successful response body',
+  );
+  if (success.alive !== true) throw new Error('Successful response body was not delivered');
+
+  fetchMock.mockResolvedValueOnce(
+    fakeResponse({
+      json: async () => {
+        throw new SyntaxError('invalid success JSON');
+      },
+    }),
+  );
+  const invalidBody = await captureWithin(
+    api.apiFetch('/mutation-watchdog/invalid-body', { timeoutMs: 100 }),
+    'rejected response body',
+  );
+  if (!(invalidBody instanceof api.ApiError) || invalidBody.status !== 502) {
+    throw new Error('Rejected response body did not become a 502 ApiError');
+  }
+
+  const bodyReadStarted = deferred<void>();
+  const caller = new AbortController();
+  const callerReason = new Error('watchdog caller abort');
+  fetchMock.mockResolvedValueOnce(
+    fakeResponse({
+      json: () => {
+        bodyReadStarted.resolve();
+        return new Promise(() => undefined);
+      },
+    }),
+  );
+  const abortedBody = api.apiFetch('/mutation-watchdog/body-abort', {
+    signal: caller.signal,
+    timeoutMs: 100,
+  });
+  await settleWithin(bodyReadStarted.promise, 'response body read start');
+  caller.abort(callerReason);
+  const bodyAbortError = await captureWithin(abortedBody, 'response body caller abort');
+  if (bodyAbortError !== callerReason) {
+    throw new Error('Response body caller abort did not preserve its reason');
+  }
+
+  fetchMock.mockResolvedValueOnce(fakeResponse({ json: () => new Promise(() => undefined) }));
+  const bodyTimeout = await captureWithin(
+    api.apiFetch('/mutation-watchdog/body-timeout', { timeoutMs: 10 }),
+    'response body timeout',
+  );
+  if (!(bodyTimeout instanceof api.ApiError) || bodyTimeout.status !== 408) {
+    throw new Error('Response body timeout did not produce a 408 ApiError');
+  }
+
+  fetchUntilAborted();
+  const transportTimeout = await captureWithin(
+    api.apiFetch('/mutation-watchdog/fetch-timeout', { timeoutMs: 10 }),
+    'fetch timeout',
+  );
+  if (!(transportTimeout instanceof api.ApiError) || transportTimeout.status !== 408) {
+    throw new Error('Fetch timeout did not produce a 408 ApiError');
+  }
+
+  const cursor = '550e8400-e29b-41d4-a716-446655440041';
+  fetchMock.mockResolvedValue(
+    fakeResponse({
+      json: async () => ({ user: PROFILE_USER, attempts: [{ id: 'a1' }], nextCursor: cursor }),
+    }),
+  );
+  let emittedPages = 0;
+  const repeatedCursor = await captureWithin(
+    api.apiConsumeUserDataPages(() => {
+      emittedPages += 1;
+      if (emittedPages > 1) throw new Error('Repeated cursor page reached the consumer');
+    }),
+    'repeated export cursor',
+  );
+  if (!(repeatedCursor instanceof ContractError) || emittedPages !== 1) {
+    throw new Error('Repeated export cursor was not rejected before its second page');
+  }
+}
+
+beforeAll(async () => {
   setEnv(undefined);
   setDev(true);
   api = require('../src/lib/api') as ApiModule;
+  let preflightPassed = false;
+  try {
+    await assertMutationLiveness();
+    preflightPassed = true;
+  } finally {
+    mockSecureData.clear();
+    fetchMock.mockReset();
+    if (!preflightPassed) {
+      // A stalled token operation can leave the old module's serialized queue
+      // pending forever. Detach it before Jest processes the failed hook; all
+      // late promise outcomes remain observed by settleWithin.
+      api.setUnauthorizedHandler(null);
+      api = importFreshApi();
+    }
+  }
 });
 
 afterEach(async () => {
@@ -350,7 +522,7 @@ describe('token storage', () => {
       });
 
     const saving = api.saveToken('jwt-new');
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, saving);
     const staleCleanup = api.clearToken('jwt-old');
 
     expect(SecureStore.deleteItemAsync).not.toHaveBeenCalled();
@@ -376,7 +548,7 @@ describe('token storage', () => {
     fetchMock.mockResolvedValue(fakeResponse());
 
     const saving = api.saveToken('jwt-new');
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, saving);
     const request = api.apiFetch('/me');
     await Promise.resolve();
     const callsBeforeRelease = fetchMock.mock.calls.length;
@@ -403,7 +575,7 @@ describe('token storage', () => {
     fetchMock.mockResolvedValue(fakeResponse());
 
     const clearing = api.clearToken('jwt-old');
-    await deleteStarted.promise;
+    await expectBarrierBeforeSettlement(deleteStarted.promise, clearing);
     const request = api.apiFetch('/me');
     await Promise.resolve();
     const callsBeforeRelease = fetchMock.mock.calls.length;
@@ -624,6 +796,7 @@ describe('apiFetch', () => {
     const [input, init] = fetchMock.mock.calls[0];
     expect(input).toBe('http://localhost:4000/health');
     expect(init.method).toBe('GET');
+    expect(init.cache).toBe('no-store');
     expect(init.headers).toEqual({ 'Content-Type': 'application/json' });
     expect(init.body).toBeUndefined();
     expect(init.signal).toBeInstanceOf(AbortSignal);
@@ -735,7 +908,7 @@ describe('apiFetch', () => {
 
     try {
       const request = api.apiFetch('/budgeted', { timeoutMs: 100 });
-      await fetchStarted.promise;
+      await expectBarrierBeforeSettlement(fetchStarted.promise, request);
       jest.advanceTimersByTime(40);
       response.resolve(fakeResponse());
       await request;
@@ -786,7 +959,7 @@ describe('apiFetch', () => {
         timeoutMs: 60_000,
       }),
     );
-    await jsonStarted.promise;
+    await expectBarrierBeforeSettlement(jsonStarted.promise, request);
     caller.abort(reason);
     jsonBody.resolve({ late: true });
     await expect(request).resolves.toBe(reason);
@@ -886,7 +1059,7 @@ describe('apiFetch', () => {
     });
 
     const request = fresh.apiFetch('/me', { onRequestStarted });
-    await tokenReadStarted.promise;
+    await expectBarrierBeforeSettlement(tokenReadStarted.promise, request);
 
     expect(onRequestStarted).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -1002,6 +1175,20 @@ describe('apiFetch', () => {
     expect(json).not.toHaveBeenCalled();
   });
 
+  it('requires an exact expected success status when the caller specifies one', async () => {
+    const json = jest.fn(async () => ({ accepted: true }));
+    fetchMock.mockResolvedValue(fakeResponse({ status: 200, json }));
+
+    await expect(api.apiFetch('/gone', { expectedStatus: 204 })).rejects.toMatchObject({
+      status: 502,
+      message: 'The server returned an invalid response',
+    });
+    expect(json).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(fakeResponse({ status: 204 }));
+    await expect(api.apiFetch('/gone', { expectedStatus: 204 })).resolves.toBeUndefined();
+  });
+
   it('maps a non-JSON success body to a 502 ApiError', async () => {
     fetchMock.mockResolvedValue(
       fakeResponse({
@@ -1063,7 +1250,7 @@ describe('apiFetch', () => {
         signal: controller.signal,
         timeoutMs: 100,
       });
-      await fetchStarted.promise;
+      await expectBarrierBeforeSettlement(fetchStarted.promise, request);
       controller.abort(new Error('learner cancelled'));
       jest.advanceTimersByTime(100);
       transport.reject(platformAbort);
@@ -1089,7 +1276,7 @@ describe('apiFetch', () => {
       const request = catchAsync(
         api.apiFetch('/timeout-wins', { signal: caller.signal, timeoutMs: 100 }),
       );
-      await fetchStarted.promise;
+      await expectBarrierBeforeSettlement(fetchStarted.promise, request);
       jest.advanceTimersByTime(100);
       caller.abort(new Error('later learner cancellation'));
       transport.reject(platformFailure);
@@ -1141,6 +1328,25 @@ describe('apiFetch', () => {
     expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
     addSpy.mockRestore();
     removeSpy.mockRestore();
+  });
+
+  it('does not let throwing abort-listener cleanup strand a completed body read', async () => {
+    const caller = new AbortController();
+    const removeSpy = jest.spyOn(caller.signal, 'removeEventListener').mockImplementation(() => {
+      throw new Error('host signal cleanup failed');
+    });
+    fetchMock.mockResolvedValueOnce(fakeResponse({ json: async () => ({ ok: true }) }));
+
+    try {
+      await expect(
+        api.apiFetch('/hostile-signal-cleanup', { signal: caller.signal }),
+      ).resolves.toEqual({
+        ok: true,
+      });
+      expect(removeSpy).toHaveBeenCalledWith('abort', expect.any(Function));
+    } finally {
+      removeSpy.mockRestore();
+    }
   });
 
   it('removes a completed 204 request timeout and abort listener', async () => {
@@ -1374,6 +1580,87 @@ describe('error response parsing', () => {
     );
 
     it.each([
+      ['body', {}, { retryAfterSeconds: 7 }, 7],
+      ['header', { 'Retry-After': '9' }, { retryAfterSeconds: 7 }, 9],
+      ['upper bound', {}, { retryAfterSeconds: 121 }, undefined],
+    ])(
+      'bounds REQUEST_IN_FLIGHT Retry-After from the %s',
+      async (_case, headers, body, expected) => {
+        fetchMock.mockResolvedValue(
+          fakeResponse({
+            ok: false,
+            status: 409,
+            headers,
+            json: async () => ({ code: 'REQUEST_IN_FLIGHT', ...body }),
+          }),
+        );
+
+        const error = (await catchAsync(api.apiFetch('/practice/attempt'))) as ApiErrorInstance;
+
+        expect(error).toMatchObject({ status: 409, code: 'REQUEST_IN_FLIGHT' });
+        expect(error.retryAfterSeconds).toBe(expected);
+      },
+    );
+
+    it('ignores a retry hint on an unrelated 409', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 409,
+          headers: { 'Retry-After': '7' },
+          json: async () => ({ code: 'STATE_CHANGED', retryAfterSeconds: 7 }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/practice/attempt'))) as ApiErrorInstance;
+
+      expect(error).toMatchObject({ status: 409, code: 'STATE_CHANGED' });
+      expect(error.retryAfterSeconds).toBeUndefined();
+    });
+
+    it('keeps REQUEST_IN_FLIGHT seconds-only when the body also claims hours', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 409,
+          json: async () => ({
+            code: 'REQUEST_IN_FLIGHT',
+            retryAfterSeconds: 2,
+            retryAfterHours: 48,
+          }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/practice/attempt'))) as ApiErrorInstance;
+
+      expect(error).toMatchObject({
+        status: 409,
+        code: 'REQUEST_IN_FLIGHT',
+        retryAfterSeconds: 2,
+        retryAfterHours: undefined,
+      });
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.stillChecking')} ${t('wait.seconds', { count: 2 })}`,
+      );
+    });
+
+    it('ignores REQUEST_IN_FLIGHT retry hints on a non-409 response', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({
+          ok: false,
+          status: 400,
+          headers: { 'Retry-After': '7' },
+          json: async () => ({ code: 'REQUEST_IN_FLIGHT', retryAfterSeconds: 9 }),
+        }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/practice/attempt'))) as ApiErrorInstance;
+
+      expect(error).toMatchObject({ status: 400, code: 'REQUEST_IN_FLIGHT' });
+      expect(error.retryAfterSeconds).toBeUndefined();
+    });
+
+    it.each([
       [120, 120],
       [121, undefined],
     ])(
@@ -1442,6 +1729,37 @@ describe('error response parsing', () => {
       expect(error).toMatchObject({ status: 503, message: 'Request failed with status 503' });
       expect(error.retryAfterSeconds).toBeUndefined();
       expect(error.retryAfterHours).toBeUndefined();
+    });
+
+    it('does not trust properties attached to a callable error body', async () => {
+      const callableBody = Object.assign(() => undefined, {
+        code: 'RATE_LIMITED',
+        retryAfterSeconds: 30,
+      });
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, json: async () => callableBody }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error.code).toBeUndefined();
+      expect(error.retryAfterSeconds).toBeUndefined();
+    });
+
+    it('keeps a primitive 429 body retry-free instead of dereferencing it', async () => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ ok: false, status: 429, json: async () => 'rate limited' }),
+      );
+
+      const error = (await catchAsync(api.apiFetch('/limited'))) as ApiErrorInstance;
+
+      expect(error).toBeInstanceOf(api.ApiError);
+      expect(error).toMatchObject({
+        status: 429,
+        code: undefined,
+        retryAfterSeconds: undefined,
+        retryAfterHours: undefined,
+      });
     });
 
     it('ignores retry hints on statuses outside the 429/503 contract', async () => {
@@ -2275,7 +2593,7 @@ describe('apiPostPresignedAudio', () => {
         maxBytes,
         { signal: caller.signal, timeoutMs: 100 },
       );
-      await uploadStarted.promise;
+      await expectBarrierBeforeSettlement(uploadStarted.promise, request);
       caller.abort(new Error('learner cancelled'));
       jest.advanceTimersByTime(100);
       upload.reject(platformAbort);
@@ -2308,7 +2626,7 @@ describe('apiPostPresignedAudio', () => {
           { signal: caller.signal, timeoutMs: 100 },
         ),
       );
-      await uploadStarted.promise;
+      await expectBarrierBeforeSettlement(uploadStarted.promise, request);
       jest.advanceTimersByTime(100);
       caller.abort(new Error('later learner cancellation'));
       upload.reject(platformFailure);
@@ -2914,8 +3232,23 @@ describe('typed endpoint helpers', () => {
     );
   });
 
-  it('apiExportUserData walks every page and combines the attempts', async () => {
+  it.each([
+    ['apiSkipPracticeWord', () => api.apiSkipPracticeWord(HISTORY_ITEM.questionId)],
+    ['apiForgotPassword', () => api.apiForgotPassword('ada@example.com')],
+    [
+      'apiResetPassword',
+      () => api.apiResetPassword('ada@example.com', 'abcdef123456', 'NewPass123'),
+    ],
+    ['apiRestartDiagnostic', () => api.apiRestartDiagnostic()],
+  ])('%s rejects a non-204 success response', async (_name, call) => {
+    fetchMock.mockResolvedValue(fakeResponse({ status: 200 }));
+
+    await expect(call()).rejects.toMatchObject({ status: 502 });
+  });
+
+  it('apiConsumeUserDataPages emits each validated page without combining them', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const consumePage = jest.fn();
     fetchMock
       .mockResolvedValueOnce(
         fakeResponse({
@@ -2936,24 +3269,69 @@ describe('typed endpoint helpers', () => {
         }),
       );
 
-    await expect(api.apiExportUserData()).resolves.toEqual({
-      user: PROFILE_USER,
-      attempts: [{ id: 'a1' }, { id: 'a2' }],
-    });
+    await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
+    expect(consumePage).toHaveBeenNthCalledWith(
+      1,
+      { user: PROFILE_USER, attempts: [{ id: 'a1' }], nextCursor: cursor },
+      0,
+    );
+    expect(consumePage).toHaveBeenNthCalledWith(
+      2,
+      { user: PROFILE_USER, attempts: [{ id: 'a2' }], nextCursor: null },
+      1,
+    );
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      'http://localhost:4000/auth/me/data',
+      'http://localhost:4000/auth/me/data?limit=500',
       expect.anything(),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      `http://localhost:4000/auth/me/data?cursor=${cursor}`,
+      `http://localhost:4000/auth/me/data?limit=500&cursor=${cursor}`,
       expect.anything(),
     );
   });
 
-  it('apiExportUserData pins its initiating token across every page', async () => {
+  it('apiConsumeUserDataPages emits an empty terminal page', async () => {
+    const consumePage = jest.fn();
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }),
+      }),
+    );
+
+    await api.apiConsumeUserDataPages(consumePage);
+
+    expect(consumePage).toHaveBeenCalledWith(
+      { user: PROFILE_USER, attempts: [], nextCursor: null },
+      0,
+    );
+  });
+
+  it('apiConsumeUserDataPages stops before another request when its consumer fails', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const failure = new Error('file write failed');
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          user: PROFILE_USER,
+          attempts: [{ id: 'a1' }],
+          nextCursor: cursor,
+        }),
+      }),
+    );
+
+    await expect(
+      api.apiConsumeUserDataPages(() => {
+        throw failure;
+      }),
+    ).rejects.toBe(failure);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('apiConsumeUserDataPages pins its initiating token across every page', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const consumePage = jest.fn();
     await api.saveToken('jwt-export-owner');
     fetchMock
       .mockResolvedValueOnce(
@@ -2978,10 +3356,8 @@ describe('typed endpoint helpers', () => {
         }),
       );
 
-    await expect(api.apiExportUserData()).resolves.toEqual({
-      user: PROFILE_USER,
-      attempts: [{ id: 'a1' }, { id: 'a2' }],
-    });
+    await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
+    expect(consumePage).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls.map(([, init]) => init.headers.Authorization)).toEqual([
       'Bearer jwt-export-owner',
       'Bearer jwt-export-owner',
@@ -2989,8 +3365,9 @@ describe('typed endpoint helpers', () => {
     await expect(api.getToken()).resolves.toBe('jwt-new-session');
   });
 
-  it('apiExportUserData rejects pages that claim a different account', async () => {
+  it('apiConsumeUserDataPages rejects a foreign-account page before emitting it', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const consumePage = jest.fn();
     fetchMock
       .mockResolvedValueOnce(
         fakeResponse({
@@ -3011,8 +3388,9 @@ describe('typed endpoint helpers', () => {
         }),
       );
 
-    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumePage).toHaveBeenCalledTimes(1);
   });
 
   // A screen that unmounts mid-request must be able to cancel the read, so the
@@ -3023,7 +3401,10 @@ describe('typed endpoint helpers', () => {
       'apiGetPracticeHistory',
       (signal: AbortSignal) => api.apiGetPracticeHistory(undefined, signal),
     ],
-    ['apiExportUserData', (signal: AbortSignal) => api.apiExportUserData(signal)],
+    [
+      'apiConsumeUserDataPages',
+      (signal: AbortSignal) => api.apiConsumeUserDataPages(jest.fn(), signal),
+    ],
   ])('%s forwards the caller abort signal to the request', async (_name, call) => {
     const controller = new AbortController();
     const reason = new Error('screen left');
@@ -3039,14 +3420,15 @@ describe('typed endpoint helpers', () => {
     expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
   });
 
-  it('apiExportUserData stops walking at the page cap instead of trusting the server', async () => {
+  it('apiConsumeUserDataPages rejects an excessive cursor before emitting page 10,000', async () => {
     // Distinct cursors forever: only the page bound can end this walk.
     const exportCursor = (page: number) =>
       `550e8400-e29b-41d4-a716-${String(page).padStart(12, '0')}`;
     let calls = 0;
+    const consumePage = jest.fn();
     fetchMock.mockImplementation(async () => {
       calls += 1;
-      if (calls > 600) throw new Error('the export walk never stopped');
+      if (calls > 10_100) throw new Error('the export walk never stopped');
       return fakeResponse({
         json: async () => ({
           user: PROFILE_USER,
@@ -3056,16 +3438,47 @@ describe('typed endpoint helpers', () => {
       });
     });
 
-    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
     // EXPORT_MAX_PAGES pages are fetched, and not one page more.
-    expect(fetchMock).toHaveBeenCalledTimes(500);
-    expect(fetchMock.mock.calls[499][0]).toBe(
-      `http://localhost:4000/auth/me/data?cursor=${exportCursor(499)}`,
+    expect(fetchMock).toHaveBeenCalledTimes(10_000);
+    expect(fetchMock.mock.calls[9_999][0]).toBe(
+      `http://localhost:4000/auth/me/data?limit=500&cursor=${exportCursor(9_999)}`,
     );
-  });
+    expect(consumePage).toHaveBeenCalledTimes(9_999);
+  }, 30_000);
 
-  it('apiExportUserData aborts on a repeated cursor instead of spinning forever', async () => {
+  it('apiConsumeUserDataPages accepts an exactly 10,000-page terminal walk', async () => {
+    const exportCursor = (page: number) =>
+      `550e8400-e29b-41d4-a716-${String(page).padStart(12, '0')}`;
+    let calls = 0;
+    fetchMock.mockImplementation(async () => {
+      calls += 1;
+      return fakeResponse({
+        json: async () => ({
+          user: PROFILE_USER,
+          attempts: calls === 10_000 ? [] : [{ id: `a${calls}` }],
+          nextCursor: calls === 10_000 ? null : exportCursor(calls),
+        }),
+      });
+    });
+    const consumePage = jest.fn();
+
+    await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(10_000);
+    expect(consumePage).toHaveBeenCalledTimes(10_000);
+    expect(consumePage).toHaveBeenLastCalledWith(
+      { user: PROFILE_USER, attempts: [], nextCursor: null },
+      9_999,
+    );
+  }, 30_000);
+
+  it('apiConsumeUserDataPages rejects a repeated cursor before emitting the cyclic page', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440042';
+    let emittedPages = 0;
+    const consumePage = jest.fn(() => {
+      emittedPages += 1;
+      if (emittedPages > 1) throw new Error('Cyclic page reached the consumer');
+    });
     fetchMock.mockResolvedValue(
       fakeResponse({
         json: async () => ({
@@ -3076,8 +3489,9 @@ describe('typed endpoint helpers', () => {
       }),
     );
 
-    await expect(api.apiExportUserData()).rejects.toBeInstanceOf(ContractError);
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
     // First page + the page fetched with the repeated cursor.
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumePage).toHaveBeenCalledTimes(1);
   });
 });

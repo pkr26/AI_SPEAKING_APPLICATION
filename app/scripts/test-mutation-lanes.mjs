@@ -41,6 +41,28 @@ function lanes(definition) {
   );
 }
 
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+async function withTimeout(promise, message) {
+  let timeout;
+  try {
+    await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), 2_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function expectManifestProblem(options, expectedFragment) {
   await assert.rejects(
     () => assertMutationLaneManifest(options),
@@ -230,10 +252,13 @@ test('declaration files and non-TypeScript sources are not expected to have lane
   assert.deepEqual(result.testFiles, ['__tests__/a-test.ts']);
 });
 
-async function fixtureMutationRunnerApp() {
+async function fixtureMutationRunnerApp(additionalLaneNames = []) {
   return fixtureAppDir(
     [...mutationSharedInputFiles, ...mutationLanes.recorder.mutate],
-    [...mutationLanes.recorder.testFiles],
+    [
+      ...mutationLanes.recorder.testFiles,
+      ...additionalLaneNames.flatMap((laneName) => mutationLanes[laneName].testFiles),
+    ],
   );
 }
 
@@ -244,13 +269,14 @@ test('runMutation writes provenance only after a successful lane report', async 
   const reportDir = path.join(appDir, 'reports');
   t.after(() => fs.rm(appDir, { recursive: true, force: true }));
   let observedParallelLanes;
+  let mergedParallelLanes;
   const result = await runMutation({
     appDir,
     reportDir,
     environment: { MUTATION_PARALLEL_LANES: '9' },
     laneNames: ['recorder'],
     parallelLanes: 2,
-    merge: false,
+    merge: true,
     validateManifest: async () => {},
     runLane: async ({ environment }) => {
       observedParallelLanes = environment.MUTATION_PARALLEL_LANES;
@@ -258,10 +284,23 @@ test('runMutation writes provenance only after a successful lane report', async 
       await fs.writeFile(path.join(reportDir, 'recorder.json'), '{}');
       return 0;
     },
+    mergeReports: async ({ environment }) => {
+      mergedParallelLanes = environment.MUTATION_PARALLEL_LANES;
+      return {
+        summary: {
+          strictMutationGatePassed: true,
+          mutantCount: 0,
+          laneCount: 1,
+          mutationScore: null,
+          staticMutants: 0,
+        },
+      };
+    },
   });
 
   assert.equal(result.exitCode, 0);
-  assert.equal(observedParallelLanes, '1');
+  assert.equal(observedParallelLanes, '2');
+  assert.equal(mergedParallelLanes, '2');
   const provenance = JSON.parse(
     await fs.readFile(mutationLaneProvenancePath(reportDir, 'recorder'), 'utf8'),
   );
@@ -273,7 +312,7 @@ test('runMutation writes provenance only after a successful lane report', async 
       appDir,
       lanes: mutationLanes,
       laneNames: ['recorder'],
-      environment: { MUTATION_PARALLEL_LANES: '1' },
+      environment: { MUTATION_PARALLEL_LANES: '2' },
     }),
   );
   await assert.rejects(
@@ -363,63 +402,189 @@ test('a failed Recorder pass preserves prior canonical artifacts and blocks app 
   }
 });
 
-test('a stopped Recorder pass prevents later mutation lanes from starting', async (t) => {
-  t.mock.method(console, 'log', () => {});
-  t.mock.method(console, 'error', () => {});
-  const appDir = await fixtureMutationRunnerApp();
-  const reportDir = path.join(appDir, 'reports');
-  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
-  const started = [];
-  const result = await runMutation({
-    appDir,
-    reportDir,
-    environment: {},
-    laneNames: ['recorder', 'api'],
-    parallelLanes: 1,
-    merge: false,
-    validateManifest: async () => {},
-    runLane: async ({ environment, laneName }) => {
-      assert.equal(environment.MUTATION_PARALLEL_LANES, '1');
-      started.push(laneName);
-      return laneName === 'recorder' ? 143 : 0;
-    },
+for (const stopExitCode of [130, 143]) {
+  test(`a stopped Recorder pass (${stopExitCode}) starts no sibling lanes`, async (t) => {
+    t.mock.method(console, 'log', () => {});
+    t.mock.method(console, 'error', () => {});
+    const appDir = await fixtureMutationRunnerApp(['api', 'types']);
+    const reportDir = path.join(appDir, 'reports');
+    t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+    const started = [];
+    const result = await runMutation({
+      appDir,
+      reportDir,
+      environment: {},
+      // Recorder must still run first even when the caller puts it in the middle.
+      laneNames: ['api', 'recorder', 'types'],
+      parallelLanes: 2,
+      merge: false,
+      validateManifest: async () => {},
+      runLane: async ({ environment, laneName }) => {
+        assert.equal(environment.MUTATION_PARALLEL_LANES, '2');
+        started.push(laneName);
+        return laneName === 'recorder' ? stopExitCode : 0;
+      },
+    });
+    assert.equal(result.exitCode, 1);
+    assert.deepEqual(started, ['recorder']);
+    assert.deepEqual(result.failedLanes, [{ laneName: 'recorder', exitCode: stopExitCode }]);
   });
-  assert.equal(result.exitCode, 1);
-  assert.deepEqual(started, ['recorder']);
-  assert.deepEqual(result.failedLanes, [{ laneName: 'recorder', exitCode: 143 }]);
-});
+}
 
-test('Recorder serializes outer lanes even when parallel lanes were requested', async (t) => {
+test('Recorder runs alone first, then ordinary lanes use the requested parallelism', async (t) => {
   t.mock.method(console, 'log', () => {});
   t.mock.method(console, 'error', () => {});
-  const appDir = await fixtureMutationRunnerApp();
+  const appDir = await fixtureMutationRunnerApp(['api', 'types']);
   const reportDir = path.join(appDir, 'reports');
   t.after(() => fs.rm(appDir, { recursive: true, force: true }));
-  await fs.writeFile(path.join(appDir, '__tests__/api-test.ts'), '');
-  let active = 0;
-  let maxActive = 0;
+  const ordinaryEntered = deferred();
+  const releaseOrdinary = deferred();
+  let activeOrdinary = 0;
+  let maxActiveOrdinary = 0;
+  let recorderFinished = false;
   const started = [];
-  const result = await runMutation({
+  const running = runMutation({
     appDir,
     reportDir,
     environment: {},
-    laneNames: ['recorder', 'api'],
+    laneNames: ['api', 'recorder', 'types'],
     parallelLanes: 2,
     merge: false,
     validateManifest: async () => {},
     runLane: async ({ environment, laneName }) => {
-      assert.equal(environment.MUTATION_PARALLEL_LANES, '1');
+      assert.equal(environment.MUTATION_PARALLEL_LANES, '2');
+      started.push(laneName);
+      await fs.mkdir(reportDir, { recursive: true });
+      if (laneName === 'recorder') {
+        assert.equal(activeOrdinary, 0);
+        recorderFinished = true;
+      } else {
+        assert.equal(recorderFinished, true);
+        activeOrdinary += 1;
+        maxActiveOrdinary = Math.max(maxActiveOrdinary, activeOrdinary);
+        if (activeOrdinary === 2) ordinaryEntered.resolve();
+        await releaseOrdinary.promise;
+        activeOrdinary -= 1;
+      }
+      await fs.writeFile(path.join(reportDir, `${laneName}.json`), '{}');
+      return 0;
+    },
+  });
+
+  let barrierError;
+  try {
+    await withTimeout(ordinaryEntered.promise, 'ordinary lanes did not overlap');
+  } catch (error) {
+    barrierError = error;
+  }
+  releaseOrdinary.resolve();
+  const result = await running;
+  if (barrierError) throw barrierError;
+
+  assert.equal(result.exitCode, 0);
+  assert.equal(started[0], 'recorder');
+  assert.deepEqual(new Set(started.slice(1)), new Set(['api', 'types']));
+  assert.equal(maxActiveOrdinary, 2);
+});
+
+test('a normal Recorder failure still runs the remaining lanes', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp(['api']);
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const started = [];
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['api', 'recorder'],
+    parallelLanes: 2,
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async ({ laneName }) => {
+      started.push(laneName);
+      return 1;
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(started, ['recorder', 'api']);
+  assert.deepEqual(result.failedLanes, [
+    { laneName: 'recorder', exitCode: 1 },
+    { laneName: 'api', exitCode: 1 },
+  ]);
+});
+
+test('an ordinary lane failure continues through the remaining queue', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp(['api', 'types']);
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const started = [];
+  const result = await runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['api', 'types'],
+    parallelLanes: 1,
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async ({ laneName }) => {
+      started.push(laneName);
+      return 1;
+    },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.deepEqual(started, ['api', 'types']);
+});
+
+test('campaigns without Recorder still run ordinary lanes in parallel', async (t) => {
+  t.mock.method(console, 'log', () => {});
+  t.mock.method(console, 'error', () => {});
+  const appDir = await fixtureMutationRunnerApp(['api', 'types']);
+  const reportDir = path.join(appDir, 'reports');
+  t.after(() => fs.rm(appDir, { recursive: true, force: true }));
+  const bothEntered = deferred();
+  const release = deferred();
+  let active = 0;
+  let maxActive = 0;
+  const started = [];
+  const running = runMutation({
+    appDir,
+    reportDir,
+    environment: {},
+    laneNames: ['api', 'types'],
+    parallelLanes: 2,
+    merge: false,
+    validateManifest: async () => {},
+    runLane: async ({ environment, laneName }) => {
+      assert.equal(environment.MUTATION_PARALLEL_LANES, '2');
       started.push(laneName);
       active += 1;
       maxActive = Math.max(maxActive, active);
-      await new Promise((resolve) => setImmediate(resolve));
+      if (active === 2) bothEntered.resolve();
+      await release.promise;
       active -= 1;
       return 1;
     },
   });
+
+  let barrierError;
+  try {
+    await withTimeout(bothEntered.promise, 'ordinary lanes did not run in parallel');
+  } catch (error) {
+    barrierError = error;
+  }
+  release.resolve();
+  const result = await running;
+  if (barrierError) throw barrierError;
+
   assert.equal(result.exitCode, 1);
-  assert.equal(maxActive, 1);
-  assert.deepEqual(started, ['recorder', 'api']);
+  assert.deepEqual(new Set(started), new Set(['api', 'types']));
+  assert.equal(maxActive, 2);
 });
 
 test('runMutation fails when an unmutated production dependency changes during a lane', async (t) => {

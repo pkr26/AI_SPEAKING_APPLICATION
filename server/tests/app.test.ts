@@ -214,12 +214,36 @@ describe('app wiring', () => {
     const { res: first } = await registerUser(a);
     const { res: second } = await registerUser(a);
     const requestId = randomUUID();
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    const question = await pool.query<{
+      id: string;
+      cefr_level: string;
+      prompt_word: string;
+      question_text: string;
+    }>('SELECT id, cefr_level, prompt_word, question_text FROM questions LIMIT 1');
+    const q = question.rows[0];
+    const storedResponse = {
+      passed: true,
+      mastered: true,
+      attemptNo: 1,
+      score: 81,
+      transcript: 'A complete stored answer.',
+      feedback: 'Clear and relevant.',
+      next: {
+        question: {
+          id: q.id,
+          cefrLevel: q.cefr_level,
+          promptWord: q.prompt_word,
+          questionText: q.question_text,
+        },
+        kind: 'new',
+        progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 100, dueCount: 1 },
+      },
+    };
     await pool.query(
       `INSERT INTO assessment_requests
          (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at)
        VALUES ($1, $2, $3, 'practice', $4, 'completed', $5, now())`,
-      [first.body.user.id, requestId, randomUUID(), question.rows[0].id, { score: 81 }],
+      [first.body.user.id, requestId, randomUUID(), q.id, storedResponse],
     );
 
     const completed = await request(a)
@@ -229,9 +253,9 @@ describe('app wiring', () => {
     expect(completed.headers['cache-control']).toBe('no-store');
     expect(completed.body).toEqual({
       status: 'completed',
-      response: { score: 81 },
+      response: storedResponse,
       context: 'practice',
-      questionId: question.rows[0].id,
+      questionId: q.id,
     });
 
     const otherUser = await request(a)

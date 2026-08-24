@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
@@ -11,6 +11,7 @@ import { I18nProvider, setActiveLanguage, translateFor, type MessageKey } from '
 import type { usePracticeFlow } from '../src/lib/practice-flow';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { PracticeStats, User } from '../src/lib/types';
+import { useHardwareBack } from '../src/lib/use-hardware-back';
 
 // Under jest no I18nProvider is mounted, so the screen falls back to English.
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
@@ -26,6 +27,7 @@ interface MockFocusRegistration {
 }
 
 const mockHomeFocusRegistrations: MockFocusRegistration[] = [];
+let mockHomeAutoFocus = true;
 
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
@@ -42,7 +44,7 @@ jest.mock('expo-router', () => {
       ReactActual.useEffect(() => {
         const registration = { callback, cleanup: null as (() => void) | null };
         mockHomeFocusRegistrations.push(registration);
-        const cleanup = callback();
+        const cleanup = mockHomeAutoFocus ? callback() : undefined;
         registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
         return () => {
           registration.cleanup?.();
@@ -143,6 +145,16 @@ let backHandlers: (() => boolean)[];
 
 const queryClients: QueryClient[] = [];
 
+beforeAll(() => {
+  // Keep query notifications in the operation's controlled act() turn. This
+  // avoids coverage-mode timer batching publishing a Home update between tests.
+  notifyManager.setScheduler((notify) => notify());
+});
+
+afterAll(() => {
+  notifyManager.setScheduler((notify) => setTimeout(notify, 0));
+});
+
 function makeQueryClient() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   queryClients.push(client);
@@ -156,6 +168,11 @@ function renderHome(queryClient?: QueryClient) {
       <HomeScreen />
     </QueryClientProvider>,
   );
+}
+
+function HardwareBackHarness({ consume }: { consume: boolean }) {
+  useHardwareBack(() => consume);
+  return null;
 }
 
 /** Renders inside the real provider, so the screen translates like a te account. */
@@ -243,6 +260,7 @@ beforeEach(() => {
   // clearAllMocks keeps recorded return values, so re-arm the default here.
   mockRouter.canGoBack.mockReturnValue(false);
   mockHomeFocusRegistrations.length = 0;
+  mockHomeAutoFocus = true;
   backHandlers = [];
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
     backHandlers.push(handler as () => boolean);
@@ -301,6 +319,38 @@ describe('home screen', () => {
     await rendered.rerender(tree());
 
     expect(captureSessionLease).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses the current auth lease for navigation after a same-mounted session change', async () => {
+    const leaseA = { owner: 'home-a' } as never;
+    const leaseB = { owner: 'home-b' } as never;
+    let currentLease = leaseA;
+    const captureSessionLease = jest.fn(() => currentLease);
+    const isSessionLeaseCurrent = jest.fn((lease: unknown) => lease === currentLease);
+    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
+    mockGetStats.mockResolvedValue(STATS);
+    const queryClient = makeQueryClient();
+    const tree = () => (
+      <QueryClientProvider client={queryClient}>
+        <HomeScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    await screen.findByText('B1');
+
+    currentLease = leaseB;
+    mockAuthValue = makeAuth({
+      sessionVersion: 2,
+      captureSessionLease,
+      isSessionLeaseCurrent,
+    });
+    await rendered.rerender(tree());
+    mockRouter.navigate.mockClear();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('home.startPractice') }));
+
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/practice');
   });
 
   it('shows a retryable error when stats cannot load', async () => {
@@ -607,6 +657,41 @@ describe('home screen', () => {
     });
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
+  });
+
+  it('fails closed until the focus lifecycle grants navigation ownership', async () => {
+    mockHomeAutoFocus = false;
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+
+    await fireEvent.press(screen.getByRole('button', { name: t('home.startPractice') }));
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await focusHome();
+    await fireEvent.press(screen.getByRole('button', { name: t('home.startPractice') }));
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/practice');
+  });
+
+  it('keeps one hardware-back subscription while invoking the latest handler', async () => {
+    const remove = jest.fn();
+    let subscribedHandler: (() => boolean) | undefined;
+    jest.mocked(BackHandler.addEventListener).mockImplementation((_event, handler) => {
+      subscribedHandler = handler as () => boolean;
+      return { remove };
+    });
+
+    const rendered = await render(<HardwareBackHarness consume={false} />);
+    expect(BackHandler.addEventListener).toHaveBeenCalledTimes(1);
+    expect(subscribedHandler?.()).toBe(false);
+
+    await rendered.rerender(<HardwareBackHarness consume />);
+    expect(BackHandler.addEventListener).toHaveBeenCalledTimes(1);
+    expect(subscribedHandler?.()).toBe(true);
+
+    await rendered.unmount();
+    expect(remove).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a queued navigation after blur and accepts it after refocus', async () => {

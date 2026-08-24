@@ -35,12 +35,12 @@ export async function registerUser(a: Express, overrides: Record<string, unknown
   return { res, body };
 }
 
-/** Attach a valid-audio multipart form with the given questionId. */
-export function answerForm(req: request.Test, questionId: string) {
+/** Attach a valid-audio multipart form with the given questionId/requestId. */
+export function answerForm(req: request.Test, questionId: string, requestId = randomUUID()) {
   return req
     .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
     .field('questionId', questionId)
-    .field('requestId', randomUUID());
+    .field('requestId', requestId);
 }
 
 /**
@@ -50,14 +50,30 @@ export function answerForm(req: request.Test, questionId: string) {
 export async function completeDiagnostic(a: Express, token: string): Promise<string> {
   for (let i = 0; i < 5; i++) {
     const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
-    if (next.body.done) return next.body.level;
-    const questionId = next.body.question.id;
+    if (next.status !== 200) {
+      throw new Error(`diagnostic next failed: ${next.status} ${JSON.stringify(next.body)}`);
+    }
+    if (next.body.done) {
+      if (typeof next.body.level !== 'string') {
+        throw new Error(`diagnostic completion omitted its level: ${JSON.stringify(next.body)}`);
+      }
+      return next.body.level;
+    }
+    const questionId = next.body?.question?.id;
+    if (typeof questionId !== 'string') {
+      throw new Error(`diagnostic next omitted its question: ${JSON.stringify(next.body)}`);
+    }
     const res = await answerForm(
       request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
       questionId,
     );
     if (res.status !== 200) throw new Error(`diagnostic answer failed: ${res.status} ${JSON.stringify(res.body)}`);
-    if (res.body.done) return res.body.level;
+    if (res.body.done) {
+      if (typeof res.body.level !== 'string') {
+        throw new Error(`diagnostic answer completion omitted its level: ${JSON.stringify(res.body)}`);
+      }
+      return res.body.level;
+    }
   }
   throw new Error('diagnostic did not finish within 5 answers');
 }

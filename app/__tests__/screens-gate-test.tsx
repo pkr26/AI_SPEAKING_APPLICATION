@@ -938,6 +938,52 @@ describe('index gate', () => {
     expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
   });
 
+  it('recaptures the lease when its capture function changes during one profile request', async () => {
+    let resolveProfile!: (value: unknown) => void;
+    const profileRequest = new Promise<unknown>((resolve) => {
+      resolveProfile = resolve;
+    });
+    const leaseA = { owner: 'gate-a' } as never;
+    const leaseB = { owner: 'gate-b' } as never;
+    let currentLease: unknown = leaseA;
+    const captureA = jest.fn(() => leaseA);
+    const captureB = jest.fn(() => leaseB);
+    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
+    const firstSetUser = jest.fn();
+    mockAuthValue = makeAuth({
+      user: null,
+      setUser: firstSetUser,
+      captureSessionLease: captureA,
+      isSessionLeaseCurrent,
+    });
+    mockApiFetch.mockReturnValue(profileRequest);
+    const rendered = await renderGate();
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(captureA).toHaveBeenCalledTimes(1);
+
+    const replacementSetUser = jest.fn();
+    currentLease = leaseB;
+    mockAuthValue = makeAuth({
+      user: null,
+      setUser: replacementSetUser,
+      captureSessionLease: captureB,
+      isSessionLeaseCurrent,
+    });
+    await rendered.rerenderGate();
+    expect(mockApiFetch).toHaveBeenCalledTimes(1);
+    expect(captureB).toHaveBeenCalledTimes(1);
+
+    const currentProfile = { ...USER, name: 'Current Lease' };
+    await act(async () => {
+      resolveProfile({ user: currentProfile });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(replacementSetUser).toHaveBeenCalledWith(currentProfile));
+    expect(firstSetUser).not.toHaveBeenCalled();
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
+  });
+
   it('does not commit or route from /auth/me after the render-captured lease expires', async () => {
     let resolveProfile!: (value: unknown) => void;
     const profile = new Promise<unknown>((resolve) => {

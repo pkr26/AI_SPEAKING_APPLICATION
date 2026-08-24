@@ -498,6 +498,7 @@ describe('logout', () => {
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/logout', {
       method: 'POST',
       expireSessionOn401: false,
+      expectedStatus: 204,
     });
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
@@ -1031,6 +1032,7 @@ describe('deleteAccount', () => {
       method: 'DELETE',
       body: { password: 'secret1' },
       expireSessionOn401: false,
+      expectedStatus: 204,
     });
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);

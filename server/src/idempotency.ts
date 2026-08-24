@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
+import { z } from 'zod';
 import { pool } from './db';
 import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
+import { logger } from './logger';
 import { ApiErrorCode, HttpError } from './middleware';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
@@ -20,6 +22,227 @@ interface RequestRow {
   question_id: string;
   status: 'processing' | 'completed';
   response_body: Record<string, unknown> | null;
+}
+
+function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
+  const CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
+  const PRACTICE_MAX_ATTEMPTS = 3;
+  const PRACTICE_PASS_SCORE = 60;
+  const PRACTICE_MASTER_SCORE = 75;
+  const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+  const absent = z.undefined().optional();
+  const boundedString = (maximum: number) => z.string().max(maximum);
+  const nonEmptyString = (maximum: number) =>
+    z
+      .string()
+      .max(maximum)
+      .refine((value) => value.trim().length > 0);
+  const integer = (minimum: number, maximum: number) => z.number().finite().int().min(minimum).max(maximum);
+
+  const uuid = z.string().regex(UUID_PATTERN);
+  const cefrLevel = z.enum(CEFR_LEVELS);
+  const attemptNumber = integer(1, PRACTICE_MAX_ATTEMPTS);
+  const failingScore = integer(0, PRACTICE_PASS_SCORE - 1);
+  const passingScore = integer(PRACTICE_PASS_SCORE, 100);
+  const learningPassScore = integer(PRACTICE_PASS_SCORE, PRACTICE_MASTER_SCORE - 1);
+  const masteryScore = integer(PRACTICE_MASTER_SCORE, 100);
+
+  const question = z.object({
+    id: uuid,
+    cefrLevel,
+    promptWord: nonEmptyString(100),
+    questionText: nonEmptyString(1_000),
+  });
+
+  const wordBankCount = integer(0, 100_000);
+  const practiceProgress = z
+    .object({
+      masteredCount: wordBankCount,
+      learningCount: wordBankCount,
+      totalAtLevel: integer(1, 100_000),
+      dueCount: wordBankCount.optional(),
+    })
+    .refine(({ masteredCount, learningCount, totalAtLevel }) => masteredCount + learningCount <= totalAtLevel)
+    .refine(
+      ({ masteredCount, learningCount, dueCount }) =>
+        dueCount === undefined || dueCount <= masteredCount + learningCount,
+    );
+
+  const practiceQuestionPayload = z.object({
+    question,
+    kind: z.enum(['revision', 'new']),
+    progress: practiceProgress,
+  });
+
+  const levelUp = z.union([
+    z.object({ from: z.literal('A1'), to: z.literal('A2') }),
+    z.object({ from: z.literal('A2'), to: z.literal('B1') }),
+    z.object({ from: z.literal('B1'), to: z.literal('B2') }),
+    z.object({ from: z.literal('B2'), to: z.literal('C1') }),
+    z.object({ from: z.literal('C1'), to: z.literal('C2') }),
+  ]);
+
+  const diagnosticOutcome = z.union([
+    z.object({
+      passed: z.literal(false),
+      score: failingScore,
+      transcript: boundedString(12_000),
+      feedback: nonEmptyString(800),
+    }),
+    z.object({
+      passed: z.literal(true),
+      score: passingScore,
+      transcript: boundedString(12_000),
+      feedback: nonEmptyString(800),
+    }),
+  ]);
+  const diagnosticCompletion = z.discriminatedUnion('done', [
+    z.object({ done: z.literal(true), level: cefrLevel, nextQuestion: absent }),
+    z.object({ done: z.literal(false), level: absent, nextQuestion: question }),
+  ]);
+  const diagnosticResponse = z.intersection(diagnosticOutcome, diagnosticCompletion);
+
+  const commonPracticeFields = {
+    attemptNo: attemptNumber,
+    feedback: nonEmptyString(800),
+  } as const;
+  const noConditionalPracticeFields = {
+    noSpeech: absent,
+    attemptsLeft: absent,
+    finalFeedback: absent,
+    levelUp: absent,
+  } as const;
+
+  const silenceResponse = z
+    .object({
+      ...commonPracticeFields,
+      passed: z.literal(false),
+      mastered: z.literal(false),
+      score: z.literal(0),
+      transcript: z.literal(''),
+      noSpeech: z.literal(true),
+      attemptsLeft: integer(1, PRACTICE_MAX_ATTEMPTS),
+      finalFeedback: absent,
+      next: absent,
+      levelUp: absent,
+    })
+    .refine(({ attemptNo, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - (attemptNo - 1));
+
+  const retryResponse = z
+    .object({
+      ...commonPracticeFields,
+      passed: z.literal(false),
+      mastered: z.literal(false),
+      score: failingScore,
+      transcript: nonEmptyString(12_000),
+      noSpeech: absent,
+      attemptsLeft: attemptNumber,
+      finalFeedback: absent,
+      next: absent,
+      levelUp: absent,
+    })
+    .refine(({ attemptNo, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - attemptNo);
+
+  const terminalResponse = z.object({
+    ...commonPracticeFields,
+    passed: z.literal(false),
+    mastered: z.literal(false),
+    score: failingScore,
+    transcript: nonEmptyString(12_000),
+    noSpeech: absent,
+    attemptsLeft: z.literal(0),
+    finalFeedback: nonEmptyString(4_000),
+    next: practiceQuestionPayload,
+    levelUp: absent,
+  });
+
+  const learningPassResponse = z.object({
+    ...commonPracticeFields,
+    ...noConditionalPracticeFields,
+    passed: z.literal(true),
+    mastered: z.literal(false),
+    score: learningPassScore,
+    transcript: nonEmptyString(12_000),
+    next: practiceQuestionPayload,
+  });
+
+  const masteryResponse = z.object({
+    ...commonPracticeFields,
+    ...noConditionalPracticeFields,
+    passed: z.literal(true),
+    mastered: z.literal(true),
+    score: masteryScore,
+    transcript: nonEmptyString(12_000),
+    next: practiceQuestionPayload,
+  });
+
+  const promotionResponse = z
+    .object({
+      ...commonPracticeFields,
+      noSpeech: absent,
+      attemptsLeft: absent,
+      finalFeedback: absent,
+      passed: z.literal(true),
+      mastered: z.literal(true),
+      score: masteryScore,
+      transcript: nonEmptyString(12_000),
+      next: practiceQuestionPayload,
+      levelUp,
+    })
+    .refine(({ levelUp: promotion, next }) => next.question.cefrLevel === promotion.to);
+
+  const practiceResponse = z.union([
+    silenceResponse,
+    retryResponse,
+    terminalResponse,
+    learningPassResponse,
+    masteryResponse,
+    promotionResponse,
+  ]);
+
+  const nativeCommonFields = {
+    mode: z.literal('native'),
+    feedback: nonEmptyString(800),
+  } as const;
+  const nativeResponse = z.union([
+    z.object({
+      ...nativeCommonFields,
+      understood: z.literal(false),
+      transcript: z.literal(''),
+      modelAnswer: z.literal(''),
+    }),
+    z.object({
+      ...nativeCommonFields,
+      understood: z.boolean(),
+      transcript: nonEmptyString(12_000),
+      modelAnswer: nonEmptyString(800),
+    }),
+  ]);
+
+  return {
+    diagnostic: diagnosticResponse,
+    practice: practiceResponse,
+    'practice-native': nativeResponse,
+  };
+}
+
+/**
+ * Validate durable JSONB before it crosses the database-to-client boundary.
+ * Internal writers are expected to produce these exact discriminated shapes,
+ * but a manual data repair or future writer drift must fail closed as a 500
+ * instead of making the app consume an impossible completed response.
+ */
+export function validatedAssessmentResponse(
+  context: AssessmentContext,
+  response: Record<string, unknown>,
+): Record<string, unknown> {
+  const valid = createResponseSchemas()[context].safeParse(response).success;
+  if (!valid) {
+    logger.error({ context }, 'stored assessment response failed its public contract');
+    throw new HttpError(500, 'Stored assessment response is invalid', 'INTERNAL');
+  }
+  return response;
 }
 
 export type AssessmentRequestClaim =
@@ -128,8 +351,9 @@ export async function claimAssessmentRequest(
       throw new HttpError(409, 'Assessment request identifier was already used', 'REQUEST_ID_REUSED');
     }
     if (row.status === 'completed' && row.response_body) {
+      const response = validatedAssessmentResponse(row.context, row.response_body);
       await client.query('COMMIT');
-      return { kind: 'completed', response: row.response_body };
+      return { kind: 'completed', response };
     }
     throw new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
       retryAfterSeconds: 2,
@@ -148,12 +372,15 @@ export async function completeAssessmentRequest(
   requestId: string,
   claimId: string,
   response: Record<string, unknown>,
+  context: AssessmentContext,
 ): Promise<void> {
+  const validatedResponse = validatedAssessmentResponse(context, response);
   const completed = (await client.query(
     `UPDATE assessment_requests
      SET status = 'completed', response_body = $1::jsonb, completed_at = now()
-     WHERE user_id = $2 AND request_id = $3 AND claim_id = $4 AND status = 'processing'`,
-    [JSON.stringify(response), userId, requestId, claimId],
+     WHERE user_id = $2 AND request_id = $3 AND claim_id = $4
+       AND context = $5 AND status = 'processing'`,
+    [JSON.stringify(validatedResponse), userId, requestId, claimId, context],
   )) as { rowCount?: number | null };
   if (completed.rowCount !== 1) {
     throw new HttpError(409, 'Assessment request ownership changed; please retry', 'STATE_CHANGED');
@@ -210,7 +437,12 @@ export async function getAssessmentRequestStatus(
   const row = rows[0];
   if (!row) return undefined;
   if (row.status === 'completed' && row.response_body) {
-    return { status: 'completed', context: row.context, questionId: row.question_id, response: row.response_body };
+    return {
+      status: 'completed',
+      context: row.context,
+      questionId: row.question_id,
+      response: validatedAssessmentResponse(row.context, row.response_body),
+    };
   }
   return { status: 'processing', context: row.context, questionId: row.question_id };
 }

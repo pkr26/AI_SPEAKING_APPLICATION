@@ -229,7 +229,7 @@ async function finalizeDiagnosticAnswer(
       body = { ...body, done: false, nextQuestion };
     }
 
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, body);
+    await completeAssessmentRequest(client, userId, requestId, requestClaimId, body, 'diagnostic');
     await client.query('COMMIT');
     return body;
   } catch (err) {

@@ -225,8 +225,11 @@ describe('GET /practice/stats', () => {
     const { token, userId } = await freshUser();
     const [q] = await someQuestions(1);
     await insertAttempt(userId, q.id, 5, { context: 'diagnostic' });
-    await insertAttempt(userId, q.id, 60);
-    await insertAttempt(userId, q.id, 10);
+    // This assertion is about context filtering, not elapsed time. Keep both
+    // practice rows on the current UTC day even when the suite runs during the
+    // first hour after midnight.
+    await insertAttempt(userId, q.id, 0);
+    await insertAttempt(userId, q.id, 0);
 
     const r = await request(a).get('/practice/stats').set('Authorization', `Bearer ${token}`);
 

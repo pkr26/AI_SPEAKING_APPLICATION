@@ -38,6 +38,23 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+async function expectBarrierBeforeSettlement<T>(
+  barrier: Promise<void>,
+  operation: Promise<T>,
+): Promise<void> {
+  await Promise.race([
+    barrier,
+    Promise.resolve(operation).then(
+      () => {
+        throw new Error('operation settled before reaching the test barrier');
+      },
+      (error: unknown) => {
+        throw error;
+      },
+    ),
+  ]);
+}
+
 const pending: PendingAssessment = {
   ownerId: '550e8400-e29b-41d4-a716-446655440000',
   endpoint: '/practice/attempt',
@@ -819,7 +836,7 @@ describe('pending assessment edge cases', () => {
     const candidate = { ...pending, stage: 'prepared' as const };
 
     const creating = mod.ensurePendingAssessment(candidate, generation);
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, creating);
     const clearing = mod.clearPendingAssessment();
     allowWrite.resolve();
 
@@ -858,7 +875,7 @@ describe('pending assessment edge cases', () => {
     });
 
     const saving = mod.savePendingAssessment(pending);
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, saving);
     const clearing = mod.clearPendingAssessment(pending.requestId);
 
     expect(storageEvents).toEqual(['save-started']);
@@ -886,7 +903,7 @@ describe('pending assessment edge cases', () => {
       });
 
     const firstClaim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
-    await claimWriteStarted.promise;
+    await expectBarrierBeforeSettlement(claimWriteStarted.promise, firstClaim);
     const secondClaim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
 
     expect(secureStore.setItemAsync).toHaveBeenCalledTimes(2); // Initial save plus first claim.
@@ -921,7 +938,7 @@ describe('pending assessment edge cases', () => {
       });
 
     const claim = mod.claimPendingAssessmentRecoveryPost(pending.requestId);
-    await claimWriteStarted.promise;
+    await expectBarrierBeforeSettlement(claimWriteStarted.promise, claim);
     const refund = mod.refundPendingAssessmentRecoveryPost(pending.requestId);
 
     expect(storageEvents).toEqual(['claim-started']);
@@ -994,7 +1011,7 @@ describe('pending assessment edge cases', () => {
       });
 
     const saving = mod.savePendingAssessment(pending);
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, saving);
     const cancelling = mod.markPendingAssessmentCancelled(pending.requestId);
 
     expect(storageEvents).toEqual(['save-started']);
@@ -1026,7 +1043,7 @@ describe('pending assessment edge cases', () => {
       });
 
     const savingReplacement = mod.savePendingAssessment(replacement);
-    await writeStarted.promise;
+    await expectBarrierBeforeSettlement(writeStarted.promise, savingReplacement);
     const cancellingStaleRequest = mod.markPendingAssessmentCancelled(pending.requestId);
     allowWrite.resolve();
 
@@ -1062,7 +1079,7 @@ describe('pending assessment edge cases', () => {
       });
 
     const cancelling = mod.markPendingAssessmentCancelled(pending.requestId);
-    await cancellationStarted.promise;
+    await expectBarrierBeforeSettlement(cancellationStarted.promise, cancelling);
     const savingReplacement = mod.savePendingAssessment(replacement);
 
     expect(storageEvents).toEqual(['cancel-started']);

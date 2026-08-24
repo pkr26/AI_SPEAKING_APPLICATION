@@ -116,6 +116,9 @@ describe('practice stuck cases', () => {
 
   async function freshUser() {
     const { res } = await registerUser(a);
+    if (res.status !== 201 || typeof res.body?.token !== 'string' || typeof res.body?.user?.id !== 'string') {
+      throw new Error(`practice setup registration failed: ${res.status} ${JSON.stringify(res.body)}`);
+    }
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
     const level = await completeDiagnostic(a, token);
@@ -127,6 +130,9 @@ describe('practice stuck cases', () => {
       'SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id LIMIT 1',
       [level],
     );
+    if (typeof rows[0]?.id !== 'string') {
+      throw new Error(`practice setup found no question for level ${JSON.stringify(level)}`);
+    }
     return rows[0].id;
   }
 

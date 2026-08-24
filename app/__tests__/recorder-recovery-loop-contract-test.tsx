@@ -7,6 +7,7 @@ import { AccessibilityInfo, AppState, Platform } from 'react-native';
 
 import Recorder from '../src/components/Recorder';
 import {
+  ApiError,
   apiFetch,
   apiPostPresignedAudio,
   apiRequestAudioUpload,
@@ -159,7 +160,7 @@ async function flushMicrotasks(turns = 20): Promise<void> {
   await flushMicrotasks(turns - 1);
 }
 
-function pendingRecord(): PendingAssessment {
+function pendingRecord(overrides: Partial<PendingAssessment> = {}): PendingAssessment {
   return {
     ownerId: OWNER_ID,
     endpoint: ENDPOINT,
@@ -167,6 +168,7 @@ function pendingRecord(): PendingAssessment {
     requestId: REQUEST_ID,
     createdAt: Date.now(),
     stage: 'direct-posting',
+    ...overrides,
   };
 }
 
@@ -242,6 +244,70 @@ afterEach(async () => {
 // This bounded recovery harness runs as its own Stryker pass; later component
 // suites cannot convert its decisive result into a shared-state timeout.
 describe('Recorder recovery-loop mutation contract', () => {
+  it('keeps the ordinary two-second poll delay after a hintless in-flight conflict', async () => {
+    jest.useFakeTimers();
+    const audioKey = `audio-uploads/${OWNER_ID}/${REQUEST_ID}.m4a`;
+    asMock(loadPendingAssessment).mockResolvedValue(
+      pendingRecord({ stage: 's3-granted', audioKey }),
+    );
+    for (let index = 0; index < 6; index += 1) {
+      asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+    }
+    asMock(apiFetch).mockImplementationOnce(
+      async (_path: string, options?: { onRequestStarted?: () => void }): Promise<never> => {
+        options?.onRequestStarted?.();
+        throw new ApiError(409, 'processing', undefined, { code: 'REQUEST_IN_FLIGHT' });
+      },
+    );
+    asMock(apiFetch).mockResolvedValueOnce({
+      status: 'completed',
+      context: 'practice',
+      questionId: QUESTION_ID,
+      response: { score: 81 },
+    });
+    const onResult = jest.fn();
+    let view: Awaited<ReturnType<typeof render>> | undefined;
+    try {
+      view = await render(
+        <Recorder
+          ownerId={OWNER_ID}
+          questionId={QUESTION_ID}
+          endpoint={ENDPOINT}
+          parseResult={(value) => ({ parsed: value })}
+          onResult={onResult}
+          onError={jest.fn()}
+          onRecoveryUnresolved={jest.fn()}
+        />,
+      );
+      await act(async () => flushMicrotasks());
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+
+      for (let index = 0; index < 5; index += 1) {
+        await act(async () => {
+          jest.advanceTimersByTime(2_000);
+          await flushMicrotasks();
+        });
+      }
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1_999);
+        await flushMicrotasks();
+      });
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await flushMicrotasks();
+      });
+      expect(apiFetch).toHaveBeenCalledTimes(8);
+      expect(onResult).toHaveBeenCalledWith({ parsed: { score: 81 } });
+    } finally {
+      await view?.unmount();
+      jest.useRealTimers();
+    }
+  });
+
   it('bounds a self-deferred recovery to one completed read and one controlled second read', async () => {
     const secondLoad = deferred<PendingAssessment | null>();
     let secondLoadObserved = false;

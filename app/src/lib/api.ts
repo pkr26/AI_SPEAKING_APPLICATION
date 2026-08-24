@@ -18,6 +18,7 @@ import {
   type NativeLanguage,
   type PracticeStats,
   type User,
+  type UserDataPage,
 } from './types';
 
 const TOKEN_KEY = 'auth_token';
@@ -342,10 +343,20 @@ function parseRetryAfterSecondsHeader(
   return boundedSeconds(Number(header), maxSeconds);
 }
 
-// The 503 backpressure contract (assess semaphore, pool shed) promises a small
-// bounded delay; 429 rate/daily limits may legitimately ask for much longer.
+function removeAbortListener(signal: AbortSignal | undefined, listener: () => void): void {
+  try {
+    signal?.removeEventListener('abort', listener);
+  } catch {
+    // Listener cleanup is best effort. A nonstandard signal must never mask
+    // or strand an otherwise settled request, body read, or native upload.
+  }
+}
+
+// The 409 in-flight and 503 backpressure contracts promise small bounded
+// delays; 429 rate/daily limits may legitimately ask for much longer.
 const MAX_RETRY_AFTER_SECONDS_503 = 120;
 const MAX_RETRY_AFTER_SECONDS_429 = 24 * 60 * 60;
+const MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT = 120;
 const MAX_RETRY_AFTER_HOURS = 48;
 
 /**
@@ -377,7 +388,7 @@ function readResponseBody<T>(
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
-      externalSignal?.removeEventListener('abort', abortFromCaller);
+      removeAbortListener(externalSignal, abortFromCaller);
       callback();
     };
     const abortFromCaller = () => {
@@ -427,7 +438,7 @@ async function throwForStatus(
   // Do not forward server or upstream-provider error bodies into the UI. The
   // only fields read are the machine-readable `code` (mapped to localized
   // copy by userMessageForError) and the bounded, non-sensitive retry delays
-  // that drive the 429/503 "please wait" contract.
+  // that drive the 409/429/503 "please wait" contracts.
   let body: unknown;
   try {
     body = await readJsonBody(res, timeoutMs, externalSignal);
@@ -443,12 +454,25 @@ async function throwForStatus(
 
   let retryAfterSeconds: number | undefined;
   let retryAfterHours: number | undefined;
-  if (res.status === 503 || res.status === 429) {
+  if (
+    res.status === 503 ||
+    res.status === 429 ||
+    (res.status === 409 && code === 'REQUEST_IN_FLIGHT')
+  ) {
     const maxSeconds =
-      res.status === 503 ? MAX_RETRY_AFTER_SECONDS_503 : MAX_RETRY_AFTER_SECONDS_429;
+      res.status === 429
+        ? MAX_RETRY_AFTER_SECONDS_429
+        : res.status === 503
+          ? MAX_RETRY_AFTER_SECONDS_503
+          : MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT;
     retryAfterSeconds =
       parseRetryAfterSecondsHeader(res.headers.get('Retry-After'), maxSeconds) ??
       boundedSeconds(record?.retryAfterSeconds, maxSeconds);
+  }
+  // Only rate/daily-limit responses define an hours-scale retry contract.
+  // REQUEST_IN_FLIGHT is deliberately seconds-only even if a malformed peer
+  // attaches both fields.
+  if (res.status === 429) {
     const hours = record?.retryAfterHours;
     if (
       typeof hours === 'number' &&
@@ -519,7 +543,7 @@ async function fetchWithTimeout(
     throw new ApiError(0, 'Could not connect to the server. Check your connection and try again.');
   } finally {
     clearTimeout(timeout);
-    externalSignal?.removeEventListener('abort', abortFromCaller);
+    removeAbortListener(externalSignal, abortFromCaller);
   }
 }
 
@@ -539,6 +563,8 @@ interface ApiFetchOptions {
   expireSessionOn401?: boolean;
   /** Called immediately before the request can reach the API. */
   onRequestStarted?: () => void;
+  /** Require one exact successful HTTP status before accepting the response. */
+  expectedStatus?: number;
 }
 
 function handleUnauthorized(status: number, token: string | null, enabled: boolean): void {
@@ -570,6 +596,9 @@ async function apiFetchWithToken<T>(
       // closed instead of relying on platform-specific redirect behavior to
       // strip that credential before crossing an origin boundary.
       redirect: 'error',
+      // Never let a platform cache turn an API GET into a conditional request
+      // whose raw 304 has no JSON body for the endpoint contract to parse.
+      cache: 'no-store',
       headers: {
         'Content-Type': 'application/json',
         ...clientVersionHeader(),
@@ -586,6 +615,9 @@ async function apiFetchWithToken<T>(
   if (!res.ok) {
     handleUnauthorized(res.status, token, options.expireSessionOn401 !== false);
     await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+  }
+  if (options.expectedStatus !== undefined && res.status !== options.expectedStatus) {
+    throw new ApiError(502, 'The server returned an invalid response');
   }
   if (res.status === 204) return undefined as T;
   try {
@@ -857,7 +889,7 @@ export async function apiPostPresignedAudio(
       throw new ApiError(0, 'Could not upload the recording');
     } finally {
       clearTimeout(timeout);
-      options.signal?.removeEventListener('abort', abortFromCaller);
+      removeAbortListener(options.signal, abortFromCaller);
     }
     if (result.status < 200 || result.status >= 300) {
       throw new ApiError(result.status, `Request failed with status ${result.status}`);
@@ -928,6 +960,7 @@ export async function apiSkipPracticeWord(questionId: string): Promise<void> {
   await apiFetch<void>('/practice/skip', {
     method: 'POST',
     body: { questionId },
+    expectedStatus: 204,
   });
 }
 
@@ -937,6 +970,7 @@ export async function apiForgotPassword(email: string): Promise<void> {
     method: 'POST',
     body: { email },
     auth: false,
+    expectedStatus: 204,
   });
 }
 
@@ -949,6 +983,7 @@ export async function apiResetPassword(
     method: 'POST',
     body: { email, token, newPassword },
     auth: false,
+    expectedStatus: 204,
   });
 }
 
@@ -970,41 +1005,59 @@ export async function apiRestartDiagnostic(): Promise<void> {
   await apiFetch<void>('/diagnostic/restart', {
     method: 'POST',
     body: { confirm: true },
+    expectedStatus: 204,
   });
 }
 
 // The export walker refuses to loop forever on a server that keeps handing
-// out cursors; the server caps each page at 100 rows, so 500 pages bound the
-// walk at 50k attempt rows — far beyond any real account.
-const EXPORT_MAX_PAGES = 500;
+// out cursors. Requesting the server maximum of 500 rows and allowing 10,000
+// pages bounds one export at 5,000,000 attempt rows and 10,000 requests.
+const EXPORT_PAGE_LIMIT = 500;
+const EXPORT_MAX_PAGES = 10_000;
+
+export type UserDataPageConsumer = (page: UserDataPage, pageIndex: number) => void | Promise<void>;
 
 /**
- * Walks every page of GET /auth/me/data and returns the combined export.
- * Repeated or excessive cursors abort as contract errors instead of spinning.
+ * Walks GET /auth/me/data under one pinned bearer token and hands each fully
+ * validated page to the caller. The walker retains only cursor identities;
+ * consumers can stream each at-most-500-row page without accumulating the
+ * account's lifetime history in RAM.
  */
-export async function apiExportUserData(
+export async function apiConsumeUserDataPages(
+  consumePage: UserDataPageConsumer,
   signal?: AbortSignal,
-): Promise<{ user: User; attempts: Record<string, unknown>[] }> {
+): Promise<void> {
   // An export is one logical read even though it spans many HTTP requests.
   // Pin the initiating session so a logout/new login cannot silently switch
   // accounts between pages.
   const token = await tokenForRequest();
-  const attempts: Record<string, unknown>[] = [];
-  let user: User | null = null;
+  let userId: string | null = null;
   let cursor: string | null = null;
   const seenCursors = new Set<string>();
   for (let page = 0; page < EXPORT_MAX_PAGES; page += 1) {
-    const cursorParam: string = cursor ? `?cursor=${encodeURIComponent(cursor)}` : '';
+    const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
     const data = parseUserDataPage(
-      await apiFetchWithToken<unknown>(`/auth/me/data${cursorParam}`, { signal }, token),
+      await apiFetchWithToken<unknown>(
+        `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}${cursorParam}`,
+        { signal },
+        token,
+      ),
     );
-    if (user && data.user.id !== user.id) throw new ContractError();
-    user ??= data.user;
-    attempts.push(...data.attempts);
-    if (data.nextCursor === null) return { user, attempts };
-    if (seenCursors.has(data.nextCursor)) throw new ContractError();
-    seenCursors.add(data.nextCursor);
-    cursor = data.nextCursor;
+    if (userId !== null && data.user.id !== userId) throw new ContractError();
+    userId ??= data.user.id;
+    const nextCursor = data.nextCursor;
+    if (nextCursor !== null) {
+      // A next page beyond this one would exceed the explicit 10,000-request
+      // bound. Reject before emitting this page so an invalid walk cannot make
+      // an externally visible partial export look complete.
+      if (page === EXPORT_MAX_PAGES - 1 || seenCursors.has(nextCursor)) {
+        throw new ContractError();
+      }
+      seenCursors.add(nextCursor);
+    }
+    await consumePage(data, page);
+    if (nextCursor === null) return;
+    cursor = nextCursor;
   }
   throw new ContractError();
 }

@@ -25,9 +25,13 @@ const BCRYPT_COST = 12;
 const BCRYPT_MAX_BYTES = 72;
 const MAX_NAME_LENGTH = 100;
 const MAX_EMAIL_LENGTH = 254;
+
 // A real cost-12 hash keeps the unknown-email login path comparable to a
 // normal bcrypt verification without corresponding to any user password.
-const DUMMY_BCRYPT_HASH = '$2b$12$uHmk0Jtqi.9oe6f8E8sIMuNV0ECcPhIheggvbpHkSlO/6IXNNQzFu';
+function dummyBcryptHash(): string {
+  return '$2b$12$uHmk0Jtqi.9oe6f8E8sIMuNV0ECcPhIheggvbpHkSlO/6IXNNQzFu';
+}
+
 /** 16 random bytes rendered as 32 lowercase hex characters. */
 const RESET_TOKEN_BYTES = 16;
 const RESET_TOKEN_TTL_MINUTES = 30;
@@ -224,7 +228,7 @@ export function createAuthRouter(limiters: Limiters) {
       const user = rows[0];
       // Always verify, even when the account budget is exhausted: an attacker
       // saturating it must not lock out the real owner (see rate-limit.ts).
-      const validPassword = await bcrypt.compare(password, user?.password_hash ?? DUMMY_BCRYPT_HASH);
+      const validPassword = await bcrypt.compare(password, user ? user.password_hash : dummyBcryptHash());
       if (!user || !validPassword) {
         if (res.locals.loginAccountThrottled) {
           throw new HttpError(429, 'Too many login attempts, please try again later');

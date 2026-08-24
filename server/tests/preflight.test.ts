@@ -15,15 +15,42 @@ vi.mock('pg', () => ({
 }));
 
 import { preflight, runPreflightCommand } from '../db/preflight';
+import { REQUIRED_CEFR_LEVELS } from '../src/question-inventory';
 
 const DATABASE_URL = 'postgres://localhost:5432/preflight_test';
+const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
 const CHECK_NAMES = [
   'invalid users',
   'duplicate question natural keys',
-  'invalid questions',
+  'invalid question metadata',
   'invalid attempts',
   'invalid diagnostic states',
 ] as const;
+
+function inventoryRow(cefr_level: string, prompt_word = 'word') {
+  const translation = {
+    word: 'translation',
+    question: 'Translated question?',
+    examples: Array.from({ length: 3 }, () => ({ en: 'English example.', native: 'Native example.' })),
+  };
+  return {
+    id: QUESTION_ID,
+    cefr_level,
+    prompt_word,
+    question_text: 'Answer this question.',
+    translations: { te: translation, hi: translation, es: translation, zh: translation },
+  };
+}
+
+function healthyInventory() {
+  return REQUIRED_CEFR_LEVELS.flatMap((level) => Array.from({ length: 100 }, () => inventoryRow(level)));
+}
+
+function mockPreflightQueries(counts: readonly number[] = CHECK_NAMES.map(() => 0), inventory = healthyInventory()) {
+  query.mockResolvedValueOnce({ rows: [] });
+  for (const count of counts) query.mockResolvedValueOnce({ rows: [{ n: count }] });
+  query.mockResolvedValueOnce({ rows: inventory });
+}
 
 beforeEach(() => {
   clientConstructor.mockClear();
@@ -34,9 +61,11 @@ beforeEach(() => {
 
 describe('database integrity preflight', () => {
   it('runs every bounded read-only integrity check and always closes the client', async () => {
-    query.mockResolvedValue({ rows: [{ n: 0 }] });
+    vi.resetModules();
+    const { preflight: freshPreflight } = await import('../db/preflight');
+    mockPreflightQueries();
 
-    await expect(preflight(DATABASE_URL)).resolves.toBeUndefined();
+    await expect(freshPreflight(DATABASE_URL)).resolves.toBeUndefined();
 
     expect(clientConstructor).toHaveBeenCalledWith({
       connectionString: DATABASE_URL,
@@ -44,34 +73,35 @@ describe('database integrity preflight', () => {
     });
     expect(connect).toHaveBeenCalledOnce();
     expect(query.mock.calls[0]).toEqual(["SET statement_timeout = '60s'"]);
-    expect(query).toHaveBeenCalledTimes(6);
-    const integritySql = query.mock.calls.slice(1).map(([sql]) => String(sql));
+    expect(query).toHaveBeenCalledTimes(7);
+    const integritySql = query.mock.calls.slice(1, 6).map(([sql]) => String(sql));
     expect(integritySql).toHaveLength(5);
     expect(integritySql[0]).toContain('token_version <= 0');
     expect(integritySql[0]).toContain('diagnostic_completed AND cefr_level IS NULL');
+    expect(integritySql[0]).toContain("btrim(name, U&'\\0009");
+    expect(integritySql[0]).toContain("btrim(email, U&'\\0009");
+    expect(integritySql[0]).toContain('\\00A0');
+    expect(integritySql[0]).toContain('\\FEFF');
     expect(integritySql[1]).toContain('GROUP BY cefr_level, prompt_word HAVING count(*) > 1');
-    expect(integritySql[2]).toContain("translations ?& ARRAY['te', 'hi', 'es', 'zh']");
-    expect(integritySql[2]).toContain("unnest(ARRAY['te', 'hi', 'es', 'zh'])");
-    expect(integritySql[2]).toContain("jsonb_typeof(payload.translation->'word') IS DISTINCT FROM 'string'");
-    expect(integritySql[2]).toContain("char_length(payload.translation->>'word') > 500");
-    expect(integritySql[2]).toContain("btrim(payload.translation->>'question') = ''");
-    expect(integritySql[2]).toContain("jsonb_array_length(payload.translation->'examples') <> 3");
-    expect(integritySql[2]).toContain("jsonb_array_elements(payload.translation->'examples')");
-    expect(integritySql[2]).toContain("jsonb_typeof(example.item->'native') IS DISTINCT FROM 'string'");
-    expect(integritySql[2]).toContain("char_length(example.item->>'native') > 4000");
+    expect(integritySql[2]).toContain('created_at IS NULL');
     expect(integritySql[3]).toContain('score NOT BETWEEN 0 AND 100');
+    expect(integritySql[3]).toContain("WHEN 'diagnostic' THEN attempt_no NOT BETWEEN 1 AND 5");
+    expect(integritySql[3]).toContain("WHEN 'practice' THEN attempt_no NOT BETWEEN 1 AND 3");
+    expect(integritySql[3]).toContain('passed IS DISTINCT FROM (score >= 60)');
     expect(integritySql[3]).toContain('char_length(transcript) > 12000');
+    expect(integritySql[3]).toContain("btrim(feedback, U&'\\0009");
     expect(integritySql[4]).toContain('low_idx > high_idx + 1');
+    expect(query.mock.calls[6]).toEqual([
+      expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations'),
+      [601],
+    ]);
     expect(end).toHaveBeenCalledOnce();
   });
 
   it.each(CHECK_NAMES.map((name, index) => [name, index, index + 1] as const))(
     'reports a nonzero %s failure by name and count',
     async (name, failedIndex, count) => {
-      query.mockResolvedValueOnce({ rows: [] });
-      for (let index = 0; index < CHECK_NAMES.length; index++) {
-        query.mockResolvedValueOnce({ rows: [{ n: index === failedIndex ? count : 0 }] });
-      }
+      mockPreflightQueries(CHECK_NAMES.map((_checkName, index) => (index === failedIndex ? count : 0)));
 
       await expect(preflight(DATABASE_URL)).rejects.toThrow(`${name}: ${count}`);
       expect(end).toHaveBeenCalledOnce();
@@ -79,17 +109,29 @@ describe('database integrity preflight', () => {
   );
 
   it('reports multiple integrity failures on separate operator-readable lines', async () => {
-    query
-      .mockResolvedValueOnce({ rows: [] })
-      .mockResolvedValueOnce({ rows: [{ n: 2 }] })
-      .mockResolvedValueOnce({ rows: [{ n: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ n: 3 }] })
-      .mockResolvedValueOnce({ rows: [{ n: 0 }] })
-      .mockResolvedValueOnce({ rows: [{ n: 0 }] });
+    mockPreflightQueries([2, 0, 3, 0, 0]);
 
     await expect(preflight(DATABASE_URL)).rejects.toThrow(
-      'database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - invalid users: 2\n  - invalid questions: 3',
+      'database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - invalid users: 2\n  - invalid question metadata: 3',
     );
+    expect(end).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    [
+      'an overfilled level',
+      [...healthyInventory(), inventoryRow('A1')],
+      'question inventory A1: expected 100, found 101',
+    ],
+    [
+      'a malformed JavaScript-whitespace row',
+      healthyInventory().map((row, index) => (index === 0 ? { ...row, prompt_word: '\t\n' } : row)),
+      'malformed question rows: 1',
+    ],
+  ] as const)('reports %s before deployment', async (_name, inventory, expectedFailure) => {
+    mockPreflightQueries(undefined, [...inventory]);
+
+    await expect(preflight(DATABASE_URL)).rejects.toThrow(expectedFailure);
     expect(end).toHaveBeenCalledOnce();
   });
 
@@ -112,7 +154,7 @@ describe('database integrity preflight', () => {
 
   it('propagates a disconnect failure when every integrity check succeeds', async () => {
     const disconnectFailure = new Error('disconnect failed');
-    query.mockResolvedValue({ rows: [{ n: 0 }] });
+    mockPreflightQueries();
     end.mockRejectedValueOnce(disconnectFailure);
 
     await expect(preflight(DATABASE_URL)).rejects.toBe(disconnectFailure);

@@ -179,7 +179,7 @@ submission. API and upstream-provider error bodies are never shown directly to
 users. Device-only secure storage records the owner, question, request, upload
 stage, and user-scoped S3 key when applicable, allowing the app to reconcile an
 interrupted handoff through authenticated `GET /assessments/:requestId`; the
-server replay expires after 24 hours.
+server replay expires after 48 hours.
 
 English practice responses report whether the word was mastered (score 75+),
 and silence is returned as an explicit free-retry result. Native-language

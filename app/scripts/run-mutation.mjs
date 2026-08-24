@@ -176,7 +176,7 @@ export async function runMutation({
   const recorderRequested = laneNames.includes('recorder');
   const effectiveEnvironment = {
     ...environment,
-    MUTATION_PARALLEL_LANES: String(recorderRequested ? 1 : effectiveParallelLanes),
+    MUTATION_PARALLEL_LANES: String(effectiveParallelLanes),
   };
   await validateManifest({ appDir });
   const repeatedLaneNames = laneNames.filter(
@@ -198,71 +198,75 @@ export async function runMutation({
 
     const startedAt = Date.now();
     const failedLanes = [];
-    const queue = [...laneNames];
-    // Recorder owns its own total-worker budget and process-group stop signal.
-    // Serialize the outer campaign whenever it is present so sibling lanes
-    // cannot exceed that budget or outlive a user stop.
-    const workerCount = recorderRequested ? 1 : Math.min(effectiveParallelLanes, queue.length || 1);
-    if (recorderRequested && effectiveParallelLanes > 1) {
-      console.log('Recorder requested: serializing outer mutation lanes despite parallel setting.');
-    }
     let stopRequested = false;
 
-    async function worker() {
-      for (let laneName = queue.shift(); laneName !== undefined; laneName = queue.shift()) {
-        if (stopRequested) return;
-        console.log(`\n=== App mutation lane: ${laneName} ===`);
-        let exitCode;
-        try {
-          const provenanceBefore = await createMutationLaneProvenance({
+    async function executeLane(laneName) {
+      console.log(`\n=== App mutation lane: ${laneName} ===`);
+      let exitCode;
+      try {
+        const provenanceBefore = await createMutationLaneProvenance({
+          appDir,
+          laneName,
+          lane: mutationLanes[laneName],
+          environment: effectiveEnvironment,
+        });
+        exitCode = await runLane({
+          laneName,
+          reportDir,
+          appDir,
+          environment: effectiveEnvironment,
+        });
+        if (exitCode === 0) {
+          const provenanceAfter = await createMutationLaneProvenance({
             appDir,
             laneName,
             lane: mutationLanes[laneName],
             environment: effectiveEnvironment,
           });
-          exitCode = await runLane({
-            laneName,
-            reportDir,
-            appDir,
-            environment: effectiveEnvironment,
-          });
-          if (exitCode === 0) {
-            const provenanceAfter = await createMutationLaneProvenance({
-              appDir,
-              laneName,
-              lane: mutationLanes[laneName],
-              environment: effectiveEnvironment,
-            });
-            if (provenanceBefore.fingerprint !== provenanceAfter.fingerprint) {
-              throw new Error(
-                `Mutation inputs for lane ${laneName} changed while Stryker was running; rerun the lane`,
-              );
-            }
-            await fs.access(path.join(reportDir, `${laneName}.json`));
-            await writeMutationLaneProvenance({ reportDir, provenance: provenanceAfter });
+          if (provenanceBefore.fingerprint !== provenanceAfter.fingerprint) {
+            throw new Error(
+              `Mutation inputs for lane ${laneName} changed while Stryker was running; rerun the lane`,
+            );
           }
-        } catch (error) {
-          console.error(`Mutation lane ${laneName} could not complete`, error);
-          exitCode = 1;
+          await fs.access(path.join(reportDir, `${laneName}.json`));
+          await writeMutationLaneProvenance({ reportDir, provenance: provenanceAfter });
         }
-        if (exitCode !== 0) {
-          failedLanes.push({ laneName, exitCode });
-          if (exitCode === 130 || exitCode === 143) {
-            stopRequested = true;
-            queue.length = 0;
-            console.error(`Mutation campaign stop propagated from lane ${laneName}.`);
-          }
-          console.error(
-            `Mutation lane ${laneName} exited with status ${exitCode}; ` +
-              (stopRequested
-                ? 'the campaign is stopping.'
-                : 'continuing with the remaining lanes.'),
-          );
+      } catch (error) {
+        console.error(`Mutation lane ${laneName} could not complete`, error);
+        exitCode = 1;
+      }
+      if (exitCode !== 0) {
+        failedLanes.push({ laneName, exitCode });
+        if (exitCode === 130 || exitCode === 143) {
+          stopRequested = true;
+          console.error(`Mutation campaign stop propagated from lane ${laneName}.`);
         }
+        console.error(
+          `Mutation lane ${laneName} exited with status ${exitCode}; ` +
+            (stopRequested ? 'the campaign is stopping.' : 'continuing with the remaining lanes.'),
+        );
       }
     }
 
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    // Recorder owns its own total-worker budget and process-group stop signal.
+    // Run it physically alone and before every ordinary lane, regardless of
+    // the caller's lane order. A normal threshold failure still allows the
+    // independent lanes to report; a propagated user stop launches none.
+    if (recorderRequested) await executeLane('recorder');
+
+    const queue = laneNames.filter((laneName) => laneName !== 'recorder');
+    async function worker() {
+      for (let laneName = queue.shift(); laneName !== undefined; laneName = queue.shift()) {
+        if (stopRequested) return;
+        await executeLane(laneName);
+        if (stopRequested) queue.length = 0;
+      }
+    }
+
+    if (!stopRequested) {
+      const workerCount = Math.min(effectiveParallelLanes, queue.length);
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+    }
 
     let mergeError;
     let strictGateError;

@@ -240,6 +240,7 @@ describe('question and diagnostic contract parsers', () => {
       nextQuestion: question,
     };
     expect(parseDiagnosticAnswerResult(answer)).toEqual(answer);
+    expectContractError(() => parseDiagnosticAnswerResult(Object.assign([], answer)));
     expectContractError(() => parseDiagnosticAnswerResult({ ...answer, score: Number.NaN }));
     expectContractError(() => parseDiagnosticAnswerResult({ ...answer, score: 101 }));
     expectContractError(() => parseDiagnosticAnswerResult({ ...answer, feedback: '  ' }));
@@ -250,6 +251,24 @@ describe('question and diagnostic contract parsers', () => {
     expectContractError(() =>
       parseDiagnosticAnswerResult({ ...answer, done: true, level: undefined }),
     );
+  });
+
+  it('requires diagnostic passed to match the score threshold', () => {
+    const answer = {
+      passed: true,
+      score: 60,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: true,
+      level: 'B1',
+    } as const;
+    expect(parseDiagnosticAnswerResult(answer)).toEqual(answer);
+    expect(parseDiagnosticAnswerResult({ ...answer, passed: false, score: 59 })).toMatchObject({
+      passed: false,
+      score: 59,
+    });
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, passed: false }));
+    expectContractError(() => parseDiagnosticAnswerResult({ ...answer, score: 59 }));
   });
 
   it('uses the first next-question snapshot in a diagnostic answer', () => {
@@ -710,7 +729,7 @@ describe('field validators', () => {
 
 describe('score and progress boundaries', () => {
   const doneAnswer = {
-    passed: true,
+    passed: false,
     score: 0,
     transcript: '',
     feedback: 'Good start.',
@@ -718,8 +737,16 @@ describe('score and progress boundaries', () => {
     level: 'A1',
   } as const;
 
-  it.each([0, 100])('accepts boundary score %i', (score) => {
-    expect(parseDiagnosticAnswerResult({ ...doneAnswer, score })).toMatchObject({ score });
+  it.each([
+    [0, false],
+    [59, false],
+    [60, true],
+    [100, true],
+  ])('accepts score boundary %i with passed=%s', (score, passed) => {
+    expect(parseDiagnosticAnswerResult({ ...doneAnswer, score, passed })).toMatchObject({
+      score,
+      passed,
+    });
   });
 
   it.each([-1, 50.5])('rejects out-of-contract score %s', (score) => {
@@ -1562,6 +1589,17 @@ describe('audio key ownership', () => {
     expect(audioKeyBelongsToOwner(forged, ownerId)).toBe(false);
   });
 
+  it('rejects a string-like forged owner without invoking its method', () => {
+    const toLowerCase = jest.fn(() => ownerId);
+    const forgedOwner = {
+      toLowerCase,
+    } as unknown as string;
+
+    expect(() => audioKeyBelongsToOwner(ownedKey, forgedOwner)).not.toThrow();
+    expect(audioKeyBelongsToOwner(ownedKey, forgedOwner)).toBe(false);
+    expect(toLowerCase).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['a foreign prefix', `uploads/${ownerId}/${recordingId}.m4a`],
     ['a non-uuid recording id', `audio-uploads/${ownerId}/recording.m4a`],
@@ -1750,6 +1788,23 @@ describe('practice stats parser', () => {
     });
   });
 
+  it('accepts lifetime counters above the former 100,000 ceiling', () => {
+    const longLivedAccount = {
+      ...stats,
+      streakDays: 100_001,
+      practicedToday: 100_001,
+      totalAttempts: 100_001,
+    };
+    expect(parsePracticeStats(longLivedAccount)).toEqual(longLivedAccount);
+  });
+
+  it('rejects lifetime counters outside the nonnegative safe-integer range', () => {
+    expectContractError(() =>
+      parsePracticeStats({ ...stats, totalAttempts: Number.MAX_SAFE_INTEGER + 1 }),
+    );
+    expectContractError(() => parsePracticeStats({ ...stats, streakDays: Number.NaN }));
+  });
+
   it('drops unknown additive fields instead of failing on them', () => {
     expect(parsePracticeStats({ ...stats, someFutureField: 1 })).toEqual(stats);
   });
@@ -1884,6 +1939,7 @@ describe('practice stats parser', () => {
 
   it.each([
     ['a non-record value', 'stats'],
+    ['an array carrying valid stats fields', Object.assign([], stats)],
     ['an unknown level', { ...stats, level: 'Z9' }],
     ['missing progress', { ...stats, progress: undefined }],
     [
@@ -1976,7 +2032,48 @@ describe('practice history parser', () => {
     },
   );
 
+  it('accepts diagnostic attempt numbers through the backend maximum of 5', () => {
+    const page = {
+      items: [{ ...item, context: 'diagnostic', attemptNo: 5 }],
+      nextCursor: null,
+    } as const;
+    expect(parsePracticeHistory(page)).toEqual(page);
+  });
+
   it.each([
+    [59, false],
+    [60, true],
+  ])('accepts history score %i with passed=%s', (score, passed) => {
+    const page = { items: [{ ...item, score, passed }], nextCursor: null };
+    expect(parsePracticeHistory(page)).toEqual(page);
+  });
+
+  it.each([
+    [59, true],
+    [60, false],
+  ])('rejects history score %i with inconsistent passed=%s', (score, passed) => {
+    expectContractError(() =>
+      parsePracticeHistory({ items: [{ ...item, score, passed }], nextCursor: null }),
+    );
+  });
+
+  it('keeps the practice maximum at 3 and rejects diagnostic attempt 6', () => {
+    expectContractError(() =>
+      parsePracticeHistory({
+        items: [{ ...item, context: 'practice', attemptNo: 4 }],
+        nextCursor: null,
+      }),
+    );
+    expectContractError(() =>
+      parsePracticeHistory({
+        items: [{ ...item, context: 'diagnostic', attemptNo: 6 }],
+        nextCursor: null,
+      }),
+    );
+  });
+
+  it.each([
+    ['an array carrying valid item fields', Object.assign([], item)],
     ['a non-uuid id', { ...item, id: 'row-1' }],
     ['a non-uuid questionId', { ...item, questionId: 'question-1' }],
     ['a blank prompt word', { ...item, promptWord: '  ' }],
@@ -2025,14 +2122,14 @@ describe('user data export page parser', () => {
   });
 
   it('accepts a full export page and rejects one row beyond the server maximum', () => {
-    const attempts = Array.from({ length: 1_000 }, (_value, index) => ({ id: index }));
+    const attempts = Array.from({ length: 500 }, (_value, index) => ({ id: index }));
     expect(parseUserDataPage({ user: exportUser, attempts, nextCursor: cursor }).attempts).toEqual(
       attempts,
     );
     expectContractError(() =>
       parseUserDataPage({
         user: exportUser,
-        attempts: [...attempts, { id: 1_000 }],
+        attempts: [...attempts, { id: 500 }],
         nextCursor: cursor,
       }),
     );

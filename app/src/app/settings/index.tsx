@@ -15,7 +15,7 @@ import {
 
 import Button from '../../components/Button';
 import {
-  apiExportUserData,
+  apiConsumeUserDataPages,
   apiRestartDiagnostic,
   apiUpdateProfile,
   userMessageForError,
@@ -174,6 +174,7 @@ export default function SettingsScreen() {
       navigationStartedRef.current = false;
       return () => {
         navigationStartedRef.current = true;
+        exportControllerRef.current?.abort();
       };
     }, []),
   );
@@ -419,6 +420,7 @@ export default function SettingsScreen() {
     publishNavigationLock();
     setExportBusy(true);
     setExportError(null);
+    const exportFile: { current: File | null } = { current: null };
     try {
       if (!(await Sharing.isAvailableAsync())) {
         if (!renderCanHandle()) return;
@@ -426,29 +428,59 @@ export default function SettingsScreen() {
         return;
       }
       if (!renderCanHandle()) return;
-      const data = await apiExportUserData(controller.signal);
-      if (!renderCanHandle()) return;
-      const file = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
-      try {
-        file.write(JSON.stringify(data, null, 2));
-        await Sharing.shareAsync(file.uri, {
-          mimeType: 'application/json',
-          dialogTitle: t('settings.export'),
-        });
-      } finally {
-        // The export contains PII; never leave it in the app cache once the
-        // share sheet is done. Cleanup failure must not mask the share outcome.
-        try {
-          file.delete();
-        } catch {
-          // The OS cache eviction will reclaim it eventually.
+      let documentStarted = false;
+      let hasAttempts = false;
+      await apiConsumeUserDataPages((page) => {
+        if (controller.signal.aborted || !renderCanHandle() || page.user.id !== user.id) {
+          controller.abort();
+          throw new DOMException('The export session expired.', 'AbortError');
         }
-      }
+        const encodedAttempts = page.attempts.map((attempt) => JSON.stringify(attempt));
+        if (encodedAttempts.some((attempt) => typeof attempt !== 'string')) {
+          throw new Error('The export contains an invalid attempt.');
+        }
+        if (!documentStarted) {
+          const encodedUser = JSON.stringify(page.user);
+          if (typeof encodedUser !== 'string') throw new Error('The export user is invalid.');
+          exportFile.current = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
+          exportFile.current.write(`{"user":${encodedUser},"attempts":[`, {
+            encoding: 'utf8',
+          });
+          documentStarted = true;
+        }
+        if (encodedAttempts.length > 0) {
+          exportFile.current!.write(`${hasAttempts ? ',' : ''}${encodedAttempts.join(',')}`, {
+            append: true,
+            encoding: 'utf8',
+          });
+          hasAttempts = true;
+        }
+      }, controller.signal);
+      if (!renderCanHandle()) return;
+      // A successful walker always emits its final (possibly empty) page.
+      // Fail closed if a mocked or incompatible implementation violates that
+      // contract instead of sharing a malformed file.
+      if (!documentStarted) throw new Error('The export returned no pages.');
+      const completedFile = exportFile.current;
+      if (completedFile === null) throw new Error('The export file is unavailable.');
+      completedFile.write(']}', { append: true, encoding: 'utf8' });
+      await Sharing.shareAsync(completedFile.uri, {
+        mimeType: 'application/json',
+        dialogTitle: t('settings.export'),
+      });
     } catch (error) {
       if (renderCanHandle() && !controller.signal.aborted) {
         setExportError(userMessageForError(error, t('settings.exportFailed')));
       }
     } finally {
+      // The export contains PII; delete every created cache file after success,
+      // page/write/share failure, or a session-triggered abort. Cleanup failure
+      // must not mask the original outcome.
+      try {
+        exportFile.current?.delete();
+      } catch {
+        // The OS cache eviction will reclaim it eventually.
+      }
       exportControllerRef.current = null;
       exportBusyRef.current = false;
       if (renderOwnsIdentity()) {

@@ -9,7 +9,7 @@ import type { Fiber, TestInstance } from 'test-renderer';
 import SettingsScreen, { formatReminderHour } from '../src/app/settings/index';
 import {
   ApiError,
-  apiExportUserData,
+  apiConsumeUserDataPages,
   apiRestartDiagnostic,
   apiUpdateProfile,
 } from '../src/lib/api';
@@ -76,6 +76,7 @@ jest.mock('expo-router', () => {
 const mockWrite = jest.fn();
 const mockDelete = jest.fn();
 let lastFileUri: string | null = null;
+let lastFileContents = '';
 
 jest.mock('expo-file-system', () => ({
   Paths: { cache: '/mock-cache' },
@@ -102,7 +103,7 @@ jest.mock('../src/lib/daily-reminder', () => ({
 
 jest.mock('../src/lib/api', () => ({
   ...jest.requireActual('../src/lib/api'),
-  apiExportUserData: jest.fn(),
+  apiConsumeUserDataPages: jest.fn(),
   apiRestartDiagnostic: jest.fn(),
   apiUpdateProfile: jest.fn(),
 }));
@@ -166,7 +167,8 @@ jest.mock('../src/lib/auth', () => ({
 }));
 
 const mockUpdateProfile = apiUpdateProfile as jest.Mock;
-const mockExportData = apiExportUserData as jest.Mock;
+const mockConsumeExportPages = apiConsumeUserDataPages as jest.Mock;
+const mockExportData = jest.fn();
 const mockRestartDiagnostic = apiRestartDiagnostic as jest.Mock;
 const mockGetReminder = getDailyReminder as jest.Mock;
 const mockEnableReminder = enableDailyReminder as jest.Mock;
@@ -318,13 +320,25 @@ async function expectPressFeedback(
 beforeEach(() => {
   jest.clearAllMocks();
   lastFileUri = null;
+  lastFileContents = '';
   mockFocusCallback = null;
   mockBeforeRemoveListener = null;
   mockAuthValue = makeAuth();
   mockUpdateProfile.mockReset();
-  mockExportData.mockReset();
+  mockExportData.mockReset().mockResolvedValue({ user: USER, attempts: [] });
+  mockConsumeExportPages.mockReset().mockImplementation(async (consumePage, signal) => {
+    const data = (await mockExportData(signal)) as {
+      user: User;
+      attempts: Record<string, unknown>[];
+    };
+    await consumePage({ ...data, nextCursor: null }, 0);
+  });
   mockRestartDiagnostic.mockReset();
-  mockWrite.mockReset();
+  mockWrite
+    .mockReset()
+    .mockImplementation((content: string, options?: { append?: boolean; encoding?: string }) => {
+      lastFileContents = options?.append ? `${lastFileContents}${content}` : content;
+    });
   mockDelete.mockReset();
   mockGetReminder.mockReset().mockResolvedValue(null);
   mockEnableReminder.mockReset().mockResolvedValue('enabled');
@@ -492,6 +506,7 @@ describe('settings profile card', () => {
     await act(async () => {
       await fireEvent(input(), 'focus');
     });
+    await fireEvent.changeText(input(), USER.name);
     // A profile refresh while focused must not overwrite active typing, but a
     // field the learner never edited should adopt that canonical name on blur
     // instead of leaving an accidental stale overwrite ready to save.
@@ -503,6 +518,34 @@ describe('settings profile card', () => {
       await fireEvent(input(), 'blur');
     });
     expect(input().props.value).toBe('Ada King');
+  });
+
+  it('keeps a canonical resync clean across a later focused profile refresh', async () => {
+    const { rerenderSettings } = await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada King' } });
+    await rerenderSettings();
+    expect(input().props.value).toBe('Ada King');
+
+    await fireEvent(input(), 'focus');
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada Byron' } });
+    await rerenderSettings();
+    expect(input().props.value).toBe('Ada King');
+
+    await fireEvent(input(), 'blur');
+    expect(input().props.value).toBe('Ada Byron');
+  });
+
+  it('keeps an unsaved different draft when the field blurs', async () => {
+    await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+
+    await fireEvent(input(), 'focus');
+    await fireEvent.changeText(input(), 'Grace');
+    await fireEvent(input(), 'blur');
+
+    expect(input().props.value).toBe('Grace');
   });
 
   it('saves the name once when Save is tapped twice before a re-render', async () => {
@@ -1431,7 +1474,7 @@ describe('settings screen layout', () => {
 });
 
 describe('data export', () => {
-  it('walks the export, writes a JSON file, and hands it to the share sheet', async () => {
+  it('writes a JSON export and hands it to the share sheet', async () => {
     const exportData = { user: USER, attempts: [{ id: 'a1' }] };
     mockExportData.mockResolvedValue(exportData);
     await renderSettings();
@@ -1447,13 +1490,143 @@ describe('data export', () => {
       Paths.cache,
       expect.stringMatching(/^ai-english-coach-data-\d+\.json$/),
     );
-    expect(mockWrite).toHaveBeenCalledWith(JSON.stringify(exportData, null, 2));
+    expect(lastFileContents).toBe(JSON.stringify(exportData));
+    expect(mockWrite).toHaveBeenNthCalledWith(1, `{"user":${JSON.stringify(USER)},"attempts":[`, {
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(2, '{"id":"a1"}', {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(3, ']}', {
+      append: true,
+      encoding: 'utf8',
+    });
     expect(mockShareAsync).toHaveBeenCalledWith(lastFileUri, {
       mimeType: 'application/json',
       dialogTitle: t('settings.export'),
     });
     // The export embeds PII: the cache file is deleted once the share sheet closes.
     expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('appends multiple pages into one exact JSON document without retaining an aggregate', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const expected = {
+      user: USER,
+      attempts: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+    };
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: cursor }, 0);
+      await consumePage(
+        { user: USER, attempts: [{ id: 'a2' }, { id: 'a3' }], nextCursor: null },
+        1,
+      );
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(lastFileContents).toBe(JSON.stringify(expected));
+    expect(JSON.parse(lastFileContents)).toEqual(expected);
+    expect(mockWrite).toHaveBeenCalledTimes(4);
+    expect(mockShareAsync).toHaveBeenCalledTimes(1);
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes a partial file and never shares when a later page fails', async () => {
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage(
+        {
+          user: USER,
+          attempts: [{ id: 'a1' }],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440041',
+        },
+        0,
+      );
+      throw new ApiError(500, 'page failed');
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
+    expect(lastFileContents.endsWith(']}')).toBe(false);
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unserializable attempt before creating an export file', async () => {
+    const invalidAttempt = { toJSON: () => undefined };
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: USER, attempts: [invalidAttempt], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockFile).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unserializable current user before creating an export file', async () => {
+    const invalidUser = { ...USER, toJSON: () => undefined };
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: invalidUser, attempts: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockFile).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('rejects a wrong-account first page before creating or writing a file', async () => {
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: OTHER_USER, attempts: [{ id: 'foreign' }], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(mockFile).not.toHaveBeenCalled();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.exportFailed'))).toBeNull();
+  });
+
+  it('aborts and deletes a partial file when identity changes after page one', async () => {
+    const remainingPages = deferred<void>();
+    let exportSignal: AbortSignal | undefined;
+    mockConsumeExportPages.mockImplementation(async (consumePage, signal) => {
+      exportSignal = signal;
+      await consumePage(
+        {
+          user: USER,
+          attempts: [{ id: 'a1' }],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440041',
+        },
+        0,
+      );
+      await remainingPages.promise;
+    });
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    await waitFor(() => expect(mockWrite).toHaveBeenCalledTimes(2));
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(exportSignal?.aborted).toBe(true);
+    remainingPages.reject(exportSignal?.reason ?? new Error('aborted'));
+
+    await waitFor(() => expect(mockDelete).toHaveBeenCalledTimes(1));
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.exportFailed'))).toBeNull();
   });
 
   it('deletes the export file even when the share sheet fails', async () => {
@@ -1466,7 +1639,28 @@ describe('data export', () => {
     });
 
     expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(lastFileContents).toBe(JSON.stringify({ user: USER, attempts: [] }));
+    // Empty pages add no empty append write: only the header and closing suffix
+    // cross the native filesystem bridge.
+    expect(mockWrite).toHaveBeenCalledTimes(2);
     expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes without closing or sharing when the lease expires after the final page', async () => {
+    let leaseCurrent = true;
+    mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: null }, 0);
+      leaseCurrent = false;
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(lastFileContents.endsWith(']}')).toBe(false);
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(t('settings.exportFailed'))).toBeNull();
   });
 
   it('does not write or share an export whose session lease expired in flight', async () => {
@@ -1529,6 +1723,8 @@ describe('data export', () => {
     });
 
     expect(await screen.findByText(`${t('error.tooMany')} ${t('wait.minute')}`)).toBeTruthy();
+    expect(mockFile).not.toHaveBeenCalled();
+    expect(mockDelete).not.toHaveBeenCalled();
     expect(mockShareAsync).not.toHaveBeenCalled();
   });
 
@@ -1924,7 +2120,9 @@ describe('retake placement test', () => {
     );
     await renderSettings();
 
-    await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
+    const retakeRow = screen.getByRole('button', { name: t('settings.retake') });
+    const reopen = committedPressHandler(retakeRow);
+    await fireEvent.press(retakeRow);
     const calls = alertSpy.mock.calls;
     const buttons = calls[calls.length - 1][2] as { text?: string; onPress?: () => void }[];
     const confirm = buttons.find((candidate) => candidate.text === t('retake.confirm'))?.onPress;
@@ -1932,13 +2130,63 @@ describe('retake placement test', () => {
 
     await act(async () => {
       confirm();
+      reopen();
       confirm();
     });
 
     expect(mockRestartDiagnostic).toHaveBeenCalledTimes(1);
+    expect(alertSpy).toHaveBeenCalledTimes(1);
     await act(async () => {
       resolveRestart();
     });
+  });
+
+  it('keeps settings handlers inert after a successful retake starts navigation', async () => {
+    mockRestartDiagnostic.mockResolvedValue(undefined);
+    await renderSettings();
+    const staleExport = committedPressHandler(
+      screen.getByRole('button', { name: t('settings.export') }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
+    await pressAlertButton(t('retake.confirm'));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/diagnostic'));
+    mockSharingAvailable.mockClear();
+
+    await act(async () => {
+      staleExport();
+      await Promise.resolve();
+    });
+
+    expect(mockSharingAvailable).not.toHaveBeenCalled();
+  });
+
+  it('does not let an old dismiss clear a newer retake confirmation', async () => {
+    mockRestartDiagnostic.mockResolvedValue(undefined);
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.retake') });
+    await fireEvent.press(row());
+    const firstCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const firstButtons = firstCall[2] as { text?: string; onPress?: () => void }[];
+    const firstCancel = firstButtons.find((button) => button.text === t('common.cancel'))?.onPress;
+    const firstDismiss = (firstCall[3] as { onDismiss?: () => void }).onDismiss;
+    if (!firstCancel || !firstDismiss) throw new Error('First confirmation callbacks are missing');
+    await act(async () => firstCancel());
+
+    await fireEvent.press(row());
+    const secondCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const secondButtons = secondCall[2] as { text?: string; onPress?: () => void }[];
+    const secondConfirm = secondButtons.find(
+      (button) => button.text === t('retake.confirm'),
+    )?.onPress;
+    if (!secondConfirm) throw new Error('Second confirmation callback is missing');
+
+    await act(async () => {
+      firstDismiss();
+      secondConfirm();
+      await Promise.resolve();
+    });
+
+    expect(mockRestartDiagnostic).toHaveBeenCalledTimes(1);
   });
 
   it('writes the session user as it stands when the restart lands', async () => {
@@ -2076,6 +2324,23 @@ describe('account actions', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps settings handlers inert after logout starts gate navigation', async () => {
+    await renderSettings();
+    const staleExport = committedPressHandler(
+      screen.getByRole('button', { name: t('settings.export') }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    mockSharingAvailable.mockClear();
+
+    await act(async () => {
+      staleExport();
+      await Promise.resolve();
+    });
+
+    expect(mockSharingAvailable).not.toHaveBeenCalled();
   });
 
   it('logs out once when the row is tapped twice before a re-render', async () => {
@@ -2613,6 +2878,31 @@ describe('settings async race fences', () => {
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
   });
 
+  it('keeps old-identity text callbacks from mutating the replacement profile field', async () => {
+    const view = await renderSettings();
+    const oldInput = screen.getByLabelText(t('signup.nameLabel'));
+    const oldChange = oldInput.props.onChangeText as (value: string) => void;
+    const oldFocus = oldInput.props.onFocus as () => void;
+    const oldBlur = oldInput.props.onBlur as () => void;
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    const replacementInput = () => screen.getByLabelText(t('signup.nameLabel'));
+    const restingStyle = flattenedStyle(replacementInput());
+
+    await act(async () => oldChange('Stale intruder'));
+    expect(replacementInput().props.value).toBe(OTHER_USER.name);
+
+    await act(async () => oldFocus());
+    expect(flattenedStyle(replacementInput())).toEqual(restingStyle);
+
+    await fireEvent(replacementInput(), 'focus');
+    await fireEvent.changeText(replacementInput(), 'Grace Murray');
+    const focusedStyle = flattenedStyle(replacementInput());
+    await act(async () => oldBlur());
+    expect(replacementInput().props.value).toBe('Grace Murray');
+    expect(flattenedStyle(replacementInput())).toEqual(focusedStyle);
+  });
+
   it.each(['identity', 'unmount'] as const)(
     'does not let an export handler captured before %s read or share account data',
     async (boundary) => {
@@ -2833,6 +3123,9 @@ describe('settings async race fences', () => {
     mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
     await renderSettings();
 
+    const staleToggle = committedPressHandler(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }),
+    );
     await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
     await fireEvent.press(languageChip(1));
     await waitFor(() => expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi'));
@@ -2842,6 +3135,11 @@ describe('settings async race fences', () => {
     expect(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
     ).toMatchObject({ disabled: true, busy: true });
+    await act(async () => {
+      staleToggle();
+      await Promise.resolve();
+    });
+    expect(mockDisableReminder).toHaveBeenCalledTimes(1);
     disable.resolve();
     await act(async () => Promise.resolve());
   });
@@ -2863,6 +3161,9 @@ describe('settings async race fences', () => {
     await act(async () => Promise.resolve());
     expect(screen.getByText(reminderTimeText(19))).toBeTruthy();
     expect(screen.queryByText(reminderTimeText(20))).toBeNull();
+    expect(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true, busy: true });
   });
 
   it('does not publish fallback reminder state after the language lease expires', async () => {
@@ -3045,11 +3346,53 @@ describe('settings async race fences', () => {
       headerBackVisible: true,
       gestureEnabled: true,
     });
+    expect(
+      screen.getByRole('button', { name: t('settings.retake') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
     mockSetOptions.mockClear();
     await act(async () => confirm());
 
     expect(mockRestartDiagnostic).not.toHaveBeenCalled();
     expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('gives a replacement identity fresh navigation and profile callbacks', async () => {
+    const update = { ...OTHER_USER, name: 'Grace Murray' };
+    mockUpdateProfile.mockResolvedValue(update);
+    const view = await renderSettings();
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    mockRouter.navigate.mockClear();
+    mockUpdateProfile.mockClear();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('header.privacy') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings/privacy');
+
+    // Re-arm the route after the navigation assertion so the replacement
+    // identity's profile callback is tested independently in the same mount.
+    const focus = mockFocusCallback;
+    await act(async () => {
+      focus?.();
+    });
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Grace Murray');
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+    expect(mockUpdateProfile).toHaveBeenCalledWith({ name: 'Grace Murray' });
+  });
+
+  it('routes a replacement identity after its own logout completes', async () => {
+    const replacementLogout = jest.fn().mockResolvedValue(undefined);
+    const view = await renderSettings();
+    mockAuthValue = makeAuth({
+      user: OTHER_USER,
+      sessionVersion: 2,
+      logout: replacementLogout,
+    });
+    await view.rerenderSettings();
+    mockRouter.replace.mockClear();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+
+    expect(replacementLogout).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
   it('does not let a cancelled retake confirmation start later from its captured callback', async () => {

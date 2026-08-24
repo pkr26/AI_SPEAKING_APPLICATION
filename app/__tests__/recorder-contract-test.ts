@@ -16,9 +16,11 @@ import {
   recordingStatusIsTerminal,
   recordingTerminalFailureShouldInterrupt,
   recoveryDurationForRecordAge,
+  recoveryRetryDelayMillis,
   shouldRunRecordingCacheJanitor,
   terminalEventQuarantineIndex,
 } from '../src/components/Recorder';
+import { ApiError } from '../src/lib/api';
 
 // Recorder imports native modules even when a test uses only its exported pure
 // contracts. Keep this suite free of component mounts and native side effects:
@@ -97,6 +99,18 @@ function pendingRecord(overrides: Partial<Pending> = {}): Pending {
  * 650,652,653; take generation 674.
  */
 describe('Recorder mutation-first pure contracts', () => {
+  it('uses a bounded Retry-After only for the coded in-flight conflict', () => {
+    expect(
+      recoveryRetryDelayMillis(new ApiError(409, 'processing', 7, { code: 'REQUEST_IN_FLIGHT' })),
+    ).toBe(7_000);
+    expect(
+      recoveryRetryDelayMillis(new ApiError(409, 'conflict', 7, { code: 'STATE_CHANGED' })),
+    ).toBeNull();
+    expect(
+      recoveryRetryDelayMillis(new ApiError(500, 'wrong status', 7, { code: 'REQUEST_IN_FLIGHT' })),
+    ).toBeNull();
+  });
+
   it('uses the monotonic clock and its wall-clock fallback', () => {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
     const performanceNow = jest.spyOn(performance, 'now').mockReturnValue(321);

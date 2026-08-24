@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import request from 'supertest';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../src/app';
 import { pool } from '../src/db';
@@ -11,21 +11,43 @@ import {
   assertDatabaseSchemaCurrent,
   expectedMigrationManifest,
   migrationManifestFromDirectory,
+  QUESTION_INVENTORY_READINESS_TTL_MS,
+  resetQuestionInventoryReadinessCacheForTests,
   SchemaQuery,
 } from '../src/schema-readiness';
+
+const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
 
 function successfulMigrationRows() {
   return expectedMigrationManifest().map(({ name, checksum }) => ({ name, checksum }));
 }
 
-const completeQuestionInventory = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].map((cefr_level) => ({
-  cefr_level,
-  count: 100,
-}));
+function inventoryRow(cefr_level: string) {
+  const translation = {
+    word: 'translation',
+    question: 'Translated question?',
+    examples: Array.from({ length: 3 }, () => ({ en: 'English example.', native: 'Native example.' })),
+  };
+  return {
+    id: QUESTION_ID,
+    cefr_level,
+    prompt_word: 'word',
+    question_text: 'Answer this question.',
+    translations: { te: translation, hi: translation, es: translation, zh: translation },
+  };
+}
+
+const completeQuestionInventory = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].flatMap((cefrLevel) =>
+  Array.from({ length: 100 }, () => inventoryRow(cefrLevel)),
+);
 
 // A migration this release does not package, sorting after every packaged one
 // — what an old replica sees once the next release's migration job has run.
 const NEWER_RELEASE_MIGRATION = { name: '999_from_a_newer_release.sql', checksum: 'f'.repeat(64) };
+
+beforeEach(() => {
+  resetQuestionInventoryReadinessCacheForTests();
+});
 
 describe('database schema readiness', () => {
   it('filters non-SQL assets and hashes migrations in deterministic filename order', () => {
@@ -79,7 +101,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('013_assessment_audio_key_uniqueness.sql');
+    expect(manifest.at(-1)?.name).toBe('015_public_strings_nonblank.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -89,11 +111,15 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '013_assessment_audio_key_uniqueness.sql',
+      latestMigration: '015_public_strings_nonblank.sql',
     });
     expect(query.mock.calls[0]).toEqual(['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"']);
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
     expect(query.mock.calls[2]?.[0]).toContain('FROM questions');
+    expect(query.mock.calls[2]?.[0]).toContain('SELECT id, cefr_level, prompt_word, question_text, translations');
+    expect(query.mock.calls[2]?.[0]).toContain('ORDER BY cefr_level');
+    expect(query.mock.calls[2]?.[0]).toContain('LIMIT $1');
+    expect(query.mock.calls[2]?.[1]).toEqual([601]);
   });
 
   it('rejects a missing or checksum-mismatched migration, even beside newer extra rows', async () => {
@@ -123,7 +149,7 @@ describe('database schema readiness', () => {
 
     // The reported migration is still this release's latest packaged one.
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '013_assessment_audio_key_uniqueness.sql',
+      latestMigration: '015_public_strings_nonblank.sql',
     });
   });
 
@@ -137,15 +163,14 @@ describe('database schema readiness', () => {
   });
 
   it('accepts the exact 100-question runtime boundary for every CEFR level', async () => {
-    const exactMinimum = completeQuestionInventory.map((row) => ({ ...row, count: 100 }));
     const query = vi
       .fn()
       .mockResolvedValueOnce({ rows: successfulMigrationRows() })
       .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
-      .mockResolvedValueOnce({ rows: exactMinimum });
+      .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '013_assessment_audio_key_uniqueness.sql',
+      latestMigration: '015_public_strings_nonblank.sql',
     });
   });
 
@@ -165,34 +190,25 @@ describe('database schema readiness', () => {
     }
   });
 
-  it('rejects an unseeded or incomplete CEFR question inventory', async () => {
+  it('rejects an unseeded, incomplete, overfilled, or malformed CEFR question inventory', async () => {
     for (const rows of [
       [],
       completeQuestionInventory.slice(0, -1),
-      completeQuestionInventory.map((row) => (row.cefr_level === 'A1' ? { ...row, count: 99 } : row)),
+      [...completeQuestionInventory, inventoryRow('A1')],
+      completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, prompt_word: '\t' } : row)),
+      completeQuestionInventory.map((row, index) =>
+        index === 0 ? { ...row, id: '00000000-0000-0000-0000-000000000000' } : row,
+      ),
       completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, cefr_level: null } : row)),
-      completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '100' } : row)),
+      [...completeQuestionInventory.slice(1), inventoryRow('A0')],
     ]) {
       const query = vi
         .fn()
         .mockResolvedValueOnce({ rows: successfulMigrationRows() })
         .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
         .mockResolvedValueOnce({ rows });
-      await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
-        'Question inventory is incomplete',
-      );
+      await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow('Question inventory is invalid');
     }
-  });
-
-  it('rejects a string count of 100 even when every CEFR inventory row is present', async () => {
-    const rows = completeQuestionInventory.map((row, index) => (index === 0 ? { ...row, count: '100' } : row));
-    const query = vi
-      .fn()
-      .mockResolvedValueOnce({ rows: successfulMigrationRows() })
-      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
-      .mockResolvedValueOnce({ rows });
-
-    await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow('Question inventory is incomplete');
   });
 
   it('uses the pool adapter with explicit values for every readiness query', async () => {
@@ -204,16 +220,139 @@ describe('database schema readiness', () => {
 
     try {
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '013_assessment_audio_key_uniqueness.sql',
+        latestMigration: '015_public_strings_nonblank.sql',
       });
       expect(query.mock.calls).toEqual([
         ['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"', []],
         ['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']],
-        [expect.stringContaining('FROM questions'), []],
+        [expect.stringContaining('FROM questions'), [601]],
       ]);
     } finally {
       query.mockRestore();
     }
+  });
+
+  it('single-flights concurrent inventory scans while every caller checks migration and table liveness', async () => {
+    let inventoryReads = 0;
+    let releaseInventory!: (value: { rows: unknown[] }) => void;
+    const pendingInventory = new Promise<{ rows: unknown[] }>((resolve) => {
+      releaseInventory = resolve;
+    });
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: string) => {
+      if (text.includes('FROM schema_migrations')) return Promise.resolve({ rows: successfulMigrationRows() });
+      if (text.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'rate_limit_windows' }] });
+      if (text.includes('FROM questions')) {
+        inventoryReads += 1;
+        return pendingInventory;
+      }
+      return Promise.reject(new Error(`unexpected readiness query: ${text}`));
+    }) as never);
+
+    try {
+      const first = assertDatabaseSchemaCurrent();
+      const second = assertDatabaseSchemaCurrent();
+      await vi.waitFor(() => expect(inventoryReads).toBe(1));
+      releaseInventory({ rows: completeQuestionInventory });
+
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        { latestMigration: '015_public_strings_nonblank.sql' },
+        { latestMigration: '015_public_strings_nonblank.sql' },
+      ]);
+      expect(query.mock.calls.filter(([text]) => String(text).includes('FROM schema_migrations'))).toHaveLength(2);
+      expect(query.mock.calls.filter(([text]) => String(text).includes('to_regclass'))).toHaveLength(2);
+      expect(query.mock.calls.filter(([text]) => String(text).includes('FROM questions'))).toHaveLength(1);
+    } finally {
+      releaseInventory({ rows: completeQuestionInventory });
+      query.mockRestore();
+    }
+  });
+
+  it('reuses a valid inventory only before the TTL boundary and still checks DB liveness on every call', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-08-22T12:00:00.000Z'));
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: string) => {
+      if (text.includes('FROM schema_migrations')) return Promise.resolve({ rows: successfulMigrationRows() });
+      if (text.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'rate_limit_windows' }] });
+      if (text.includes('FROM questions')) return Promise.resolve({ rows: completeQuestionInventory });
+      return Promise.reject(new Error(`unexpected readiness query: ${text}`));
+    }) as never);
+
+    try {
+      await assertDatabaseSchemaCurrent();
+      vi.advanceTimersByTime(QUESTION_INVENTORY_READINESS_TTL_MS - 1);
+      await assertDatabaseSchemaCurrent();
+      expect(query.mock.calls.filter(([text]) => String(text).includes('FROM questions'))).toHaveLength(1);
+
+      vi.advanceTimersByTime(1);
+      await assertDatabaseSchemaCurrent();
+      expect(query.mock.calls.filter(([text]) => String(text).includes('FROM questions'))).toHaveLength(2);
+      expect(query.mock.calls.filter(([text]) => String(text).includes('FROM schema_migrations'))).toHaveLength(3);
+      expect(query.mock.calls.filter(([text]) => String(text).includes('to_regclass'))).toHaveLength(3);
+    } finally {
+      query.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not cache a failed inventory scan', async () => {
+    let inventoryReads = 0;
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: string) => {
+      if (text.includes('FROM schema_migrations')) return Promise.resolve({ rows: successfulMigrationRows() });
+      if (text.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'rate_limit_windows' }] });
+      if (text.includes('FROM questions')) {
+        inventoryReads += 1;
+        return inventoryReads === 1
+          ? Promise.reject(new Error('catalog read failed'))
+          : Promise.resolve({ rows: completeQuestionInventory });
+      }
+      return Promise.reject(new Error(`unexpected readiness query: ${text}`));
+    }) as never);
+
+    try {
+      await expect(assertDatabaseSchemaCurrent()).rejects.toThrow('catalog read failed');
+      await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
+        latestMigration: '015_public_strings_nonblank.sql',
+      });
+      expect(inventoryReads).toBe(2);
+    } finally {
+      query.mockRestore();
+    }
+  });
+
+  it('never lets one custom query adapter cache inventory readiness for another', async () => {
+    const healthyAdapter = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: successfulMigrationRows() })
+      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
+      .mockResolvedValueOnce({ rows: completeQuestionInventory });
+    const malformedInventory = completeQuestionInventory.map((row, index) =>
+      index === 0 ? { ...row, id: '00000000-0000-0000-0000-000000000000' } : row,
+    );
+    const malformedAdapter = vi
+      .fn()
+      .mockResolvedValueOnce({ rows: successfulMigrationRows() })
+      .mockResolvedValueOnce({ rows: [{ table_name: 'rate_limit_windows' }] })
+      .mockResolvedValueOnce({ rows: malformedInventory });
+
+    await expect(assertDatabaseSchemaCurrent(healthyAdapter as SchemaQuery)).resolves.toEqual({
+      latestMigration: '015_public_strings_nonblank.sql',
+    });
+    await expect(assertDatabaseSchemaCurrent(malformedAdapter as SchemaQuery)).rejects.toThrow(
+      'Question inventory is invalid',
+    );
+    expect(healthyAdapter).toHaveBeenCalledTimes(3);
+    expect(malformedAdapter).toHaveBeenCalledTimes(3);
+  });
+
+  it('/ready invokes both dependency checks for every probe', async () => {
+    const schemaCheck = vi.fn(async () => undefined);
+    const audioInspectorCheck = vi.fn(async () => undefined);
+    const a = createApp({ schemaCheck, audioInspectorCheck });
+
+    await expect(request(a).get('/ready')).resolves.toMatchObject({ status: 200, body: { ok: true } });
+    await expect(request(a).get('/ready')).resolves.toMatchObject({ status: 200, body: { ok: true } });
+    expect(schemaCheck).toHaveBeenCalledTimes(2);
+    expect(audioInspectorCheck).toHaveBeenCalledTimes(2);
   });
 
   it.each(['schema', 'media inspector'] as const)('/ready hides a failed %s dependency check', async (failure) => {

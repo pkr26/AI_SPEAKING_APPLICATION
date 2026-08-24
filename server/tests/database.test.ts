@@ -7,6 +7,7 @@ import { migrate, seed } from '../db/run';
 import { assertSafeDestructiveDatabase } from '../db/database-safety';
 import { renderSeedSql } from '../db/generate-seed';
 import { questions, type QuestionSeed } from '../db/seed-data';
+import { assertDatabaseSchemaCurrent, resetQuestionInventoryReadinessCacheForTests } from '../src/schema-readiness';
 import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
 import { pool } from './helpers';
 
@@ -50,6 +51,70 @@ describe('database content seeding', () => {
 
   it('executes every production preflight query against the healthy migrated catalog', async () => {
     await expect(preflight(process.env.DATABASE_URL!)).resolves.toBeUndefined();
+  });
+
+  it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
+    resetQuestionInventoryReadinessCacheForTests();
+    await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
+      latestMigration: '015_public_strings_nonblank.sql',
+    });
+    const expectInventoryRejected = async () => {
+      resetQuestionInventoryReadinessCacheForTests();
+      await expect(assertDatabaseSchemaCurrent()).rejects.toThrow('Question inventory is invalid');
+      await expect(preflight(process.env.DATABASE_URL!)).rejects.toThrow('database integrity preflight failed');
+    };
+
+    const original = await pool.query<{
+      id: string;
+      prompt_word: string;
+      question_text: string;
+      translations: Record<string, unknown>;
+    }>(
+      "SELECT id, prompt_word, question_text, translations FROM questions WHERE cefr_level = 'A1' ORDER BY id LIMIT 1",
+    );
+    const { id, prompt_word: promptWord, question_text: questionText, translations } = original.rows[0];
+    try {
+      for (const path of ['{te,word}', '{te,examples,0,en}']) {
+        await pool.query(`UPDATE questions SET translations = jsonb_set(translations, $2, '7'::jsonb) WHERE id = $1`, [
+          id,
+          path,
+        ]);
+        await expectInventoryRejected();
+        await pool.query('UPDATE questions SET translations = $2::jsonb WHERE id = $1', [
+          id,
+          JSON.stringify(translations),
+        ]);
+      }
+
+      await pool.query('UPDATE questions SET prompt_word = $2 WHERE id = $1', [id, '\t\n']);
+      await expectInventoryRejected();
+      await pool.query('UPDATE questions SET prompt_word = $2 WHERE id = $1', [id, promptWord]);
+
+      // PostgreSQL char_length sees 51 code points, while JavaScript sees 102
+      // UTF-16 code units. The shared validator must enforce the app boundary.
+      await pool.query('UPDATE questions SET prompt_word = $2 WHERE id = $1', [id, '😀'.repeat(51)]);
+      await expectInventoryRejected();
+      await pool.query('UPDATE questions SET prompt_word = $2 WHERE id = $1', [id, promptWord]);
+
+      const extra = await pool.query<{ id: string }>(
+        `INSERT INTO questions (cefr_level, prompt_word, question_text, translations)
+         VALUES ('A1', $1, 'Temporary readiness overfill', $2::jsonb)
+         RETURNING id`,
+        [`readiness-overfill-${randomUUID()}`, JSON.stringify(translations)],
+      );
+      try {
+        await expectInventoryRejected();
+      } finally {
+        await pool.query('DELETE FROM questions WHERE id = $1', [extra.rows[0].id]);
+      }
+    } finally {
+      await pool.query(
+        `UPDATE questions
+         SET prompt_word = $2, question_text = $3, translations = $4::jsonb
+         WHERE id = $1`,
+        [id, promptWord, questionText, JSON.stringify(translations)],
+      );
+    }
   });
 
   it('is idempotent and preserves question IDs, attempts, and diagnostic state', async () => {
@@ -204,6 +269,201 @@ describe('migration 010/011 invariants', () => {
       { relname: 'practice_progress', reloptions: ['autovacuum_vacuum_scale_factor=0.01', 'fillfactor=80'] },
       { relname: 'rate_limit_windows', reloptions: ['autovacuum_vacuum_scale_factor=0.01', 'fillfactor=80'] },
     ]);
+  });
+});
+
+describe('migration 014 attempt-result invariants', () => {
+  it('enforces context attempt bounds and derives passed from the score threshold', async () => {
+    const email = `attempt_invariants_${randomUUID()}@example.com`;
+    const user = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('Attempt Invariants', $1, 'not-used', 'te') RETURNING id`,
+      [email],
+    );
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 1');
+    const userId = user.rows[0].id;
+    const questionId = question.rows[0].id;
+    const insertAttempt = (context: 'diagnostic' | 'practice', attemptNo: number, score: number, passed: boolean) =>
+      pool.query(
+        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
+         VALUES ($1, $2, $3, $4, 'bounded answer', $5, $6, 'bounded feedback')`,
+        [userId, questionId, context, attemptNo, score, passed],
+      );
+
+    try {
+      await expect(insertAttempt('diagnostic', 1, 59, false)).resolves.toMatchObject({ rowCount: 1 });
+      await expect(insertAttempt('diagnostic', 5, 60, true)).resolves.toMatchObject({ rowCount: 1 });
+      await expect(insertAttempt('practice', 1, 100, true)).resolves.toMatchObject({ rowCount: 1 });
+      await expect(insertAttempt('practice', 3, 0, false)).resolves.toMatchObject({ rowCount: 1 });
+
+      for (const invalid of [
+        ['diagnostic', 0, 59, false],
+        ['diagnostic', 6, 60, true],
+        ['practice', 0, 59, false],
+        ['practice', 4, 60, true],
+        ['diagnostic', 1, 59, true],
+        ['practice', 1, 60, false],
+      ] as const) {
+        const [context, attemptNo, score, passed] = invalid;
+        await expect(insertAttempt(context, attemptNo, score, passed)).rejects.toMatchObject({ code: '23514' });
+      }
+
+      const constraints = await pool.query<{ conname: string; convalidated: boolean }>(
+        `SELECT conname, convalidated
+         FROM pg_constraint
+         WHERE conrelid = 'attempts'::regclass
+           AND conname IN ('attempts_context_attempt_no_check', 'attempts_passed_score_check')
+         ORDER BY conname`,
+      );
+      expect(constraints.rows).toEqual([
+        { conname: 'attempts_context_attempt_no_check', convalidated: true },
+        { conname: 'attempts_passed_score_check', convalidated: true },
+      ]);
+      const retiredConstraint = await pool.query(
+        `SELECT 1 FROM pg_constraint
+         WHERE conrelid = 'attempts'::regclass
+           AND conname = 'attempts_attempt_no_check'`,
+      );
+      expect(retiredConstraint.rowCount).toBe(0);
+    } finally {
+      await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    }
+  });
+
+  it.each([
+    ['attempt number', 4, 59, false],
+    ['passed/score derivation', 1, 59, true],
+  ] as const)('fails atomically when a legacy row has an invalid %s', async (_caseName, attemptNo, score, passed) => {
+    const client = await pool.connect();
+    const schema = `attempt_invariant_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query(`CREATE TABLE attempts (
+        context TEXT NOT NULL CHECK (context IN ('diagnostic', 'practice')),
+        attempt_no INT NOT NULL,
+        score INT NOT NULL CHECK (score BETWEEN 0 AND 100),
+        passed BOOLEAN NOT NULL,
+        CONSTRAINT attempts_attempt_no_check CHECK (attempt_no > 0)
+      )`);
+      await client.query("INSERT INTO attempts VALUES ('practice', $1, $2, $3)", [attemptNo, score, passed]);
+      await client.query('SAVEPOINT before_attempt_invariants');
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/014_attempt_result_invariants.sql'), 'utf8');
+      await expect(client.query(sql)).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_attempt_invariants');
+
+      const constraints = await client.query<{ conname: string }>(
+        `SELECT conname FROM pg_constraint
+         WHERE conrelid = 'attempts'::regclass
+           AND conname IN (
+             'attempts_attempt_no_check',
+             'attempts_context_attempt_no_check',
+             'attempts_passed_score_check'
+           )
+         ORDER BY conname`,
+      );
+      expect(constraints.rows).toEqual([{ conname: 'attempts_attempt_no_check' }]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 015 public-string invariants', () => {
+  it('rejects ECMAScript-whitespace-only user identity and attempt feedback fields', async () => {
+    const validEmail = `public_strings_${randomUUID()}@example.com`;
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 1');
+    const blank = `\t\u00a0\ufeff`;
+
+    await expect(
+      pool.query(
+        `INSERT INTO users (name, email, password_hash, native_language)
+         VALUES ($1, $2, 'not-used', 'te')`,
+        [blank, `blank_name_${randomUUID()}@example.com`],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      pool.query(
+        `INSERT INTO users (name, email, password_hash, native_language)
+         VALUES ('Valid Name', $1, 'not-used', 'te')`,
+        [blank],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    const user = await pool.query<{ id: string }>(
+      `INSERT INTO users (name, email, password_hash, native_language)
+       VALUES ('Public String Invariants', $1, 'not-used', 'te') RETURNING id`,
+      [validEmail],
+    );
+    const userId = user.rows[0].id;
+    try {
+      await expect(
+        pool.query(
+          `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
+           VALUES ($1, $2, 'practice', 1, 'bounded answer', 60, true, $3)`,
+          [userId, question.rows[0].id, blank],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+
+      const constraints = await pool.query<{ conname: string; convalidated: boolean }>(
+        `SELECT conname, convalidated
+         FROM pg_constraint
+         WHERE conname IN (
+           'users_name_nonblank_check',
+           'users_email_nonblank_check',
+           'attempts_feedback_nonblank_check'
+         )
+         ORDER BY conname`,
+      );
+      expect(constraints.rows).toEqual([
+        { conname: 'attempts_feedback_nonblank_check', convalidated: true },
+        { conname: 'users_email_nonblank_check', convalidated: true },
+        { conname: 'users_name_nonblank_check', convalidated: true },
+      ]);
+    } finally {
+      await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    }
+  });
+
+  it.each([
+    ['user name', `\t\u00a0\ufeff`, 'learner@example.com', 'Helpful feedback.'],
+    ['user email', 'Learner', `\t\u00a0\ufeff`, 'Helpful feedback.'],
+    ['attempt feedback', 'Learner', 'learner@example.com', `\t\u00a0\ufeff`],
+  ] as const)('fails atomically when a legacy row has blank %s', async (_caseName, name, email, feedback) => {
+    const client = await pool.connect();
+    const schema = `public_string_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE users (name TEXT NOT NULL, email TEXT NOT NULL)');
+      await client.query('CREATE TABLE attempts (feedback TEXT NOT NULL)');
+      await client.query('INSERT INTO users (name, email) VALUES ($1, $2)', [name, email]);
+      await client.query('INSERT INTO attempts (feedback) VALUES ($1)', [feedback]);
+      await client.query('SAVEPOINT before_public_string_invariants');
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/015_public_strings_nonblank.sql'), 'utf8');
+      await expect(client.query(sql)).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_public_string_invariants');
+
+      const constraints = await client.query<{ conname: string }>(
+        `SELECT conname FROM pg_constraint
+           WHERE connamespace = $1::regnamespace
+             AND conname IN (
+               'users_name_nonblank_check',
+               'users_email_nonblank_check',
+               'attempts_feedback_nonblank_check'
+             )`,
+        [schema],
+      );
+      expect(constraints.rows).toEqual([]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 });
 

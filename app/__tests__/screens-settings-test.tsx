@@ -69,7 +69,7 @@ const mockAddNavigationListener = jest.fn(
     };
   },
 );
-const mockNavigation = {
+let mockNavigation: { setOptions: jest.Mock; addListener: jest.Mock } = {
   setOptions: mockSetOptions,
   addListener: mockAddNavigationListener,
 };
@@ -380,6 +380,23 @@ function dispatchBeforeRemove(type: string): jest.Mock {
   return preventDefault;
 }
 
+type BeforeRemoveListener = NonNullable<typeof mockBeforeRemoveListener>;
+
+function navigationHarness() {
+  let listener: BeforeRemoveListener | null = null;
+  const remove = jest.fn();
+  const addListener = jest.fn((event: string, next: BeforeRemoveListener) => {
+    if (event === 'beforeRemove') listener = next;
+    return remove;
+  });
+  return {
+    navigation: { setOptions: jest.fn(), addListener },
+    addListener,
+    remove,
+    listener: () => listener,
+  };
+}
+
 function expectFirstNavigationUpdate(expected: typeof LOCKED_NAVIGATION_OPTIONS): void {
   expect(mockSetOptions).toHaveBeenCalled();
   expect(mockSetOptions.mock.calls[0]?.[0]).toEqual(expected);
@@ -389,6 +406,10 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockBeforeRemoveListener = null;
   mockHardwareBackHandler = null;
+  mockNavigation = {
+    setOptions: mockSetOptions,
+    addListener: mockAddNavigationListener,
+  };
   mockAuthValue = makeAuth();
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
 });
@@ -412,6 +433,24 @@ function updateButton() {
 }
 
 describe('change password screen', () => {
+  it('resubscribes its removal guard when navigation identity changes', async () => {
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await renderScreen(<ChangePasswordScreen />);
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(
+      <QueryClientProvider client={queryClients[queryClients.length - 1]!}>
+        <ChangePasswordScreen />
+      </QueryClientProvider>,
+    );
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
+  });
+
   it('keeps Update disabled until all fields validate', async () => {
     await renderScreen(<ChangePasswordScreen />);
     expect(screen.getByLabelText(t('cp.currentLabel')).props.value).toBe('');
@@ -914,6 +953,25 @@ function deleteButton() {
 }
 
 describe('delete account screen', () => {
+  it('resubscribes its removal guard when navigation identity changes', async () => {
+    const queryClient = makeQueryClient();
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await renderScreen(<DeleteAccountScreen />, queryClient);
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(
+      <QueryClientProvider client={queryClient}>
+        <DeleteAccountScreen />
+      </QueryClientProvider>,
+    );
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
+  });
+
   it('renders the permanence warning and keeps delete disabled initially', async () => {
     await renderScreen(<DeleteAccountScreen />);
     expect(flattenedStyle(screen.getByRole('header', { name: t('da.warningTitle') }))).toEqual({
@@ -1147,6 +1205,39 @@ describe('delete account screen', () => {
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
     expect(mockSetOptions).toHaveBeenLastCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
     expect(deleteButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
+  });
+
+  it('ignores the native dismiss callback after deletion has claimed the confirmation', async () => {
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest.fn(() => deletion.promise);
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+
+    const confirmationCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const buttons = (confirmationCall?.[2] ?? []) as {
+      text?: string;
+      onPress?: () => void;
+    }[];
+    const confirmDelete = buttons.find((button) => button.text === t('da.confirmDelete'))?.onPress;
+    const onDismiss = (confirmationCall?.[3] as { onDismiss?: () => void } | undefined)?.onDismiss;
+    if (!confirmDelete || !onDismiss) throw new Error('Delete confirmation callbacks are missing');
+    mockSetOptions.mockClear();
+
+    await act(async () => {
+      confirmDelete();
+      onDismiss();
+      await Promise.resolve();
+    });
+
+    expect(mockAuthValue.deleteAccount).toHaveBeenCalledTimes(1);
+    expect(hardwareBackIsHandled()).toBe(true);
+    expect(
+      screen.getByRole('button', { name: t('da.submitBusy') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+    expect(mockSetOptions).not.toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
+
+    await act(async () => deletion.resolve(undefined));
   });
 
   it('ignores every captured confirmation callback after unmount', async () => {

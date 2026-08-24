@@ -57,7 +57,7 @@ const mockAddNavigationListener = jest.fn(
     };
   },
 );
-const mockNavigation = {
+let mockNavigation: { setOptions: jest.Mock; addListener: jest.Mock } = {
   setOptions: mockSetOptions,
   addListener: mockAddNavigationListener,
 };
@@ -205,6 +205,23 @@ function dispatchBeforeRemove(type: string): jest.Mock {
   return preventDefault;
 }
 
+type BeforeRemoveListener = NonNullable<typeof mockBeforeRemoveListener>;
+
+function navigationHarness() {
+  let listener: BeforeRemoveListener | null = null;
+  const remove = jest.fn();
+  const addListener = jest.fn((event: string, next: BeforeRemoveListener) => {
+    if (event === 'beforeRemove') listener = next;
+    return remove;
+  });
+  return {
+    navigation: { setOptions: jest.fn(), addListener },
+    addListener,
+    remove,
+    listener: () => listener,
+  };
+}
+
 type SemanticStyle = Record<string, unknown>;
 
 function flattenedStyle(node: TestInstance): SemanticStyle {
@@ -345,6 +362,10 @@ beforeEach(() => {
   mockSearchParams = {};
   mockBeforeRemoveListener = null;
   mockHardwareBackHandler = null;
+  mockNavigation = {
+    setOptions: mockSetOptions,
+    addListener: mockAddNavigationListener,
+  };
   mockAuthValue = makeAuth();
   mockForgot.mockReset().mockResolvedValue(undefined);
   mockReset.mockReset().mockResolvedValue(undefined);
@@ -377,6 +398,28 @@ describe('login entry points', () => {
 });
 
 describe('forgot-password screen', () => {
+  it('lets the idle Back to login Link navigate', async () => {
+    await render(<ForgotPasswordScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+
+    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('resubscribes the removal guard when navigation identity changes', async () => {
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await render(<ForgotPasswordScreen />);
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(<ForgotPasswordScreen />);
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
+  });
+
   it('keeps Send code disabled until an email is typed', async () => {
     await render(<ForgotPasswordScreen />);
     const button = () => screen.getByRole('button', { name: t('reset.submitRequest') });
@@ -757,6 +800,30 @@ describe('forgot-password screen', () => {
 });
 
 describe('reset-password screen', () => {
+  it('lets the idle Back to login Link navigate', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+
+    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('resubscribes the removal guard when navigation identity changes', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await render(<ResetPasswordScreen />);
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(<ResetPasswordScreen />);
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
+  });
+
   async function fillValidForm() {
     await fireEvent.changeText(
       screen.getByLabelText(t('reset.codeLabel')),

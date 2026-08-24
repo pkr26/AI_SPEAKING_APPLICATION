@@ -18,7 +18,7 @@ const serverDirectory = path.resolve(path.dirname(fileURLToPath(import.meta.url)
 test('the checked-in manifest exactly partitions every executable backend TypeScript file', async () => {
   await assert.doesNotReject(assertMutationLaneManifest({ serverDir: serverDirectory }));
   assert.equal(codeMutationLaneNames.length, 19);
-  assert.equal(expectedCodeMutationFiles.length, 27);
+  assert.equal(expectedCodeMutationFiles.length, 28);
   assert.equal(new Set(expectedCodeMutationFiles).size, expectedCodeMutationFiles.length);
 });
 

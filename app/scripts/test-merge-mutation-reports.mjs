@@ -528,7 +528,7 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
   }
 });
 
-test('the Recorder review pins 187 equivalents without exempting sentinel kills or final gaps', () => {
+test('the Recorder review pins 187 equivalents without exempting final gaps', () => {
   const recorderEntries = equivalentMutants.filter(
     (entry) => entry.file === 'src/components/Recorder.tsx',
   );
@@ -537,74 +537,36 @@ test('the Recorder review pins 187 equivalents without exempting sentinel kills 
   assert.equal(new Set(reviewedIds).size, 187, 'canonical Recorder IDs must be unique');
   assert.ok(reviewedIds.every((id) => /^\d+$/u.test(id)));
 
-  assert.ok(reviewedIds.includes('1896'), 'reviewed post-unmount setter invariant is missing');
+  assert.ok(reviewedIds.includes('1910'), 'reviewed post-unmount setter invariant is missing');
 
-  const reclassifiedInvariantIds = ['1220', '2187', '2188', '2206', '2258', '2266', '2311', '2340'];
+  const reclassifiedInvariantIds = ['1231', '2201', '2202', '2220', '2272', '2280', '2325', '2354'];
   for (const id of reclassifiedInvariantIds) {
     assert.ok(reviewedIds.includes(id), `reviewed invariant ${id} is missing`);
   }
 
-  const sentinelKilledIds = [
-    '1317',
-    '1321',
-    '2238',
-    '2451',
-    '2453',
-    '2454',
-    '2834',
-    '2835',
-    '2836',
-  ];
-  const finalGapIds = ['891', '2268'];
-  const unexplainedOldCanonicalIds = [...sentinelKilledIds, ...finalGapIds];
-  assert.equal(unexplainedOldCanonicalIds.length, 11);
-  for (const id of unexplainedOldCanonicalIds) {
+  const finalGapIds = ['457', '1734'];
+  for (const id of finalGapIds) {
     assert.equal(reviewedIds.includes(id), false, `mutant ${id} must remain unexplained`);
   }
 
-  const formerBehavioralGapIds = [
-    '891',
-    '1220',
-    '1317',
-    '1321',
-    '2187',
-    '2188',
-    '2206',
-    '2238',
-    '2258',
-    '2266',
-    '2268',
-    '2311',
-    '2340',
-    '2451',
-    '2453',
-    '2454',
-    '2834',
-    '2835',
-    '2836',
-  ];
-  assert.deepEqual(
-    [...reclassifiedInvariantIds, ...unexplainedOldCanonicalIds].toSorted(),
-    formerBehavioralGapIds.toSorted(),
-  );
-
   const simplificationIds = [
-    '2023',
-    '2025',
-    '2027',
-    '2029',
-    '2031',
-    '2032',
-    '2033',
-    '2034',
-    '2035',
     '2037',
     '2039',
-    '2040',
+    '2041',
     '2042',
+    '2043',
     '2045',
+    '2046',
     '2047',
-    '2050',
+    '2048',
+    '2049',
+    '2051',
+    '2053',
+    '2054',
+    '2056',
+    '2059',
+    '2061',
+    '2064',
   ];
   for (const id of simplificationIds) {
     const entry = recorderEntries.find((candidate) => candidate.reviewedMutantId === id);

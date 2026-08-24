@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { QueryClient, QueryClientProvider, QueryObserver } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
@@ -176,6 +176,16 @@ function nextPayload(question: Question, asked: number) {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 // ----- helpers -----
 
 let alertSpy: jest.SpyInstance;
@@ -325,12 +335,14 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  // Flush TanStack Query's batched notifications inside act().
+  // Clear every observed cache and drain TanStack Query's timer-batched
+  // notifications inside act so slower multi-file runs cannot publish a late
+  // DiagnosticScreen update into the next suite.
   await act(async () => {
+    for (const client of queryClients) client.clear();
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  // Cancel cache-gc timers so the jest process can exit promptly.
-  for (const client of queryClients) client.clear();
   queryClients.length = 0;
   alertSpy.mockRestore();
 });
@@ -372,6 +384,33 @@ describe('diagnostic screen', () => {
         exact: true,
       }),
     ).toBeDefined();
+  });
+
+  it('recaptures the session lease when its auth capture callback changes for the same identity', async () => {
+    const leaseA = { owner: 'lease-a' } as never;
+    const leaseB = { owner: 'lease-b' } as never;
+    const captureA = jest.fn(() => leaseA);
+    mockAuthValue = makeAuth({
+      captureSessionLease: captureA,
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === leaseA),
+    });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen();
+    await startFreshTest();
+    expect(captureA).toHaveBeenCalled();
+
+    const captureB = jest.fn(() => leaseB);
+    mockAuthValue = makeAuth({
+      captureSessionLease: captureB,
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === leaseB),
+    });
+    await rendered.rerenderScreen();
+    alertSpy.mockClear();
+
+    await act(async () => recorderProps().onError('current lease failure'));
+
+    expect(captureB).toHaveBeenCalled();
+    expect(alertSpy).toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'current lease failure');
   });
 
   it('shows the one-shot localized intro before the first question of a fresh test', async () => {
@@ -454,6 +493,43 @@ describe('diagnostic screen', () => {
       ownerId: OTHER_USER.id,
       questionId: QUESTION_2.id,
     });
+    mockRouter.navigate.mockClear();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+  });
+
+  it('drops an initial diagnostic response when its captured session lease expires before delivery', async () => {
+    const initial = deferred<ReturnType<typeof nextPayload>>();
+    const leaseA = { owner: 'initial-request' } as never;
+    let currentLease: unknown = leaseA;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => leaseA),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockReturnValue(initial.promise);
+    const queryClient = makeQueryClient();
+    await renderScreen(queryClient);
+    expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+
+    currentLease = { owner: 'replacement-session' };
+    await act(async () => {
+      initial.resolve(nextPayload(QUESTION_1, 0));
+      await initial.promise;
+    });
+    await waitFor(() =>
+      expect(queryClient.getQueryState(['diagnostic-next', 1, USER.id])?.status).toBe('success'),
+    );
+    await act(async () => {
+      // The cache settles before TanStack's timer-batched observer notification;
+      // drain that turn so DiagnosticScreen's passive data effect has also run.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
+    expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
+    expect(screen.queryByRole('button', { name: t('diag.introStart') })).toBeNull();
+    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
+    expect(mockRecorderProps).toBeNull();
   });
 
   it('renders no stale question while a new identity has cached empty diagnostic data', async () => {
@@ -839,6 +915,55 @@ describe('diagnostic screen', () => {
     expect(recorderProps().questionId).toBe(QUESTION_2.id);
   });
 
+  it('rejects callbacks retained by the previous question Recorder after advancing', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    const oldCallbacks = recorderProps();
+
+    await act(async () =>
+      oldCallbacks.onResult({
+        passed: true,
+        score: 88,
+        transcript: 'accepted answer',
+        feedback: 'accepted feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(recorderProps().questionId).toBe(QUESTION_2.id);
+    alertSpy.mockClear();
+    const callsBeforeReplay = mockApiFetch.mock.calls.length;
+
+    await act(async () => {
+      oldCallbacks.onResult({
+        passed: true,
+        score: 99,
+        transcript: 'late old answer',
+        feedback: 'late old feedback',
+        done: true,
+        level: 'C2',
+      });
+      oldCallbacks.onError('late old error');
+      oldCallbacks.onRecoveryUnresolved();
+      oldCallbacks.onInteractionLockChange?.(true);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeReplay);
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+  });
+
   it('reveals the level and completes the diagnostic', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
     const queryClient = makeQueryClient();
@@ -927,6 +1052,27 @@ describe('diagnostic screen', () => {
         nextQuestion: QUESTION_1,
       });
     });
+
+    alertSpy.mockClear();
+    mockRouter.navigate.mockClear();
+    const callsAfterAcceptedResult = mockApiFetch.mock.calls.length;
+    await act(async () => {
+      callbacks.onError('late error after accepted result');
+      callbacks.onRecoveryUnresolved();
+      callbacks.onInteractionLockChange?.(true);
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledTimes(callsAfterAcceptedResult);
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
 
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
     expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
@@ -1171,6 +1317,43 @@ describe('diagnostic screen', () => {
     expect(recorderProps().questionId).toBe(QUESTION_2.id);
   });
 
+  it('cancels only the diagnostic-next query when a recorder result is accepted', async () => {
+    const queryClient = makeQueryClient();
+    const unrelated = deferred<string>();
+    let unrelatedSignal: AbortSignal | undefined;
+    const unrelatedFetch = queryClient.fetchQuery({
+      queryKey: ['unrelated-diagnostic-work'],
+      queryFn: ({ signal }) => {
+        unrelatedSignal = signal;
+        return unrelated.promise;
+      },
+    });
+    const unrelatedSettlement = unrelatedFetch.catch((error: unknown) => error);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen(queryClient);
+    await screen.findByText(QUESTION_1.questionText);
+    await waitFor(() => expect(unrelatedSignal).toBeDefined());
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 90,
+        transcript: 'accepted answer',
+        feedback: 'accepted feedback',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+
+    expect(unrelatedSignal?.aborted).toBe(false);
+    let unrelatedResult: unknown;
+    await act(async () => {
+      unrelated.resolve('unrelated result');
+      unrelatedResult = await unrelatedSettlement;
+    });
+    expect(unrelatedResult).toBe('unrelated result');
+  });
+
   it('shows the completion view immediately when the test is already done', async () => {
     mockApiFetch.mockResolvedValue({ done: true, level: 'A2' });
     await renderScreen();
@@ -1304,6 +1487,121 @@ describe('diagnostic screen', () => {
     expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
   });
 
+  it.each(['resolve', 'reject'] as const)(
+    'releases the same Recorder recovery latch after its refresh %s',
+    async (settlement) => {
+      const firstRefresh = deferred<void>();
+      const secondRefresh = deferred<void>();
+      const refetch = jest
+        .spyOn(QueryObserver.prototype, 'refetch')
+        .mockReturnValueOnce(firstRefresh.promise as never)
+        .mockReturnValueOnce(secondRefresh.promise as never);
+      mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+
+      try {
+        await renderScreen();
+        await screen.findByText(QUESTION_1.questionText);
+        const callbacks = recorderProps();
+
+        await act(async () => {
+          callbacks.onRecoveryUnresolved();
+          await Promise.resolve();
+        });
+        expect(refetch).toHaveBeenCalledTimes(1);
+
+        await act(async () => {
+          if (settlement === 'resolve') firstRefresh.resolve();
+          else firstRefresh.reject(new Error('controlled recovery failure'));
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        await act(async () => {
+          callbacks.onRecoveryUnresolved();
+          await Promise.resolve();
+        });
+        expect(refetch).toHaveBeenCalledTimes(2);
+
+        secondRefresh.resolve();
+        await act(async () => {
+          await Promise.resolve();
+        });
+      } finally {
+        firstRefresh.resolve();
+        secondRefresh.resolve();
+        refetch.mockRestore();
+      }
+    },
+  );
+
+  it.each(['resolve', 'reject'] as const)(
+    'does not let an older Recorder recovery settlement release the newer owner after %s',
+    async (settlement) => {
+      const oldRefresh = deferred<void>();
+      const currentRefresh = deferred<void>();
+      const unexpectedRefresh = deferred<void>();
+      const refetch = jest
+        .spyOn(QueryObserver.prototype, 'refetch')
+        .mockReturnValueOnce(oldRefresh.promise as never)
+        .mockReturnValueOnce(currentRefresh.promise as never)
+        .mockReturnValueOnce(unexpectedRefresh.promise as never);
+      mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+
+      try {
+        await renderScreen();
+        await screen.findByText(QUESTION_1.questionText);
+        const oldCallbacks = recorderProps();
+
+        await act(async () => {
+          oldCallbacks.onRecoveryUnresolved();
+          await Promise.resolve();
+        });
+        expect(refetch).toHaveBeenCalledTimes(1);
+
+        await act(async () =>
+          oldCallbacks.onResult({
+            passed: true,
+            score: 88,
+            transcript: 'accepted answer',
+            feedback: 'accepted feedback',
+            done: false,
+            nextQuestion: QUESTION_2,
+          }),
+        );
+        await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+        expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
+        const currentCallbacks = recorderProps();
+
+        await act(async () => {
+          currentCallbacks.onRecoveryUnresolved();
+          await Promise.resolve();
+        });
+        expect(refetch).toHaveBeenCalledTimes(2);
+
+        await act(async () => {
+          if (settlement === 'resolve') oldRefresh.resolve();
+          else oldRefresh.reject(new Error('older recovery failure'));
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+        await act(async () => {
+          currentCallbacks.onRecoveryUnresolved();
+          await Promise.resolve();
+        });
+        expect(refetch).toHaveBeenCalledTimes(2);
+
+        currentRefresh.resolve();
+        await act(async () => {
+          await Promise.resolve();
+        });
+      } finally {
+        oldRefresh.resolve();
+        currentRefresh.resolve();
+        unexpectedRefresh.resolve();
+        refetch.mockRestore();
+      }
+    },
+  );
+
   it('navigates to the settings screen from the account action', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
@@ -1365,6 +1663,12 @@ describe('diagnostic screen', () => {
     });
     expect(logout).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
 
     await act(async () => {
       rejectLogout(new Error('offline'));
@@ -1444,13 +1748,63 @@ describe('diagnostic screen', () => {
     });
     expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
     expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
 
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(logout).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+  });
+
+  it('does not navigate after a pending logout resolves while the diagnostic is blurred', async () => {
+    const pendingLogout = deferred<void>();
+    const logout = jest.fn(() => pendingLogout.promise);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(logout).toHaveBeenCalledTimes(1);
+    await blurScreen();
+    pendingLogout.resolve();
     await act(async () => {
-      void pressLogout();
+      await pendingLogout.promise;
       await Promise.resolve();
     });
-    expect(logout).toHaveBeenCalledTimes(2);
-    expect(mockRouter.replace).toHaveBeenCalledWith('/');
+
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('drops a pending logout failure after its strict session lease expires without a rerender', async () => {
+    const pendingLogout = deferred<void>();
+    const leaseA = { owner: 'logout-lease-a' } as never;
+    let currentLease: unknown = leaseA;
+    const logout = jest.fn(() => pendingLogout.promise);
+    mockAuthValue = makeAuth({
+      logout,
+      captureSessionLease: jest.fn(() => leaseA),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(logout).toHaveBeenCalledTimes(1);
+    currentLease = { owner: 'logout-lease-b' };
+    pendingLogout.reject(new Error('late offline failure'));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
   });
 
   it('alerts when logout fails', async () => {

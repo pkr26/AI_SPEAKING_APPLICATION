@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { StyleSheet, useColorScheme } from 'react-native';
@@ -6,7 +6,7 @@ import type { TestInstance } from 'test-renderer';
 
 import HistoryScreen, { groupHistoryByDay } from '../src/app/history';
 import { apiGetPracticeHistory, ApiError } from '../src/lib/api';
-import { useAuth } from '../src/lib/auth';
+import { type SessionLease, useAuth } from '../src/lib/auth';
 import { I18nProvider, setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import {
@@ -45,6 +45,13 @@ const USER: User = {
   diagnosticCompleted: true,
 };
 
+const OTHER_USER: User = {
+  ...USER,
+  id: '550e8400-e29b-41d4-a716-446655440010',
+  name: 'Grace Hopper',
+  email: 'grace@example.com',
+};
+
 let mockAuthValue: AuthValue;
 
 function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
@@ -66,6 +73,16 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     setUser: jest.fn(),
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 jest.mock('../src/lib/auth', () => ({
@@ -122,6 +139,12 @@ function makeQueryClient(staleTime = 0) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime } } });
   queryClients.push(client);
   return client;
+}
+
+function markOrdinaryFetchInFlight(client: QueryClient, queryKey: readonly unknown[]) {
+  const query = client.getQueryCache().find({ queryKey, exact: true });
+  if (!query) throw new Error(`No query exists for ${JSON.stringify(queryKey)}`);
+  query.setState({ fetchStatus: 'fetching', fetchMeta: null });
 }
 
 function renderHistory() {
@@ -286,6 +309,7 @@ afterEach(async () => {
   });
   for (const client of queryClients) client.clear();
   queryClients.length = 0;
+  jest.restoreAllMocks();
 });
 
 describe('groupHistoryByDay', () => {
@@ -979,8 +1003,103 @@ describe('history screen', () => {
     expect(passes()).toBe(before);
   });
 
+  it('switches the cached history and captured lease at a same-mount account boundary', async () => {
+    const firstLease = { owner: 'first-history-account' } as never;
+    const secondLease = { owner: 'second-history-account' } as never;
+    let currentLease: SessionLease = firstLease;
+    const captureSessionLease = jest.fn(() => currentLease);
+    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
+    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
+
+    const client = makeQueryClient(Infinity);
+    const firstKey = ['practice-history', USER.id] as const;
+    const secondKey = ['practice-history', OTHER_USER.id] as const;
+    const secondCursor = '550e8400-e29b-41d4-a716-446655440067';
+    client.setQueryData(firstKey, {
+      pages: [{ items: [historyItem({ promptWord: 'first-account' })], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    client.setQueryData(secondKey, {
+      pages: [
+        {
+          items: [
+            historyItem({
+              id: '550e8400-e29b-41d4-a716-446655440068',
+              promptWord: 'second-account',
+            }),
+          ],
+          nextCursor: secondCursor,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    expect(screen.getByText('first-account')).toBeTruthy();
+    expect(captureSessionLease).toHaveBeenCalledTimes(1);
+
+    currentLease = secondLease;
+    mockAuthValue = makeAuth({
+      user: OTHER_USER,
+      sessionVersion: 2,
+      captureSessionLease,
+      isSessionLeaseCurrent,
+    });
+    await rendered.rerender(tree());
+
+    expect(screen.getByText('second-account')).toBeTruthy();
+    expect(screen.queryByText('first-account')).toBeNull();
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
+
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
+    await waitFor(() =>
+      expect(mockGetHistory).toHaveBeenCalledWith(secondCursor, expect.anything()),
+    );
+    expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
+  });
+
+  it('rejects a retained Load More handler after the history screen unmounts', async () => {
+    const client = makeQueryClient(Infinity);
+    const queryKey = ['practice-history', USER.id] as const;
+    client.setQueryData(queryKey, {
+      pages: [
+        {
+          items: [historyItem()],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440069',
+        },
+      ],
+      pageParams: [undefined],
+    });
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    const fetchNextPageSpy = jest
+      .spyOn(InfiniteQueryObserver.prototype, 'fetchNextPage')
+      .mockResolvedValue({} as never);
+    const rendered = await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+    const retainedLoadMore = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
+
+    await rendered.unmount();
+    await act(async () => {
+      retainedLoadMore();
+      await Promise.resolve();
+    });
+
+    expect(fetchNextPageSpy).not.toHaveBeenCalled();
+  });
+
   it('swaps the load-more button for a footer spinner and skips duplicate requests', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440056';
+    const refetchSpy = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     let releaseOlder: () => void = () => undefined;
     mockGetHistory.mockResolvedValueOnce({ items: [historyItem()], nextCursor: cursor });
     mockGetHistory.mockImplementation(
@@ -1011,6 +1130,7 @@ describe('history screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(mockGetHistory).toHaveBeenCalledTimes(2);
+    expect(refetchSpy).not.toHaveBeenCalled();
 
     const footerLabel = screen.getByText(t('history.loadingMore'));
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
@@ -1037,6 +1157,7 @@ describe('history screen', () => {
 
   it('queues Load More behind a loaded-page refresh and then fetches the older cursor', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440065';
+    const refetchSpy = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     const client = makeQueryClient();
     client.setQueryData(['practice-history', USER.id], {
       pages: [{ items: [historyItem()], nextCursor: cursor }],
@@ -1068,6 +1189,7 @@ describe('history screen', () => {
       await Promise.resolve();
     });
     const callsBeforeRefreshSettled = mockGetHistory.mock.calls.length;
+    expect(refetchSpy).toHaveBeenCalledTimes(1);
 
     await act(async () => {
       resolveRefresh({ items: [historyItem()], nextCursor: cursor });
@@ -1092,6 +1214,149 @@ describe('history screen', () => {
     expect(callsAfterRefreshSettled).toBe(2);
     expect(mockGetHistory.mock.calls[1][0]).toBe(cursor);
     expect(await screen.findByText('journey')).toBeTruthy();
+  });
+
+  it('keeps a new account queue owned when the previous account refresh settles', async () => {
+    const firstRefresh = deferred<{ isError: boolean }>();
+    const secondRefresh = deferred<{ isError: boolean }>();
+    const extraRefresh = deferred<{ isError: boolean }>();
+    const refetchSpy = jest
+      .spyOn(InfiniteQueryObserver.prototype, 'refetch')
+      .mockImplementationOnce(() => firstRefresh.promise as never)
+      .mockImplementationOnce(() => secondRefresh.promise as never)
+      .mockImplementation(() => extraRefresh.promise as never);
+    const fetchNextPageSpy = jest
+      .spyOn(InfiniteQueryObserver.prototype, 'fetchNextPage')
+      .mockResolvedValue({} as never);
+    mockAuthValue = makeAuth({ isSessionLeaseCurrent: jest.fn(() => true) });
+
+    const client = makeQueryClient(Infinity);
+    const firstKey = ['practice-history', USER.id] as const;
+    const secondKey = ['practice-history', OTHER_USER.id] as const;
+    client.setQueryData(firstKey, {
+      pages: [
+        {
+          items: [historyItem({ promptWord: 'first-account' })],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440070',
+        },
+      ],
+      pageParams: [undefined],
+    });
+    client.setQueryData(secondKey, {
+      pages: [
+        {
+          items: [
+            historyItem({
+              id: '550e8400-e29b-41d4-a716-446655440071',
+              promptWord: 'second-account',
+            }),
+          ],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440072',
+        },
+      ],
+      pageParams: [undefined],
+    });
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    const firstLoadMore = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
+    await act(async () => {
+      markOrdinaryFetchInFlight(client, firstKey);
+      firstLoadMore();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({
+      user: OTHER_USER,
+      sessionVersion: 2,
+      isSessionLeaseCurrent: jest.fn(() => true),
+    });
+    await rendered.rerender(tree());
+    const secondLoadMore = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
+    await act(async () => {
+      markOrdinaryFetchInFlight(client, secondKey);
+      secondLoadMore();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      firstRefresh.resolve({ isError: false });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fetchNextPageSpy).not.toHaveBeenCalled();
+
+    await act(async () => {
+      secondLoadMore();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondRefresh.resolve({ isError: true });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  it('releases its queued refresh token after that owner settles with an error', async () => {
+    const firstRefresh = deferred<{ isError: boolean }>();
+    const secondRefresh = deferred<{ isError: boolean }>();
+    const refetchSpy = jest
+      .spyOn(InfiniteQueryObserver.prototype, 'refetch')
+      .mockImplementationOnce(() => firstRefresh.promise as never)
+      .mockImplementationOnce(() => secondRefresh.promise as never);
+    const client = makeQueryClient(Infinity);
+    const queryKey = ['practice-history', USER.id] as const;
+    client.setQueryData(queryKey, {
+      pages: [
+        {
+          items: [historyItem()],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440073',
+        },
+      ],
+      pageParams: [undefined],
+    });
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+    const loadMore = committedPressHandler(
+      screen.getByRole('button', { name: t('history.loadMore') }),
+    );
+    await act(async () => {
+      markOrdinaryFetchInFlight(client, queryKey);
+      loadMore();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstRefresh.resolve({ isError: true });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      loadMore();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondRefresh.resolve({ isError: true });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
   });
 
   it('joins repeated retries after a cached empty page fails in the background', async () => {

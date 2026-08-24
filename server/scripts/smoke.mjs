@@ -6,15 +6,21 @@
 //   RATE_LIMIT_ASSESS_MAX=100000 ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 ASSESS_IP_DAILY_CAP=100000 npm run dev
 
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
 const BASE = process.env.BASE_URL || 'http://localhost:4000';
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
+const appConfig = JSON.parse(await readFile(new URL('../../app/app.json', import.meta.url), 'utf8'));
+const CLIENT_VERSION = appConfig?.expo?.version;
+if (typeof CLIENT_VERSION !== 'string' || CLIENT_VERSION.length === 0) {
+  throw new Error('app/app.json must provide expo.version for the API compatibility handshake');
+}
 
 // Fail-closed assertion budget: the exact number of ok() calls that run
 // exactly once per successful run (everything outside the diagnostic-answer
 // and practice-attempt loops, excluding the final tally check itself).
 // UPDATE THIS COUNT whenever checks are intentionally added or removed.
-const EXPECTED_DETERMINISTIC_ASSERTIONS = 52;
+const EXPECTED_DETERMINISTIC_ASSERTIONS = 59;
 
 let passed = 0;
 function ok(name, cond, extra = '') {
@@ -27,7 +33,7 @@ function ok(name, cond, extra = '') {
 }
 
 async function req(method, path, { token, json, form } = {}) {
-  const headers = {};
+  const headers = { 'X-Client-Version': CLIENT_VERSION };
   if (token) headers.Authorization = `Bearer ${token}`;
   let body;
   if (json !== undefined) {
@@ -59,7 +65,8 @@ function audioForm(questionId, requestId = randomUUID()) {
 
 const isUuid = (s) =>
   typeof s === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s);
-const hasKeys = (obj, keys) => keys.every((k) => Object.prototype.hasOwnProperty.call(obj, k));
+const hasKeys = (obj, keys) =>
+  !!obj && typeof obj === 'object' && keys.every((k) => Object.prototype.hasOwnProperty.call(obj, k));
 const questionShape = (q) =>
   q &&
   isUuid(q.id) &&
@@ -123,6 +130,35 @@ ok(
 r = await req('GET', '/auth/me');
 ok('GET /auth/me without token returns 401', r.status === 401);
 
+r = await req('PATCH', '/auth/me', {
+  token,
+  json: { name: 'Updated Smoke Test', nativeLanguage: 'hi' },
+});
+ok(
+  'PATCH /auth/me returns the updated full user contract',
+  r.status === 200 &&
+    r.body.user?.id === userId &&
+    r.body.user?.name === 'Updated Smoke Test' &&
+    r.body.user?.nativeLanguage === 'hi',
+  JSON.stringify(r.body),
+);
+
+r = await req('POST', '/auth/forgot-password', { json: { email } });
+ok(
+  'forgot-password preserves its uniform empty 204 contract',
+  r.status === 204 && r.body === null,
+  JSON.stringify(r.body),
+);
+
+r = await req('POST', '/auth/reset-password', {
+  json: { email, token: 'not-the-issued-reset-code', newPassword: 'resetcandidate123' },
+});
+ok(
+  'reset-password rejects an invalid code with the stable error contract',
+  r.status === 400 && r.body.error === 'Reset code is invalid or expired' && r.body.code === 'RESET_INVALID',
+  JSON.stringify(r.body),
+);
+
 // ---------- practice before diagnostic ----------
 r = await req('GET', '/practice/question', { token });
 ok(
@@ -141,6 +177,9 @@ ok(
 );
 r = await req('POST', '/uploads/audio-url', { token, json: { contentType: 'text/plain' } });
 ok('uploads/audio-url rejects non-audio content type with 415', r.status === 415, JSON.stringify(r.body));
+
+r = await req('POST', '/diagnostic/restart', { token, json: { confirm: true } });
+ok('diagnostic/restart returns an empty 204', r.status === 204 && r.body === null, JSON.stringify(r.body));
 
 r = await req('GET', '/diagnostic/next', { token });
 ok(
@@ -278,7 +317,11 @@ const helpEtag = r.headers.get('etag');
 ok('help sends an ETag', typeof helpEtag === 'string' && helpEtag.length > 0);
 
 const cachedRes = await fetch(`${BASE}/practice/question/${practiceQ.id}/help`, {
-  headers: { Authorization: `Bearer ${token}`, 'If-None-Match': helpEtag },
+  headers: {
+    Authorization: `Bearer ${token}`,
+    'If-None-Match': helpEtag,
+    'X-Client-Version': CLIENT_VERSION,
+  },
 });
 ok('help with If-None-Match returns 304', cachedRes.status === 304, `got ${cachedRes.status}`);
 
@@ -287,6 +330,9 @@ ok('help for unknown question returns 404', r.status === 404 && typeof r.body.er
 
 r = await req('GET', `/practice/question/not-a-uuid/help`, { token });
 ok('help with malformed UUID returns 400', r.status === 400 && typeof r.body.error === 'string', `got ${r.status}`);
+
+r = await req('POST', '/practice/skip', { token, json: { questionId: practiceQ.id } });
+ok('practice/skip returns an empty 204', r.status === 204 && r.body === null, JSON.stringify(r.body));
 
 r = await req('POST', '/practice/attempt', { token, form: new FormData() });
 ok(
@@ -362,6 +408,45 @@ ok(
     typeof r.body.transcript === 'string' &&
     typeof r.body.modelAnswer === 'string' &&
     typeof r.body.feedback === 'string',
+  JSON.stringify(r.body),
+);
+
+r = await req('GET', '/practice/history', { token });
+ok(
+  'practice/history returns parseable attempt rows and a nullable cursor',
+  r.status === 200 &&
+    Array.isArray(r.body.items) &&
+    r.body.items.length > 0 &&
+    r.body.items.every((item) =>
+      hasKeys(item, [
+        'id',
+        'questionId',
+        'promptWord',
+        'questionText',
+        'cefrLevel',
+        'context',
+        'attemptNo',
+        'score',
+        'passed',
+        'transcript',
+        'feedback',
+        'createdAt',
+      ]),
+    ) &&
+    (r.body.nextCursor === null || isUuid(r.body.nextCursor)),
+  JSON.stringify(r.body).slice(0, 300),
+);
+
+r = await req('GET', '/practice/stats', { token });
+ok(
+  'practice/stats returns level, progress, streak, and attempt totals',
+  r.status === 200 &&
+    r.body.level === assignedLevel &&
+    hasKeys(r.body.progress, ['masteredCount', 'learningCount', 'totalAtLevel', 'dueCount']) &&
+    Number.isInteger(r.body.streakDays) &&
+    Number.isInteger(r.body.practicedToday) &&
+    Number.isInteger(r.body.totalAttempts) &&
+    r.body.totalAttempts > 0,
   JSON.stringify(r.body),
 );
 

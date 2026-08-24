@@ -1345,6 +1345,8 @@ describe('Recorder pure behavior contracts', () => {
   it.each([
     ['429', new ApiError(429, 'wait', 1), 2_000],
     ['503', new ApiError(503, 'wait', 10), 10_000],
+    ['request in flight', new ApiError(409, 'wait', 7, { code: 'REQUEST_IN_FLIGHT' }), 7_000],
+    ['unrelated conflict', new ApiError(409, 'wait', 7, { code: 'STATE_CHANGED' }), null],
     ['lower bound', new ApiError(503, 'wait', 0), 2_000],
     ['upper bound', new ApiError(503, 'wait', 600), 5 * 60_000],
     ['wrong status', new ApiError(500, 'wait', 1), null],
@@ -9176,7 +9178,7 @@ describe('Recorder', () => {
       expect(props.onResult).not.toHaveBeenCalled();
     });
 
-    it('keeps polling the same S3 handoff when its resubmission is already processing', async () => {
+    it('honors REQUEST_IN_FLIGHT Retry-After before polling the same S3 handoff', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
@@ -9184,7 +9186,9 @@ describe('Recorder', () => {
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
-      mockStartedApiFetchFailureOnce(new ApiError(409, 'processing'));
+      mockStartedApiFetchFailureOnce(
+        new ApiError(409, 'processing', 7, { code: 'REQUEST_IN_FLIGHT' }),
+      );
       asMock(apiFetch).mockResolvedValueOnce({
         status: 'completed',
         context: 'practice',
@@ -9194,7 +9198,18 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
 
       expect(apiFetch).toHaveBeenCalledTimes(1);
-      await advancePolls(6);
+      await advancePolls(5);
+
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+      await act(async () => {
+        jest.advanceTimersByTime(6_999);
+        await flushMicrotasks();
+      });
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+      await act(async () => {
+        jest.advanceTimersByTime(1);
+        await flushMicrotasks();
+      });
 
       expect(apiFetch).toHaveBeenCalledTimes(8);
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 81 } });

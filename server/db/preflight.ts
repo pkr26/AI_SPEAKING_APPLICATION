@@ -1,10 +1,16 @@
 import dotenv from 'dotenv';
 import { Client } from 'pg';
+import { boundedQuestionInventoryQuery, questionInventoryIssues } from '../src/question-inventory';
 
 interface IntegrityCheck {
   name: string;
   sql: string;
 }
+
+// Exact ECMAScript trim characters used by the mobile parser. PostgreSQL's
+// one-argument btrim only removes U+0020, so it would miss tabs, NBSP, BOM,
+// and the other Unicode whitespace-only values JavaScript rejects.
+const JS_TRIM_CHARACTERS_SQL = String.raw`U&'\0009\000A\000B\000C\000D\0020\00A0\1680\2000\2001\2002\2003\2004\2005\2006\2007\2008\2009\200A\2028\2029\202F\205F\3000\FEFF'`;
 
 function integrityChecks(): IntegrityCheck[] {
   return [
@@ -12,7 +18,9 @@ function integrityChecks(): IntegrityCheck[] {
       name: 'invalid users',
       sql: `SELECT count(*)::int AS n FROM users
           WHERE name IS NULL OR char_length(name) NOT BETWEEN 1 AND 100
+             OR btrim(name, ${JS_TRIM_CHARACTERS_SQL}) = ''
              OR created_at IS NULL OR char_length(email) NOT BETWEEN 3 AND 254
+             OR btrim(email, ${JS_TRIM_CHARACTERS_SQL}) = ''
              OR token_version <= 0
              OR (cefr_level IS NOT NULL AND cefr_level NOT IN ('A1','A2','B1','B2','C1','C2'))
              OR (diagnostic_completed AND cefr_level IS NULL)`,
@@ -24,54 +32,25 @@ function integrityChecks(): IntegrityCheck[] {
           ) duplicates`,
     },
     {
-      name: 'invalid questions',
+      name: 'invalid question metadata',
       sql: `SELECT count(*)::int AS n FROM questions
-          WHERE created_at IS NULL
-             OR char_length(prompt_word) NOT BETWEEN 1 AND 100
-             OR btrim(prompt_word) = ''
-             OR char_length(question_text) NOT BETWEEN 1 AND 1000
-             OR btrim(question_text) = ''
-             OR jsonb_typeof(translations) IS DISTINCT FROM 'object'
-             OR NOT (translations ?& ARRAY['te', 'hi', 'es', 'zh'])
-             OR EXISTS (
-               SELECT 1
-               FROM unnest(ARRAY['te', 'hi', 'es', 'zh']) AS supported_language(code)
-               CROSS JOIN LATERAL (
-                 SELECT translations->supported_language.code
-               ) AS payload(translation)
-               WHERE jsonb_typeof(payload.translation) IS DISTINCT FROM 'object'
-                  OR jsonb_typeof(payload.translation->'word') IS DISTINCT FROM 'string'
-                  OR btrim(payload.translation->>'word') = ''
-                  OR char_length(payload.translation->>'word') > 500
-                  OR jsonb_typeof(payload.translation->'question') IS DISTINCT FROM 'string'
-                  OR btrim(payload.translation->>'question') = ''
-                  OR char_length(payload.translation->>'question') > 4000
-                  OR CASE
-                       WHEN jsonb_typeof(payload.translation->'examples') IS DISTINCT FROM 'array'
-                         THEN true
-                       ELSE jsonb_array_length(payload.translation->'examples') <> 3
-                         OR EXISTS (
-                           SELECT 1
-                           FROM jsonb_array_elements(payload.translation->'examples') AS example(item)
-                           WHERE jsonb_typeof(example.item) IS DISTINCT FROM 'object'
-                              OR jsonb_typeof(example.item->'en') IS DISTINCT FROM 'string'
-                              OR btrim(example.item->>'en') = ''
-                              OR char_length(example.item->>'en') > 4000
-                              OR jsonb_typeof(example.item->'native') IS DISTINCT FROM 'string'
-                              OR btrim(example.item->>'native') = ''
-                              OR char_length(example.item->>'native') > 4000
-                         )
-                     END
-             )`,
+          WHERE created_at IS NULL`,
     },
     {
       name: 'invalid attempts',
       sql: `SELECT count(*)::int AS n FROM attempts
           WHERE user_id IS NULL OR question_id IS NULL OR transcript IS NULL
              OR score IS NULL OR passed IS NULL OR feedback IS NULL OR created_at IS NULL
-             OR attempt_no <= 0 OR score NOT BETWEEN 0 AND 100
+             OR CASE context
+                  WHEN 'diagnostic' THEN attempt_no NOT BETWEEN 1 AND 5
+                  WHEN 'practice' THEN attempt_no NOT BETWEEN 1 AND 3
+                  ELSE true
+                END
+             OR score NOT BETWEEN 0 AND 100
+             OR passed IS DISTINCT FROM (score >= 60)
              OR char_length(transcript) > 12000
-             OR char_length(feedback) NOT BETWEEN 1 AND 800`,
+             OR char_length(feedback) NOT BETWEEN 1 AND 800
+             OR btrim(feedback, ${JS_TRIM_CHARACTERS_SQL}) = ''`,
     },
     {
       name: 'invalid diagnostic states',
@@ -82,7 +61,7 @@ function integrityChecks(): IntegrityCheck[] {
   ];
 }
 
-/** Read-only validation for databases created before migration 003. */
+/** Read-only validation for an existing database before a production upgrade. */
 export async function preflight(dbUrl: string): Promise<void> {
   const client = new Client({ connectionString: dbUrl, connectionTimeoutMillis: 10_000 });
   await client.connect();
@@ -94,6 +73,13 @@ export async function preflight(dbUrl: string): Promise<void> {
       const { rows } = await client.query<{ n: number }>(check.sql);
       if (rows[0].n > 0) failures.push(`${check.name}: ${rows[0].n}`);
     }
+    // Catalog publication only upserts reviewed natural keys; it deliberately
+    // does not delete extras. Detect an incomplete, overfilled, or malformed
+    // legacy catalog before migration/startup, using exactly the same bounded
+    // JavaScript rules as runtime readiness and the mobile response parsers.
+    const inventoryQuery = boundedQuestionInventoryQuery();
+    const inventory = await client.query(inventoryQuery.text, [...inventoryQuery.values]);
+    failures.push(...questionInventoryIssues(inventory.rows));
     if (failures.length > 0) {
       throw new Error(
         `database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - ${failures.join('\n  - ')}`,

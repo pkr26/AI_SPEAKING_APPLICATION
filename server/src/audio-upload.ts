@@ -183,16 +183,25 @@ export function createAudioUploadRouter(limiters: Limiters) {
       // A presigned PUT cannot reliably enforce a maximum object length. S3
       // POST policies can, so the storage service itself rejects oversized
       // objects before they can create unbounded storage or download costs.
-      const { url: uploadUrl, fields: uploadFields } = await createPresignedPost(getS3(), {
-        Bucket: config.s3.bucket,
-        Key: key,
-        Fields: { 'Content-Type': contentType },
-        Conditions: [
-          ['eq', '$Content-Type', contentType],
-          ['content-length-range', 1, MAX_AUDIO_BYTES],
-        ],
-        Expires: config.s3.uploadUrlTtlSeconds,
-      });
+      let uploadUrl: string;
+      let uploadFields: Record<string, string>;
+      try {
+        const grant = await createPresignedPost(getS3(), {
+          Bucket: config.s3.bucket,
+          Key: key,
+          Fields: { 'Content-Type': contentType },
+          Conditions: [
+            ['eq', '$Content-Type', contentType],
+            ['content-length-range', 1, MAX_AUDIO_BYTES],
+          ],
+          Expires: config.s3.uploadUrlTtlSeconds,
+        });
+        uploadUrl = grant.url;
+        uploadFields = grant.fields;
+      } catch (err) {
+        logger.warn({ err, userId: req.user!.id }, 'failed to create presigned audio upload grant');
+        throw new HttpError(502, 'Audio storage unavailable; please try again', 'PROVIDER_FAILED');
+      }
       res.json({
         mode: 's3',
         uploadUrl,

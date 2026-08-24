@@ -82,7 +82,7 @@ const mockAddNavigationListener = jest.fn(
     };
   },
 );
-const mockNavigation = {
+let mockNavigation: { setOptions: jest.Mock; addListener: jest.Mock } = {
   setOptions: mockSetOptions,
   addListener: mockAddNavigationListener,
 };
@@ -230,11 +230,32 @@ function dispatchBeforeRemove(type: string): jest.Mock {
   return preventDefault;
 }
 
+type BeforeRemoveListener = NonNullable<typeof mockBeforeRemoveListener>;
+
+function navigationHarness() {
+  let listener: BeforeRemoveListener | null = null;
+  const remove = jest.fn();
+  const addListener = jest.fn((event: string, next: BeforeRemoveListener) => {
+    if (event === 'beforeRemove') listener = next;
+    return remove;
+  });
+  return {
+    navigation: { setOptions: jest.fn(), addListener },
+    addListener,
+    remove,
+    listener: () => listener,
+  };
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockSearchParams = {};
   mockBeforeRemoveListener = null;
   mockHardwareBackHandler = null;
+  mockNavigation = {
+    setOptions: mockSetOptions,
+    addListener: mockAddNavigationListener,
+  };
   mockAuthValue = makeAuth();
   mockedConsumeSessionExpiredNotice.mockResolvedValue(false);
   // The preview test below mounts the real I18nProvider, whose effect moves the
@@ -371,6 +392,29 @@ describe('login screen', () => {
       '/forgot-password',
     );
     expect(screen.getByRole('link', { name: t('login.footerLink') }).props.href).toBe('/signup');
+  });
+
+  it('lets an idle login Link navigate', async () => {
+    await render(<LoginScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('login.forgot') }));
+
+    expect(mockLinkNavigate).toHaveBeenCalledWith('/forgot-password');
+  });
+
+  it('resubscribes the login removal guard when navigation identity changes', async () => {
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await render(<LoginScreen />);
+    expect(first.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(<LoginScreen />);
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
   });
 
   it('lays out the login screen on the shared token scale', async () => {
@@ -944,6 +988,29 @@ function LanguageProbe() {
 }
 
 describe('signup screen', () => {
+  it('lets the idle login Link navigate', async () => {
+    await render(<SignupScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('signup.footerLink') }));
+
+    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('resubscribes the signup removal guard when navigation identity changes', async () => {
+    const first = navigationHarness();
+    mockNavigation = first.navigation;
+    const rendered = await render(<SignupScreen />);
+    expect(first.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+
+    const second = navigationHarness();
+    mockNavigation = second.navigation;
+    await rendered.rerender(<SignupScreen />);
+
+    expect(first.remove).toHaveBeenCalledTimes(1);
+    expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
+    expect(second.listener()).toEqual(expect.any(Function));
+  });
+
   it('renders all fields and language choices', async () => {
     await render(<SignupScreen />);
     expect(screen.getByText(t('signup.title'))).toBeTruthy();

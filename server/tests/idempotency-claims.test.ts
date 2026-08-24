@@ -8,8 +8,11 @@ import {
   completeAssessmentRequest,
   getAssessmentRequestStatus,
   isAudioKeyClaimedForProcessing,
+  validatedAssessmentResponse,
 } from '../src/idempotency';
+import { logger } from '../src/logger';
 import { HttpError } from '../src/middleware';
+import { assessmentResponseCases, practiceMastery } from './assessment-response-corpus';
 import { app, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -27,6 +30,130 @@ describe('claimAssessmentRequest ownership and replay', () => {
     userId = res.body.user.id;
     const { rows } = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 2');
     [questionId, otherQuestionId] = [rows[0].id, rows[1].id];
+  });
+
+  function completedPracticeResponse(score = 86) {
+    return {
+      passed: true,
+      mastered: score >= 75,
+      attemptNo: 1,
+      score,
+      transcript: 'A complete stored answer.',
+      feedback: 'Clear and relevant.',
+      next: {
+        question: {
+          id: questionId,
+          cefrLevel: 'A1',
+          promptWord: 'contract',
+          questionText: 'Explain this contract.',
+        },
+        kind: 'new',
+        progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 100, dueCount: 1 },
+      },
+    };
+  }
+
+  const retryPracticeResponse = {
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    score: 50,
+    transcript: 'A retryable stored answer.',
+    feedback: 'Add more detail.',
+  } as const;
+
+  const completedDiagnosticResponse = {
+    passed: true,
+    score: 60,
+    transcript: 'A diagnostic answer.',
+    feedback: 'This meets the threshold.',
+    done: true,
+    level: 'A1',
+  } as const;
+
+  const nativeResponse = {
+    mode: 'native',
+    understood: true,
+    transcript: 'A native-language answer.',
+    modelAnswer: 'This is a model English answer.',
+    feedback: 'The answer shows understanding.',
+  } as const;
+
+  it('validates every durable assessment response context and rejects drift', () => {
+    const practice = completedPracticeResponse();
+    expect(validatedAssessmentResponse('diagnostic', completedDiagnosticResponse)).toBe(completedDiagnosticResponse);
+    expect(validatedAssessmentResponse('practice', practice)).toBe(practice);
+    expect(validatedAssessmentResponse('practice-native', nativeResponse)).toBe(nativeResponse);
+
+    for (const [context, response] of [
+      ['diagnostic', { ...completedDiagnosticResponse, passed: false }],
+      ['practice', { passed: true, score: 90 }],
+      ['practice-native', { ...nativeResponse, modelAnswer: '' }],
+    ] as const) {
+      expect(() => validatedAssessmentResponse(context, response)).toThrowError(
+        expect.objectContaining({ status: 500, code: 'INTERNAL' }),
+      );
+    }
+  });
+
+  it('enforces the complete durable-response boundary corpus', () => {
+    for (const testCase of assessmentResponseCases) {
+      const validate = () => validatedAssessmentResponse(testCase.context, testCase.value as Record<string, unknown>);
+      if (testCase.valid) {
+        expect(validate(), testCase.name).toBe(testCase.value);
+      } else {
+        expect(validate, testCase.name).toThrowError(expect.objectContaining({ status: 500, code: 'INTERNAL' }));
+      }
+    }
+  });
+
+  it('logs only the failed response context with the stable diagnostic', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+
+    expect(() => validatedAssessmentResponse('practice', { ...practiceMastery(), score: 74 })).toThrowError(
+      expect.objectContaining({ status: 500, code: 'INTERNAL' }),
+    );
+
+    expect(error).toHaveBeenCalledOnce();
+    expect(error).toHaveBeenCalledWith(
+      { context: 'practice' },
+      'stored assessment response failed its public contract',
+    );
+    error.mockRestore();
+  });
+
+  it('refuses invalid or wrong-context response bodies before completing a claim', async () => {
+    const invalidRequestId = randomUUID();
+    const invalidClaim = await claimAssessmentRequest(userId, invalidRequestId, 'practice', questionId);
+    if (invalidClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
+    await expect(
+      completeAssessmentRequest(
+        pool,
+        userId,
+        invalidRequestId,
+        invalidClaim.claimId,
+        { passed: true, score: 90 },
+        'practice',
+      ),
+    ).rejects.toMatchObject({ status: 500, code: 'INTERNAL' });
+
+    await expect(
+      completeAssessmentRequest(
+        pool,
+        userId,
+        invalidRequestId,
+        invalidClaim.claimId,
+        completedDiagnosticResponse,
+        'diagnostic',
+      ),
+    ).rejects.toMatchObject({ status: 409, code: 'STATE_CHANGED' });
+
+    const row = await pool.query<{ status: string }>(
+      'SELECT status FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, invalidRequestId],
+    );
+    expect(row.rows).toEqual([{ status: 'processing' }]);
   });
 
   it('preserves the in-flight subtype name for diagnostics', () => {
@@ -78,7 +205,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const requestId = randomUUID();
     const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId);
     if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
-    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, { passed: true });
+    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, retryPracticeResponse, 'practice');
 
     const collision = claimAssessmentRequest(userId, requestId, 'practice', otherQuestionId);
     await expect(collision).rejects.toBeInstanceOf(HttpError);
@@ -104,10 +231,11 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const withBody = randomUUID();
     const claim = await claimAssessmentRequest(userId, withBody, 'practice', questionId);
     if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
-    await completeAssessmentRequest(pool, userId, withBody, claim.claimId, { passed: true, score: 91 });
+    const storedResponse = completedPracticeResponse(91);
+    await completeAssessmentRequest(pool, userId, withBody, claim.claimId, storedResponse, 'practice');
 
     const replay = await claimAssessmentRequest(userId, withBody, 'practice', questionId);
-    expect(replay).toEqual({ kind: 'completed', response: { passed: true, score: 91 } });
+    expect(replay).toEqual({ kind: 'completed', response: storedResponse });
 
     // NOTE: a completed row without a response body is rejected by the
     // assessment_requests_response_check constraint, so the corresponding
@@ -118,7 +246,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       status: 'completed',
       context: 'practice',
       questionId,
-      response: { passed: true, score: 91 },
+      response: storedResponse,
     });
   });
 
@@ -128,8 +256,15 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const replayableRequestId = randomUUID();
     const replayableClaim = await claimAssessmentRequest(userId, replayableRequestId, 'practice', questionId);
     if (replayableClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
-    const replayableResponse = { passed: true, score: 86 };
-    await completeAssessmentRequest(pool, userId, replayableRequestId, replayableClaim.claimId, replayableResponse);
+    const replayableResponse = completedPracticeResponse();
+    await completeAssessmentRequest(
+      pool,
+      userId,
+      replayableRequestId,
+      replayableClaim.claimId,
+      replayableResponse,
+      'practice',
+    );
     await pool.query(
       `UPDATE assessment_requests
        SET completed_at = now() - interval '47 hours'
@@ -145,10 +280,14 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const expiredRequestId = randomUUID();
     const expiredClaim = await claimAssessmentRequest(userId, expiredRequestId, 'practice', questionId);
     if (expiredClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
-    await completeAssessmentRequest(pool, userId, expiredRequestId, expiredClaim.claimId, {
-      passed: false,
-      score: 42,
-    });
+    await completeAssessmentRequest(
+      pool,
+      userId,
+      expiredRequestId,
+      expiredClaim.claimId,
+      retryPracticeResponse,
+      'practice',
+    );
     await pool.query(
       `UPDATE assessment_requests
        SET completed_at = now() - interval '49 hours'
@@ -164,7 +303,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
   it('commits and releases the transaction used to replay a completed request', async () => {
     const requestId = randomUUID();
-    const response = { passed: true, score: 88 };
+    const response = completedPracticeResponse(88);
     const client = {
       query: vi
         .fn()
@@ -369,11 +508,11 @@ describe('claimAssessmentRequest ownership and replay', () => {
     await expect(isAudioKeyClaimedForProcessing(userId, audioKey)).resolves.toBe(true);
     await expect(isAudioKeyClaimedForProcessing(randomUUID(), audioKey)).resolves.toBe(false);
 
-    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, { passed: true });
+    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, retryPracticeResponse, 'practice');
     await expect(isAudioKeyClaimedForProcessing(userId, audioKey)).resolves.toBe(false);
     await expect(claimAssessmentRequest(userId, requestId, 'practice', questionId, audioKey)).resolves.toEqual({
       kind: 'completed',
-      response: { passed: true },
+      response: retryPracticeResponse,
     });
 
     // An expired processing row no longer protects the object either.
@@ -409,7 +548,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       code: 'REQUEST_ID_REUSED',
     });
 
-    await completeAssessmentRequest(pool, userId, ownerRequestId, owner.claimId, { passed: true });
+    await completeAssessmentRequest(pool, userId, ownerRequestId, owner.claimId, retryPracticeResponse, 'practice');
     await expect(
       claimAssessmentRequest(userId, randomUUID(), 'diagnostic', questionId, audioKey),
     ).rejects.toMatchObject({

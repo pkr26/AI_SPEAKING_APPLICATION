@@ -251,22 +251,31 @@ function isPracticeKind(value: unknown): value is PracticeKind {
   return value === 'revision' || value === 'new';
 }
 
-function isCount(value: unknown): value is number {
-  return isNumber(value) && Number.isInteger(value) && value >= 0 && value <= 100_000;
+const MAX_WORD_BANK_COUNT = 100_000;
+
+function isWordBankCount(value: unknown): value is number {
+  return (
+    isNumber(value) && Number.isSafeInteger(value) && value >= 0 && value <= MAX_WORD_BANK_COUNT
+  );
+}
+
+function isLifetimeCount(value: unknown): value is number {
+  return isNumber(value) && Number.isSafeInteger(value) && value >= 0;
 }
 
 function isPracticeProgress(value: unknown): value is PracticeProgress {
   return (
     isRecord(value) &&
-    isCount(value.masteredCount) &&
-    isCount(value.learningCount) &&
-    isCount(value.totalAtLevel) &&
+    isWordBankCount(value.masteredCount) &&
+    isWordBankCount(value.learningCount) &&
+    isWordBankCount(value.totalAtLevel) &&
     value.totalAtLevel >= 1 &&
     value.masteredCount + value.learningCount <= value.totalAtLevel &&
     // Additive SRS field: absent on older servers, and never larger than the
     // learning+mastered rows it counts due entries of.
     (value.dueCount === undefined ||
-      (isCount(value.dueCount) && value.dueCount <= value.masteredCount + value.learningCount))
+      (isWordBankCount(value.dueCount) &&
+        value.dueCount <= value.masteredCount + value.learningCount))
   );
 }
 
@@ -347,6 +356,7 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
   ) {
     throw new ContractError();
   }
+  if (passed !== score >= PRACTICE_PASS_SCORE) throw new ContractError();
   const result: DiagnosticAnswerResult = {
     passed,
     score,
@@ -565,16 +575,16 @@ export function parsePracticeStats(value: unknown): PracticeStats {
   const lastPracticedAt = value.lastPracticedAt;
   if (
     !(isCefrLevel(level) || level === null) ||
-    !isCount(masteredCount) ||
-    !isCount(learningCount) ||
-    !isCount(totalAtLevel) ||
+    !isWordBankCount(masteredCount) ||
+    !isWordBankCount(learningCount) ||
+    !isWordBankCount(totalAtLevel) ||
     // Stats were born after SRS, so dueCount is required here.
-    !isCount(dueCount) ||
+    !isWordBankCount(dueCount) ||
     masteredCount + learningCount > totalAtLevel ||
     dueCount > masteredCount + learningCount ||
-    !isCount(streakDays) ||
-    !isCount(practicedToday) ||
-    !isCount(totalAttempts) ||
+    !isLifetimeCount(streakDays) ||
+    !isLifetimeCount(practicedToday) ||
+    !isLifetimeCount(totalAttempts) ||
     // Today's attempts are a subset of all attempts.
     practicedToday > totalAttempts ||
     (lastPracticedAt !== null && !isTimestamp(lastPracticedAt))
@@ -609,42 +619,44 @@ export function parsePracticeStats(value: unknown): PracticeStats {
 
 export const HISTORY_PAGE_LIMIT = 20;
 const HISTORY_MAX_PAGE_ITEMS = 50;
+const DIAGNOSTIC_MAX_ATTEMPTS = 5;
 
 function parseHistoryItem(value: unknown): HistoryItem {
+  if (!isRecord(value)) throw new ContractError();
+  const context = value.context;
+  const attemptNo = value.attemptNo;
+  const score = value.score;
+  const passed = value.passed;
   if (
-    !isRecord(value) ||
     !isUuid(value.id) ||
     !isUuid(value.questionId) ||
     !isBoundedNonEmptyString(value.promptWord, 100) ||
     !isBoundedNonEmptyString(value.questionText, 1_000) ||
     !isCefrLevel(value.cefrLevel) ||
-    (value.context !== 'diagnostic' && value.context !== 'practice') ||
-    !isNumber(value.attemptNo) ||
-    !Number.isInteger(value.attemptNo) ||
-    // attemptNo ≤ 3 also bounds diagnostic history items; that stays safe only
-    // because the server's diagnostic binary search converges within 3
-    // questions (server MAX_QUESTIONS = 5, 6 CEFR levels). Revisit this bound
-    // if either of those changes.
-    value.attemptNo < 1 ||
-    value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
-    !isScore(value.score) ||
-    typeof value.passed !== 'boolean' ||
+    (context !== 'diagnostic' && context !== 'practice') ||
+    !isNumber(attemptNo) ||
+    !Number.isSafeInteger(attemptNo) ||
+    attemptNo < 1 ||
+    attemptNo > (context === 'diagnostic' ? DIAGNOSTIC_MAX_ATTEMPTS : PRACTICE_MAX_ATTEMPTS) ||
+    !isScore(score) ||
+    typeof passed !== 'boolean' ||
     !isBoundedString(value.transcript, 12_000) ||
     !isBoundedNonEmptyString(value.feedback, 4_000) ||
     !isTimestamp(value.createdAt)
   ) {
     throw new ContractError();
   }
+  if (passed !== score >= PRACTICE_PASS_SCORE) throw new ContractError();
   return {
     id: value.id,
     questionId: value.questionId,
     promptWord: value.promptWord,
     questionText: value.questionText,
     cefrLevel: value.cefrLevel,
-    context: value.context,
-    attemptNo: value.attemptNo,
-    score: value.score,
-    passed: value.passed,
+    context,
+    attemptNo: attemptNo as number,
+    score,
+    passed,
     transcript: value.transcript,
     feedback: value.feedback,
     createdAt: value.createdAt,
@@ -668,7 +680,7 @@ export function parsePracticeHistory(value: unknown): HistoryPage {
   };
 }
 
-const EXPORT_MAX_PAGE_ITEMS = 1_000;
+const EXPORT_MAX_PAGE_ITEMS = 500;
 
 export function parseUserDataPage(value: unknown): UserDataPage {
   if (

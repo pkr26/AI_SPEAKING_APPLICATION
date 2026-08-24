@@ -1,19 +1,15 @@
 import { spawnSync } from 'node:child_process';
 
-// Expo SDK 57 currently resolves three upstream advisories through its
-// build/Metro toolchain. Keep CI strict without applying npm's incompatible
-// Expo 53 / React Native 0.72 downgrade: any new advisory ID, critical issue,
-// or increase over this reviewed transitive graph fails the build.
-// @testing-library/react-native is a devDependency but is marked devOptional
-// (an optional peer elsewhere in the graph), so npm audit --omit=dev still
-// counts it as one extra node affected by the same reviewed react-native
-// advisories — no new advisory IDs.
-// expo-sharing and expo-splash-screen now also resolve their own
-// @expo/config-plugins → xcode → uuid chain (the same reviewed uuid
-// advisory), adding two more moderate nodes in the same upstream transitive
-// graph — still no new advisory IDs.
-const reviewedAdvisories = new Set([1119441, 1138808, 1138809]);
-const reviewedMaximums = { moderate: 9, high: 15, total: 24 };
+// Expo SDK 57's build/config graph currently resolves one upstream uuid
+// advisory through xcode. The affected uuid v3/v5/v6 buffer-output APIs are
+// not used by this app, and npm's offered fix is an incompatible downgrade to
+// Expo 46 / expo-sharing 14. Keep CI strict: any new advisory ID, any high or
+// critical issue, or growth beyond these 12 transitive nodes fails the build.
+// Metro is pinned to the SDK-compatible 0.84.5 patch in package.json overrides;
+// that removes the separately reviewed image-size denial-of-service advisories
+// still present in React Native 0.86.2's older 0.84.4 lock resolution.
+const reviewedAdvisories = new Set([1119441]);
+const reviewedMaximums = { moderate: 12, high: 0, total: 12 };
 
 const result = spawnSync('npm', ['audit', '--omit=dev', '--json'], {
   encoding: 'utf8',

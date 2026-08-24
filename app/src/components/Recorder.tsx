@@ -510,7 +510,9 @@ export function capacityRetryDelayMillis(retryAfterSeconds: unknown): number {
 export function recoveryRetryDelayMillis(error: unknown): number | null {
   if (
     !(error instanceof ApiError) ||
-    (error.status !== 429 && error.status !== 503) ||
+    (error.status !== 429 &&
+      error.status !== 503 &&
+      !(error.status === 409 && error.code === 'REQUEST_IN_FLIGHT')) ||
     !Number.isFinite(error.retryAfterSeconds)
   ) {
     return null;
@@ -2025,6 +2027,8 @@ export default function Recorder<T>({
                 // read instead of polling an abandoned row for the full lease.
                 if (retryError instanceof ApiError && retryError.status === 409) {
                   resubmissionConflictPending = true;
+                  const retryDelay = recoveryRetryDelayMillis(retryError);
+                  if (retryDelay !== null) nextPollDelayMs = retryDelay;
                 }
                 // AUDIO_UPLOAD_MISSING is the exact additive contract proving
                 // the persisted key is dead without reaching provider work.

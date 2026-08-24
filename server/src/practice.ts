@@ -536,7 +536,7 @@ async function storePracticeResult(
       questionId,
       claim.claimId,
     ]);
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response);
+    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response, 'practice');
     await client.query('COMMIT');
     return response;
   } catch (err) {
@@ -584,7 +584,7 @@ async function storeSilenceResult(
       questionId,
       claim.claimId,
     ]);
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response);
+    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response, 'practice');
     await client.query('COMMIT');
     return response;
   } catch (err) {
@@ -1031,7 +1031,7 @@ export function createPracticeRouter(limiters: Limiters) {
               'DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3',
               [user.id, question.id, claim.claimId],
             );
-            await completeAssessmentRequest(client, user.id, requestId, requestClaimId, response);
+            await completeAssessmentRequest(client, user.id, requestId, requestClaimId, response, 'practice-native');
             await client.query('COMMIT');
           } catch (err) {
             return await rollbackTransaction(client, { value: err });

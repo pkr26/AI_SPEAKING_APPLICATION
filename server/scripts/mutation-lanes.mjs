@@ -37,7 +37,10 @@ export const codeMutationLanes = Object.freeze({
       'tests/rate-limit.test.ts',
     ],
   ),
-  schemaReadiness: lane(['src/schema-readiness.ts'], ['tests/schema-readiness.test.ts']),
+  schemaReadiness: lane(
+    ['src/question-inventory.ts', 'src/schema-readiness.ts'],
+    ['tests/question-inventory.test.ts', 'tests/schema-readiness.test.ts'],
+  ),
   metrics: lane(['src/metrics.ts'], ['tests/metrics-initialization.test.ts', 'tests/metrics.test.ts']),
   index: lane(['src/index.ts'], ['tests/index-lifecycle.test.ts']),
   auth: lane(
@@ -154,6 +157,10 @@ export const codeMutationLanes = Object.freeze({
  * so a new test file can never silently skip the mutation campaign.
  */
 export const intentionallyUnassignedTestFiles = Object.freeze({
+  'tests/frontend-contract.test.ts':
+    'Cross-package integration contract: it loads the mobile app parsers from outside the server-root Stryker ' +
+    'sandbox and validates unmutated HTTP responses end to end. Production response construction remains mutation-' +
+    'covered by its owning route lanes, while this test deliberately stays in the ordinary full Vitest suite.',
   'tests/index.test.ts':
     'In-process bootstrap integration test: it imports src/index directly, binds the real configured port, and ' +
     'ends the shared pool. Inside a reused Stryker vitest worker a shutdown-breaking mutant would leak the bound ' +

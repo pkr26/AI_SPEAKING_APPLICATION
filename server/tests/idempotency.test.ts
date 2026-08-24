@@ -61,6 +61,27 @@ describe('assessment request recovery', () => {
     );
   }
 
+  function completedPracticeResponse(score = 80) {
+    return {
+      passed: true,
+      mastered: score >= 75,
+      attemptNo: 1,
+      score,
+      transcript: 'A recovered transcript.',
+      feedback: 'Clear and relevant.',
+      next: {
+        question: {
+          id: questionId,
+          cefrLevel: 'A1',
+          promptWord: 'recovery',
+          questionText: 'Describe a successful recovery.',
+        },
+        kind: 'new',
+        progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 100, dueCount: 1 },
+      },
+    };
+  }
+
   it("requires authentication and does not reveal another user's request", async () => {
     const requestId = randomUUID();
     await insertRequest(requestId);
@@ -92,13 +113,7 @@ describe('assessment request recovery', () => {
 
   it('replays a completed response privately without cache storage', async () => {
     const requestId = randomUUID();
-    const storedResponse = {
-      passed: true,
-      attemptNo: 1,
-      score: 88,
-      transcript: 'A recovered transcript.',
-      feedback: 'Clear and relevant.',
-    };
+    const storedResponse = completedPracticeResponse(88);
     await insertRequest(requestId, {
       status: 'completed',
       completedAt: new Date().toISOString(),
@@ -117,6 +132,20 @@ describe('assessment request recovery', () => {
     });
   });
 
+  it('fails closed when completed JSONB does not satisfy its context response contract', async () => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, {
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      response: { passed: true, score: 90 },
+    });
+
+    const response = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${ownerToken}`);
+
+    expect(response.status).toBe(500);
+    expect(response.body).toEqual({ error: 'Stored assessment response is invalid', code: 'INTERNAL' });
+  });
+
   it('uses the status-specific retention timestamp when deciding whether a request is recoverable', async () => {
     const staleProcessingId = randomUUID();
     await insertRequest(staleProcessingId, {
@@ -132,7 +161,7 @@ describe('assessment request recovery', () => {
       status: 'completed',
       startedAt: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString(),
       completedAt: new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString(),
-      response: { passed: false, score: 50 },
+      response: completedPracticeResponse(),
     });
     const recentlyCompleted = await request(a)
       .get(`/assessments/${recentlyCompletedId}`)
@@ -167,7 +196,7 @@ describe('assessment request recovery', () => {
 
     await abandonAssessmentRequest(ownerId, requestId, staleClaimId);
     await expect(
-      completeAssessmentRequest(pool, ownerId, requestId, staleClaimId, { passed: false }),
+      completeAssessmentRequest(pool, ownerId, requestId, staleClaimId, completedPracticeResponse(), 'practice'),
     ).rejects.toMatchObject({
       status: 409,
       message: 'Assessment request ownership changed; please retry',
@@ -180,8 +209,8 @@ describe('assessment request recovery', () => {
     );
     expect(stillOwned.rows).toEqual([{ claim_id: replacement.claimId, status: 'processing' }]);
 
-    const storedResponse = { passed: true, score: 91 };
-    await completeAssessmentRequest(pool, ownerId, requestId, replacement.claimId, storedResponse);
+    const storedResponse = completedPracticeResponse(91);
+    await completeAssessmentRequest(pool, ownerId, requestId, replacement.claimId, storedResponse, 'practice');
     await abandonAssessmentRequest(ownerId, requestId, staleClaimId);
 
     const completed = await pool.query<{ claim_id: string; status: string; response_body: Record<string, unknown> }>(

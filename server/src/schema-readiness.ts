@@ -3,9 +3,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { pool } from './db';
-
-const REQUIRED_CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
-const REQUIRED_QUESTIONS_PER_LEVEL = 100;
+import { boundedQuestionInventoryQuery, questionInventoryIssues } from './question-inventory';
 
 export interface MigrationManifestEntry {
   name: string;
@@ -39,12 +37,52 @@ export function migrationManifestFromDirectory(migrationsDirectory: string): rea
 // probe.
 const PACKAGED_MIGRATION_MANIFEST = migrationManifestFromDirectory(path.join(__dirname, '..', 'db', 'migrations'));
 
+/**
+ * Catalog content changes only during controlled publication. Cache the
+ * multi-megabyte validation briefly so concurrent/public readiness probes do
+ * not repeatedly transfer and parse all 600 translation payloads. Migration
+ * and required-table queries below still execute on every probe, preserving a
+ * cheap database-liveness check; a catalog drift is visible within this bound.
+ */
+export const QUESTION_INVENTORY_READINESS_TTL_MS = 60_000;
+
+let questionInventoryReadyUntil = 0;
+let questionInventoryValidationInFlight: Promise<void> | undefined;
+
 export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
   return PACKAGED_MIGRATION_MANIFEST;
 }
 
 async function queryPool(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
   return pool.query(text, [...values]);
+}
+
+async function validateQuestionInventory(query: SchemaQuery): Promise<void> {
+  const inventoryQuery = boundedQuestionInventoryQuery();
+  const questionResult = await query(inventoryQuery.text, inventoryQuery.values);
+  if (questionInventoryIssues(questionResult.rows).length > 0) {
+    throw new Error('Question inventory is invalid; every CEFR level requires exactly 100 well-formed questions');
+  }
+}
+
+async function validateCachedQuestionInventory(query: SchemaQuery): Promise<void> {
+  if (questionInventoryReadyUntil > Date.now()) return;
+  if (questionInventoryValidationInFlight) return questionInventoryValidationInFlight;
+
+  const validation = validateQuestionInventory(query).then(() => {
+    questionInventoryReadyUntil = Date.now() + QUESTION_INVENTORY_READINESS_TTL_MS;
+  });
+  questionInventoryValidationInFlight = validation;
+  try {
+    await validation;
+  } finally {
+    questionInventoryValidationInFlight = undefined;
+  }
+}
+
+/** Clear only the bounded inventory cache; used by isolated readiness tests. */
+export function resetQuestionInventoryReadinessCacheForTests(): void {
+  questionInventoryReadyUntil = 0;
 }
 
 export async function assertDatabaseSchemaCurrent(
@@ -89,25 +127,15 @@ export async function assertDatabaseSchemaCurrent(
   // Practice completion promises a different next question. Treat the
   // authored content inventory as a runtime dependency so an unseeded or
   // partially published database never serves an impossible response shape.
-  const questionResult = await query(
-    `SELECT cefr_level, count(*)::int AS count
-     FROM questions
-     GROUP BY cefr_level
-     ORDER BY cefr_level`,
-  );
-  const questionCounts = new Map(
-    (questionResult.rows as Array<{ cefr_level?: unknown; count?: unknown }>).map(
-      (row) => [row.cefr_level, row.count] as const,
-    ),
-  );
-  if (
-    REQUIRED_CEFR_LEVELS.some((level) => {
-      const count = questionCounts.get(level);
-      return typeof count !== 'number' || count < REQUIRED_QUESTIONS_PER_LEVEL;
-    })
-  ) {
-    throw new Error('Question inventory is incomplete; every CEFR level requires at least 100 questions');
-  }
+  // One row beyond the exact catalog size proves an overfill, so cap the
+  // readiness scan there instead of making a corrupted table an unbounded
+  // cost on every probe. With exactly 600 rows, the shared JavaScript
+  // validator also applies the mobile parser's UTF-16 length and trim rules to
+  // every language-specific scalar and example returned by the help route.
+  // Custom query adapters are test/deployment seams and deliberately bypass
+  // process-global caching so one database/fixture can never bless another.
+  if (query === queryPool) await validateCachedQuestionInventory(query);
+  else await validateQuestionInventory(query);
 
   return { latestMigration: latest.name };
 }

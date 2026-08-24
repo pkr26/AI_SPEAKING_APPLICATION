@@ -122,7 +122,7 @@ beforeEach(() => {
   createPresignedPostMock.mockImplementation(
     (_client: unknown, options: { Key: string; Fields: Record<string, string> }) =>
       Promise.resolve({
-        url: 'https://s3.example.com/presigned-post',
+        url: 'https://test-audio-bucket.s3.us-east-1.amazonaws.com/presigned-post',
         fields: { key: options.Key, ...options.Fields, policy: 'signed-policy' },
       }),
   );
@@ -147,7 +147,7 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.body.mode).toBe('s3');
-    expect(res.body.uploadUrl).toBe('https://s3.example.com/presigned-post');
+    expect(res.body.uploadUrl).toBe('https://test-audio-bucket.s3.us-east-1.amazonaws.com/presigned-post');
     expect(res.body.audioKey).toMatch(new RegExp(`^audio-uploads/${userId}/[0-9a-f-]{36}\\.m4a$`));
     expect(res.body.contentType).toBe('audio/mp4');
     expect(res.body.expiresIn).toBe(config.s3.uploadUrlTtlSeconds);
@@ -178,6 +178,33 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     expect(postOptions.Conditions).toContainEqual(['content-length-range', 1, 25 * 1024 * 1024]);
     expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
     expect(s3ClientConstructorMock).toHaveBeenCalledWith({ region: config.s3.region });
+  });
+
+  it('maps presigned-grant provider failures to the stable retryable storage contract', async () => {
+    const failure = new Error('credential provider unavailable');
+    createPresignedPostMock.mockRejectedValueOnce(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const userId = registration.body.user.id as string;
+
+    try {
+      const response = await request(a)
+        .post('/uploads/audio-url')
+        .set('Authorization', `Bearer ${registration.body.token as string}`)
+        .send({ contentType: 'audio/mp4' });
+
+      expect(response.status).toBe(502);
+      expect(response.body).toEqual({
+        error: 'Audio storage unavailable; please try again',
+        code: 'PROVIDER_FAILED',
+      });
+      expect(JSON.stringify(response.body)).not.toContain('credential provider unavailable');
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith({ err: failure, userId }, 'failed to create presigned audio upload grant');
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('enforces the upload-grant budget per user without coupling learners on one IP', async () => {
@@ -1237,7 +1264,14 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const boundAudioKey = ownedKey(userId);
     const freshAudioKey = ownedKey(userId);
     const requestId = randomUUID();
-    const replayBody = { score: 87, done: false };
+    const replayBody = {
+      passed: true,
+      score: 87,
+      transcript: 'A completed diagnostic answer.',
+      feedback: 'Clear and relevant.',
+      done: true,
+      level: 'A1',
+    };
     await pool.query(
       `INSERT INTO assessment_requests
            (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at, audio_key)
@@ -1262,7 +1296,14 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
     const requestId = randomUUID();
-    const replayBody = { score: 91, done: false };
+    const replayBody = {
+      passed: true,
+      score: 91,
+      transcript: 'A completed diagnostic answer.',
+      feedback: 'Clear and relevant.',
+      done: true,
+      level: 'A1',
+    };
     await pool.query(
       `INSERT INTO assessment_requests
            (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at, audio_key)

@@ -62,6 +62,7 @@ const mockAddNavigationListener = jest.fn(
   },
 );
 const mockNavigation = { setOptions: mockSetOptions, addListener: mockAddNavigationListener };
+let mockCurrentNavigation = mockNavigation;
 
 // Focus is simulated by invoking the effect on mount and its cleanup on
 // unmount, re-running when the callback identity changes (as expo-router does
@@ -72,6 +73,9 @@ interface MockFocusRegistration {
 }
 
 const mockFocusRegistrations: MockFocusRegistration[] = [];
+let mockDeferFocusSetup = false;
+let mockDeferFocusCleanup = false;
+const mockDeferredFocusCleanups: (() => void)[] = [];
 
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
@@ -84,15 +88,20 @@ jest.mock('expo-router', () => {
       dismissTo: jest.fn(),
     },
     useLocalSearchParams: () => mockSearchParams,
-    useNavigation: () => mockNavigation,
+    useNavigation: () => mockCurrentNavigation,
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
         const registration = { callback, cleanup: null as (() => void) | null };
         mockFocusRegistrations.push(registration);
-        const cleanup = callback();
-        registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        if (!mockDeferFocusSetup) {
+          const cleanup = callback();
+          registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        }
         return () => {
-          registration.cleanup?.();
+          if (registration.cleanup) {
+            if (mockDeferFocusCleanup) mockDeferredFocusCleanups.push(registration.cleanup);
+            else registration.cleanup();
+          }
           const index = mockFocusRegistrations.indexOf(registration);
           if (index >= 0) mockFocusRegistrations.splice(index, 1);
         };
@@ -331,6 +340,32 @@ function dispatchBeforeRemove(type = 'GO_BACK'): jest.Mock {
   return event.preventDefault;
 }
 
+function createNavigationDouble() {
+  const listeners = new Set<(event: BeforeRemoveEvent) => void>();
+  const setOptions = jest.fn();
+  const addListener = jest.fn((event: string, listener: (event: BeforeRemoveEvent) => void) => {
+    if (event === 'beforeRemove') listeners.add(listener);
+    return () => listeners.delete(listener);
+  });
+  return {
+    navigation: { setOptions, addListener },
+    setOptions,
+    listeners,
+  };
+}
+
+function dispatchNavigationBeforeRemove(
+  listeners: ReadonlySet<(event: BeforeRemoveEvent) => void>,
+  type = 'GO_BACK',
+): jest.Mock {
+  const event: BeforeRemoveEvent = {
+    data: { action: { type } },
+    preventDefault: jest.fn(),
+  };
+  for (const listener of listeners) listener(event);
+  return event.preventDefault;
+}
+
 const queryClients: QueryClient[] = [];
 
 function makeQueryClient() {
@@ -494,6 +529,10 @@ beforeEach(() => {
   mockSkipWord.mockReset();
   mockRecorderProps = null;
   mockSearchParams = {};
+  mockCurrentNavigation = mockNavigation;
+  mockDeferFocusSetup = false;
+  mockDeferFocusCleanup = false;
+  mockDeferredFocusCleanups.length = 0;
   mockAuthValue = makeAuth();
   mockPracticeFlow = makePracticeFlow();
   // Default to "already seen" so the explainer card stays out of every test
@@ -521,6 +560,7 @@ afterEach(async () => {
   for (const client of queryClients) client.clear();
   queryClients.length = 0;
   for (const spy of transientSpies) spy.mockRestore();
+  for (const cleanup of mockDeferredFocusCleanups.splice(0)) cleanup();
   alertSpy.mockRestore();
 });
 
@@ -530,6 +570,12 @@ describe('practice home screen', () => {
     await renderScreen(<PracticeScreen />);
     expect(screen.getByText(t('practice.loadingQuestion'))).toBeTruthy();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
   });
 
   it('keeps footer actions above a larger device safe-area inset', async () => {
@@ -557,6 +603,7 @@ describe('practice home screen', () => {
       ownerId: USER.id,
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
+      disabled: false,
     });
     // The screen chooses which response contract the recorder parses with; a
     // swapped parser breaks the flow at runtime, so pin the wiring.
@@ -3647,6 +3694,928 @@ describe('skip word busy state', () => {
     expect(
       screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
+  });
+});
+
+describe('practice mutation ownership sentinels', () => {
+  it('ignores a Recorder lock before the practice screen receives focus ownership', async () => {
+    mockDeferFocusSetup = true;
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    mockSetOptions.mockClear();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+  });
+
+  it('rolls practice cache, lease, owner locks, and navigation into a new account', async () => {
+    const firstLease = { owner: 'practice-first-account' } as never;
+    const secondLease = { owner: 'practice-second-account' } as never;
+    let currentLease: SessionLease = firstLease;
+    const captureSessionLease = jest.fn(() => currentLease);
+    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
+    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
+
+    const client = makeQueryClient();
+    client.setQueryDefaults(['practice-question'], { staleTime: Infinity });
+    const secondPayload: PracticeQuestionPayload = {
+      ...PRACTICE_QUESTION,
+      question: {
+        ...QUESTION,
+        promptWord: 'clarity',
+        questionText: 'Explain why clarity matters.',
+      },
+    };
+    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
+    client.setQueryData(['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel], secondPayload);
+    const view = await render(withProviders(<PracticeScreen />, client, 0));
+    expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+
+    currentLease = secondLease;
+    mockAuthValue = makeAuth({
+      user: OTHER_USER,
+      sessionVersion: 1,
+      captureSessionLease,
+      isSessionLeaseCurrent,
+    });
+    await view.rerender(withProviders(<PracticeScreen />, client, 0));
+
+    expect(screen.getByText('Explain why clarity matters.')).toBeTruthy();
+    expect(screen.queryByText(QUESTION.questionText)).toBeNull();
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+    await act(async () => recorderProps().onInteractionLockChange?.(false));
+    await fireEvent.press(screen.getByRole('button', { name: t('practice.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
+  });
+
+  it('uses the synchronous practice layout cleanup before passive focus cleanup', async () => {
+    mockDeferFocusCleanup = true;
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const view = await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const callbacks = recorderProps();
+
+    await view.unmount();
+    alertSpy.mockClear();
+    await act(async () => callbacks.onError('layout cleanup window'));
+
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects the previous practice Recorder after an answer-mode owner change', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+    const englishCallbacks = recorderProps();
+    await act(async () => englishCallbacks.onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+    mockSetOptions.mockClear();
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<PracticeScreen />);
+    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+    alertSpy.mockClear();
+
+    await act(async () => {
+      englishCallbacks.onError('old English recorder');
+      englishCallbacks.onInteractionLockChange?.(true);
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+  });
+
+  it('moves practice navigation subscriptions and lock publication to a new navigation object', async () => {
+    const firstNavigation = createNavigationDouble();
+    const secondNavigation = createNavigationDouble();
+    mockCurrentNavigation = firstNavigation.navigation;
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(firstNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+
+    firstNavigation.setOptions.mockClear();
+    mockCurrentNavigation = secondNavigation.navigation;
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<PracticeScreen />);
+
+    expect(firstNavigation.listeners.size).toBe(0);
+    expect(secondNavigation.listeners.size).toBe(1);
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+
+    firstNavigation.setOptions.mockClear();
+    secondNavigation.setOptions.mockClear();
+    await blurScreen();
+    await focusScreen();
+    expect(firstNavigation.setOptions).not.toHaveBeenCalled();
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+    expect(dispatchNavigationBeforeRemove(secondNavigation.listeners)).toHaveBeenCalledTimes(1);
+    expect(dispatchNavigationBeforeRemove(firstNavigation.listeners)).not.toHaveBeenCalled();
+  });
+
+  it('publishes no practice navigation options while an owner reset commits off-focus', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    await blurScreen();
+    mockSetOptions.mockClear();
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<PracticeScreen />);
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('isolates result cancellation and blocks late Recorder work after navigation is claimed', async () => {
+    const refetchSpy = trackQueryRefetches();
+    const client = makeQueryClient();
+    const unrelated = deferred<string>();
+    let unrelatedSignal: AbortSignal | undefined;
+    const unrelatedRequest = client.fetchQuery({
+      queryKey: ['practice-unrelated-sentinel'],
+      queryFn: ({ signal }) => {
+        unrelatedSignal = signal;
+        return unrelated.promise;
+      },
+    });
+    const unrelatedSettled = Promise.allSettled([unrelatedRequest]);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />, client);
+    await screen.findByText(QUESTION.questionText);
+    const callbacks = recorderProps();
+
+    await act(async () => {
+      callbacks.onResult(PASSED_RESULT);
+      callbacks.onError('late result error');
+      callbacks.onRecoveryUnresolved();
+      await Promise.resolve();
+    });
+    const unrelatedWasAborted = unrelatedSignal?.aborted;
+    unrelated.resolve('kept');
+    await unrelatedSettled;
+
+    expect(unrelatedWasAborted).toBe(false);
+    expect(alertSpy).not.toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'late result error');
+    expect(refetchSpy).not.toHaveBeenCalled();
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'releases a practice recovery claim after the same owner %s path settles',
+    async (outcome) => {
+      const firstRefresh = deferred<unknown>();
+      const secondRefresh = deferred<unknown>();
+      const refetchSpy = trackQueryRefetches();
+      refetchSpy
+        .mockImplementationOnce(() => firstRefresh.promise as never)
+        .mockImplementationOnce(() => secondRefresh.promise as never);
+      mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+      await renderScreen(<PracticeScreen />);
+      await screen.findByText(QUESTION.questionText);
+      const recover = recorderProps().onRecoveryUnresolved;
+
+      await act(async () => {
+        recover();
+        await Promise.resolve();
+      });
+      expect(refetchSpy).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        if (outcome === 'resolve') firstRefresh.resolve(PRACTICE_QUESTION);
+        else firstRefresh.reject(new Error('recovery failed'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        recover();
+        await Promise.resolve();
+      });
+      expect(refetchSpy).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        secondRefresh.resolve(PRACTICE_QUESTION);
+        await Promise.resolve();
+      });
+    },
+  );
+
+  it.each(['resolve', 'reject'] as const)(
+    'does not let an old practice recovery %s path clear the new owner claim',
+    async (outcome) => {
+      const oldRefresh = deferred<unknown>();
+      const currentRefresh = deferred<unknown>();
+      const extraRefresh = deferred<unknown>();
+      const refetchSpy = trackQueryRefetches();
+      refetchSpy
+        .mockImplementationOnce(() => oldRefresh.promise as never)
+        .mockImplementationOnce(() => currentRefresh.promise as never)
+        .mockImplementation(() => extraRefresh.promise as never);
+      const client = makeQueryClient();
+      client.setQueryDefaults(['practice-question'], { staleTime: Infinity });
+      client.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
+      await renderScreen(<PracticeScreen />, client);
+      const oldRecover = recorderProps().onRecoveryUnresolved;
+      await act(async () => {
+        oldRecover();
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        client.setQueryData(['practice-question', USER.id, USER.cefrLevel], NEXT_PRACTICE_QUESTION);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(screen.getByText(NEXT_QUESTION.questionText)).toBeTruthy();
+      const currentRecover = recorderProps().onRecoveryUnresolved;
+      await act(async () => {
+        currentRecover();
+        await Promise.resolve();
+      });
+      expect(refetchSpy).toHaveBeenCalledTimes(2);
+
+      await act(async () => {
+        if (outcome === 'resolve') oldRefresh.resolve(PRACTICE_QUESTION);
+        else oldRefresh.reject(new Error('old recovery failed'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await act(async () => {
+        currentRecover();
+        await Promise.resolve();
+      });
+      expect(refetchSpy).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        currentRefresh.resolve(NEXT_PRACTICE_QUESTION);
+        await Promise.resolve();
+      });
+    },
+  );
+
+  it('rejects a retained Skip handler after its captured session lease expires', async () => {
+    const firstLease = { owner: 'skip-current' } as never;
+    let currentLease: SessionLease = firstLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const retainedSkip = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+
+    currentLease = { owner: 'skip-expired' } as never;
+    await act(async () => {
+      retainedSkip();
+      await Promise.resolve();
+    });
+
+    expect(mockSkipWord).not.toHaveBeenCalled();
+  });
+
+  it('does not refetch a skipped word after ownership expires during the API call', async () => {
+    const skipRequest = deferred<void>();
+    const refetchSpy = trackQueryRefetches().mockResolvedValue({ isError: false } as never);
+    const firstLease = { owner: 'skip-request' } as never;
+    let currentLease: SessionLease = firstLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const skip = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      skip();
+      await Promise.resolve();
+    });
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+
+    currentLease = { owner: 'skip-request-expired' } as never;
+    await act(async () => {
+      skipRequest.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(refetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a rejected skip after its lease expires without losing focus', async () => {
+    const skipRequest = deferred<void>();
+    const firstLease = { owner: 'skip-rejection' } as never;
+    let currentLease: SessionLease = firstLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const skip = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      skip();
+      await Promise.resolve();
+    });
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
+
+    currentLease = { owner: 'skip-rejection-expired' } as never;
+    alertSpy.mockClear();
+    await act(async () => {
+      skipRequest.reject(new Error('late skip rejection'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('suppresses a failed post-skip refetch after its lease expires', async () => {
+    const refetchRequest = deferred<{ isError: boolean; error: Error }>();
+    const refetchSpy = trackQueryRefetches().mockImplementation(
+      () => refetchRequest.promise as never,
+    );
+    const firstLease = { owner: 'skip-refetch' } as never;
+    let currentLease: SessionLease = firstLease;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => currentLease),
+      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
+    });
+    mockSkipWord.mockResolvedValue(undefined);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const skip = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      skip();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(refetchSpy).toHaveBeenCalledTimes(1);
+
+    currentLease = { owner: 'skip-refetch-expired' } as never;
+    alertSpy.mockClear();
+    await act(async () => {
+      refetchRequest.resolve({ isError: true, error: new Error('late refetch') });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('publishes no old skip finalizer into a replacement account', async () => {
+    const skipRequest = deferred<void>();
+    mockSkipWord.mockReturnValue(skipRequest.promise);
+    const client = makeQueryClient();
+    client.setQueryDefaults(['practice-question'], { staleTime: Infinity });
+    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
+    client.setQueryData(
+      ['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel],
+      NEXT_PRACTICE_QUESTION,
+    );
+    const view = await render(withProviders(<PracticeScreen />, client, 0));
+    const skip = committedPressHandler(
+      screen.getByRole('button', { name: t('practice.skipWord') }),
+    );
+    await act(async () => {
+      skip();
+      await Promise.resolve();
+    });
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerender(withProviders(<PracticeScreen />, client, 0));
+    mockSetOptions.mockClear();
+    await act(async () => {
+      skipRequest.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('locks exits synchronously for logout and restores the actual controls after failure', async () => {
+    const firstLogout = deferred<void>();
+    const logout = jest
+      .fn()
+      .mockReturnValueOnce(firstLogout.promise)
+      .mockResolvedValueOnce(undefined);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const pressLogout = committedPressHandler(
+      screen.getByRole('button', { name: t('common.logOut') }),
+    );
+    let immediateBack = false;
+    let immediateRemoval!: jest.Mock;
+
+    await act(async () => {
+      void pressLogout();
+      immediateBack = pressHardwareBack();
+      immediateRemoval = dispatchBeforeRemove();
+      await Promise.resolve();
+    });
+    expect(immediateBack).toBe(true);
+    expect(immediateRemoval).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+
+    await act(async () => {
+      firstLogout.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toEqual({ disabled: false });
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(logout).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(['resolve', 'reject'] as const)(
+    'publishes no practice logout %s continuation after focus is lost',
+    async (outcome) => {
+      const logoutRequest = deferred<void>();
+      mockAuthValue = makeAuth({ logout: jest.fn(() => logoutRequest.promise) });
+      mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+      await renderScreen(<PracticeScreen />);
+      await screen.findByText(QUESTION.questionText);
+      const logout = committedPressHandler(
+        screen.getByRole('button', { name: t('common.logOut') }),
+      );
+      await act(async () => {
+        void logout();
+        await Promise.resolve();
+      });
+      await blurScreen();
+      mockRouter.replace.mockClear();
+      alertSpy.mockClear();
+
+      await act(async () => {
+        if (outcome === 'resolve') logoutRequest.resolve(undefined);
+        else logoutRequest.reject(new Error('late logout failure'));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(mockRouter.replace).not.toHaveBeenCalled();
+      expect(alertSpy).not.toHaveBeenCalled();
+    },
+  );
+
+  it('publishes no old logout finalizer into a replacement account', async () => {
+    const logoutRequest = deferred<void>();
+    mockAuthValue = makeAuth({ logout: jest.fn(() => logoutRequest.promise) });
+    const client = makeQueryClient();
+    client.setQueryDefaults(['practice-question'], { staleTime: Infinity });
+    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
+    client.setQueryData(
+      ['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel],
+      NEXT_PRACTICE_QUESTION,
+    );
+    const view = await render(withProviders(<PracticeScreen />, client, 0));
+    await act(async () => {
+      void committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }))();
+      await Promise.resolve();
+    });
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerender(withProviders(<PracticeScreen />, client, 0));
+    mockSetOptions.mockClear();
+    await act(async () => {
+      logoutRequest.reject(new Error('old logout failed'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+});
+
+describe('practice attempt mutation ownership sentinels', () => {
+  beforeEach(() => {
+    mockSearchParams = { questionId: QUESTION.id };
+  });
+
+  it('ignores a Practice Mode Recorder lock before focus ownership is granted', async () => {
+    mockDeferFocusSetup = true;
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    mockSetOptions.mockClear();
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
+  });
+
+  it('rolls Practice Mode cache, lease, owner locks, and callbacks into a new account', async () => {
+    const firstLease = { owner: 'attempt-first-account' } as never;
+    const secondLease = { owner: 'attempt-second-account' } as never;
+    let currentLease: SessionLease = firstLease;
+    const captureSessionLease = jest.fn(() => currentLease);
+    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
+    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
+    const client = makeQueryClient();
+    const invalidateSpy = jest.spyOn(client, 'invalidateQueries');
+    client.setQueryDefaults(['question-help'], { staleTime: Infinity });
+    const secondHelp = {
+      ...HELP_CONTENT,
+      promptWord: 'clarity',
+      questionText: 'Explain why clarity matters.',
+    };
+    client.setQueryData(['question-help', USER.id, USER.nativeLanguage, QUESTION.id], HELP_CONTENT);
+    client.setQueryData(
+      ['question-help', OTHER_USER.id, OTHER_USER.nativeLanguage, QUESTION.id],
+      secondHelp,
+    );
+    const view = await render(withProviders(<AttemptScreen />, client, 0));
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
+
+    currentLease = secondLease;
+    mockAuthValue = makeAuth({
+      user: OTHER_USER,
+      sessionVersion: 1,
+      captureSessionLease,
+      isSessionLeaseCurrent,
+    });
+    await view.rerender(withProviders(<AttemptScreen />, client, 0));
+
+    expect(screen.getByText('Explain why clarity matters.')).toBeTruthy();
+    expect(screen.queryByText(QUESTION.questionText)).toBeNull();
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
+    expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
+
+    invalidateSpy.mockClear();
+    mockRouter.dismissTo.mockClear();
+    await act(async () => recorderProps().onRecoveryUnresolved());
+    expect(invalidateSpy).toHaveBeenCalledWith({
+      queryKey: ['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel],
+    });
+    expect(mockRouter.dismissTo).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('uses the synchronous Practice Mode layout cleanup before passive focus cleanup', async () => {
+    mockDeferFocusCleanup = true;
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const view = await renderScreen(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const callbacks = recorderProps();
+
+    await view.unmount();
+    alertSpy.mockClear();
+    await act(async () => callbacks.onError('attempt layout cleanup window'));
+
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('rejects the previous Practice Mode Recorder and accepts the new mode owner', async () => {
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
+    const englishCallbacks = recorderProps();
+    await act(async () => englishCallbacks.onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
+    mockSetOptions.mockClear();
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<AttemptScreen />);
+    const nativeCallbacks = recorderProps();
+    expect(nativeCallbacks.endpoint).toBe('/practice/attempt/native');
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: true, disabled: false });
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+    alertSpy.mockClear();
+
+    await act(async () => {
+      englishCallbacks.onError('old attempt recorder');
+      englishCallbacks.onInteractionLockChange?.(true);
+    });
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: true, disabled: false });
+
+    await act(async () => nativeCallbacks.onInteractionLockChange?.(true));
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: true, disabled: true });
+  });
+
+  it('moves Practice Mode navigation subscriptions and owner unlocks to a new navigator', async () => {
+    const firstNavigation = createNavigationDouble();
+    const secondNavigation = createNavigationDouble();
+    mockCurrentNavigation = firstNavigation.navigation;
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(firstNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+
+    firstNavigation.setOptions.mockClear();
+    mockCurrentNavigation = secondNavigation.navigation;
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<AttemptScreen />);
+    expect(firstNavigation.listeners.size).toBe(0);
+    expect(secondNavigation.listeners.size).toBe(1);
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+
+    firstNavigation.setOptions.mockClear();
+    secondNavigation.setOptions.mockClear();
+    await blurScreen();
+    await focusScreen();
+    expect(firstNavigation.setOptions).not.toHaveBeenCalled();
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+    expect(dispatchNavigationBeforeRemove(secondNavigation.listeners)).toHaveBeenCalledTimes(1);
+    expect(dispatchNavigationBeforeRemove(firstNavigation.listeners)).not.toHaveBeenCalled();
+  });
+
+  it('publishes no Practice Mode navigation options for an owner reset off-focus', async () => {
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    await blurScreen();
+    mockSetOptions.mockClear();
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await rerenderScreen(<AttemptScreen />);
+
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('isolates Practice Mode result cancellation and blocks late Recorder work', async () => {
+    const client = makeQueryClient();
+    const unrelated = deferred<string>();
+    let unrelatedSignal: AbortSignal | undefined;
+    const unrelatedRequest = client.fetchQuery({
+      queryKey: ['attempt-unrelated-sentinel'],
+      queryFn: ({ signal }) => {
+        unrelatedSignal = signal;
+        return unrelated.promise;
+      },
+    });
+    const unrelatedSettled = Promise.allSettled([unrelatedRequest]);
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />, client);
+    await screen.findByText(QUESTION.questionText);
+    const callbacks = recorderProps();
+
+    await act(async () => {
+      callbacks.onResult(PASSED_RESULT);
+      callbacks.onError('late attempt result error');
+      callbacks.onRecoveryUnresolved();
+      await Promise.resolve();
+    });
+    const unrelatedWasAborted = unrelatedSignal?.aborted;
+    unrelated.resolve('kept');
+    await unrelatedSettled;
+
+    expect(unrelatedWasAborted).toBe(false);
+    expect(alertSpy).not.toHaveBeenCalledWith(
+      t('diag.assessFailedTitle'),
+      'late attempt result error',
+    );
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('blocks late Practice Mode work after recovery has already claimed navigation', async () => {
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const client = makeQueryClient();
+    const invalidateSpy = jest.spyOn(client, 'invalidateQueries');
+    await renderScreen(<AttemptScreen />, client);
+    await screen.findByText(QUESTION.questionText);
+    const callbacks = recorderProps();
+
+    await act(async () => {
+      callbacks.onRecoveryUnresolved();
+      callbacks.onError('late recovery error');
+      callbacks.onResult(PASSED_RESULT);
+      callbacks.onRecoveryEndpointMismatch?.('/practice/attempt/native');
+    });
+
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+    expect(mockRouter.dismissTo).toHaveBeenCalledTimes(1);
+    expect(alertSpy).not.toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'late recovery error');
+    expect(mockPracticeFlow.showFeedback).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
+  });
+});
+
+describe('practice feedback mutation ownership sentinels', () => {
+  it('recaptures the session lease for a replacement feedback card in the same mount', async () => {
+    const firstLease = { owner: 'feedback-first-card' } as never;
+    const secondLease = { owner: 'feedback-second-card' } as never;
+    let currentLease: SessionLease = firstLease;
+    const captureSessionLease = jest.fn(() => currentLease);
+    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
+    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const rerenderScreen = await renderRerenderable(<FeedbackScreen />);
+    expect(screen.getByText(t('feedback.passedTitle'))).toBeTruthy();
+    expect(captureSessionLease).toHaveBeenCalledTimes(1);
+
+    currentLease = secondLease;
+    mockAuthValue = makeAuth({
+      sessionVersion: 2,
+      captureSessionLease,
+      isSessionLeaseCurrent,
+    });
+    const replacementResult: AttemptResult = {
+      ...PASSED_RESULT,
+      mastered: true,
+      score: 88,
+    };
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: NEXT_QUESTION.id, result: replacementResult },
+    });
+    await rerenderScreen(<FeedbackScreen />);
+
+    expect(screen.getByText(t('feedback.masteredTitle'))).toBeTruthy();
+    expect(captureSessionLease).toHaveBeenCalledTimes(2);
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+    expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
+  });
+
+  it('rejects feedback actions before passive focus ownership is granted', async () => {
+    mockDeferFocusSetup = true;
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('uses feedback layout cleanup before a deferred passive focus cleanup', async () => {
+    mockDeferFocusCleanup = true;
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const view = await renderScreen(<FeedbackScreen />);
+    const retainedNext = committedPressHandler(
+      screen.getByRole('button', { name: t('feedback.nextQuestion') }),
+    );
+
+    await view.unmount();
+    await act(async () => retainedNext());
+
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('rejects a retained feedback action after the card loses focus', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+    const retainedNext = committedPressHandler(
+      screen.getByRole('button', { name: t('feedback.nextQuestion') }),
+    );
+    await blurScreen();
+
+    await act(async () => retainedNext());
+
+    expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
+  });
+
+  it('cancels only the current practice question when feedback advances', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    const client = makeQueryClient();
+    const unrelated = deferred<string>();
+    let unrelatedSignal: AbortSignal | undefined;
+    const unrelatedRequest = client.fetchQuery({
+      queryKey: ['feedback-unrelated-sentinel'],
+      queryFn: ({ signal }) => {
+        unrelatedSignal = signal;
+        return unrelated.promise;
+      },
+    });
+    const unrelatedSettled = Promise.allSettled([unrelatedRequest]);
+    await renderScreen(<FeedbackScreen />, client);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    const unrelatedWasAborted = unrelatedSignal?.aborted;
+    unrelated.resolve('kept');
+    await unrelatedSettled;
+
+    expect(unrelatedWasAborted).toBe(false);
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
   });
 });
 

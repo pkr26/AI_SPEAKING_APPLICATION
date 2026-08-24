@@ -349,6 +349,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         await apiFetch<void>('/auth/logout', {
           method: 'POST',
           expireSessionOn401: false,
+          expectedStatus: 204,
         });
       } catch (error) {
         // An expired/revoked token already satisfies server-side logout. Do not
@@ -444,6 +445,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             method: 'DELETE',
             body: { password },
             expireSessionOn401: false,
+            expectedStatus: 204,
           });
         } catch (error) {
           if (error instanceof ApiError && error.status === 401) {

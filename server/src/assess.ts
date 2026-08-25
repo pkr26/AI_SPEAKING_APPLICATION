@@ -265,8 +265,8 @@ export interface AssessOptions {
 
 /** Route-specific pieces of the shared paid-provider skeleton below. */
 interface ProviderAssessmentSpec<T> {
-  /** Whisper language pin: 'en' for speaking, the learner's language otherwise. */
-  transcriptionLanguage: string;
+  /** Optional Whisper hint: English speaking plus supported native codes. */
+  transcriptionLanguage?: 'en' | Exclude<NativeLanguage, 'te'>;
   /** Simulated result when MOCK_AI=true (no provider call is made). */
   mockResult: () => T;
   /** Gentle non-error result when Whisper hears nothing usable. */
@@ -342,7 +342,7 @@ async function callProvider<T>(
           {
             file: uploadStream,
             model: 'whisper-1',
-            language: spec.transcriptionLanguage,
+            ...(spec.transcriptionLanguage === undefined ? {} : { language: spec.transcriptionLanguage }),
           },
           { signal: controller.signal },
         );
@@ -465,9 +465,9 @@ export function assessSpeaking(
 
 /**
  * Native-language comprehension check (practice "answer in my language" mode).
- * Transcribes with Whisper pinned to the learner's native language and asks GPT
- * only whether the transcript shows understanding of the question, plus a short
- * model English answer to imitate. It never scores mastery and never writes
+ * Whisper is pinned for Hindi, Spanish, and Chinese; Telugu omits the language
+ * hint because whisper-1 rejects its code. GPT still grades with the learner's
+ * exact native-language context. It never scores mastery and never writes
  * progress — that stays exclusive to English attempts.
  */
 export function assessNativeComprehension(
@@ -479,7 +479,7 @@ export function assessNativeComprehension(
 ): Promise<NativeAssessResult> {
   const nativeGradingSchema = createNativeGradingSchema();
   return callProvider<NativeAssessResult>(audioPath, q, userId, options, {
-    transcriptionLanguage: nativeLanguage,
+    transcriptionLanguage: nativeLanguage === 'te' ? undefined : nativeLanguage,
     mockResult: () => ({
       understood: true,
       transcript: '(mock transcript)',

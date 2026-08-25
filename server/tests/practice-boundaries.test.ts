@@ -69,20 +69,35 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
 
   async function freshUserAtQuestion() {
     const { res } = await registerUser(a);
-    const token = res.body.token;
+    expect(res.status).toBe(201);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
     await completeDiagnostic(a, token);
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
-    return { token, questionId: q.body.question.id as string };
+    expect(q.status).toBe(200);
+    return { token, userId, questionId: q.body.question.id as string };
   }
 
   it('walks attempts 1-3 on repeated failures, then resets to 1', async () => {
     vi.spyOn(Math, 'random').mockReturnValue(FAIL_SCORE);
-    const { token, questionId } = await freshUserAtQuestion();
-    const attempt = () =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
+    const { token, userId, questionId } = await freshUserAtQuestion();
+    const attempt = async () => {
+      const response = await answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        questionId,
+      );
+      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      await vi.waitFor(async () => {
+        const claim = await pool.query<{ count: number }>(
+          'SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
+          [userId, questionId],
+        );
+        expect(claim.rows[0].count).toBe(0);
+      });
+      return response;
+    };
 
     const first = await attempt();
-    expect(first.status).toBe(200);
     expect(first.body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
     expect(first.body.next).toBeUndefined();
     expect(first.body.finalFeedback).toBeUndefined();

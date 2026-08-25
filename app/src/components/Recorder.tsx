@@ -1778,6 +1778,7 @@ export default function Recorder<T>({
           });
           if (!isCurrent()) return false;
           const grant = await apiRequestAudioUpload(descriptor.type, ownerId, {
+            assessmentEndpoint: pending.endpoint,
             signal: recoveryController.signal,
           });
           if (!isCurrent() || grant.mode !== 's3') return false;
@@ -2831,6 +2832,7 @@ export default function Recorder<T>({
       const descriptor = await resolveAudioFileDescriptor(uri, { signal: controller.signal });
       if (!canContinueSubmission()) return;
       const grant = await apiRequestAudioUpload(descriptor.type, ownerId, {
+        assessmentEndpoint: endpoint,
         signal: controller.signal,
       });
       if (!canContinueSubmission()) return;

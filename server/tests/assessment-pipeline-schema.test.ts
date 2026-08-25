@@ -3,10 +3,12 @@ import { buildAssessmentSubmissionChain } from '../src/assessment-pipeline';
 import { config } from '../src/config';
 import type { Limiters } from '../src/rate-limit';
 
-const originalBucket = config.s3.bucket;
+const originalDiagnosticBucket = config.s3.diagnostic.bucket;
+const originalPracticeBucket = config.s3.practice.bucket;
 
 afterEach(() => {
-  config.s3.bucket = originalBucket;
+  config.s3.diagnostic.bucket = originalDiagnosticBucket;
+  config.s3.practice.bucket = originalPracticeBucket;
 });
 
 function inertLimiters(): Limiters {
@@ -21,8 +23,8 @@ function inertLimiters(): Limiters {
 
 describe('assessment submission schema', () => {
   it('pins both UUID messages in direct-upload mode', () => {
-    config.s3.bucket = '';
-    const { bodySchema } = buildAssessmentSubmissionChain(inertLimiters());
+    config.s3.diagnostic.bucket = '';
+    const { bodySchema } = buildAssessmentSubmissionChain(inertLimiters(), 'diagnostic');
     const questionId = '00000000-0000-4000-8000-000000000001';
     const requestId = '00000000-0000-4000-8000-000000000002';
 
@@ -41,8 +43,8 @@ describe('assessment submission schema', () => {
   });
 
   it('requires an S3 key and accepts 512 characters but rejects 513', () => {
-    config.s3.bucket = 'mutation-schema-bucket';
-    const { bodySchema } = buildAssessmentSubmissionChain(inertLimiters());
+    config.s3.practice.bucket = 'mutation-schema-practice-bucket';
+    const { bodySchema, storageScope } = buildAssessmentSubmissionChain(inertLimiters(), 'practice');
     const ids = {
       questionId: '00000000-0000-4000-8000-000000000001',
       requestId: '00000000-0000-4000-8000-000000000002',
@@ -51,5 +53,6 @@ describe('assessment submission schema', () => {
     expect(bodySchema.safeParse(ids).success).toBe(false);
     expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(512) }).success).toBe(true);
     expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(513) }).success).toBe(false);
+    expect(storageScope).toBe('practice');
   });
 });

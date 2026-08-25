@@ -1,5 +1,6 @@
 import {
   audioKeyBelongsToOwner,
+  audioKeyMatchesAssessmentEndpoint,
   CEFR_LEVELS,
   ContractError,
   isNativeOutcome,
@@ -1242,9 +1243,10 @@ describe('help and attempt detail boundaries', () => {
 
 describe('audio upload grant parser', () => {
   const audioKey =
-    'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.m4a';
+    'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440002.m4a';
   const s3 = {
     mode: 's3',
+    assessmentEndpoint: '/practice/attempt',
     uploadUrl: 'https://bucket.s3.amazonaws.com/',
     uploadFields: {
       key: audioKey,
@@ -1263,8 +1265,11 @@ describe('audio upload grant parser', () => {
   });
 
   it('accepts direct and s3 grants', () => {
-    expect(parseAudioUploadGrant({ mode: 'direct' })).toEqual({
+    expect(
+      parseAudioUploadGrant({ mode: 'direct', assessmentEndpoint: '/diagnostic/answer' }),
+    ).toEqual({
       mode: 'direct',
+      assessmentEndpoint: '/diagnostic/answer',
     });
     expect(parseAudioUploadGrant(s3)).toEqual(s3);
   });
@@ -1285,8 +1290,15 @@ describe('audio upload grant parser', () => {
   });
 
   it('strips unknown fields from grants', () => {
-    expect(parseAudioUploadGrant({ mode: 'direct', extra: 'x' })).toEqual({
+    expect(
+      parseAudioUploadGrant({
+        mode: 'direct',
+        assessmentEndpoint: '/practice/attempt/native',
+        extra: 'x',
+      }),
+    ).toEqual({
       mode: 'direct',
+      assessmentEndpoint: '/practice/attempt/native',
     });
   });
 
@@ -1407,6 +1419,7 @@ describe('audio upload grant parser', () => {
 
   it('requires the complete, anchored per-user S3 key shape', () => {
     expectContractError(() => parseAudioUploadGrant(withAudioKey(`junk/${audioKey}`)));
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(`junk/practice/${audioKey}`)));
     expectContractError(() => parseAudioUploadGrant(withAudioKey(`${audioKey}/junk`)));
     // Trailing segments must not ride in behind a well-formed prefix, even when
     // the whole key still ends in an allowlisted extension.
@@ -1419,6 +1432,20 @@ describe('audio upload grant parser', () => {
     const invalidVariant = audioKey.replace('550e8400-e29b-41d4-a716', '550e8400-e29b-41d4-c716');
     expectContractError(() => parseAudioUploadGrant(withAudioKey(invalidVersion)));
     expectContractError(() => parseAudioUploadGrant(withAudioKey(invalidVariant)));
+  });
+
+  it('requires the signed key scope to match the echoed assessment endpoint', () => {
+    const diagnosticAudioKey = audioKey.replace('/practice/', '/diagnostic/');
+    expect(
+      parseAudioUploadGrant({
+        ...withAudioKey(diagnosticAudioKey),
+        assessmentEndpoint: '/diagnostic/answer',
+      }),
+    ).toMatchObject({
+      assessmentEndpoint: '/diagnostic/answer',
+      audioKey: diagnosticAudioKey,
+    });
+    expectContractError(() => parseAudioUploadGrant(withAudioKey(diagnosticAudioKey)));
   });
 
   it('bounds and sanitizes every signed multipart field', () => {
@@ -1530,7 +1557,11 @@ describe('audio upload grant parser', () => {
     42,
     [],
     { mode: 'bogus' },
+    { mode: 'direct' },
+    { mode: 'direct', assessmentEndpoint: '/diagnostic/next' },
     { ...s3, mode: 1 },
+    { ...s3, assessmentEndpoint: undefined },
+    { ...s3, assessmentEndpoint: '/practice/answer' },
     { mode: 's3' },
     { ...s3, uploadUrl: '' },
     { ...s3, uploadUrl: 'http://bucket.s3.amazonaws.com/' },
@@ -1566,7 +1597,7 @@ describe('audio key ownership', () => {
   const ownerId = '550e8400-e29b-41d4-a716-446655440000';
   const otherOwnerId = '550e8400-e29b-41d4-a716-446655440009';
   const recordingId = '550e8400-e29b-41d4-a716-446655440002';
-  const ownedKey = `audio-uploads/${ownerId}/${recordingId}.m4a`;
+  const ownedKey = `audio-uploads/practice/${ownerId}/${recordingId}.m4a`;
 
   it('accepts an owned key whichever side carries uppercase hex', () => {
     expect(audioKeyBelongsToOwner(ownedKey, ownerId)).toBe(true);
@@ -1576,7 +1607,7 @@ describe('audio key ownership', () => {
 
   it('rejects a well-formed key stored under another account', () => {
     expect(
-      audioKeyBelongsToOwner(`audio-uploads/${otherOwnerId}/${recordingId}.m4a`, ownerId),
+      audioKeyBelongsToOwner(`audio-uploads/practice/${otherOwnerId}/${recordingId}.m4a`, ownerId),
     ).toBe(false);
   });
 
@@ -1602,14 +1633,47 @@ describe('audio key ownership', () => {
 
   it.each([
     ['a foreign prefix', `uploads/${ownerId}/${recordingId}.m4a`],
-    ['a non-uuid recording id', `audio-uploads/${ownerId}/recording.m4a`],
-    ['a disallowed extension', `audio-uploads/${ownerId}/${recordingId}.exe`],
+    ['a missing scope', `audio-uploads/${ownerId}/${recordingId}.m4a`],
+    ['an unknown scope', `audio-uploads/other/${ownerId}/${recordingId}.m4a`],
+    ['a non-uuid recording id', `audio-uploads/practice/${ownerId}/recording.m4a`],
+    ['a disallowed extension', `audio-uploads/practice/${ownerId}/${recordingId}.exe`],
     [
       'a traversal suffix',
-      `audio-uploads/${ownerId}/${recordingId}.m4a/../../${otherOwnerId}/steal.m4a`,
+      `audio-uploads/practice/${ownerId}/${recordingId}.m4a/../../${otherOwnerId}/steal.m4a`,
     ],
   ])('rejects %s even though the owner segment matches', (_label, key) => {
     expect(audioKeyBelongsToOwner(key, ownerId)).toBe(false);
+  });
+
+  it.each([
+    ['/diagnostic/answer', 'diagnostic'],
+    ['/practice/attempt', 'practice'],
+    ['/practice/attempt/native', 'practice'],
+  ] as const)('matches endpoint %s only to the %s key scope', (endpoint, scope) => {
+    const matching = `audio-uploads/${scope}/${ownerId}/${recordingId}.m4a`;
+    const otherScope = scope === 'diagnostic' ? 'practice' : 'diagnostic';
+    const mismatched = `audio-uploads/${otherScope}/${ownerId}/${recordingId}.m4a`;
+
+    expect(audioKeyMatchesAssessmentEndpoint(matching, endpoint)).toBe(true);
+    expect(audioKeyMatchesAssessmentEndpoint(mismatched, endpoint)).toBe(false);
+  });
+
+  it('fails closed for an endpoint value that bypasses TypeScript', () => {
+    expect(
+      audioKeyMatchesAssessmentEndpoint(ownedKey, '/practice/answer' as '/practice/attempt'),
+    ).toBe(false);
+  });
+
+  it('rejects a forged string-like audio key without coercing or calling string methods on it', () => {
+    const toString = jest.fn(() => ownedKey);
+    const forgedKey = { toString } as unknown as string;
+    let result: boolean | undefined;
+
+    expect(() => {
+      result = audioKeyMatchesAssessmentEndpoint(forgedKey, '/practice/attempt');
+    }).not.toThrow();
+    expect(result).toBe(false);
+    expect(toString).not.toHaveBeenCalled();
   });
 });
 

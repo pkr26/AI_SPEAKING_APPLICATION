@@ -453,7 +453,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
   });
 
   it('returns a retryable in-flight 409 when an audio-key conflict disappears before it can be read', async () => {
-    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const audioKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     const client = {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN' || text === 'ROLLBACK') return undefined;
@@ -494,7 +494,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
   it('records the submitted audio key on the processing claim for cleanup arbitration', async () => {
     const requestId = randomUUID();
-    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const audioKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId, audioKey);
     if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
 
@@ -516,7 +516,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     });
 
     // An expired processing row no longer protects the object either.
-    const staleKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const staleKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     await pool.query(
       `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
        VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
@@ -535,7 +535,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
   });
 
   it('binds one S3 object to one requestId across processing and completed states', async () => {
-    const audioKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const audioKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     const ownerRequestId = randomUUID();
     const owner = await claimAssessmentRequest(userId, ownerRequestId, 'practice', questionId, audioKey);
     if (owner.kind !== 'claimed') throw new Error('expected a fresh owner claim');
@@ -559,7 +559,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
   });
 
   it('releases an abandoned audio binding and replaces a stale binding without touching another key', async () => {
-    const abandonedKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const abandonedKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     const abandonedRequestId = randomUUID();
     const abandoned = await claimAssessmentRequest(userId, abandonedRequestId, 'practice', questionId, abandonedKey);
     if (abandoned.kind !== 'claimed') throw new Error('expected a fresh abandoned claim');
@@ -570,7 +570,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
       claimAssessmentRequest(userId, reboundAbandonedRequestId, 'practice', questionId, abandonedKey),
     ).resolves.toMatchObject({ kind: 'claimed' });
 
-    const staleKey = `audio-uploads/${userId}/${randomUUID()}.m4a`;
+    const staleKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     const staleRequestId = randomUUID();
     await pool.query(
       `INSERT INTO assessment_requests

@@ -9,6 +9,8 @@ import {
   isOwnedAudioKey,
   ownSubmittedPresignedAudio,
   resolvePresignedAudio,
+  s3StorageEnabled,
+  AudioStorageScope,
   SubmittedAudioFile,
 } from './audio-upload';
 import { config } from './config';
@@ -28,7 +30,7 @@ import { ownSubmittedAudioFile, uploadAudio, verifyAudioMagicBytes } from './upl
  * persistence, error codes) is injected through AssessmentSubmissionHooks.
  */
 
-function createSubmissionBodySchema() {
+function createSubmissionBodySchema(storageScope: AudioStorageScope) {
   const submissionBodySchema = z.object({
     questionId: z.string().uuid('questionId must be a valid UUID'),
     requestId: z.string().uuid('requestId must be a valid UUID'),
@@ -36,12 +38,16 @@ function createSubmissionBodySchema() {
 
   // S3 mode receives JSON with the presigned object key; local mode receives
   // multipart audio (see audio-upload.ts / upload.ts).
-  return config.s3.bucket ? submissionBodySchema.extend({ audioKey: z.string().max(512) }) : submissionBodySchema;
+  return s3StorageEnabled(storageScope)
+    ? submissionBodySchema.extend({ audioKey: z.string().max(512) })
+    : submissionBodySchema;
 }
 
 export type SubmissionBodySchema = ReturnType<typeof createSubmissionBodySchema>;
 
 export interface AssessmentSubmissionChain {
+  /** Storage destination fixed by the mounted assessment route. */
+  storageScope: AudioStorageScope;
   /** Mount before the route handler; ends with the dual-mode body validation. */
   middleware: RequestHandler[];
   /** The exact schema instance validate() parsed, for validated() reads. */
@@ -58,7 +64,7 @@ export interface AssessmentSubmissionChain {
 
 /**
  * Build the submission middleware chain. Resolved at router build time (not
- * module load): tests flip config.s3.bucket before creating the app.
+ * module load): tests flip the route scope's bucket before creating the app.
  *
  * Order matters and is pinned by tests:
  * - Transient-object cleanup registration belongs to submission routes only:
@@ -71,24 +77,30 @@ export interface AssessmentSubmissionChain {
  */
 export function buildAssessmentSubmissionChain(
   limiters: Limiters,
+  storageScope: AudioStorageScope,
   eligibility: RequestHandler[] = [],
 ): AssessmentSubmissionChain {
-  const bodySchema = createSubmissionBodySchema();
+  const bodySchema = createSubmissionBodySchema(storageScope);
   return {
+    storageScope,
     bodySchema,
     respendAssessmentBudget: limiters.respendAssessmentBudget,
     middleware: [
-      ...(config.s3.bucket ? [discardSubmittedPresignedAudio] : []),
+      ...(s3StorageEnabled(storageScope) ? [discardSubmittedPresignedAudio(storageScope)] : []),
       ...eligibility,
       limiters.assess,
       limiters.assessIpDaily,
       limiters.assessAbortGuard,
-      ...(config.s3.bucket ? [validate({ body: bodySchema })] : [uploadAudio, validate({ body: bodySchema })]),
+      ...(s3StorageEnabled(storageScope)
+        ? [validate({ body: bodySchema })]
+        : [uploadAudio, validate({ body: bodySchema })]),
     ],
   };
 }
 
 export interface AssessmentSubmissionHooks<Claim, Result> {
+  /** Route-bound storage scope; never accepted from the submission body. */
+  storageScope: AudioStorageScope;
   /** Idempotency context stored with the durable request claim. */
   context: AssessmentContext;
   /** The chain's schema instance, so the runner reads the validated body. */
@@ -165,7 +177,7 @@ export async function runAssessmentSubmission<Claim, Result>(
     // 500 (PostgreSQL text rejects a NUL byte). A key the download would refuse
     // is also a key no cleanup may ever consult. Direct mode has none.
     const rawAudioKey = (req.body as { audioKey?: unknown }).audioKey;
-    const audioKey = isOwnedAudioKey(user.id, rawAudioKey) ? rawAudioKey : undefined;
+    const audioKey = isOwnedAudioKey(hooks.storageScope, user.id, rawAudioKey) ? rawAudioKey : undefined;
     const { rows: qRows } = await pool.query<QuestionRow>(
       `SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`,
       [questionId],
@@ -190,7 +202,9 @@ export async function runAssessmentSubmission<Claim, Result>(
         throw new HttpError(403, 'Question is not available at your level', 'FORBIDDEN');
       }
       await hooks.assertEligibleAfterOwned?.(user);
-      if (config.s3.bucket) audioFile = await resolvePresignedAudio(req, res);
+      if (s3StorageEnabled(hooks.storageScope)) {
+        audioFile = await resolvePresignedAudio(hooks.storageScope, req, res);
+      }
       if (!audioFile) {
         throw new HttpError(400, 'audio file is required');
       }

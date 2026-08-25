@@ -242,8 +242,8 @@ const REQUEST_ID = '550e8400-e29b-41d4-a716-446655440002';
 const OTHER_QUESTION_ID = '550e8400-e29b-41d4-a716-446655440003';
 const OTHER_REQUEST_ID = '550e8400-e29b-41d4-a716-446655440004';
 const OTHER_OWNER_ID = '550e8400-e29b-41d4-a716-446655440005';
-const S3_AUDIO_KEY = `audio-uploads/${OWNER_ID}/550e8400-e29b-41d4-a716-446655440006.m4a`;
 const ENDPOINT = '/practice/attempt' as const;
+const S3_AUDIO_KEY = `audio-uploads/practice/${OWNER_ID}/550e8400-e29b-41d4-a716-446655440006.m4a`;
 const RECORDING_URI = 'file:///recordings/answer.m4a';
 
 // No I18nProvider is mounted in tests, so the component renders the module's
@@ -917,7 +917,10 @@ beforeEach(() => {
 
   asMock(apiFetch).mockReset();
   asMock(apiRequestAudioUpload).mockReset();
-  asMock(apiRequestAudioUpload).mockResolvedValue({ mode: 'direct' });
+  asMock(apiRequestAudioUpload).mockResolvedValue({
+    mode: 'direct',
+    assessmentEndpoint: ENDPOINT,
+  });
   asMock(apiPostPresignedAudio).mockReset();
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);
   asMock(apiUploadAudio).mockReset();
@@ -5571,41 +5574,45 @@ describe('Recorder', () => {
       expect(apiUploadAudio).not.toHaveBeenCalled();
     });
 
-    it('uploads directly with a durable requestId and delivers the result', async () => {
-      const { props } = await renderRecorder();
-      await recordAndStop();
+    it.each(['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const)(
+      'uses Recorder endpoint %s for a fresh grant and direct durable submission',
+      async (assessmentEndpoint) => {
+        const { props } = await renderRecorder({ endpoint: assessmentEndpoint });
+        await recordAndStop();
 
-      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
-      await flushAct();
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await flushAct();
 
-      expect(savePendingAssessment).toHaveBeenCalledWith({
-        ownerId: OWNER_ID,
-        endpoint: ENDPOINT,
-        questionId: QUESTION_ID,
-        requestId: REQUEST_ID,
-        createdAt: expect.any(Number),
-        stage: 'prepared',
-      });
-      expect(markPendingAssessmentStage).toHaveBeenCalledWith(REQUEST_ID, 'direct-posting');
-      expect(resolveAudioFileDescriptor).toHaveBeenCalledWith(RECORDING_URI, {
-        signal: expect.any(AbortSignal),
-      });
-      expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4', OWNER_ID, {
-        signal: expect.any(AbortSignal),
-      });
-      expect(apiUploadAudio).toHaveBeenCalledWith(
-        ENDPOINT,
-        RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
-        expect.objectContaining({ signal: expect.any(AbortSignal) }),
-      );
-      expect(props.parseResult).toHaveBeenCalledWith({ ok: true });
-      expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } });
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
-      expect(deletedRecordingUris()).toContain(RECORDING_URI);
-      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
-    });
+        expect(savePendingAssessment).toHaveBeenCalledWith({
+          ownerId: OWNER_ID,
+          endpoint: assessmentEndpoint,
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          createdAt: expect.any(Number),
+          stage: 'prepared',
+        });
+        expect(markPendingAssessmentStage).toHaveBeenCalledWith(REQUEST_ID, 'direct-posting');
+        expect(resolveAudioFileDescriptor).toHaveBeenCalledWith(RECORDING_URI, {
+          signal: expect.any(AbortSignal),
+        });
+        expect(apiRequestAudioUpload).toHaveBeenCalledWith('audio/mp4', OWNER_ID, {
+          assessmentEndpoint,
+          signal: expect.any(AbortSignal),
+        });
+        expect(apiUploadAudio).toHaveBeenCalledWith(
+          assessmentEndpoint,
+          RECORDING_URI,
+          { questionId: QUESTION_ID, requestId: REQUEST_ID },
+          expect.objectContaining({ signal: expect.any(AbortSignal) }),
+        );
+        expect(props.parseResult).toHaveBeenCalledWith({ ok: true });
+        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } });
+        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        expect(deletedRecordingUris()).toContain(RECORDING_URI);
+        expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      },
+    );
 
     it('does not upload after an account clear invalidates the captured handoff generation', async () => {
       asMock(capturePendingAssessmentGeneration).mockReturnValue(17);
@@ -5930,6 +5937,7 @@ describe('Recorder', () => {
       };
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields,
         audioKey: S3_AUDIO_KEY,
@@ -5978,6 +5986,7 @@ describe('Recorder', () => {
         if (mode === 's3') {
           asMock(apiRequestAudioUpload).mockResolvedValue({
             mode: 's3',
+            assessmentEndpoint: ENDPOINT,
             uploadUrl: 'https://s3.example.com/upload',
             uploadFields: { key: S3_AUDIO_KEY },
             audioKey: S3_AUDIO_KEY,
@@ -6374,6 +6383,7 @@ describe('Recorder', () => {
     it('keeps the take when the direct-to-S3 upload dies before any assessment POST', async () => {
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -6429,6 +6439,7 @@ describe('Recorder', () => {
       jest.useFakeTimers();
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -6620,6 +6631,7 @@ describe('Recorder', () => {
         if (mode === 's3') {
           asMock(apiRequestAudioUpload).mockResolvedValue({
             mode: 's3',
+            assessmentEndpoint: ENDPOINT,
             uploadUrl: 'https://s3.example.com/upload',
             uploadFields: { key: S3_AUDIO_KEY },
             audioKey: S3_AUDIO_KEY,
@@ -6672,6 +6684,7 @@ describe('Recorder', () => {
       const s3Upload = deferred<void>();
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -8340,6 +8353,7 @@ describe('Recorder', () => {
       jest.useFakeTimers();
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -8574,6 +8588,7 @@ describe('Recorder', () => {
       });
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields,
         audioKey: S3_AUDIO_KEY,
@@ -9266,9 +9281,10 @@ describe('Recorder', () => {
     );
 
     describe('upload-gone re-upload', () => {
-      const REUPLOAD_KEY = `audio-uploads/${OWNER_ID}/550e8400-e29b-41d4-a716-446655440007.m4a`;
+      const REUPLOAD_KEY = `audio-uploads/practice/${OWNER_ID}/550e8400-e29b-41d4-a716-446655440007.m4a`;
       const S3_GRANT = {
         mode: 's3' as const,
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -9327,6 +9343,10 @@ describe('Recorder', () => {
 
         // One fresh grant + one fresh S3 POST for the same logical submission.
         expect(apiRequestAudioUpload).toHaveBeenCalledTimes(2);
+        expect(apiRequestAudioUpload).toHaveBeenNthCalledWith(2, 'audio/mp4', OWNER_ID, {
+          assessmentEndpoint: ENDPOINT,
+          signal: expect.any(AbortSignal),
+        });
         expect(markPendingAssessmentStage).toHaveBeenCalledWith(
           REQUEST_ID,
           's3-granted',
@@ -9550,7 +9570,7 @@ describe('Recorder', () => {
         jest.useFakeTimers();
         asMock(apiRequestAudioUpload)
           .mockResolvedValueOnce(S3_GRANT)
-          .mockResolvedValueOnce({ mode: 'direct' });
+          .mockResolvedValueOnce({ mode: 'direct', assessmentEndpoint: ENDPOINT });
         const { props } = await submitIntoDeadKeyRejection(
           new ApiError(400, 'audio upload not found or expired', undefined, {
             code: 'AUDIO_UPLOAD_MISSING',
@@ -10278,6 +10298,7 @@ describe('Recorder', () => {
 
     const S3_GRANT = {
       mode: 's3',
+      assessmentEndpoint: ENDPOINT,
       uploadUrl: 'https://s3.example.com/upload',
       uploadFields: { key: S3_AUDIO_KEY },
       audioKey: S3_AUDIO_KEY,
@@ -12307,6 +12328,7 @@ describe('Recorder', () => {
     it('passes the recovery abort signal to a fresh upload-grant request', async () => {
       const freshGrant = deferred<{
         mode: 's3';
+        assessmentEndpoint: typeof ENDPOINT;
         uploadUrl: string;
         uploadFields: Record<string, string>;
         audioKey: string;
@@ -12315,7 +12337,7 @@ describe('Recorder', () => {
         maxBytes: number;
       }>();
       asMock(apiRequestAudioUpload)
-        .mockResolvedValueOnce({ mode: 'direct' })
+        .mockResolvedValueOnce({ mode: 'direct', assessmentEndpoint: ENDPOINT })
         .mockReturnValueOnce(freshGrant.promise);
       const { props } = await beginS3DeadKeyRecovery(
         new ApiError(400, 'missing audio', undefined, { code: 'AUDIO_UPLOAD_MISSING' }),
@@ -12329,6 +12351,7 @@ describe('Recorder', () => {
         for (const handler of appStateHandlers) handler('background');
         freshGrant.resolve({
           mode: 's3',
+          assessmentEndpoint: ENDPOINT,
           uploadUrl: 'https://s3.example.com/new',
           uploadFields: { key: S3_AUDIO_KEY },
           audioKey: S3_AUDIO_KEY,
@@ -13157,6 +13180,7 @@ describe('Recorder', () => {
       const resubmission = deferred<unknown>();
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -13207,6 +13231,7 @@ describe('Recorder', () => {
       const objectUpload = deferred<void>();
       const grant = {
         mode: 's3' as const,
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,
@@ -13338,7 +13363,7 @@ describe('Recorder', () => {
     });
 
     it('abandons a submission whose upload grant lands after backgrounding', async () => {
-      const grant = deferred<{ mode: string }>();
+      const grant = deferred<{ mode: 'direct'; assessmentEndpoint: typeof ENDPOINT }>();
       asMock(apiRequestAudioUpload).mockReturnValue(grant.promise);
       const { props } = await renderRecorder();
       await recordAndStop();
@@ -13348,7 +13373,7 @@ describe('Recorder', () => {
 
       backgroundApp();
       await act(async () => {
-        grant.resolve({ mode: 'direct' });
+        grant.resolve({ mode: 'direct', assessmentEndpoint: ENDPOINT });
         await flushMicrotasks();
       });
 
@@ -13617,6 +13642,7 @@ describe('Recorder', () => {
       jest.useFakeTimers();
       asMock(apiRequestAudioUpload).mockResolvedValue({
         mode: 's3',
+        assessmentEndpoint: ENDPOINT,
         uploadUrl: 'https://s3.example.com/upload',
         uploadFields: { key: S3_AUDIO_KEY },
         audioKey: S3_AUDIO_KEY,

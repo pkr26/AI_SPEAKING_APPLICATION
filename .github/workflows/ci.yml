@@ -138,7 +138,7 @@ jobs:
       # default database with the image's own compiled migration/catalog
       # commands first. NODE_ENV=development permits MOCK_AI and the local
       # upload fallback; the baked-in production mode rejects MOCK_AI and
-      # requires S3_BUCKET.
+      # requires distinct diagnostic and practice S3 buckets.
       - name: Exercise container healthcheck
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
@@ -153,6 +153,8 @@ jobs:
             -e DATABASE_URL \
             -e JWT_SECRET \
             -e MOCK_AI=true \
+            -e S3_DIAGNOSTIC_BUCKET= \
+            -e S3_PRACTICE_BUCKET= \
             -e PORT=4000 \
             ai-english-server:ci
           healthy=""

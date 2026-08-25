@@ -259,7 +259,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
   // dual-mode validation); see assessment-pipeline.ts. Unlike practice there
   // is no eligibility middleware: the already-completed rejection runs inside
   // the pipeline after the request UUID is owned, so it abandons the claim.
-  const submission = buildAssessmentSubmissionChain(limiters);
+  const submission = buildAssessmentSubmissionChain(limiters, 'diagnostic');
 
   router.get(
     '/next',
@@ -362,6 +362,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
     ...submission.middleware,
     h(async (req: AuthedRequest, res) =>
       runAssessmentSubmission<DiagnosticClaim, AssessResult>(req, res, {
+        storageScope: submission.storageScope,
         context: 'diagnostic',
         bodySchema: submission.bodySchema,
         respendAssessmentBudget: submission.respendAssessmentBudget,

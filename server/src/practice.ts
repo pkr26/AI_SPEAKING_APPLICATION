@@ -683,7 +683,7 @@ export function createPracticeRouter(limiters: Limiters) {
 
   // Shared submission choreography (S3-conditional cleanup + eligibility +
   // paid limiters + dual-mode validation); see assessment-pipeline.ts.
-  const submission = buildAssessmentSubmissionChain(limiters, [requireCompletedDiagnostic]);
+  const submission = buildAssessmentSubmissionChain(limiters, 'practice', [requireCompletedDiagnostic]);
 
   router.get(
     '/question',
@@ -907,6 +907,7 @@ export function createPracticeRouter(limiters: Limiters) {
     ...submission.middleware,
     h(async (req: AuthedRequest, res) =>
       runAssessmentSubmission<PracticeClaim, AssessResult>(req, res, {
+        storageScope: submission.storageScope,
         context: 'practice',
         bodySchema: submission.bodySchema,
         respendAssessmentBudget: submission.respendAssessmentBudget,
@@ -973,6 +974,7 @@ export function createPracticeRouter(limiters: Limiters) {
     ...submission.middleware,
     h(async (req: AuthedRequest, res) =>
       runAssessmentSubmission<PracticeClaim, NativeAssessResult>(req, res, {
+        storageScope: submission.storageScope,
         context: 'practice-native',
         bodySchema: submission.bodySchema,
         respendAssessmentBudget: submission.respendAssessmentBudget,

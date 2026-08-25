@@ -528,13 +528,13 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
   }
 });
 
-test('the Recorder review pins 187 equivalents without exempting final gaps', () => {
+test('the Recorder review pins 186 equivalents without exempting final gaps', () => {
   const recorderEntries = equivalentMutants.filter(
     (entry) => entry.file === 'src/components/Recorder.tsx',
   );
   const reviewedIds = recorderEntries.map((entry) => entry.reviewedMutantId);
-  assert.equal(recorderEntries.length, 187);
-  assert.equal(new Set(reviewedIds).size, 187, 'canonical Recorder IDs must be unique');
+  assert.equal(recorderEntries.length, 186);
+  assert.equal(new Set(reviewedIds).size, 186, 'canonical Recorder IDs must be unique');
   assert.ok(reviewedIds.every((id) => /^\d+$/u.test(id)));
 
   assert.ok(reviewedIds.includes('1910'), 'reviewed post-unmount setter invariant is missing');

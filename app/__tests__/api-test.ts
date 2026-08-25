@@ -2209,7 +2209,8 @@ describe('apiUploadAudio', () => {
 
 describe('apiRequestAudioUpload', () => {
   const ownerId = '550e8400-e29b-41d4-a716-446655440000';
-  const audioKey = `audio-uploads/${ownerId}/550e8400-e29b-41d4-a716-446655440002.m4a`;
+  const assessmentEndpoint = '/practice/attempt' as const;
+  const audioKey = `audio-uploads/practice/${ownerId}/550e8400-e29b-41d4-a716-446655440002.m4a`;
   const uploadFields = {
     key: audioKey,
     'Content-Type': 'audio/mp4',
@@ -2219,6 +2220,7 @@ describe('apiRequestAudioUpload', () => {
   it('posts the content type and parses the grant', async () => {
     const grant = {
       mode: 's3',
+      assessmentEndpoint,
       uploadUrl: 'https://bucket.s3.amazonaws.com/',
       uploadFields,
       audioKey,
@@ -2228,29 +2230,58 @@ describe('apiRequestAudioUpload', () => {
     };
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => grant }));
 
-    const result = await api.apiRequestAudioUpload('audio/mp4', ownerId);
+    const result = await api.apiRequestAudioUpload('audio/mp4', ownerId, {
+      assessmentEndpoint,
+    });
 
     expect(result).toEqual(grant);
     const [input, init] = fetchMock.mock.calls[0];
     expect(input).toBe('http://localhost:4000/uploads/audio-url');
     expect(init.method).toBe('POST');
-    expect(init.body).toBe(JSON.stringify({ contentType: 'audio/mp4' }));
+    expect(init.body).toBe(JSON.stringify({ contentType: 'audio/mp4', assessmentEndpoint }));
+    expect(JSON.parse(init.body as string)).not.toHaveProperty('bucket');
+    expect(JSON.parse(init.body as string)).not.toHaveProperty('bucketName');
   });
 
   it('accepts the direct-upload fallback without applying S3-only checks', async () => {
-    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ mode: 'direct' }) }));
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ mode: 'direct', assessmentEndpoint }) }),
+    );
 
-    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).resolves.toEqual({
+    await expect(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+    ).resolves.toEqual({
       mode: 'direct',
+      assessmentEndpoint,
     });
   });
+
+  it.each(['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const)(
+    'sends the exact logical assessment endpoint %s without a bucket selector',
+    async (endpoint) => {
+      fetchMock.mockResolvedValue(
+        fakeResponse({ json: async () => ({ mode: 'direct', assessmentEndpoint: endpoint }) }),
+      );
+
+      await api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint: endpoint });
+
+      const body = JSON.parse(fetchMock.mock.calls[0][1].body as string) as Record<string, unknown>;
+      expect(body).toEqual({ contentType: 'audio/mp4', assessmentEndpoint: endpoint });
+      expect(Object.keys(body)).not.toEqual(
+        expect.arrayContaining(['bucket', 'bucketName', 'bucketArn', 'bucketHost']),
+      );
+    },
+  );
 
   it('forwards the caller abort signal to the grant request', async () => {
     fetchUntilAborted();
     const controller = new AbortController();
 
     const pending = catchAsync(
-      api.apiRequestAudioUpload('audio/mp4', ownerId, { signal: controller.signal }),
+      api.apiRequestAudioUpload('audio/mp4', ownerId, {
+        assessmentEndpoint,
+        signal: controller.signal,
+      }),
     );
     controller.abort();
 
@@ -2261,6 +2292,7 @@ describe('apiRequestAudioUpload', () => {
   it('compares a signed content type with the normalized requested value', async () => {
     const grant = {
       mode: 's3',
+      assessmentEndpoint,
       uploadUrl: 'https://bucket.s3.amazonaws.com/',
       uploadFields,
       audioKey,
@@ -2270,13 +2302,17 @@ describe('apiRequestAudioUpload', () => {
     };
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => grant }));
 
-    await expect(api.apiRequestAudioUpload('  AUDIO/MP4  ', ownerId)).resolves.toEqual(grant);
+    await expect(
+      api.apiRequestAudioUpload('  AUDIO/MP4  ', ownerId, { assessmentEndpoint }),
+    ).resolves.toEqual(grant);
   });
 
   it('rejects a malformed grant as a contract error', async () => {
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ mode: 'carrier-pigeon' }) }));
 
-    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
+    await expect(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+    ).rejects.toThrow(ContractError);
   });
 
   it('rejects a signed content type that differs from the requested recording', async () => {
@@ -2284,6 +2320,7 @@ describe('apiRequestAudioUpload', () => {
       fakeResponse({
         json: async () => ({
           mode: 's3',
+          assessmentEndpoint,
           uploadUrl: 'https://bucket.s3.amazonaws.com/',
           uploadFields: {
             ...uploadFields,
@@ -2297,7 +2334,9 @@ describe('apiRequestAudioUpload', () => {
       }),
     );
 
-    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
+    await expect(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+    ).rejects.toThrow(ContractError);
   });
 
   it('rejects a self-consistent grant signed for a content type nobody asked for', async () => {
@@ -2307,6 +2346,7 @@ describe('apiRequestAudioUpload', () => {
       fakeResponse({
         json: async () => ({
           mode: 's3',
+          assessmentEndpoint,
           uploadUrl: 'https://bucket.s3.amazonaws.com/',
           uploadFields,
           audioKey,
@@ -2317,16 +2357,19 @@ describe('apiRequestAudioUpload', () => {
       }),
     );
 
-    await expect(api.apiRequestAudioUpload('audio/webm', ownerId)).rejects.toThrow(ContractError);
+    await expect(
+      api.apiRequestAudioUpload('audio/webm', ownerId, { assessmentEndpoint }),
+    ).rejects.toThrow(ContractError);
   });
 
   it('rejects an otherwise valid grant whose object key belongs to another user', async () => {
     const otherKey =
-      'audio-uploads/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440002.m4a';
+      'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440002.m4a';
     fetchMock.mockResolvedValue(
       fakeResponse({
         json: async () => ({
           mode: 's3',
+          assessmentEndpoint,
           uploadUrl: 'https://bucket.s3.amazonaws.com/',
           uploadFields: { ...uploadFields, key: otherKey },
           audioKey: otherKey,
@@ -2337,7 +2380,56 @@ describe('apiRequestAudioUpload', () => {
       }),
     );
 
-    await expect(api.apiRequestAudioUpload('audio/mp4', ownerId)).rejects.toThrow(ContractError);
+    await expect(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+    ).rejects.toThrow(ContractError);
+  });
+
+  it.each(['direct', 's3'] as const)(
+    'rejects a %s grant echoed for a different assessment endpoint',
+    async (mode) => {
+      const diagnosticKey = audioKey.replace('/practice/', '/diagnostic/');
+      const mismatchedGrant =
+        mode === 'direct'
+          ? { mode, assessmentEndpoint: '/diagnostic/answer' }
+          : {
+              mode,
+              assessmentEndpoint: '/diagnostic/answer',
+              uploadUrl: 'https://bucket.s3.amazonaws.com/',
+              uploadFields: { ...uploadFields, key: diagnosticKey },
+              audioKey: diagnosticKey,
+              contentType: 'audio/mp4',
+              expiresIn: 900,
+              maxBytes: 25 * 1024 * 1024,
+            };
+      fetchMock.mockResolvedValue(fakeResponse({ json: async () => mismatchedGrant }));
+
+      await expect(
+        api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+      ).rejects.toThrow(ContractError);
+    },
+  );
+
+  it('rejects an owned key whose scope does not match the requested endpoint', async () => {
+    const diagnosticKey = `audio-uploads/diagnostic/${ownerId}/550e8400-e29b-41d4-a716-446655440002.m4a`;
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          mode: 's3',
+          assessmentEndpoint,
+          uploadUrl: 'https://bucket.s3.amazonaws.com/',
+          uploadFields: { ...uploadFields, key: diagnosticKey },
+          audioKey: diagnosticKey,
+          contentType: 'audio/mp4',
+          expiresIn: 900,
+          maxBytes: 25 * 1024 * 1024,
+        }),
+      }),
+    );
+
+    await expect(
+      api.apiRequestAudioUpload('audio/mp4', ownerId, { assessmentEndpoint }),
+    ).rejects.toThrow(ContractError);
   });
 });
 

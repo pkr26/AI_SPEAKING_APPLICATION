@@ -64,7 +64,7 @@ const pending: PendingAssessment = {
   stage: 'direct-posting',
 };
 const audioKey =
-  'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
+  'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
 
 describe('durable assessment handoff', () => {
   // The module keeps an in-memory copy, so reset through the public API:
@@ -144,7 +144,7 @@ describe('durable assessment handoff', () => {
 
   it('replaces the stored S3 key when a fresh grant supersedes it', async () => {
     const supersedingKey =
-      'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440004.m4a';
+      'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440004.m4a';
     await savePendingAssessment({ ...pending, stage: 's3-granted', audioKey });
 
     await expect(
@@ -243,7 +243,7 @@ describe('pending assessment edge cases', () => {
       ...pending,
       stage: 's3-granted',
       audioKey:
-        'audio-uploads/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440003.m4a',
+        'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440003.m4a',
     },
     {
       ...pending,
@@ -257,7 +257,7 @@ describe('pending assessment edge cases', () => {
       ...pending,
       stage: 's3-granted',
       audioKey:
-        'audio-uploads/550e8400-e29b-41d4-a716-446655440000/prefix-550e8400-e29b-41d4-a716-446655440003.m4a',
+        'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440000/prefix-550e8400-e29b-41d4-a716-446655440003.m4a',
     },
     { ...pending, delivery: 'unknown' },
     { ...pending, cancelRequested: null },
@@ -345,6 +345,33 @@ describe('pending assessment edge cases', () => {
         audioKey: uppercaseFilenameKey,
       }),
     ).toEqual({ ...pending, stage: 's3-granted', audioKey: uppercaseFilenameKey });
+  });
+
+  it.each([
+    ['/diagnostic/answer', 'diagnostic'],
+    ['/practice/attempt', 'practice'],
+    ['/practice/attempt/native', 'practice'],
+  ] as const)('requires endpoint %s to match the durable %s key scope', (endpoint, scope) => {
+    const matchingKey = `audio-uploads/${scope}/${pending.ownerId}/550e8400-e29b-41d4-a716-446655440003.m4a`;
+    const otherScope = scope === 'diagnostic' ? 'practice' : 'diagnostic';
+    const mismatchedKey = `audio-uploads/${otherScope}/${pending.ownerId}/550e8400-e29b-41d4-a716-446655440003.m4a`;
+
+    expect(
+      parsePendingAssessment({
+        ...pending,
+        endpoint,
+        stage: 's3-granted',
+        audioKey: matchingKey,
+      }),
+    ).toEqual({ ...pending, endpoint, stage: 's3-granted', audioKey: matchingKey });
+    expect(
+      parsePendingAssessment({
+        ...pending,
+        endpoint,
+        stage: 's3-granted',
+        audioKey: mismatchedKey,
+      }),
+    ).toBeNull();
   });
 
   it('refuses to persist invalid metadata', async () => {

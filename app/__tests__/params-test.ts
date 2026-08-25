@@ -121,7 +121,7 @@ describe('pending assessment metadata', () => {
 
   it('accepts only an owner-bound S3 object key', () => {
     const audioKey =
-      'audio-uploads/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
+      'audio-uploads/diagnostic/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
     expect(parsePendingAssessment({ ...valid, stage: 's3-granted', audioKey })).toEqual({
       ...valid,
       stage: 's3-granted',
@@ -132,7 +132,7 @@ describe('pending assessment metadata', () => {
         ...valid,
         stage: 's3-granted',
         audioKey:
-          'audio-uploads/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440003.m4a',
+          'audio-uploads/diagnostic/550e8400-e29b-41d4-a716-446655440099/550e8400-e29b-41d4-a716-446655440003.m4a',
       }),
     ).toBeNull();
   });

@@ -1,7 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 
 import { isUuid } from './params';
-import { audioKeyBelongsToOwner } from './types';
+import { audioKeyBelongsToOwner, audioKeyMatchesAssessmentEndpoint } from './types';
 
 export type AssessmentEndpoint =
   '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
@@ -91,7 +91,8 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
   if (
     stage === 's3-granted' &&
     (typeof candidate.audioKey !== 'string' ||
-      !audioKeyBelongsToOwner(candidate.audioKey, candidate.ownerId))
+      !audioKeyBelongsToOwner(candidate.audioKey, candidate.ownerId) ||
+      !audioKeyMatchesAssessmentEndpoint(candidate.audioKey, candidate.endpoint))
   ) {
     return null;
   }

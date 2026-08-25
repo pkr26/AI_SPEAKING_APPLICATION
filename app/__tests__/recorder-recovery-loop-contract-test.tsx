@@ -221,7 +221,10 @@ beforeEach(() => {
   asMock(claimPendingAssessmentRecoveryPost).mockResolvedValue(true);
   asMock(refundPendingAssessmentRecoveryPost).mockResolvedValue(true);
   asMock(resolveAudioFileDescriptor).mockResolvedValue({ name: 'audio.m4a', type: 'audio/mp4' });
-  asMock(apiRequestAudioUpload).mockResolvedValue({ mode: 'direct' });
+  asMock(apiRequestAudioUpload).mockResolvedValue({
+    mode: 'direct',
+    assessmentEndpoint: '/practice/attempt',
+  });
   asMock(apiUploadAudio).mockResolvedValue({ ok: true });
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);
   jest.spyOn(AppState, 'addEventListener').mockReturnValue({ remove: jest.fn() });
@@ -246,7 +249,7 @@ afterEach(async () => {
 describe('Recorder recovery-loop mutation contract', () => {
   it('keeps the ordinary two-second poll delay after a hintless in-flight conflict', async () => {
     jest.useFakeTimers();
-    const audioKey = `audio-uploads/${OWNER_ID}/${REQUEST_ID}.m4a`;
+    const audioKey = `audio-uploads/practice/${OWNER_ID}/${REQUEST_ID}.m4a`;
     asMock(loadPendingAssessment).mockResolvedValue(
       pendingRecord({ stage: 's3-granted', audioKey }),
     );

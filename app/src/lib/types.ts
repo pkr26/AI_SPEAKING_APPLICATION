@@ -1,3 +1,5 @@
+import type { AssessmentEndpoint } from './pending-assessment';
+
 export type NativeLanguage = 'te' | 'hi' | 'es' | 'zh';
 export type CefrLevel = 'A1' | 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 
@@ -705,9 +707,10 @@ export function parseUserDataPage(value: unknown): UserDataPage {
 }
 
 export type AudioUploadGrant =
-  | { mode: 'direct' }
+  | { mode: 'direct'; assessmentEndpoint: AssessmentEndpoint }
   | {
       mode: 's3';
+      assessmentEndpoint: AssessmentEndpoint;
       uploadUrl: string;
       uploadFields: Record<string, string>;
       audioKey: string;
@@ -775,7 +778,7 @@ function safeUploadUrl(value: string): boolean {
 }
 
 function safeAudioKey(value: string): boolean {
-  return /^audio-uploads\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
+  return /^audio-uploads\/(diagnostic|practice)\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(m4a|mp3|wav|ogg|webm|flac)$/i.test(
     value,
   );
 }
@@ -784,7 +787,25 @@ export function audioKeyBelongsToOwner(audioKey: string, ownerId: string): boole
   // This helper is exported and sits on a security boundary. Fail closed when
   // JavaScript callers bypass its TypeScript signature with string-like values.
   if (typeof audioKey !== 'string' || typeof ownerId !== 'string') return false;
-  return safeAudioKey(audioKey) && audioKey.split('/')[1]!.toLowerCase() === ownerId.toLowerCase();
+  return safeAudioKey(audioKey) && audioKey.split('/')[2]!.toLowerCase() === ownerId.toLowerCase();
+}
+
+export function audioKeyMatchesAssessmentEndpoint(
+  audioKey: string,
+  endpoint: AssessmentEndpoint,
+): boolean {
+  if (typeof audioKey !== 'string' || typeof endpoint !== 'string' || !safeAudioKey(audioKey)) {
+    return false;
+  }
+  let expectedScope: 'diagnostic' | 'practice';
+  if (endpoint === '/diagnostic/answer') {
+    expectedScope = 'diagnostic';
+  } else if (endpoint === '/practice/attempt' || endpoint === '/practice/attempt/native') {
+    expectedScope = 'practice';
+  } else {
+    return false;
+  }
+  return audioKey.split('/')[1]!.toLowerCase() === expectedScope;
 }
 
 function parseUploadFields(value: unknown): Record<string, string> | null {
@@ -818,7 +839,15 @@ function parseUploadFields(value: unknown): Record<string, string> | null {
 export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
   if (!isRecord(value)) throw new ContractError();
   const mode = value.mode;
-  if (mode === 'direct') return { mode: 'direct' };
+  const assessmentEndpoint = value.assessmentEndpoint;
+  if (
+    assessmentEndpoint !== '/diagnostic/answer' &&
+    assessmentEndpoint !== '/practice/attempt' &&
+    assessmentEndpoint !== '/practice/attempt/native'
+  ) {
+    throw new ContractError();
+  }
+  if (mode === 'direct') return { mode: 'direct', assessmentEndpoint };
   const uploadUrl = value.uploadUrl;
   const rawUploadFields = value.uploadFields;
   const audioKey = value.audioKey;
@@ -835,6 +864,7 @@ export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
     safeUploadUrl(uploadUrl) &&
     isNonEmptyString(audioKey) &&
     safeAudioKey(audioKey) &&
+    audioKeyMatchesAssessmentEndpoint(audioKey, assessmentEndpoint) &&
     uploadFields !== null &&
     Object.hasOwn(uploadFields, 'key') &&
     uploadFields.key === audioKey &&
@@ -853,6 +883,7 @@ export function parseAudioUploadGrant(value: unknown): AudioUploadGrant {
   ) {
     return {
       mode: 's3',
+      assessmentEndpoint,
       uploadUrl,
       uploadFields,
       audioKey,

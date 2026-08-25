@@ -41,20 +41,36 @@ vi.mock('@aws-sdk/s3-presigned-post', () => ({
 import { config } from '../src/config';
 import {
   createAudioSizeCap,
-  discardPresignedAudio,
-  discardSubmittedPresignedAudio,
+  discardPresignedAudio as discardScopedPresignedAudio,
+  discardSubmittedPresignedAudio as createDiscardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
   ownSubmittedPresignedAudio,
   preserveSubmittedPresignedAudio,
-  resolvePresignedAudio,
+  resolvePresignedAudio as resolveScopedPresignedAudio,
 } from '../src/audio-upload';
 import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
 import { MAX_AUDIO_BYTES, ownSubmittedAudioFile, uploadsDir } from '../src/upload';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
-// Switch the whole app into S3 ingress mode (must precede createApp()).
-config.s3.bucket = 'test-audio-bucket';
+// Switch both assessment domains into S3 ingress mode (must precede
+// createApp()). Most lifecycle tests use the diagnostic route-bound scope;
+// dedicated assertions below pin practice routing independently.
+config.s3.diagnostic.bucket = 'test-diagnostic-audio-bucket';
+config.s3.diagnostic.region = 'us-east-1';
+config.s3.practice.bucket = 'test-practice-audio-bucket';
+config.s3.practice.region = 'eu-west-2';
+config.s3.accessKeyId = '';
+config.s3.secretAccessKey = '';
+config.s3.sessionToken = '';
+
+const discardSubmittedPresignedAudio = createDiscardSubmittedPresignedAudio('diagnostic');
+const discardPresignedAudio = (userId: string, audioKey: string) =>
+  discardScopedPresignedAudio('diagnostic', userId, audioKey);
+const resolvePresignedAudio = (
+  request: Parameters<typeof resolveScopedPresignedAudio>[1],
+  response: Parameters<typeof resolveScopedPresignedAudio>[2],
+) => resolveScopedPresignedAudio('diagnostic', request, response);
 
 async function registerAndGetQuestion(a: ReturnType<typeof app>) {
   const { res: reg } = await registerUser(a);
@@ -68,7 +84,11 @@ async function registerAndGetQuestion(a: ReturnType<typeof app>) {
 }
 
 function ownedKey(userId: string): string {
-  return `audio-uploads/${userId}/${randomUUID()}.m4a`;
+  return `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`;
+}
+
+function practiceOwnedKey(userId: string): string {
+  return `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
 }
 
 async function completeDiagnosticInS3Mode(a: ReturnType<typeof app>, token: string, userId: string): Promise<void> {
@@ -142,13 +162,14 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     const res = await request(a)
       .post('/uploads/audio-url')
       .set('Authorization', `Bearer ${token}`)
-      .send({ contentType: ' AUDIO/MP4 ' });
+      .send({ contentType: ' AUDIO/MP4 ', assessmentEndpoint: '/diagnostic/answer' });
 
     expect(res.status).toBe(200);
     expect(res.headers['cache-control']).toBe('no-store');
     expect(res.body.mode).toBe('s3');
+    expect(res.body.assessmentEndpoint).toBe('/diagnostic/answer');
     expect(res.body.uploadUrl).toBe('https://test-audio-bucket.s3.us-east-1.amazonaws.com/presigned-post');
-    expect(res.body.audioKey).toMatch(new RegExp(`^audio-uploads/${userId}/[0-9a-f-]{36}\\.m4a$`));
+    expect(res.body.audioKey).toMatch(new RegExp(`^audio-uploads/diagnostic/${userId}/[0-9a-f-]{36}\\.m4a$`));
     expect(res.body.contentType).toBe('audio/mp4');
     expect(res.body.expiresIn).toBe(config.s3.uploadUrlTtlSeconds);
     expect(res.body.maxBytes).toBe(25 * 1024 * 1024);
@@ -169,7 +190,7 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
       Expires: number;
     };
     expect(postOptions).toMatchObject({
-      Bucket: config.s3.bucket,
+      Bucket: config.s3.diagnostic.bucket,
       Key: res.body.audioKey,
       Fields: { 'Content-Type': 'audio/mp4' },
       Expires: config.s3.uploadUrlTtlSeconds,
@@ -177,7 +198,26 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     expect(postOptions.Conditions).toContainEqual(['eq', '$Content-Type', 'audio/mp4']);
     expect(postOptions.Conditions).toContainEqual(['content-length-range', 1, 25 * 1024 * 1024]);
     expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
-    expect(s3ClientConstructorMock).toHaveBeenCalledWith({ region: config.s3.region });
+    expect(s3ClientConstructorMock).toHaveBeenCalledWith({ region: config.s3.diagnostic.region });
+  });
+
+  it('routes native-practice grants to the practice bucket and scope', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const userId = registration.body.user.id as string;
+    const response = await request(a)
+      .post('/uploads/audio-url')
+      .set('Authorization', `Bearer ${registration.body.token as string}`)
+      .send({ contentType: 'audio/mp4', assessmentEndpoint: '/practice/attempt/native' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.assessmentEndpoint).toBe('/practice/attempt/native');
+    expect(response.body.audioKey).toMatch(new RegExp(`^audio-uploads/practice/${userId}/[0-9a-f-]{36}\\.m4a$`));
+    expect(createPresignedPostMock.mock.calls[0][1]).toMatchObject({
+      Bucket: config.s3.practice.bucket,
+      Key: response.body.audioKey,
+    });
+    expect(s3ClientConstructorMock).toHaveBeenCalledWith({ region: config.s3.practice.region });
   });
 
   it('maps presigned-grant provider failures to the stable retryable storage contract', async () => {
@@ -192,7 +232,7 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
       const response = await request(a)
         .post('/uploads/audio-url')
         .set('Authorization', `Bearer ${registration.body.token as string}`)
-        .send({ contentType: 'audio/mp4' });
+        .send({ contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' });
 
       expect(response.status).toBe(502);
       expect(response.body).toEqual({
@@ -224,13 +264,13 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
           await request(a)
             .post('/uploads/audio-url')
             .set('Authorization', `Bearer ${firstToken}`)
-            .send({ contentType: 'audio/mp4' })
+            .send({ contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' })
         ).status,
       ).toBe(200);
       const limited = await request(a)
         .post('/uploads/audio-url')
         .set('Authorization', `Bearer ${firstToken}`)
-        .send({ contentType: 'audio/mp4' });
+        .send({ contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' });
       expect(limited.status).toBe(429);
       expect(limited.headers['cache-control']).toBe('no-store');
       expect(limited.body).toEqual({
@@ -243,7 +283,7 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
           await request(a)
             .post('/uploads/audio-url')
             .set('Authorization', `Bearer ${secondToken}`)
-            .send({ contentType: 'audio/mp4' })
+            .send({ contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' })
         ).status,
       ).toBe(200);
     } finally {
@@ -517,7 +557,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     expect(sendMock).toHaveBeenCalledOnce();
     expect(sendMock.mock.calls[0][0]).toEqual({
       kind: 'delete',
-      input: { Bucket: config.s3.bucket, Key: audioKey },
+      input: { Bucket: config.s3.diagnostic.bucket, Key: audioKey },
     });
     expect((sendMock.mock.calls[0][1] as { abortSignal: AbortSignal }).abortSignal).toBeInstanceOf(AbortSignal);
 
@@ -708,7 +748,7 @@ describe('S3 object download boundaries', () => {
       expect(file.path).toBeTruthy();
       expect(sendMock.mock.calls[0][0]).toEqual({
         kind: 'get',
-        input: { Bucket: config.s3.bucket, Key: req.body.audioKey },
+        input: { Bucket: config.s3.diagnostic.bucket, Key: req.body.audioKey },
       });
       expect(observedSignal).toBeInstanceOf(AbortSignal);
       expect(createWriteStream).toHaveBeenCalledWith(file.path, { flags: 'wx', mode: 0o600 });
@@ -730,8 +770,8 @@ describe('S3 object download boundaries', () => {
   });
 
   it('returns the stable configuration error if a valid key is resolved without a bucket', async () => {
-    const previousBucket = config.s3.bucket;
-    config.s3.bucket = '';
+    const previousBucket = config.s3.diagnostic.bucket;
+    config.s3.diagnostic.bucket = '';
 
     try {
       await expect(
@@ -739,7 +779,7 @@ describe('S3 object download boundaries', () => {
       ).rejects.toMatchObject({ status: 503, message: 'Audio storage is not configured' });
       expect(sendMock).not.toHaveBeenCalled();
     } finally {
-      config.s3.bucket = previousBucket;
+      config.s3.diagnostic.bucket = previousBucket;
     }
   });
 
@@ -1823,6 +1863,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
 });
 
 describe('POST /practice/attempt (S3 mode)', () => {
+  const ownedKey = practiceOwnedKey;
   it('never schedules deletion for read routes carrying an owned audioKey body', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
@@ -1849,6 +1890,27 @@ describe('POST /practice/attempt (S3 mode)', () => {
     // Reads have no submission semantics: no GetObject and no DeleteObject may
     // be scheduled, even after any response-finish finalizer would have run.
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a diagnostic-scoped key on the practice route without touching either bucket', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await pool.query("UPDATE users SET cefr_level = 'A1', diagnostic_completed = true WHERE id = $1", [userId]);
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const diagnosticKey = `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`;
+    sendMock.mockClear();
+
+    const response = await request(a)
+      .post('/practice/attempt')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey: diagnosticKey });
+
+    expect(response.status).toBe(400);
+    expect(response.body.error).toBe('audioKey is missing or invalid');
+    await new Promise<void>((resolve) => setImmediate(resolve));
     expect(sendMock).not.toHaveBeenCalled();
   });
 
@@ -2082,8 +2144,8 @@ describe('POST /practice/attempt (S3 mode)', () => {
         key: command.input.Key,
       }));
       expect(operations).toEqual([
-        { kind: 'get', bucket: config.s3.bucket, key: audioKey },
-        { kind: 'delete', bucket: config.s3.bucket, key: audioKey },
+        { kind: 'get', bucket: config.s3.practice.bucket, key: audioKey },
+        { kind: 'delete', bucket: config.s3.practice.bucket, key: audioKey },
       ]);
     });
   });

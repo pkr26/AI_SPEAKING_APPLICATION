@@ -310,7 +310,10 @@ beforeEach(() => {
   asMock(claimPendingAssessmentRecoveryPost).mockResolvedValue(true);
   asMock(refundPendingAssessmentRecoveryPost).mockResolvedValue(true);
   asMock(resolveAudioFileDescriptor).mockResolvedValue({ name: 'audio.m4a', type: 'audio/mp4' });
-  asMock(apiRequestAudioUpload).mockResolvedValue({ mode: 'direct' });
+  asMock(apiRequestAudioUpload).mockResolvedValue({
+    mode: 'direct',
+    assessmentEndpoint: '/practice/attempt',
+  });
   asMock(apiUploadAudio).mockResolvedValue({ ok: true });
   asMock(apiFetch).mockResolvedValue({ ok: true });
   asMock(apiPostPresignedAudio).mockResolvedValue(undefined);

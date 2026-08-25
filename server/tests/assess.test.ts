@@ -735,7 +735,7 @@ describe('assessNativeComprehension (OpenAI path)', () => {
     expect(abortInFlightAssessments()).toBe(0);
   });
 
-  it('pins whisper to the learner language and grades with the pinned model', async () => {
+  it('omits the unsupported Telugu whisper hint while retaining Telugu grading context', async () => {
     openaiMocks.transcribe.mockResolvedValue({ text: '  నా ఊరి గురించి  ' });
     openaiMocks.parse.mockResolvedValue({
       choices: [
@@ -762,7 +762,7 @@ describe('assessNativeComprehension (OpenAI path)', () => {
 
     const [transcribeArgs] = openaiMocks.transcribe.mock.calls[0];
     expect(transcribeArgs.model).toBe('whisper-1');
-    expect(transcribeArgs.language).toBe('te');
+    expect(Object.hasOwn(transcribeArgs, 'language')).toBe(false);
 
     const [parseArgs] = openaiMocks.parse.mock.calls[0];
     expect(parseArgs.model).toBe('gpt-4o-mini-2024-07-18');
@@ -840,7 +840,9 @@ describe('assessNativeComprehension (OpenAI path)', () => {
 
     await assessNativeComprehension(audioPath, QUESTION, code, userId);
 
-    expect(openaiMocks.transcribe.mock.calls[0][0].language).toBe(code);
+    const [transcribeArgs] = openaiMocks.transcribe.mock.calls[0];
+    expect(Object.hasOwn(transcribeArgs, 'language')).toBe(true);
+    expect(transcribeArgs.language).toBe(code);
     const [parseArgs] = openaiMocks.parse.mock.calls[0];
     const systemMessage = parseArgs.messages.find((m: { role: string }) => m.role === 'system');
     expect(systemMessage.content).toContain(name);

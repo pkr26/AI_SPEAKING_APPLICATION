@@ -5,7 +5,8 @@
 // high limits use distinct PostgreSQL rate-limit namespaces, so this scenario
 // can run immediately after scripts/smoke.mjs without inheriting its counters:
 //
-//   MOCK_AI=true S3_BUCKET= PORT=4100 AI_MAX_CONCURRENCY=10 \
+//   MOCK_AI=true S3_DIAGNOSTIC_BUCKET= S3_PRACTICE_BUCKET= \
+//   PORT=4100 AI_MAX_CONCURRENCY=10 \
 //   RATE_LIMIT_GLOBAL_MAX=100000 RATE_LIMIT_AUTH_MAX=100000 \
 //   RATE_LIMIT_REGISTER_MAX=100000 RATE_LIMIT_ASSESS_MAX=100000 \
 //   ASSESS_DAILY_CAP=100000 ASSESS_GLOBAL_DAILY_CAP=100000 \
@@ -177,13 +178,16 @@ function audioForm(questionId, requestId = randomUUID()) {
   return form;
 }
 
-async function requestDirectUploadGrant(user, name) {
+async function requestDirectUploadGrant(user, name, assessmentEndpoint) {
   const grantResponse = await req('POST', '/uploads/audio-url', {
     token: user.token,
-    json: { contentType: 'audio/mp4' },
+    json: { contentType: 'audio/mp4', assessmentEndpoint },
   });
   expectResponse(`${name} upload grant`, grantResponse, 200);
-  check(`${name} upload grant uses local direct mode`, grantResponse.body?.mode === 'direct');
+  check(
+    `${name} upload grant uses endpoint-bound local direct mode`,
+    grantResponse.body?.mode === 'direct' && grantResponse.body.assessmentEndpoint === assessmentEndpoint,
+  );
 }
 
 const isUuid = (value) =>
@@ -509,7 +513,7 @@ async function main() {
   // Safety gate: in real-AI mode this fixture is rejected before provider
   // work, and no later assessment request is launched. In mock mode the marker
   // below proves that the remaining load is entirely local.
-  await requestDirectUploadGrant(createdUsers[0], 'serial mock-AI safety probe');
+  await requestDirectUploadGrant(createdUsers[0], 'serial mock-AI safety probe', '/diagnostic/answer');
   await submitDiagnosticAnswer(createdUsers[0], 'serial mock-AI safety probe');
   console.log('ok: MOCK_AI safety marker observed before concurrent assessments');
 
@@ -525,7 +529,11 @@ async function main() {
       pending.every((user) => user.diagnosticAttempts < 5),
     );
     await concurrentPhase(`diagnostic upload-grant wave ${wave}`, pending, (user) =>
-      requestDirectUploadGrant(user, `diagnostic user ${user.index + 1} attempt ${user.diagnosticAttempts + 1}`),
+      requestDirectUploadGrant(
+        user,
+        `diagnostic user ${user.index + 1} attempt ${user.diagnosticAttempts + 1}`,
+        '/diagnostic/answer',
+      ),
     );
     await concurrentPhase(`diagnostic assessment wave ${wave}`, pending, (user) =>
       submitDiagnosticAnswer(user, `diagnostic user ${user.index + 1} attempt ${user.diagnosticAttempts + 1}`),
@@ -603,7 +611,7 @@ async function main() {
   });
 
   await concurrentPhase('issue 10 English-practice upload grants', createdUsers, (user) =>
-    requestDirectUploadGrant(user, `English practice user ${user.index + 1}`),
+    requestDirectUploadGrant(user, `English practice user ${user.index + 1}`, '/practice/attempt'),
   );
   await concurrentPhase('submit 10 English practice attempts', createdUsers, async (user) => {
     const attemptResponse = await req('POST', '/practice/attempt', {
@@ -657,7 +665,7 @@ async function main() {
   });
 
   await concurrentPhase('issue 10 native-practice upload grants', createdUsers, (user) =>
-    requestDirectUploadGrant(user, `native practice user ${user.index + 1}`),
+    requestDirectUploadGrant(user, `native practice user ${user.index + 1}`, '/practice/attempt/native'),
   );
   for (const user of createdUsers) {
     user.nativeRequestId = randomUUID();

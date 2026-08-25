@@ -770,8 +770,9 @@ describe('auth: data export', () => {
 
   it('exports user + attempts without password_hash', async () => {
     const { res } = await registerUser(a);
-    const token = res.body.token;
-    const userId = res.body.user.id;
+    expect(res.status).toBe(201);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
     await pool.query(
       `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
@@ -792,25 +793,28 @@ describe('auth: data export', () => {
   it('paginates exports with an account-bound cursor', async () => {
     const first = await registerUser(a);
     const second = await registerUser(a);
+    expect(first.res.status).toBe(201);
+    expect(second.res.status).toBe(201);
+    const firstUserId = first.res.body.user.id as string;
+    const firstToken = first.res.body.token as string;
+    const secondUserId = second.res.body.user.id as string;
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
     for (const transcript of ['first', 'second', 'third']) {
       await pool.query(
         `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
          VALUES ($1, $2, 'practice', 1, $3, 80, true, 'nice')`,
-        [first.res.body.user.id, q.rows[0].id, transcript],
+        [firstUserId, q.rows[0].id, transcript],
       );
     }
 
-    const pageOne = await request(a)
-      .get('/auth/me/data?limit=2')
-      .set('Authorization', `Bearer ${first.res.body.token}`);
+    const pageOne = await request(a).get('/auth/me/data?limit=2').set('Authorization', `Bearer ${firstToken}`);
     expect(pageOne.status).toBe(200);
     expect(pageOne.body.attempts).toHaveLength(2);
     expect(pageOne.body.nextCursor).toBe(pageOne.body.attempts[1].id);
 
     const pageTwo = await request(a)
       .get(`/auth/me/data?limit=2&cursor=${pageOne.body.nextCursor}`)
-      .set('Authorization', `Bearer ${first.res.body.token}`);
+      .set('Authorization', `Bearer ${firstToken}`);
     expect(pageTwo.status).toBe(200);
     expect(pageTwo.body.attempts).toHaveLength(1);
     expect(pageTwo.body.nextCursor).toBeNull();
@@ -820,11 +824,11 @@ describe('auth: data export', () => {
          (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
        VALUES ($1, $2, 'practice', 1, 'foreign', 50, false, 'foreign feedback')
        RETURNING id`,
-      [second.res.body.user.id, q.rows[0].id],
+      [secondUserId, q.rows[0].id],
     );
     const foreignCursor = await request(a)
       .get(`/auth/me/data?cursor=${foreignAttempt.rows[0].id}`)
-      .set('Authorization', `Bearer ${first.res.body.token}`);
+      .set('Authorization', `Bearer ${firstToken}`);
     expect(foreignCursor.status).toBe(400);
     expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor', code: 'VALIDATION_FAILED' });
   });

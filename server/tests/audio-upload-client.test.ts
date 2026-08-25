@@ -24,8 +24,10 @@ vi.mock('@aws-sdk/client-s3', () => {
 });
 
 const managedEnvironment = [
-  'S3_BUCKET',
-  'S3_REGION',
+  'S3_DIAGNOSTIC_BUCKET',
+  'S3_DIAGNOSTIC_REGION',
+  'S3_PRACTICE_BUCKET',
+  'S3_PRACTICE_REGION',
   'S3_ACCESS_KEY_ID',
   'S3_SECRET_ACCESS_KEY',
   'S3_SESSION_TOKEN',
@@ -51,14 +53,19 @@ async function constructClientWith(environment: Record<string, string>) {
   vi.resetModules();
   for (const name of managedEnvironment) delete process.env[name];
   Object.assign(process.env, {
-    S3_BUCKET: 'credential-mode-bucket',
-    S3_REGION: 'eu-west-2',
+    S3_DIAGNOSTIC_BUCKET: 'credential-diagnostic-bucket',
+    S3_DIAGNOSTIC_REGION: 'eu-west-2',
+    S3_PRACTICE_BUCKET: 'credential-practice-bucket',
+    S3_PRACTICE_REGION: 'ap-southeast-2',
+    S3_ACCESS_KEY_ID: '',
+    S3_SECRET_ACCESS_KEY: '',
+    S3_SESSION_TOKEN: '',
     ...environment,
   });
   const { discardPresignedAudio } = await import('../src/audio-upload');
   const userId = randomUUID();
-  await discardPresignedAudio(userId, `audio-uploads/${userId}/${randomUUID()}.m4a`);
-  await discardPresignedAudio(userId, `audio-uploads/${userId}/${randomUUID()}.m4a`);
+  await discardPresignedAudio('diagnostic', userId, `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`);
+  await discardPresignedAudio('diagnostic', userId, `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`);
   expect(sendMock).toHaveBeenCalledTimes(2);
   expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
   return s3ClientConstructorMock.mock.calls[0][0] as Record<string, unknown>;
@@ -68,8 +75,13 @@ async function constructClientAfterCredentialMutation(accessKeyId: string, secre
   vi.resetModules();
   for (const name of managedEnvironment) delete process.env[name];
   Object.assign(process.env, {
-    S3_BUCKET: 'credential-mode-bucket',
-    S3_REGION: 'eu-west-2',
+    S3_DIAGNOSTIC_BUCKET: 'credential-diagnostic-bucket',
+    S3_DIAGNOSTIC_REGION: 'eu-west-2',
+    S3_PRACTICE_BUCKET: 'credential-practice-bucket',
+    S3_PRACTICE_REGION: 'ap-southeast-2',
+    S3_ACCESS_KEY_ID: '',
+    S3_SECRET_ACCESS_KEY: '',
+    S3_SESSION_TOKEN: '',
   });
   const { config } = await import('../src/config');
   config.s3.accessKeyId = accessKeyId;
@@ -77,7 +89,7 @@ async function constructClientAfterCredentialMutation(accessKeyId: string, secre
   const { discardPresignedAudio } = await import('../src/audio-upload');
   const userId = randomUUID();
 
-  await discardPresignedAudio(userId, `audio-uploads/${userId}/${randomUUID()}.m4a`);
+  await discardPresignedAudio('diagnostic', userId, `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`);
   expect(sendMock).toHaveBeenCalledOnce();
   expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
   return s3ClientConstructorMock.mock.calls[0][0] as Record<string, unknown>;
@@ -86,6 +98,30 @@ async function constructClientAfterCredentialMutation(accessKeyId: string, secre
 describe('S3 client credential modes', () => {
   it('uses the configured region and the AWS default provider chain when static credentials are absent', async () => {
     await expect(constructClientWith({})).resolves.toEqual({ region: 'eu-west-2' });
+  });
+
+  it('constructs independent region clients for diagnostic and practice storage', async () => {
+    vi.resetModules();
+    for (const name of managedEnvironment) delete process.env[name];
+    Object.assign(process.env, {
+      S3_DIAGNOSTIC_BUCKET: 'region-diagnostic-bucket',
+      S3_DIAGNOSTIC_REGION: 'eu-west-2',
+      S3_PRACTICE_BUCKET: 'region-practice-bucket',
+      S3_PRACTICE_REGION: 'ap-southeast-2',
+      S3_ACCESS_KEY_ID: '',
+      S3_SECRET_ACCESS_KEY: '',
+      S3_SESSION_TOKEN: '',
+    });
+    const { discardPresignedAudio } = await import('../src/audio-upload');
+    const userId = randomUUID();
+
+    await discardPresignedAudio('diagnostic', userId, `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`);
+    await discardPresignedAudio('practice', userId, `audio-uploads/practice/${userId}/${randomUUID()}.m4a`);
+
+    expect(s3ClientConstructorMock.mock.calls.map(([options]) => options)).toEqual([
+      { region: 'eu-west-2' },
+      { region: 'ap-southeast-2' },
+    ]);
   });
 
   it('uses a complete static access-key pair without inventing a session token', async () => {

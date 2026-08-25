@@ -10,6 +10,7 @@ import {
   createMutationExecutionIdentity,
   createMutationReportProvenance,
   listStableMutationInputFiles,
+  mutationEnvironmentVariableNames,
   mutationProvenancePath,
   writeMutationReportProvenance,
 } from './mutation-provenance.mjs';
@@ -115,6 +116,14 @@ test('stable input discovery covers backend execution inputs and excludes transi
   );
   assert.equal(files.includes('.mutation-campaign.lock'), false);
   assert.equal(files.includes('stryker.catalog.config.json'), false);
+});
+
+test('provenance fingerprints both split S3 destinations and no obsolete single-bucket variables', () => {
+  for (const name of ['S3_DIAGNOSTIC_BUCKET', 'S3_DIAGNOSTIC_REGION', 'S3_PRACTICE_BUCKET', 'S3_PRACTICE_REGION']) {
+    assert.equal(mutationEnvironmentVariableNames.includes(name), true, `missing ${name}`);
+  }
+  assert.equal(mutationEnvironmentVariableNames.includes('S3_BUCKET'), false);
+  assert.equal(mutationEnvironmentVariableNames.includes('S3_REGION'), false);
 });
 
 test('catalog Stryker config uses bounded parallelism and routes reporters into the wrapper staging directory', async () => {

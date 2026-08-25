@@ -170,16 +170,19 @@ src/
 ## Backend contract
 
 JSON, camelCase; `Authorization: Bearer <token>`. Before sending audio, the app
-calls `POST /uploads/audio-url`. Production receives a short-lived,
-size-constrained S3 multipart-POST grant, uploads the native file directly, then
-POSTs `{questionId, requestId, audioKey}` to the assessment endpoint. Local
-development receives `mode: direct` and sends multipart form data with file
-field `audio`. The same UUID `requestId` identifies every retry of one logical
-submission. API and upstream-provider error bodies are never shown directly to
-users. Device-only secure storage records the owner, question, request, upload
-stage, and user-scoped S3 key when applicable, allowing the app to reconcile an
-interrupted handoff through authenticated `GET /assessments/:requestId`; the
-server replay expires after 48 hours.
+calls `POST /uploads/audio-url` with `{contentType,assessmentEndpoint}`.
+Production receives a short-lived, size-constrained S3 multipart-POST grant
+that echoes the endpoint and carries a route-scoped
+`audio-uploads/{diagnostic|practice}/{ownerId}/...` key. The app uploads the
+native file directly, then POSTs `{questionId,requestId,audioKey}` to that exact
+assessment endpoint. Local development receives endpoint-bound `mode: direct`
+and sends multipart form data with file field `audio`. The same UUID
+`requestId` identifies every retry of one logical submission. API and
+upstream-provider error bodies are never shown directly to users. Device-only
+secure storage records the owner, endpoint, question, request, upload stage,
+and scoped S3 key when applicable, allowing the app to reconcile an interrupted
+handoff through authenticated `GET /assessments/:requestId`; the server replay
+expires after 48 hours.
 
 English practice responses report whether the word was mastered (score 75+),
 and silence is returned as an explicit free-retry result. Native-language

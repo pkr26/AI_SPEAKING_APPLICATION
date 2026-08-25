@@ -17,6 +17,27 @@ import { AUDIO_TYPES, MAX_AUDIO_BYTES, submittedAudioFileIsOwned, uploadsDir } f
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
+
+export const ASSESSMENT_ENDPOINTS = ['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const;
+export type AssessmentEndpoint = (typeof ASSESSMENT_ENDPOINTS)[number];
+export type AudioStorageScope = 'diagnostic' | 'practice';
+export const AUDIO_STORAGE_SCOPES = ['diagnostic', 'practice'] as const satisfies readonly AudioStorageScope[];
+
+export function storageScopeForAssessmentEndpoint(endpoint: AssessmentEndpoint): AudioStorageScope {
+  return endpoint === '/diagnostic/answer' ? 'diagnostic' : 'practice';
+}
+
+function storageConfig(scope: AudioStorageScope): { bucket: string; region: string } {
+  return config.s3[scope];
+}
+
+export function s3StorageEnabled(scope: AudioStorageScope): boolean {
+  return storageConfig(scope).bucket.length > 0;
+}
+
+function anyS3StorageEnabled(): boolean {
+  return AUDIO_STORAGE_SCOPES.some(s3StorageEnabled);
+}
 // Errnos the local temp-file write (or its chmod) can raise. Download failures
 // carry bare Node errnos too — a body truncated mid-transfer rejects with
 // ERR_STREAM_PREMATURE_CLOSE/ECONNRESET after the SDK call already resolved,
@@ -38,6 +59,7 @@ function isLocalDiskErrorCode(code: unknown): boolean {
 }
 
 interface SubmittedAudioCleanup {
+  scope: AudioStorageScope;
   userId: string;
   audioKey: string;
   preserve: boolean;
@@ -75,11 +97,11 @@ export function contentTypeToExt(contentType: string): string | undefined {
  * learner can never have the API fetch another learner's object — or an
  * arbitrary bucket object — through the assessment pipeline.
  */
-export function isOwnedAudioKey(userId: string, key: unknown): key is string {
+export function isOwnedAudioKey(scope: AudioStorageScope, userId: string, key: unknown): key is string {
   if (typeof key !== 'string') return false;
   const exts = AUDIO_EXTS.join('|');
   return new RegExp(
-    `^${KEY_PREFIX}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
+    `^${KEY_PREFIX}/${scope}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
     'i',
   ).test(key);
 }
@@ -126,15 +148,16 @@ function releaseUnreadObjectBody(body: unknown): void {
 }
 
 // --- S3 client (module singleton, created on first real use) ----------------
-let s3Client: S3Client | null = null;
+const s3Clients: Partial<Record<AudioStorageScope, S3Client>> = {};
 
-function getS3(): S3Client {
-  if (!config.s3.bucket) {
+function getS3(scope: AudioStorageScope): S3Client {
+  const target = storageConfig(scope);
+  if (!target.bucket) {
     throw new HttpError(503, 'Audio storage is not configured');
   }
-  if (!s3Client) {
-    s3Client = new S3Client({
-      region: config.s3.region,
+  if (!s3Clients[scope]) {
+    s3Clients[scope] = new S3Client({
+      region: target.region,
       // Static keys are a local/dev convenience; in AWS environments the
       // default provider chain (IAM role, shared config) is preferred.
       ...(config.s3.accessKeyId && config.s3.secretAccessKey
@@ -148,12 +171,13 @@ function getS3(): S3Client {
         : {}),
     });
   }
-  return s3Client;
+  return s3Clients[scope];
 }
 
 export function createAudioUploadRouter(limiters: Limiters) {
   const audioUrlBodySchema = z.object({
     contentType: z.string().max(128),
+    assessmentEndpoint: z.enum(ASSESSMENT_ENDPOINTS),
   });
   const router = Router();
   router.use((_req, res, next) => {
@@ -167,27 +191,29 @@ export function createAudioUploadRouter(limiters: Limiters) {
   // multipart mode and tells the client so (production config requires S3).
   router.post(
     '/audio-url',
-    ...(config.s3.bucket ? [limiters.uploadGrant] : []),
+    ...(anyS3StorageEnabled() ? [limiters.uploadGrant] : []),
     validate({ body: audioUrlBodySchema }),
     h(async (req: AuthedRequest, res) => {
-      const { contentType: requestedContentType } = validated(req, audioUrlBodySchema);
+      const { contentType: requestedContentType, assessmentEndpoint } = validated(req, audioUrlBodySchema);
+      const scope = storageScopeForAssessmentEndpoint(assessmentEndpoint);
+      const target = storageConfig(scope);
       const contentType = requestedContentType.trim().toLowerCase();
       const ext = contentTypeToExt(contentType);
       if (!ext) {
         throw new HttpError(415, 'Unsupported audio media type', 'AUDIO_INVALID');
       }
-      if (!config.s3.bucket) {
-        return res.json({ mode: 'direct' });
+      if (!target.bucket) {
+        return res.json({ mode: 'direct', assessmentEndpoint });
       }
-      const key = `${KEY_PREFIX}/${req.user!.id}/${randomUUID()}.${ext}`;
+      const key = `${KEY_PREFIX}/${scope}/${req.user!.id}/${randomUUID()}.${ext}`;
       // A presigned PUT cannot reliably enforce a maximum object length. S3
       // POST policies can, so the storage service itself rejects oversized
       // objects before they can create unbounded storage or download costs.
       let uploadUrl: string;
       let uploadFields: Record<string, string>;
       try {
-        const grant = await createPresignedPost(getS3(), {
-          Bucket: config.s3.bucket,
+        const grant = await createPresignedPost(getS3(scope), {
+          Bucket: target.bucket,
           Key: key,
           Fields: { 'Content-Type': contentType },
           Conditions: [
@@ -204,6 +230,7 @@ export function createAudioUploadRouter(limiters: Limiters) {
       }
       res.json({
         mode: 's3',
+        assessmentEndpoint,
         uploadUrl,
         uploadFields,
         audioKey: key,
@@ -221,13 +248,14 @@ export function createAudioUploadRouter(limiters: Limiters) {
  * Best-effort deletion for a user-owned transient object after a successful
  * fresh owner no longer needs it.
  */
-export async function discardPresignedAudio(userId: string, audioKey: string): Promise<void> {
-  if (!isOwnedAudioKey(userId, audioKey) || !config.s3.bucket) return;
+export async function discardPresignedAudio(scope: AudioStorageScope, userId: string, audioKey: string): Promise<void> {
+  const target = storageConfig(scope);
+  if (!isOwnedAudioKey(scope, userId, audioKey) || !target.bucket) return;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.s3.operationTimeoutMs);
   timer.unref();
   try {
-    await getS3().send(new DeleteObjectCommand({ Bucket: config.s3.bucket, Key: audioKey }), {
+    await getS3(scope).send(new DeleteObjectCommand({ Bucket: target.bucket, Key: audioKey }), {
       abortSignal: controller.signal,
     });
   } catch (err) {
@@ -282,7 +310,7 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
       warnAudioCleanup({ err, userId: cleanup.userId }, 'failed to verify S3 audio cleanup ownership');
       return;
     }
-    await discardPresignedAudio(cleanup.userId, cleanup.audioKey);
+    await discardPresignedAudio(cleanup.scope, cleanup.userId, cleanup.audioKey);
   })();
   return cleanup.finalizing;
 }
@@ -295,34 +323,39 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
  * race a newly rebound request. That makes
  * malformed and pre-route requests safe without a racy ownership lookup.
  */
-export const discardSubmittedPresignedAudio: RequestHandler = (rawReq, res, next) => {
-  const req = rawReq as AuthedRequest;
-  const body = req.body as { audioKey?: unknown } | undefined;
-  if (!body || !req.user) {
-    return next();
-  }
-  const audioKey = body.audioKey;
-  if (!isOwnedAudioKey(req.user.id, audioKey)) {
-    return next();
-  }
+export function discardSubmittedPresignedAudio(scope: AudioStorageScope): RequestHandler {
+  return (rawReq, res, next) => {
+    const req = rawReq as AuthedRequest;
+    const body = req.body as { audioKey?: unknown } | undefined;
+    if (!body || !req.user) {
+      return next();
+    }
+    const audioKey = body.audioKey;
+    if (!isOwnedAudioKey(scope, req.user.id, audioKey)) {
+      return next();
+    }
 
-  (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP] = {
-    userId: req.user.id,
-    audioKey,
-    preserve: true,
+    (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP] = {
+      scope,
+      userId: req.user.id,
+      audioKey,
+      preserve: true,
+    };
+    // Finalize on a microtask so every synchronous finish listener observes
+    // the completed response first. An error after a client abort
+    // intentionally retains the object (no `finish` fires); the bucket
+    // lifecycle bounds it.
+    res.once('finish', () => queueMicrotask(() => void finalizeSubmittedPresignedAudio(res)));
+    // `close` can precede route/claim resolution when a client disconnects.
+    // In that case retain the object for the active worker and let the
+    // mandatory S3 lifecycle rule collect any orphan; a normal post-finish
+    // close is harmless.
+    res.once('close', () => {
+      if (res.writableFinished) void finalizeSubmittedPresignedAudio(res);
+    });
+    return next();
   };
-  // Finalize on a microtask so every synchronous finish listener observes the
-  // completed response first. An error after a client abort intentionally
-  // retains the object (no `finish` fires); the bucket lifecycle bounds it.
-  res.once('finish', () => queueMicrotask(() => void finalizeSubmittedPresignedAudio(res)));
-  // `close` can precede route/claim resolution when a client disconnects. In
-  // that case retain the object for the active worker and let the mandatory S3
-  // lifecycle rule collect any orphan; a normal post-finish close is harmless.
-  res.once('close', () => {
-    if (res.writableFinished) void finalizeSubmittedPresignedAudio(res);
-  });
-  return next();
-};
+}
 
 /**
  * The slice of an uploaded audio file the assessment pipeline consumes.
@@ -343,9 +376,13 @@ export interface SubmittedAudioFile {
  * registered before validation discards the S3 object when the response
  * finishes.
  */
-export async function resolvePresignedAudio(authed: AuthedRequest, res: Response): Promise<SubmittedAudioFile> {
+export async function resolvePresignedAudio(
+  scope: AudioStorageScope,
+  authed: AuthedRequest,
+  res: Response,
+): Promise<SubmittedAudioFile> {
   const audioKey = (authed.body as { audioKey?: string }).audioKey;
-  if (!audioKey || !isOwnedAudioKey(authed.user!.id, audioKey)) {
+  if (!audioKey || !isOwnedAudioKey(scope, authed.user!.id, audioKey)) {
     throw new HttpError(400, 'audioKey is missing or invalid');
   }
 
@@ -368,7 +405,8 @@ export async function resolvePresignedAudio(authed: AuthedRequest, res: Response
   });
 
   try {
-    const object = await getS3().send(new GetObjectCommand({ Bucket: config.s3.bucket, Key: audioKey }), {
+    const target = storageConfig(scope);
+    const object = await getS3(scope).send(new GetObjectCommand({ Bucket: target.bucket, Key: audioKey }), {
       abortSignal: controller.signal,
     });
     if (!object.Body) throw new HttpError(400, 'audio upload not found or expired', 'AUDIO_UPLOAD_MISSING');

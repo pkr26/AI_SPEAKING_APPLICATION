@@ -168,14 +168,21 @@ ok(
 );
 
 // ---------- diagnostic ----------
-// Audio upload grant: without S3_BUCKET the API runs in local multipart mode.
-r = await req('POST', '/uploads/audio-url', { token, json: { contentType: 'audio/mp4' } });
+// Audio upload grant: without the split S3 buckets the API runs in local
+// multipart mode while still echoing the route-bound assessment endpoint.
+r = await req('POST', '/uploads/audio-url', {
+  token,
+  json: { contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' },
+});
 ok(
-  'uploads/audio-url returns direct mode without S3_BUCKET',
-  r.status === 200 && r.body.mode === 'direct',
+  'uploads/audio-url returns endpoint-bound direct mode without split S3 buckets',
+  r.status === 200 && r.body.mode === 'direct' && r.body.assessmentEndpoint === '/diagnostic/answer',
   JSON.stringify(r.body),
 );
-r = await req('POST', '/uploads/audio-url', { token, json: { contentType: 'text/plain' } });
+r = await req('POST', '/uploads/audio-url', {
+  token,
+  json: { contentType: 'text/plain', assessmentEndpoint: '/diagnostic/answer' },
+});
 ok('uploads/audio-url rejects non-audio content type with 415', r.status === 415, JSON.stringify(r.body));
 
 r = await req('POST', '/diagnostic/restart', { token, json: { confirm: true } });

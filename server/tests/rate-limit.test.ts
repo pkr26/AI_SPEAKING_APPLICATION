@@ -1580,8 +1580,10 @@ describe('assessment reservation after client disconnect', () => {
     transportFailed?: boolean;
     emitCloseDuringAssessment?: boolean;
   }) {
+    const practiceBucket = config.s3.practice.bucket;
+    config.s3.practice.bucket = '';
     const limiters = buildLimiters();
-    const chain = buildAssessmentSubmissionChain(limiters);
+    const chain = buildAssessmentSubmissionChain(limiters, 'practice');
     const respend = vi.fn();
     const { rows: userRows } = await pool.query<UserRow>(
       `INSERT INTO users (name, email, password_hash, native_language)
@@ -1632,6 +1634,7 @@ describe('assessment reservation after client disconnect', () => {
       );
 
       await runAssessmentSubmission<{ claimId: string }, { ok: boolean }>(req, res as never, {
+        storageScope: chain.storageScope,
         context: 'practice',
         bodySchema: chain.bodySchema,
         respendAssessmentBudget: respend,
@@ -1650,6 +1653,7 @@ describe('assessment reservation after client disconnect', () => {
         clearClaim: async () => {},
       });
     } finally {
+      config.s3.practice.bucket = practiceBucket;
       // The in-flight idempotency claim row cascades away with the user.
       await pool.query('DELETE FROM users WHERE id = $1', [user.id]);
     }

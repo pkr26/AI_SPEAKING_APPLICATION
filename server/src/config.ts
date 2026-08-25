@@ -221,10 +221,12 @@ const envSchema = z
     RATE_LIMIT_UPLOAD_GRANT_MAX: z.coerce.number().int().min(1).max(100_000).default(40),
     MOCK_AI: bool,
     OPENAI_API_KEY: z.string().default(''),
-    // Audio ingress: empty S3_BUCKET keeps the local multipart-to-disk flow for
-    // dev/test; production must store uploads in S3 via presigned POST grants.
-    S3_BUCKET: z.string().trim().default(''),
-    S3_REGION: z.string().trim().min(1).default('us-east-1'),
+    // Audio ingress: both buckets empty keeps the local multipart-to-disk flow
+    // for dev/test. Production separates placement audio from practice audio.
+    S3_DIAGNOSTIC_BUCKET: z.string().trim().default(''),
+    S3_DIAGNOSTIC_REGION: z.string().trim().min(1).default('us-east-1'),
+    S3_PRACTICE_BUCKET: z.string().trim().default(''),
+    S3_PRACTICE_REGION: z.string().trim().min(1).default('us-east-1'),
     // Optional static credentials; when empty the AWS default provider chain
     // (instance/task IAM role, shared config) is used instead.
     S3_ACCESS_KEY_ID: z.string().trim().max(256).default(''),
@@ -317,11 +319,27 @@ const envSchema = z
         message: 'must have at least 10 distinct characters in production; use a randomly generated secret',
       });
     }
-    if (env.NODE_ENV === 'production' && !env.S3_BUCKET) {
+    const hasDiagnosticBucket = env.S3_DIAGNOSTIC_BUCKET.length > 0;
+    const hasPracticeBucket = env.S3_PRACTICE_BUCKET.length > 0;
+    if (hasDiagnosticBucket !== hasPracticeBucket) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['S3_BUCKET'],
-        message: 'is required in production; learner audio must use size-constrained S3 presigned POST grants',
+        path: [hasDiagnosticBucket ? 'S3_PRACTICE_BUCKET' : 'S3_DIAGNOSTIC_BUCKET'],
+        message: 'diagnostic and practice S3 buckets must either both be set or both be empty',
+      });
+    }
+    if (env.NODE_ENV === 'production' && !(hasDiagnosticBucket && hasPracticeBucket)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['S3_DIAGNOSTIC_BUCKET'],
+        message: 'both diagnostic and practice S3 buckets are required in production',
+      });
+    }
+    if (hasDiagnosticBucket && env.S3_DIAGNOSTIC_BUCKET === env.S3_PRACTICE_BUCKET) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['S3_PRACTICE_BUCKET'],
+        message: 'must be different from S3_DIAGNOSTIC_BUCKET',
       });
     }
     const hasS3AccessKey = env.S3_ACCESS_KEY_ID.length > 0;
@@ -340,11 +358,11 @@ const envSchema = z
         message: 'requires both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY',
       });
     }
-    if (!env.S3_BUCKET && (hasS3AccessKey || hasS3SecretKey || env.S3_SESSION_TOKEN)) {
+    if (!(hasDiagnosticBucket && hasPracticeBucket) && (hasS3AccessKey || hasS3SecretKey || env.S3_SESSION_TOKEN)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
-        path: ['S3_BUCKET'],
-        message: 'is required when static S3 credentials are configured',
+        path: ['S3_DIAGNOSTIC_BUCKET'],
+        message: 'both S3 buckets are required when static S3 credentials are configured',
       });
     }
     if (env.ASSESS_GLOBAL_DAILY_CAP < env.ASSESS_DAILY_CAP) {
@@ -437,8 +455,14 @@ export const config = {
   mockAi: env.MOCK_AI,
   openaiApiKey: env.OPENAI_API_KEY,
   s3: {
-    bucket: env.S3_BUCKET,
-    region: env.S3_REGION,
+    diagnostic: {
+      bucket: env.S3_DIAGNOSTIC_BUCKET,
+      region: env.S3_DIAGNOSTIC_REGION,
+    },
+    practice: {
+      bucket: env.S3_PRACTICE_BUCKET,
+      region: env.S3_PRACTICE_REGION,
+    },
     accessKeyId: env.S3_ACCESS_KEY_ID,
     secretAccessKey: env.S3_SECRET_ACCESS_KEY,
     sessionToken: env.S3_SESSION_TOKEN,

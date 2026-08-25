@@ -54,8 +54,10 @@ const MANAGED_KEYS = [
   'RATE_LIMIT_UPLOAD_GRANT_MAX',
   'MOCK_AI',
   'OPENAI_API_KEY',
-  'S3_BUCKET',
-  'S3_REGION',
+  'S3_DIAGNOSTIC_BUCKET',
+  'S3_DIAGNOSTIC_REGION',
+  'S3_PRACTICE_BUCKET',
+  'S3_PRACTICE_REGION',
   'S3_ACCESS_KEY_ID',
   'S3_SECRET_ACCESS_KEY',
   'S3_SESSION_TOKEN',
@@ -64,6 +66,10 @@ const MANAGED_KEYS = [
 ];
 
 const VALID_SECRET = 'a-realistic-signing-secret-with-32-plus-characters';
+const TEST_S3_BUCKETS = {
+  S3_DIAGNOSTIC_BUCKET: 'diagnostic-audio-bucket',
+  S3_PRACTICE_BUCKET: 'practice-audio-bucket',
+} as const;
 
 // Production boots only with real mail delivery configured (F-5 guard).
 const PRODUCTION_MAIL = {
@@ -127,6 +133,20 @@ async function expectSingleInvalidIssue(env: Record<string, string>, path: strin
   expect(errorSpy).toHaveBeenCalledWith(`Invalid environment configuration:\n  - ${path}: ${message}`);
 }
 
+async function expectInvalidIssues(
+  env: Record<string, string>,
+  issues: ReadonlyArray<{ path: string; message: string }>,
+) {
+  exitSpy.mockClear();
+  errorSpy.mockClear();
+  await expect(loadConfig(env)).rejects.toThrow('process.exit called');
+  expect(exitSpy).toHaveBeenCalledWith(1);
+  expect(errorSpy).toHaveBeenCalledOnce();
+  expect(errorSpy).toHaveBeenCalledWith(
+    `Invalid environment configuration:\n${issues.map(({ path, message }) => `  - ${path}: ${message}`).join('\n')}`,
+  );
+}
+
 describe('config env validation', () => {
   it('applies documented defaults when optional variables are absent', async () => {
     const config = await loadConfig(baseEnv({}));
@@ -173,8 +193,8 @@ describe('config env validation', () => {
     expect(config.mockAi).toBe(true);
     expect(config.openaiApiKey).toBe('');
     expect(config.s3).toEqual({
-      bucket: '',
-      region: 'us-east-1',
+      diagnostic: { bucket: '', region: 'us-east-1' },
+      practice: { bucket: '', region: 'us-east-1' },
       accessKeyId: '',
       secretAccessKey: '',
       sessionToken: '',
@@ -212,7 +232,8 @@ describe('config env validation', () => {
         RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS: '120000',
         RATE_LIMIT_UPLOAD_GRANT_MAX: '8',
         CORS_ORIGINS: ' https://a.example ,,https://b.example ',
-        S3_REGION: ' eu-west-2 ',
+        S3_DIAGNOSTIC_REGION: ' eu-west-2 ',
+        S3_PRACTICE_REGION: ' ap-southeast-2 ',
         S3_UPLOAD_URL_TTL_SECONDS: '120',
         S3_OPERATION_TIMEOUT_MS: '4000',
         LOG_LEVEL: 'warn',
@@ -235,7 +256,8 @@ describe('config env validation', () => {
     expect(config.corsOrigins).toEqual(['https://a.example', 'https://b.example']);
     expect(config.s3.uploadUrlTtlSeconds).toBe(120);
     expect(config.s3.operationTimeoutMs).toBe(4000);
-    expect(config.s3.region).toBe('eu-west-2');
+    expect(config.s3.diagnostic.region).toBe('eu-west-2');
+    expect(config.s3.practice.region).toBe('ap-southeast-2');
     expect(config.logLevel).toBe('warn');
   });
 
@@ -344,7 +366,7 @@ describe('config env validation', () => {
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
         JWT_SECRET: 'this-is-a-test-secret-with-enough-length',
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         ...PRODUCTION_MAIL,
       }),
       'looks like a placeholder',
@@ -354,10 +376,11 @@ describe('config env validation', () => {
         NODE_ENV: 'production',
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
-        S3_BUCKET: '',
+        S3_DIAGNOSTIC_BUCKET: '',
+        S3_PRACTICE_BUCKET: '',
         ...PRODUCTION_MAIL,
       }),
-      'S3_BUCKET',
+      'S3_DIAGNOSTIC_BUCKET',
     );
     await expectInvalid(
       baseEnv({
@@ -365,7 +388,7 @@ describe('config env validation', () => {
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
         JWT_SECRET: 'this is a test secret with enough length',
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         ...PRODUCTION_MAIL,
       }),
       'looks like a placeholder',
@@ -375,13 +398,14 @@ describe('config env validation', () => {
         NODE_ENV: 'production',
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
         ...PRODUCTION_MAIL,
       }),
     );
     expect(prod.isProduction).toBe(true);
-    expect(prod.s3.bucket).toBe('audio-bucket');
+    expect(prod.s3.diagnostic.bucket).toBe('diagnostic-audio-bucket');
+    expect(prod.s3.practice.bucket).toBe('practice-audio-bucket');
   });
 
   it('requires a structured database URL and verified TLS in production', async () => {
@@ -400,7 +424,7 @@ describe('config env validation', () => {
         NODE_ENV: 'production',
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=require',
         ...PRODUCTION_MAIL,
       }),
@@ -422,7 +446,7 @@ describe('config env validation', () => {
         MOCK_AI: 'false',
         OPENAI_API_KEY: 'sk-real',
         JWT_SECRET: 'prefix-testsecret-suffix-with-enough-length',
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
         ...PRODUCTION_MAIL,
       }),
@@ -435,7 +459,7 @@ describe('config env validation', () => {
       NODE_ENV: 'production',
       MOCK_AI: 'false',
       OPENAI_API_KEY: 'sk-real',
-      S3_BUCKET: 'audio-bucket',
+      ...TEST_S3_BUCKETS,
       DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
       ...PRODUCTION_MAIL,
     };
@@ -468,39 +492,106 @@ describe('config env validation', () => {
 
   it('requires complete, nonblank static S3 credentials and supports a session token', async () => {
     await expectInvalid(
-      baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access-only' }),
+      baseEnv({ ...TEST_S3_BUCKETS, S3_ACCESS_KEY_ID: 'access-only' }),
       'must either both be set or both be empty',
     );
     await expectInvalid(
-      baseEnv({ S3_BUCKET: 'audio-bucket', S3_SECRET_ACCESS_KEY: 'secret-only' }),
+      baseEnv({ ...TEST_S3_BUCKETS, S3_SECRET_ACCESS_KEY: 'secret-only' }),
       'must either both be set or both be empty',
     );
     await expectInvalid(
       baseEnv({
-        S3_BUCKET: 'audio-bucket',
+        ...TEST_S3_BUCKETS,
         S3_ACCESS_KEY_ID: '   ',
         S3_SECRET_ACCESS_KEY: 'secret-only',
       }),
       'must either both be set or both be empty',
     );
     await expectInvalid(baseEnv({ S3_SESSION_TOKEN: 'token-only' }), 'requires both');
-    await expectInvalid(baseEnv({ S3_ACCESS_KEY_ID: 'access-only' }), 'S3_BUCKET');
-    await expectInvalid(baseEnv({ S3_ACCESS_KEY_ID: 'access', S3_SECRET_ACCESS_KEY: 'secret' }), 'S3_BUCKET');
+    await expectInvalid(baseEnv({ S3_ACCESS_KEY_ID: 'access-only' }), 'S3_DIAGNOSTIC_BUCKET');
+    await expectInvalid(
+      baseEnv({ S3_ACCESS_KEY_ID: 'access', S3_SECRET_ACCESS_KEY: 'secret' }),
+      'S3_DIAGNOSTIC_BUCKET',
+    );
 
     const config = await loadConfig(
       baseEnv({
-        S3_BUCKET: ' audio-bucket ',
+        S3_DIAGNOSTIC_BUCKET: ' diagnostic-audio-bucket ',
+        S3_PRACTICE_BUCKET: ' practice-audio-bucket ',
         S3_ACCESS_KEY_ID: ' access ',
         S3_SECRET_ACCESS_KEY: ' secret ',
         S3_SESSION_TOKEN: ' session ',
       }),
     );
     expect(config.s3).toMatchObject({
-      bucket: 'audio-bucket',
+      diagnostic: { bucket: 'diagnostic-audio-bucket' },
+      practice: { bucket: 'practice-audio-bucket' },
       accessKeyId: 'access',
       secretAccessKey: 'secret',
       sessionToken: 'session',
     });
+  });
+
+  it('requires diagnostic and practice buckets together and keeps them distinct', async () => {
+    const pairedBucketMessage = 'diagnostic and practice S3 buckets must either both be set or both be empty';
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_DIAGNOSTIC_BUCKET: 'diagnostic-only' }),
+      'S3_PRACTICE_BUCKET',
+      pairedBucketMessage,
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_PRACTICE_BUCKET: 'practice-only' }),
+      'S3_DIAGNOSTIC_BUCKET',
+      pairedBucketMessage,
+    );
+    await expectSingleInvalidIssue(
+      baseEnv({ S3_DIAGNOSTIC_BUCKET: 'same-bucket', S3_PRACTICE_BUCKET: 'same-bucket' }),
+      'S3_PRACTICE_BUCKET',
+      'must be different from S3_DIAGNOSTIC_BUCKET',
+    );
+  });
+
+  it('reports both paired-bucket and production requirements for a partial production configuration', async () => {
+    await expectInvalidIssues(
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+        S3_DIAGNOSTIC_BUCKET: 'diagnostic-only',
+        ...PRODUCTION_MAIL,
+      }),
+      [
+        {
+          path: 'S3_PRACTICE_BUCKET',
+          message: 'diagnostic and practice S3 buckets must either both be set or both be empty',
+        },
+        {
+          path: 'S3_DIAGNOSTIC_BUCKET',
+          message: 'both diagnostic and practice S3 buckets are required in production',
+        },
+      ],
+    );
+  });
+
+  it('reports both paired-bucket and credential requirements for a partial static S3 configuration', async () => {
+    await expectInvalidIssues(
+      baseEnv({
+        S3_DIAGNOSTIC_BUCKET: 'diagnostic-only',
+        S3_ACCESS_KEY_ID: 'access',
+        S3_SECRET_ACCESS_KEY: 'secret',
+      }),
+      [
+        {
+          path: 'S3_PRACTICE_BUCKET',
+          message: 'diagnostic and practice S3 buckets must either both be set or both be empty',
+        },
+        {
+          path: 'S3_DIAGNOSTIC_BUCKET',
+          message: 'both S3 buckets are required when static S3 credentials are configured',
+        },
+      ],
+    );
   });
 
   it('rejects ASSESS_GLOBAL_DAILY_CAP below ASSESS_DAILY_CAP', async () => {
@@ -600,7 +691,7 @@ describe('config env validation', () => {
       NODE_ENV: 'production',
       MOCK_AI: 'false',
       OPENAI_API_KEY: 'sk-real',
-      S3_BUCKET: 'audio-bucket',
+      ...TEST_S3_BUCKETS,
       DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
     };
 
@@ -698,7 +789,7 @@ describe('config env validation', () => {
       NODE_ENV: 'production',
       MOCK_AI: 'false',
       OPENAI_API_KEY: 'sk-real',
-      S3_BUCKET: 'audio-bucket',
+      ...TEST_S3_BUCKETS,
       DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
       ...PRODUCTION_MAIL,
     };
@@ -724,24 +815,24 @@ describe('config env validation', () => {
       'looks like a placeholder and is not allowed in production',
     );
     await expectSingleInvalidIssue(
-      baseEnv({ ...validProduction, S3_BUCKET: '' }),
-      'S3_BUCKET',
-      'is required in production; learner audio must use size-constrained S3 presigned POST grants',
+      baseEnv({ ...validProduction, S3_DIAGNOSTIC_BUCKET: '', S3_PRACTICE_BUCKET: '' }),
+      'S3_DIAGNOSTIC_BUCKET',
+      'both diagnostic and practice S3 buckets are required in production',
     );
     await expectSingleInvalidIssue(
-      baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access-only' }),
+      baseEnv({ ...TEST_S3_BUCKETS, S3_ACCESS_KEY_ID: 'access-only' }),
       'S3_ACCESS_KEY_ID',
       'and S3_SECRET_ACCESS_KEY must either both be set or both be empty',
     );
     await expectSingleInvalidIssue(
-      baseEnv({ S3_BUCKET: 'audio-bucket', S3_SESSION_TOKEN: 'session-only' }),
+      baseEnv({ ...TEST_S3_BUCKETS, S3_SESSION_TOKEN: 'session-only' }),
       'S3_SESSION_TOKEN',
       'requires both S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY',
     );
     await expectSingleInvalidIssue(
       baseEnv({ S3_ACCESS_KEY_ID: 'access', S3_SECRET_ACCESS_KEY: 'secret' }),
-      'S3_BUCKET',
-      'is required when static S3 credentials are configured',
+      'S3_DIAGNOSTIC_BUCKET',
+      'both S3 buckets are required when static S3 credentials are configured',
     );
     await expectSingleInvalidIssue(
       baseEnv({ ASSESS_DAILY_CAP: '10', ASSESS_GLOBAL_DAILY_CAP: '9' }),
@@ -759,7 +850,7 @@ describe('config env validation', () => {
     exitSpy.mockClear();
     errorSpy.mockClear();
     await expect(
-      loadConfig(baseEnv({ S3_BUCKET: 'audio-bucket', S3_ACCESS_KEY_ID: 'access', S3_SESSION_TOKEN: 'token' })),
+      loadConfig(baseEnv({ ...TEST_S3_BUCKETS, S3_ACCESS_KEY_ID: 'access', S3_SESSION_TOKEN: 'token' })),
     ).rejects.toThrow('process.exit called');
     expect(errorSpy).toHaveBeenCalledOnce();
     expect(errorSpy).toHaveBeenCalledWith(

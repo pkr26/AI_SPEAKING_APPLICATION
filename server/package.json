@@ -16,6 +16,7 @@
     "build": "tsc -p tsconfig.json && node scripts/copy-db-assets.mjs",
     "start": "node dist/src/index.js",
     "smoke": "node scripts/smoke.mjs",
+    "smoke:s3": "node scripts/live-s3-smoke.mjs",
     "smoke:concurrent": "node scripts/concurrent-smoke.mjs",
     "smoke:load1000": "node scripts/load-1000.mjs",
     "verify:load1000": "node scripts/verify-1000.mjs",

@@ -349,8 +349,14 @@ describe('practice', () => {
 
   it('maps malformed multipart framing to 400 instead of 500', async () => {
     const { res } = await registerUser(a);
-    const token = res.body.token;
-    await completeDiagnostic(a, token);
+    expect(res.status).toBe(201);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const completed = await pool.query(
+      "UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1",
+      [userId],
+    );
+    expect(completed.rowCount).toBe(1);
     const before = (await fs.readdir(uploadsDir)).sort();
 
     const postRaw = (contentType: string, body: string | Buffer) =>
@@ -362,7 +368,7 @@ describe('practice', () => {
 
     // A multipart content type without a boundary parameter.
     const noBoundary = await postRaw('multipart/form-data', 'garbage');
-    expect(noBoundary.status).toBe(400);
+    expect(noBoundary.status, JSON.stringify(noBoundary.body)).toBe(400);
     expect(noBoundary.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     // A form that opens a part but never sends the closing boundary.
@@ -370,7 +376,7 @@ describe('practice', () => {
       'multipart/form-data; boundary=abc',
       '--abc\r\nContent-Disposition: form-data; name="questionId"\r\n\r\n9f1badb5',
     );
-    expect(truncated.status).toBe(400);
+    expect(truncated.status, JSON.stringify(truncated.body)).toBe(400);
     expect(truncated.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     // A NUL byte inside the file part's filename header.
@@ -384,7 +390,7 @@ describe('practice', () => {
         Buffer.from('\r\n--abc--\r\n', 'utf8'),
       ]),
     );
-    expect(nulFilename.status).toBe(400);
+    expect(nulFilename.status, JSON.stringify(nulFilename.body)).toBe(400);
     expect(nulFilename.body).toEqual({ error: 'Malformed multipart body', code: 'VALIDATION_FAILED' });
 
     expect((await fs.readdir(uploadsDir)).sort()).toEqual(before);

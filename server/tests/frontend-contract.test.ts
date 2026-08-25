@@ -145,7 +145,7 @@ describe('real API responses satisfy the mobile app parsers', () => {
     const grant = await request(a)
       .post('/uploads/audio-url')
       .set(bearer(user.token))
-      .send({ contentType: 'audio/mp4' });
+      .send({ contentType: 'audio/mp4', assessmentEndpoint: '/diagnostic/answer' });
     expect(grant.status).toBe(200);
     expect(() => frontend.parseAudioUploadGrant(grant.body)).not.toThrow();
 

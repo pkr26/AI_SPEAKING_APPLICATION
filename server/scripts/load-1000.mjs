@@ -25,7 +25,8 @@
 //
 // Start the server first, e.g.:
 //   PORT=4100 DATABASE_URL=postgres://localhost:5432/ai_english_load1000 \
-//   MOCK_AI=true S3_BUCKET= LOG_LEVEL=warn DB_POOL_MAX=100 UV_THREADPOOL_SIZE=16 \
+//   MOCK_AI=true S3_DIAGNOSTIC_BUCKET= S3_PRACTICE_BUCKET= LOG_LEVEL=warn \
+//   DB_POOL_MAX=100 UV_THREADPOOL_SIZE=16 \
 //   RATE_LIMIT_GLOBAL_MAX=50000000 RATE_LIMIT_AUTH_MAX=10000000 \
 //   RATE_LIMIT_LOGIN_ACCOUNT_MAX=100000 RATE_LIMIT_PASSWORD_MAX=100000 \
 //   RATE_LIMIT_REGISTER_MAX=100000 RATE_LIMIT_ASSESS_MAX=100000000 \
@@ -51,6 +52,9 @@ const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 60_000);
 const MAX_BARRIER_DISPATCH_SPREAD_MS = Number(process.env.MAX_BARRIER_SPREAD_MS || 5_000);
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
 const NATIVE_LANGUAGES = ['te', 'hi', 'es', 'zh'];
+const DIAGNOSTIC_ASSESSMENT_ENDPOINT = '/diagnostic/answer';
+const PRACTICE_ASSESSMENT_ENDPOINT = '/practice/attempt';
+const NATIVE_ASSESSMENT_ENDPOINT = '/practice/attempt/native';
 const PASSWORD = 'loadTestPass123';
 const NEW_PASSWORD = 'loadTestPass456';
 const REPORTS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'reports', 'load1000');
@@ -277,6 +281,15 @@ function mockAssessmentValid(body) {
   );
 }
 
+function directGrantValid(response, assessmentEndpoint) {
+  return (
+    response.ok &&
+    response.status === 200 &&
+    response.body?.mode === 'direct' &&
+    response.body.assessmentEndpoint === assessmentEndpoint
+  );
+}
+
 async function concurrentPhase(name, participants, action) {
   if (participants.length === 0) {
     phaseStats.push({ name, participants: 0, maxOverlap: 0, dispatchSpreadMs: 0, durationMs: 0 });
@@ -390,10 +403,13 @@ async function actionDiagnosticJourney(user) {
   for (let round = 0; round < 5 && current; round++) {
     const grant = await reqRobust('POST', '/uploads/audio-url', {
       token: user.token,
-      json: { contentType: 'audio/mp4' },
+      json: {
+        contentType: 'audio/mp4',
+        assessmentEndpoint: DIAGNOSTIC_ASSESSMENT_ENDPOINT,
+      },
     });
-    if (!grant.ok || grant.status !== 200 || grant.body?.mode !== 'direct') {
-      fail(user, 'diagnostic grant', `expected direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
+    if (!directGrantValid(grant, DIAGNOSTIC_ASSESSMENT_ENDPOINT)) {
+      fail(user, 'diagnostic grant', `expected endpoint-bound direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
       return;
     }
     const requestId = randomUUID();
@@ -490,10 +506,13 @@ async function actionHelp(user) {
 async function englishAttemptOnce(user, questionId) {
   const grant = await reqRobust('POST', '/uploads/audio-url', {
     token: user.token,
-    json: { contentType: 'audio/mp4' },
+    json: {
+      contentType: 'audio/mp4',
+      assessmentEndpoint: PRACTICE_ASSESSMENT_ENDPOINT,
+    },
   });
-  if (!grant.ok || grant.status !== 200 || grant.body?.mode !== 'direct') {
-    fail(user, 'english grant', `expected direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
+  if (!directGrantValid(grant, PRACTICE_ASSESSMENT_ENDPOINT)) {
+    fail(user, 'english grant', `expected endpoint-bound direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
     return null;
   }
   const requestId = randomUUID();
@@ -588,10 +607,13 @@ async function actionEnglishProgress(user) {
 async function actionNativeJourney(user) {
   const grant = await reqRobust('POST', '/uploads/audio-url', {
     token: user.token,
-    json: { contentType: 'audio/mp4' },
+    json: {
+      contentType: 'audio/mp4',
+      assessmentEndpoint: NATIVE_ASSESSMENT_ENDPOINT,
+    },
   });
-  if (!grant.ok || grant.status !== 200 || grant.body?.mode !== 'direct') {
-    fail(user, 'native grant', `expected direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
+  if (!directGrantValid(grant, NATIVE_ASSESSMENT_ENDPOINT)) {
+    fail(user, 'native grant', `expected endpoint-bound direct grant, got ${grant.ok ? grant.status : 'NETERR'}`);
     return;
   }
   const requestId = randomUUID();
@@ -780,7 +802,10 @@ async function actionErrorCheck(user, kind) {
     case 'hostile-grant': {
       const r = await reqRobust('POST', '/uploads/audio-url', {
         token: user.token,
-        json: { contentType: 'application/x-evil' },
+        json: {
+          contentType: 'application/x-evil',
+          assessmentEndpoint: DIAGNOSTIC_ASSESSMENT_ENDPOINT,
+        },
       });
       // Unsupported media types are rejected with 415 by design (audio-upload.ts).
       if (!r.ok || r.status !== 415) fail(user, 'err hostile-grant', `expected 415, got ${r.ok ? r.status : 'NETERR'}`);
@@ -847,10 +872,13 @@ async function main() {
     if (probeNext.ok && probeNext.status === 200 && probeNext.body?.done === false) {
       const probeGrant = await reqRobust('POST', '/uploads/audio-url', {
         token: probe.token,
-        json: { contentType: 'audio/mp4' },
+        json: {
+          contentType: 'audio/mp4',
+          assessmentEndpoint: DIAGNOSTIC_ASSESSMENT_ENDPOINT,
+        },
       });
-      if (!probeGrant.ok || probeGrant.status !== 200 || probeGrant.body?.mode !== 'direct') {
-        throw new Error('upload grant probe failed — server is not in direct-upload mock mode');
+      if (!directGrantValid(probeGrant, DIAGNOSTIC_ASSESSMENT_ENDPOINT)) {
+        throw new Error('upload grant probe failed — server is not in endpoint-bound direct-upload mock mode');
       }
       const probeRequestId = randomUUID();
       const probeAnswer = await req('POST', '/diagnostic/answer', {

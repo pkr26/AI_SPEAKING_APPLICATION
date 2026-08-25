@@ -6,6 +6,7 @@ import { Platform } from 'react-native';
 import { translate, type MessageKey } from './i18n';
 import {
   audioKeyBelongsToOwner,
+  audioKeyMatchesAssessmentEndpoint,
   ContractError,
   HISTORY_PAGE_LIMIT,
   parseAudioUploadGrant,
@@ -20,6 +21,7 @@ import {
   type User,
   type UserDataPage,
 } from './types';
+import type { AssessmentEndpoint } from './pending-assessment';
 
 const TOKEN_KEY = 'auth_token';
 const TOKEN_KEYCHAIN_SERVICE = 'ai-english-coach.auth-token';
@@ -792,18 +794,20 @@ export async function apiUploadAudio<T>(
 export async function apiRequestAudioUpload(
   contentType: string,
   ownerId: string,
-  options: { signal?: AbortSignal } = {},
+  options: { assessmentEndpoint: AssessmentEndpoint; signal?: AbortSignal },
 ): Promise<AudioUploadGrant> {
   const raw = await apiFetch<unknown>('/uploads/audio-url', {
     method: 'POST',
-    body: { contentType },
+    body: { contentType, assessmentEndpoint: options.assessmentEndpoint },
     signal: options.signal,
   });
   const grant = parseAudioUploadGrant(raw);
+  if (grant.assessmentEndpoint !== options.assessmentEndpoint) throw new ContractError();
   if (grant.mode === 's3') {
     if (
       grant.contentType !== contentType.trim().toLowerCase() ||
-      !audioKeyBelongsToOwner(grant.audioKey, ownerId)
+      !audioKeyBelongsToOwner(grant.audioKey, ownerId) ||
+      !audioKeyMatchesAssessmentEndpoint(grant.audioKey, options.assessmentEndpoint)
     ) {
       throw new ContractError();
     }

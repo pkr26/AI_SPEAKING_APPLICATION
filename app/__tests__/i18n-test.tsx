@@ -1,6 +1,6 @@
-import { fireEvent, render, screen } from '@testing-library/react-native';
+import { render, screen } from '@testing-library/react-native';
 import React from 'react';
-import { Pressable, Text } from 'react-native';
+import { Text } from 'react-native';
 
 import {
   deviceLanguage,
@@ -85,6 +85,16 @@ describe('A1-English source copy pins for critical safety strings', () => {
     expect(dictionaries.en['recorder.privacyNote']).toBe(
       'We send your recording only after you tap Send Answer.',
     );
+  });
+
+  it('pins retained-recording and temporary-upload privacy disclosures without removing the legal placeholder', () => {
+    expect(dictionaries.en['privacy.p1']).toBe(
+      'We store your name, email, practice answers, and successful submitted recordings so you can replay them until you delete the recording or your account.',
+    );
+    expect(dictionaries.en['privacy.p2']).toBe(
+      'Failed or abandoned uploads are temporary. AI providers process submitted audio and its transcript to assess your answer.',
+    );
+    expect(dictionaries.en['legal.placeholderNote']).toContain('must review and replace');
   });
 
   it('pins the delete-account warning', () => {
@@ -289,14 +299,11 @@ describe('deviceLanguage', () => {
 // ----- Provider / hook language selection -----
 
 function Probe() {
-  const { language, t, setPreviewLanguage } = useI18n();
+  const { language, t } = useI18n();
   return (
     <>
       <Text testID="lang">{language}</Text>
       <Text testID="msg">{t('login.submit')}</Text>
-      <Pressable testID="pick-zh" onPress={() => setPreviewLanguage('zh')}>
-        <Text>zh</Text>
-      </Pressable>
     </>
   );
 }
@@ -307,9 +314,9 @@ function HookProbe() {
 }
 
 describe('I18nProvider language selection', () => {
-  it("uses the signed-in user's native language and syncs event-time copy", async () => {
+  it("uses the signed-in account's UI language and syncs event-time copy", async () => {
     await render(
-      <I18nProvider userLanguage="te">
+      <I18nProvider accountLanguage="te">
         <Probe />
       </I18nProvider>,
     );
@@ -320,9 +327,9 @@ describe('I18nProvider language selection', () => {
     expect(translate('login.submit')).toBe(dictionaries.te['login.submit']);
   });
 
-  it('falls back to the device locale when signed out', async () => {
+  it('always uses English when signed out', async () => {
     await render(
-      <I18nProvider userLanguage={null}>
+      <I18nProvider accountLanguage={null}>
         <Probe />
       </I18nProvider>,
     );
@@ -330,25 +337,12 @@ describe('I18nProvider language selection', () => {
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.en['login.submit']);
   });
 
-  it('applies a signed-out preview language immediately', async () => {
+  it('supports an account UI language independently of learning language', async () => {
     await render(
-      <I18nProvider userLanguage={null}>
+      <I18nProvider accountLanguage="hi">
         <Probe />
       </I18nProvider>,
     );
-    await fireEvent.press(screen.getByTestId('pick-zh'));
-    expect(screen.getByTestId('lang')).toHaveTextContent('zh');
-    expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.zh['login.submit']);
-    expect(getActiveLanguage()).toBe('zh');
-  });
-
-  it('lets the account language win over any preview', async () => {
-    await render(
-      <I18nProvider userLanguage="hi">
-        <Probe />
-      </I18nProvider>,
-    );
-    await fireEvent.press(screen.getByTestId('pick-zh'));
     expect(screen.getByTestId('lang')).toHaveTextContent('hi');
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.hi['login.submit']);
     expect(getActiveLanguage()).toBe('hi');
@@ -356,13 +350,13 @@ describe('I18nProvider language selection', () => {
 
   it('switches languages when the user changes', async () => {
     const view = await render(
-      <I18nProvider userLanguage="es">
+      <I18nProvider accountLanguage="es">
         <Probe />
       </I18nProvider>,
     );
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.es['login.submit']);
     await view.rerender(
-      <I18nProvider userLanguage={null}>
+      <I18nProvider accountLanguage={null}>
         <Probe />
       </I18nProvider>,
     );
@@ -376,12 +370,5 @@ describe('useI18n / useT without a provider', () => {
     setActiveLanguage('hi');
     await render(<HookProbe />);
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.hi['common.tryAgain']);
-  });
-
-  it('ignores preview requests without a provider', async () => {
-    await render(<Probe />);
-    await fireEvent.press(screen.getByTestId('pick-zh'));
-    expect(screen.getByTestId('lang')).toHaveTextContent('en');
-    expect(getActiveLanguage()).toBe('en');
   });
 });

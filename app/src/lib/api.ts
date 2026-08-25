@@ -12,12 +12,19 @@ import {
   parseAudioUploadGrant,
   parsePracticeHistory,
   parsePracticeStats,
+  parseRecordingExportPage,
+  parseRecordingPage,
+  parseRecordingPlaybackGrant,
   parseUserDataPage,
   parseUserResponse,
   type AudioUploadGrant,
   type HistoryPage,
   type NativeLanguage,
   type PracticeStats,
+  type RecordingExportPage,
+  type RecordingPage,
+  type RecordingPlaybackGrant,
+  type UiLanguage,
   type User,
   type UserDataPage,
 } from './types';
@@ -959,6 +966,40 @@ export async function apiGetPracticeHistory(
   );
 }
 
+/** One newest-first page of retained owner recordings. */
+export async function apiGetRecordings(
+  cursor?: string,
+  signal?: AbortSignal,
+): Promise<RecordingPage> {
+  const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+  return parseRecordingPage(
+    await apiFetch<unknown>(`/recordings?limit=${HISTORY_PAGE_LIMIT}${cursorParam}`, { signal }),
+  );
+}
+
+/** Lazily issues one short-lived, owner-bound S3 playback capability. */
+export async function apiGetRecordingPlaybackGrant(
+  recordingId: string,
+  signal?: AbortSignal,
+): Promise<RecordingPlaybackGrant> {
+  return parseRecordingPlaybackGrant(
+    await apiFetch<unknown>(`/recordings/${encodeURIComponent(recordingId)}/playback-url`, {
+      method: 'POST',
+      signal,
+    }),
+    recordingId,
+  );
+}
+
+/** Idempotently removes one owner recording while retaining assessment text. */
+export async function apiDeleteRecording(recordingId: string, signal?: AbortSignal): Promise<void> {
+  await apiFetch<void>(`/recordings/${encodeURIComponent(recordingId)}`, {
+    method: 'DELETE',
+    signal,
+    expectedStatus: 204,
+  });
+}
+
 /** Defers the current word for a week and frees the queue for the next one. */
 export async function apiSkipPracticeWord(questionId: string): Promise<void> {
   await apiFetch<void>('/practice/skip', {
@@ -991,10 +1032,11 @@ export async function apiResetPassword(
   });
 }
 
-/** Updates name and/or native language; returns the server's updated user. */
+/** Updates independent profile/UI preferences; returns the server's updated user. */
 export async function apiUpdateProfile(update: {
   name?: string;
   nativeLanguage?: NativeLanguage;
+  uiLanguage?: UiLanguage;
 }): Promise<User> {
   return parseUserResponse(
     await apiFetch<unknown>('/auth/me', {
@@ -1020,21 +1062,16 @@ const EXPORT_PAGE_LIMIT = 500;
 const EXPORT_MAX_PAGES = 10_000;
 
 export type UserDataPageConsumer = (page: UserDataPage, pageIndex: number) => void | Promise<void>;
+export type RecordingExportPageConsumer = (
+  page: RecordingExportPage,
+  pageIndex: number,
+) => void | Promise<void>;
 
-/**
- * Walks GET /auth/me/data under one pinned bearer token and hands each fully
- * validated page to the caller. The walker retains only cursor identities;
- * consumers can stream each at-most-500-row page without accumulating the
- * account's lifetime history in RAM.
- */
-export async function apiConsumeUserDataPages(
+async function consumeUserDataPagesWithToken(
+  token: string | null,
   consumePage: UserDataPageConsumer,
   signal?: AbortSignal,
 ): Promise<void> {
-  // An export is one logical read even though it spans many HTTP requests.
-  // Pin the initiating session so a logout/new login cannot silently switch
-  // accounts between pages.
-  const token = await tokenForRequest();
   let userId: string | null = null;
   let cursor: string | null = null;
   const seenCursors = new Set<string>();
@@ -1051,12 +1088,7 @@ export async function apiConsumeUserDataPages(
     userId ??= data.user.id;
     const nextCursor = data.nextCursor;
     if (nextCursor !== null) {
-      // A next page beyond this one would exceed the explicit 10,000-request
-      // bound. Reject before emitting this page so an invalid walk cannot make
-      // an externally visible partial export look complete.
-      if (page === EXPORT_MAX_PAGES - 1 || seenCursors.has(nextCursor)) {
-        throw new ContractError();
-      }
+      if (page === EXPORT_MAX_PAGES - 1 || seenCursors.has(nextCursor)) throw new ContractError();
       seenCursors.add(nextCursor);
     }
     await consumePage(data, page);
@@ -1064,4 +1096,69 @@ export async function apiConsumeUserDataPages(
     cursor = nextCursor;
   }
   throw new ContractError();
+}
+
+async function consumeRecordingExportPagesWithToken(
+  token: string | null,
+  consumePage: RecordingExportPageConsumer,
+  signal?: AbortSignal,
+): Promise<void> {
+  let cursor: string | null = null;
+  const seenCursors = new Set<string>();
+  for (let page = 0; page < EXPORT_MAX_PAGES; page += 1) {
+    const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+    const data = parseRecordingExportPage(
+      await apiFetchWithToken<unknown>(
+        `/recordings/export?limit=${EXPORT_PAGE_LIMIT}${cursorParam}`,
+        { signal },
+        token,
+      ),
+    );
+    const nextCursor = data.nextCursor;
+    if (nextCursor !== null) {
+      if (page === EXPORT_MAX_PAGES - 1 || seenCursors.has(nextCursor)) throw new ContractError();
+      seenCursors.add(nextCursor);
+    }
+    await consumePage(data, page);
+    if (nextCursor === null) return;
+    cursor = nextCursor;
+  }
+  throw new ContractError();
+}
+
+/**
+ * Walks GET /auth/me/data under one pinned bearer token and hands each fully
+ * validated page to the caller. The walker retains only cursor identities;
+ * consumers can stream each at-most-500-row page without accumulating the
+ * account's lifetime history in RAM.
+ */
+export async function apiConsumeUserDataPages(
+  consumePage: UserDataPageConsumer,
+  signal?: AbortSignal,
+): Promise<void> {
+  // An export is one logical read even though it spans many HTTP requests.
+  // Pin the initiating session so a logout/new login cannot silently switch
+  // accounts between pages.
+  const token = await tokenForRequest();
+  await consumeUserDataPagesWithToken(token, consumePage, signal);
+}
+
+export async function apiConsumeRecordingExportPages(
+  consumePage: RecordingExportPageConsumer,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = await tokenForRequest();
+  await consumeRecordingExportPagesWithToken(token, consumePage, signal);
+}
+
+/** Exports attempts and recording metadata under one pinned bearer identity. */
+export async function apiConsumeAccountExportPages(
+  consumeUserPage: UserDataPageConsumer,
+  consumeRecordingPage: RecordingExportPageConsumer,
+  signal?: AbortSignal,
+): Promise<void> {
+  const token = await tokenForRequest();
+  await consumeUserDataPagesWithToken(token, consumeUserPage, signal);
+  if (signal?.aborted) throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+  await consumeRecordingExportPagesWithToken(token, consumeRecordingPage, signal);
 }

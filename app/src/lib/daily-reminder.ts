@@ -1,7 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
-import { translate, translateFor, type MessageKey, type UiLanguage } from './i18n';
+import { getActiveLanguage, translateFor, type MessageKey, type UiLanguage } from './i18n';
 
 /**
  * Local daily practice reminder (no remote push). The scheduled notification
@@ -16,6 +16,8 @@ import { translate, translateFor, type MessageKey, type UiLanguage } from './i18
 
 export interface DailyReminder {
   hour: number;
+  /** Absent only for a legacy v1 preference that predates language tracking. */
+  uiLanguage?: UiLanguage;
 }
 
 export const DEFAULT_REMINDER_HOUR = 19;
@@ -61,7 +63,19 @@ export function isReminderHour(value: unknown): value is number {
 export function parseDailyReminder(value: unknown): DailyReminder | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const hour = (value as { hour?: unknown }).hour;
-  return isReminderHour(hour) ? { hour } : null;
+  const uiLanguage = (value as { uiLanguage?: unknown }).uiLanguage;
+  if (!isReminderHour(hour)) return null;
+  if (
+    uiLanguage !== undefined &&
+    uiLanguage !== 'en' &&
+    uiLanguage !== 'te' &&
+    uiLanguage !== 'hi' &&
+    uiLanguage !== 'es' &&
+    uiLanguage !== 'zh'
+  ) {
+    return null;
+  }
+  return { hour, ...(uiLanguage === undefined ? {} : { uiLanguage }) };
 }
 
 /** The stored reminder preference; caller must already own reminderQueue. */
@@ -100,7 +114,8 @@ async function enableDailyReminderUnsafe(
   language?: UiLanguage,
 ): Promise<'enabled' | 'denied'> {
   if (!isReminderHour(hour)) throw new Error('Invalid reminder hour');
-  const tr = (key: MessageKey) => (language ? translateFor(language, key) : translate(key));
+  const resolvedLanguage = language ?? getActiveLanguage();
+  const tr = (key: MessageKey) => translateFor(resolvedLanguage, key);
   const Notifications = notifications();
   let { granted } = await Notifications.getPermissionsAsync();
   if (!granted) {
@@ -147,7 +162,11 @@ async function enableDailyReminderUnsafe(
     throw error;
   }
   try {
-    await SecureStore.setItemAsync(STORAGE_KEY, JSON.stringify({ hour }), STORAGE_OPTIONS);
+    await SecureStore.setItemAsync(
+      STORAGE_KEY,
+      JSON.stringify({ hour, uiLanguage: resolvedLanguage }),
+      STORAGE_OPTIONS,
+    );
   } catch (error) {
     // The new schedule is already live, so a missing "on" preference would
     // leave the OS nudging a learner whose toggle reads off — the mirror of
@@ -180,8 +199,9 @@ export function refreshDailyReminderLanguage(language: UiLanguage): Promise<Dail
   return withReminderLock(async () => {
     const stored = await getDailyReminderUnsafe();
     if (!stored) return null;
+    if (stored.uiLanguage === language) return stored;
     const outcome = await enableDailyReminderUnsafe(stored.hour, language);
-    return outcome === 'enabled' ? stored : null;
+    return outcome === 'enabled' ? { hour: stored.hour, uiLanguage: language } : null;
   });
 }
 

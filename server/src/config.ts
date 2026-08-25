@@ -118,6 +118,10 @@ const envSchema = z
     // operational detail (routes, latencies, provider error rates) and must
     // only be scraped from a private network when enabled (404 when off).
     METRICS_ENABLED: bool,
+    ADS_ENABLED: bool,
+    ADS_AUDIENCE_MODE: z.enum(['unknown', 'adult-only', 'child']).default('unknown'),
+    ADS_HOME_BANNER_ENABLED: bool,
+    ADS_HISTORY_NATIVE_ENABLED: bool,
     // Oldest app version the API still answers ("1.2.3"); empty disables the
     // X-Client-Version gate. Response contracts are additive-only, so this is
     // for retiring clients that predate a required behavior, not routine use.
@@ -219,6 +223,13 @@ const envSchema = z
       .max(86_400_000)
       .default(60 * 60 * 1000),
     RATE_LIMIT_UPLOAD_GRANT_MAX: z.coerce.number().int().min(1).max(100_000).default(40),
+    RATE_LIMIT_PLAYBACK_GRANT_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(15 * 60 * 1000),
+    RATE_LIMIT_PLAYBACK_GRANT_MAX: z.coerce.number().int().min(1).max(100_000).default(60),
     MOCK_AI: bool,
     OPENAI_API_KEY: z.string().default(''),
     // Audio ingress: both buckets empty keeps the local multipart-to-disk flow
@@ -234,6 +245,10 @@ const envSchema = z
     S3_SESSION_TOKEN: z.string().trim().max(8192).default(''),
     S3_UPLOAD_URL_TTL_SECONDS: z.coerce.number().int().min(60).max(3600).default(300),
     S3_OPERATION_TIMEOUT_MS: z.coerce.number().int().min(1000).max(60_000).default(30_000),
+    RECORDING_PLAYBACK_URL_TTL_SECONDS: z.coerce.number().int().min(30).max(300).default(60),
+    RECORDING_MAINTENANCE_INTERVAL_MS: z.coerce.number().int().min(10_000).max(3_600_000).default(60_000),
+    RECORDING_MAINTENANCE_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
+    RECORDING_MAINTENANCE_CONCURRENCY: z.coerce.number().int().min(1).max(16).default(4),
   })
   .superRefine((env, ctx) => {
     if (env.NODE_ENV === 'production') {
@@ -426,6 +441,12 @@ export const config = {
   gradingModel: env.GRADING_MODEL,
   shutdownDrainMs: env.SHUTDOWN_DRAIN_MS,
   metricsEnabled: env.METRICS_ENABLED,
+  ads: {
+    enabled: env.ADS_ENABLED,
+    audienceMode: env.ADS_AUDIENCE_MODE,
+    homeBannerEnabled: env.ADS_HOME_BANNER_ENABLED,
+    historyNativeEnabled: env.ADS_HISTORY_NATIVE_ENABLED,
+  },
   minClientVersion: env.MIN_CLIENT_VERSION || undefined,
   ffmpegPath: env.FFMPEG_PATH,
   ffprobePath: env.FFPROBE_PATH,
@@ -447,6 +468,8 @@ export const config = {
     assessMax: env.RATE_LIMIT_ASSESS_MAX,
     uploadGrantWindowMs: env.RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS,
     uploadGrantMax: env.RATE_LIMIT_UPLOAD_GRANT_MAX,
+    playbackGrantWindowMs: env.RATE_LIMIT_PLAYBACK_GRANT_WINDOW_MS,
+    playbackGrantMax: env.RATE_LIMIT_PLAYBACK_GRANT_MAX,
   },
   mail: {
     mode: env.MAIL_MODE,
@@ -468,5 +491,11 @@ export const config = {
     sessionToken: env.S3_SESSION_TOKEN,
     uploadUrlTtlSeconds: env.S3_UPLOAD_URL_TTL_SECONDS,
     operationTimeoutMs: env.S3_OPERATION_TIMEOUT_MS,
+  },
+  recordings: {
+    playbackUrlTtlSeconds: env.RECORDING_PLAYBACK_URL_TTL_SECONDS,
+    maintenanceIntervalMs: env.RECORDING_MAINTENANCE_INTERVAL_MS,
+    maintenanceBatchSize: env.RECORDING_MAINTENANCE_BATCH_SIZE,
+    maintenanceConcurrency: env.RECORDING_MAINTENANCE_CONCURRENCY,
   },
 };

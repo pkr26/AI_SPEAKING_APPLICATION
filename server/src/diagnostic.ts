@@ -9,6 +9,7 @@ import { completeAssessmentRequest } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
+import { RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
@@ -153,6 +154,7 @@ async function finalizeDiagnosticAnswer(
   requestId: string,
   requestClaimId: string,
   result: AssessResult,
+  recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
@@ -177,11 +179,13 @@ async function finalizeDiagnosticAnswer(
     }
 
     const attemptNo = state.questions_asked + 1;
-    await client.query(
+    const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'diagnostic', $3, $4, $5, $6, $7)`,
+       VALUES ($1, $2, 'diagnostic', $3, $4, $5, $6, $7)
+       RETURNING id`,
       [userId, question.id, attemptNo, result.transcript, result.score, result.passed, result.feedback],
     );
+    if (recording) recording.attemptId = insertedAttempt.rows[0].id;
 
     const mid = LEVELS.indexOf(question.cefr_level);
     let low = state.low_idx;
@@ -229,7 +233,7 @@ async function finalizeDiagnosticAnswer(
       body = { ...body, done: false, nextQuestion };
     }
 
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, body, 'diagnostic');
+    body = await completeAssessmentRequest(client, userId, requestId, requestClaimId, body, 'diagnostic', recording);
     await client.query('COMMIT');
     return body;
   } catch (err) {
@@ -389,8 +393,16 @@ export function createDiagnosticRouter(limiters: Limiters) {
             user.id,
             options,
           ),
-        persist: (user, _question, claim, result, requestId, requestClaimId) =>
-          finalizeDiagnosticAnswer(user.id, claim.question, claim.claimId, requestId, requestClaimId, result),
+        persist: (user, _question, claim, result, requestId, requestClaimId, recording) =>
+          finalizeDiagnosticAnswer(
+            user.id,
+            claim.question,
+            claim.claimId,
+            requestId,
+            requestClaimId,
+            result,
+            recording,
+          ),
         clearClaim: (user, _question, claim) => clearDiagnosticClaim(user.id, claim.claimId),
       }),
     ),

@@ -3181,11 +3181,30 @@ const PROFILE_USER = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'hi',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
 
 describe('typed endpoint helpers', () => {
+  const recordingId = '550e8400-e29b-41d4-a716-446655440090';
+  const recordingBody = {
+    id: recordingId,
+    questionId: HISTORY_ITEM.questionId,
+    context: 'practice',
+    promptWord: 'courage',
+    questionText: 'Describe courage.',
+    cefrLevel: 'B1',
+    contentType: 'audio/mp4',
+    sizeBytes: 2_048,
+    durationMs: 8_000,
+    status: 'available',
+    createdAt: '2026-08-25T00:00:00.000Z',
+    availableAt: '2026-08-25T00:00:01.000Z',
+  };
+  const playbackUrl =
+    'https://private.s3.us-west-1.amazonaws.com/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=x&X-Amz-Date=20260825T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=abc';
+
   it('apiGetPracticeStats fetches /practice/stats and returns the parsed stats', async () => {
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
 
@@ -3228,6 +3247,138 @@ describe('typed endpoint helpers', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       `http://localhost:4000/practice/history?limit=20&cursor=${HISTORY_ITEM.id}`,
       expect.anything(),
+    );
+  });
+
+  it('loads recordings, lazily requests a playback URL, and deletes by owner recording id', async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({ json: async () => ({ items: [recordingBody], nextCursor: null }) }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            recordingId,
+            playbackUrl,
+            expiresIn: 60,
+            contentType: 'audio/mp4',
+          }),
+        }),
+      )
+      .mockResolvedValueOnce(fakeResponse({ status: 204 }));
+
+    await expect(api.apiGetRecordings()).resolves.toEqual({
+      items: [recordingBody],
+      nextCursor: null,
+    });
+    await expect(api.apiGetRecordingPlaybackGrant(recordingId)).resolves.toEqual({
+      recordingId,
+      playbackUrl,
+      expiresIn: 60,
+      contentType: 'audio/mp4',
+    });
+    await expect(api.apiDeleteRecording(recordingId)).resolves.toBeUndefined();
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost:4000/recordings?limit=20',
+      `http://localhost:4000/recordings/${recordingId}/playback-url`,
+      `http://localhost:4000/recordings/${recordingId}`,
+    ]);
+    expect(fetchMock.mock.calls[1][1]).toEqual(expect.objectContaining({ method: 'POST' }));
+    expect(fetchMock.mock.calls[2][1]).toEqual(expect.objectContaining({ method: 'DELETE' }));
+  });
+
+  it('rejects a playback grant that echoes another recording id', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          recordingId: HISTORY_ITEM.id,
+          playbackUrl,
+          expiresIn: 60,
+          contentType: 'audio/mp4',
+        }),
+      }),
+    );
+    await expect(api.apiGetRecordingPlaybackGrant(recordingId)).rejects.toBeInstanceOf(
+      ContractError,
+    );
+  });
+
+  it('exports attempts and recording metadata under one pinned token', async () => {
+    await api.saveToken('pinned-export-token');
+    const consumeUser = jest.fn();
+    const consumeRecordings = jest.fn();
+    fetchMock
+      .mockImplementationOnce(async () => {
+        await api.saveToken('replacement-token');
+        return fakeResponse({
+          json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }),
+        });
+      })
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            recordings: [
+              {
+                ...recordingBody,
+                requestId: HISTORY_ITEM.questionId,
+                attemptId: HISTORY_ITEM.id,
+              },
+            ],
+            nextCursor: null,
+          }),
+        }),
+      );
+
+    await api.apiConsumeAccountExportPages(consumeUser, consumeRecordings);
+    expect(consumeUser).toHaveBeenCalledWith(
+      { user: PROFILE_USER, attempts: [], nextCursor: null },
+      0,
+    );
+    expect(consumeRecordings).toHaveBeenCalledWith(
+      {
+        recordings: [
+          {
+            ...recordingBody,
+            requestId: HISTORY_ITEM.questionId,
+            attemptId: HISTORY_ITEM.id,
+          },
+        ],
+        nextCursor: null,
+      },
+      0,
+    );
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.headers.Authorization).toBe('Bearer pinned-export-token');
+    }
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost:4000/auth/me/data?limit=500',
+      'http://localhost:4000/recordings/export?limit=500',
+    ]);
+  });
+
+  it('walks recording-export pages and rejects a repeated cursor before duplicate emission', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440099';
+    const consume = jest.fn();
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => ({
+          recordings: [
+            {
+              ...recordingBody,
+              requestId: HISTORY_ITEM.questionId,
+              attemptId: null,
+            },
+          ],
+          nextCursor: cursor,
+        }),
+      }),
+    );
+
+    await expect(api.apiConsumeRecordingExportPages(consume)).rejects.toBeInstanceOf(ContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consume).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[1][0]).toBe(
+      `http://localhost:4000/recordings/export?limit=500&cursor=${cursor}`,
     );
   });
 
@@ -3303,9 +3454,28 @@ describe('typed endpoint helpers', () => {
     );
   });
 
+  it('apiUpdateProfile PATCHes the UI language independently', async () => {
+    const updated = { ...PROFILE_USER, uiLanguage: 'es' as const };
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ user: updated }) }));
+
+    await expect(api.apiUpdateProfile({ uiLanguage: 'es' })).resolves.toEqual(updated);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/auth/me',
+      expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ uiLanguage: 'es' }) }),
+    );
+  });
+
   it('apiUpdateProfile rejects a malformed user payload', async () => {
     fetchMock.mockResolvedValue(
       fakeResponse({ json: async () => ({ user: { ...PROFILE_USER, nativeLanguage: 'fr' } }) }),
+    );
+
+    await expect(api.apiUpdateProfile({ name: 'Ada' })).rejects.toBeInstanceOf(ContractError);
+  });
+
+  it('apiUpdateProfile rejects an unsupported UI language in the response', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ user: { ...PROFILE_USER, uiLanguage: 'fr' } }) }),
     );
 
     await expect(api.apiUpdateProfile({ name: 'Ada' })).rejects.toBeInstanceOf(ContractError);

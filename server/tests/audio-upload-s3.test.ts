@@ -31,6 +31,11 @@ vi.mock('@aws-sdk/client-s3', () => {
     S3Client: s3ClientConstructorMock,
     GetObjectCommand: command('get'),
     DeleteObjectCommand: command('delete'),
+    DeleteObjectsCommand: command('delete-versions'),
+    ListObjectVersionsCommand: command('list-versions'),
+    PutObjectTaggingCommand: command('tag-retained'),
+    GetBucketVersioningCommand: command('get-versioning'),
+    GetBucketLifecycleConfigurationCommand: command('get-lifecycle'),
   };
 });
 
@@ -40,6 +45,7 @@ vi.mock('@aws-sdk/s3-presigned-post', () => ({
 
 import { config } from '../src/config';
 import {
+  assertRetainedAudioStorageAvailable,
   createAudioSizeCap,
   discardPresignedAudio as discardScopedPresignedAudio,
   discardSubmittedPresignedAudio as createDiscardSubmittedPresignedAudio,
@@ -47,6 +53,7 @@ import {
   ownSubmittedPresignedAudio,
   preserveSubmittedPresignedAudio,
   resolvePresignedAudio as resolveScopedPresignedAudio,
+  sweepPresignedAudioVersions,
 } from '../src/audio-upload';
 import { logger } from '../src/logger';
 import { AuthedRequest } from '../src/middleware';
@@ -92,7 +99,7 @@ function practiceOwnedKey(userId: string): string {
 }
 
 async function completeDiagnosticInS3Mode(a: ReturnType<typeof app>, token: string, userId: string): Promise<void> {
-  let deletes = 0;
+  let retainedTags = 0;
   for (let i = 0; i < 5; i++) {
     const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
     if (next.body.done) return;
@@ -108,12 +115,11 @@ async function completeDiagnosticInS3Mode(a: ReturnType<typeof app>, token: stri
     if (response.status !== 200) {
       throw new Error(`diagnostic answer failed: ${response.status} ${JSON.stringify(response.body)}`);
     }
-    // Object deletion now consults the claim table first, so it lands a beat
-    // after the response; drain it so callers start from a clean sendMock.
-    deletes++;
-    const expectedDeletes = deletes;
+    // Retention tagging lands immediately after the result transaction.
+    retainedTags++;
+    const expectedTags = retainedTags;
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.filter(([command]) => command.kind === 'delete')).toHaveLength(expectedDeletes);
+      expect(sendMock.mock.calls.filter(([command]) => command.kind === 'tag-retained')).toHaveLength(expectedTags);
     });
     if (response.body.done) return;
   }
@@ -176,6 +182,7 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     expect(res.body.uploadFields).toMatchObject({
       key: res.body.audioKey,
       'Content-Type': 'audio/mp4',
+      tagging: expect.stringContaining('<Key>retention</Key><Value>transient</Value>'),
       policy: 'signed-policy',
     });
 
@@ -192,10 +199,18 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
     expect(postOptions).toMatchObject({
       Bucket: config.s3.diagnostic.bucket,
       Key: res.body.audioKey,
-      Fields: { 'Content-Type': 'audio/mp4' },
+      Fields: {
+        'Content-Type': 'audio/mp4',
+        tagging: expect.stringContaining('<Key>retention</Key><Value>transient</Value>'),
+      },
       Expires: config.s3.uploadUrlTtlSeconds,
     });
     expect(postOptions.Conditions).toContainEqual(['eq', '$Content-Type', 'audio/mp4']);
+    expect(postOptions.Conditions).toContainEqual([
+      'eq',
+      '$tagging',
+      expect.stringContaining('<Key>retention</Key><Value>transient</Value>'),
+    ]);
     expect(postOptions.Conditions).toContainEqual(['content-length-range', 1, 25 * 1024 * 1024]);
     expect(s3ClientConstructorMock).toHaveBeenCalledOnce();
     expect(s3ClientConstructorMock).toHaveBeenCalledWith({ region: config.s3.diagnostic.region });
@@ -290,6 +305,85 @@ describe('POST /uploads/audio-url (S3 mode)', () => {
       config.rateLimit.uploadGrantWindowMs = previousWindow;
       config.rateLimit.uploadGrantMax = previousMax;
     }
+  });
+});
+
+describe('retained-audio storage readiness', () => {
+  const exactLifecycle = {
+    Rules: [
+      {
+        Status: 'Enabled',
+        Filter: { Tag: { Key: 'retention', Value: 'transient' } },
+        Expiration: { Days: 1 },
+        NoncurrentVersionExpiration: { NoncurrentDays: 1 },
+      },
+    ],
+  };
+
+  it('requires versioning and an exact transient-only current/noncurrent lifecycle', async () => {
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
+      if (command.kind === 'get-lifecycle') return Promise.resolve(exactLifecycle);
+      return Promise.resolve({});
+    });
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+  });
+
+  it('rejects a broad expiration rule that could delete retained versions', async () => {
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
+      if (command.kind === 'get-lifecycle') {
+        return Promise.resolve({
+          Rules: [
+            ...exactLifecycle.Rules,
+            { Status: 'Enabled', Filter: { Prefix: 'audio-uploads/' }, Expiration: { Days: 30 } },
+          ],
+        });
+      }
+      return Promise.resolve({});
+    });
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'expiration rule that can delete retained recordings',
+    );
+  });
+
+  it.each([
+    { Expiration: { Date: new Date('2099-01-01') }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 100 }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 1 }, NoncurrentVersionExpiration: { NoncurrentDays: 100 } },
+  ])('rejects a non-recurring or non-short transient lifecycle', async (timing) => {
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
+      if (command.kind === 'get-lifecycle') {
+        return Promise.resolve({
+          Rules: [{ Status: 'Enabled', Filter: { Tag: { Key: 'retention', Value: 'transient' } }, ...timing }],
+        });
+      }
+      return Promise.resolve({});
+    });
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'lacks the required transient-tag lifecycle',
+    );
+  });
+});
+
+describe('durable recording deletion sweep', () => {
+  it('fails when a 200 DeleteObjects response contains per-version errors', async () => {
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'list-versions') {
+        return Promise.resolve({ Versions: [{ Key: 'exact-key', VersionId: 'v1' }], IsTruncated: false });
+      }
+      if (command.kind === 'delete-versions') return Promise.resolve({ Errors: [{ Code: 'AccessDenied' }] });
+      return Promise.resolve({});
+    });
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow('per-version deletion errors');
+  });
+
+  it('fails closed when a truncated version listing omits continuation markers', async () => {
+    sendMock.mockResolvedValue({ Versions: [], DeleteMarkers: [], IsTruncated: true });
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow(
+      'omitted continuation markers',
+    );
   });
 });
 
@@ -1230,7 +1324,7 @@ describe('S3 object download boundaries', () => {
 });
 
 describe('POST /diagnostic/answer (S3 mode)', () => {
-  it('downloads the presigned object, assesses it, and deletes the object', async () => {
+  it('downloads the presigned object, assesses it, and retains its exact version', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const audioKey = ownedKey(userId);
@@ -1254,14 +1348,26 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     );
     expect(storedClaim.rows).toEqual([{ audio_key: audioKey }]);
 
-    // The delete consults the claim table before firing, so await it.
+    expect(res.body.recordingId).toMatch(/^[0-9a-f-]{36}$/i);
     await vi.waitFor(() => {
       const kinds = sendMock.mock.calls.map(([command]) => command.kind);
       expect(kinds).toContain('get');
-      expect(kinds).toContain('delete');
+      expect(kinds).toContain('tag-retained');
     });
-    const deleteCommand = sendMock.mock.calls.find(([command]) => command.kind === 'delete')![0];
-    expect(deleteCommand.input.Key).toBe(audioKey);
+    const tagCommand = sendMock.mock.calls.find(([command]) => command.kind === 'tag-retained')![0];
+    expect(tagCommand.input).toMatchObject({
+      Key: audioKey,
+      VersionId: 'mock-unversioned-object',
+      Tagging: { TagSet: [{ Key: 'retention', Value: 'retained' }] },
+    });
+    const recording = await pool.query(
+      `SELECT id, request_id, audio_key, status
+       FROM recordings WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+    expect(recording.rows).toEqual([
+      { id: res.body.recordingId, request_id: requestId, audio_key: audioKey, status: 'available' },
+    ]);
   });
 
   it('replays a completed request without another storage operation', async () => {
@@ -1279,10 +1385,9 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       .set('Authorization', `Bearer ${token}`)
       .send({ questionId, requestId, audioKey });
     expect(first.status).toBe(200);
-    // Drain the first answer's claim-checked delete before clearing, or it can
-    // land inside the replay's assertion window.
+    // Drain the first answer's retention tag before clearing.
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('tag-retained');
     });
 
     sendMock.mockClear();
@@ -1539,7 +1644,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const owner = ownerOutcome.response;
     expect(owner.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
     });
   });
 
@@ -1671,7 +1776,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       await clientOutcome;
 
       await vi.waitFor(() => {
-        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
       });
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect((await fs.readdir(uploadsDir)).sort()).toEqual(uploadsBefore);
@@ -1816,7 +1921,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     const retried = await submit();
     expect(retried.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'tag-retained']);
     });
   });
 
@@ -2114,7 +2219,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     }
   });
 
-  it('downloads, assesses, and finally deletes the learner-owned object', async () => {
+  it('downloads, assesses, and retains the learner-owned object', async () => {
     const a = app();
     const { res: registration } = await registerUser(a);
     const token = registration.body.token as string;
@@ -2145,7 +2250,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       }));
       expect(operations).toEqual([
         { kind: 'get', bucket: config.s3.practice.bucket, key: audioKey },
-        { kind: 'delete', bucket: config.s3.practice.bucket, key: audioKey },
+        { kind: 'tag-retained', bucket: config.s3.practice.bucket, key: audioKey },
       ]);
     });
   });
@@ -2191,7 +2296,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const retried = await submit();
     expect(retried.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'get', 'tag-retained']);
     });
   });
 
@@ -2248,7 +2353,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     if (ownerOutcome.status === 'rejected') throw ownerOutcome.reason;
     expect(ownerOutcome.response.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
     });
   });
 
@@ -2306,7 +2411,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     if (ownerOutcome.status === 'rejected') throw ownerOutcome.reason;
     expect(ownerOutcome.response.status).toBe(200);
     await vi.waitFor(() => {
-      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
     });
   });
 

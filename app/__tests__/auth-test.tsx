@@ -81,6 +81,7 @@ const USER: User = {
   name: 'Test User',
   email: 'test@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: null,
   diagnosticCompleted: false,
 };

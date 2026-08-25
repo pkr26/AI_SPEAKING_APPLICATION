@@ -3,8 +3,9 @@ import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
 import { createAuthRouter } from './auth';
+import { createClientConfigRouter } from './client-config';
 import { assertAudioInspectorAvailable } from './audio-inspection';
-import { createAudioUploadRouter } from './audio-upload';
+import { assertRetainedAudioStorageAvailable, createAudioUploadRouter } from './audio-upload';
 import { config } from './config';
 import { createDiagnosticRouter } from './diagnostic';
 import { httpLogger, logger } from './logger';
@@ -14,16 +15,19 @@ import { AuthedRequest, clientVersionGate, errorHandler, h, HttpError, requireAu
 import { z } from 'zod';
 import { createPracticeRouter } from './practice';
 import { buildLimiters } from './rate-limit';
+import { createRecordingsRouter } from './recordings';
 import { assertDatabaseSchemaCurrent } from './schema-readiness';
 
 interface AppDependencies {
   schemaCheck?: () => Promise<unknown>;
   audioInspectorCheck?: () => Promise<unknown>;
+  recordingStorageCheck?: () => Promise<unknown>;
 }
 
 export function createApp({
   schemaCheck = assertDatabaseSchemaCurrent,
   audioInspectorCheck = assertAudioInspectorAvailable,
+  recordingStorageCheck = assertRetainedAudioStorageAvailable,
 }: AppDependencies = {}) {
   const app = express();
 
@@ -64,7 +68,7 @@ export function createApp({
   app.get('/ready', limiters.readiness, async (_req, res) => {
     res.set('Cache-Control', 'no-store');
     try {
-      await Promise.all([schemaCheck(), audioInspectorCheck()]);
+      await Promise.all([schemaCheck(), audioInspectorCheck(), recordingStorageCheck()]);
       res.json({ ok: true });
     } catch (err) {
       logger.error({ err }, 'readiness dependency check failed');
@@ -94,6 +98,7 @@ export function createApp({
   // the cheap per-replica flood brake; mounting it after credential limiters
   // would let rejected attack traffic keep writing a PG row on every request.
   app.use(limiters.global);
+  app.use('/client-config', createClientConfigRouter(config.ads));
 
   // Credential routes are throttled before JSON parsing/bcrypt work. Logout is
   // deliberately excluded: an authenticated learner must always be able to
@@ -137,6 +142,7 @@ export function createApp({
   app.use('/diagnostic', createDiagnosticRouter(limiters));
   app.use('/practice', createPracticeRouter(limiters));
   app.use('/uploads', createAudioUploadRouter(limiters));
+  app.use('/recordings', createRecordingsRouter(limiters));
 
   app.use((_req, res) => res.status(404).json({ error: 'Not found', code: 'NOT_FOUND' }));
   app.use(errorHandler);

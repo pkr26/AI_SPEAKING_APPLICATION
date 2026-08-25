@@ -26,6 +26,7 @@ describe('PATCH /auth/me', () => {
         name: 'Renamed Learner', // register-grade trimming applies
         email: reg.email,
         nativeLanguage: 'te',
+        uiLanguage: 'en',
         cefrLevel: null,
         diagnosticCompleted: false,
       },
@@ -35,29 +36,48 @@ describe('PATCH /auth/me', () => {
     expect(me.body.user.name).toBe('Renamed Learner');
   });
 
-  it('updates the native language alone, and both fields together', async () => {
+  it('updates native and UI languages independently, and all profile fields together', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
+
+    const uiOnly = await request(a)
+      .patch('/auth/me')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ uiLanguage: 'zh' });
+    expect(uiOnly.status).toBe(200);
+    expect(uiOnly.body.user).toMatchObject({
+      name: 'Test User',
+      nativeLanguage: 'te',
+      uiLanguage: 'zh',
+    });
 
     const languageOnly = await request(a)
       .patch('/auth/me')
       .set('Authorization', `Bearer ${token}`)
       .send({ nativeLanguage: 'hi' });
     expect(languageOnly.status).toBe(200);
-    expect(languageOnly.body.user).toMatchObject({ name: 'Test User', nativeLanguage: 'hi' });
+    expect(languageOnly.body.user).toMatchObject({
+      name: 'Test User',
+      nativeLanguage: 'hi',
+      uiLanguage: 'zh',
+    });
 
     const both = await request(a)
       .patch('/auth/me')
       .set('Authorization', `Bearer ${token}`)
-      .send({ name: 'Nueva Persona', nativeLanguage: 'es' });
+      .send({ name: 'Nueva Persona', nativeLanguage: 'es', uiLanguage: 'es' });
     expect(both.status).toBe(200);
-    expect(both.body.user).toMatchObject({ name: 'Nueva Persona', nativeLanguage: 'es' });
+    expect(both.body.user).toMatchObject({
+      name: 'Nueva Persona',
+      nativeLanguage: 'es',
+      uiLanguage: 'es',
+    });
 
-    const { rows } = await pool.query<{ name: string; native_language: string }>(
-      'SELECT name, native_language FROM users WHERE id = $1',
+    const { rows } = await pool.query<{ name: string; native_language: string; ui_language: string }>(
+      'SELECT name, native_language, ui_language FROM users WHERE id = $1',
       [res.body.user.id],
     );
-    expect(rows[0]).toEqual({ name: 'Nueva Persona', native_language: 'es' });
+    expect(rows[0]).toEqual({ name: 'Nueva Persona', native_language: 'es', ui_language: 'es' });
   });
 
   it('rejects an empty update with 400 VALIDATION_FAILED', async () => {
@@ -66,7 +86,7 @@ describe('PATCH /auth/me', () => {
     const empty = await request(a).patch('/auth/me').set('Authorization', `Bearer ${res.body.token}`).send({});
     expect(empty.status).toBe(400);
     expect(empty.body).toEqual({
-      error: 'at least one of name or nativeLanguage is required',
+      error: 'at least one of name, nativeLanguage, or uiLanguage is required',
       code: 'VALIDATION_FAILED',
     });
 
@@ -112,9 +132,19 @@ describe('PATCH /auth/me', () => {
       code: 'VALIDATION_FAILED',
     });
 
+    const badUiLanguage = await request(a)
+      .patch('/auth/me')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ uiLanguage: 'fr' });
+    expect(badUiLanguage.status).toBe(400);
+    expect(badUiLanguage.body).toEqual({
+      error: "uiLanguage: uiLanguage must be one of 'en','te','hi','es','zh'",
+      code: 'VALIDATION_FAILED',
+    });
+
     // None of the rejected updates may have landed.
     const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${token}`);
-    expect(me.body.user).toMatchObject({ name: 'Test User', nativeLanguage: 'te' });
+    expect(me.body.user).toMatchObject({ name: 'Test User', nativeLanguage: 'te', uiLanguage: 'en' });
   });
 
   it('requires authentication', async () => {
@@ -130,7 +160,7 @@ describe('PATCH /auth/me', () => {
     // UPDATE then matches no row. Simulate by emptying that one query result.
     const originalQuery = pool.query.bind(pool);
     const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...args: unknown[]) => {
-      if (typeof text === 'string' && text.startsWith('UPDATE users SET name = coalesce')) {
+      if (typeof text === 'string' && text.startsWith('UPDATE users') && text.includes('SET name = coalesce')) {
         return Promise.resolve({ rows: [], rowCount: 0 });
       }
       return originalQuery(text as never, ...(args as never[]));

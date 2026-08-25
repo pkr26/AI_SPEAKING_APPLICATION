@@ -3,8 +3,18 @@ import fs from 'fs';
 import path from 'path';
 import { Transform } from 'stream';
 import { pipeline } from 'stream/promises';
-import { DeleteObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectCommand,
+  DeleteObjectsCommand,
+  GetBucketVersioningCommand,
+  GetBucketLifecycleConfigurationCommand,
+  GetObjectCommand,
+  ListObjectVersionsCommand,
+  PutObjectTaggingCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import { createPresignedPost } from '@aws-sdk/s3-presigned-post';
+import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { RequestHandler, Response, Router } from 'express';
 import { z } from 'zod';
 import { config } from './config';
@@ -17,6 +27,8 @@ import { AUDIO_TYPES, MAX_AUDIO_BYTES, submittedAudioFileIsOwned, uploadsDir } f
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
+const TRANSIENT_RETENTION_TAGGING =
+  '<Tagging><TagSet><Tag><Key>retention</Key><Value>transient</Value></Tag></TagSet></Tagging>';
 
 export const ASSESSMENT_ENDPOINTS = ['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const;
 export type AssessmentEndpoint = (typeof ASSESSMENT_ENDPOINTS)[number];
@@ -33,6 +45,116 @@ function storageConfig(scope: AudioStorageScope): { bucket: string; region: stri
 
 export function s3StorageEnabled(scope: AudioStorageScope): boolean {
   return storageConfig(scope).bucket.length > 0;
+}
+
+let retainedStorageReadinessCache: { expiresAt: number; error?: Error } | undefined;
+let retainedStorageReadinessInFlight: Promise<void> | undefined;
+
+function hasExactTransientLifecycleFilter(rule: {
+  Filter?: {
+    Prefix?: string;
+    Tag?: { Key?: string; Value?: string };
+    ObjectSizeGreaterThan?: number;
+    ObjectSizeLessThan?: number;
+    And?: {
+      Prefix?: string;
+      Tags?: Array<{ Key?: string; Value?: string }>;
+      ObjectSizeGreaterThan?: number;
+      ObjectSizeLessThan?: number;
+    };
+  };
+}): boolean {
+  const filter = rule.Filter;
+  if (!filter) return false;
+  if (filter.Tag) {
+    return (
+      filter.Tag.Key === 'retention' &&
+      filter.Tag.Value === 'transient' &&
+      filter.Prefix === undefined &&
+      filter.And === undefined &&
+      filter.ObjectSizeGreaterThan === undefined &&
+      filter.ObjectSizeLessThan === undefined
+    );
+  }
+  const and = filter.And;
+  return (
+    and !== undefined &&
+    filter.Prefix === undefined &&
+    filter.ObjectSizeGreaterThan === undefined &&
+    filter.ObjectSizeLessThan === undefined &&
+    and.Prefix === undefined &&
+    and.ObjectSizeGreaterThan === undefined &&
+    and.ObjectSizeLessThan === undefined &&
+    and.Tags?.length === 1 &&
+    and.Tags[0].Key === 'retention' &&
+    and.Tags[0].Value === 'transient'
+  );
+}
+
+async function probeRetainedAudioStorage(): Promise<void> {
+  for (const scope of AUDIO_STORAGE_SCOPES) {
+    if (!s3StorageEnabled(scope)) continue;
+    const target = storageConfig(scope);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.s3.operationTimeoutMs);
+    timer.unref();
+    try {
+      const versioning = await getS3(scope).send(new GetBucketVersioningCommand({ Bucket: target.bucket }), {
+        abortSignal: controller.signal,
+      });
+      if (versioning.Status !== 'Enabled') throw new Error(`${scope} audio bucket versioning is not enabled`);
+      const lifecycle = await getS3(scope).send(new GetBucketLifecycleConfigurationCommand({ Bucket: target.bucket }), {
+        abortSignal: controller.signal,
+      });
+      const expiringRules =
+        lifecycle.Rules?.filter(
+          (rule) =>
+            rule.Status === 'Enabled' &&
+            (rule.Expiration !== undefined || rule.NoncurrentVersionExpiration !== undefined),
+        ) ?? [];
+      if (expiringRules.some((rule) => !hasExactTransientLifecycleFilter(rule))) {
+        throw new Error(`${scope} audio bucket has an expiration rule that can delete retained recordings`);
+      }
+      const transientLifecycle = expiringRules.some(
+        (rule) =>
+          hasExactTransientLifecycleFilter(rule) &&
+          Number.isInteger(rule.Expiration?.Days) &&
+          rule.Expiration!.Days! >= 1 &&
+          rule.Expiration!.Days! <= 7 &&
+          Number.isInteger(rule.NoncurrentVersionExpiration?.NoncurrentDays) &&
+          rule.NoncurrentVersionExpiration!.NoncurrentDays! >= 1 &&
+          rule.NoncurrentVersionExpiration!.NoncurrentDays! <= 7,
+      );
+      if (!transientLifecycle) {
+        throw new Error(`${scope} audio bucket lacks the required transient-tag lifecycle`);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+export function assertRetainedAudioStorageAvailable({ force = false }: { force?: boolean } = {}): Promise<void> {
+  if (!force && retainedStorageReadinessCache && retainedStorageReadinessCache.expiresAt > Date.now()) {
+    return retainedStorageReadinessCache.error
+      ? Promise.reject(retainedStorageReadinessCache.error)
+      : Promise.resolve();
+  }
+  if (!force && retainedStorageReadinessInFlight) return retainedStorageReadinessInFlight;
+  retainedStorageReadinessInFlight = probeRetainedAudioStorage()
+    .then(() => {
+      retainedStorageReadinessCache = { expiresAt: Date.now() + 30_000 };
+    })
+    .catch((error: unknown) => {
+      const normalized =
+        error instanceof Error ? error : new Error('recording storage readiness failed', { cause: error });
+      retainedStorageReadinessCache = { expiresAt: Date.now() + 2_000, error: normalized };
+      throw normalized;
+    })
+    .finally(() => {
+      retainedStorageReadinessInFlight = undefined;
+    });
+  return retainedStorageReadinessInFlight;
 }
 
 function anyS3StorageEnabled(): boolean {
@@ -215,9 +337,10 @@ export function createAudioUploadRouter(limiters: Limiters) {
         const grant = await createPresignedPost(getS3(scope), {
           Bucket: target.bucket,
           Key: key,
-          Fields: { 'Content-Type': contentType },
+          Fields: { 'Content-Type': contentType, tagging: TRANSIENT_RETENTION_TAGGING },
           Conditions: [
             ['eq', '$Content-Type', contentType],
+            ['eq', '$tagging', TRANSIENT_RETENTION_TAGGING],
             ['content-length-range', 1, MAX_AUDIO_BYTES],
           ],
           Expires: config.s3.uploadUrlTtlSeconds,
@@ -263,6 +386,104 @@ export async function discardPresignedAudio(scope: AudioStorageScope, userId: st
   } finally {
     clearTimeout(timer);
   }
+}
+
+export async function retainPresignedAudioVersion(
+  scope: AudioStorageScope,
+  userId: string,
+  audioKey: string,
+  versionId: string,
+): Promise<void> {
+  if (!isOwnedAudioKey(scope, userId, audioKey)) throw new Error('recording key is not owned by the learner');
+  const target = storageConfig(scope);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.s3.operationTimeoutMs);
+  timer.unref();
+  try {
+    await getS3(scope).send(
+      new PutObjectTaggingCommand({
+        Bucket: target.bucket,
+        Key: audioKey,
+        VersionId: versionId,
+        Tagging: { TagSet: [{ Key: 'retention', Value: 'retained' }] },
+      }),
+      { abortSignal: controller.signal },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function createPresignedRecordingPlaybackUrl(
+  scope: AudioStorageScope,
+  audioKey: string,
+  versionId: string,
+  contentType: string,
+  expiresIn: number,
+): Promise<string> {
+  const target = storageConfig(scope);
+  return getSignedUrl(
+    getS3(scope),
+    new GetObjectCommand({
+      Bucket: target.bucket,
+      Key: audioKey,
+      VersionId: versionId,
+      ResponseContentType: contentType,
+      ResponseContentDisposition: 'inline',
+    }),
+    { expiresIn },
+  );
+}
+
+/** Delete every version and delete marker for one exact unguessable key. */
+export async function sweepPresignedAudioVersions(scope: AudioStorageScope, audioKey: string): Promise<number> {
+  const target = storageConfig(scope);
+  let keyMarker: string | undefined;
+  let versionIdMarker: string | undefined;
+  let removed = 0;
+  const seenMarkers = new Set<string>();
+  let pages = 0;
+  do {
+    if (++pages > 1000) throw new Error('S3 version sweep exceeded its page bound');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), config.s3.operationTimeoutMs);
+    timer.unref();
+    try {
+      const listed = await getS3(scope).send(
+        new ListObjectVersionsCommand({
+          Bucket: target.bucket,
+          Prefix: audioKey,
+          KeyMarker: keyMarker,
+          VersionIdMarker: versionIdMarker,
+        }),
+        { abortSignal: controller.signal },
+      );
+      const objects = [...(listed.Versions ?? []), ...(listed.DeleteMarkers ?? [])]
+        .filter((object) => object.Key === audioKey && object.VersionId)
+        .map((object) => ({ Key: audioKey, VersionId: object.VersionId! }));
+      if (objects.length > 0) {
+        const deleted = await getS3(scope).send(
+          new DeleteObjectsCommand({ Bucket: target.bucket, Delete: { Objects: objects, Quiet: true } }),
+          { abortSignal: controller.signal },
+        );
+        if ((deleted.Errors?.length ?? 0) > 0) throw new Error('S3 returned per-version deletion errors');
+        removed += objects.length;
+      }
+      if (listed.IsTruncated && (!listed.NextKeyMarker || !listed.NextVersionIdMarker)) {
+        throw new Error('truncated S3 version listing omitted continuation markers');
+      }
+      if (listed.IsTruncated) {
+        const markerIdentity = `${listed.NextKeyMarker}\u0000${listed.NextVersionIdMarker}`;
+        if (seenMarkers.has(markerIdentity)) throw new Error('S3 version listing repeated a continuation marker');
+        seenMarkers.add(markerIdentity);
+      }
+      keyMarker = listed.IsTruncated ? listed.NextKeyMarker : undefined;
+      versionIdMarker = listed.IsTruncated ? listed.NextVersionIdMarker : undefined;
+    } finally {
+      clearTimeout(timer);
+    }
+  } while (keyMarker !== undefined || versionIdMarker !== undefined);
+  return removed;
 }
 
 /** Preserve a submitted key because another worker may still be reading it. */
@@ -366,6 +587,14 @@ export function discardSubmittedPresignedAudio(scope: AudioStorageScope): Reques
 export interface SubmittedAudioFile {
   path: string;
   originalname: string;
+  retainedSource?: {
+    audioKey: string;
+    scope: AudioStorageScope;
+    s3VersionId: string;
+    contentType: string;
+    sizeBytes: number;
+    etag?: string;
+  };
 }
 
 /**
@@ -419,6 +648,30 @@ export async function resolvePresignedAudio(
     const out = fs.createWriteStream(tempPath, { flags: 'wx', mode: 0o600 });
     await pipeline(object.Body as NodeJS.ReadableStream, sizeCap, out, { signal: controller.signal });
     fs.chmodSync(tempPath, 0o600);
+    const sizeBytes = fs.statSync(tempPath).size;
+    const extension = path.extname(audioKey).toLowerCase();
+    const suppliedContentType = object.ContentType?.trim().toLowerCase();
+    const contentType =
+      suppliedContentType && AUDIO_TYPES[extension]?.includes(suppliedContentType)
+        ? suppliedContentType
+        : AUDIO_TYPES[extension]?.[0];
+    if (!contentType) throw new HttpError(415, 'Invalid audio media type', 'AUDIO_INVALID');
+    const s3VersionId = object.VersionId || (config.mockAi ? 'mock-unversioned-object' : undefined);
+    if (!s3VersionId) {
+      throw new HttpError(503, 'Versioned audio storage is required', 'PROVIDER_FAILED');
+    }
+    return {
+      path: tempPath,
+      originalname: path.basename(audioKey),
+      retainedSource: {
+        audioKey,
+        scope,
+        s3VersionId,
+        contentType,
+        sizeBytes,
+        ...(object.ETag ? { etag: object.ETag } : {}),
+      },
+    };
   } catch (err) {
     cleanup();
     if (err instanceof HttpError) throw err;
@@ -444,5 +697,5 @@ export async function resolvePresignedAudio(
     clearTimeout(operationTimer);
   }
 
-  return { path: tempPath, originalname: path.basename(audioKey) };
+  throw new Error('unreachable S3 audio resolution state');
 }

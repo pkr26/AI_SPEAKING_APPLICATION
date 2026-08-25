@@ -19,6 +19,13 @@ speakers of Telugu, Hindi, Spanish, and Chinese (Simplified).
 Web is intentionally unsupported because this app requires native secure token
 storage; browser persistence is not an accepted security fallback.
 
+AdMob also requires a native development/release build; it is not supported by
+Expo Go. Development builds use Google's official sample app/unit IDs. A
+production config evaluation fails unless the two owner app IDs and four
+platform/placement unit IDs documented in `.env.example` are valid, unique,
+and not Google sample IDs. Remote `/client-config` policy and UMP consent still
+default every placement off at runtime.
+
 ## Run
 
 ```bash
@@ -135,6 +142,14 @@ EXPO_PUBLIC_API_URL=http://192.168.1.5:4000 npx expo start
 
 (When unset and the app is served from Metro, the app also auto-derives the
 dev machine's LAN IP from `expoConfig.hostUri` as a fallback.)
+
+### Production AdMob IDs
+
+Set all six values from `.env.example` for production EAS/export builds. App
+IDs use the `ca-app-pub-…~…` form; ad-unit IDs use `ca-app-pub-…/…`. Never use
+Google's sample IDs in a store build. Ads remain disabled until the backend
+operator explicitly sets `ADS_ENABLED=true`, `ADS_AUDIENCE_MODE=adult-only`,
+and the individual placement switch after the audience decision is approved.
 
 ## Project structure
 

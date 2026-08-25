@@ -1,6 +1,7 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import React, { createContext, useContext, useEffect, useMemo } from 'react';
 
-import type { NativeLanguage } from './types';
+import type { UiLanguage } from './types';
+export type { UiLanguage } from './types';
 
 /**
  * Typed UI string catalog.
@@ -13,18 +14,16 @@ import type { NativeLanguage } from './types';
  * - Templates support simple `{placeholder}` substitution via `formatTemplate`.
  *
  * Language selection:
- * - Signed in: the account's `nativeLanguage`.
- * - Signed out: the signup screen's live preview choice, if any.
- * - Otherwise: the device locale, when it is one of the supported languages.
- * - Fallback: English.
+ * - Signed in: the account's `uiLanguage`.
+ * - Signed out: English.
+ * - `nativeLanguage` never selects interface copy; it is reserved for
+ *   learning help, native answers, and transcription hints.
  *
  * Components read strings with `useT()`/`useI18n()` so they re-render when the
  * language changes. Non-React code (API error mapping, auth errors, recorder
  * callbacks) uses `translate()`, which resolves the active language at call
  * time; the provider keeps that module-level language in sync.
  */
-
-export type UiLanguage = 'en' | NativeLanguage;
 
 export const SUPPORTED_UI_LANGUAGES: readonly UiLanguage[] = ['en', 'te', 'hi', 'es', 'zh'];
 
@@ -119,7 +118,8 @@ const en = {
   'signup.nameLabel': 'Name',
   'signup.namePlaceholder': 'Your name',
   'signup.passwordPlaceholder': 'At least 8 characters, with a letter and a number',
-  'signup.languageLabel': 'Your language',
+  'signup.languageLabel': 'Learning language',
+  'signup.languageHelp': 'Used for help and answers in your language.',
   'signup.submit': 'Create account',
   'signup.submitBusy': 'Creating your account…',
   'signup.failed': 'We could not create your account. Please check your information and try again.',
@@ -377,6 +377,7 @@ const en = {
   // ----- Screen titles (new routes) -----
   'header.home': 'Home',
   'header.history': 'History',
+  'header.recordings': 'My recordings',
   'header.settings': 'Settings',
   'header.privacy': 'Privacy Policy',
   'header.terms': 'Terms of Use',
@@ -424,6 +425,41 @@ const en = {
   'history.showDetails': 'Show details',
   'history.hideDetails': 'Hide details',
 
+  // ----- Saved recordings -----
+  'recordings.loading': 'Loading your recordings…',
+  'recordings.loadFailedTitle': 'We could not load your recordings',
+  'recordings.loadFailed': 'We could not load your recordings. Please try again.',
+  'recordings.emptyTitle': 'No saved recordings',
+  'recordings.emptyBody': 'Record and send an answer — your saved recordings will appear here.',
+  'recordings.loadMore': 'Show older recordings',
+  'recordings.loadingMore': 'Loading more…',
+  'recordings.intro':
+    'Listen to recordings you submitted, or delete only the audio while keeping your results.',
+  'recordings.contextDiagnostic': 'Level test',
+  'recordings.contextPractice': 'English practice',
+  'recordings.contextNative': 'Answer in your language',
+  'recordings.statusAvailable': 'Ready to play',
+  'recordings.statusPending': 'Being prepared',
+  'recordings.statusUnavailable': 'Unavailable',
+  'recordings.checkPending': 'Check pending recordings',
+  'recordings.yourRecording': 'Your recording',
+  'recordings.playLabel': 'Play your submitted recording',
+  'recordings.pauseLabel': 'Pause your submitted recording',
+  'recordings.playFailed': 'We could not play this recording. Please try again.',
+  'recordings.preparing': 'Preparing…',
+  'recordings.pending': 'This recording is still being prepared. We will check again briefly.',
+  'recordings.unavailable': 'This recording is unavailable.',
+  'recordings.deleteTitle': 'Delete this recording?',
+  'recordings.deleteBody':
+    'The audio will be deleted. Your score, transcript, and feedback will stay.',
+  'recordings.deleteBodyNamed':
+    'Delete the recording for “{name}”? Your score, transcript, and feedback will stay.',
+  'recordings.deleteAction': 'Delete recording',
+  'recordings.deleteHint': 'Deletes only the saved audio, not your result.',
+  'recordings.deleteFailed': 'We could not delete this recording. Please try again.',
+  'recordings.deleted': 'Recording deleted. Your result is still saved.',
+  'recordings.progressLabel': 'Recording playback progress',
+
   // ----- Skip word -----
   'practice.skipWord': 'Skip this word for now',
   'practice.skipFailedTitle': 'We could not skip this word',
@@ -450,7 +486,15 @@ const en = {
 
   // ----- Settings / profile -----
   'settings.profileTitle': 'Your profile',
+  'ads.label': 'Advertisement',
+  'ads.privacyOptions': 'Ad privacy choices',
+  'ads.privacyOptionsHelp': 'Review or change the privacy choices used for ads.',
+  'ads.privacyFailed': 'We could not open ad privacy choices. Please try again.',
   'settings.levelLabel': 'English level',
+  'settings.appLanguageLabel': 'App language',
+  'settings.appLanguageHelp': 'Choose the language used for buttons and messages.',
+  'settings.learningLanguageLabel': 'Learning language',
+  'settings.learningLanguageHelp': 'Used for help and answers in your language.',
   'settings.levelPending': 'Not tested yet',
   'settings.saveName': 'Save name',
   'settings.saveNameBusy': 'Saving…',
@@ -480,9 +524,10 @@ const en = {
   // ----- Legal (placeholder copy pending owner review) -----
   'legal.placeholderNote':
     'This page is a general example. The app owner must review and replace it before release.',
-  'privacy.p1': 'We store your name, email, and your practice answers.',
+  'privacy.p1':
+    'We store your name, email, practice answers, and successful submitted recordings so you can replay them until you delete the recording or your account.',
   'privacy.p2':
-    'We send your recordings to our server to check your English. We use AI services for this.',
+    'Failed or abandoned uploads are temporary. AI providers process submitted audio and its transcript to assess your answer.',
   'privacy.p3': 'You can export your data or delete your account at any time in Settings.',
   'terms.p1': 'This app helps you practice English. It does not give official certificates.',
   'terms.p2': 'Please use the app fairly. Do not share your account with other people.',
@@ -577,7 +622,8 @@ const te: Record<MessageKey, string> = {
   'signup.nameLabel': 'పేరు',
   'signup.namePlaceholder': 'మీ పేరు',
   'signup.passwordPlaceholder': 'కనీసం 8 అక్షరాలు, ఒక అక్షరం మరియు ఒక అంకెతో',
-  'signup.languageLabel': 'మీ భాష',
+  'signup.languageLabel': 'అభ్యాస భాష',
+  'signup.languageHelp': 'సహాయం మరియు మీ భాషలో సమాధానాల కోసం ఉపయోగించబడుతుంది.',
   'signup.submit': 'ఖాతా సృష్టించండి',
   'signup.submitBusy': 'మీ ఖాతా సృష్టిస్తున్నాము…',
   'signup.failed': 'మీ ఖాతాను సృష్టించలేకపోయాము. దయచేసి మీ సమాచారం చూసుకుని మళ్లీ ప్రయత్నించండి.',
@@ -821,6 +867,7 @@ const te: Record<MessageKey, string> = {
 
   'header.home': 'హోమ్',
   'header.history': 'చరిత్ర',
+  'header.recordings': 'నా రికార్డింగ్స్',
   'header.settings': 'సెట్టింగ్స్',
   'header.privacy': 'గోప్యతా విధానం',
   'header.terms': 'వాడుక నియమాలు',
@@ -864,6 +911,41 @@ const te: Record<MessageKey, string> = {
   'history.showDetails': 'వివరాలు చూపించు',
   'history.hideDetails': 'వివరాలు దాచు',
 
+  'recordings.loading': 'మీ రికార్డింగ్స్ లోడ్ అవుతున్నాయి…',
+  'recordings.loadFailedTitle': 'మీ రికార్డింగ్స్‌ను లోడ్ చేయలేకపోయాము',
+  'recordings.loadFailed': 'మీ రికార్డింగ్స్‌ను లోడ్ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'recordings.emptyTitle': 'సేవ్ చేసిన రికార్డింగ్స్ లేవు',
+  'recordings.emptyBody':
+    'జవాబు రికార్డ్ చేసి పంపండి — సేవ్ చేసిన రికార్డింగ్స్ ఇక్కడ కనిపిస్తాయి.',
+  'recordings.loadMore': 'పాత రికార్డింగ్స్ చూపించు',
+  'recordings.loadingMore': 'మరిన్ని లోడ్ అవుతున్నాయి…',
+  'recordings.intro':
+    'మీరు పంపిన రికార్డింగ్స్ వినండి, లేదా ఫలితాలను ఉంచుకుని ఆడియోను మాత్రమే తొలగించండి.',
+  'recordings.contextDiagnostic': 'స్థాయి పరీక్ష',
+  'recordings.contextPractice': 'ఇంగ్లీష్ ప్రాక్టీస్',
+  'recordings.contextNative': 'మీ భాషలో జవాబు',
+  'recordings.statusAvailable': 'ప్లే చేయడానికి సిద్ధం',
+  'recordings.statusPending': 'సిద్ధం అవుతోంది',
+  'recordings.statusUnavailable': 'అందుబాటులో లేదు',
+  'recordings.checkPending': 'సిద్ధమవుతున్న రికార్డింగ్స్ తనిఖీ చేయండి',
+  'recordings.yourRecording': 'మీ రికార్డింగ్',
+  'recordings.playLabel': 'మీరు పంపిన రికార్డింగ్ ప్లే చేయండి',
+  'recordings.pauseLabel': 'మీరు పంపిన రికార్డింగ్‌ను పాజ్ చేయండి',
+  'recordings.playFailed': 'ఈ రికార్డింగ్ ప్లే చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'recordings.preparing': 'సిద్ధం చేస్తున్నాము…',
+  'recordings.pending': 'ఈ రికార్డింగ్ ఇంకా సిద్ధమవుతోంది. కొద్దిసేపు మళ్లీ తనిఖీ చేస్తాము.',
+  'recordings.unavailable': 'ఈ రికార్డింగ్ అందుబాటులో లేదు.',
+  'recordings.deleteTitle': 'ఈ రికార్డింగ్‌ను తొలగించాలా?',
+  'recordings.deleteBody':
+    'ఆడియో తొలగించబడుతుంది. మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
+  'recordings.deleteBodyNamed':
+    '“{name}” రికార్డింగ్‌ను తొలగించాలా? మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
+  'recordings.deleteAction': 'రికార్డింగ్ తొలగించు',
+  'recordings.deleteHint': 'సేవ్ చేసిన ఆడియోను మాత్రమే తొలగిస్తుంది, ఫలితాన్ని కాదు.',
+  'recordings.deleteFailed': 'ఈ రికార్డింగ్‌ను తొలగించలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'recordings.deleted': 'రికార్డింగ్ తొలగించబడింది. మీ ఫలితం ఇంకా సేవ్ అయి ఉంది.',
+  'recordings.progressLabel': 'రికార్డింగ్ ప్లేబ్యాక్ పురోగతి',
+
   'practice.skipWord': 'ఈ పదాన్ని ఇప్పటికి దాటవేయండి',
   'practice.skipFailedTitle': 'ఈ పదాన్ని దాటవేయలేకపోయాము',
   'practice.skipFailed': 'ఈ పదాన్ని దాటవేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
@@ -886,7 +968,15 @@ const te: Record<MessageKey, string> = {
   'reset.backToLogin': 'లాగిన్‌కు వెళ్లండి',
 
   'settings.profileTitle': 'మీ ప్రొఫైల్',
+  'ads.label': 'ప్రకటన',
+  'ads.privacyOptions': 'ప్రకటన గోప్యత ఎంపికలు',
+  'ads.privacyOptionsHelp': 'ప్రకటనల కోసం ఉపయోగించే గోప్యత ఎంపికలను చూడండి లేదా మార్చండి.',
+  'ads.privacyFailed': 'ప్రకటన గోప్యత ఎంపికలను తెరవలేకపోయాము. మళ్లీ ప్రయత్నించండి.',
   'settings.levelLabel': 'ఇంగ్లీష్ స్థాయి',
+  'settings.appLanguageLabel': 'యాప్ భాష',
+  'settings.appLanguageHelp': 'బటన్లు మరియు సందేశాల కోసం ఉపయోగించే భాషను ఎంచుకోండి.',
+  'settings.learningLanguageLabel': 'అభ్యాస భాష',
+  'settings.learningLanguageHelp': 'సహాయం మరియు మీ భాషలో సమాధానాల కోసం ఉపయోగించబడుతుంది.',
   'settings.levelPending': 'ఇంకా పరీక్ష చేయలేదు',
   'settings.saveName': 'పేరు సేవ్ చేయండి',
   'settings.saveNameBusy': 'సేవ్ చేస్తున్నాము…',
@@ -914,9 +1004,10 @@ const te: Record<MessageKey, string> = {
 
   'legal.placeholderNote':
     'ఈ పేజీ ఒక సాధారణ ఉదాహరణ. విడుదలకు ముందు యాప్ యజమాని దీన్ని సమీక్షించి మార్చాలి.',
-  'privacy.p1': 'మేము మీ పేరు, ఇమెయిల్, మీ ప్రాక్టీస్ జవాబులను నిల్వ చేస్తాము.',
+  'privacy.p1':
+    'మీరు రికార్డింగ్ లేదా ఖాతాను తొలగించే వరకు మళ్లీ వినడానికి మీ పేరు, ఇమెయిల్, ప్రాక్టీస్ జవాబులు మరియు విజయవంతంగా పంపిన రికార్డింగ్స్‌ను నిల్వ చేస్తాము.',
   'privacy.p2':
-    'మీ ఇంగ్లీష్‌ను తనిఖీ చేయడానికి మీ రికార్డింగ్‌లను మా సర్వర్‌కు పంపుతాము. దీనికి AI సేవలను ఉపయోగిస్తాము.',
+    'విఫలమైన లేదా మధ్యలో వదిలిన అప్‌లోడ్లు తాత్కాలికం. పంపిన ఆడియోను మరియు దాని ట్రాన్స్‌క్రిప్ట్‌ను AI సేవలు ప్రాసెస్ చేస్తాయి.',
   'privacy.p3':
     'సెట్టింగ్స్‌లో మీరు ఎప్పుడైనా మీ డేటాను ఎగుమతి చేయవచ్చు లేదా మీ ఖాతాను తొలగించవచ్చు.',
   'terms.p1':
@@ -1011,7 +1102,8 @@ const hi: Record<MessageKey, string> = {
   'signup.nameLabel': 'नाम',
   'signup.namePlaceholder': 'आपका नाम',
   'signup.passwordPlaceholder': 'कम से कम 8 अक्षर, एक अक्षर और एक अंक के साथ',
-  'signup.languageLabel': 'आपकी भाषा',
+  'signup.languageLabel': 'सीखने की भाषा',
+  'signup.languageHelp': 'मदद और अपनी भाषा में जवाब देने के लिए इसका उपयोग होता है।',
   'signup.submit': 'खाता बनाएँ',
   'signup.submitBusy': 'आपका खाता बन रहा है…',
   'signup.failed': 'हम आपका खाता नहीं बना पाए। कृपया अपनी जानकारी जाँचें और फिर से कोशिश करें।',
@@ -1254,6 +1346,7 @@ const hi: Record<MessageKey, string> = {
 
   'header.home': 'होम',
   'header.history': 'इतिहास',
+  'header.recordings': 'मेरी रिकॉर्डिंग',
   'header.settings': 'सेटिंग्स',
   'header.privacy': 'गोपनीयता नीति',
   'header.terms': 'उपयोग की शर्तें',
@@ -1297,6 +1390,38 @@ const hi: Record<MessageKey, string> = {
   'history.showDetails': 'विवरण दिखाएँ',
   'history.hideDetails': 'विवरण छिपाएँ',
 
+  'recordings.loading': 'आपकी रिकॉर्डिंग लोड हो रही हैं…',
+  'recordings.loadFailedTitle': 'हम आपकी रिकॉर्डिंग लोड नहीं कर पाए',
+  'recordings.loadFailed': 'हम आपकी रिकॉर्डिंग लोड नहीं कर पाए। कृपया फिर से कोशिश करें।',
+  'recordings.emptyTitle': 'कोई रिकॉर्डिंग सहेजी नहीं गई',
+  'recordings.emptyBody': 'जवाब रिकॉर्ड करके भेजें — सहेजी गई रिकॉर्डिंग यहाँ दिखेंगी।',
+  'recordings.loadMore': 'पुरानी रिकॉर्डिंग दिखाएँ',
+  'recordings.loadingMore': 'और लोड हो रहा है…',
+  'recordings.intro': 'अपनी भेजी हुई रिकॉर्डिंग सुनें, या अपने नतीजे रखते हुए केवल ऑडियो हटाएँ।',
+  'recordings.contextDiagnostic': 'स्तर टेस्ट',
+  'recordings.contextPractice': 'अंग्रेज़ी प्रैक्टिस',
+  'recordings.contextNative': 'अपनी भाषा में जवाब',
+  'recordings.statusAvailable': 'चलाने के लिए तैयार',
+  'recordings.statusPending': 'तैयार हो रही है',
+  'recordings.statusUnavailable': 'उपलब्ध नहीं',
+  'recordings.checkPending': 'तैयार हो रही रिकॉर्डिंग जाँचें',
+  'recordings.yourRecording': 'आपकी रिकॉर्डिंग',
+  'recordings.playLabel': 'अपनी भेजी हुई रिकॉर्डिंग चलाएँ',
+  'recordings.pauseLabel': 'अपनी भेजी हुई रिकॉर्डिंग रोकें',
+  'recordings.playFailed': 'हम यह रिकॉर्डिंग नहीं चला पाए। कृपया फिर से कोशिश करें।',
+  'recordings.preparing': 'तैयार हो रही है…',
+  'recordings.pending': 'यह रिकॉर्डिंग अभी तैयार हो रही है। हम थोड़ी देर तक फिर जाँचेंगे।',
+  'recordings.unavailable': 'यह रिकॉर्डिंग उपलब्ध नहीं है।',
+  'recordings.deleteTitle': 'यह रिकॉर्डिंग हटाएँ?',
+  'recordings.deleteBody': 'ऑडियो हट जाएगा। आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
+  'recordings.deleteBodyNamed':
+    '“{name}” की रिकॉर्डिंग हटाएँ? आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
+  'recordings.deleteAction': 'रिकॉर्डिंग हटाएँ',
+  'recordings.deleteHint': 'केवल सहेजा हुआ ऑडियो हटाता है, आपका नतीजा नहीं।',
+  'recordings.deleteFailed': 'हम यह रिकॉर्डिंग नहीं हटा पाए। कृपया फिर से कोशिश करें।',
+  'recordings.deleted': 'रिकॉर्डिंग हटा दी गई। आपका नतीजा अभी भी सहेजा हुआ है।',
+  'recordings.progressLabel': 'रिकॉर्डिंग चलने की प्रगति',
+
   'practice.skipWord': 'यह शब्द अभी छोड़ दें',
   'practice.skipFailedTitle': 'हम यह शब्द नहीं छोड़ पाए',
   'practice.skipFailed': 'हम यह शब्द नहीं छोड़ पाए। कृपया फिर से कोशिश करें।',
@@ -1319,7 +1444,15 @@ const hi: Record<MessageKey, string> = {
   'reset.backToLogin': 'लॉग इन पर जाएँ',
 
   'settings.profileTitle': 'आपकी प्रोफ़ाइल',
+  'ads.label': 'विज्ञापन',
+  'ads.privacyOptions': 'विज्ञापन गोपनीयता विकल्प',
+  'ads.privacyOptionsHelp': 'विज्ञापनों के लिए उपयोग होने वाले गोपनीयता विकल्प देखें या बदलें।',
+  'ads.privacyFailed': 'हम विज्ञापन गोपनीयता विकल्प नहीं खोल पाए। फिर से कोशिश करें।',
   'settings.levelLabel': 'अंग्रेज़ी स्तर',
+  'settings.appLanguageLabel': 'ऐप की भाषा',
+  'settings.appLanguageHelp': 'बटन और संदेशों के लिए भाषा चुनें।',
+  'settings.learningLanguageLabel': 'सीखने की भाषा',
+  'settings.learningLanguageHelp': 'मदद और अपनी भाषा में जवाब देने के लिए इसका उपयोग होता है।',
   'settings.levelPending': 'अभी टेस्ट नहीं हुआ',
   'settings.saveName': 'नाम सहेजें',
   'settings.saveNameBusy': 'सहेज रहे हैं…',
@@ -1346,9 +1479,10 @@ const hi: Record<MessageKey, string> = {
 
   'legal.placeholderNote':
     'यह पेज एक सामान्य उदाहरण है। रिलीज़ से पहले ऐप के मालिक को इसे देखकर बदलना होगा।',
-  'privacy.p1': 'हम आपका नाम, ईमेल और आपके प्रैक्टिस जवाब सहेजते हैं।',
+  'privacy.p1':
+    'हम आपका नाम, ईमेल, प्रैक्टिस जवाब और सफलतापूर्वक भेजी गई रिकॉर्डिंग सहेजते हैं, ताकि रिकॉर्डिंग या खाता हटाने तक आप उन्हें फिर सुन सकें।',
   'privacy.p2':
-    'आपकी अंग्रेज़ी जाँचने के लिए हम आपकी रिकॉर्डिंग अपने सर्वर पर भेजते हैं। इसके लिए हम AI सेवाओं का उपयोग करते हैं।',
+    'असफल या अधूरे अपलोड अस्थायी होते हैं। AI सेवाएँ भेजे गए ऑडियो और उसकी ट्रांसक्रिप्ट को प्रोसेस करती हैं।',
   'privacy.p3': 'सेटिंग्स में आप कभी भी अपना डेटा निर्यात कर सकते हैं या अपना खाता हटा सकते हैं।',
   'terms.p1':
     'यह ऐप आपको अंग्रेज़ी की प्रैक्टिस में मदद करता है। यह आधिकारिक प्रमाणपत्र नहीं देता।',
@@ -1440,7 +1574,8 @@ const es: Record<MessageKey, string> = {
   'signup.nameLabel': 'Nombre',
   'signup.namePlaceholder': 'Tu nombre',
   'signup.passwordPlaceholder': 'Al menos 8 caracteres, con una letra y un número',
-  'signup.languageLabel': 'Tu idioma',
+  'signup.languageLabel': 'Idioma de aprendizaje',
+  'signup.languageHelp': 'Se usa para la ayuda y las respuestas en tu idioma.',
   'signup.submit': 'Crear cuenta',
   'signup.submitBusy': 'Creando tu cuenta…',
   'signup.failed': 'No pudimos crear tu cuenta. Revisa tu información e intenta de nuevo.',
@@ -1680,6 +1815,7 @@ const es: Record<MessageKey, string> = {
 
   'header.home': 'Inicio',
   'header.history': 'Historial',
+  'header.recordings': 'Mis grabaciones',
   'header.settings': 'Ajustes',
   'header.privacy': 'Política de privacidad',
   'header.terms': 'Condiciones de uso',
@@ -1723,6 +1859,40 @@ const es: Record<MessageKey, string> = {
   'history.showDetails': 'Ver detalles',
   'history.hideDetails': 'Ocultar detalles',
 
+  'recordings.loading': 'Cargando tus grabaciones…',
+  'recordings.loadFailedTitle': 'No pudimos cargar tus grabaciones',
+  'recordings.loadFailed': 'No pudimos cargar tus grabaciones. Intenta de nuevo.',
+  'recordings.emptyTitle': 'No hay grabaciones guardadas',
+  'recordings.emptyBody': 'Graba y envía una respuesta; tus grabaciones guardadas aparecerán aquí.',
+  'recordings.loadMore': 'Ver grabaciones anteriores',
+  'recordings.loadingMore': 'Cargando más…',
+  'recordings.intro':
+    'Escucha las grabaciones que enviaste o elimina solo el audio y conserva tus resultados.',
+  'recordings.contextDiagnostic': 'Prueba de nivel',
+  'recordings.contextPractice': 'Práctica de inglés',
+  'recordings.contextNative': 'Respuesta en tu idioma',
+  'recordings.statusAvailable': 'Lista para reproducir',
+  'recordings.statusPending': 'Preparándose',
+  'recordings.statusUnavailable': 'No disponible',
+  'recordings.checkPending': 'Comprobar grabaciones pendientes',
+  'recordings.yourRecording': 'Tu grabación',
+  'recordings.playLabel': 'Reproducir tu grabación enviada',
+  'recordings.pauseLabel': 'Pausar tu grabación enviada',
+  'recordings.playFailed': 'No pudimos reproducir esta grabación. Intenta de nuevo.',
+  'recordings.preparing': 'Preparando…',
+  'recordings.pending': 'Esta grabación aún se está preparando. La comprobaremos brevemente.',
+  'recordings.unavailable': 'Esta grabación no está disponible.',
+  'recordings.deleteTitle': '¿Eliminar esta grabación?',
+  'recordings.deleteBody':
+    'Se eliminará el audio. Tu puntuación, transcripción y comentarios se conservarán.',
+  'recordings.deleteBodyNamed':
+    '¿Eliminar la grabación de “{name}”? Tu puntuación, transcripción y comentarios se conservarán.',
+  'recordings.deleteAction': 'Eliminar grabación',
+  'recordings.deleteHint': 'Elimina solo el audio guardado, no tu resultado.',
+  'recordings.deleteFailed': 'No pudimos eliminar esta grabación. Intenta de nuevo.',
+  'recordings.deleted': 'Grabación eliminada. Tu resultado sigue guardado.',
+  'recordings.progressLabel': 'Progreso de reproducción de la grabación',
+
   'practice.skipWord': 'Saltar esta palabra por ahora',
   'practice.skipFailedTitle': 'No pudimos saltar esta palabra',
   'practice.skipFailed': 'No pudimos saltar esta palabra. Intenta de nuevo.',
@@ -1746,7 +1916,15 @@ const es: Record<MessageKey, string> = {
   'reset.backToLogin': 'Volver a iniciar sesión',
 
   'settings.profileTitle': 'Tu perfil',
+  'ads.label': 'Anuncio',
+  'ads.privacyOptions': 'Opciones de privacidad de anuncios',
+  'ads.privacyOptionsHelp': 'Revisa o cambia las opciones de privacidad usadas para los anuncios.',
+  'ads.privacyFailed': 'No pudimos abrir las opciones de privacidad. Intenta de nuevo.',
   'settings.levelLabel': 'Nivel de inglés',
+  'settings.appLanguageLabel': 'Idioma de la aplicación',
+  'settings.appLanguageHelp': 'Elige el idioma de los botones y mensajes.',
+  'settings.learningLanguageLabel': 'Idioma de aprendizaje',
+  'settings.learningLanguageHelp': 'Se usa para la ayuda y las respuestas en tu idioma.',
   'settings.levelPending': 'Aún sin prueba',
   'settings.saveName': 'Guardar nombre',
   'settings.saveNameBusy': 'Guardando…',
@@ -1774,9 +1952,10 @@ const es: Record<MessageKey, string> = {
 
   'legal.placeholderNote':
     'Esta página es un ejemplo general. El dueño de la app debe revisarla y cambiarla antes del lanzamiento.',
-  'privacy.p1': 'Guardamos tu nombre, tu email y tus respuestas de práctica.',
+  'privacy.p1':
+    'Guardamos tu nombre, email, respuestas y grabaciones enviadas correctamente para que puedas escucharlas hasta que borres la grabación o tu cuenta.',
   'privacy.p2':
-    'Enviamos tus grabaciones a nuestro servidor para revisar tu inglés. Usamos servicios de IA para esto.',
+    'Las subidas fallidas o abandonadas son temporales. Los servicios de IA procesan el audio enviado y su transcripción.',
   'privacy.p3': 'Puedes exportar tus datos o borrar tu cuenta en cualquier momento desde Ajustes.',
   'terms.p1': 'Esta app te ayuda a practicar inglés. No da certificados oficiales.',
   'terms.p2': 'Usa la app de forma justa, por favor. No compartas tu cuenta con otras personas.',
@@ -1861,7 +2040,8 @@ const zh: Record<MessageKey, string> = {
   'signup.nameLabel': '名字',
   'signup.namePlaceholder': '你的名字',
   'signup.passwordPlaceholder': '至少 8 个字符，包含一个字母和一个数字',
-  'signup.languageLabel': '你的语言',
+  'signup.languageLabel': '学习语言',
+  'signup.languageHelp': '用于帮助内容和用你的语言回答。',
   'signup.submit': '创建账户',
   'signup.submitBusy': '正在创建你的账户…',
   'signup.failed': '我们无法创建你的账户。请检查你的信息后再试一次。',
@@ -2083,6 +2263,7 @@ const zh: Record<MessageKey, string> = {
 
   'header.home': '首页',
   'header.history': '历史记录',
+  'header.recordings': '我的录音',
   'header.settings': '设置',
   'header.privacy': '隐私政策',
   'header.terms': '使用条款',
@@ -2126,6 +2307,37 @@ const zh: Record<MessageKey, string> = {
   'history.showDetails': '显示详情',
   'history.hideDetails': '隐藏详情',
 
+  'recordings.loading': '正在加载你的录音…',
+  'recordings.loadFailedTitle': '我们无法加载你的录音',
+  'recordings.loadFailed': '我们无法加载你的录音。请再试一次。',
+  'recordings.emptyTitle': '还没有保存的录音',
+  'recordings.emptyBody': '录制并发送回答后，保存的录音会显示在这里。',
+  'recordings.loadMore': '查看更早的录音',
+  'recordings.loadingMore': '正在加载更多…',
+  'recordings.intro': '收听你提交的录音，或只删除音频并保留学习结果。',
+  'recordings.contextDiagnostic': '等级测试',
+  'recordings.contextPractice': '英语练习',
+  'recordings.contextNative': '用你的语言回答',
+  'recordings.statusAvailable': '可以播放',
+  'recordings.statusPending': '正在准备',
+  'recordings.statusUnavailable': '不可用',
+  'recordings.checkPending': '检查待处理的录音',
+  'recordings.yourRecording': '你的录音',
+  'recordings.playLabel': '播放你提交的录音',
+  'recordings.pauseLabel': '暂停你提交的录音',
+  'recordings.playFailed': '我们无法播放这段录音。请再试一次。',
+  'recordings.preparing': '正在准备…',
+  'recordings.pending': '这段录音仍在准备中。我们会短暂重试。',
+  'recordings.unavailable': '这段录音不可用。',
+  'recordings.deleteTitle': '删除这段录音？',
+  'recordings.deleteBody': '音频会被删除，但你的分数、转写和反馈会保留。',
+  'recordings.deleteBodyNamed': '删除“{name}”的录音？你的分数、转写和反馈会保留。',
+  'recordings.deleteAction': '删除录音',
+  'recordings.deleteHint': '只删除保存的音频，不删除你的结果。',
+  'recordings.deleteFailed': '我们无法删除这段录音。请再试一次。',
+  'recordings.deleted': '录音已删除。你的结果仍然保留。',
+  'recordings.progressLabel': '录音播放进度',
+
   'practice.skipWord': '暂时跳过这个单词',
   'practice.skipFailedTitle': '我们无法跳过这个单词',
   'practice.skipFailed': '我们无法跳过这个单词。请再试一次。',
@@ -2148,7 +2360,15 @@ const zh: Record<MessageKey, string> = {
   'reset.backToLogin': '返回登录',
 
   'settings.profileTitle': '你的资料',
+  'ads.label': '广告',
+  'ads.privacyOptions': '广告隐私选项',
+  'ads.privacyOptionsHelp': '查看或更改广告使用的隐私选项。',
+  'ads.privacyFailed': '无法打开广告隐私选项。请再试一次。',
   'settings.levelLabel': '英语等级',
+  'settings.appLanguageLabel': '应用语言',
+  'settings.appLanguageHelp': '选择按钮和消息所用的语言。',
+  'settings.learningLanguageLabel': '学习语言',
+  'settings.learningLanguageHelp': '用于帮助内容和用你的语言回答。',
   'settings.levelPending': '还没有测试',
   'settings.saveName': '保存名字',
   'settings.saveNameBusy': '正在保存…',
@@ -2174,8 +2394,9 @@ const zh: Record<MessageKey, string> = {
   'reminder.notificationBody': '今天花几分钟练习英语吧。',
 
   'legal.placeholderNote': '本页面只是一个通用示例。应用所有者必须在发布前审核并替换它。',
-  'privacy.p1': '我们会保存你的名字、邮箱和练习回答。',
-  'privacy.p2': '我们会把你的录音发送到我们的服务器来检查你的英语。我们为此使用 AI 服务。',
+  'privacy.p1':
+    '我们会保存你的名字、邮箱、练习回答和成功提交的录音，供你重复收听，直到你删除录音或账户。',
+  'privacy.p2': '失败或放弃的上传是临时的。AI 服务会处理已提交的音频及其转写文本。',
   'privacy.p3': '你可以随时在设置里导出你的数据或删除你的账户。',
   'terms.p1': '这个应用帮助你练习英语。它不颁发官方证书。',
   'terms.p2': '请合理使用这个应用。不要把你的账户分享给别人。',
@@ -2234,12 +2455,12 @@ export function deviceLanguage(): UiLanguage {
 /**
  * The language used by non-React code (API error mapping, auth errors,
  * recorder callbacks). The provider keeps it in sync with the UI language; it
- * starts as the device language so signed-out flows are localized too.
+ * starts in English because every signed-out surface is deliberately English.
  */
 let activeLanguage: UiLanguage | null = null;
 
 export function getActiveLanguage(): UiLanguage {
-  return activeLanguage ?? deviceLanguage();
+  return activeLanguage ?? 'en';
 }
 
 export function setActiveLanguage(language: UiLanguage): void {
@@ -2256,11 +2477,6 @@ export type Translator = (key: MessageKey, params?: MessageParams) => string;
 interface I18nContextValue {
   language: UiLanguage;
   t: Translator;
-  /**
-   * Signed-out live preview (signup language chips). Ignored while a user is
-   * signed in; the account language always wins.
-   */
-  setPreviewLanguage: (language: UiLanguage | null) => void;
 }
 
 const I18nContext = createContext<I18nContextValue | null>(null);
@@ -2271,19 +2487,17 @@ const FALLBACK_CONTEXT: I18nContextValue = {
     return getActiveLanguage();
   },
   t: translate,
-  setPreviewLanguage: () => undefined,
 };
 
 export function I18nProvider({
-  userLanguage,
+  accountLanguage,
   children,
 }: {
-  /** The signed-in account's native language; null when signed out. */
-  userLanguage: NativeLanguage | null;
+  /** The signed-in account's UI language; null when signed out. */
+  accountLanguage: UiLanguage | null;
   children: React.ReactNode;
 }) {
-  const [preview, setPreview] = useState<UiLanguage | null>(null);
-  const language: UiLanguage = userLanguage ?? preview ?? deviceLanguage();
+  const language: UiLanguage = accountLanguage ?? 'en';
 
   // Alerts and API errors are built outside React at event time; keep the
   // module-level language they read in sync with the rendered language.
@@ -2295,7 +2509,6 @@ export function I18nProvider({
     () => ({
       language,
       t: (key, params) => translateFor(language, key, params),
-      setPreviewLanguage: setPreview,
     }),
     [language],
   );

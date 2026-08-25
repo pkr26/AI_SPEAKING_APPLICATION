@@ -109,6 +109,7 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'te',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -319,6 +320,7 @@ describe('root layout route guards', () => {
       'practice/attempt',
       'practice/feedback',
       'history',
+      'recordings',
       'settings/index',
       'settings/change-password',
       'settings/delete-account',

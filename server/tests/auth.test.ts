@@ -72,6 +72,15 @@ describe('auth: register validation', () => {
     });
   });
 
+  it('rejects an unsupported uiLanguage with 400', async () => {
+    const { res } = await registerUser(a, { uiLanguage: 'fr' });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({
+      error: "uiLanguage: uiLanguage must be one of 'en','te','hi','es','zh'",
+      code: 'VALIDATION_FAILED',
+    });
+  });
+
   it('rejects a short password (<8) with 400', async () => {
     const { res } = await registerUser(a, { password: 'ab1' });
     expect(res.status).toBe(400);
@@ -119,12 +128,26 @@ describe('auth: register validation', () => {
     expect(typeof res.body.token).toBe('string');
     expect(res.headers['cache-control']).toContain('no-store');
     expect(res.body.user.email).toBe(body.email);
+    expect(res.body.user.nativeLanguage).toBe('te');
+    expect(res.body.user.uiLanguage).toBe('en');
     expect(res.body.user.cefrLevel).toBeNull();
     expect(res.body.user.diagnosticCompleted).toBe(false);
 
     const { rows } = await pool.query('SELECT * FROM diagnostic_state WHERE user_id = $1', [res.body.user.id]);
     expect(rows).toHaveLength(1);
     expect(rows[0].questions_asked).toBe(0);
+  });
+
+  it('accepts an explicit supported uiLanguage independently of nativeLanguage', async () => {
+    const { res } = await registerUser(a, { nativeLanguage: 'te', uiLanguage: 'zh' });
+    expect(res.status).toBe(201);
+    expect(res.body.user).toMatchObject({ nativeLanguage: 'te', uiLanguage: 'zh' });
+
+    const stored = await pool.query<{ native_language: string; ui_language: string }>(
+      'SELECT native_language, ui_language FROM users WHERE id = $1',
+      [res.body.user.id],
+    );
+    expect(stored.rows[0]).toEqual({ native_language: 'te', ui_language: 'zh' });
   });
 
   it("accepts letters from the learner's writing system in passwords", async () => {
@@ -201,11 +224,12 @@ describe('auth: login', () => {
   });
 
   it('logs in with correct credentials', async () => {
-    const { res, body } = await registerUser(a);
+    const { res, body } = await registerUser(a, { nativeLanguage: 'te', uiLanguage: 'hi' });
     expect(res.status).toBe(201);
     const login = await request(a).post('/auth/login').send({ email: body.email, password: STRONG_PASSWORD });
     expect(login.status).toBe(200);
     expect(typeof login.body.token).toBe('string');
+    expect(login.body.user).toMatchObject({ nativeLanguage: 'te', uiLanguage: 'hi' });
     expect(login.headers['cache-control']).toContain('no-store');
   });
 
@@ -461,6 +485,7 @@ describe('auth: change-password token revocation', () => {
       .send({ currentPassword: STRONG_PASSWORD, newPassword });
     expect(changed.status).toBe(200);
     expect(typeof changed.body.token).toBe('string');
+    expect(changed.body.user.uiLanguage).toBe('en');
 
     const withOld = await request(a).get('/auth/me').set('Authorization', `Bearer ${oldToken}`);
     expect(withOld.status).toBe(401);
@@ -784,6 +809,7 @@ describe('auth: data export', () => {
     expect(r.status).toBe(200);
     expect(r.headers['cache-control']).toContain('no-store');
     expect(r.body.user.id).toBe(userId);
+    expect(r.body.user.uiLanguage).toBe('en');
     expect(r.body.user.password_hash).toBeUndefined();
     expect(r.body.attempts).toHaveLength(1);
     expect(r.body.attempts[0].transcript).toBe('hello');

@@ -95,6 +95,12 @@ describe('metrics initialization', () => {
         labelNames: ['janitor'],
         registers: [registry],
       },
+      {
+        name: 'recording_maintenance_total',
+        help: 'Durable recording retention/deletion maintenance outcomes',
+        labelNames: ['operation', 'outcome'],
+        registers: [registry],
+      },
     ]);
 
     for (const [name, help] of [

@@ -708,8 +708,8 @@ export function assertAudioInspectorAvailable({ force = false }: { force?: boole
   return availabilityInFlight;
 }
 
-/** Reject invalid, implausibly short, or overlong media before paid AI work. */
-export async function verifyAudioDuration(filePath: string): Promise<true> {
+/** Reject invalid, implausibly short, or overlong media and return measured duration. */
+export async function measureAudioDuration(filePath: string): Promise<number> {
   const releaseSlot = acquireInspectionSlot();
   let duration: number;
   try {
@@ -726,5 +726,11 @@ export async function verifyAudioDuration(filePath: string): Promise<true> {
   if (duration > MAX_AUDIO_DURATION_SECONDS) {
     throw new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG');
   }
+  return duration;
+}
+
+/** Backward-compatible boolean gate for callers that do not need metadata. */
+export async function verifyAudioDuration(filePath: string): Promise<true> {
+  await measureAudioDuration(filePath);
   return true;
 }

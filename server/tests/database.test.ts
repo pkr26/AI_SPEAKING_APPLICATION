@@ -56,7 +56,7 @@ describe('database content seeding', () => {
   it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
     resetQuestionInventoryReadinessCacheForTests();
     await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-      latestMigration: '015_public_strings_nonblank.sql',
+      latestMigration: '017_retained_recordings.sql',
     });
     const expectInventoryRejected = async () => {
       resetQuestionInventoryReadinessCacheForTests();
@@ -463,6 +463,47 @@ describe('migration 015 public-string invariants', () => {
         [schema],
       );
       expect(constraints.rows).toEqual([]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 016 user UI language', () => {
+  it('backfills existing users, defaults new users to English, and rejects unsupported values', async () => {
+    const client = await pool.connect();
+    const schema = `ui_language_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE users (id INTEGER PRIMARY KEY)');
+      await client.query('INSERT INTO users (id) VALUES (1)');
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/016_user_ui_language.sql'), 'utf8');
+      await client.query(sql);
+      await client.query('INSERT INTO users (id) VALUES (2)');
+
+      const rows = await client.query<{ id: number; ui_language: string }>(
+        'SELECT id, ui_language FROM users ORDER BY id',
+      );
+      expect(rows.rows).toEqual([
+        { id: 1, ui_language: 'en' },
+        { id: 2, ui_language: 'en' },
+      ]);
+
+      const column = await client.query<{ is_nullable: string; column_default: string }>(
+        `SELECT is_nullable, column_default
+         FROM information_schema.columns
+         WHERE table_schema = $1 AND table_name = 'users' AND column_name = 'ui_language'`,
+        [schema],
+      );
+      expect(column.rows).toEqual([{ is_nullable: 'NO', column_default: "'en'::text" }]);
+
+      await expect(client.query("INSERT INTO users (id, ui_language) VALUES (3, 'fr')")).rejects.toMatchObject({
+        code: '23514',
+      });
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();

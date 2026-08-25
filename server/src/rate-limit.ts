@@ -490,6 +490,18 @@ export function buildLimiters() {
     message: { error: 'Audio upload grant rate limit reached, please try again later', code: 'RATE_LIMITED' },
   });
 
+  const playbackGrant = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.playbackGrantWindowMs,
+    limit: config.rateLimit.playbackGrantMax,
+    store: new PostgresRateLimitStore(
+      `playback-grant:${config.rateLimit.playbackGrantWindowMs}:${config.rateLimit.playbackGrantMax}`,
+      config.rateLimit.playbackGrantWindowMs,
+    ),
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
+    message: { error: 'Recording playback rate limit reached, please try again later', code: 'RATE_LIMITED' },
+  });
+
   return {
     global,
     auth,
@@ -504,6 +516,7 @@ export function buildLimiters() {
     assessAbortGuard,
     respendAssessmentBudget,
     uploadGrant,
+    playbackGrant,
   };
 }
 

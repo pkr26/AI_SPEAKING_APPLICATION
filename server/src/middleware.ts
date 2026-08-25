@@ -96,6 +96,7 @@ export interface UserRow {
   email: string;
   password_hash: string;
   native_language: string;
+  ui_language: string;
   cefr_level: string | null;
   diagnostic_completed: boolean;
   token_version: number;

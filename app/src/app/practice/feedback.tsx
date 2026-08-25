@@ -6,6 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 
 import Button from '../../components/Button';
+import RecordingPlayback from '../../components/RecordingPlayback';
 import { useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
 import { usePracticeFlow } from '../../lib/practice-flow';
@@ -418,6 +419,13 @@ export default function FeedbackScreen() {
             <>
               <Text style={styles.cardLabel}>{t('feedback.sayInEnglish')}</Text>
               <Text style={styles.modelAnswer}>{result.modelAnswer}</Text>
+            </>
+          )}
+
+          {user && result.recordingId && (
+            <>
+              <Text style={styles.cardLabel}>{t('recordings.yourRecording')}</Text>
+              <RecordingPlayback ownerId={user.id} recordingId={result.recordingId} />
             </>
           )}
         </View>

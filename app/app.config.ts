@@ -1,0 +1,196 @@
+import type { ConfigContext, ExpoConfig } from 'expo/config';
+
+import appJson from './app.json';
+
+export const SAMPLE_ADMOB_ANDROID_APP_ID = 'ca-app-pub-3940256099942544~3347511713';
+export const SAMPLE_ADMOB_IOS_APP_ID = 'ca-app-pub-3940256099942544~1458002511';
+export const SAMPLE_HOME_BANNER_ANDROID_UNIT_ID = 'ca-app-pub-3940256099942544/9214589741';
+export const SAMPLE_HOME_BANNER_IOS_UNIT_ID = 'ca-app-pub-3940256099942544/2435281174';
+export const SAMPLE_HISTORY_NATIVE_ANDROID_UNIT_ID = 'ca-app-pub-3940256099942544/2247696110';
+export const SAMPLE_HISTORY_NATIVE_IOS_UNIT_ID = 'ca-app-pub-3940256099942544/3986624511';
+
+const ADMOB_APP_ID = /^ca-app-pub-\d{16}~\d{10}$/;
+const ADMOB_UNIT_ID = /^ca-app-pub-\d{16}\/\d{10}$/;
+
+/** Current Google/participating-buyer list from the AdMob iOS privacy guide. */
+export const GOOGLE_SKADNETWORK_IDENTIFIERS = [
+  'cstr6suwn9.skadnetwork',
+  '4fzdc2evr5.skadnetwork',
+  '2fnua5tdw4.skadnetwork',
+  'ydx93a7ass.skadnetwork',
+  'p78axxw29g.skadnetwork',
+  'v72qych5uu.skadnetwork',
+  'ludvb6z3bs.skadnetwork',
+  'cp8zw746q7.skadnetwork',
+  '3sh42y64q3.skadnetwork',
+  'c6k4g5qg8m.skadnetwork',
+  's39g8k73mm.skadnetwork',
+  'wg4vff78zm.skadnetwork',
+  '3qy4746246.skadnetwork',
+  'f38h382jlk.skadnetwork',
+  'hs6bdukanm.skadnetwork',
+  'mlmmfzh3r3.skadnetwork',
+  'v4nxqhlyqp.skadnetwork',
+  'wzmmz9fp6w.skadnetwork',
+  'su67r6k2v3.skadnetwork',
+  'yclnxrl5pm.skadnetwork',
+  't38b2kh725.skadnetwork',
+  '7ug5zh24hu.skadnetwork',
+  'gta9lk7p23.skadnetwork',
+  'vutu7akeur.skadnetwork',
+  'y5ghdn5j9k.skadnetwork',
+  'v9wttpbfk9.skadnetwork',
+  'n38lu8286q.skadnetwork',
+  '47vhws6wlr.skadnetwork',
+  'kbd757ywx3.skadnetwork',
+  '9t245vhmpl.skadnetwork',
+  'a2p9lx4jpn.skadnetwork',
+  '22mmun2rn5.skadnetwork',
+  '44jx6755aq.skadnetwork',
+  'k674qkevps.skadnetwork',
+  '4468km3ulz.skadnetwork',
+  '2u9pt9hc89.skadnetwork',
+  '8s468mfl3y.skadnetwork',
+  'klf5c3l5u5.skadnetwork',
+  'ppxm28t8ap.skadnetwork',
+  'kbmxgpxpgc.skadnetwork',
+  'uw77j35x4d.skadnetwork',
+  '578prtvx9j.skadnetwork',
+  '4dzt52r2t5.skadnetwork',
+  'tl55sbb4fm.skadnetwork',
+  'c3frkrj4fj.skadnetwork',
+  'e5fvkxwrpn.skadnetwork',
+  '8c4e2ghe7u.skadnetwork',
+  '3rd42ekr43.skadnetwork',
+  '97r2b46745.skadnetwork',
+  '3qcr597p9d.skadnetwork',
+] as const;
+
+const UMP_PROGUARD_RULES = `
+# Google User Messaging Platform consent SDK.
+-keep class com.google.android.gms.internal.consent_sdk.** { *; }
+`.trim();
+
+function productionAppId(name: string, value: string | undefined, sample: string): string {
+  const normalized = value?.trim();
+  if (
+    !normalized ||
+    !ADMOB_APP_ID.test(normalized) ||
+    normalized === sample ||
+    normalized.startsWith('ca-app-pub-3940256099942544~')
+  ) {
+    throw new Error(`${name} must be a real AdMob app ID in production`);
+  }
+  return normalized;
+}
+
+function productionUnitId(name: string, value: string | undefined, sample: string): string {
+  const normalized = value?.trim();
+  if (
+    !normalized ||
+    !ADMOB_UNIT_ID.test(normalized) ||
+    normalized === sample ||
+    normalized.startsWith('ca-app-pub-3940256099942544/')
+  ) {
+    throw new Error(`${name} must be a real AdMob unit ID in production`);
+  }
+  return normalized;
+}
+
+export default (
+  { config }: ConfigContext,
+  environment: NodeJS.ProcessEnv = process.env,
+): ExpoConfig => {
+  const production = environment.NODE_ENV === 'production';
+  const androidAppId = production
+    ? productionAppId(
+        'ADMOB_ANDROID_APP_ID',
+        environment.ADMOB_ANDROID_APP_ID,
+        SAMPLE_ADMOB_ANDROID_APP_ID,
+      )
+    : SAMPLE_ADMOB_ANDROID_APP_ID;
+  const iosAppId = production
+    ? productionAppId('ADMOB_IOS_APP_ID', environment.ADMOB_IOS_APP_ID, SAMPLE_ADMOB_IOS_APP_ID)
+    : SAMPLE_ADMOB_IOS_APP_ID;
+  if (production && androidAppId === iosAppId) {
+    throw new Error('ADMOB Android and iOS app IDs must be different in production');
+  }
+  const homeBannerAndroidUnitId = production
+    ? productionUnitId(
+        'EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID',
+        environment.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID,
+        SAMPLE_HOME_BANNER_ANDROID_UNIT_ID,
+      )
+    : SAMPLE_HOME_BANNER_ANDROID_UNIT_ID;
+  const homeBannerIosUnitId = production
+    ? productionUnitId(
+        'EXPO_PUBLIC_ADMOB_IOS_HOME_BANNER_ID',
+        environment.EXPO_PUBLIC_ADMOB_IOS_HOME_BANNER_ID,
+        SAMPLE_HOME_BANNER_IOS_UNIT_ID,
+      )
+    : SAMPLE_HOME_BANNER_IOS_UNIT_ID;
+  const historyNativeAndroidUnitId = production
+    ? productionUnitId(
+        'EXPO_PUBLIC_ADMOB_ANDROID_HISTORY_NATIVE_ID',
+        environment.EXPO_PUBLIC_ADMOB_ANDROID_HISTORY_NATIVE_ID,
+        SAMPLE_HISTORY_NATIVE_ANDROID_UNIT_ID,
+      )
+    : SAMPLE_HISTORY_NATIVE_ANDROID_UNIT_ID;
+  const historyNativeIosUnitId = production
+    ? productionUnitId(
+        'EXPO_PUBLIC_ADMOB_IOS_HISTORY_NATIVE_ID',
+        environment.EXPO_PUBLIC_ADMOB_IOS_HISTORY_NATIVE_ID,
+        SAMPLE_HISTORY_NATIVE_IOS_UNIT_ID,
+      )
+    : SAMPLE_HISTORY_NATIVE_IOS_UNIT_ID;
+  if (
+    production &&
+    new Set([
+      homeBannerAndroidUnitId,
+      homeBannerIosUnitId,
+      historyNativeAndroidUnitId,
+      historyNativeIosUnitId,
+    ]).size !== 4
+  ) {
+    throw new Error('AdMob production unit IDs must be unique per platform and placement');
+  }
+  const base = appJson.expo as ExpoConfig;
+  const plugins = (base.plugins ?? []).filter((plugin) => {
+    const name = Array.isArray(plugin) ? plugin[0] : plugin;
+    return name !== 'react-native-google-mobile-ads' && name !== 'expo-build-properties';
+  });
+
+  return {
+    ...config,
+    ...base,
+    extra: {
+      ...base.extra,
+      admob: {
+        homeBannerAndroidUnitId,
+        homeBannerIosUnitId,
+        historyNativeAndroidUnitId,
+        historyNativeIosUnitId,
+      },
+    },
+    plugins: [
+      ...plugins,
+      [
+        'react-native-google-mobile-ads',
+        {
+          androidAppId,
+          iosAppId,
+          delayAppMeasurementInit: true,
+          skAdNetworkItems: [...GOOGLE_SKADNETWORK_IDENTIFIERS],
+          userTrackingUsageDescription:
+            'This identifier may be used to show ads and measure their performance when you allow it.',
+        },
+      ],
+      [
+        'expo-build-properties',
+        {
+          android: { extraProguardRules: UMP_PROGUARD_RULES },
+        },
+      ],
+    ],
+  };
+};

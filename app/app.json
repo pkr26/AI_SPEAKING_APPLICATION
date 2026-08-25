@@ -58,7 +58,9 @@
             "backgroundColor": "#0F1417"
           }
         }
-      ]
+      ],
+      "react-native-google-mobile-ads",
+      "expo-build-properties"
     ]
   }
 }

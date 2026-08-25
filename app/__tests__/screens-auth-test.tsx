@@ -157,6 +157,7 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -956,31 +957,30 @@ describe('login screen', () => {
   });
 });
 
-// The signup screen live-previews the tapped chip language, so helpers accept
-// the language the screen is currently rendered in.
-async function fillSignup(name: string, email: string, password: string, lang: UiLanguage = 'en') {
+// Learning-language chips never relocalize signed-out UI; the optional
+// argument remains so ownership/race tests can keep their concise call shape.
+async function fillSignup(name: string, email: string, password: string, _lang: UiLanguage = 'en') {
   await fireEvent.changeText(
-    screen.getByPlaceholderText(translateFor(lang, 'signup.namePlaceholder')),
+    screen.getByPlaceholderText(translateFor('en', 'signup.namePlaceholder')),
     name,
   );
   await fireEvent.changeText(
-    screen.getByPlaceholderText(translateFor(lang, 'login.emailPlaceholder')),
+    screen.getByPlaceholderText(translateFor('en', 'login.emailPlaceholder')),
     email,
   );
   await fireEvent.changeText(
-    screen.getByPlaceholderText(translateFor(lang, 'signup.passwordPlaceholder')),
+    screen.getByPlaceholderText(translateFor('en', 'signup.passwordPlaceholder')),
     password,
   );
 }
 
-function signUpButton(lang: UiLanguage = 'en') {
-  return screen.getByRole('button', { name: translateFor(lang, 'signup.submit') });
+function signUpButton(_lang: UiLanguage = 'en') {
+  return screen.getByRole('button', { name: translateFor('en', 'signup.submit') });
 }
 
 /**
- * Reports the provider's language from outside the signup route, so a preview
- * that outlives the screen is observable the way login and the reset flow see
- * it.
+ * Reports the provider language outside signup so chip presses cannot hide a
+ * signed-out relocalization side effect.
  */
 function LanguageProbe() {
   const { language } = useI18n();
@@ -1235,27 +1235,17 @@ describe('signup screen', () => {
     });
   });
 
-  it('drops the previewed language once the signup screen is left', async () => {
-    const view = await render(
-      <I18nProvider userLanguage={null}>
+  it('keeps signed-out UI English when a learning language is selected', async () => {
+    await render(
+      <I18nProvider accountLanguage={null}>
         <SignupScreen />
         <LanguageProbe />
       </I18nProvider>,
     );
 
-    // The preview is provider-wide while signup is on screen.
     await fireEvent.press(screen.getByLabelText('Chinese (Simplified), 简体中文'));
-    expect(screen.getByTestId('provider-language')).toHaveTextContent('zh');
-
-    // Leaving signup must not strand login, the reset flow, and event-time copy
-    // in a language the user only sampled: no signed-out screen offers a chip
-    // back to English.
-    await view.rerender(
-      <I18nProvider userLanguage={null}>
-        <LanguageProbe />
-      </I18nProvider>,
-    );
     expect(screen.getByTestId('provider-language')).toHaveTextContent('en');
+    expect(screen.getByText(t('signup.title'))).toBeTruthy();
   });
 
   it('enforces trimmed name and email boundaries', async () => {
@@ -1321,25 +1311,17 @@ describe('signup screen', () => {
   it('chains name to email to password and submits from the password field', async () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
-    // The chip press relabels every field in Telugu via the live preview.
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
-    const emailFocus = spyOnTextInputFocus(
-      screen.getByLabelText(translateFor('te', 'login.emailLabel')),
-    );
-    const passwordFocus = spyOnTextInputFocus(
-      screen.getByLabelText(translateFor('te', 'login.passwordLabel')),
-    );
+    const emailFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.emailLabel')));
+    const passwordFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.passwordLabel')));
 
-    await fireEvent(screen.getByLabelText(translateFor('te', 'signup.nameLabel')), 'submitEditing');
+    await fireEvent(screen.getByLabelText(t('signup.nameLabel')), 'submitEditing');
     expect(emailFocus).toHaveBeenCalledTimes(1);
 
-    await fireEvent(screen.getByLabelText(translateFor('te', 'login.emailLabel')), 'submitEditing');
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'submitEditing');
     expect(passwordFocus).toHaveBeenCalledTimes(1);
 
-    await fireEvent(
-      screen.getByLabelText(translateFor('te', 'login.passwordLabel')),
-      'submitEditing',
-    );
+    await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.register).toHaveBeenCalledWith(
       'Ada',
@@ -1359,18 +1341,12 @@ describe('signup screen', () => {
 
     // A chosen language alone is not enough once the name is blanked out.
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
-    await fireEvent.changeText(
-      screen.getByPlaceholderText(translateFor('te', 'signup.namePlaceholder')),
-      '   ',
-    );
-    await fireEvent(
-      screen.getByLabelText(translateFor('te', 'login.passwordLabel')),
-      'submitEditing',
-    );
+    await fireEvent.changeText(screen.getByPlaceholderText(t('signup.namePlaceholder')), '   ');
+    await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
 
     expect(mockAuthValue.register).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
-    expect(screen.queryByText(translateFor('te', 'signup.submitBusy'))).toBeNull();
+    expect(screen.queryByText(t('signup.submitBusy'))).toBeNull();
   });
 
   it('keeps the name and email return keys harmless once the screen is gone', async () => {
@@ -1462,45 +1438,34 @@ describe('signup screen', () => {
     await fillSignup('Ada', 'ada@example.com', `a1${'é'.repeat(36)}`);
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
-    // The inline policy error follows the live-preview language.
-    expect(screen.getByText(translateFor('te', 'password.tooLong'))).toBeTruthy();
+    expect(screen.getByText(t('password.tooLong'))).toBeTruthy();
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
     expect(mockAuthValue.register).not.toHaveBeenCalled();
   });
 
-  it('previews the whole signup screen in the tapped chip language', async () => {
+  it('does not use a learning-language chip as the app language', async () => {
     await render(<SignupScreen />);
     expect(screen.getByText(t('signup.title'))).toBeTruthy();
     expect(screen.getByText(t('signup.submit'))).toBeTruthy();
 
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
-    expect(screen.getByText(translateFor('te', 'signup.title'))).toBeTruthy();
-    expect(screen.getByText(translateFor('te', 'signup.submit'))).toBeTruthy();
-    expect(screen.queryByText(t('signup.title'))).toBeNull();
-    expect(screen.queryByText(t('signup.submit'))).toBeNull();
+    expect(screen.getByText(t('signup.title'))).toBeTruthy();
+    expect(screen.getByText(t('signup.submit'))).toBeTruthy();
 
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
-    expect(screen.getByText(translateFor('es', 'signup.title'))).toBeTruthy();
-    expect(screen.getByText(translateFor('es', 'signup.submit'))).toBeTruthy();
-    expect(screen.queryByText(translateFor('te', 'signup.title'))).toBeNull();
-    expect(screen.queryByText(translateFor('te', 'signup.submit'))).toBeNull();
+    expect(screen.getByText(t('signup.title'))).toBeTruthy();
+    expect(screen.getByText(t('signup.submit'))).toBeTruthy();
   });
 
-  it('renders inline password-policy errors in the preview language', async () => {
+  it('keeps inline password-policy errors in signed-out English', async () => {
     await render(<SignupScreen />);
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
-    await fireEvent.changeText(
-      screen.getByPlaceholderText(translateFor('te', 'signup.passwordPlaceholder')),
-      'ab1',
-    );
-    expect(screen.getByText(translateFor('te', 'password.tooShort'))).toBeTruthy();
-    expect(screen.queryByText(t('password.tooShort'))).toBeNull();
+    await fireEvent.changeText(screen.getByPlaceholderText(t('signup.passwordPlaceholder')), 'ab1');
+    expect(screen.getByText(t('password.tooShort'))).toBeTruthy();
 
-    // Switching the preview re-renders the existing error in the new language.
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
-    expect(screen.getByText(translateFor('es', 'password.tooShort'))).toBeTruthy();
-    expect(screen.queryByText(translateFor('te', 'password.tooShort'))).toBeNull();
+    expect(screen.getByText(t('password.tooShort'))).toBeTruthy();
   });
 
   it('registers and navigates home on success', async () => {
@@ -1548,7 +1513,7 @@ describe('signup screen', () => {
 
     try {
       const busyButton = await screen.findByRole('button', {
-        name: translateFor('te', 'signup.submitBusy'),
+        name: t('signup.submitBusy'),
       });
       expect(busyButton.props.accessibilityState).toEqual({
         disabled: true,
@@ -1576,7 +1541,7 @@ describe('signup screen', () => {
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const submit = committedPressHandler(signUpButton('te'));
     const loginBeforeBusy = screen.getByRole('link', {
-      name: translateFor('te', 'signup.footerLink'),
+      name: t('signup.footerLink'),
     });
     const openLogin = committedPressHandler(loginBeforeBusy);
     let preventedBack!: jest.Mock;
@@ -1597,7 +1562,7 @@ describe('signup screen', () => {
     expect(resetRemoval).not.toHaveBeenCalled();
     expect(mockSetOptions).toHaveBeenCalledWith(LOCKED_NAVIGATION_OPTIONS);
     const loginLink = screen.getByRole('link', {
-      name: translateFor('te', 'signup.footerLink'),
+      name: t('signup.footerLink'),
     });
     expect(loginLink.props.accessibilityState).toMatchObject({ disabled: true });
     await fireEvent.press(loginLink);
@@ -1608,7 +1573,7 @@ describe('signup screen', () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(await screen.findByText(translateFor('te', 'signup.failed'))).toBeTruthy();
+    expect(await screen.findByText(t('signup.failed'))).toBeTruthy();
     expect(hardwareBackIsHandled()).toBe(false);
     expect(dispatchBeforeRemove('GO_BACK')).not.toHaveBeenCalled();
     expect(mockSetOptions).toHaveBeenCalledWith(UNLOCKED_NAVIGATION_OPTIONS);
@@ -1677,7 +1642,7 @@ describe('signup screen', () => {
     await fireEvent.press(signUpButton('te'));
 
     // The screen translator follows the previewed language.
-    const alert = await screen.findByText(translateFor('te', 'error.emailTaken'));
+    const alert = await screen.findByText(t('error.emailTaken'));
     expect(alert.props.accessibilityRole).toBe('alert');
     expect(flattenedStyle(alert)).toEqual({
       marginTop: 14,
@@ -1721,7 +1686,7 @@ describe('signup screen', () => {
     await fireEvent.press(signUpButton('te'));
 
     // The fallback comes from the screen translator, so it is previewed Telugu.
-    expect(await screen.findByText(translateFor('te', 'signup.failed'))).toBeTruthy();
+    expect(await screen.findByText(t('signup.failed'))).toBeTruthy();
     expect(signUpButton('te').props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(signUpButton('te'));

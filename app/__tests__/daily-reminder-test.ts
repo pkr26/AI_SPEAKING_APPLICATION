@@ -149,7 +149,7 @@ describe('getDailyReminder', () => {
 
     scheduled.resolve('notification-id');
     await expect(enabling).resolves.toBe('enabled');
-    await expect(reading).resolves.toEqual({ hour: 19 });
+    await expect(reading).resolves.toEqual({ hour: 19, uiLanguage: 'en' });
     expect(readsBeforeRelease).toBe(0);
   });
 
@@ -178,7 +178,7 @@ describe('enableDailyReminder', () => {
     });
     expect(setItemAsync).toHaveBeenCalledWith(
       'daily_reminder_v1',
-      JSON.stringify({ hour: 19 }),
+      JSON.stringify({ hour: 19, uiLanguage: 'en' }),
       STORAGE_OPTIONS,
     );
     // Notification channels are Android-only (on iOS the call just logs and
@@ -468,7 +468,10 @@ describe('refreshDailyReminderLanguage', () => {
   it('reads and re-schedules an enabled reminder inside one queued transaction', async () => {
     withPersistedReminder({ hour: 8 });
 
-    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({ hour: 8 });
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({
+      hour: 8,
+      uiLanguage: 'hi',
+    });
 
     expect(mockScheduleNotificationAsync).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -479,7 +482,17 @@ describe('refreshDailyReminderLanguage', () => {
         trigger: expect.objectContaining({ hour: 8 }),
       }),
     );
-    await expect(getDailyReminder()).resolves.toEqual({ hour: 8 });
+    await expect(getDailyReminder()).resolves.toEqual({ hour: 8, uiLanguage: 'hi' });
+  });
+
+  it('does not rebuild notification copy when the stored UI language already matches', async () => {
+    withPersistedReminder({ hour: 8, uiLanguage: 'hi' });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({
+      hour: 8,
+      uiLanguage: 'hi',
+    });
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
   });
 
   it('returns null without scheduling when reminders are off', async () => {
@@ -505,7 +518,7 @@ describe('refreshDailyReminderLanguage', () => {
     const deletesBeforeRelease = deleteItemAsync.mock.calls.length;
 
     scheduled.resolve('notification-id');
-    await expect(refreshing).resolves.toEqual({ hour: 19 });
+    await expect(refreshing).resolves.toEqual({ hour: 19, uiLanguage: 'hi' });
     await expect(loggingOut).resolves.toBeUndefined();
     expect(deletesBeforeRelease).toBe(0);
     await expect(getDailyReminder()).resolves.toBeNull();

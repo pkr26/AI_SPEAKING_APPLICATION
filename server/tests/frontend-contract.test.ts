@@ -77,6 +77,7 @@ function expectEmpty204(response: { status: number; text: string }): void {
 async function registerAndParse(a: Express) {
   const registration = await registerUser(a);
   expect(registration.res.status).toBe(201);
+  expect(registration.res.body.user).toMatchObject({ nativeLanguage: 'te', uiLanguage: 'en' });
   expect(() => frontend.parseAuthResponse(registration.res.body)).not.toThrow();
   return {
     id: registration.res.body.user.id as string,
@@ -138,8 +139,9 @@ describe('real API responses satisfy the mobile app parsers', () => {
     const profile = await request(a)
       .patch('/auth/me')
       .set(bearer(user.token))
-      .send({ name: 'Contract Learner', nativeLanguage: 'hi' });
+      .send({ name: 'Contract Learner', nativeLanguage: 'hi', uiLanguage: 'es' });
     expect(profile.status).toBe(200);
+    expect(profile.body.user).toMatchObject({ nativeLanguage: 'hi', uiLanguage: 'es' });
     expect(() => frontend.parseUserResponse(profile.body)).not.toThrow();
 
     const grant = await request(a)

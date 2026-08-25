@@ -14,6 +14,9 @@ import {
   parsePracticeHistory,
   parsePracticeQuestion,
   parsePracticeStats,
+  parseRecordingExportPage,
+  parseRecordingPage,
+  parseRecordingPlaybackGrant,
   parseUser,
   parseUserDataPage,
   parseUserResponse,
@@ -27,6 +30,7 @@ const user = {
   name: 'Learner',
   email: 'learner@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 } as const;
@@ -62,6 +66,98 @@ describe('practice scoring constants', () => {
   });
 });
 
+describe('recording contracts', () => {
+  const recordingId = '550e8400-e29b-41d4-a716-446655440050';
+  const recording = {
+    id: recordingId,
+    questionId: question.id,
+    context: 'practice' as const,
+    promptWord: question.promptWord,
+    questionText: question.questionText,
+    cefrLevel: question.cefrLevel,
+    contentType: 'audio/mp4',
+    sizeBytes: 2_048,
+    durationMs: 8_000,
+    status: 'available' as const,
+    createdAt: '2026-08-25T00:00:00.000Z',
+    availableAt: '2026-08-25T00:00:01.000Z',
+  };
+  const playbackUrl =
+    'https://private.s3.us-west-1.amazonaws.com/object?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=x&X-Amz-Date=20260825T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=abc';
+
+  it('parses library, export, and short-lived playback contracts', () => {
+    expect(parseRecordingPage({ items: [recording], nextCursor: null })).toEqual({
+      items: [recording],
+      nextCursor: null,
+    });
+    expect(
+      parseRecordingExportPage({
+        recordings: [{ ...recording, requestId: question.id, attemptId: null }],
+        nextCursor: null,
+      }),
+    ).toEqual({
+      recordings: [{ ...recording, requestId: question.id, attemptId: null }],
+      nextCursor: null,
+    });
+    expect(
+      parseRecordingPlaybackGrant(
+        { recordingId, playbackUrl, expiresIn: 60, contentType: 'audio/mp4' },
+        recordingId,
+      ),
+    ).toEqual({ recordingId, playbackUrl, expiresIn: 60, contentType: 'audio/mp4' });
+  });
+
+  it.each([
+    { ...recording, id: 'bad' },
+    { ...recording, status: 'deleted' },
+    { ...recording, status: 'available', availableAt: null },
+    { ...recording, status: 'retention_pending', availableAt: recording.availableAt },
+    { ...recording, sizeBytes: 0 },
+    { ...recording, durationMs: 121_000 },
+  ])('rejects malformed recording metadata %#', (value) => {
+    expectContractError(() => parseRecordingPage({ items: [value], nextCursor: null }));
+  });
+
+  it.each([
+    'http://private.s3.us-west-1.amazonaws.com/object',
+    'https://evil.example.com/object?X-Amz-Expires=60',
+    'https://user:pass@private.s3.us-west-1.amazonaws.com/object?X-Amz-Expires=60',
+    'https://private.s3.us-west-1.amazonaws.com/object?X-Amz-Expires=300',
+  ])('rejects hostile playback URL %s', (url) => {
+    expectContractError(() =>
+      parseRecordingPlaybackGrant(
+        { recordingId, playbackUrl: url, expiresIn: 60, contentType: 'audio/mp4' },
+        recordingId,
+      ),
+    );
+  });
+
+  it('accepts additive recording ids in assessment outcomes and rejects malformed ids', () => {
+    const attempt = {
+      passed: true,
+      mastered: false,
+      attemptNo: 1,
+      score: 70,
+      transcript: 'Answer',
+      feedback: 'Good.',
+      next: practicePayload,
+      recordingId,
+    };
+    expect(parseAttemptResult(attempt).recordingId).toBe(recordingId);
+    expect(
+      parseNativeAttemptResult({
+        mode: 'native',
+        understood: true,
+        transcript: 'Respuesta',
+        modelAnswer: 'Answer.',
+        feedback: 'Good.',
+        recordingId,
+      }).recordingId,
+    ).toBe(recordingId);
+    expectContractError(() => parseAttemptResult({ ...attempt, recordingId: 'bad' }));
+  });
+});
+
 describe('identity contract parsers', () => {
   it('uses stable, actionable contract-error identity and copy', () => {
     expect(new ContractError()).toMatchObject({
@@ -83,6 +179,8 @@ describe('identity contract parsers', () => {
     null,
     [],
     { ...user, nativeLanguage: 'xx' },
+    { ...user, uiLanguage: 'fr' },
+    { ...user, uiLanguage: 'EN' },
     { ...user, cefrLevel: 1 },
     { ...user, cefrLevel: 'B9' },
     { ...user, id: 'not-a-uuid' },
@@ -695,6 +793,14 @@ describe('field validators', () => {
 
   it.each(['fr', 'TE', '', 't e', 'english'])('rejects native language %p', (nativeLanguage) => {
     expectContractError(() => parseUser({ ...user, nativeLanguage }));
+  });
+
+  it.each(['en', 'te', 'hi', 'es', 'zh'])('accepts UI language %s', (uiLanguage) => {
+    expect(parseUser({ ...user, uiLanguage })).toMatchObject({ uiLanguage });
+  });
+
+  it.each(['fr', 'EN', '', 'english'])('rejects UI language %p', (uiLanguage) => {
+    expectContractError(() => parseUser({ ...user, uiLanguage }));
   });
 
   it.each(['A1', 'A2', 'B2', 'C1', 'C2'])('accepts CEFR level %s', (cefrLevel) => {

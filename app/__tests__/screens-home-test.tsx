@@ -53,6 +53,7 @@ jest.mock('expo-router', () => {
         };
       }, [callback]);
     },
+    useIsFocused: () => true,
   };
 });
 
@@ -63,6 +64,7 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -179,7 +181,7 @@ function HardwareBackHarness({ consume }: { consume: boolean }) {
 function renderHomeInTelugu() {
   return render(
     <QueryClientProvider client={makeQueryClient()}>
-      <I18nProvider userLanguage="te">
+      <I18nProvider accountLanguage="te">
         <HomeScreen />
       </I18nProvider>
     </QueryClientProvider>,
@@ -644,6 +646,7 @@ describe('home screen', () => {
   it.each([
     [t('home.startPractice'), '/practice'],
     [t('header.history'), '/history'],
+    [t('header.recordings'), '/recordings'],
     [t('header.settings'), '/settings'],
   ] as const)('navigates once from %s after a rapid double tap', async (label, destination) => {
     mockGetStats.mockResolvedValue(STATS);
@@ -853,6 +856,7 @@ describe('home screen presentation', () => {
       marginTop: spacing.lg,
       flexDirection: 'row',
       justifyContent: 'center',
+      flexWrap: 'wrap',
       gap: spacing.xl,
     });
   });

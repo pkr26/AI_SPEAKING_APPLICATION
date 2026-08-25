@@ -4,6 +4,7 @@ import { pool } from './db';
 import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
 import { logger } from './logger';
 import { ApiErrorCode, HttpError } from './middleware';
+import { insertRetainedRecording, RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
@@ -41,6 +42,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const integer = (minimum: number, maximum: number) => z.number().finite().int().min(minimum).max(maximum);
 
   const uuid = z.string().regex(UUID_PATTERN);
+  const recordingFields = { recordingId: uuid.optional() } as const;
   const cefrLevel = z.enum(CEFR_LEVELS);
   const attemptNumber = integer(1, PRACTICE_MAX_ATTEMPTS);
   const failingScore = integer(0, PRACTICE_PASS_SCORE - 1);
@@ -85,12 +87,14 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
 
   const diagnosticOutcome = z.union([
     z.object({
+      ...recordingFields,
       passed: z.literal(false),
       score: failingScore,
       transcript: boundedString(12_000),
       feedback: nonEmptyString(800),
     }),
     z.object({
+      ...recordingFields,
       passed: z.literal(true),
       score: passingScore,
       transcript: boundedString(12_000),
@@ -104,6 +108,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const diagnosticResponse = z.intersection(diagnosticOutcome, diagnosticCompletion);
 
   const commonPracticeFields = {
+    ...recordingFields,
     attemptNo: attemptNumber,
     feedback: nonEmptyString(800),
   } as const;
@@ -202,6 +207,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   ]);
 
   const nativeCommonFields = {
+    ...recordingFields,
     mode: z.literal('native'),
     feedback: nonEmptyString(800),
   } as const;
@@ -373,18 +379,27 @@ export async function completeAssessmentRequest(
   claimId: string,
   response: Record<string, unknown>,
   context: AssessmentContext,
-): Promise<void> {
-  const validatedResponse = validatedAssessmentResponse(context, response);
+  recording?: RecordingCapture,
+): Promise<Record<string, unknown>> {
+  const publicResponse = recording ? { ...response, recordingId: recording.id } : response;
+  const validatedResponse = validatedAssessmentResponse(context, publicResponse);
   const completed = (await client.query(
     `UPDATE assessment_requests
      SET status = 'completed', response_body = $1::jsonb, completed_at = now()
      WHERE user_id = $2 AND request_id = $3 AND claim_id = $4
-       AND context = $5 AND status = 'processing'`,
+       AND context = $5 AND status = 'processing'
+     RETURNING question_id, audio_key`,
     [JSON.stringify(validatedResponse), userId, requestId, claimId, context],
-  )) as { rowCount?: number | null };
+  )) as { rowCount?: number | null; rows: Array<{ question_id: string; audio_key: string | null }> };
   if (completed.rowCount !== 1) {
     throw new HttpError(409, 'Assessment request ownership changed; please retry', 'STATE_CHANGED');
   }
+  if (recording) {
+    const owner = completed.rows[0];
+    if (!owner?.audio_key) throw new Error('recording completion has no authoritative S3 audio key');
+    await insertRetainedRecording(client, userId, requestId, owner.question_id, context, owner.audio_key, recording);
+  }
+  return publicResponse;
 }
 
 export async function abandonAssessmentRequest(userId: string, requestId: string, claimId: string): Promise<void> {

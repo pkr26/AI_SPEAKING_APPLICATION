@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { router, useFocusEffect } from 'expo-router';
+import { router, useFocusEffect, useIsFocused } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
@@ -12,6 +12,7 @@ import {
 } from 'react-native';
 
 import Button from '../components/Button';
+import HomeBannerAd from '../components/HomeBannerAd';
 import { apiGetPracticeStats, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
@@ -34,6 +35,7 @@ function DecorativeEmoji({ children, style }: { children: string; style: StylePr
  */
 export default function HomeScreen() {
   const { user, setUser, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
+  const focused = useIsFocused();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -59,7 +61,7 @@ export default function HomeScreen() {
     }, []),
   );
   const navigateOnce = useCallback(
-    (destination: '/practice' | '/history' | '/settings') => {
+    (destination: '/practice' | '/history' | '/recordings' | '/settings') => {
       if (navigationStartedRef.current || !isSessionLeaseCurrent(sessionLease)) return;
       navigationStartedRef.current = true;
       router.navigate(destination);
@@ -293,12 +295,19 @@ export default function HomeScreen() {
           onPress={() => navigateOnce('/history')}
         />
         <Button
+          title={t('header.recordings')}
+          variant="quiet"
+          size="sm"
+          onPress={() => navigateOnce('/recordings')}
+        />
+        <Button
           title={t('header.settings')}
           variant="quiet"
           size="sm"
           onPress={() => navigateOnce('/settings')}
         />
       </View>
+      <HomeBannerAd focused={focused} />
     </ScrollView>
   );
 }
@@ -459,6 +468,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginTop: spacing.lg,
     flexDirection: 'row',
     justifyContent: 'center',
+    flexWrap: 'wrap',
     gap: spacing.xl,
   },
 }));

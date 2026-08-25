@@ -1,8 +1,11 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import { useIsFocused } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, SectionList, Text, View } from 'react-native';
 
 import Button from '../components/Button';
+import HistoryNativeAdCard from '../components/HistoryNativeAdCard';
+import RecordingPlayback from '../components/RecordingPlayback';
 import { apiGetPracticeHistory, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n, type Translator, type UiLanguage } from '../lib/i18n';
@@ -64,7 +67,7 @@ function scoreChipStyles(styles: HistoryStyles, score: number) {
   return { chip: styles.scoreChipFailed, text: styles.scoreChipFailedText };
 }
 
-function HistoryRow({ item, t }: { item: HistoryItem; t: Translator }) {
+function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; t: Translator }) {
   const styles = themedStyles(useTheme());
   const [expanded, setExpanded] = useState(false);
   const chip = scoreChipStyles(styles, item.score);
@@ -125,6 +128,18 @@ function HistoryRow({ item, t }: { item: HistoryItem; t: Translator }) {
           )}
           <Text style={styles.detailLabel}>{t('feedback.feedbackLabel')}</Text>
           <Text style={styles.detailText}>{item.feedback}</Text>
+          {item.recordingId && (
+            <>
+              <Text style={styles.detailLabel}>{t('recordings.yourRecording')}</Text>
+              <RecordingPlayback
+                compact
+                ownerId={ownerId}
+                recordingId={item.recordingId}
+                recordingLabel={item.promptWord}
+                recordingStatus={item.recordingStatus}
+              />
+            </>
+          )}
         </View>
       )}
     </View>
@@ -134,6 +149,7 @@ function HistoryRow({ item, t }: { item: HistoryItem; t: Translator }) {
 /** Day-grouped, cursor-paged attempt history for the signed-in learner. */
 export default function HistoryScreen() {
   const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
+  const focused = useIsFocused();
   const { t, language } = useI18n();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -183,6 +199,7 @@ export default function HistoryScreen() {
     () => groupHistoryByDay(items, DATE_LOCALES[language]),
     [items, language],
   );
+  const historyAdAnchorId = items[7]?.id ?? null;
 
   // The route gate redirects after logout/session expiry.
   if (!user) return null;
@@ -287,8 +304,20 @@ export default function HistoryScreen() {
       contentContainerStyle={styles.listContent}
       contentInsetAdjustmentBehavior="automatic"
       sections={sections}
+      // Include enough initial cells for eight real rows even when day headers
+      // split them, so the audited ad anchor is not deferred by virtualization.
+      initialNumToRender={12}
       keyExtractor={(item) => item.id}
-      renderItem={({ item }) => <HistoryRow item={item} t={t} />}
+      renderItem={({ item }) => (
+        <>
+          <HistoryRow item={item} ownerId={user.id} t={t} />
+          {item.id === historyAdAnchorId ? (
+            <View style={styles.historyAdSlot}>
+              <HistoryNativeAdCard focused={focused} />
+            </View>
+          ) : null}
+        </>
+      )}
       renderSectionHeader={({ section }) => (
         <Text accessibilityRole="header" style={styles.sectionHeader}>
           {section.title}
@@ -297,38 +326,40 @@ export default function HistoryScreen() {
       onEndReachedThreshold={0.4}
       onEndReached={loadOlderOnScroll}
       ListFooterComponent={
-        historyQuery.isFetchingNextPage ? (
-          <View style={styles.footer}>
-            <ActivityIndicator color={theme.colors.primary} />
-            <Text accessibilityLiveRegion="polite" style={styles.muted}>
-              {t('history.loadingMore')}
-            </Text>
-          </View>
-        ) : historyQuery.isFetchNextPageError ? (
-          // The loaded answers stay on screen, so the full-screen error state
-          // above never runs for a failed older page: report it here instead of
-          // dropping back to a "Show older answers" button that says nothing.
-          <View style={styles.footer}>
-            <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-              {userMessageForError(historyQuery.error, t('history.loadFailed'))}
-            </Text>
+        <>
+          {historyQuery.isFetchingNextPage ? (
+            <View style={styles.footer}>
+              <ActivityIndicator color={theme.colors.primary} />
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('history.loadingMore')}
+              </Text>
+            </View>
+          ) : historyQuery.isFetchNextPageError ? (
+            // The loaded answers stay on screen, so the full-screen error state
+            // above never runs for a failed older page: report it here instead of
+            // dropping back to a "Show older answers" button that says nothing.
+            <View style={styles.footer}>
+              <Text accessibilityLiveRegion="assertive" style={styles.muted}>
+                {userMessageForError(historyQuery.error, t('history.loadFailed'))}
+              </Text>
+              <Button
+                title={t('common.tryAgain')}
+                variant="secondary"
+                fullWidth
+                onPress={loadOlder}
+                style={styles.retryButton}
+              />
+            </View>
+          ) : historyQuery.hasNextPage ? (
             <Button
-              title={t('common.tryAgain')}
+              title={t('history.loadMore')}
               variant="secondary"
               fullWidth
               onPress={loadOlder}
-              style={styles.retryButton}
+              style={styles.loadMoreButton}
             />
-          </View>
-        ) : historyQuery.hasNextPage ? (
-          <Button
-            title={t('history.loadMore')}
-            variant="secondary"
-            fullWidth
-            onPress={loadOlder}
-            style={styles.loadMoreButton}
-          />
-        ) : null
+          ) : null}
+        </>
       }
     />
   );
@@ -499,6 +530,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontStyle: 'italic',
     lineHeight: 22,
     color: colors.text,
+  },
+  historyAdSlot: {
+    marginTop: 24,
+    marginBottom: 24,
   },
   footer: {
     paddingVertical: spacing.lg,

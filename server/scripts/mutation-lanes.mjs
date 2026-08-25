@@ -20,6 +20,7 @@ function lane(mutate, testFiles) {
  */
 export const codeMutationLanes = Object.freeze({
   config: lane(['src/config.ts'], ['tests/config.test.ts']),
+  clientConfig: lane(['src/client-config.ts'], ['tests/client-config.test.ts']),
   db: lane(['src/db.ts'], ['tests/db-config.test.ts']),
   logger: lane(['src/logger.ts'], ['tests/logger.test.ts']),
   middleware: lane(['src/middleware.ts'], ['tests/middleware.test.ts']),
@@ -112,6 +113,10 @@ export const codeMutationLanes = Object.freeze({
   audioUpload: lane(
     ['src/audio-upload.ts'],
     ['tests/audio-upload.test.ts', 'tests/audio-upload-client.test.ts', 'tests/audio-upload-s3.test.ts'],
+  ),
+  recordings: lane(
+    ['src/recording-store.ts', 'src/recordings.ts'],
+    ['tests/recordings.test.ts', 'tests/recording-maintenance.test.ts', 'tests/audio-upload-s3.test.ts'],
   ),
   upload: lane(
     ['src/upload.ts'],

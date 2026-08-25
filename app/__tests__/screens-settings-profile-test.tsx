@@ -9,7 +9,7 @@ import type { Fiber, TestInstance } from 'test-renderer';
 import SettingsScreen, { formatReminderHour } from '../src/app/settings/index';
 import {
   ApiError,
-  apiConsumeUserDataPages,
+  apiConsumeAccountExportPages,
   apiRestartDiagnostic,
   apiUpdateProfile,
 } from '../src/lib/api';
@@ -103,7 +103,7 @@ jest.mock('../src/lib/daily-reminder', () => ({
 
 jest.mock('../src/lib/api', () => ({
   ...jest.requireActual('../src/lib/api'),
-  apiConsumeUserDataPages: jest.fn(),
+  apiConsumeAccountExportPages: jest.fn(),
   apiRestartDiagnostic: jest.fn(),
   apiUpdateProfile: jest.fn(),
 }));
@@ -115,9 +115,20 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
+
+const mockShowAdPrivacyOptions = jest.fn(async () => true);
+let mockPrivacyOptionsRequired = false;
+
+jest.mock('../src/lib/ads', () => ({
+  useAds: () => ({
+    privacyOptionsRequired: mockPrivacyOptionsRequired,
+    showPrivacyOptions: mockShowAdPrivacyOptions,
+  }),
+}));
 
 const OTHER_USER: User = {
   ...USER,
@@ -167,7 +178,7 @@ jest.mock('../src/lib/auth', () => ({
 }));
 
 const mockUpdateProfile = apiUpdateProfile as jest.Mock;
-const mockConsumeExportPages = apiConsumeUserDataPages as jest.Mock;
+const mockConsumeExportPages = apiConsumeAccountExportPages as jest.Mock;
 const mockExportData = jest.fn();
 const mockRestartDiagnostic = apiRestartDiagnostic as jest.Mock;
 const mockGetReminder = getDailyReminder as jest.Mock;
@@ -281,6 +292,12 @@ function languageChip(index: number): TestInstance {
   return screen.getByRole('button', { name: chipLabel(index) });
 }
 
+function appLanguageChip(index: number): TestInstance {
+  return screen.getByRole('button', {
+    name: `${t('settings.appLanguageLabel')}: ${chipLabel(index)}`,
+  });
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -324,15 +341,20 @@ beforeEach(() => {
   mockFocusCallback = null;
   mockBeforeRemoveListener = null;
   mockAuthValue = makeAuth();
+  mockPrivacyOptionsRequired = false;
+  mockShowAdPrivacyOptions.mockReset().mockResolvedValue(true);
   mockUpdateProfile.mockReset();
   mockExportData.mockReset().mockResolvedValue({ user: USER, attempts: [] });
-  mockConsumeExportPages.mockReset().mockImplementation(async (consumePage, signal) => {
-    const data = (await mockExportData(signal)) as {
-      user: User;
-      attempts: Record<string, unknown>[];
-    };
-    await consumePage({ ...data, nextCursor: null }, 0);
-  });
+  mockConsumeExportPages
+    .mockReset()
+    .mockImplementation(async (consumePage, consumeRecordings, signal) => {
+      const data = (await mockExportData(signal)) as {
+        user: User;
+        attempts: Record<string, unknown>[];
+      };
+      await consumePage({ ...data, nextCursor: null }, 0);
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
+    });
   mockRestartDiagnostic.mockReset();
   mockWrite
     .mockReset()
@@ -678,12 +700,12 @@ describe('settings profile card', () => {
     await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     const setUser = mockAuthValue.setUser;
     await act(async () => {
-      resolveLanguage({ ...USER, nativeLanguage: 'hi' });
+      resolveLanguage({ ...USER, uiLanguage: 'hi' });
     });
     await act(async () => {
       // This delayed server snapshot predates the language write.
@@ -693,7 +715,7 @@ describe('settings profile card', () => {
     expect(setUser).toHaveBeenLastCalledWith({
       ...USER,
       name: 'Ada King',
-      nativeLanguage: 'hi',
+      uiLanguage: 'hi',
     });
   });
 
@@ -891,7 +913,7 @@ describe('settings profile card', () => {
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
   });
 
-  it('switches the native language through the server before re-rendering the UI', async () => {
+  it('switches learning language without changing UI or reminder copy', async () => {
     const updated = { ...USER, nativeLanguage: 'hi' as const };
     mockUpdateProfile.mockResolvedValue(updated);
     const queryClient = makeQueryClient();
@@ -903,25 +925,22 @@ describe('settings profile card', () => {
     });
 
     expect(mockUpdateProfile).toHaveBeenCalledWith({ nativeLanguage: 'hi' });
-    // The account language drives i18n: the provider re-renders everything.
     expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
-    // Help content is served in the account language. Remove the old-language
-    // entry so an observer cannot refetch it during the provider handoff.
+    // Help content is served in the learning language.
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['question-help'] });
-    // The atomic refresh still checks durable state; it returns off here.
-    expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
+    expect(mockRefreshReminderLanguage).not.toHaveBeenCalled();
     expect(mockEnableReminder).not.toHaveBeenCalled();
   });
 
   it('re-schedules an enabled daily reminder in the new language', async () => {
     mockGetReminder.mockResolvedValue({ hour: 19 });
     mockRefreshReminderLanguage.mockResolvedValue({ hour: 19 });
-    const updated = { ...USER, nativeLanguage: 'hi' as const };
+    const updated = { ...USER, uiLanguage: 'hi' as const };
     mockUpdateProfile.mockResolvedValue(updated);
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
@@ -932,7 +951,7 @@ describe('settings profile card', () => {
 
   it('requests the atomic language refresh before reminder hydration has rendered', async () => {
     mockGetReminder.mockReturnValue(new Promise(() => undefined));
-    const updated = { ...USER, nativeLanguage: 'hi' as const };
+    const updated = { ...USER, uiLanguage: 'hi' as const };
     mockUpdateProfile.mockResolvedValue(updated);
     await renderSettings();
 
@@ -940,7 +959,7 @@ describe('settings profile card', () => {
     expect(screen.queryByRole('switch', { name: t('reminder.toggleLabel') })).toBeNull();
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
@@ -954,11 +973,11 @@ describe('settings profile card', () => {
     // closure would put the reminder back at the hour the learner just left.
     mockGetReminder.mockResolvedValue({ hour: 19 });
     mockRefreshReminderLanguage.mockResolvedValue({ hour: 20 });
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' as const });
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
@@ -983,7 +1002,7 @@ describe('settings profile card', () => {
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }),
     );
     await act(async () => {
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
     await act(async () => {
       staleToggle();
@@ -991,7 +1010,7 @@ describe('settings profile card', () => {
     expect(mockDisableReminder).not.toHaveBeenCalled();
 
     await act(async () => {
-      resolveUpdate({ ...USER, nativeLanguage: 'hi' });
+      resolveUpdate({ ...USER, uiLanguage: 'hi' });
     });
 
     expect(mockEnableReminder).not.toHaveBeenCalled();
@@ -1027,11 +1046,11 @@ describe('settings profile card', () => {
       await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
     });
     await act(async () => {
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     await act(async () => {
-      resolveUpdate({ ...USER, nativeLanguage: 'hi' });
+      resolveUpdate({ ...USER, uiLanguage: 'hi' });
     });
     expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
 
@@ -1050,11 +1069,11 @@ describe('settings profile card', () => {
         resolveRefresh = resolve;
       }),
     );
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' as const });
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     const toggle = () => screen.getByRole('switch', { name: t('reminder.toggleLabel') });
@@ -1088,11 +1107,11 @@ describe('settings profile card', () => {
 
   it('atomically confirms that there is no reminder to re-schedule', async () => {
     mockGetReminder.mockResolvedValue(null);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' as const });
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
@@ -1104,12 +1123,12 @@ describe('settings profile card', () => {
 
   it('does not surface a language error when the reminder re-schedule fails', async () => {
     mockGetReminder.mockResolvedValue({ hour: 19 });
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' as const });
     mockRefreshReminderLanguage.mockRejectedValue(new Error('os error'));
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(mockAuthValue.setUser).toHaveBeenCalled();
@@ -1128,12 +1147,12 @@ describe('settings profile card', () => {
     // and forgets the preference when it cannot replace it: the toggle must
     // stop claiming a reminder that no longer exists anywhere.
     mockGetReminder.mockResolvedValueOnce({ hour: 8 }).mockResolvedValue(null);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' as const });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' as const });
     mockRefreshReminderLanguage.mockRejectedValue(new Error('os error'));
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(languageChip(1));
+      await fireEvent.press(appLanguageChip(1));
     });
 
     expect(await screen.findByText(hi('reminder.failed'))).toBeTruthy();
@@ -1147,7 +1166,80 @@ describe('settings profile card', () => {
     await act(async () => {
       await fireEvent.press(toggle());
     });
-    expect(mockEnableReminder).toHaveBeenLastCalledWith(8);
+    expect(mockEnableReminder).toHaveBeenLastCalledWith(8, 'en');
+  });
+
+  it('shows and opens UMP privacy options only when the SDK requires them', async () => {
+    const initial = await renderSettings();
+    expect(screen.queryByRole('button', { name: t('ads.privacyOptions') })).toBeNull();
+    await initial.unmount();
+
+    mockPrivacyOptionsRequired = true;
+    await renderSettings();
+    expect(screen.getByText(t('ads.privacyOptionsHelp'))).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps UMP privacy progress and errors separate from reminder state', async () => {
+    const privacyResult = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockReturnValue(privacyResult.promise);
+    await renderSettings();
+
+    const privacyButton = () => screen.getByRole('button', { name: t('ads.privacyOptions') });
+    await fireEvent.press(privacyButton());
+    await waitFor(() =>
+      expect(privacyButton().props.accessibilityState).toMatchObject({
+        busy: true,
+        disabled: true,
+      }),
+    );
+    expect(
+      screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+    ).toMatchObject({ busy: false });
+    expect(
+      screen.container.queryAll(
+        (node) =>
+          node.type === 'ActivityIndicator' &&
+          node.props.accessibilityLabel === t('ads.privacyOptions'),
+      ),
+    ).toHaveLength(1);
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+
+    // UMP may make the form no longer required before a later request-config
+    // step fails. The dedicated error must survive that action-row removal.
+    mockPrivacyOptionsRequired = false;
+    privacyResult.resolve(false);
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('ads.privacyFailed')),
+    );
+    expect(screen.queryByRole('button', { name: t('ads.privacyOptions') })).toBeNull();
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+    expect(screen.queryByText(t('reminder.failed'))).toBeNull();
+  });
+
+  it('suppresses stale UMP privacy failures after the account changes', async () => {
+    const privacyResult = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockReturnValue(privacyResult.promise);
+    const view = await renderSettings();
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    await waitFor(() => expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(1));
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    mockSetOptions.mockClear();
+    privacyResult.reject(new Error('late UMP failure'));
+    await act(async () => Promise.resolve());
+
+    expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+    expect(mockSetOptions).not.toHaveBeenCalled();
   });
 
   it('does not PATCH when tapping the already-selected language', async () => {
@@ -1343,22 +1435,22 @@ describe('settings screen layout', () => {
       backgroundColor: colors.card,
     });
 
-    expect(flattenedStyle(screen.getByText('తెలుగు'))).toEqual({
+    expect(flattenedStyle(within(languageChip(0)).getByText('తెలుగు'))).toEqual({
       fontSize: 17,
       fontWeight: '700',
       color: colors.primary,
     });
-    expect(flattenedStyle(screen.getByText('Telugu'))).toEqual({
+    expect(flattenedStyle(within(languageChip(0)).getByText('Telugu'))).toEqual({
       marginTop: 2,
       fontSize: 13,
       color: colors.primary,
     });
-    expect(flattenedStyle(screen.getByText('हिन्दी'))).toEqual({
+    expect(flattenedStyle(within(languageChip(1)).getByText('हिन्दी'))).toEqual({
       fontSize: 17,
       fontWeight: '700',
       color: colors.text,
     });
-    expect(flattenedStyle(screen.getByText('Hindi'))).toEqual({
+    expect(flattenedStyle(within(languageChip(1)).getByText('Hindi'))).toEqual({
       marginTop: 2,
       fontSize: 13,
       color: colors.muted,
@@ -1490,7 +1582,7 @@ describe('data export', () => {
       Paths.cache,
       expect.stringMatching(/^ai-english-coach-data-\d+\.json$/),
     );
-    expect(lastFileContents).toBe(JSON.stringify(exportData));
+    expect(lastFileContents).toBe(JSON.stringify({ ...exportData, recordings: [] }));
     expect(mockWrite).toHaveBeenNthCalledWith(1, `{"user":${JSON.stringify(USER)},"attempts":[`, {
       encoding: 'utf8',
     });
@@ -1498,7 +1590,11 @@ describe('data export', () => {
       append: true,
       encoding: 'utf8',
     });
-    expect(mockWrite).toHaveBeenNthCalledWith(3, ']}', {
+    expect(mockWrite).toHaveBeenNthCalledWith(3, '],"recordings":[', {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(4, ']}', {
       append: true,
       encoding: 'utf8',
     });
@@ -1515,13 +1611,15 @@ describe('data export', () => {
     const expected = {
       user: USER,
       attempts: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+      recordings: [],
     };
-    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
       await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: cursor }, 0);
       await consumePage(
         { user: USER, attempts: [{ id: 'a2' }, { id: 'a3' }], nextCursor: null },
         1,
       );
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
     });
     await renderSettings();
 
@@ -1529,9 +1627,43 @@ describe('data export', () => {
 
     expect(lastFileContents).toBe(JSON.stringify(expected));
     expect(JSON.parse(lastFileContents)).toEqual(expected);
-    expect(mockWrite).toHaveBeenCalledTimes(4);
+    expect(mockWrite).toHaveBeenCalledTimes(5);
     expect(mockShareAsync).toHaveBeenCalledTimes(1);
     expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('adds strictly parsed recording metadata without playback capabilities or storage coordinates', async () => {
+    const exportedRecording = {
+      id: '550e8400-e29b-41d4-a716-446655440090',
+      requestId: '550e8400-e29b-41d4-a716-446655440091',
+      attemptId: '550e8400-e29b-41d4-a716-446655440092',
+      questionId: '550e8400-e29b-41d4-a716-446655440093',
+      context: 'practice',
+      promptWord: 'courage',
+      questionText: 'Describe courage.',
+      cefrLevel: 'B1',
+      contentType: 'audio/mp4',
+      sizeBytes: 2_048,
+      durationMs: 8_000,
+      status: 'available',
+      createdAt: '2026-08-25T00:00:00.000Z',
+      availableAt: '2026-08-25T00:00:01.000Z',
+    };
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await consumeRecordings({ recordings: [exportedRecording], nextCursor: null }, 0);
+    });
+    await renderSettings();
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(JSON.parse(lastFileContents)).toEqual({
+      user: USER,
+      attempts: [],
+      recordings: [exportedRecording],
+    });
+    expect(lastFileContents).not.toContain('playbackUrl');
+    expect(lastFileContents).not.toContain('audioKey');
+    expect(lastFileContents).not.toContain('s3VersionId');
   });
 
   it('deletes a partial file and never shares when a later page fails', async () => {
@@ -1604,7 +1736,7 @@ describe('data export', () => {
   it('aborts and deletes a partial file when identity changes after page one', async () => {
     const remainingPages = deferred<void>();
     let exportSignal: AbortSignal | undefined;
-    mockConsumeExportPages.mockImplementation(async (consumePage, signal) => {
+    mockConsumeExportPages.mockImplementation(async (consumePage, _consumeRecordings, signal) => {
       exportSignal = signal;
       await consumePage(
         {
@@ -1639,10 +1771,9 @@ describe('data export', () => {
     });
 
     expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
-    expect(lastFileContents).toBe(JSON.stringify({ user: USER, attempts: [] }));
-    // Empty pages add no empty append write: only the header and closing suffix
-    // cross the native filesystem bridge.
-    expect(mockWrite).toHaveBeenCalledTimes(2);
+    expect(lastFileContents).toBe(JSON.stringify({ user: USER, attempts: [], recordings: [] }));
+    // Each additive array writes one boundary even when both are empty.
+    expect(mockWrite).toHaveBeenCalledTimes(3);
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
 
@@ -1773,7 +1904,7 @@ describe('daily reminder controls', () => {
       await fireEvent.press(toggle());
     });
 
-    expect(mockEnableReminder).toHaveBeenCalledWith(19);
+    expect(mockEnableReminder).toHaveBeenCalledWith(19, 'en');
     expect(toggle().props.accessibilityState).toMatchObject({ checked: true });
     expect(screen.getByText(reminderTimeText(19))).toBeTruthy();
   });
@@ -1839,7 +1970,7 @@ describe('daily reminder controls', () => {
 
     // Turning it back on resumes at 9, the hour that was denied — not the old
     // hour and not the default.
-    expect(mockEnableReminder).toHaveBeenLastCalledWith(9);
+    expect(mockEnableReminder).toHaveBeenLastCalledWith(9, 'en');
     expect(screen.getByText(reminderTimeText(9))).toBeTruthy();
   });
 
@@ -1852,13 +1983,13 @@ describe('daily reminder controls', () => {
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('reminder.earlier') }));
     });
-    expect(mockEnableReminder).toHaveBeenCalledWith(23);
+    expect(mockEnableReminder).toHaveBeenCalledWith(23, 'en');
     expect(screen.getByText(reminderTimeText(23))).toBeTruthy();
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('reminder.later') }));
     });
-    expect(mockEnableReminder).toHaveBeenLastCalledWith(0);
+    expect(mockEnableReminder).toHaveBeenLastCalledWith(0, 'en');
     expect(screen.getByText(reminderTimeText(0))).toBeTruthy();
   });
 
@@ -3120,14 +3251,14 @@ describe('settings async race fences', () => {
     const refresh = deferred<{ hour: number } | null>();
     mockDisableReminder.mockReturnValue(disable.promise);
     mockRefreshReminderLanguage.mockReturnValue(refresh.promise);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' });
     await renderSettings();
 
     const staleToggle = committedPressHandler(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }),
     );
     await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
-    await fireEvent.press(languageChip(1));
+    await fireEvent.press(appLanguageChip(1));
     await waitFor(() => expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi'));
     refresh.resolve(null);
     await act(async () => Promise.resolve());
@@ -3150,9 +3281,9 @@ describe('settings async race fences', () => {
     let leaseCurrent = true;
     mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
     mockRefreshReminderLanguage.mockReturnValue(refresh.promise);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' });
     await renderSettings();
-    await fireEvent.press(languageChip(1));
+    await fireEvent.press(appLanguageChip(1));
     await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalled());
     await waitFor(() => expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi'));
 
@@ -3173,9 +3304,9 @@ describe('settings async race fences', () => {
     let leaseCurrent = true;
     mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
     mockRefreshReminderLanguage.mockReturnValue(refresh.promise);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' });
     await renderSettings();
-    await fireEvent.press(languageChip(1));
+    await fireEvent.press(appLanguageChip(1));
     await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalled());
     await waitFor(() => expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi'));
 
@@ -3207,9 +3338,9 @@ describe('settings async race fences', () => {
   it('handles a successful language refresh before reminder hydration', async () => {
     mockGetReminder.mockReturnValueOnce(new Promise(() => undefined));
     mockRefreshReminderLanguage.mockResolvedValue(null);
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' });
     await renderSettings();
-    await fireEvent.press(languageChip(1));
+    await fireEvent.press(appLanguageChip(1));
 
     await waitFor(() =>
       expect(screen.getByRole('switch', { name: t('reminder.toggleLabel') })).toBeTruthy(),
@@ -3221,9 +3352,9 @@ describe('settings async race fences', () => {
   it('reports reminder fallback failure before hydration without mislabeling the PATCH', async () => {
     mockGetReminder.mockReturnValueOnce(new Promise(() => undefined)).mockResolvedValue(null);
     mockRefreshReminderLanguage.mockRejectedValue(new Error('schedule failed'));
-    mockUpdateProfile.mockResolvedValue({ ...USER, nativeLanguage: 'hi' });
+    mockUpdateProfile.mockResolvedValue({ ...USER, uiLanguage: 'hi' });
     await renderSettings();
-    await fireEvent.press(languageChip(1));
+    await fireEvent.press(appLanguageChip(1));
 
     expect(await screen.findByText(hi('reminder.failed'))).toBeTruthy();
     expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();

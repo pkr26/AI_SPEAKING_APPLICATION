@@ -11,7 +11,13 @@
 import { randomUUID } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
-import { DeleteObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
+import {
+  DeleteObjectsCommand,
+  GetObjectCommand,
+  GetObjectTaggingCommand,
+  ListObjectVersionsCommand,
+  S3Client,
+} from '@aws-sdk/client-s3';
 import 'dotenv/config';
 import pg from 'pg';
 
@@ -23,7 +29,7 @@ const { Client } = pg;
 const DEFAULT_BASE_URL = 'http://127.0.0.1:4000';
 const REQUEST_TIMEOUT_MS = 180_000;
 const S3_OPERATION_TIMEOUT_MS = 15_000;
-const DELETE_POLL_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000];
+const DELETE_POLL_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 45_000];
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const ENDPOINTS = {
   diagnostic: '/diagnostic/answer',
@@ -344,7 +350,7 @@ async function objectExists(scope, key, includeRunSignal = true) {
 async function waitForObjectMissing(scope, key, label) {
   for (const delayMs of DELETE_POLL_DELAYS_MS) {
     if (delayMs > 0) await delay(delayMs);
-    if (!(await objectExists(scope, key))) {
+    if ((await listExactVersions(scope, key)).length === 0) {
       check(label, true);
       return;
     }
@@ -352,10 +358,42 @@ async function waitForObjectMissing(scope, key, label) {
   check(label, false);
 }
 
+async function listExactVersions(scope, key, includeRunSignal = true) {
+  const target = targets[scope];
+  const found = [];
+  let keyMarker;
+  let versionIdMarker;
+  for (let page = 0; page < 1000; page++) {
+    const listed = await target.client.send(
+      new ListObjectVersionsCommand({
+        Bucket: target.bucket,
+        Prefix: key,
+        KeyMarker: keyMarker,
+        VersionIdMarker: versionIdMarker,
+      }),
+      { abortSignal: operationSignal(includeRunSignal) },
+    );
+    for (const version of [...(listed.Versions || []), ...(listed.DeleteMarkers || [])]) {
+      if (version.Key === key && version.VersionId) found.push({ Key: key, VersionId: version.VersionId });
+    }
+    if (!listed.IsTruncated) return found;
+    if (!listed.NextKeyMarker || !listed.NextVersionIdMarker) {
+      throw new SmokeFailure(`${scope} version listing omitted continuation markers`);
+    }
+    keyMarker = listed.NextKeyMarker;
+    versionIdMarker = listed.NextVersionIdMarker;
+  }
+  throw new SmokeFailure(`${scope} version listing exceeded its page bound`);
+}
+
 async function adminDelete(scope, key, includeRunSignal = true) {
-  await targets[scope].client.send(new DeleteObjectCommand({ Bucket: targets[scope].bucket, Key: key }), {
-    abortSignal: operationSignal(includeRunSignal),
-  });
+  const versions = await listExactVersions(scope, key, includeRunSignal);
+  if (versions.length === 0) return;
+  const deleted = await targets[scope].client.send(
+    new DeleteObjectsCommand({ Bucket: targets[scope].bucket, Delete: { Objects: versions, Quiet: true } }),
+    { abortSignal: operationSignal(includeRunSignal) },
+  );
+  if ((deleted.Errors?.length || 0) > 0) throw new SmokeFailure(`${scope} version cleanup returned errors`);
 }
 
 async function submitAssessment(endpoint, questionId, audioKey, label) {
@@ -365,6 +403,20 @@ async function submitAssessment(endpoint, questionId, audioKey, label) {
   });
   checkStatus(label, response, 200);
   check(`${label} returns a JSON object`, isRecord(response.body));
+  check(`${label} returns a retained recording id`, isUuid(response.body?.recordingId));
+  return response.body;
+}
+
+async function requestPlayback(recordingId, label) {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const response = await apiRequest('POST', `/recordings/${recordingId}/playback-url`, {
+      token: account.token,
+    });
+    if (response.status === 200) return response;
+    if (response.status !== 409 || response.body?.code !== 'REQUEST_IN_FLIGHT') return response;
+    await delay(1_000);
+  }
+  throw new SmokeFailure(`${label} playback did not become ready`);
 }
 
 async function exerciseSuccessfulAssessment(endpoint, scope, questionId, audioBytes, label) {
@@ -374,8 +426,62 @@ async function exerciseSuccessfulAssessment(endpoint, scope, questionId, audioBy
     `${label} signed upload returns 2xx (observed HTTP ${upload.status}${upload.errorCode ? ` ${upload.errorCode}` : ''})`,
     upload.status >= 200 && upload.status < 300,
   );
-  await submitAssessment(endpoint, questionId, grant.audioKey, label);
-  await waitForObjectMissing(scope, grant.audioKey, `${label} object is deleted after success`);
+  const assessment = await submitAssessment(endpoint, questionId, grant.audioKey, label);
+  check(`${label} object remains private after assessment`, await objectExists(scope, grant.audioKey));
+  const retainedVersions = await listExactVersions(scope, grant.audioKey);
+  let retainedTagFound = false;
+  for (const version of retainedVersions) {
+    const tags = await targets[scope].client.send(
+      new GetObjectTaggingCommand({
+        Bucket: targets[scope].bucket,
+        Key: grant.audioKey,
+        VersionId: version.VersionId,
+      }),
+      { abortSignal: operationSignal() },
+    );
+    if (tags.TagSet?.some((tag) => tag.Key === 'retention' && tag.Value === 'retained')) {
+      retainedTagFound = true;
+      break;
+    }
+  }
+  check(`${label} exact S3 version is tagged for indefinite retention`, retainedTagFound);
+  const listed = await apiRequest('GET', '/recordings?limit=50', { token: account.token });
+  checkStatus(`${label} recording list`, listed, 200);
+  check(
+    `${label} recording list maps the owner question without storage coordinates`,
+    listed.body?.items?.some(
+      (item) =>
+        item.id === assessment.recordingId &&
+        item.questionId === questionId &&
+        item.context &&
+        !Object.hasOwn(item, 'audioKey') &&
+        !Object.hasOwn(item, 's3VersionId'),
+    ),
+  );
+  const playback = await requestPlayback(assessment.recordingId, label);
+  checkStatus(`${label} playback grant`, playback, 200);
+  check(
+    `${label} playback grant is short-lived and storage-secret-free`,
+    playback.body?.recordingId === assessment.recordingId &&
+      typeof playback.body?.playbackUrl === 'string' &&
+      Number.isInteger(playback.body?.expiresIn) &&
+      playback.body.expiresIn > 0 &&
+      playback.body.expiresIn <= 300 &&
+      !Object.hasOwn(playback.body, 'audioKey') &&
+      !Object.hasOwn(playback.body, 'bucket'),
+  );
+  const playbackResponse = await fetch(playback.body.playbackUrl, {
+    signal: operationSignal(),
+    redirect: 'manual',
+  });
+  const playedBytes = Buffer.from(await playbackResponse.arrayBuffer());
+  check(
+    `${label} signed playback URL returns the exact uploaded fixture`,
+    playbackResponse.status === 200 && playedBytes.equals(Buffer.from(audioBytes)),
+  );
+  const deleted = await apiRequest('DELETE', `/recordings/${assessment.recordingId}`, { token: account.token });
+  checkStatus(`${label} recording deletion`, deleted, 204);
+  await waitForObjectMissing(scope, grant.audioKey, `${label} object is eventually deleted after owner deletion`);
 }
 
 async function exerciseRejectedPolicyUpload(label, mutate) {

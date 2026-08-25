@@ -32,6 +32,7 @@ jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
 jest.mock('expo-router', () => ({
   router: { push: jest.fn(), replace: jest.fn(), back: jest.fn(), dismissTo: jest.fn() },
   useFocusEffect: jest.fn(),
+  useIsFocused: () => true,
 }));
 
 type AuthValue = ReturnType<typeof useAuth>;
@@ -41,6 +42,7 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -93,6 +95,27 @@ jest.mock('../src/lib/auth', () => ({
 jest.mock('../src/lib/api', () => ({
   ...jest.requireActual('../src/lib/api'),
   apiGetPracticeHistory: jest.fn(),
+}));
+
+jest.mock('../src/components/RecordingPlayback', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  const { Text } = jest.requireActual<typeof import('react-native')>('react-native');
+  return {
+    __esModule: true,
+    default: ({ recordingId }: { recordingId: string }) =>
+      ReactActual.createElement(Text, null, `recording-player:${recordingId}`),
+  };
+});
+
+jest.mock('../src/components/HistoryNativeAdCard', () => ({
+  __esModule: true,
+  default: () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const ReactActual = require('react') as typeof import('react');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Text } = require('react-native') as typeof import('react-native');
+    return ReactActual.createElement(Text, { testID: 'history-native-ad' }, 'history-native-ad');
+  },
 }));
 
 const mockGetHistory = apiGetPracticeHistory as jest.Mock;
@@ -159,7 +182,7 @@ function renderHistory() {
 function renderHistoryIn(language: NativeLanguage) {
   return render(
     <QueryClientProvider client={makeQueryClient()}>
-      <I18nProvider userLanguage={language}>
+      <I18nProvider accountLanguage={language}>
         <HistoryScreen />
       </I18nProvider>
     </QueryClientProvider>,
@@ -799,6 +822,45 @@ describe('history screen', () => {
     expect(screen.queryByText('“I was brave at work.”')).toBeNull();
     expect(screen.queryByText(t('feedback.weHeard'))).toBeNull();
     expect(screen.getByText(t('history.showDetails'))).toBeTruthy();
+  });
+
+  it('inserts one native ad only after the eighth real history item', async () => {
+    const items = Array.from({ length: 8 }, (_, index) =>
+      historyItem({
+        id: `550e8400-e29b-41d4-a716-4466554401${String(index).padStart(2, '0')}`,
+        promptWord: `word-${index + 1}`,
+        createdAt:
+          index < 4
+            ? `2026-08-15T${String(12 - index).padStart(2, '0')}:00:00.000Z`
+            : `2026-08-14T${String(20 - index).padStart(2, '0')}:00:00.000Z`,
+      }),
+    );
+    mockGetHistory.mockResolvedValue({ items: items.slice(0, 7), nextCursor: null });
+    const view = await renderHistory();
+    await screen.findByText('word-7');
+    expect(screen.queryByTestId('history-native-ad')).toBeNull();
+    await view.unmount();
+
+    mockGetHistory.mockResolvedValue({ items, nextCursor: null });
+    await renderHistory();
+    await waitFor(() => expect(screen.getByTestId('history-native-ad')).toBeTruthy());
+    expect(screen.getAllByTestId('history-native-ad')).toHaveLength(1);
+  });
+
+  it('mounts contextual owner playback only while an expanded row has a recording', async () => {
+    const recordingId = '550e8400-e29b-41d4-a716-446655440090';
+    mockGetHistory.mockResolvedValue({
+      items: [historyItem({ recordingId, recordingStatus: 'available' })],
+      nextCursor: null,
+    });
+    await renderHistory();
+    await screen.findByText('courage');
+    expect(screen.queryByText(`recording-player:${recordingId}`)).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { expanded: false }));
+    expect(screen.getByText(t('recordings.yourRecording'))).toBeTruthy();
+    expect(screen.getByText(`recording-player:${recordingId}`)).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { expanded: true }));
+    expect(screen.queryByText(`recording-player:${recordingId}`)).toBeNull();
   });
 
   it('sets the expanded detail block off from the row header', async () => {

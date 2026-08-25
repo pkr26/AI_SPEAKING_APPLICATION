@@ -20,6 +20,9 @@
     "smoke:concurrent": "node scripts/concurrent-smoke.mjs",
     "smoke:load1000": "node scripts/load-1000.mjs",
     "verify:load1000": "node scripts/verify-1000.mjs",
+    "smoke:load1000:live": "node scripts/load-1000-live.mjs",
+    "verify:load1000:live": "node scripts/verify-1000-live.mjs",
+    "analyze:load1000:live": "node scripts/analyze-1000-live.mjs",
     "test": "vitest run --coverage",
     "test:quick": "vitest run",
     "mutation": "node scripts/run-mutation-all.mjs",
@@ -39,6 +42,7 @@
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1109.0",
     "@aws-sdk/s3-presigned-post": "^3.1109.0",
+    "@aws-sdk/s3-request-presigner": "^3.1109.0",
     "bcrypt": "^6.0.0",
     "compression": "^1.8.1",
     "cors": "^2.8.5",

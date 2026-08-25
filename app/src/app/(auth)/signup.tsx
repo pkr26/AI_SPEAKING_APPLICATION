@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,7 +8,7 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Link, router, useFocusEffect, useNavigation } from 'expo-router';
+import { Link, router, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
@@ -20,7 +20,7 @@ import {
   passwordPolicyError,
   useAuth,
 } from '../../lib/auth';
-import { translateFor, useI18n, type MessageParams, type MessageKey } from '../../lib/i18n';
+import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
@@ -35,7 +35,7 @@ const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
 export default function SignupScreen() {
   const { register } = useAuth();
   const navigation = useNavigation();
-  const { language: contextLanguage, setPreviewLanguage } = useI18n();
+  const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
@@ -77,23 +77,9 @@ export default function SignupScreen() {
     if (busyRef.current) event.preventDefault();
   };
 
-  // Live preview: tapping a language chip switches this screen's UI language
-  // immediately, before any account exists. The chosen language is also pushed
-  // into the provider so event-time copy (alerts, API errors) follows along.
-  const language = nativeLanguage ?? contextLanguage;
-  const t = (key: MessageKey, params?: MessageParams) => translateFor(language, key, params);
-
   const chooseLanguage = (code: NativeLanguage) => {
     setNativeLanguage(code);
-    setPreviewLanguage(code);
   };
-
-  // The provider sits above the navigator, so the preview outlives this route,
-  // and no signed-out screen offers a way back to English (the chips are the
-  // four native languages). Scope it to the focused screen: leaving signup
-  // restores the device language, while a completed signup is unaffected
-  // because the account language already outranks the preview.
-  useFocusEffect(useCallback(() => () => setPreviewLanguage(null), [setPreviewLanguage]));
 
   const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
 
@@ -232,6 +218,7 @@ export default function SignupScreen() {
             )}
 
             <Text style={styles.label}>{t('signup.languageLabel')}</Text>
+            <Text style={styles.languageHelp}>{t('signup.languageHelp')}</Text>
             <View style={styles.languageGrid}>
               {LANGUAGES.map((lang) => {
                 const selected = nativeLanguage === lang.code;
@@ -361,6 +348,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.primary,
     fontSize: 14,
     fontWeight: '600',
+  },
+  languageHelp: {
+    marginBottom: spacing.sm,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
   },
   languageGrid: {
     flexDirection: 'row',

@@ -9,8 +9,10 @@ import { cleanupAssessmentRequests } from './idempotency';
 import { janitorRemovedTotal } from './metrics';
 import { cleanupOldUploads } from './upload';
 import { cleanupRateLimitWindows } from './postgres-rate-limit-store';
+import { runRecordingMaintenance } from './recordings';
 import { assertDatabaseSchemaCurrent } from './schema-readiness';
 import { assertAudioInspectorAvailable } from './audio-inspection';
+import { assertRetainedAudioStorageAvailable } from './audio-upload';
 
 const app = createApp();
 const server = createServer(app);
@@ -86,6 +88,13 @@ const janitorDefinitions: JanitorDefinition[] = [
     intervalMs: DATABASE_JANITOR_INTERVAL_MS,
     successMessage: 'janitor removed expired password reset tokens',
     failureMessage: 'password reset token janitor failed',
+  },
+  {
+    janitor: 'recordings',
+    cleanup: runRecordingMaintenance,
+    intervalMs: config.recordings.maintenanceIntervalMs,
+    successMessage: 'recording maintenance removed completed deletion tombstones',
+    failureMessage: 'recording maintenance failed',
   },
 ];
 
@@ -297,7 +306,11 @@ async function warnIfPoolOversized(): Promise<void> {
 
 // Refuse traffic until the release schema and required media inspector are
 // ready. The same dependency checks back /ready for post-start drift/failure.
-Promise.all([assertDatabaseSchemaCurrent(), assertAudioInspectorAvailable({ force: true })])
+Promise.all([
+  assertDatabaseSchemaCurrent(),
+  assertAudioInspectorAvailable({ force: true }),
+  assertRetainedAudioStorageAvailable({ force: true }),
+])
   .then(async () => {
     if (shuttingDown) return;
     await warnIfPoolOversized();

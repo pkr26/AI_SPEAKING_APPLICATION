@@ -154,6 +154,15 @@ jest.mock('../src/components/Recorder', () => ({
   default: MockRecorder,
 }));
 
+jest.mock('../src/components/RecordingPlayback', () => ({
+  __esModule: true,
+  default: ({ recordingId }: { recordingId: string }) => {
+    const ReactActual = jest.requireActual<typeof import('react')>('react');
+    const { Text: NativeText } = jest.requireActual<typeof import('react-native')>('react-native');
+    return ReactActual.createElement(NativeText, null, `recording-player:${recordingId}`);
+  },
+}));
+
 // ----- auth mock -----
 
 type AuthValue = ReturnType<typeof useAuth>;
@@ -163,6 +172,7 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
+  uiLanguage: 'en',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -2113,6 +2123,16 @@ describe('practice feedback screen', () => {
     );
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+
+  it('shows contextual submitted-recording playback when the additive id is present', async () => {
+    const recordingId = '550e8400-e29b-41d4-a716-446655440090';
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: { ...PASSED_RESULT, recordingId } },
+    });
+    await renderScreen(<FeedbackScreen />);
+    expect(screen.getByText(t('recordings.yourRecording'))).toBeTruthy();
+    expect(screen.getByText(`recording-player:${recordingId}`)).toBeTruthy();
   });
 
   it('renders the mastered variant and seeds the next question', async () => {

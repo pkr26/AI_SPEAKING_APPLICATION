@@ -14,6 +14,7 @@ import { logger } from './logger';
 import { completeAssessmentRequest } from './idempotency';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
+import { RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 const MAX_ATTEMPTS = 3;
@@ -383,6 +384,7 @@ async function storePracticeResult(
   body: Record<string, unknown>,
   level: string,
   finalFeedback: string,
+  recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
@@ -409,11 +411,13 @@ async function storePracticeResult(
     if (owned.rowCount !== 1) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
-    await client.query(
+    const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7)`,
+       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7)
+       RETURNING id`,
       [userId, questionId, claim.attemptNo, result.transcript, result.score, result.passed, result.feedback],
     );
+    if (recording) recording.attemptId = insertedAttempt.rows[0].id;
     // Lock the word's progress row (when it exists) so the mastery transition
     // and the promotion decision below read a stable prior state even if a
     // rival transaction touches the same word.
@@ -536,7 +540,15 @@ async function storePracticeResult(
       questionId,
       claim.claimId,
     ]);
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response, 'practice');
+    response = await completeAssessmentRequest(
+      client,
+      userId,
+      requestId,
+      requestClaimId,
+      response,
+      'practice',
+      recording,
+    );
     await client.query('COMMIT');
     return response;
   } catch (err) {
@@ -558,6 +570,7 @@ async function storeSilenceResult(
   requestId: string,
   requestClaimId: string,
   response: Record<string, unknown>,
+  recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
   try {
@@ -584,7 +597,15 @@ async function storeSilenceResult(
       questionId,
       claim.claimId,
     ]);
-    await completeAssessmentRequest(client, userId, requestId, requestClaimId, response, 'practice');
+    response = await completeAssessmentRequest(
+      client,
+      userId,
+      requestId,
+      requestClaimId,
+      response,
+      'practice',
+      recording,
+    );
     await client.query('COMMIT');
     return response;
   } catch (err) {
@@ -773,9 +794,10 @@ export function createPracticeRouter(limiters: Limiters) {
         `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
                 q.question_text AS "questionText", q.cefr_level AS "cefrLevel", a.context,
                 a.attempt_no AS "attemptNo", a.score, a.passed, a.transcript, a.feedback,
-                a.created_at AS "createdAt"
+                a.created_at AS "createdAt", r.id AS "recordingId", r.status AS "recordingStatus"
          FROM attempts a
          JOIN questions q ON q.id = a.question_id
+         LEFT JOIN recordings r ON r.attempt_id = a.id AND r.user_id = a.user_id
          WHERE a.user_id = $1
            AND (
              $2::uuid IS NULL
@@ -916,20 +938,28 @@ export function createPracticeRouter(limiters: Limiters) {
         claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id, question.cefr_level),
         assess: (audioPath, user, question, _claim, options) =>
           assessSpeaking(audioPath, assessQuestionContext(question), user.id, options),
-        persist: (user, question, claim, result, requestId, requestClaimId) => {
+        persist: (user, question, claim, result, requestId, requestClaimId, recording) => {
           if (result.transcript === '') {
             // Silence: not an attempt. Nothing is persisted about the word and
             // the attempt counter does not advance; the retry is free.
-            return storeSilenceResult(user.id, question.id, claim, requestId, requestClaimId, {
-              passed: false,
-              noSpeech: true,
-              mastered: false,
-              attemptNo: claim.attemptNo,
-              score: 0,
-              transcript: '',
-              feedback: result.feedback,
-              attemptsLeft: MAX_ATTEMPTS - (claim.attemptNo - 1),
-            });
+            return storeSilenceResult(
+              user.id,
+              question.id,
+              claim,
+              requestId,
+              requestClaimId,
+              {
+                passed: false,
+                noSpeech: true,
+                mastered: false,
+                attemptNo: claim.attemptNo,
+                score: 0,
+                transcript: '',
+                feedback: result.feedback,
+                attemptsLeft: MAX_ATTEMPTS - (claim.attemptNo - 1),
+              },
+              recording,
+            );
           }
           const mastered = result.score >= MASTER_SCORE;
           const body: Record<string, unknown> = {
@@ -957,6 +987,7 @@ export function createPracticeRouter(limiters: Limiters) {
             body,
             user.cefr_level!,
             finalFeedback,
+            recording,
           );
         },
         clearClaim: (user, question, claim) => clearPracticeClaim(user.id, question.id, claim.claimId),
@@ -992,7 +1023,7 @@ export function createPracticeRouter(limiters: Limiters) {
             user.id,
             options,
           ),
-        persist: async (user, question, claim, result, requestId, requestClaimId) => {
+        persist: async (user, question, claim, result, requestId, requestClaimId, recording) => {
           const feedback =
             result.understood || result.transcript === ''
               ? result.feedback
@@ -1033,8 +1064,17 @@ export function createPracticeRouter(limiters: Limiters) {
               'DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3',
               [user.id, question.id, claim.claimId],
             );
-            await completeAssessmentRequest(client, user.id, requestId, requestClaimId, response, 'practice-native');
+            const completedResponse = await completeAssessmentRequest(
+              client,
+              user.id,
+              requestId,
+              requestClaimId,
+              response,
+              'practice-native',
+              recording,
+            );
             await client.query('COMMIT');
+            return completedResponse;
           } catch (err) {
             return await rollbackTransaction(client, { value: err });
           } finally {

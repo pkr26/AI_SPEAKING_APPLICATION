@@ -14,8 +14,9 @@ import {
 } from 'react-native';
 
 import Button from '../../components/Button';
+import { useAds } from '../../lib/ads';
 import {
-  apiConsumeUserDataPages,
+  apiConsumeAccountExportPages,
   apiRestartDiagnostic,
   apiUpdateProfile,
   userMessageForError,
@@ -33,11 +34,16 @@ import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage, User } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
-const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
+const LEARNING_LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
   { code: 'te', english: 'Telugu', native: 'తెలుగు' },
   { code: 'hi', english: 'Hindi', native: 'हिन्दी' },
   { code: 'es', english: 'Spanish', native: 'Español' },
   { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
+];
+
+const UI_LANGUAGES: { code: UiLanguage; english: string; native: string }[] = [
+  { code: 'en', english: 'English', native: 'English' },
+  ...LEARNING_LANGUAGES,
 ];
 
 export function formatReminderHour(hour: number, language: UiLanguage = 'en'): string {
@@ -58,7 +64,7 @@ interface ReminderState {
 
 /**
  * Real settings/profile screen replacing the old Alert menus: profile facts,
- * name + native-language editing (the language drives the whole UI language),
+ * name plus independent app-language and learning-language editing,
  * data export, daily reminder, placement-test retake, legal pages, log out,
  * and delete account.
  */
@@ -67,6 +73,7 @@ export default function SettingsScreen() {
     useAuth();
   const t = useT();
   const { language } = useI18n();
+  const { privacyOptionsRequired, showPrivacyOptions } = useAds();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
@@ -86,7 +93,9 @@ export default function SettingsScreen() {
   const [nameError, setNameError] = useState<string | null>(null);
 
   const [languageBusy, setLanguageBusy] = useState(false);
+  const [languageOperation, setLanguageOperation] = useState<'ui' | 'native' | null>(null);
   const [languageError, setLanguageError] = useState<string | null>(null);
+  const [languageErrorScope, setLanguageErrorScope] = useState<'ui' | 'native' | null>(null);
 
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
@@ -94,6 +103,9 @@ export default function SettingsScreen() {
   const [reminder, setReminder] = useState<ReminderState | null>(null);
   const [reminderBusy, setReminderBusy] = useState(false);
   const [reminderError, setReminderError] = useState<string | null>(null);
+
+  const [privacyBusy, setPrivacyBusy] = useState(false);
+  const [privacyError, setPrivacyError] = useState<string | null>(null);
 
   const [retakeBusy, setRetakeBusy] = useState(false);
   const [retakeConfirming, setRetakeConfirming] = useState(false);
@@ -110,6 +122,7 @@ export default function SettingsScreen() {
   const exportBusyRef = useRef(false);
   const exportControllerRef = useRef<AbortController | null>(null);
   const reminderBusyRef = useRef(false);
+  const privacyBusyRef = useRef<symbol | null>(null);
   const retakeBusyRef = useRef(false);
   const retakeConfirmingRef = useRef<symbol | null>(null);
   const logoutBusyRef = useRef(false);
@@ -129,6 +142,7 @@ export default function SettingsScreen() {
       languageBusyRef.current ||
       exportBusyRef.current ||
       reminderBusyRef.current ||
+      privacyBusyRef.current !== null ||
       retakeBusyRef.current ||
       retakeConfirmingRef.current !== null ||
       logoutBusyRef.current,
@@ -149,6 +163,7 @@ export default function SettingsScreen() {
     languageBusy ||
     exportBusy ||
     reminderBusy ||
+    privacyBusy ||
     retakeBusy ||
     retakeConfirming ||
     logoutBusy;
@@ -197,7 +212,10 @@ export default function SettingsScreen() {
       // A replacement identity must never inherit a native confirmation or
       // the header lock owned by the account that just left this route.
       retakeConfirmingRef.current = null;
+      privacyBusyRef.current = null;
       setRetakeConfirming(false);
+      setPrivacyBusy(false);
+      setPrivacyError(null);
       navigationRef.current.setOptions({ headerBackVisible: true, gestureEnabled: true });
     }
     activeIdentityRef.current = activeIdentity;
@@ -227,6 +245,7 @@ export default function SettingsScreen() {
     (
       destination:
         | '/settings/change-password'
+        | '/recordings'
         | '/settings/privacy'
         | '/settings/terms'
         | '/settings/delete-account',
@@ -247,7 +266,7 @@ export default function SettingsScreen() {
 
   const mergeProfileField = (
     updated: User,
-    field: Pick<User, 'name'> | Pick<User, 'nativeLanguage'>,
+    field: Pick<User, 'name'> | Pick<User, 'nativeLanguage'> | Pick<User, 'uiLanguage'>,
   ): boolean => {
     const current = userRef.current;
     if (!renderCanHandle() || !current || current.id !== updated.id) return false;
@@ -336,7 +355,7 @@ export default function SettingsScreen() {
     }
   };
 
-  const chooseLanguage = async (code: NativeLanguage) => {
+  const chooseNativeLanguage = async (code: NativeLanguage) => {
     if (
       !renderCanHandle() ||
       code === user.nativeLanguage ||
@@ -348,59 +367,21 @@ export default function SettingsScreen() {
     languageBusyRef.current = true;
     publishNavigationLock();
     setLanguageBusy(true);
+    setLanguageOperation('native');
     setLanguageError(null);
+    setLanguageErrorScope(null);
     try {
-      // The server confirms first; setUser then re-renders the whole UI in the
-      // new language immediately (nativeLanguage drives the i18n provider).
       const updated = await apiUpdateProfile({ nativeLanguage: code });
       if (!mergeProfileField(updated, { nativeLanguage: updated.nativeLanguage })) {
         return;
       }
-      // The old-language help key must disappear rather than refetching under
-      // the account language it was created with during the render handoff.
+      // Help content is selected by the learning language, so every cached
+      // translation from the former choice must be retired. UI copy and local
+      // reminder text deliberately remain in user.uiLanguage.
       queryClient.removeQueries({ queryKey: ['question-help'] });
-      // The scheduled reminder copy was baked in the old language. Re-schedule
-      // it in the new one — explicitly, because the module-level active
-      // language only updates on the render after setUser. Best effort: the
-      // language change already succeeded, so a failed re-schedule must not
-      // surface as a language error.
-      {
-        // The module owns the read + conditional reschedule as one queued
-        // transaction. Run it even before hydration finishes or while another
-        // reminder change is queued: it will observe the newest stored state,
-        // so neither an in-flight disable nor logout can be followed by a stale
-        // enable that revives the notification.
-        const ownsReminderLatch = !reminderBusyRef.current;
-        if (ownsReminderLatch) {
-          reminderBusyRef.current = true;
-          setReminderBusy(true);
-        }
-        try {
-          const survived = await refreshDailyReminderLanguage(code);
-          if (renderCanHandle()) {
-            setReminder({
-              enabled: survived !== null,
-              hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
-            });
-          }
-        } catch {
-          const survived = await getDailyReminder();
-          if (renderCanHandle()) {
-            setReminder({
-              enabled: survived !== null,
-              hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
-            });
-            setReminderError(translateFor(code, 'reminder.failed'));
-          }
-        } finally {
-          if (ownsReminderLatch) {
-            reminderBusyRef.current = false;
-            if (renderOwnsIdentity()) setReminderBusy(false);
-          }
-        }
-      }
     } catch (error) {
       if (renderCanHandle()) {
+        setLanguageErrorScope('native');
         setLanguageError(userMessageForError(error, t('settings.updateFailed')));
       }
     } finally {
@@ -408,6 +389,72 @@ export default function SettingsScreen() {
       if (renderOwnsIdentity()) {
         publishNavigationLock();
         setLanguageBusy(false);
+        setLanguageOperation(null);
+      }
+    }
+  };
+
+  const chooseUiLanguage = async (code: UiLanguage) => {
+    if (
+      !renderCanHandle() ||
+      code === user.uiLanguage ||
+      languageBusyRef.current ||
+      logoutBusyRef.current
+    ) {
+      return;
+    }
+    languageBusyRef.current = true;
+    publishNavigationLock();
+    setLanguageBusy(true);
+    setLanguageOperation('ui');
+    setLanguageError(null);
+    setLanguageErrorScope(null);
+    try {
+      const updated = await apiUpdateProfile({ uiLanguage: code });
+      if (!mergeProfileField(updated, { uiLanguage: updated.uiLanguage })) return;
+
+      // Notification title/body/channel copy is baked into the OS schedule.
+      // Rebuild it in the confirmed UI language. This is best effort: the
+      // account preference already committed and must not be rolled back.
+      const ownsReminderLatch = !reminderBusyRef.current;
+      if (ownsReminderLatch) {
+        reminderBusyRef.current = true;
+        setReminderBusy(true);
+      }
+      try {
+        const survived = await refreshDailyReminderLanguage(code);
+        if (renderCanHandle()) {
+          setReminder({
+            enabled: survived !== null,
+            hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
+          });
+        }
+      } catch {
+        const survived = await getDailyReminder();
+        if (renderCanHandle()) {
+          setReminder({
+            enabled: survived !== null,
+            hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
+          });
+          setReminderError(translateFor(code, 'reminder.failed'));
+        }
+      } finally {
+        if (ownsReminderLatch) {
+          reminderBusyRef.current = false;
+          if (renderOwnsIdentity()) setReminderBusy(false);
+        }
+      }
+    } catch (error) {
+      if (renderCanHandle()) {
+        setLanguageErrorScope('ui');
+        setLanguageError(userMessageForError(error, t('settings.updateFailed')));
+      }
+    } finally {
+      languageBusyRef.current = false;
+      if (renderOwnsIdentity()) {
+        publishNavigationLock();
+        setLanguageBusy(false);
+        setLanguageOperation(null);
       }
     }
   };
@@ -430,37 +477,69 @@ export default function SettingsScreen() {
       if (!renderCanHandle()) return;
       let documentStarted = false;
       let hasAttempts = false;
-      await apiConsumeUserDataPages((page) => {
-        if (controller.signal.aborted || !renderCanHandle() || page.user.id !== user.id) {
-          controller.abort();
-          throw new DOMException('The export session expired.', 'AbortError');
-        }
-        const encodedAttempts = page.attempts.map((attempt) => JSON.stringify(attempt));
-        if (encodedAttempts.some((attempt) => typeof attempt !== 'string')) {
-          throw new Error('The export contains an invalid attempt.');
-        }
-        if (!documentStarted) {
-          const encodedUser = JSON.stringify(page.user);
-          if (typeof encodedUser !== 'string') throw new Error('The export user is invalid.');
-          exportFile.current = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
-          exportFile.current.write(`{"user":${encodedUser},"attempts":[`, {
-            encoding: 'utf8',
-          });
-          documentStarted = true;
-        }
-        if (encodedAttempts.length > 0) {
-          exportFile.current!.write(`${hasAttempts ? ',' : ''}${encodedAttempts.join(',')}`, {
-            append: true,
-            encoding: 'utf8',
-          });
-          hasAttempts = true;
-        }
-      }, controller.signal);
+      let recordingsStarted = false;
+      let hasRecordings = false;
+      await apiConsumeAccountExportPages(
+        (page) => {
+          if (controller.signal.aborted || !renderCanHandle() || page.user.id !== user.id) {
+            controller.abort();
+            throw new DOMException('The export session expired.', 'AbortError');
+          }
+          const encodedAttempts = page.attempts.map((attempt) => JSON.stringify(attempt));
+          if (encodedAttempts.some((attempt) => typeof attempt !== 'string')) {
+            throw new Error('The export contains an invalid attempt.');
+          }
+          if (!documentStarted) {
+            const encodedUser = JSON.stringify(page.user);
+            if (typeof encodedUser !== 'string') throw new Error('The export user is invalid.');
+            exportFile.current = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
+            exportFile.current.write(`{"user":${encodedUser},"attempts":[`, {
+              encoding: 'utf8',
+            });
+            documentStarted = true;
+          }
+          if (encodedAttempts.length > 0) {
+            exportFile.current!.write(`${hasAttempts ? ',' : ''}${encodedAttempts.join(',')}`, {
+              append: true,
+              encoding: 'utf8',
+            });
+            hasAttempts = true;
+          }
+        },
+        (page) => {
+          if (
+            controller.signal.aborted ||
+            !renderCanHandle() ||
+            !documentStarted ||
+            !exportFile.current
+          ) {
+            controller.abort();
+            throw new DOMException('The export session expired.', 'AbortError');
+          }
+          if (!recordingsStarted) {
+            exportFile.current.write('],"recordings":[', { append: true, encoding: 'utf8' });
+            recordingsStarted = true;
+          }
+          const encodedRecordings = page.recordings.map((recording) => JSON.stringify(recording));
+          if (encodedRecordings.some((recording) => typeof recording !== 'string')) {
+            throw new Error('The export contains an invalid recording.');
+          }
+          if (encodedRecordings.length > 0) {
+            exportFile.current.write(`${hasRecordings ? ',' : ''}${encodedRecordings.join(',')}`, {
+              append: true,
+              encoding: 'utf8',
+            });
+            hasRecordings = true;
+          }
+        },
+        controller.signal,
+      );
       if (!renderCanHandle()) return;
       // A successful walker always emits its final (possibly empty) page.
       // Fail closed if a mocked or incompatible implementation violates that
       // contract instead of sharing a malformed file.
       if (!documentStarted) throw new Error('The export returned no pages.');
+      if (!recordingsStarted) throw new Error('The recording export returned no pages.');
       const completedFile = exportFile.current;
       if (completedFile === null) throw new Error('The export file is unavailable.');
       completedFile.write(']}', { append: true, encoding: 'utf8' });
@@ -505,7 +584,7 @@ export default function SettingsScreen() {
     setReminderError(null);
     try {
       if (next.enabled) {
-        const outcome = await enableDailyReminder(next.hour);
+        const outcome = await enableDailyReminder(next.hour, language);
         if (!renderCanHandle()) return;
         if (outcome === 'denied') {
           setReminder({ enabled: false, hour: next.hour });
@@ -536,6 +615,29 @@ export default function SettingsScreen() {
   const shiftReminderHour = (current: ReminderState, delta: number) => {
     if (!renderCanHandle() || !current.enabled) return;
     void applyReminder({ enabled: true, hour: (current.hour + delta + 24) % 24 });
+  };
+
+  const openAdPrivacyOptions = async () => {
+    if (!renderCanHandle() || blockingOperationActive()) return;
+    const operationOwner = Symbol('ad-privacy-options');
+    privacyBusyRef.current = operationOwner;
+    publishNavigationLock();
+    setPrivacyBusy(true);
+    setPrivacyError(null);
+    try {
+      if (!(await showPrivacyOptions()) && renderCanHandle()) {
+        setPrivacyError(t('ads.privacyFailed'));
+      }
+    } catch {
+      if (renderCanHandle()) setPrivacyError(t('ads.privacyFailed'));
+    } finally {
+      if (privacyBusyRef.current !== operationOwner) return;
+      privacyBusyRef.current = null;
+      if (renderOwnsIdentity()) {
+        publishNavigationLock();
+        setPrivacyBusy(false);
+      }
+    }
   };
 
   const retakeTest = (): boolean => {
@@ -662,7 +764,10 @@ export default function SettingsScreen() {
     }
   };
 
-  const selectedLanguage = LANGUAGES.find((lang) => lang.code === user.nativeLanguage);
+  const selectedUiLanguage = UI_LANGUAGES.find((lang) => lang.code === user.uiLanguage);
+  const selectedLearningLanguage = LEARNING_LANGUAGES.find(
+    (lang) => lang.code === user.nativeLanguage,
+  );
 
   return (
     <ScrollView
@@ -741,18 +846,19 @@ export default function SettingsScreen() {
             : t('settings.levelPending')}
         </Text>
 
-        <Text style={styles.label}>{t('signup.languageLabel')}</Text>
+        <Text style={styles.label}>{t('settings.appLanguageLabel')}</Text>
+        <Text style={styles.languageHelp}>{t('settings.appLanguageHelp')}</Text>
         <View style={styles.languageGrid}>
-          {LANGUAGES.map((lang) => {
-            const selected = user.nativeLanguage === lang.code;
+          {UI_LANGUAGES.map((lang) => {
+            const selected = user.uiLanguage === lang.code;
             return (
               <Pressable
                 key={lang.code}
                 accessibilityRole="button"
-                accessibilityLabel={`${lang.english}, ${lang.native}`}
+                accessibilityLabel={`${t('settings.appLanguageLabel')}: ${lang.english}, ${lang.native}`}
                 accessibilityState={{ selected }}
                 disabled={languageBusy || logoutBusy}
-                onPress={() => void chooseLanguage(lang.code)}
+                onPress={() => void chooseUiLanguage(lang.code)}
                 style={[
                   styles.languageChip,
                   selected && styles.languageChipSelected,
@@ -769,10 +875,48 @@ export default function SettingsScreen() {
             );
           })}
         </View>
-        {selectedLanguage && languageBusy && (
+        {selectedUiLanguage && languageBusy && languageOperation === 'ui' && (
           <ActivityIndicator style={styles.languageSpinner} color={colors.primary} />
         )}
-        {languageError && (
+        {languageError && languageErrorScope === 'ui' && (
+          <Text accessibilityRole="alert" style={styles.fieldError}>
+            {languageError}
+          </Text>
+        )}
+
+        <Text style={styles.label}>{t('settings.learningLanguageLabel')}</Text>
+        <Text style={styles.languageHelp}>{t('settings.learningLanguageHelp')}</Text>
+        <View style={styles.languageGrid}>
+          {LEARNING_LANGUAGES.map((lang) => {
+            const selected = user.nativeLanguage === lang.code;
+            return (
+              <Pressable
+                key={lang.code}
+                accessibilityRole="button"
+                accessibilityLabel={`${lang.english}, ${lang.native}`}
+                accessibilityState={{ selected }}
+                disabled={languageBusy || logoutBusy}
+                onPress={() => void chooseNativeLanguage(lang.code)}
+                style={[
+                  styles.languageChip,
+                  selected && styles.languageChipSelected,
+                  (languageBusy || logoutBusy) && !selected && styles.controlDisabled,
+                ]}
+              >
+                <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
+                  {lang.native}
+                </Text>
+                <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
+                  {lang.english}
+                </Text>
+              </Pressable>
+            );
+          })}
+        </View>
+        {selectedLearningLanguage && languageBusy && languageOperation === 'native' && (
+          <ActivityIndicator style={styles.languageSpinner} color={colors.primary} />
+        )}
+        {languageError && languageErrorScope === 'native' && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {languageError}
           </Text>
@@ -846,12 +990,59 @@ export default function SettingsScreen() {
             {reminderError}
           </Text>
         )}
+        {(privacyOptionsRequired || privacyBusy || privacyError) && (
+          <>
+            {privacyOptionsRequired && (
+              <>
+                <Text style={styles.privacyHelp}>{t('ads.privacyOptionsHelp')}</Text>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityState={{ busy: privacyBusy, disabled: screenBusy }}
+                  disabled={screenBusy}
+                  onPress={() => void openAdPrivacyOptions()}
+                  style={({ pressed }) => [
+                    styles.actionRow,
+                    screenBusy && styles.controlDisabled,
+                    pressed && styles.actionRowPressed,
+                  ]}
+                >
+                  <Text style={styles.actionText}>{t('ads.privacyOptions')}</Text>
+                </Pressable>
+              </>
+            )}
+            {privacyBusy && (
+              <ActivityIndicator
+                accessibilityLabel={t('ads.privacyOptions')}
+                style={styles.privacySpinner}
+                color={colors.primary}
+              />
+            )}
+            {privacyError && (
+              <Text accessibilityRole="alert" style={styles.fieldError}>
+                {privacyError}
+              </Text>
+            )}
+          </>
+        )}
       </View>
 
       <View style={styles.card}>
         <Text accessibilityRole="header" style={styles.cardTitle}>
           {t('menu.accountTitle')}
         </Text>
+
+        <Pressable
+          accessibilityRole="button"
+          disabled={screenBusy}
+          style={({ pressed }) => [
+            styles.actionRow,
+            screenBusy && styles.controlDisabled,
+            pressed && styles.actionRowPressed,
+          ]}
+          onPress={() => navigateOnce('/recordings')}
+        >
+          <Text style={styles.actionText}>{t('header.recordings')}</Text>
+        </Pressable>
 
         <Pressable
           accessibilityRole="button"
@@ -1035,6 +1226,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.danger,
     fontSize: 13,
   },
+  languageHelp: {
+    marginBottom: spacing.sm,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
+  },
   languageGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1083,6 +1280,15 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     borderRadius: radii.pill,
     borderWidth: 1,
     borderColor: colors.primary,
+  },
+  privacyHelp: {
+    marginTop: spacing.md,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  privacySpinner: {
+    marginTop: spacing.sm,
   },
   reminderToggleOn: {
     backgroundColor: colors.primary,

@@ -78,6 +78,8 @@ describe('GET /practice/history', () => {
       transcript: 'transcribed answer',
       feedback: 'feedback text',
       createdAt: expect.any(String),
+      recordingId: null,
+      recordingStatus: null,
     });
     // Diagnostic attempts belong to the history, flagged by their context.
     expect(r.body.items[2]).toMatchObject({ context: 'diagnostic', score: 55, passed: false });

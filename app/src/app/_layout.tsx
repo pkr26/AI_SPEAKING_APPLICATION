@@ -6,7 +6,9 @@ import { AppState, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
+import { AdsProvider } from '../lib/ads';
 import { AuthProvider, useAuth } from '../lib/auth';
+import { refreshDailyReminderLanguage } from '../lib/daily-reminder';
 import { I18nProvider, translate, useT } from '../lib/i18n';
 import { PracticeFlowProvider } from '../lib/practice-flow';
 import { createThemedStyles, useTheme } from '../lib/theme';
@@ -84,6 +86,7 @@ function RootNavigator() {
           <Stack.Screen name="history" options={{ title: t('header.history') }} />
         </Stack.Protected>
         <Stack.Protected guard={hasProfile}>
+          <Stack.Screen name="recordings" options={{ title: t('header.recordings') }} />
           <Stack.Screen name="settings/index" options={{ title: t('header.settings') }} />
           <Stack.Screen
             name="settings/change-password"
@@ -101,10 +104,22 @@ function RootNavigator() {
   );
 }
 
-/** Bridges the authenticated user's language into the i18n provider. */
+/** Bridges the authenticated user's UI language into the i18n provider. */
 function LocalizedProviders({ children }: { children: React.ReactNode }) {
   const { user } = useAuth();
-  return <I18nProvider userLanguage={user?.nativeLanguage ?? null}>{children}</I18nProvider>;
+  return <I18nProvider accountLanguage={user?.uiLanguage ?? null}>{children}</I18nProvider>;
+}
+
+/** Keeps OS-baked reminder copy aligned after restore or another device's edit. */
+function ReminderLanguageBridge() {
+  const { user } = useAuth();
+  const userId = user?.id;
+  const uiLanguage = user?.uiLanguage;
+  useEffect(() => {
+    if (!userId || !uiLanguage) return;
+    void refreshDailyReminderLanguage(uiLanguage).catch(() => undefined);
+  }, [uiLanguage, userId]);
+  return null;
 }
 
 function QueryFocusBridge() {
@@ -151,13 +166,16 @@ export default function RootLayout() {
     <SafeAreaProvider>
       <QueryClientProvider client={queryClient}>
         <QueryFocusBridge />
-        <AuthProvider>
-          <LocalizedProviders>
-            <PracticeFlowProvider>
-              <RootNavigator />
-            </PracticeFlowProvider>
-          </LocalizedProviders>
-        </AuthProvider>
+        <AdsProvider>
+          <AuthProvider>
+            <LocalizedProviders>
+              <ReminderLanguageBridge />
+              <PracticeFlowProvider>
+                <RootNavigator />
+              </PracticeFlowProvider>
+            </LocalizedProviders>
+          </AuthProvider>
+        </AdsProvider>
       </QueryClientProvider>
     </SafeAreaProvider>
   );

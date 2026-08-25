@@ -1,13 +1,15 @@
+import { randomUUID } from 'crypto';
 import { RequestHandler, Response } from 'express';
 import fs from 'fs/promises';
 import { z } from 'zod';
 import { AssessOptions } from './assess';
-import { verifyAudioDuration } from './audio-inspection';
+import { measureAudioDuration } from './audio-inspection';
 import {
   discardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
   isOwnedAudioKey,
   ownSubmittedPresignedAudio,
+  preserveSubmittedPresignedAudio,
   resolvePresignedAudio,
   s3StorageEnabled,
   AudioStorageScope,
@@ -18,6 +20,8 @@ import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
 import { abandonAssessmentRequest, AssessmentContext, claimAssessmentRequest } from './idempotency';
 import { AuthedRequest, HttpError, UserRow, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
+import { RecordingCapture } from './recording-store';
+import { tryRetainRecording } from './recordings';
 import { ownSubmittedAudioFile, uploadAudio, verifyAudioMagicBytes } from './upload';
 
 /**
@@ -135,6 +139,7 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
     result: Result,
     requestId: string,
     requestClaimId: string,
+    recording?: RecordingCapture,
   ) => Promise<Record<string, unknown>>;
   /** Best-effort release of the per-question claim (never throws). */
   clearClaim: (user: UserRow, question: QuestionRow, claim: Claim) => Promise<void>;
@@ -209,7 +214,7 @@ export async function runAssessmentSubmission<Claim, Result>(
         throw new HttpError(400, 'audio file is required');
       }
       await verifyAudioMagicBytes(audioFile.path);
-      if (!config.mockAi) await verifyAudioDuration(audioFile.path);
+      const durationMs = config.mockAi ? undefined : Math.round((await measureAudioDuration(audioFile.path)) * 1000);
       claim = await hooks.claimAttempt(user, question);
       const result = await hooks.assess(audioFile.path, user, question, claim, {
         // Once the capacity reservation commits, the assessment limiters
@@ -233,7 +238,26 @@ export async function runAssessmentSubmission<Claim, Result>(
           }
         },
       });
-      const response = await hooks.persist(user, question, claim, result, requestId, requestClaim.claimId);
+      const recording: RecordingCapture | undefined = audioFile.retainedSource
+        ? {
+            id: randomUUID(),
+            storageScope: audioFile.retainedSource.scope,
+            audioKey: audioFile.retainedSource.audioKey,
+            s3VersionId: audioFile.retainedSource.s3VersionId,
+            contentType: audioFile.retainedSource.contentType,
+            sizeBytes: audioFile.retainedSource.sizeBytes,
+            ...(durationMs === undefined ? {} : { durationMs }),
+            ...(audioFile.retainedSource.etag ? { etag: audioFile.retainedSource.etag } : {}),
+          }
+        : undefined;
+      const response = await hooks.persist(user, question, claim, result, requestId, requestClaim.claimId, recording);
+      if (recording) {
+        // The metadata and idempotent response committed together. Suppress the
+        // old success DeleteObject and promote the exact version; a durable
+        // worker retries if this immediate best-effort tag fails.
+        preserveSubmittedPresignedAudio(res);
+        void tryRetainRecording(recording.id);
+      }
       completed = true;
       try {
         return res.json(response);

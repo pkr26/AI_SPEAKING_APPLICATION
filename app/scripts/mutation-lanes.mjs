@@ -43,6 +43,22 @@ export const mutationLanes = Object.freeze({
   i18n: lane(['src/lib/i18n.tsx'], ['__tests__/i18n-test.tsx']),
   types: lane(['src/lib/types.ts'], ['__tests__/types-test.ts']),
   api: lane(['src/lib/api.ts'], ['__tests__/api-test.ts']),
+  ads: lane(
+    [
+      'src/lib/ads.tsx',
+      'src/components/HomeBannerAd.tsx',
+      'src/components/HistoryNativeAdCard.tsx',
+    ],
+    ['__tests__/ads-test.tsx'],
+  ),
+  recordings: lane(
+    ['src/app/recordings.tsx', 'src/components/RecordingPlayback.tsx', 'src/lib/audio-session.ts'],
+    [
+      '__tests__/recording-playback-test.tsx',
+      '__tests__/recorder-audio-owner-contract-test.tsx',
+      '__tests__/screens-recordings-test.tsx',
+    ],
+  ),
   authLib: lane(['src/lib/auth.tsx'], ['__tests__/auth-test.tsx']),
   storage: lane(
     ['src/lib/params.ts', 'src/lib/pending-assessment.ts'],
@@ -134,6 +150,8 @@ export const mutationLanes = Object.freeze({
  * never silently skip the campaign.
  */
 export const intentionallyUnassignedTestFiles = Object.freeze({
+  '__tests__/admob-app-config-test.ts':
+    'Exercises app.config.ts, which lives outside the mutable src/ tree and owns no app production mutant.',
   '__tests__/app-config-test.ts':
     'Asserts the shape of app.json (scheme, orientation, plugin list, EAS ' +
     'project wiring). It imports no TypeScript source, so it owns no mutants.',

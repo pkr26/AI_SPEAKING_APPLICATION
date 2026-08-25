@@ -41,9 +41,11 @@ const runtime = vi.hoisted(() => {
     cleanupRateLimits: vi.fn(async () => 0),
     cleanupUsage: vi.fn(async () => 0),
     cleanupResetTokens: vi.fn(async () => 0),
+    cleanupRecordings: vi.fn(async () => 0),
     abortAssessments: vi.fn(() => 0),
     assertSchema: vi.fn(async (): Promise<void> => undefined),
     assertAudio: vi.fn(async (): Promise<void> => undefined),
+    assertStorage: vi.fn(async (): Promise<void> => undefined),
     trustProxy: false as false | number,
     dbPoolMax: 20,
   };
@@ -59,6 +61,7 @@ vi.mock('../src/config', () => ({
     openaiTimeoutMs: 60_000,
     shutdownDrainMs: 140_000,
     s3: { operationTimeoutMs: 30_000 },
+    recordings: { maintenanceIntervalMs: 60_000 },
     get trustProxy() {
       return runtime.trustProxy;
     },
@@ -77,6 +80,8 @@ vi.mock('../src/assess', () => ({
   abortInFlightAssessments: runtime.abortAssessments,
 }));
 vi.mock('../src/auth', () => ({ cleanupPasswordResetTokens: runtime.cleanupResetTokens }));
+vi.mock('../src/recordings', () => ({ runRecordingMaintenance: runtime.cleanupRecordings }));
+vi.mock('../src/audio-upload', () => ({ assertRetainedAudioStorageAvailable: runtime.assertStorage }));
 vi.mock('../src/schema-readiness', () => ({ assertDatabaseSchemaCurrent: runtime.assertSchema }));
 vi.mock('../src/audio-inspection', () => ({ assertAudioInspectorAvailable: runtime.assertAudio }));
 
@@ -118,9 +123,11 @@ beforeEach(() => {
   runtime.cleanupRateLimits.mockResolvedValue(0);
   runtime.cleanupUsage.mockResolvedValue(0);
   runtime.cleanupResetTokens.mockResolvedValue(0);
+  runtime.cleanupRecordings.mockResolvedValue(0);
   runtime.abortAssessments.mockReturnValue(0);
   runtime.assertSchema.mockResolvedValue(undefined);
   runtime.assertAudio.mockResolvedValue(undefined);
+  runtime.assertStorage.mockResolvedValue(undefined);
   originalSigtermListeners = new Set(process.listeners('SIGTERM'));
   originalSigintListeners = new Set(process.listeners('SIGINT'));
 });
@@ -265,11 +272,13 @@ describe('server lifecycle failure handling', () => {
     const rateLimitError = new Error('rate-limit cleanup failed');
     const usageError = new Error('usage cleanup failed');
     const resetTokenError = new Error('reset token cleanup failed');
+    const recordingError = new Error('recording maintenance failed');
     runtime.cleanupUploads.mockRejectedValueOnce(uploadError);
     runtime.cleanupRequests.mockRejectedValueOnce(replayError);
     runtime.cleanupRateLimits.mockRejectedValueOnce(rateLimitError);
     runtime.cleanupUsage.mockRejectedValueOnce(usageError);
     runtime.cleanupResetTokens.mockRejectedValueOnce(resetTokenError);
+    runtime.cleanupRecordings.mockRejectedValueOnce(recordingError);
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
 
     await import('../src/index');
@@ -281,6 +290,7 @@ describe('server lifecycle failure handling', () => {
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: rateLimitError }, 'rate-limit janitor failed');
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: usageError }, 'assessment usage janitor failed');
       expect(runtime.logger.warn).toHaveBeenCalledWith({ err: resetTokenError }, 'password reset token janitor failed');
+      expect(runtime.logger.warn).toHaveBeenCalledWith({ err: recordingError }, 'recording maintenance failed');
     });
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
@@ -315,6 +325,7 @@ describe('server lifecycle failure handling', () => {
     runtime.cleanupRateLimits.mockResolvedValueOnce(4);
     runtime.cleanupUsage.mockResolvedValueOnce(5);
     runtime.cleanupResetTokens.mockResolvedValueOnce(6);
+    runtime.cleanupRecordings.mockResolvedValueOnce(7);
     const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
 
     await import('../src/index');
@@ -327,6 +338,10 @@ describe('server lifecycle failure handling', () => {
         'janitor removed expired assessment reservations',
       );
       expect(runtime.logger.info).toHaveBeenCalledWith({ removed: 6 }, 'janitor removed expired password reset tokens');
+      expect(runtime.logger.info).toHaveBeenCalledWith(
+        { removed: 7 },
+        'recording maintenance removed completed deletion tombstones',
+      );
     });
 
     // The same tick feeds janitor_removed_total, labeled per janitor. Import
@@ -342,6 +357,7 @@ describe('server lifecycle failure handling', () => {
       'rate-limit-windows': 4,
       'assessment-usage': 5,
       'password-reset-tokens': 6,
+      recordings: 7,
     });
 
     runtime.logger.info.mockClear();
@@ -407,6 +423,7 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.cleanupRateLimits).not.toHaveBeenCalled();
     expect(runtime.cleanupUsage).not.toHaveBeenCalled();
     expect(runtime.cleanupResetTokens).not.toHaveBeenCalled();
+    expect(runtime.cleanupRecordings).not.toHaveBeenCalled();
     expect(setIntervalSpy).not.toHaveBeenCalled();
 
     releaseSchema();
@@ -423,12 +440,14 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.cleanupRateLimits).toHaveBeenCalledOnce();
     expect(runtime.cleanupUsage).toHaveBeenCalledOnce();
     expect(runtime.cleanupResetTokens).toHaveBeenCalledOnce();
+    expect(runtime.cleanupRecordings).toHaveBeenCalledOnce();
     expect(setIntervalSpy.mock.calls.map(([, delay]) => delay)).toEqual([
       15 * 60 * 1000,
       60 * 60 * 1000,
       60 * 60 * 1000,
       60 * 60 * 1000,
       60 * 60 * 1000,
+      60 * 1000,
     ]);
 
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
@@ -437,12 +456,13 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.cleanupRateLimits).toHaveBeenCalledTimes(2);
     expect(runtime.cleanupUsage).toHaveBeenCalledTimes(2);
     expect(runtime.cleanupResetTokens).toHaveBeenCalledTimes(2);
+    expect(runtime.cleanupRecordings).toHaveBeenCalledTimes(61);
 
     addedSignalListener('SIGTERM')('SIGTERM');
     await Promise.resolve();
     await Promise.resolve();
     expect(exit).toHaveBeenCalledWith(0);
-    expect(clearIntervalSpy).toHaveBeenCalledTimes(5);
+    expect(clearIntervalSpy).toHaveBeenCalledTimes(6);
 
     const callsAfterShutdown = [
       runtime.cleanupUploads.mock.calls.length,
@@ -450,6 +470,7 @@ describe('server lifecycle failure handling', () => {
       runtime.cleanupRateLimits.mock.calls.length,
       runtime.cleanupUsage.mock.calls.length,
       runtime.cleanupResetTokens.mock.calls.length,
+      runtime.cleanupRecordings.mock.calls.length,
     ];
     await vi.advanceTimersByTimeAsync(60 * 60 * 1000);
     expect([
@@ -458,6 +479,7 @@ describe('server lifecycle failure handling', () => {
       runtime.cleanupRateLimits.mock.calls.length,
       runtime.cleanupUsage.mock.calls.length,
       runtime.cleanupResetTokens.mock.calls.length,
+      runtime.cleanupRecordings.mock.calls.length,
     ]).toEqual(callsAfterShutdown);
   });
 

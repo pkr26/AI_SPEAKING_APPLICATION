@@ -30,6 +30,10 @@ const MANAGED_KEYS = [
   'GRADING_MODEL',
   'SHUTDOWN_DRAIN_MS',
   'METRICS_ENABLED',
+  'ADS_ENABLED',
+  'ADS_AUDIENCE_MODE',
+  'ADS_HOME_BANNER_ENABLED',
+  'ADS_HISTORY_NATIVE_ENABLED',
   'MIN_CLIENT_VERSION',
   'FFMPEG_PATH',
   'FFPROBE_PATH',
@@ -52,6 +56,8 @@ const MANAGED_KEYS = [
   'RATE_LIMIT_ASSESS_MAX',
   'RATE_LIMIT_UPLOAD_GRANT_WINDOW_MS',
   'RATE_LIMIT_UPLOAD_GRANT_MAX',
+  'RATE_LIMIT_PLAYBACK_GRANT_WINDOW_MS',
+  'RATE_LIMIT_PLAYBACK_GRANT_MAX',
   'MOCK_AI',
   'OPENAI_API_KEY',
   'S3_DIAGNOSTIC_BUCKET',
@@ -63,6 +69,10 @@ const MANAGED_KEYS = [
   'S3_SESSION_TOKEN',
   'S3_UPLOAD_URL_TTL_SECONDS',
   'S3_OPERATION_TIMEOUT_MS',
+  'RECORDING_PLAYBACK_URL_TTL_SECONDS',
+  'RECORDING_MAINTENANCE_INTERVAL_MS',
+  'RECORDING_MAINTENANCE_BATCH_SIZE',
+  'RECORDING_MAINTENANCE_CONCURRENCY',
 ];
 
 const VALID_SECRET = 'a-realistic-signing-secret-with-32-plus-characters';
@@ -165,6 +175,12 @@ describe('config env validation', () => {
     expect(config.gradingModel).toBe('gpt-4o-mini-2024-07-18');
     expect(config.shutdownDrainMs).toBe(140_000);
     expect(config.metricsEnabled).toBe(false);
+    expect(config.ads).toEqual({
+      enabled: false,
+      audienceMode: 'unknown',
+      homeBannerEnabled: false,
+      historyNativeEnabled: false,
+    });
     expect(config.minClientVersion).toBeUndefined();
     expect(config.ffmpegPath).toBe('ffmpeg');
     expect(config.ffprobePath).toBe('ffprobe');
@@ -186,6 +202,8 @@ describe('config env validation', () => {
       assessMax: 20,
       uploadGrantWindowMs: 60 * 60 * 1000,
       uploadGrantMax: 40,
+      playbackGrantWindowMs: 15 * 60 * 1000,
+      playbackGrantMax: 60,
     });
     expect(config.trustProxy).toBe(false);
     expect(config.corsOrigins).toEqual([]);
@@ -333,6 +351,25 @@ describe('config env validation', () => {
     expect((await loadConfig(baseEnv({ METRICS_ENABLED: '1' }))).metricsEnabled).toBe(true);
     expect((await loadConfig(baseEnv({ METRICS_ENABLED: '0' }))).metricsEnabled).toBe(false);
     await expectInvalid(baseEnv({ METRICS_ENABLED: 'on' }), "must be one of 'true', 'false', '1', or '0'");
+  });
+
+  it('parses the fail-closed ads policy and rejects unsupported audience modes', async () => {
+    const config = await loadConfig(
+      baseEnv({
+        ADS_ENABLED: 'true',
+        ADS_AUDIENCE_MODE: 'adult-only',
+        ADS_HOME_BANNER_ENABLED: '1',
+        ADS_HISTORY_NATIVE_ENABLED: 'true',
+      }),
+    );
+    expect(config.ads).toEqual({
+      enabled: true,
+      audienceMode: 'adult-only',
+      homeBannerEnabled: true,
+      historyNativeEnabled: true,
+    });
+    await expectInvalid(baseEnv({ ADS_AUDIENCE_MODE: 'teen' }), 'ADS_AUDIENCE_MODE');
+    await expectInvalid(baseEnv({ ADS_ENABLED: 'yes' }), "must be one of 'true', 'false', '1', or '0'");
   });
 
   it('parses TRUST_PROXY hop counts and rejects unsafe values', async () => {

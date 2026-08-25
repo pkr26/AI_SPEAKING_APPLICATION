@@ -1,6 +1,7 @@
 import type { AssessmentEndpoint } from './pending-assessment';
 
 export type NativeLanguage = 'te' | 'hi' | 'es' | 'zh';
+export type UiLanguage = 'en' | NativeLanguage;
 export type CefrLevel = 'A1' | 'A2' | 'B1' | 'B2' | 'C1' | 'C2';
 
 /** CEFR levels in promotion order; level-up responses move one step right. */
@@ -11,6 +12,7 @@ export interface User {
   name: string;
   email: string;
   nativeLanguage: NativeLanguage;
+  uiLanguage: UiLanguage;
   cefrLevel: CefrLevel | null;
   diagnosticCompleted: boolean;
 }
@@ -38,6 +40,7 @@ export interface DiagnosticAnswerResult {
   done: boolean;
   level?: CefrLevel;
   nextQuestion?: Question;
+  recordingId?: string;
 }
 
 export interface HelpContent {
@@ -90,6 +93,7 @@ export interface AttemptResult {
   finalFeedback?: string;
   next?: PracticeQuestionPayload;
   levelUp?: LevelUp;
+  recordingId?: string;
 }
 
 export interface PracticeStats {
@@ -108,6 +112,8 @@ export interface PracticeStats {
 }
 
 export type HistoryContext = 'diagnostic' | 'practice';
+export type RecordingContext = HistoryContext | 'practice-native';
+export type RecordingStatus = 'retention_pending' | 'available' | 'unavailable';
 
 export interface HistoryItem {
   id: string;
@@ -122,6 +128,8 @@ export interface HistoryItem {
   transcript: string;
   feedback: string;
   createdAt: string;
+  recordingId?: string | null;
+  recordingStatus?: RecordingStatus | null;
 }
 
 export interface HistoryPage {
@@ -143,6 +151,44 @@ export interface NativeAttemptResult {
   transcript: string;
   modelAnswer: string;
   feedback: string;
+  recordingId?: string;
+}
+
+export interface RecordingItem {
+  id: string;
+  questionId: string;
+  context: RecordingContext;
+  promptWord: string;
+  questionText: string;
+  cefrLevel: CefrLevel;
+  contentType: string;
+  sizeBytes: number;
+  durationMs: number | null;
+  status: RecordingStatus;
+  createdAt: string;
+  availableAt: string | null;
+}
+
+export interface RecordingPage {
+  items: RecordingItem[];
+  nextCursor: string | null;
+}
+
+export interface RecordingExportPage {
+  recordings: RecordingExportItem[];
+  nextCursor: string | null;
+}
+
+export interface RecordingExportItem extends RecordingItem {
+  requestId: string;
+  attemptId: string | null;
+}
+
+export interface RecordingPlaybackGrant {
+  recordingId: string;
+  playbackUrl: string;
+  expiresIn: number;
+  contentType: string;
 }
 
 export type PracticeOutcome = AttemptResult | NativeAttemptResult;
@@ -184,6 +230,10 @@ function isNumber(value: unknown): value is number {
 
 function isNativeLanguage(value: unknown): value is NativeLanguage {
   return value === 'te' || value === 'hi' || value === 'es' || value === 'zh';
+}
+
+function isUiLanguage(value: unknown): value is UiLanguage {
+  return value === 'en' || isNativeLanguage(value);
 }
 
 function isCefrLevel(value: unknown): value is CefrLevel {
@@ -231,6 +281,7 @@ export function parseUser(value: unknown): User {
       isBoundedNonEmptyString(candidate.name, 100) &&
       isBoundedNonEmptyString(candidate.email, 254) &&
       isNativeLanguage(candidate.nativeLanguage) &&
+      isUiLanguage(candidate.uiLanguage) &&
       (candidate.cefrLevel === null || isCefrLevel(candidate.cefrLevel)) &&
       typeof candidate.diagnosticCompleted === 'boolean'
     );
@@ -349,12 +400,14 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
   const transcript = value.transcript;
   const feedback = value.feedback;
   const done = value.done;
+  const recordingId = value.recordingId;
   if (
     typeof passed !== 'boolean' ||
     !isScore(score) ||
     !isBoundedString(transcript, 12_000) ||
     !isBoundedNonEmptyString(feedback, 800) ||
-    typeof done !== 'boolean'
+    typeof done !== 'boolean' ||
+    (recordingId !== undefined && !isUuid(recordingId))
   ) {
     throw new ContractError();
   }
@@ -366,6 +419,7 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
     feedback,
     done,
   };
+  if (recordingId !== undefined) result.recordingId = recordingId;
   const level = value.level;
   const nextQuestion = value.nextQuestion;
   if (done) {
@@ -429,6 +483,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   const attemptsLeft = value.attemptsLeft;
   const finalFeedback = value.finalFeedback;
   const next = value.next;
+  const recordingId = value.recordingId;
   if (
     typeof passed !== 'boolean' ||
     typeof mastered !== 'boolean' ||
@@ -438,7 +493,8 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     attemptNo > PRACTICE_MAX_ATTEMPTS ||
     !isScore(score) ||
     !isBoundedString(transcript, 12_000) ||
-    !isBoundedNonEmptyString(feedback, 800)
+    !isBoundedNonEmptyString(feedback, 800) ||
+    (recordingId !== undefined && !isUuid(recordingId))
   ) {
     throw new ContractError();
   }
@@ -450,6 +506,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     transcript,
     feedback,
   };
+  if (recordingId !== undefined) result.recordingId = recordingId;
 
   // These flags are derived by the server, not independent model output.
   // Reject an impossible combination instead of rendering misleading mastery
@@ -535,7 +592,8 @@ export function parseNativeAttemptResult(value: unknown): NativeAttemptResult {
     typeof value.understood !== 'boolean' ||
     !isBoundedString(value.transcript, 12_000) ||
     !isBoundedString(value.modelAnswer, 800) ||
-    !isBoundedNonEmptyString(value.feedback, 800)
+    !isBoundedNonEmptyString(value.feedback, 800) ||
+    (value.recordingId !== undefined && !isUuid(value.recordingId))
   ) {
     throw new ContractError();
   }
@@ -554,12 +612,17 @@ export function parseNativeAttemptResult(value: unknown): NativeAttemptResult {
     transcript: value.transcript,
     modelAnswer: value.modelAnswer,
     feedback: value.feedback,
+    ...(value.recordingId === undefined ? {} : { recordingId: value.recordingId }),
   };
 }
 
 /** Server timestamps are ISO-8601 strings; anything unparseable is contract drift. */
 function isTimestamp(value: unknown): value is string {
   return isBoundedNonEmptyString(value, 64) && !Number.isNaN(Date.parse(value));
+}
+
+function isRecordingStatus(value: unknown): value is RecordingStatus {
+  return value === 'retention_pending' || value === 'available' || value === 'unavailable';
 }
 
 export function parsePracticeStats(value: unknown): PracticeStats {
@@ -629,6 +692,8 @@ function parseHistoryItem(value: unknown): HistoryItem {
   const attemptNo = value.attemptNo;
   const score = value.score;
   const passed = value.passed;
+  const recordingId = value.recordingId;
+  const recordingStatus = value.recordingStatus;
   if (
     !isUuid(value.id) ||
     !isUuid(value.questionId) ||
@@ -644,7 +709,12 @@ function parseHistoryItem(value: unknown): HistoryItem {
     typeof passed !== 'boolean' ||
     !isBoundedString(value.transcript, 12_000) ||
     !isBoundedNonEmptyString(value.feedback, 4_000) ||
-    !isTimestamp(value.createdAt)
+    !isTimestamp(value.createdAt) ||
+    !(
+      (recordingId === null && recordingStatus === null) ||
+      (isUuid(recordingId) && isRecordingStatus(recordingStatus)) ||
+      (recordingId === undefined && recordingStatus === undefined)
+    )
   ) {
     throw new ContractError();
   }
@@ -662,6 +732,7 @@ function parseHistoryItem(value: unknown): HistoryItem {
     transcript: value.transcript,
     feedback: value.feedback,
     createdAt: value.createdAt,
+    ...(recordingId === undefined ? {} : { recordingId, recordingStatus }),
   };
 }
 
@@ -680,6 +751,90 @@ export function parsePracticeHistory(value: unknown): HistoryPage {
     items: value.items.map(parseHistoryItem),
     nextCursor: value.nextCursor,
   };
+}
+
+const RECORDING_MAX_PAGE_ITEMS = 500;
+
+export function parseRecordingItem(value: unknown): RecordingItem {
+  if (!isRecord(value)) throw new ContractError();
+  const context = value.context;
+  const durationMs = value.durationMs;
+  const status = value.status;
+  const availableAt = value.availableAt;
+  if (
+    !isUuid(value.id) ||
+    !isUuid(value.questionId) ||
+    (context !== 'diagnostic' && context !== 'practice' && context !== 'practice-native') ||
+    !isBoundedNonEmptyString(value.promptWord, 100) ||
+    !isBoundedNonEmptyString(value.questionText, 1_000) ||
+    !isCefrLevel(value.cefrLevel) ||
+    !isBoundedNonEmptyString(value.contentType, 128) ||
+    !isNumber(value.sizeBytes) ||
+    !Number.isSafeInteger(value.sizeBytes) ||
+    value.sizeBytes < 1 ||
+    value.sizeBytes > 25 * 1024 * 1024 ||
+    !(
+      durationMs === null ||
+      (isNumber(durationMs) &&
+        Number.isSafeInteger(durationMs) &&
+        durationMs >= 500 &&
+        durationMs <= 120_500)
+    ) ||
+    !isRecordingStatus(status) ||
+    !isTimestamp(value.createdAt) ||
+    !(
+      (status === 'available' && isTimestamp(availableAt)) ||
+      (status !== 'available' && availableAt === null)
+    )
+  ) {
+    throw new ContractError();
+  }
+  return {
+    id: value.id,
+    questionId: value.questionId,
+    context,
+    promptWord: value.promptWord,
+    questionText: value.questionText,
+    cefrLevel: value.cefrLevel,
+    contentType: value.contentType,
+    sizeBytes: value.sizeBytes,
+    durationMs,
+    status,
+    createdAt: value.createdAt,
+    availableAt,
+  };
+}
+
+export function parseRecordingPage(value: unknown): RecordingPage {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.items) ||
+    value.items.length > 50 ||
+    (value.nextCursor !== null && !isUuid(value.nextCursor)) ||
+    (value.items.length === 0 && value.nextCursor !== null)
+  ) {
+    throw new ContractError();
+  }
+  return { items: value.items.map(parseRecordingItem), nextCursor: value.nextCursor };
+}
+
+export function parseRecordingExportPage(value: unknown): RecordingExportPage {
+  if (
+    !isRecord(value) ||
+    !Array.isArray(value.recordings) ||
+    value.recordings.length > RECORDING_MAX_PAGE_ITEMS ||
+    (value.nextCursor !== null && !isUuid(value.nextCursor)) ||
+    (value.recordings.length === 0 && value.nextCursor !== null)
+  ) {
+    throw new ContractError();
+  }
+  const recordings = value.recordings.map((recording): RecordingExportItem => {
+    const parsed = parseRecordingItem(recording);
+    if (!isRecord(recording) || !isUuid(recording.requestId)) throw new ContractError();
+    if (recording.attemptId !== null && !isUuid(recording.attemptId)) throw new ContractError();
+    return { ...parsed, requestId: recording.requestId, attemptId: recording.attemptId };
+  });
+  return { recordings, nextCursor: value.nextCursor };
 }
 
 const EXPORT_MAX_PAGE_ITEMS = 500;
@@ -775,6 +930,55 @@ function safeUploadUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function safePlaybackUrl(value: string, expiresIn: number): boolean {
+  if (value.length > 16_384) return false;
+  try {
+    const url = new URL(value);
+    const signedExpiry = Number(url.searchParams.get('X-Amz-Expires'));
+    return (
+      url.protocol === 'https:' &&
+      isAwsS3Hostname(url.hostname) &&
+      !url.username &&
+      !url.password &&
+      !url.hash &&
+      url.searchParams.get('X-Amz-Algorithm') === 'AWS4-HMAC-SHA256' &&
+      isNonEmptyString(url.searchParams.get('X-Amz-Credential')) &&
+      isNonEmptyString(url.searchParams.get('X-Amz-Date')) &&
+      isNonEmptyString(url.searchParams.get('X-Amz-SignedHeaders')) &&
+      isNonEmptyString(url.searchParams.get('X-Amz-Signature')) &&
+      Number.isSafeInteger(signedExpiry) &&
+      signedExpiry === expiresIn
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function parseRecordingPlaybackGrant(
+  value: unknown,
+  expectedRecordingId?: string,
+): RecordingPlaybackGrant {
+  if (!isRecord(value)) throw new ContractError();
+  const recordingId = value.recordingId;
+  const playbackUrl = value.playbackUrl;
+  const expiresIn = value.expiresIn;
+  const contentType = value.contentType;
+  if (
+    !isUuid(recordingId) ||
+    (expectedRecordingId !== undefined && recordingId !== expectedRecordingId) ||
+    !isNumber(expiresIn) ||
+    !Number.isSafeInteger(expiresIn) ||
+    expiresIn < 30 ||
+    expiresIn > 300 ||
+    !isBoundedNonEmptyString(playbackUrl, 16_384) ||
+    !safePlaybackUrl(playbackUrl, expiresIn) ||
+    !isBoundedNonEmptyString(contentType, 128)
+  ) {
+    throw new ContractError();
+  }
+  return { recordingId, playbackUrl, expiresIn, contentType };
 }
 
 function safeAudioKey(value: string): boolean {

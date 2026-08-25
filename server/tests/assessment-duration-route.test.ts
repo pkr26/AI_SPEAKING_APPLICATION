@@ -4,7 +4,7 @@ import request from 'supertest';
 
 const routeMocks = vi.hoisted(() => ({
   assess: vi.fn(),
-  verifyDuration: vi.fn(),
+  measureDuration: vi.fn(),
 }));
 
 vi.mock('../src/assess', async (importOriginal) => {
@@ -14,7 +14,7 @@ vi.mock('../src/assess', async (importOriginal) => {
 
 vi.mock('../src/audio-inspection', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/audio-inspection')>();
-  return { ...actual, verifyAudioDuration: routeMocks.verifyDuration };
+  return { ...actual, measureAudioDuration: routeMocks.measureDuration };
 });
 
 import { config } from '../src/config';
@@ -25,7 +25,7 @@ const originalMockAi = config.mockAi;
 
 beforeEach(() => {
   config.mockAi = false;
-  routeMocks.verifyDuration.mockReset().mockResolvedValue(true);
+  routeMocks.measureDuration.mockReset().mockResolvedValue(1);
   routeMocks.assess.mockReset().mockResolvedValue({
     transcript: 'A complete spoken response.',
     score: 80,
@@ -56,9 +56,9 @@ describe('route audio-duration enforcement', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(routeMocks.verifyDuration).toHaveBeenCalledOnce();
-    expect(routeMocks.verifyDuration).toHaveBeenCalledWith(expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/));
-    expect(routeMocks.verifyDuration.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(routeMocks.measureDuration).toHaveBeenCalledOnce();
+    expect(routeMocks.measureDuration).toHaveBeenCalledWith(expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/));
+    expect(routeMocks.measureDuration.mock.invocationCallOrder[0]).toBeLessThan(
       routeMocks.assess.mock.invocationCallOrder[0],
     );
   });
@@ -69,7 +69,7 @@ describe('route audio-duration enforcement', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const level = await completeDiagnostic(a, token);
-    routeMocks.verifyDuration.mockClear();
+    routeMocks.measureDuration.mockClear();
     routeMocks.assess.mockClear();
     const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
       level,
@@ -81,9 +81,9 @@ describe('route audio-duration enforcement', () => {
     );
 
     expect(response.status).toBe(200);
-    expect(routeMocks.verifyDuration).toHaveBeenCalledOnce();
-    expect(routeMocks.verifyDuration).toHaveBeenCalledWith(expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/));
-    expect(routeMocks.verifyDuration.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(routeMocks.measureDuration).toHaveBeenCalledOnce();
+    expect(routeMocks.measureDuration).toHaveBeenCalledWith(expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/));
+    expect(routeMocks.measureDuration.mock.invocationCallOrder[0]).toBeLessThan(
       routeMocks.assess.mock.invocationCallOrder[0],
     );
   });
@@ -92,10 +92,10 @@ describe('route audio-duration enforcement', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
-    routeMocks.verifyDuration
+    routeMocks.measureDuration
       .mockReset()
       .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG'))
-      .mockResolvedValue(true);
+      .mockResolvedValue(1);
     const requestId = randomUUID();
 
     const rejected = await request(a)
@@ -125,10 +125,10 @@ describe('route audio-duration enforcement', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const level = await completeDiagnostic(a, token);
-    routeMocks.verifyDuration
+    routeMocks.measureDuration
       .mockReset()
       .mockRejectedValueOnce(new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG'))
-      .mockResolvedValue(true);
+      .mockResolvedValue(1);
     routeMocks.assess.mockClear();
     const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
       level,

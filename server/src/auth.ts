@@ -47,6 +47,7 @@ function toUserJson(row: UserRow) {
     name: row.name,
     email: row.email,
     nativeLanguage: row.native_language,
+    uiLanguage: row.ui_language,
     cefrLevel: row.cefr_level,
     diagnosticCompleted: row.diagnostic_completed,
   };
@@ -99,6 +100,10 @@ const nativeLanguageSchema = z.enum(['te', 'hi', 'es', 'zh'], {
   errorMap: () => ({ message: "nativeLanguage must be one of 'te','hi','es','zh'" }),
 });
 
+const uiLanguageSchema = z.enum(['en', 'te', 'hi', 'es', 'zh'], {
+  errorMap: () => ({ message: "uiLanguage must be one of 'en','te','hi','es','zh'" }),
+});
+
 const emailSchema = (requiredError: string) =>
   z
     .string({ required_error: requiredError })
@@ -112,6 +117,7 @@ const registerSchema = z.object({
   email: emailSchema('email is required'),
   password: passwordSchema,
   nativeLanguage: nativeLanguageSchema,
+  uiLanguage: uiLanguageSchema.default('en'),
 });
 
 const loginSchema = z.object({
@@ -153,10 +159,14 @@ const updateProfileSchema = z
   .object({
     name: nameSchema.optional(),
     nativeLanguage: nativeLanguageSchema.optional(),
+    uiLanguage: uiLanguageSchema.optional(),
   })
-  .refine((fields) => fields.name !== undefined || fields.nativeLanguage !== undefined, {
-    message: 'at least one of name or nativeLanguage is required',
-  });
+  .refine(
+    (fields) => fields.name !== undefined || fields.nativeLanguage !== undefined || fields.uiLanguage !== undefined,
+    {
+      message: 'at least one of name, nativeLanguage, or uiLanguage is required',
+    },
+  );
 
 /**
  * Janitor: remove expired password-reset tokens. Expiry is already enforced by
@@ -186,7 +196,7 @@ export function createAuthRouter(limiters: Limiters) {
     '/register',
     validate({ body: registerSchema }),
     h(async (req, res) => {
-      const { name, email, password, nativeLanguage } = validated(req, registerSchema);
+      const { name, email, password, nativeLanguage, uiLanguage } = validated(req, registerSchema);
 
       const passwordHash = await bcrypt.hash(password, BCRYPT_COST);
       // User + initial diagnostic state in ONE transaction.
@@ -195,8 +205,9 @@ export function createAuthRouter(limiters: Limiters) {
       try {
         await client.query('BEGIN');
         const { rows } = await client.query<UserRow>(
-          'INSERT INTO users (name, email, password_hash, native_language) VALUES ($1, $2, $3, $4) RETURNING *',
-          [name, email, passwordHash, nativeLanguage],
+          `INSERT INTO users (name, email, password_hash, native_language, ui_language)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [name, email, passwordHash, nativeLanguage, uiLanguage],
         );
         user = rows[0];
         await client.query(
@@ -373,10 +384,15 @@ export function createAuthRouter(limiters: Limiters) {
     validate({ body: updateProfileSchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const { name, nativeLanguage } = validated(req, updateProfileSchema);
+      const { name, nativeLanguage, uiLanguage } = validated(req, updateProfileSchema);
       const { rows } = await pool.query<UserRow>(
-        'UPDATE users SET name = coalesce($1, name), native_language = coalesce($2, native_language) WHERE id = $3 RETURNING *',
-        [name ?? null, nativeLanguage ?? null, user.id],
+        `UPDATE users
+         SET name = coalesce($1, name),
+             native_language = coalesce($2, native_language),
+             ui_language = coalesce($3, ui_language)
+         WHERE id = $4
+         RETURNING *`,
+        [name ?? null, nativeLanguage ?? null, uiLanguage ?? null, user.id],
       );
       const updated = rows[0];
       // A concurrent self-delete between requireAuth and this UPDATE leaves no

@@ -474,4 +474,20 @@ for (const [name, context, value] of [
   invalid(name, context, value);
 }
 
+const RECORDING_ID = '22222222-2222-4222-8222-222222222222';
+for (const [context, value] of [
+  ['diagnostic', diagnosticDone({ recordingId: RECORDING_ID })],
+  ['practice', practiceMastery({ recordingId: RECORDING_ID })],
+  ['practice-native', nativeSpoken({ recordingId: RECORDING_ID })],
+] as const) {
+  valid(`${context} retained recording id`, context, value);
+}
+for (const [context, value] of [
+  ['diagnostic', diagnosticDone({ recordingId: 'not-a-uuid' })],
+  ['practice', practiceMastery({ recordingId: 7 })],
+  ['practice-native', nativeSpoken({ recordingId: null })],
+] as const) {
+  invalid(`${context} invalid retained recording id`, context, value);
+}
+
 export const assessmentResponseCases: readonly AssessmentResponseCase[] = cases;

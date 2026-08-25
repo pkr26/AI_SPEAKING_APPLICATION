@@ -155,3 +155,10 @@ export const janitorRemovedTotal = new Counter({
   labelNames: ['janitor'] as const,
   registers: [registry],
 });
+
+export const recordingMaintenanceTotal = new Counter({
+  name: 'recording_maintenance_total',
+  help: 'Durable recording retention/deletion maintenance outcomes',
+  labelNames: ['operation', 'outcome'] as const,
+  registers: [registry],
+});

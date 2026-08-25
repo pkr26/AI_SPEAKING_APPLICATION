@@ -18,7 +18,6 @@ import {
   AudioModule,
   createAudioPlayer,
   RecordingPresets,
-  setAudioModeAsync,
   useAudioRecorder,
   type AudioRecorder,
   type AudioPlayer,
@@ -37,6 +36,12 @@ import {
   resolveAudioFileDescriptor,
   userMessageForError,
 } from '../lib/api';
+import {
+  configurePlaybackAudioMode,
+  configureRecordingAudioMode,
+  getSubmittedRecordingPlaybackActive,
+  stopActivePlayback,
+} from '../lib/audio-session';
 import { translate, useT, type MessageKey } from '../lib/i18n';
 import {
   capturePendingAssessmentGeneration,
@@ -105,7 +110,6 @@ let activeAudioSessionReleasePromise: Promise<void> | null = null;
 let resolveActiveAudioSessionRelease: (() => void) | null = null;
 const liveRecorderUris = new Set<string>();
 let recordingCacheJanitorHasRun = false;
-let audioModeQueue: Promise<void> = Promise.resolve();
 
 const MAX_RECORDING_SECONDS = 120;
 const AUTO_STOP_TAP_GRACE_MS = 1_000;
@@ -145,12 +149,6 @@ function isDefiniteAssessmentServerFailure(error: unknown): error is ApiError {
       error.code === 'POOL_SATURATED' ||
       error.code === 'INTERNAL')
   );
-}
-
-function serializeAudioMode(operation: () => Promise<void>): Promise<void> {
-  const result = audioModeQueue.then(operation, operation);
-  audioModeQueue = result.catch(() => undefined);
-  return result;
 }
 
 /**
@@ -648,15 +646,7 @@ function useScopedAudioRecorderState(
 }
 
 async function restoreAudioMode(): Promise<void> {
-  const restore = () =>
-    serializeAudioMode(() =>
-      setAudioModeAsync({
-        allowsRecording: false,
-        allowsBackgroundRecording: false,
-        playsInSilentMode: true,
-        shouldPlayInBackground: false,
-      }),
-    );
+  const restore = () => configurePlaybackAudioMode();
   try {
     await restore();
     return;
@@ -2553,17 +2543,12 @@ export default function Recorder<T>({
           return;
         }
       }
+      if (getSubmittedRecordingPlaybackActive()) await stopActivePlayback();
       await audioRestorePromiseRef.current;
       await activeAudioSessionReleasePromise;
       if (!isCurrentLifecycle()) return;
       acquireAudioSession();
-      const recordingAudioMode = {
-        allowsRecording: true,
-        allowsBackgroundRecording: false,
-        playsInSilentMode: true,
-        shouldPlayInBackground: false,
-      };
-      await serializeAudioMode(() => setAudioModeAsync(recordingAudioMode));
+      await configureRecordingAudioMode();
       if (!isCurrentLifecycle()) {
         await restoreOwnedAudioMode(false);
         return;

@@ -1,9 +1,9 @@
 import { randomUUID } from 'crypto';
-import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const storage = vi.hoisted(() => ({
-  retain: vi.fn(async () => undefined),
-  sweep: vi.fn(async () => 0),
+  retain: vi.fn(async (_scope: string, _userId: string, _audioKey: string, _versionId: string) => undefined),
+  sweep: vi.fn(async (_scope: string, _audioKey: string) => 0),
   playback: vi.fn(async () => 'https://example.invalid/playback'),
 }));
 
@@ -13,8 +13,14 @@ vi.mock('../src/audio-upload', () => ({
   createPresignedRecordingPlaybackUrl: storage.playback,
 }));
 
+import { config } from '../src/config';
 import { pool } from '../src/db';
-import { runRecordingMaintenance } from '../src/recordings';
+import { logger } from '../src/logger';
+import { recordingMaintenanceTotal } from '../src/metrics';
+import { insertRetainedRecording, type RecordingCapture } from '../src/recording-store';
+import { runRecordingMaintenance, tryRetainRecording } from '../src/recordings';
+
+const configuredMaintenanceConcurrency = config.recordings.maintenanceConcurrency;
 
 async function createUserAndQuestion() {
   const user = await pool.query<{ id: string }>(
@@ -26,9 +32,43 @@ async function createUserAndQuestion() {
   return { userId: user.rows[0].id, questionId: question.rows[0].id };
 }
 
+async function createPendingRecording(storageScope: 'diagnostic' | 'practice' = 'diagnostic') {
+  const { userId, questionId } = await createUserAndQuestion();
+  const id = randomUUID();
+  const audioKey = `audio-uploads/${storageScope}/${userId}/${randomUUID()}.m4a`;
+  await pool.query(
+    `INSERT INTO recordings (
+       id, user_id, request_id, question_id, context, storage_scope, audio_key,
+       s3_version_id, content_type, size_bytes
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'v1', 'audio/mp4', 1000)`,
+    [
+      id,
+      userId,
+      randomUUID(),
+      questionId,
+      storageScope === 'diagnostic' ? 'diagnostic' : 'practice',
+      storageScope,
+      audioKey,
+    ],
+  );
+  return { id, userId, questionId, audioKey };
+}
+
+async function maintenanceMetric(operation: 'retention' | 'deletion', outcome: 'ok' | 'error') {
+  const metric = await recordingMaintenanceTotal.get();
+  return (
+    metric.values.find((value) => value.labels.operation === operation && value.labels.outcome === outcome)?.value ?? 0
+  );
+}
+
 beforeEach(() => {
   storage.retain.mockReset().mockResolvedValue(undefined);
   storage.sweep.mockReset().mockResolvedValue(0);
+});
+
+afterEach(() => {
+  config.recordings.maintenanceConcurrency = configuredMaintenanceConcurrency;
+  vi.restoreAllMocks();
 });
 
 afterAll(async () => {
@@ -37,6 +77,7 @@ afterAll(async () => {
 
 describe('recording maintenance leases', () => {
   it('reclaims an expired lease, retags the exact version, and makes it available', async () => {
+    const metricBefore = await maintenanceMetric('retention', 'ok');
     const { userId, questionId } = await createUserAndQuestion();
     const id = randomUUID();
     const audioKey = `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`;
@@ -57,9 +98,11 @@ describe('recording maintenance leases', () => {
     expect(storage.retain).toHaveBeenCalledWith('diagnostic', userId, audioKey, 'v1');
     const stored = await pool.query('SELECT status, available_at FROM recordings WHERE id = $1', [id]);
     expect(stored.rows[0]).toMatchObject({ status: 'available', available_at: expect.any(Date) });
+    expect((await maintenanceMetric('retention', 'ok')) - metricBefore).toBe(storage.retain.mock.calls.length);
   });
 
   it('deletes a quiet-period tombstone only after an exact-key sweep proves empty', async () => {
+    const metricBefore = await maintenanceMetric('deletion', 'ok');
     const key = `audio-uploads/practice/${randomUUID()}/${randomUUID()}.m4a`;
     await pool.query(
       `INSERT INTO recording_deletion_jobs (
@@ -78,9 +121,11 @@ describe('recording maintenance leases', () => {
         ])
       ).rowCount,
     ).toBe(0);
+    expect((await maintenanceMetric('deletion', 'ok')) - metricBefore).toBe(1);
   });
 
   it('keeps failed retention pending, clears its lease, and schedules backoff', async () => {
+    const metricBefore = await maintenanceMetric('retention', 'error');
     const { userId, questionId } = await createUserAndQuestion();
     const id = randomUUID();
     await pool.query(
@@ -96,7 +141,7 @@ describe('recording maintenance leases', () => {
     const row = await pool.query(
       `SELECT status, retention_claim_id, retention_lease_expires_at,
               retention_attempts, last_retention_error_code,
-              next_retention_attempt_at > now() AS backed_off
+              EXTRACT(EPOCH FROM next_retention_attempt_at - now()) AS retry_in_seconds
        FROM recordings WHERE id = $1`,
       [id],
     );
@@ -106,8 +151,10 @@ describe('recording maintenance leases', () => {
       retention_lease_expires_at: null,
       retention_attempts: 1,
       last_retention_error_code: 'AccessDenied',
-      backed_off: true,
     });
+    expect(Number(row.rows[0].retry_in_seconds)).toBeGreaterThanOrEqual(8);
+    expect(Number(row.rows[0].retry_in_seconds)).toBeLessThanOrEqual(11);
+    expect((await maintenanceMetric('retention', 'error')) - metricBefore).toBe(1);
   });
 
   it('keeps a job after deleting versions and through its pre-final quiet period', async () => {
@@ -152,6 +199,7 @@ describe('recording maintenance leases', () => {
   });
 
   it('keeps a failed deletion job durable, clears its lease, and schedules retry', async () => {
+    const metricBefore = await maintenanceMetric('deletion', 'error');
     const key = `audio-uploads/practice/${randomUUID()}/${randomUUID()}.m4a`;
     await pool.query(
       `INSERT INTO recording_deletion_jobs (
@@ -164,16 +212,258 @@ describe('recording maintenance leases', () => {
     await expect(runRecordingMaintenance()).resolves.toBe(0);
     const job = await pool.query(
       `SELECT claim_id, lease_expires_at, attempt_count, last_error_code,
-              next_attempt_at > now() AS backed_off
+              EXTRACT(EPOCH FROM next_attempt_at - now()) AS retry_in_seconds
        FROM recording_deletion_jobs WHERE storage_scope = 'practice' AND audio_key = $1`,
       [key],
     );
-    expect(job.rows[0]).toEqual({
+    expect(job.rows[0]).toMatchObject({
       claim_id: null,
       lease_expires_at: null,
       attempt_count: 1,
       last_error_code: 'ServiceUnavailable',
-      backed_off: true,
     });
+    expect(Number(job.rows[0].retry_in_seconds)).toBeGreaterThanOrEqual(8);
+    expect(Number(job.rows[0].retry_in_seconds)).toBeLessThanOrEqual(11);
+    expect((await maintenanceMetric('deletion', 'error')) - metricBefore).toBe(1);
+  });
+
+  it('processes every claimed recording exactly once without exceeding the configured concurrency', async () => {
+    config.recordings.maintenanceConcurrency = 2;
+    const recordings = await Promise.all(Array.from({ length: 5 }, () => createPendingRecording()));
+    const seenKeys: string[] = [];
+    let active = 0;
+    let maxActive = 0;
+    storage.retain.mockImplementation(async (_scope, _userId, audioKey: string) => {
+      seenKeys.push(audioKey);
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
+      active--;
+    });
+
+    await expect(runRecordingMaintenance()).resolves.toBe(0);
+
+    expect(maxActive).toBe(2);
+    expect([...seenKeys].sort()).toEqual(recordings.map(({ audioKey }) => audioKey).sort());
+    const stored = await pool.query<{ id: string; status: string }>(
+      'SELECT id, status FROM recordings WHERE id = ANY($1::uuid[]) ORDER BY id',
+      [recordings.map(({ id }) => id)],
+    );
+    expect(stored.rows).toHaveLength(5);
+    expect(stored.rows.every(({ status }) => status === 'available')).toBe(true);
+  });
+
+  it('does nothing for an unknown targeted recording instead of invoking storage or warning', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    await expect(tryRetainRecording(randomUUID())).resolves.toBeUndefined();
+
+    expect(storage.retain).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('claims the requested retention row instead of the oldest unrelated pending row', async () => {
+    const distractor = await createPendingRecording();
+    const target = await createPendingRecording();
+    await pool.query(
+      `UPDATE recordings
+       SET next_retention_attempt_at = CASE id
+         WHEN $1::uuid THEN '2000-01-01T00:00:00Z'::timestamptz
+         WHEN $2::uuid THEN '2000-01-02T00:00:00Z'::timestamptz
+       END
+       WHERE id = ANY($3::uuid[])`,
+      [distractor.id, target.id, [distractor.id, target.id]],
+    );
+
+    await expect(tryRetainRecording(target.id)).resolves.toBeUndefined();
+
+    expect(storage.retain).toHaveBeenCalledOnce();
+    expect(storage.retain).toHaveBeenCalledWith('diagnostic', target.userId, target.audioKey, 'v1');
+    expect((await pool.query('SELECT status FROM recordings WHERE id = $1', [distractor.id])).rows).toEqual([
+      { status: 'retention_pending' },
+    ]);
+    await pool.query("UPDATE recordings SET next_retention_attempt_at = now() + interval '1 day' WHERE id = $1", [
+      distractor.id,
+    ]);
+  });
+
+  it('leaves targeted retention durable and logs the exact failure context', async () => {
+    const recording = await createPendingRecording();
+    const failure = Object.assign(new Error('tagging failed'), { name: 'AccessDenied' });
+    storage.retain.mockRejectedValueOnce(failure);
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+
+    await expect(tryRetainRecording(recording.id)).resolves.toBeUndefined();
+
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(
+      { err: failure, recordingId: recording.id },
+      'recording retention tagging failed; durable retry remains pending',
+    );
+    expect((await pool.query('SELECT status FROM recordings WHERE id = $1', [recording.id])).rows).toEqual([
+      { status: 'retention_pending' },
+    ]);
+  });
+
+  it('keeps targeted retention best-effort even when warning serialization throws', async () => {
+    const recording = await createPendingRecording();
+    storage.retain.mockRejectedValueOnce(new Error('tagging failed'));
+    vi.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('logger failed');
+    });
+
+    await expect(tryRetainRecording(recording.id)).resolves.toBeUndefined();
+  });
+
+  it('stores the stable fallback code for non-Error retention failures', async () => {
+    const recording = await createPendingRecording();
+    storage.retain.mockRejectedValueOnce('raw provider failure');
+
+    await expect(runRecordingMaintenance()).resolves.toBe(0);
+
+    expect(
+      (await pool.query('SELECT last_retention_error_code FROM recordings WHERE id = $1', [recording.id])).rows,
+    ).toEqual([{ last_retention_error_code: 'S3_ERROR' }]);
+  });
+
+  it('finalizes an empty deletion sweep at the exact quiet-period boundary', async () => {
+    const key = `audio-uploads/diagnostic/${randomUUID()}/${randomUUID()}.m4a`;
+    const finalizeAt = new Date(Date.now() + 30_000);
+    await pool.query(
+      `INSERT INTO recording_deletion_jobs (
+         storage_scope, audio_key, known_version_id, finalize_after
+       ) VALUES ('diagnostic', $1, 'v1', $2)`,
+      [key, finalizeAt],
+    );
+    vi.spyOn(Date, 'now').mockReturnValue(finalizeAt.getTime());
+
+    await expect(runRecordingMaintenance()).resolves.toBeGreaterThanOrEqual(1);
+
+    expect(
+      (
+        await pool.query(
+          "SELECT 1 FROM recording_deletion_jobs WHERE storage_scope = 'diagnostic' AND audio_key = $1",
+          [key],
+        )
+      ).rowCount,
+    ).toBe(0);
+  });
+
+  it('keeps a final-window tombstone when the sweep still removed a version', async () => {
+    const key = `audio-uploads/practice/${randomUUID()}/${randomUUID()}.m4a`;
+    await pool.query(
+      `INSERT INTO recording_deletion_jobs (
+         storage_scope, audio_key, known_version_id, finalize_after
+       ) VALUES ('practice', $1, 'v1', now() - interval '1 second')`,
+      [key],
+    );
+    storage.sweep.mockResolvedValueOnce(1);
+
+    await expect(runRecordingMaintenance()).resolves.toBe(0);
+
+    expect(
+      (
+        await pool.query(
+          `SELECT claim_id, lease_expires_at, next_attempt_at > now() AS retry_scheduled
+           FROM recording_deletion_jobs WHERE storage_scope = 'practice' AND audio_key = $1`,
+          [key],
+        )
+      ).rows,
+    ).toEqual([{ claim_id: null, lease_expires_at: null, retry_scheduled: true }]);
+  });
+
+  it('stores the stable fallback code for non-Error deletion failures', async () => {
+    const key = `audio-uploads/practice/${randomUUID()}/${randomUUID()}.m4a`;
+    await pool.query(
+      `INSERT INTO recording_deletion_jobs (
+         storage_scope, audio_key, known_version_id, finalize_after
+       ) VALUES ('practice', $1, 'v1', now() - interval '1 second')`,
+      [key],
+    );
+    storage.sweep.mockRejectedValueOnce('raw provider failure');
+
+    await expect(runRecordingMaintenance()).resolves.toBe(0);
+
+    expect(
+      (
+        await pool.query(
+          `SELECT last_error_code FROM recording_deletion_jobs
+           WHERE storage_scope = 'practice' AND audio_key = $1`,
+          [key],
+        )
+      ).rows,
+    ).toEqual([{ last_error_code: 'S3_ERROR' }]);
+  });
+});
+
+describe('retained recording insertion contract', () => {
+  const capture: RecordingCapture = {
+    id: '6d3d43f4-981e-4cbd-8882-d4d4cbf9d32a',
+    storageScope: 'practice',
+    audioKey: 'audio-uploads/practice/owner/audio.m4a',
+    s3VersionId: 'version-1',
+    contentType: 'audio/mp4',
+    sizeBytes: 1234,
+  };
+
+  it('rejects a capture that does not belong to the authoritative assessment audio before querying', async () => {
+    const query = vi.fn();
+
+    await expect(
+      insertRetainedRecording(
+        { query },
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        'practice',
+        'audio-uploads/practice/owner/other.m4a',
+        capture,
+      ),
+    ).rejects.toThrow('recording capture does not match the assessment audio owner');
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when the metadata insert does not affect exactly one row', async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 0 });
+
+    await expect(
+      insertRetainedRecording(
+        { query },
+        randomUUID(),
+        randomUUID(),
+        randomUUID(),
+        'practice',
+        capture.audioKey,
+        capture,
+      ),
+    ).rejects.toThrow('failed to insert retained recording metadata');
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('binds optional capture fields as null in the successful insert', async () => {
+    const query = vi.fn().mockResolvedValue({ rowCount: 1 });
+    const userId = randomUUID();
+    const requestId = randomUUID();
+    const questionId = randomUUID();
+
+    await expect(
+      insertRetainedRecording({ query }, userId, requestId, questionId, 'practice', capture.audioKey, capture),
+    ).resolves.toBeUndefined();
+
+    expect(query).toHaveBeenCalledWith(expect.stringContaining('INSERT INTO recordings'), [
+      capture.id,
+      userId,
+      requestId,
+      null,
+      questionId,
+      'practice',
+      'practice',
+      capture.audioKey,
+      'version-1',
+      'audio/mp4',
+      1234,
+      null,
+      null,
+    ]);
   });
 });

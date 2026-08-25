@@ -511,6 +511,7 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.server.keepAliveTimeout).toBe(65_000);
     expect(runtime.assertSchema).toHaveBeenCalledOnce();
     expect(runtime.assertAudio).toHaveBeenCalledWith({ force: true });
+    expect(runtime.assertStorage).toHaveBeenCalledWith({ force: true });
     expect(runtime.server.listen).not.toHaveBeenCalled();
 
     releaseSchema();

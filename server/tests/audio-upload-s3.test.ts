@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto';
 import fsSync from 'fs';
 import fs from 'fs/promises';
+import path from 'path';
 import { EventEmitter } from 'events';
 import { createServer } from 'http';
 import { PassThrough, Readable } from 'stream';
@@ -10,14 +11,20 @@ import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Mock the AWS SDK at the module boundary so S3 mode is fully exercisable
 // without real credentials or a bucket.
-const { sendMock, createPresignedPostMock, s3ClientConstructorMock } = vi.hoisted(() => {
+const { sendMock, createPresignedPostMock, getSignedUrlMock, s3ClientConstructorMock, routeMocks } = vi.hoisted(() => {
   const send = vi.fn();
   return {
     sendMock: send,
     createPresignedPostMock: vi.fn(),
+    getSignedUrlMock: vi.fn(),
     s3ClientConstructorMock: vi.fn().mockImplementation(function () {
       return { send };
     }),
+    routeMocks: {
+      useLiveAssess: false,
+      assess: vi.fn(),
+      measureDuration: vi.fn(),
+    },
   };
 });
 
@@ -43,15 +50,39 @@ vi.mock('@aws-sdk/s3-presigned-post', () => ({
   createPresignedPost: (client: unknown, options: unknown) => createPresignedPostMock(client, options),
 }));
 
+vi.mock('@aws-sdk/s3-request-presigner', () => ({
+  getSignedUrl: (client: unknown, command: unknown, options: unknown) => getSignedUrlMock(client, command, options),
+}));
+
+vi.mock('../src/assess', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/assess')>();
+  return {
+    ...actual,
+    assessSpeaking: (...args: Parameters<typeof actual.assessSpeaking>) =>
+      routeMocks.useLiveAssess ? routeMocks.assess(...args) : actual.assessSpeaking(...args),
+  };
+});
+
+vi.mock('../src/audio-inspection', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/audio-inspection')>();
+  return {
+    ...actual,
+    measureAudioDuration: (...args: Parameters<typeof actual.measureAudioDuration>) =>
+      routeMocks.measureDuration(...args),
+  };
+});
+
 import { config } from '../src/config';
 import {
   assertRetainedAudioStorageAvailable,
+  createPresignedRecordingPlaybackUrl,
   createAudioSizeCap,
   discardPresignedAudio as discardScopedPresignedAudio,
   discardSubmittedPresignedAudio as createDiscardSubmittedPresignedAudio,
   finalizeSubmittedPresignedAudio,
   ownSubmittedPresignedAudio,
   preserveSubmittedPresignedAudio,
+  retainPresignedAudioVersion,
   resolvePresignedAudio as resolveScopedPresignedAudio,
   sweepPresignedAudioVersions,
 } from '../src/audio-upload';
@@ -145,6 +176,22 @@ beforeEach(() => {
   vi.restoreAllMocks();
   sendMock.mockReset();
   createPresignedPostMock.mockReset();
+  getSignedUrlMock.mockReset().mockResolvedValue('https://private.example.invalid/recording');
+  routeMocks.useLiveAssess = false;
+  routeMocks.assess
+    .mockReset()
+    .mockImplementation(
+      (_audioPath: string, _question: unknown, _userId: string, options?: { onCapacityReserved?: () => void }) => {
+        options?.onCapacityReserved?.();
+        return Promise.resolve({
+          transcript: 'A complete measured response.',
+          score: 80,
+          passed: true,
+          feedback: 'Clear and relevant.',
+        });
+      },
+    );
+  routeMocks.measureDuration.mockReset().mockResolvedValue(1.234);
   createPresignedPostMock.mockImplementation(
     (_client: unknown, options: { Key: string; Fields: Record<string, string> }) =>
       Promise.resolve({
@@ -320,13 +367,141 @@ describe('retained-audio storage readiness', () => {
     ],
   };
 
-  it('requires versioning and an exact transient-only current/noncurrent lifecycle', async () => {
+  const exactAndLifecycle = {
+    Rules: [
+      {
+        Status: 'Enabled',
+        Filter: { And: { Tags: [{ Key: 'retention', Value: 'transient' }] } },
+        Expiration: { Days: 7 },
+        NoncurrentVersionExpiration: { NoncurrentDays: 7 },
+      },
+    ],
+  };
+
+  function mockStorageProbe(lifecycle: unknown = exactLifecycle, versioningStatus: unknown = 'Enabled'): void {
     sendMock.mockImplementation((command: { kind: string }) => {
-      if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
-      if (command.kind === 'get-lifecycle') return Promise.resolve(exactLifecycle);
+      if (command.kind === 'get-versioning') return Promise.resolve({ Status: versioningStatus });
+      if (command.kind === 'get-lifecycle') return Promise.resolve(lifecycle);
       return Promise.resolve({});
     });
+  }
+
+  it('requires versioning and an exact transient-only current/noncurrent lifecycle', async () => {
+    mockStorageProbe();
     await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+
+    expect(sendMock.mock.calls.map(([command]) => command)).toEqual([
+      { kind: 'get-versioning', input: { Bucket: config.s3.diagnostic.bucket } },
+      { kind: 'get-lifecycle', input: { Bucket: config.s3.diagnostic.bucket } },
+      { kind: 'get-versioning', input: { Bucket: config.s3.practice.bucket } },
+      { kind: 'get-lifecycle', input: { Bucket: config.s3.practice.bucket } },
+    ]);
+    for (const [, options] of sendMock.mock.calls) {
+      expect((options as { abortSignal: AbortSignal }).abortSignal).toBeInstanceOf(AbortSignal);
+    }
+  });
+
+  it('accepts the sole-tag And filter and both inclusive seven-day boundaries', async () => {
+    mockStorageProbe(exactAndLifecycle);
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+  });
+
+  it.each([
+    ['no filter', undefined],
+    ['an empty filter', {}],
+    ['wrong direct tag key', { Tag: { Key: 'other', Value: 'transient' } }],
+    ['wrong direct tag value', { Tag: { Key: 'retention', Value: 'retained' } }],
+    ['a direct prefix', { Tag: { Key: 'retention', Value: 'transient' }, Prefix: '' }],
+    ['a direct And sibling', { Tag: { Key: 'retention', Value: 'transient' }, And: {} }],
+    ['a direct lower-size bound', { Tag: { Key: 'retention', Value: 'transient' }, ObjectSizeGreaterThan: 0 }],
+    ['a direct upper-size bound', { Tag: { Key: 'retention', Value: 'transient' }, ObjectSizeLessThan: 1 }],
+    ['an empty And', { And: {} }],
+    ['no And tags', { And: { Prefix: '' } }],
+    ['zero And tags', { And: { Tags: [] } }],
+    [
+      'multiple And tags',
+      {
+        And: {
+          Tags: [
+            { Key: 'retention', Value: 'transient' },
+            { Key: 'other', Value: 'value' },
+          ],
+        },
+      },
+    ],
+    ['a wrong And tag key', { And: { Tags: [{ Key: 'other', Value: 'transient' }] } }],
+    ['a wrong And tag value', { And: { Tags: [{ Key: 'retention', Value: 'retained' }] } }],
+    ['a top-level prefix around And', { Prefix: '', And: { Tags: [{ Key: 'retention', Value: 'transient' }] } }],
+    [
+      'a top-level lower-size bound around And',
+      { ObjectSizeGreaterThan: 0, And: { Tags: [{ Key: 'retention', Value: 'transient' }] } },
+    ],
+    [
+      'a top-level upper-size bound around And',
+      { ObjectSizeLessThan: 1, And: { Tags: [{ Key: 'retention', Value: 'transient' }] } },
+    ],
+    ['an And prefix', { And: { Prefix: '', Tags: [{ Key: 'retention', Value: 'transient' }] } }],
+    [
+      'an And lower-size bound',
+      { And: { ObjectSizeGreaterThan: 0, Tags: [{ Key: 'retention', Value: 'transient' }] } },
+    ],
+    ['an And upper-size bound', { And: { ObjectSizeLessThan: 1, Tags: [{ Key: 'retention', Value: 'transient' }] } }],
+  ])('rejects an expiration rule whose filter has %s', async (_caseName, Filter) => {
+    mockStorageProbe({
+      Rules: [
+        {
+          Status: 'Enabled',
+          ...(Filter === undefined ? {} : { Filter }),
+          Expiration: { Days: 1 },
+          NoncurrentVersionExpiration: { NoncurrentDays: 1 },
+        },
+      ],
+    });
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'expiration rule that can delete retained recordings',
+    );
+  });
+
+  it.each([
+    ['current-version expiration only', { Expiration: { Days: 1 } }],
+    ['noncurrent-version expiration only', { NoncurrentVersionExpiration: { NoncurrentDays: 1 } }],
+  ])('rejects a broad enabled %s rule', async (_caseName, expiration) => {
+    mockStorageProbe({ Rules: [{ Status: 'Enabled', Filter: { Prefix: 'audio-uploads/' }, ...expiration }] });
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'expiration rule that can delete retained recordings',
+    );
+  });
+
+  it('ignores disabled rules and enabled rules that do not expire objects', async () => {
+    mockStorageProbe({
+      Rules: [
+        { Status: 'Disabled', Filter: { Prefix: '' }, Expiration: { Days: 1 } },
+        { Status: 'Enabled', Filter: { Prefix: '' }, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 } },
+        ...exactLifecycle.Rules,
+      ],
+    });
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+  });
+
+  it.each(['Suspended', null])('rejects bucket versioning status %s before reading lifecycle', async (status) => {
+    mockStorageProbe(exactLifecycle, status);
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'diagnostic audio bucket versioning is not enabled',
+    );
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get-versioning']);
+  });
+
+  it.each([{}, { Rules: [] }])('rejects a lifecycle without a qualifying rule', async (lifecycle) => {
+    mockStorageProbe(lifecycle);
+
+    await expect(assertRetainedAudioStorageAvailable({ force: true })).rejects.toThrow(
+      'diagnostic audio bucket lacks the required transient-tag lifecycle',
+    );
   });
 
   it('rejects a broad expiration rule that could delete retained versions', async () => {
@@ -349,7 +524,15 @@ describe('retained-audio storage readiness', () => {
 
   it.each([
     { Expiration: { Date: new Date('2099-01-01') }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 0 }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 1.5 }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 8 }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
     { Expiration: { Days: 100 }, NoncurrentVersionExpiration: { NoncurrentDays: 1 } },
+    { Expiration: { Days: 1 } },
+    { Expiration: { Days: 1 }, NoncurrentVersionExpiration: { NoncurrentDays: 0 } },
+    { Expiration: { Days: 1 }, NoncurrentVersionExpiration: { NoncurrentDays: 1.5 } },
+    { Expiration: { Days: 1 }, NoncurrentVersionExpiration: { NoncurrentDays: 8 } },
     { Expiration: { Days: 1 }, NoncurrentVersionExpiration: { NoncurrentDays: 100 } },
   ])('rejects a non-recurring or non-short transient lifecycle', async (timing) => {
     sendMock.mockImplementation((command: { kind: string }) => {
@@ -365,9 +548,407 @@ describe('retained-audio storage readiness', () => {
       'lacks the required transient-tag lifecycle',
     );
   });
+
+  it('skips a disabled scope and probes only the configured bucket', async () => {
+    const previousDiagnosticBucket = config.s3.diagnostic.bucket;
+    config.s3.diagnostic.bucket = '';
+    mockStorageProbe();
+
+    try {
+      await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+      expect(sendMock.mock.calls.map(([command]) => command)).toEqual([
+        { kind: 'get-versioning', input: { Bucket: config.s3.practice.bucket } },
+        { kind: 'get-lifecycle', input: { Bucket: config.s3.practice.bucket } },
+      ]);
+    } finally {
+      config.s3.diagnostic.bucket = previousDiagnosticBucket;
+    }
+  });
+
+  it('serves a successful probe from cache, then re-probes at the exact 30-second boundary', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2030-01-01T00:00:00.000Z'));
+    mockStorageProbe();
+
+    try {
+      await assertRetainedAudioStorageAvailable({ force: true });
+      expect(sendMock).toHaveBeenCalledTimes(4);
+      await assertRetainedAudioStorageAvailable();
+      expect(sendMock).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      await assertRetainedAudioStorageAvailable();
+      expect(sendMock).toHaveBeenCalledTimes(4);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await assertRetainedAudioStorageAvailable();
+      expect(sendMock).toHaveBeenCalledTimes(8);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bypasses a completed cache entry when force is requested', async () => {
+    mockStorageProbe();
+
+    await assertRetainedAudioStorageAvailable({ force: true });
+    await assertRetainedAudioStorageAvailable({ force: true });
+
+    expect(sendMock).toHaveBeenCalledTimes(8);
+  });
+
+  it('coalesces forced callers onto one active probe', async () => {
+    let releaseVersioning!: () => void;
+    sendMock
+      .mockImplementationOnce(
+        () =>
+          new Promise<{ Status: string }>((resolve) => {
+            releaseVersioning = () => resolve({ Status: 'Enabled' });
+          }),
+      )
+      .mockImplementation((command: { kind: string }) => {
+        if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
+        if (command.kind === 'get-lifecycle') return Promise.resolve(exactLifecycle);
+        return Promise.resolve({});
+      });
+
+    const first = assertRetainedAudioStorageAvailable({ force: true });
+    const second = assertRetainedAudioStorageAvailable({ force: true });
+    expect(second).toBe(first);
+    expect(sendMock).toHaveBeenCalledOnce();
+
+    releaseVersioning();
+    await expect(Promise.all([first, second])).resolves.toEqual([undefined, undefined]);
+    expect(sendMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('caches a normalized non-Error failure for exactly two seconds', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2030-01-01T00:00:00.000Z'));
+    const providerFailure = { reason: 'credentials unavailable' };
+    sendMock.mockRejectedValueOnce(providerFailure);
+
+    try {
+      const firstError = await assertRetainedAudioStorageAvailable({ force: true }).catch((error: unknown) => error);
+      expect(firstError).toBeInstanceOf(Error);
+      expect(firstError).toMatchObject({ message: 'recording storage readiness failed', cause: providerFailure });
+
+      const cachedError = await assertRetainedAudioStorageAvailable().catch((error: unknown) => error);
+      expect(cachedError).toBe(firstError);
+      expect(sendMock).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(1_999);
+      await expect(assertRetainedAudioStorageAvailable()).rejects.toBe(firstError);
+      expect(sendMock).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(1);
+      mockStorageProbe();
+      await expect(assertRetainedAudioStorageAvailable()).resolves.toBeUndefined();
+      expect(sendMock).toHaveBeenCalledTimes(5);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('aborts a stalled readiness request at the storage deadline and clears the failed in-flight probe', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    let observedSignal: AbortSignal | undefined;
+    sendMock.mockImplementationOnce(
+      (_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = options?.abortSignal;
+          observedSignal?.addEventListener('abort', () => {
+            const error = new Error('readiness aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        }),
+    );
+
+    try {
+      const probe = assertRetainedAudioStorageAvailable({ force: true });
+      const result = probe.then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: { name: 'AbortError', message: 'readiness aborted' },
+      });
+      expect(observedSignal?.aborted).toBe(true);
+
+      mockStorageProbe();
+      await expect(assertRetainedAudioStorageAvailable({ force: true })).resolves.toBeUndefined();
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears every successful readiness deadline', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    const observedSignals: AbortSignal[] = [];
+    sendMock.mockImplementation((command: { kind: string }, options?: { abortSignal?: AbortSignal }) => {
+      observedSignals.push(options!.abortSignal!);
+      if (command.kind === 'get-versioning') return Promise.resolve({ Status: 'Enabled' });
+      if (command.kind === 'get-lifecycle') return Promise.resolve(exactLifecycle);
+      return Promise.resolve({});
+    });
+
+    try {
+      await assertRetainedAudioStorageAvailable({ force: true });
+      await vi.advanceTimersByTimeAsync(20);
+      expect(observedSignals).toHaveLength(4);
+      expect(observedSignals.every((signal) => !signal.aborted)).toBe(true);
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('retained recording storage primitives', () => {
+  it('retags only a learner-owned exact version and clears the successful deadline', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    const userId = randomUUID();
+    const audioKey = practiceOwnedKey(userId);
+    let observedSignal: AbortSignal | undefined;
+    sendMock.mockImplementationOnce((_command: unknown, options?: { abortSignal?: AbortSignal }) => {
+      observedSignal = options?.abortSignal;
+      return Promise.resolve({});
+    });
+
+    try {
+      await expect(retainPresignedAudioVersion('practice', userId, audioKey, 'version-123')).resolves.toBeUndefined();
+      expect(sendMock).toHaveBeenCalledWith(
+        {
+          kind: 'tag-retained',
+          input: {
+            Bucket: config.s3.practice.bucket,
+            Key: audioKey,
+            VersionId: 'version-123',
+            Tagging: { TagSet: [{ Key: 'retention', Value: 'retained' }] },
+          },
+        },
+        { abortSignal: observedSignal },
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      expect(observedSignal?.aborted).toBe(false);
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects an unowned recording key before starting an S3 operation', async () => {
+    const userId = randomUUID();
+
+    await expect(
+      retainPresignedAudioVersion('diagnostic', userId, ownedKey(randomUUID()), 'version-123'),
+    ).rejects.toThrow('recording key is not owned by the learner');
+    expect(sendMock).not.toHaveBeenCalled();
+  });
+
+  it('aborts stalled retained tagging at the storage deadline', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    let observedSignal: AbortSignal | undefined;
+    sendMock.mockImplementationOnce(
+      (_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = options?.abortSignal;
+          observedSignal?.addEventListener('abort', () => {
+            const error = new Error('tagging aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        }),
+    );
+    const userId = randomUUID();
+
+    try {
+      const tagging = retainPresignedAudioVersion('diagnostic', userId, ownedKey(userId), 'version-123');
+      const result = tagging.then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: { name: 'AbortError', message: 'tagging aborted' },
+      });
+      expect(observedSignal?.aborted).toBe(true);
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('signs an exact VersionId-pinned inline playback request with the requested TTL', async () => {
+    await expect(
+      createPresignedRecordingPlaybackUrl(
+        'practice',
+        'audio-uploads/practice/owner/object.m4a',
+        'version-123',
+        'audio/mp4',
+        45,
+      ),
+    ).resolves.toBe('https://private.example.invalid/recording');
+
+    expect(getSignedUrlMock).toHaveBeenCalledOnce();
+    expect(getSignedUrlMock).toHaveBeenCalledWith(
+      expect.objectContaining({ send: sendMock }),
+      {
+        kind: 'get',
+        input: {
+          Bucket: config.s3.practice.bucket,
+          Key: 'audio-uploads/practice/owner/object.m4a',
+          VersionId: 'version-123',
+          ResponseContentType: 'audio/mp4',
+          ResponseContentDisposition: 'inline',
+        },
+      },
+      { expiresIn: 45 },
+    );
+  });
 });
 
 describe('durable recording deletion sweep', () => {
+  it('deletes only exact-key versions and delete markers and returns the accumulated count across pages', async () => {
+    let listedPages = 0;
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'list-versions') {
+        listedPages += 1;
+        if (listedPages === 1) {
+          return Promise.resolve({
+            Versions: [
+              { Key: 'exact-key', VersionId: 'v1' },
+              { Key: 'exact-key-suffix', VersionId: 'foreign-version' },
+              { Key: 'exact-key' },
+            ],
+            DeleteMarkers: [
+              { Key: 'exact-key', VersionId: 'd1' },
+              { Key: 'other-key', VersionId: 'foreign-marker' },
+            ],
+            IsTruncated: true,
+            NextKeyMarker: 'exact-key',
+            NextVersionIdMarker: 'd1',
+          });
+        }
+        return Promise.resolve({
+          Versions: [{ Key: 'exact-key', VersionId: 'v2' }],
+          DeleteMarkers: [],
+          IsTruncated: false,
+        });
+      }
+      if (command.kind === 'delete-versions') return Promise.resolve({ Errors: [] });
+      return Promise.resolve({});
+    });
+
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).resolves.toBe(3);
+
+    const listCommands = sendMock.mock.calls
+      .filter(([command]) => command.kind === 'list-versions')
+      .map(([command]) => command);
+    expect(listCommands).toEqual([
+      {
+        kind: 'list-versions',
+        input: {
+          Bucket: config.s3.diagnostic.bucket,
+          Prefix: 'exact-key',
+          KeyMarker: undefined,
+          VersionIdMarker: undefined,
+        },
+      },
+      {
+        kind: 'list-versions',
+        input: {
+          Bucket: config.s3.diagnostic.bucket,
+          Prefix: 'exact-key',
+          KeyMarker: 'exact-key',
+          VersionIdMarker: 'd1',
+        },
+      },
+    ]);
+    const deleteCommands = sendMock.mock.calls
+      .filter(([command]) => command.kind === 'delete-versions')
+      .map(([command]) => command);
+    expect(deleteCommands).toEqual([
+      {
+        kind: 'delete-versions',
+        input: {
+          Bucket: config.s3.diagnostic.bucket,
+          Delete: {
+            Objects: [
+              { Key: 'exact-key', VersionId: 'v1' },
+              { Key: 'exact-key', VersionId: 'd1' },
+            ],
+            Quiet: true,
+          },
+        },
+      },
+      {
+        kind: 'delete-versions',
+        input: {
+          Bucket: config.s3.diagnostic.bucket,
+          Delete: { Objects: [{ Key: 'exact-key', VersionId: 'v2' }], Quiet: true },
+        },
+      },
+    ]);
+  });
+
+  it('does not confuse opaque marker strings with absent terminal-page markers', async () => {
+    sendMock
+      .mockResolvedValueOnce({
+        IsTruncated: true,
+        NextKeyMarker: 'undefined',
+        NextVersionIdMarker: 'undefined',
+      })
+      .mockResolvedValueOnce({ IsTruncated: false });
+
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).resolves.toBe(0);
+    expect(
+      sendMock.mock.calls.filter(([command]) => command.kind === 'list-versions').map(([command]) => command.input),
+    ).toEqual([
+      {
+        Bucket: config.s3.diagnostic.bucket,
+        Prefix: 'exact-key',
+        KeyMarker: undefined,
+        VersionIdMarker: undefined,
+      },
+      {
+        Bucket: config.s3.diagnostic.bucket,
+        Prefix: 'exact-key',
+        KeyMarker: 'undefined',
+        VersionIdMarker: 'undefined',
+      },
+    ]);
+  });
+
+  it('returns zero without issuing DeleteObjects for an empty final page', async () => {
+    sendMock.mockResolvedValue({ IsTruncated: false });
+
+    await expect(sweepPresignedAudioVersions('practice', 'empty-key')).resolves.toBe(0);
+    expect(sendMock).toHaveBeenCalledOnce();
+    expect(sendMock.mock.calls[0][0]).toEqual({
+      kind: 'list-versions',
+      input: {
+        Bucket: config.s3.practice.bucket,
+        Prefix: 'empty-key',
+        KeyMarker: undefined,
+        VersionIdMarker: undefined,
+      },
+    });
+  });
+
   it('fails when a 200 DeleteObjects response contains per-version errors', async () => {
     sendMock.mockImplementation((command: { kind: string }) => {
       if (command.kind === 'list-versions') {
@@ -384,6 +965,108 @@ describe('durable recording deletion sweep', () => {
     await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow(
       'omitted continuation markers',
     );
+  });
+
+  it.each([
+    ['the key marker', { NextVersionIdMarker: 'v1' }],
+    ['the version marker', { NextKeyMarker: 'exact-key' }],
+  ])('fails closed when a truncated listing omits %s', async (_caseName, remainingMarker) => {
+    sendMock.mockResolvedValue({ IsTruncated: true, ...remainingMarker });
+
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow(
+      'truncated S3 version listing omitted continuation markers',
+    );
+    expect(sendMock).toHaveBeenCalledOnce();
+  });
+
+  it('fails closed when S3 repeats a continuation pair', async () => {
+    sendMock.mockResolvedValue({
+      IsTruncated: true,
+      NextKeyMarker: 'exact-key',
+      NextVersionIdMarker: 'v1',
+    });
+
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow(
+      'S3 version listing repeated a continuation marker',
+    );
+    expect(sendMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('enforces the 1000-page bound after allowing exactly 1000 unique continuation pages', async () => {
+    let page = 0;
+    sendMock.mockImplementation(() => {
+      page += 1;
+      return Promise.resolve({
+        IsTruncated: true,
+        NextKeyMarker: `exact-key-${page}`,
+        NextVersionIdMarker: `version-${page}`,
+      });
+    });
+
+    await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).rejects.toThrow(
+      'S3 version sweep exceeded its page bound',
+    );
+    expect(sendMock).toHaveBeenCalledTimes(1000);
+  });
+
+  it('aborts a stalled version listing at the storage deadline', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    let observedSignal: AbortSignal | undefined;
+    sendMock.mockImplementationOnce(
+      (_command: unknown, options?: { abortSignal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          observedSignal = options?.abortSignal;
+          observedSignal?.addEventListener('abort', () => {
+            const error = new Error('list aborted');
+            error.name = 'AbortError';
+            reject(error);
+          });
+        }),
+    );
+
+    try {
+      const sweep = sweepPresignedAudioVersions('diagnostic', 'exact-key');
+      const result = sweep.then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason: unknown) => ({ status: 'rejected' as const, reason }),
+      );
+      await vi.advanceTimersByTimeAsync(20);
+      await expect(result).resolves.toMatchObject({
+        status: 'rejected',
+        reason: { name: 'AbortError', message: 'list aborted' },
+      });
+      expect(observedSignal?.aborted).toBe(true);
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears the shared listing/deletion deadline after a successful page', async () => {
+    vi.useFakeTimers();
+    const previousTimeout = config.s3.operationTimeoutMs;
+    config.s3.operationTimeoutMs = 20;
+    const observedSignals: AbortSignal[] = [];
+    sendMock.mockImplementation((command: { kind: string }, options?: { abortSignal?: AbortSignal }) => {
+      observedSignals.push(options!.abortSignal!);
+      if (command.kind === 'list-versions') {
+        return Promise.resolve({ Versions: [{ Key: 'exact-key', VersionId: 'v1' }], IsTruncated: false });
+      }
+      return Promise.resolve({});
+    });
+
+    try {
+      await expect(sweepPresignedAudioVersions('diagnostic', 'exact-key')).resolves.toBe(1);
+      expect(observedSignals).toHaveLength(2);
+      expect(observedSignals[0]).toBe(observedSignals[1]);
+      await vi.advanceTimersByTimeAsync(20);
+      expect(observedSignals.every((signal) => !signal.aborted)).toBe(true);
+    } finally {
+      config.s3.operationTimeoutMs = previousTimeout;
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -860,6 +1543,113 @@ describe('S3 object download boundaries', () => {
       if (file?.path) await fs.rm(file.path, { force: true });
       createWriteStream.mockRestore();
       chmod.mockRestore();
+    }
+  });
+
+  it('returns the exact retained-version metadata and normalizes an allowlisted supplied content type', async () => {
+    const userId = randomUUID();
+    const audioKey = ownedKey(userId);
+    const req = directS3Request(userId, audioKey);
+    const res = new EventEmitter();
+    const bytes = fakeM4aBuffer();
+    sendMock.mockResolvedValue({
+      Body: Readable.from(bytes),
+      ContentType: ' AUDIO/X-M4A ',
+      VersionId: 'version-123',
+      ETag: '"etag-123"',
+    });
+
+    let file: Awaited<ReturnType<typeof resolvePresignedAudio>> | undefined;
+    try {
+      file = await resolvePresignedAudio(req, res as never);
+      expect(file).toEqual({
+        path: expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/),
+        originalname: path.basename(audioKey),
+        retainedSource: {
+          audioKey,
+          scope: 'diagnostic',
+          s3VersionId: 'version-123',
+          contentType: 'audio/x-m4a',
+          sizeBytes: bytes.length,
+          etag: '"etag-123"',
+        },
+      });
+    } finally {
+      res.emit('finish');
+      if (file?.path) await fs.rm(file.path, { force: true });
+    }
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['incompatible', 'audio/mpeg'],
+  ])('uses the extension canonical content type when S3 metadata is %s', async (_caseName, suppliedContentType) => {
+    const userId = randomUUID();
+    const req = directS3Request(userId);
+    const res = new EventEmitter();
+    sendMock.mockResolvedValue({
+      Body: Readable.from(fakeM4aBuffer()),
+      ...(suppliedContentType === undefined ? {} : { ContentType: suppliedContentType }),
+      VersionId: 'version-123',
+    });
+
+    let file: Awaited<ReturnType<typeof resolvePresignedAudio>> | undefined;
+    try {
+      file = await resolvePresignedAudio(req, res as never);
+      expect(file.retainedSource).toEqual({
+        audioKey: req.body.audioKey,
+        scope: 'diagnostic',
+        s3VersionId: 'version-123',
+        contentType: 'audio/m4a',
+        sizeBytes: fakeM4aBuffer().length,
+      });
+      expect(file.retainedSource).not.toHaveProperty('etag');
+    } finally {
+      res.emit('finish');
+      if (file?.path) await fs.rm(file.path, { force: true });
+    }
+  });
+
+  it('requires an S3 VersionId outside mock mode and removes the completed download on rejection', async () => {
+    const previousMockAi = config.mockAi;
+    config.mockAi = false;
+    const createWriteStream = vi.spyOn(fsSync, 'createWriteStream');
+    sendMock.mockResolvedValue({ Body: Readable.from(fakeM4aBuffer()), ContentType: 'audio/mp4' });
+
+    try {
+      await expect(
+        resolvePresignedAudio(directS3Request(randomUUID()), new EventEmitter() as never),
+      ).rejects.toMatchObject({
+        status: 503,
+        message: 'Versioned audio storage is required',
+        code: 'PROVIDER_FAILED',
+      });
+      const tempPath = createWriteStream.mock.calls[0][0] as string;
+      await vi.waitFor(async () => {
+        await expect(fs.stat(tempPath)).rejects.toMatchObject({ code: 'ENOENT' });
+      });
+    } finally {
+      if (createWriteStream.mock.calls[0]) await fs.rm(createWriteStream.mock.calls[0][0] as string, { force: true });
+      createWriteStream.mockRestore();
+      config.mockAi = previousMockAi;
+    }
+  });
+
+  it('uses the explicit mock version sentinel only in mock mode', async () => {
+    const previousMockAi = config.mockAi;
+    config.mockAi = true;
+    const req = directS3Request(randomUUID());
+    const res = new EventEmitter();
+    sendMock.mockResolvedValue({ Body: Readable.from(fakeM4aBuffer()), VersionId: '' });
+
+    let file: Awaited<ReturnType<typeof resolvePresignedAudio>> | undefined;
+    try {
+      file = await resolvePresignedAudio(req, res as never);
+      expect(file.retainedSource?.s3VersionId).toBe('mock-unversioned-object');
+    } finally {
+      res.emit('finish');
+      if (file?.path) await fs.rm(file.path, { force: true });
+      config.mockAi = previousMockAi;
     }
   });
 
@@ -1370,6 +2160,90 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     ]);
   });
 
+  it('persists measured retained metadata and links it to the diagnostic attempt outside mock mode', async () => {
+    const previousMockAi = config.mockAi;
+    config.mockAi = false;
+    routeMocks.useLiveAssess = true;
+    routeMocks.measureDuration.mockResolvedValueOnce(1.234);
+    const bytes = fakeM4aBuffer();
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') {
+        return Promise.resolve({
+          Body: Readable.from(bytes),
+          ContentType: ' AUDIO/X-M4A ',
+          VersionId: 'diagnostic-version-123',
+          ETag: '"diagnostic-etag-123"',
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    try {
+      const response = await request(a)
+        .post('/diagnostic/answer')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId, requestId, audioKey });
+
+      expect(response.status).toBe(200);
+      expect(routeMocks.measureDuration).toHaveBeenCalledOnce();
+      expect(routeMocks.measureDuration).toHaveBeenCalledWith(expect.stringMatching(/uploads\/[0-9a-f-]+\.m4a$/));
+      expect(routeMocks.assess).toHaveBeenCalledOnce();
+
+      const recording = await pool.query<{
+        attempt_id: string;
+        s3_version_id: string;
+        content_type: string;
+        size_bytes: string;
+        duration_ms: number;
+        etag: string;
+      }>(
+        `SELECT attempt_id, s3_version_id, content_type, size_bytes, duration_ms, etag
+         FROM recordings
+         WHERE user_id = $1 AND request_id = $2`,
+        [userId, requestId],
+      );
+      expect(recording.rows).toEqual([
+        {
+          attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/i),
+          s3_version_id: 'diagnostic-version-123',
+          content_type: 'audio/x-m4a',
+          size_bytes: String(bytes.length),
+          duration_ms: 1234,
+          etag: '"diagnostic-etag-123"',
+        },
+      ]);
+      const insertedAttempt = await pool.query<{ id: string }>(
+        `SELECT id
+         FROM attempts
+         WHERE user_id = $1 AND question_id = $2 AND context = 'diagnostic'`,
+        [userId, questionId],
+      );
+      expect(insertedAttempt.rows).toEqual([{ id: recording.rows[0].attempt_id }]);
+
+      await vi.waitFor(() => {
+        const tagCommand = sendMock.mock.calls.find(([command]) => command.kind === 'tag-retained')?.[0];
+        expect(tagCommand?.input).toMatchObject({
+          Bucket: config.s3.diagnostic.bucket,
+          Key: audioKey,
+          VersionId: 'diagnostic-version-123',
+        });
+      });
+      await vi.waitFor(async () => {
+        const retained = await pool.query<{ status: string }>('SELECT status FROM recordings WHERE id = $1', [
+          response.body.recordingId,
+        ]);
+        expect(retained.rows).toEqual([{ status: 'available' }]);
+      });
+    } finally {
+      routeMocks.useLiveAssess = false;
+      config.mockAi = previousMockAi;
+    }
+  });
+
   it('replays a completed request without another storage operation', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
@@ -1388,6 +2262,12 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     // Drain the first answer's retention tag before clearing.
     await vi.waitFor(() => {
       expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('tag-retained');
+    });
+    await vi.waitFor(async () => {
+      const retained = await pool.query<{ status: string }>('SELECT status FROM recordings WHERE id = $1', [
+        first.body.recordingId,
+      ]);
+      expect(retained.rows).toEqual([{ status: 'available' }]);
     });
 
     sendMock.mockClear();
@@ -2231,6 +3111,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(next.status).toBe(200);
     const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
     sendMock.mockImplementation((command: { kind: string }) => {
       if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
       return Promise.resolve({});
@@ -2239,7 +3120,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey });
+      .send({ questionId: next.body.question.id, requestId, audioKey });
 
     expect(response.status).toBe(200);
     await vi.waitFor(() => {
@@ -2253,6 +3134,22 @@ describe('POST /practice/attempt (S3 mode)', () => {
         { kind: 'tag-retained', bucket: config.s3.practice.bucket, key: audioKey },
       ]);
     });
+    const recording = await pool.query<{ attempt_id: string | null }>(
+      `SELECT attempt_id
+       FROM recordings
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+    expect(recording.rows).toEqual([{ attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/i) }]);
+    const insertedAttempt = await pool.query<{ id: string }>(
+      `SELECT id
+       FROM attempts
+       WHERE user_id = $1 AND question_id = $2 AND context = 'practice'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId, next.body.question.id],
+    );
+    expect(insertedAttempt.rows).toEqual([{ id: recording.rows[0].attempt_id }]);
   });
 
   it('keeps the submitted object through 503 backpressure so the contracted same-key retry succeeds', async () => {

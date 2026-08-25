@@ -55,4 +55,27 @@ describe('assessment submission schema', () => {
     expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(513) }).success).toBe(false);
     expect(storageScope).toBe('practice');
   });
+
+  it('registers S3 submission cleanup before eligibility and paid limiters', () => {
+    config.s3.diagnostic.bucket = 'mutation-schema-diagnostic-bucket';
+    const limiters = inertLimiters();
+    const eligibility = vi.fn();
+    const { middleware } = buildAssessmentSubmissionChain(limiters, 'diagnostic', [eligibility]);
+    const userId = '00000000-0000-4000-8000-000000000001';
+    const req = {
+      user: { id: userId },
+      body: {
+        audioKey: `audio-uploads/diagnostic/${userId}/00000000-0000-4000-8000-000000000002.m4a`,
+      },
+    };
+    const res = { once: vi.fn() };
+    const next = vi.fn();
+
+    expect(middleware).toHaveLength(6);
+    middleware[0](req as never, res as never, next);
+
+    expect(res.once.mock.calls.map(([event]) => event)).toEqual(['finish', 'close']);
+    expect(next).toHaveBeenCalledOnce();
+    expect(eligibility).not.toHaveBeenCalled();
+  });
 });

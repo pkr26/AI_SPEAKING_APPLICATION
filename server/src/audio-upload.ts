@@ -27,8 +27,6 @@ import { AUDIO_TYPES, MAX_AUDIO_BYTES, submittedAudioFileIsOwned, uploadsDir } f
 const KEY_PREFIX = 'audio-uploads';
 const AUDIO_EXTS = Object.keys(AUDIO_TYPES).map((ext) => ext.slice(1));
 const SUBMITTED_AUDIO_CLEANUP = Symbol('submittedAudioCleanup');
-const TRANSIENT_RETENTION_TAGGING =
-  '<Tagging><TagSet><Tag><Key>retention</Key><Value>transient</Value></Tag></TagSet></Tagging>';
 
 export const ASSESSMENT_ENDPOINTS = ['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const;
 export type AssessmentEndpoint = (typeof ASSESSMENT_ENDPOINTS)[number];
@@ -140,7 +138,11 @@ export function assertRetainedAudioStorageAvailable({ force = false }: { force?:
       ? Promise.reject(retainedStorageReadinessCache.error)
       : Promise.resolve();
   }
-  if (!force && retainedStorageReadinessInFlight) return retainedStorageReadinessInFlight;
+  // `force` bypasses a completed cache entry, not a probe already in flight.
+  // Starting a second forced probe would overwrite this singleton and allow
+  // the first completion to clear the newer promise while it was still using
+  // the S3 clients and readiness deadline.
+  if (retainedStorageReadinessInFlight) return retainedStorageReadinessInFlight;
   retainedStorageReadinessInFlight = probeRetainedAudioStorage()
     .then(() => {
       retainedStorageReadinessCache = { expiresAt: Date.now() + 30_000 };
@@ -328,6 +330,8 @@ export function createAudioUploadRouter(limiters: Limiters) {
         return res.json({ mode: 'direct', assessmentEndpoint });
       }
       const key = `${KEY_PREFIX}/${scope}/${req.user!.id}/${randomUUID()}.${ext}`;
+      const transientRetentionTagging =
+        '<Tagging><TagSet><Tag><Key>retention</Key><Value>transient</Value></Tag></TagSet></Tagging>';
       // A presigned PUT cannot reliably enforce a maximum object length. S3
       // POST policies can, so the storage service itself rejects oversized
       // objects before they can create unbounded storage or download costs.
@@ -337,10 +341,10 @@ export function createAudioUploadRouter(limiters: Limiters) {
         const grant = await createPresignedPost(getS3(scope), {
           Bucket: target.bucket,
           Key: key,
-          Fields: { 'Content-Type': contentType, tagging: TRANSIENT_RETENTION_TAGGING },
+          Fields: { 'Content-Type': contentType, tagging: transientRetentionTagging },
           Conditions: [
             ['eq', '$Content-Type', contentType],
-            ['eq', '$tagging', TRANSIENT_RETENTION_TAGGING],
+            ['eq', '$tagging', transientRetentionTagging],
             ['content-length-range', 1, MAX_AUDIO_BYTES],
           ],
           Expires: config.s3.uploadUrlTtlSeconds,
@@ -443,6 +447,7 @@ export async function sweepPresignedAudioVersions(scope: AudioStorageScope, audi
   let removed = 0;
   const seenMarkers = new Set<string>();
   let pages = 0;
+  let hasMore: boolean;
   do {
     if (++pages > 1000) throw new Error('S3 version sweep exceeded its page bound');
     const controller = new AbortController();
@@ -458,9 +463,15 @@ export async function sweepPresignedAudioVersions(scope: AudioStorageScope, audi
         }),
         { abortSignal: controller.signal },
       );
-      const objects = [...(listed.Versions ?? []), ...(listed.DeleteMarkers ?? [])]
-        .filter((object) => object.Key === audioKey && object.VersionId)
-        .map((object) => ({ Key: audioKey, VersionId: object.VersionId! }));
+      const objects: Array<{ Key: string; VersionId: string }> = [];
+      for (const listedObjects of [listed.Versions, listed.DeleteMarkers]) {
+        if (!listedObjects) continue;
+        for (const object of listedObjects) {
+          if (object.Key === audioKey && object.VersionId) {
+            objects.push({ Key: audioKey, VersionId: object.VersionId });
+          }
+        }
+      }
       if (objects.length > 0) {
         const deleted = await getS3(scope).send(
           new DeleteObjectsCommand({ Bucket: target.bucket, Delete: { Objects: objects, Quiet: true } }),
@@ -477,12 +488,13 @@ export async function sweepPresignedAudioVersions(scope: AudioStorageScope, audi
         if (seenMarkers.has(markerIdentity)) throw new Error('S3 version listing repeated a continuation marker');
         seenMarkers.add(markerIdentity);
       }
-      keyMarker = listed.IsTruncated ? listed.NextKeyMarker : undefined;
-      versionIdMarker = listed.IsTruncated ? listed.NextVersionIdMarker : undefined;
+      hasMore = listed.IsTruncated === true;
+      keyMarker = hasMore ? listed.NextKeyMarker : undefined;
+      versionIdMarker = hasMore ? listed.NextVersionIdMarker : undefined;
     } finally {
       clearTimeout(timer);
     }
-  } while (keyMarker !== undefined || versionIdMarker !== undefined);
+  } while (hasMore);
   return removed;
 }
 
@@ -570,10 +582,9 @@ export function discardSubmittedPresignedAudio(scope: AudioStorageScope): Reques
     // `close` can precede route/claim resolution when a client disconnects.
     // In that case retain the object for the active worker and let the
     // mandatory S3 lifecycle rule collect any orphan; a normal post-finish
-    // close is harmless.
-    res.once('close', () => {
-      if (res.writableFinished) void finalizeSubmittedPresignedAudio(res);
-    });
+    // close is harmless. The preserve-default finalizer is itself safe before
+    // finish, so both close orderings can share the same idempotent call.
+    res.once('close', () => void finalizeSubmittedPresignedAudio(res));
     return next();
   };
 }
@@ -650,12 +661,14 @@ export async function resolvePresignedAudio(
     fs.chmodSync(tempPath, 0o600);
     const sizeBytes = fs.statSync(tempPath).size;
     const extension = path.extname(audioKey).toLowerCase();
+    // isOwnedAudioKey derives its allowlist from AUDIO_TYPES, so every key that
+    // reaches storage resolution has a canonical content type for its suffix.
+    const allowedContentTypes = AUDIO_TYPES[extension]!;
     const suppliedContentType = object.ContentType?.trim().toLowerCase();
     const contentType =
-      suppliedContentType && AUDIO_TYPES[extension]?.includes(suppliedContentType)
+      suppliedContentType && allowedContentTypes.includes(suppliedContentType)
         ? suppliedContentType
-        : AUDIO_TYPES[extension]?.[0];
-    if (!contentType) throw new HttpError(415, 'Invalid audio media type', 'AUDIO_INVALID');
+        : allowedContentTypes[0];
     const s3VersionId = object.VersionId || (config.mockAi ? 'mock-unversioned-object' : undefined);
     if (!s3VersionId) {
       throw new HttpError(503, 'Versioned audio storage is required', 'PROVIDER_FAILED');
@@ -696,6 +709,4 @@ export async function resolvePresignedAudio(
   } finally {
     clearTimeout(operationTimer);
   }
-
-  throw new Error('unreachable S3 audio resolution state');
 }

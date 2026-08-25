@@ -7,19 +7,30 @@ import { useTheme } from '../lib/theme';
 
 /** Focused-only adaptive banner with a reserved slot while policy/consent resolves. */
 export default function HomeBannerAd({ focused }: { focused: boolean }) {
+  return focused ? <FocusedHomeBannerAd /> : null;
+}
+
+function FocusedHomeBannerAd() {
   const ads = useAds();
   const t = useT();
   const theme = useTheme();
   const { activatePlacement } = ads;
-  const [failed, setFailed] = useState(false);
+  const [failedConsentVersion, setFailedConsentVersion] = useState<number | null>(null);
+  const [validatedForFocus, setValidatedForFocus] = useState(false);
+  const failed = failedConsentVersion === ads.consentVersion;
   useEffect(() => {
-    if (!focused) return;
-    void Promise.resolve().then(() => setFailed(false));
-    void activatePlacement('homeBanner');
-  }, [activatePlacement, focused]);
+    let active = true;
+    void activatePlacement('homeBanner').then((ready) => {
+      if (active) setValidatedForFocus(ready);
+    });
+    return () => {
+      active = false;
+    };
+  }, [activatePlacement, ads.consentVersion]);
 
-  if (!focused || failed || ads.statuses.homeBanner === 'blocked') return null;
-  const native = ads.statuses.homeBanner === 'ready' ? adsNativeModuleWhenReady() : null;
+  if (failed || ads.statuses.homeBanner === 'blocked') return null;
+  const native =
+    validatedForFocus && ads.statuses.homeBanner === 'ready' ? adsNativeModuleWhenReady() : null;
   const unitId = adUnitIdFor('homeBanner');
   const BannerAd = native?.BannerAd;
   return (
@@ -34,7 +45,7 @@ export default function HomeBannerAd({ focused }: { focused: boolean }) {
           unitId={unitId}
           size={native.BannerAdSize.ANCHORED_ADAPTIVE_BANNER}
           requestOptions={{ requestNonPersonalizedAdsOnly: ads.requestNonPersonalizedAdsOnly }}
-          onAdFailedToLoad={() => setFailed(true)}
+          onAdFailedToLoad={() => setFailedConsentVersion(ads.consentVersion)}
         />
       ) : null}
     </View>

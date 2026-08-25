@@ -156,6 +156,33 @@ describe('claimAssessmentRequest ownership and replay', () => {
     expect(row.rows).toEqual([{ status: 'processing' }]);
   });
 
+  it('fails closed when recording completion returns no authoritative owner row', async () => {
+    const client = {
+      query: vi.fn().mockResolvedValue({ rowCount: 1, rows: [] }),
+    };
+    const recording = {
+      id: randomUUID(),
+      storageScope: 'practice' as const,
+      audioKey: `audio-uploads/practice/${userId}/${randomUUID()}.m4a`,
+      s3VersionId: 'version-1',
+      contentType: 'audio/mp4',
+      sizeBytes: 1234,
+    };
+
+    await expect(
+      completeAssessmentRequest(
+        client,
+        userId,
+        randomUUID(),
+        randomUUID(),
+        retryPracticeResponse,
+        'practice',
+        recording,
+      ),
+    ).rejects.toThrow('recording completion has no authoritative S3 audio key');
+    expect(client.query).toHaveBeenCalledOnce();
+  });
+
   it('preserves the in-flight subtype name for diagnostics', () => {
     const error = new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
       retryAfterSeconds: 2,

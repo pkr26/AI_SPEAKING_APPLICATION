@@ -18,6 +18,7 @@ type AdsNativeModule = typeof import('react-native-google-mobile-ads');
 interface AdsContextValue {
   statuses: Record<AdsPlacement, AdsPlacementStatus>;
   requestNonPersonalizedAdsOnly: boolean;
+  currentRequestNonPersonalizedAdsOnly: () => boolean;
   consentVersion: number;
   privacyOptionsRequired: boolean;
   activatePlacement: (placement: AdsPlacement) => Promise<boolean>;
@@ -81,7 +82,6 @@ function requireAdsModule(): AdsNativeModule | null {
   // The SDK contains native code and is unavailable in Expo Go. Returning null
   // is a fail-closed capability check, not a claim that Expo Go supports ads.
   if (Constants.appOwnership === 'expo') return null;
-  if (nativeModule) return nativeModule;
   return loadAdsNativeModule(() => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     nativeModule = require('react-native-google-mobile-ads') as AdsNativeModule;
@@ -96,7 +96,7 @@ interface AdmobExtra {
   historyNativeIosUnitId?: unknown;
 }
 
-export function adUnitIdFor(placement: AdsPlacement): string | null {
+export function adUnitIdFor(placement: AdsPlacement, development = __DEV__): string | null {
   const extra = Constants.expoConfig?.extra?.admob as AdmobExtra | undefined;
   if (Platform.OS !== 'android' && Platform.OS !== 'ios') return null;
   const key =
@@ -109,7 +109,7 @@ export function adUnitIdFor(placement: AdsPlacement): string | null {
         : 'historyNativeIosUnitId';
   const value = extra?.[key];
   if (typeof value !== 'string' || !ADMOB_UNIT_ID.test(value)) return null;
-  if (!__DEV__ && value.startsWith(GOOGLE_SAMPLE_PUBLISHER)) return null;
+  if (!development && value.startsWith(GOOGLE_SAMPLE_PUBLISHER)) return null;
   return value;
 }
 
@@ -117,11 +117,23 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
   const [statuses, setStatuses] = useState(INITIAL_STATUSES);
   const [privacyOptionsRequired, setPrivacyOptionsRequired] = useState(false);
   const [requestNonPersonalizedAdsOnly, setRequestNonPersonalizedAdsOnly] = useState(true);
+  const requestNonPersonalizedAdsOnlyRef = useRef(true);
   const [consentVersion, setConsentVersion] = useState(0);
   const policyRef = useRef<{
     promise: Promise<RemoteAdsPolicy | null> | null;
   }>({ promise: null });
   const initializationPromiseRef = useRef<Promise<boolean> | null>(null);
+  const consentEpochRef = useRef(0);
+  const activationTokensRef = useRef<Record<AdsPlacement, number>>({
+    homeBanner: 0,
+    historyNative: 0,
+  });
+  const privacyTransitionPromiseRef = useRef<Promise<boolean> | null>(null);
+  const privacyOptionsOperationRef = useRef(false);
+  const currentRequestNonPersonalizedAdsOnly = useCallback(
+    () => requestNonPersonalizedAdsOnlyRef.current,
+    [],
+  );
 
   const loadPolicy = useCallback(() => {
     const cache = policyRef.current;
@@ -144,6 +156,7 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
       const choices = await ads.AdsConsent.getUserChoices().catch(() => null);
       nonPersonalized = choices?.selectPersonalisedAds !== true;
     }
+    requestNonPersonalizedAdsOnlyRef.current = nonPersonalized;
     setRequestNonPersonalizedAdsOnly(nonPersonalized);
     await ads.default().setRequestConfiguration({
       maxAdContentRating: ads.MaxAdContentRating.PG,
@@ -154,56 +167,70 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
     return nonPersonalized;
   }, []);
 
-  const initializeSdk = useCallback(() => {
-    if (initializationPromiseRef.current) return initializationPromiseRef.current;
-    const initialization = (async () => {
-      const ads = requireAdsModule();
-      if (!ads) return false;
-      try {
-        let consent;
+  const initializeSdk = useCallback(
+    (expectedConsentEpoch: number) => {
+      if (initializationPromiseRef.current) return initializationPromiseRef.current;
+      const initialization = (async () => {
+        const ads = requireAdsModule();
+        if (!ads) return false;
         try {
-          consent = await ads.AdsConsent.gatherConsent();
+          let consent;
+          try {
+            consent = await ads.AdsConsent.gatherConsent();
+          } catch {
+            consent = await ads.AdsConsent.getConsentInfo().catch(() => null);
+          }
+          if (expectedConsentEpoch !== consentEpochRef.current) return false;
+          if (!consent) return false;
+          setPrivacyOptionsRequired(
+            consent.privacyOptionsRequirementStatus ===
+              ads.AdsConsentPrivacyOptionsRequirementStatus.REQUIRED,
+          );
+          if (!consent.canRequestAds) return false;
+          await updateConsentRequestMode(ads);
+          if (expectedConsentEpoch !== consentEpochRef.current) return false;
+          await ads.default().initialize();
+          return true;
         } catch {
-          consent = await ads.AdsConsent.getConsentInfo().catch(() => null);
+          return false;
         }
-        if (!consent) return false;
-        setPrivacyOptionsRequired(
-          consent.privacyOptionsRequirementStatus ===
-            ads.AdsConsentPrivacyOptionsRequirementStatus.REQUIRED,
-        );
-        if (!consent.canRequestAds) return false;
-        await updateConsentRequestMode(ads);
-        await ads.default().initialize();
-        return true;
-      } catch {
-        return false;
-      }
-    })();
-    initializationPromiseRef.current = initialization;
-    void initialization.then((ready) => {
-      if (!ready && initializationPromiseRef.current === initialization) {
-        initializationPromiseRef.current = null;
-      }
-    });
-    return initialization;
-  }, [updateConsentRequestMode]);
+      })();
+      initializationPromiseRef.current = initialization;
+      void initialization.then((ready) => {
+        if (!ready && initializationPromiseRef.current === initialization) {
+          initializationPromiseRef.current = null;
+        }
+      });
+      return initialization;
+    },
+    [updateConsentRequestMode],
+  );
 
   const activatePlacement = useCallback(
     async (placement: AdsPlacement) => {
+      const activationToken = activationTokensRef.current[placement] + 1;
+      activationTokensRef.current[placement] = activationToken;
+      const consentEpoch = consentEpochRef.current;
+      const activationIsCurrent = () =>
+        activationTokensRef.current[placement] === activationToken &&
+        consentEpochRef.current === consentEpoch;
       setStatuses((current) => ({ ...current, [placement]: 'checking' }));
       // Every focused placement activation revalidates the remote kill switch.
       const policy = await loadPolicy();
-      if (
-        !policy ||
-        !policy.enabled ||
-        policy.audienceMode !== 'adult-only' ||
-        !policy.placements[placement] ||
-        !adUnitIdFor(placement)
-      ) {
+      const privacyTransition = privacyTransitionPromiseRef.current;
+      if (privacyTransition) {
+        const transitionAllowsAds = await privacyTransition.catch(() => false);
+        if (!transitionAllowsAds) {
+          setStatuses((current) => ({ ...current, [placement]: 'blocked' }));
+          return false;
+        }
+      }
+      if (!policy || !policy.enabled || !policy.placements[placement] || !adUnitIdFor(placement)) {
         setStatuses((current) => ({ ...current, [placement]: 'blocked' }));
         return false;
       }
-      const ready = await initializeSdk();
+      const ready = await initializeSdk(consentEpoch);
+      if (!activationIsCurrent()) return false;
       setStatuses((current) => ({ ...current, [placement]: ready ? 'ready' : 'blocked' }));
       return ready;
     },
@@ -211,31 +238,39 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
   );
 
   const showPrivacyOptions = useCallback(async () => {
-    if (!privacyOptionsRequired) return false;
+    if (!privacyOptionsRequired || privacyOptionsOperationRef.current) return false;
     const ads = requireAdsModule();
     if (!ads) return false;
+    privacyOptionsOperationRef.current = true;
     let formCompleted = false;
+    let privacyTransition: Promise<boolean> | null = null;
     try {
       const result = await ads.AdsConsent.showPrivacyOptionsForm();
       formCompleted = true;
+      const staleInitialization = initializationPromiseRef.current;
+      consentEpochRef.current += 1;
+      activationTokensRef.current.homeBanner += 1;
+      activationTokensRef.current.historyNative += 1;
+      initializationPromiseRef.current = null;
       setPrivacyOptionsRequired(
         result.privacyOptionsRequirementStatus ===
           ads.AdsConsentPrivacyOptionsRequirementStatus.REQUIRED,
       );
-      if (!result.canRequestAds) {
-        initializationPromiseRef.current = null;
-        setStatuses({ homeBanner: 'blocked', historyNative: 'blocked' });
+      setStatuses(BLOCKED_STATUSES);
+      privacyTransition = (async () => {
+        await staleInitialization;
+        if (!result.canRequestAds) return false;
+        await updateConsentRequestMode(ads);
         return true;
-      }
-      await updateConsentRequestMode(ads);
+      })();
+      privacyTransitionPromiseRef.current = privacyTransition;
+      await privacyTransition;
       return true;
     } catch {
-      if (formCompleted) {
-        initializationPromiseRef.current = null;
-        setStatuses({ homeBanner: 'blocked', historyNative: 'blocked' });
-      }
       return false;
     } finally {
+      privacyTransitionPromiseRef.current = null;
+      privacyOptionsOperationRef.current = false;
       // Remount active ads only after the latest request mode has committed.
       // A completed form still invalidates old ads if mode recomputation fails.
       if (formCompleted) setConsentVersion((version) => version + 1);
@@ -246,6 +281,7 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
     () => ({
       statuses,
       requestNonPersonalizedAdsOnly,
+      currentRequestNonPersonalizedAdsOnly,
       consentVersion,
       privacyOptionsRequired,
       activatePlacement,
@@ -254,6 +290,7 @@ export function AdsProvider({ children }: { children: React.ReactNode }) {
     [
       activatePlacement,
       consentVersion,
+      currentRequestNonPersonalizedAdsOnly,
       privacyOptionsRequired,
       requestNonPersonalizedAdsOnly,
       showPrivacyOptions,
@@ -268,6 +305,7 @@ export function useAds(): AdsContextValue {
     useContext(AdsContext) ?? {
       statuses: BLOCKED_STATUSES,
       requestNonPersonalizedAdsOnly: true,
+      currentRequestNonPersonalizedAdsOnly: () => true,
       consentVersion: 0,
       privacyOptionsRequired: false,
       activatePlacement: async () => false,

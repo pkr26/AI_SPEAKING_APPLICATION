@@ -15,7 +15,12 @@ import { claimPlaybackOwner, configurePlaybackAudioMode } from '../lib/audio-ses
 import { useAuth } from '../lib/auth';
 import { translate, useT } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
-import type { HistoryPage, RecordingPage, RecordingStatus } from '../lib/types';
+import type {
+  HistoryPage,
+  RecordingPage,
+  RecordingPlaybackGrant,
+  RecordingStatus,
+} from '../lib/types';
 import Button from './Button';
 
 type PlaybackPhase = 'idle' | 'loading' | 'playing' | 'paused' | 'error' | 'deleting' | 'deleted';
@@ -30,7 +35,6 @@ interface RecordingPlaybackProps {
 }
 
 const PLAYBACK_EXPIRY_SAFETY_MS = 10_000;
-const MAX_PENDING_RETRIES = 3;
 
 function abortError(): Error {
   const error = new Error('Aborted');
@@ -38,7 +42,8 @@ function abortError(): Error {
   return error;
 }
 
-function waitAbortable(milliseconds: number, signal: AbortSignal): Promise<void> {
+/** Exported so the pre-aborted and mid-wait cancellation contracts stay deterministic. */
+export function waitAbortable(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const rejectAbort = () => {
@@ -57,7 +62,8 @@ function waitAbortable(milliseconds: number, signal: AbortSignal): Promise<void>
   });
 }
 
-function formatPlaybackTime(seconds: number): string {
+/** Formats the native player's potentially hostile/non-finite timing values. */
+export function formatPlaybackTime(seconds: number): string {
   const safe = Number.isFinite(seconds) ? Math.max(0, Math.floor(seconds)) : 0;
   const minutes = Math.floor(safe / 60);
   return `${minutes}:${String(safe % 60).padStart(2, '0')}`;
@@ -120,28 +126,33 @@ export default function RecordingPlayback({
   const t = useT();
   const styles = themedStyles(useTheme());
   const queryClient = useQueryClient();
-  const [phase, setPhase] = useState<PlaybackPhase>(
-    recordingStatus === 'unavailable' ? 'error' : 'idle',
-  );
+  const identityToken = useMemo(() => {
+    void ownerId;
+    void recordingId;
+    return Symbol();
+  }, [ownerId, recordingId]);
+  const [phase, setPhase] = useState<PlaybackPhase>('idle');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const mountedRef = useRef(false);
-  const focusedRef = useRef(false);
-  const lifecycleRef = useRef(0);
+  const mountedRef = useRef<boolean | null>(null);
+  const focusedRef = useRef<boolean | null>(null);
+  const lifecycleRef = useRef(Symbol());
   const playerRef = useRef<AudioPlayer | null>(null);
   const playerListenerRef = useRef<{ remove: () => void } | null>(null);
   const playbackControllerRef = useRef<AbortController | null>(null);
   const deleteControllerRef = useRef<AbortController | null>(null);
   const operationRef = useRef<symbol | null>(null);
+  const deleteOperationRef = useRef<symbol | null>(null);
+  const deletedRef = useRef<boolean | null>(null);
   const playbackExpiryRef = useRef(0);
   const releaseOwnerRef = useRef<(() => void) | null>(null);
-  const playbackOwnerRef = useRef(Symbol('submitted-recording-playback'));
-  const previousIdentityRef = useRef({ ownerId, recordingId });
+  const playbackOwnerRef = useRef(Symbol());
+  const committedIdentityRef = useRef(identityToken);
   const onDeletedRef = useRef(onDeleted);
   const sessionLease = useMemo(() => {
-    void sessionVersion;
     void ownerId;
+    void sessionVersion;
     return captureSessionLease();
   }, [captureSessionLease, ownerId, sessionVersion]);
 
@@ -150,9 +161,9 @@ export default function RecordingPlayback({
   }, [onDeleted]);
 
   const contextIsCurrent = useCallback(
-    (lifecycle = lifecycleRef.current) =>
-      mountedRef.current &&
-      focusedRef.current &&
+    (lifecycle: symbol) =>
+      mountedRef.current === true &&
+      focusedRef.current === true &&
       AppState.currentState !== 'background' &&
       AppState.currentState !== 'inactive' &&
       lifecycle === lifecycleRef.current &&
@@ -160,7 +171,13 @@ export default function RecordingPlayback({
     [isSessionLeaseCurrent, sessionLease],
   );
 
-  const releasePlayer = useCallback((publish = true) => {
+  const cancelDelete = useCallback(() => {
+    deleteControllerRef.current?.abort();
+    deleteControllerRef.current = null;
+    deleteOperationRef.current = null;
+  }, []);
+
+  const releasePlayer = useCallback(() => {
     playbackControllerRef.current?.abort();
     playbackControllerRef.current = null;
     operationRef.current = null;
@@ -185,85 +202,95 @@ export default function RecordingPlayback({
     }
     releaseOwnerRef.current?.();
     releaseOwnerRef.current = null;
-    if (publish && mountedRef.current) {
-      setCurrentTime(0);
-      setDuration(0);
-      setPhase((current) => (current === 'deleted' || current === 'deleting' ? current : 'idle'));
-    }
   }, []);
+
+  const resetPlaybackUi = useCallback(() => {
+    if (mountedRef.current !== true) return;
+    setCurrentTime(0);
+    setDuration(0);
+    setPhase('idle');
+  }, []);
+
+  const stopPlayback = useCallback(() => {
+    releasePlayer();
+    resetPlaybackUi();
+  }, [releasePlayer, resetPlaybackUi]);
 
   useLayoutEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
-      focusedRef.current = false;
-      lifecycleRef.current += 1;
-      playbackControllerRef.current?.abort();
-      deleteControllerRef.current?.abort();
-      releasePlayer(false);
+      cancelDelete();
+      releasePlayer();
     };
-  }, [releasePlayer]);
+  }, [cancelDelete, releasePlayer]);
 
   useLayoutEffect(() => {
-    const previous = previousIdentityRef.current;
-    if (previous.ownerId === ownerId && previous.recordingId === recordingId) return;
-    previousIdentityRef.current = { ownerId, recordingId };
-    lifecycleRef.current += 1;
-    playbackOwnerRef.current = Symbol('submitted-recording-playback');
-    deleteControllerRef.current?.abort();
-    releasePlayer(false);
+    committedIdentityRef.current = identityToken;
+    lifecycleRef.current = Symbol();
+    playbackOwnerRef.current = Symbol();
+    cancelDelete();
+    deletedRef.current = false;
+    releasePlayer();
+    // Identity changes must synchronously discard account-scoped UI before paint.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setErrorMessage(null);
-    setPhase(recordingStatus === 'unavailable' ? 'error' : 'idle');
-  }, [ownerId, recordingId, recordingStatus, releasePlayer]);
+    resetPlaybackUi();
+  }, [cancelDelete, identityToken, releasePlayer, resetPlaybackUi]);
 
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
       return () => {
         focusedRef.current = false;
-        lifecycleRef.current += 1;
-        releasePlayer();
+        lifecycleRef.current = Symbol();
+        cancelDelete();
+        stopPlayback();
       };
-    }, [releasePlayer]),
+    }, [cancelDelete, stopPlayback]),
   );
 
   useEffect(() => {
     const subscription = AppState.addEventListener('change', (state) => {
       if (state === 'active') return;
-      lifecycleRef.current += 1;
-      releasePlayer();
+      lifecycleRef.current = Symbol();
+      cancelDelete();
+      stopPlayback();
     });
     return () => subscription.remove();
-  }, [releasePlayer]);
+  }, [cancelDelete, stopPlayback]);
 
   const playbackGrant = useCallback(
     async (signal: AbortSignal) => {
-      for (let pendingRetry = 0; pendingRetry <= MAX_PENDING_RETRIES; pendingRetry++) {
+      const requestGrant = () => apiGetRecordingPlaybackGrant(recordingId, signal);
+      const retryPending = async (
+        next: () => Promise<RecordingPlaybackGrant>,
+      ): Promise<RecordingPlaybackGrant> => {
         try {
-          return await apiGetRecordingPlaybackGrant(recordingId, signal);
+          return await requestGrant();
         } catch (error) {
           if (!(
             error instanceof ApiError &&
             error.status === 409 &&
-            error.code === 'REQUEST_IN_FLIGHT' &&
-            pendingRetry < MAX_PENDING_RETRIES
+            error.code === 'REQUEST_IN_FLIGHT'
           )) {
             throw error;
           }
           const waitSeconds = Math.min(Math.max(error.retryAfterSeconds ?? 2, 1), 5);
           await waitAbortable(waitSeconds * 1_000, signal);
+          return next();
         }
-      }
-      /* istanbul ignore next -- loop termination always throws the last API error */
-      throw new Error('recording playback retry bound exhausted');
+      };
+      return retryPending(() => retryPending(() => retryPending(requestGrant)));
     },
     [recordingId],
   );
 
   const startPlayback = useCallback(async () => {
-    if (phase === 'loading' || phase === 'deleting' || phase === 'deleted') return;
+    if (operationRef.current || deleteOperationRef.current || deletedRef.current === true) {
+      return;
+    }
     const lifecycle = lifecycleRef.current;
-    if (!contextIsCurrent(lifecycle)) return;
     const existing = playerRef.current;
     if (existing && playbackExpiryRef.current > Date.now() + PLAYBACK_EXPIRY_SAFETY_MS) {
       try {
@@ -271,36 +298,32 @@ export default function RecordingPlayback({
         setPhase('playing');
         return;
       } catch {
-        releasePlayer(false);
+        // Replace the failed native player below.
       }
     }
-    releasePlayer(false);
-    const operation = Symbol('recording-playback-load');
+    releasePlayer();
+    const operation = Symbol();
     operationRef.current = operation;
     const controller = new AbortController();
     playbackControllerRef.current = controller;
     setErrorMessage(null);
     setPhase('loading');
+    const operationIsCurrent = () =>
+      committedIdentityRef.current === identityToken &&
+      operationRef.current === operation &&
+      contextIsCurrent(lifecycle);
     try {
       const grant = await playbackGrant(controller.signal);
-      if (
-        controller.signal.aborted ||
-        operationRef.current !== operation ||
-        !contextIsCurrent(lifecycle)
-      ) {
-        return;
-      }
-      const releaseOwner = await claimPlaybackOwner(playbackOwnerRef.current, () =>
-        releasePlayer(),
-      );
-      if (!contextIsCurrent(lifecycle) || operationRef.current !== operation) {
+      if (!operationIsCurrent()) return;
+      const releaseOwner = await claimPlaybackOwner(playbackOwnerRef.current, stopPlayback);
+      if (!operationIsCurrent()) {
         releaseOwner();
         return;
       }
       releaseOwnerRef.current = releaseOwner;
       await configurePlaybackAudioMode();
-      if (!contextIsCurrent(lifecycle) || operationRef.current !== operation) {
-        releasePlayer(false);
+      if (!operationIsCurrent()) {
+        releasePlayer();
         return;
       }
       const player = createAudioPlayer(grant.playbackUrl, { updateInterval: 250 });
@@ -309,7 +332,7 @@ export default function RecordingPlayback({
       playerListenerRef.current = player.addListener('playbackStatusUpdate', (status) => {
         if (playerRef.current !== player || !contextIsCurrent(lifecycle)) return;
         if (status.error) {
-          releasePlayer(false);
+          releasePlayer();
           setErrorMessage(translate('recordings.playFailed'));
           setPhase('error');
           return;
@@ -320,7 +343,7 @@ export default function RecordingPlayback({
           setPhase('paused');
           void Promise.resolve(player.seekTo(0)).catch(() => {
             if (playerRef.current === player) {
-              releasePlayer(false);
+              releasePlayer();
               setErrorMessage(translate('recordings.playFailed'));
               setPhase('error');
             }
@@ -332,23 +355,27 @@ export default function RecordingPlayback({
       player.play();
       setPhase('playing');
     } catch (error) {
-      if (controller.signal.aborted || !contextIsCurrent(lifecycle)) return;
-      releasePlayer(false);
+      if (!operationIsCurrent()) return;
+      releasePlayer();
       setErrorMessage(userMessageForError(error, t('recordings.playFailed')));
       setPhase('error');
     } finally {
       if (playbackControllerRef.current === controller) playbackControllerRef.current = null;
       if (operationRef.current === operation) operationRef.current = null;
     }
-  }, [contextIsCurrent, phase, playbackGrant, releasePlayer, t]);
+  }, [contextIsCurrent, identityToken, playbackGrant, releasePlayer, stopPlayback, t]);
 
   const togglePlayback = () => {
+    const lifecycle = lifecycleRef.current;
+    if (committedIdentityRef.current !== identityToken || !contextIsCurrent(lifecycle)) {
+      return;
+    }
     if (phase === 'playing') {
       try {
-        playerRef.current?.pause();
+        playerRef.current!.pause();
         setPhase('paused');
       } catch {
-        releasePlayer(false);
+        releasePlayer();
         setErrorMessage(t('recordings.playFailed'));
         setPhase('error');
       }
@@ -357,39 +384,65 @@ export default function RecordingPlayback({
     void startPlayback();
   };
 
-  const performDelete = useCallback(async () => {
-    const lifecycle = lifecycleRef.current;
-    if (!contextIsCurrent(lifecycle) || phase === 'deleting' || phase === 'deleted') return;
-    releasePlayer(false);
-    const controller = new AbortController();
-    deleteControllerRef.current = controller;
-    setErrorMessage(null);
-    setPhase('deleting');
-    try {
-      await apiDeleteRecording(recordingId, controller.signal);
-      if (controller.signal.aborted || !contextIsCurrent(lifecycle)) return;
-      await Promise.all([
-        queryClient.cancelQueries({ queryKey: ['recordings', ownerId], exact: true }),
-        queryClient.cancelQueries({ queryKey: ['practice-history', ownerId], exact: true }),
-      ]);
-      if (!contextIsCurrent(lifecycle)) return;
-      applyRecordingDeletionToCache(queryClient, ownerId, recordingId);
-      void queryClient.invalidateQueries({ queryKey: ['recordings', ownerId], exact: true });
-      void queryClient.invalidateQueries({ queryKey: ['practice-history', ownerId], exact: true });
-      onDeletedRef.current?.(recordingId);
-      setPhase('deleted');
-      AccessibilityInfo.announceForAccessibility(t('recordings.deleted'));
-    } catch (error) {
-      if (controller.signal.aborted || !contextIsCurrent(lifecycle)) return;
-      setErrorMessage(userMessageForError(error, t('recordings.deleteFailed')));
-      setPhase('error');
-    } finally {
-      if (deleteControllerRef.current === controller) deleteControllerRef.current = null;
-    }
-  }, [contextIsCurrent, ownerId, phase, queryClient, recordingId, releasePlayer, t]);
+  const performDelete = useCallback(
+    async (lifecycle: symbol, expectedIdentity: symbol) => {
+      if (
+        committedIdentityRef.current !== expectedIdentity ||
+        !contextIsCurrent(lifecycle) ||
+        deleteOperationRef.current ||
+        deletedRef.current === true
+      ) {
+        return;
+      }
+      releasePlayer();
+      const operation = Symbol();
+      deleteOperationRef.current = operation;
+      const controller = new AbortController();
+      deleteControllerRef.current = controller;
+      setErrorMessage(null);
+      setPhase('deleting');
+      const operationIsCurrent = () =>
+        committedIdentityRef.current === expectedIdentity && contextIsCurrent(lifecycle);
+      try {
+        await apiDeleteRecording(recordingId, controller.signal);
+        if (!operationIsCurrent()) return;
+        await Promise.all([
+          queryClient.cancelQueries({ queryKey: ['recordings', ownerId], exact: true }),
+          queryClient.cancelQueries({ queryKey: ['practice-history', ownerId], exact: true }),
+        ]);
+        if (!operationIsCurrent()) return;
+        applyRecordingDeletionToCache(queryClient, ownerId, recordingId);
+        void queryClient.invalidateQueries({ queryKey: ['recordings', ownerId], exact: true });
+        void queryClient.invalidateQueries({
+          queryKey: ['practice-history', ownerId],
+          exact: true,
+        });
+        deletedRef.current = true;
+        onDeletedRef.current?.(recordingId);
+        setPhase('deleted');
+        AccessibilityInfo.announceForAccessibility(t('recordings.deleted'));
+      } catch (error) {
+        if (!operationIsCurrent()) return;
+        setErrorMessage(userMessageForError(error, t('recordings.deleteFailed')));
+        setPhase('error');
+      } finally {
+        if (deleteControllerRef.current === controller) deleteControllerRef.current = null;
+        if (deleteOperationRef.current === operation) deleteOperationRef.current = null;
+      }
+    },
+    [contextIsCurrent, ownerId, queryClient, recordingId, releasePlayer, t],
+  );
 
   const confirmDelete = () => {
-    if (phase === 'deleting' || phase === 'deleted') return;
+    const lifecycle = lifecycleRef.current;
+    if (
+      committedIdentityRef.current !== identityToken ||
+      !contextIsCurrent(lifecycle) ||
+      deleteOperationRef.current ||
+      deletedRef.current === true
+    ) {
+      return;
+    }
     Alert.alert(
       t('recordings.deleteTitle'),
       recordingLabel
@@ -400,7 +453,7 @@ export default function RecordingPlayback({
         {
           text: t('recordings.deleteAction'),
           style: 'destructive',
-          onPress: () => void performDelete(),
+          onPress: () => void performDelete(lifecycle, identityToken),
         },
       ],
     );
@@ -408,7 +461,11 @@ export default function RecordingPlayback({
 
   if (phase === 'deleted') {
     return (
-      <Text accessibilityLiveRegion="polite" style={styles.deletedText}>
+      <Text
+        accessibilityLiveRegion="polite"
+        style={styles.deletedText}
+        testID="recording-playback-deleted"
+      >
         {t('recordings.deleted')}
       </Text>
     );
@@ -417,10 +474,15 @@ export default function RecordingPlayback({
   const unavailable = recordingStatus === 'unavailable';
   const loading = phase === 'loading';
   const deleting = phase === 'deleting';
-  const progressMax = Math.max(duration, 1);
+  const progressMax = Number.isFinite(duration) ? Math.max(duration, 1) : 1;
+  const finiteCurrentTime = Number.isFinite(currentTime) ? currentTime : 0;
+  const progressNow = Math.min(Math.max(finiteCurrentTime, 0), progressMax);
   return (
-    <View style={[styles.container, compact && styles.compact]}>
-      <View style={styles.actions}>
+    <View
+      testID="recording-playback-container"
+      style={[styles.container, compact && styles.compact]}
+    >
+      <View testID="recording-playback-actions" style={styles.actions}>
         <Button
           title={
             unavailable
@@ -451,39 +513,49 @@ export default function RecordingPlayback({
           onPress={confirmDelete}
         />
       </View>
-      {(phase === 'playing' || phase === 'paused') && duration > 0 && (
+      {(phase === 'playing' || phase === 'paused') && Number.isFinite(duration) && duration > 0 && (
         <View
           accessible
           accessibilityRole="progressbar"
           accessibilityLabel={t('recordings.progressLabel')}
-          accessibilityValue={{ min: 0, max: progressMax, now: Math.min(currentTime, progressMax) }}
+          accessibilityValue={{ min: 0, max: progressMax, now: progressNow }}
           style={styles.progressRow}
+          testID="recording-playback-progress"
         >
-          <View style={styles.progressTrack}>
+          <View testID="recording-playback-progress-track" style={styles.progressTrack}>
             <View
+              testID="recording-playback-progress-fill"
               style={[
                 styles.progressFill,
-                { width: `${Math.min(100, Math.round((currentTime / progressMax) * 100))}%` },
+                { width: `${Math.round((progressNow / progressMax) * 100)}%` },
               ]}
             />
           </View>
-          <Text style={styles.timeText}>
+          <Text testID="recording-playback-time" style={styles.timeText}>
             {formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}
           </Text>
         </View>
       )}
       {recordingStatus === 'retention_pending' && phase === 'idle' && (
-        <Text accessibilityLiveRegion="polite" style={styles.statusText}>
+        <Text
+          accessibilityLiveRegion="polite"
+          style={styles.statusText}
+          testID="recording-playback-pending"
+        >
           {t('recordings.pending')}
         </Text>
       )}
       {unavailable && (
-        <Text accessibilityLiveRegion="polite" style={styles.statusText}>
+        <Text
+          accessibilityLiveRegion="polite"
+          style={styles.statusText}
+          testID="recording-playback-unavailable"
+        >
           {t('recordings.unavailable')}
         </Text>
       )}
       {errorMessage && (
-        <Text accessibilityRole="alert" style={styles.errorText}>
+        <Text accessibilityRole="alert" style={styles.errorText} testID="recording-playback-error">
           {errorMessage}
         </Text>
       )}

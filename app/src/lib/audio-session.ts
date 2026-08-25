@@ -72,7 +72,12 @@ export async function claimPlaybackOwner(
     const previous = activePlaybackOwner;
     if (previous && previous.token !== token) {
       activePlaybackOwner = null;
-      await previous.stop();
+      try {
+        await previous.stop();
+      } catch (error) {
+        publishPlaybackActive();
+        throw error;
+      }
     }
     activePlaybackOwner = { token, stop };
     publishPlaybackActive();

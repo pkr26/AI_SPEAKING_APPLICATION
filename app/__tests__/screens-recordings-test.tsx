@@ -1,16 +1,58 @@
 import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
+import { FlatList } from 'react-native';
 
-import RecordingsScreen from '../src/app/recordings';
-import { apiGetRecordings, ApiError } from '../src/lib/api';
-import { useAuth } from '../src/lib/auth';
-import { translateFor } from '../src/lib/i18n';
-import type { RecordingItem, User } from '../src/lib/types';
+import RecordingsScreen, {
+  formatRecordingDuration,
+  formatRecordingSize,
+  nextRecordingPageParam,
+  recordingContextMessageKey,
+  RECORDING_DATE_LOCALES,
+  recordingsThemedStyles,
+} from '../src/app/recordings';
+import RecordingPlayback from '../src/components/RecordingPlayback';
+import { apiGetRecordings } from '../src/lib/api';
+import { type SessionLease, useAuth } from '../src/lib/auth';
+import { I18nProvider, translateFor, type UiLanguage } from '../src/lib/i18n';
+import { layout, lightColors, radii, spacing } from '../src/lib/theme';
+import type { RecordingItem, RecordingPage, User } from '../src/lib/types';
 
 const t = (key: Parameters<typeof translateFor>[1], params?: Record<string, string | number>) =>
   translateFor('en', key, params);
 const asMock = (value: unknown) => value as jest.Mock;
+
+jest.mock('react-native', () => {
+  const actual = jest.requireActual<typeof import('react-native')>('react-native');
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  const MockFlatList = jest.fn(
+    (props: {
+      data: unknown[];
+      keyExtractor: (item: unknown) => string;
+      renderItem: (info: { item: unknown; index: number }) => React.ReactNode;
+      ListHeaderComponent?: React.ReactNode;
+      ListFooterComponent?: React.ReactNode;
+    }) =>
+      ReactActual.createElement(
+        actual.View,
+        { testID: 'recordings-flat-list' },
+        props.ListHeaderComponent,
+        ...props.data.map((item, index) =>
+          ReactActual.createElement(
+            ReactActual.Fragment,
+            { key: props.keyExtractor(item) },
+            props.renderItem({ item, index }),
+          ),
+        ),
+        props.ListFooterComponent,
+      ),
+  );
+  return new Proxy(actual, {
+    get(target, property, receiver) {
+      return property === 'FlatList' ? MockFlatList : Reflect.get(target, property, receiver);
+    },
+  });
+});
 
 const USER: User = {
   id: '550e8400-e29b-41d4-a716-446655440000',
@@ -23,6 +65,8 @@ const USER: User = {
 };
 
 let leaseCurrent = true;
+let leaseSerial = 0;
+let capturedLease = { id: leaseSerial } as unknown as SessionLease;
 const mockAuth = {
   token: 'token',
   user: USER,
@@ -31,8 +75,8 @@ const mockAuth = {
   restoreError: null,
   retrySessionRestore: jest.fn(),
   resetStoredSession: jest.fn(),
-  captureSessionLease: jest.fn(() => ({}) as never),
-  isSessionLeaseCurrent: jest.fn(() => leaseCurrent),
+  captureSessionLease: jest.fn(() => capturedLease),
+  isSessionLeaseCurrent: jest.fn((lease: SessionLease) => leaseCurrent && lease === capturedLease),
   login: jest.fn(),
   register: jest.fn(),
   logout: jest.fn(),
@@ -53,15 +97,16 @@ jest.mock('../src/lib/api', () => ({
 
 jest.mock('../src/components/RecordingPlayback', () => ({
   __esModule: true,
-  default: ({ recordingId }: { recordingId: string }) => {
+  default: jest.fn(({ recordingId }: { recordingId: string }) => {
     const ReactActual = jest.requireActual<typeof import('react')>('react');
     const { Text: NativeText } = jest.requireActual<typeof import('react-native')>('react-native');
     return ReactActual.createElement(NativeText, null, `player:${recordingId}`);
-  },
+  }),
 }));
 
 const RECORDING_ID = '550e8400-e29b-41d4-a716-446655440011';
 const SECOND_ID = '550e8400-e29b-41d4-a716-446655440012';
+const THIRD_ID = '550e8400-e29b-41d4-a716-446655440013';
 
 function recording(overrides: Partial<RecordingItem> = {}): RecordingItem {
   return {
@@ -84,28 +129,202 @@ function recording(overrides: Partial<RecordingItem> = {}): RecordingItem {
 const clients: QueryClient[] = [];
 async function renderRecordings(
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+  language: UiLanguage = 'en',
 ) {
   clients.push(client);
   const view = await render(
     <QueryClientProvider client={client}>
-      <RecordingsScreen />
+      <I18nProvider accountLanguage={language}>
+        <RecordingsScreen />
+      </I18nProvider>
     </QueryClientProvider>,
   );
-  return { ...view, client };
+  return Object.assign(view, { client });
 }
 
 beforeEach(() => {
   leaseCurrent = true;
+  capturedLease = { id: ++leaseSerial } as unknown as SessionLease;
+  mockAuth.user = USER;
+  mockAuth.sessionVersion = 1;
+  mockAuth.captureSessionLease.mockClear();
+  mockAuth.isSessionLeaseCurrent.mockClear();
+  mockAuth.captureSessionLease.mockImplementation(() => capturedLease);
+  mockAuth.isSessionLeaseCurrent.mockImplementation(
+    (lease: SessionLease) => leaseCurrent && lease === capturedLease,
+  );
   asMock(useAuth).mockClear();
   asMock(apiGetRecordings).mockReset();
+  asMock(RecordingPlayback).mockClear();
+  asMock(FlatList).mockClear();
 });
 
 afterEach(async () => {
   await cleanup();
   for (const client of clients.splice(0)) client.clear();
+  jest.restoreAllMocks();
 });
 
 describe('recordings library', () => {
+  it('pins locale, formatting, pagination-boundary, and visual-style contracts', () => {
+    expect(RECORDING_DATE_LOCALES).toEqual({
+      en: 'en-US',
+      te: 'te-IN',
+      hi: 'hi-IN',
+      es: 'es-ES',
+      zh: 'zh-Hans',
+    });
+    expect([
+      recordingContextMessageKey('diagnostic'),
+      recordingContextMessageKey('practice-native'),
+      recordingContextMessageKey('practice'),
+    ]).toEqual([
+      'recordings.contextDiagnostic',
+      'recordings.contextNative',
+      'recordings.contextPractice',
+    ]);
+    expect([
+      formatRecordingDuration(null),
+      formatRecordingDuration(0),
+      formatRecordingDuration(59_499),
+      formatRecordingDuration(59_500),
+      formatRecordingDuration(3_600_000),
+    ]).toEqual([null, '0:01', '0:59', '1:00', '60:00']);
+    expect([
+      formatRecordingSize(1_023),
+      formatRecordingSize(1_024),
+      formatRecordingSize(1_048_575),
+      formatRecordingSize(1_048_576),
+    ]).toEqual(['1023 B', '1 KB', '1024 KB', '1.0 MB']);
+
+    const page = (nextCursor: string | null): RecordingPage => ({
+      items: nextCursor === null ? [] : [recording()],
+      nextCursor,
+    });
+    const terminal = page(null);
+    const next = page(RECORDING_ID);
+    expect(nextRecordingPageParam(terminal, [terminal])).toBeUndefined();
+    expect(nextRecordingPageParam(next, [next])).toBe(RECORDING_ID);
+    expect(nextRecordingPageParam(next, [page(RECORDING_ID), next])).toBeUndefined();
+    expect(
+      nextRecordingPageParam(next, Array.from({ length: 499 }, () => page(SECOND_ID)).concat(next)),
+    ).toBeUndefined();
+    expect(
+      nextRecordingPageParam(next, Array.from({ length: 498 }, () => page(SECOND_ID)).concat(next)),
+    ).toBe(RECORDING_ID);
+
+    const styles = recordingsThemedStyles({
+      scheme: 'light',
+      colors: lightColors,
+      layout,
+      radii,
+      spacing,
+    });
+    expect(styles).toEqual({
+      list: { flex: 1, backgroundColor: lightColors.background },
+      listContent: {
+        padding: layout.screenPadding,
+        width: '100%',
+        maxWidth: layout.contentMaxWidth,
+        alignSelf: 'center',
+      },
+      center: {
+        flex: 1,
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: spacing.xl,
+        backgroundColor: lightColors.background,
+      },
+      title: {
+        color: lightColors.text,
+        fontSize: 22,
+        fontWeight: '800',
+        textAlign: 'center',
+      },
+      muted: {
+        marginTop: spacing.sm,
+        color: lightColors.muted,
+        fontSize: 15,
+        textAlign: 'center',
+      },
+      action: { marginTop: spacing.lg },
+      intro: { marginBottom: spacing.lg, gap: spacing.sm },
+      introText: { color: lightColors.muted, fontSize: 15, lineHeight: 22 },
+      card: {
+        marginBottom: spacing.md,
+        padding: spacing.lg,
+        borderWidth: 1,
+        borderColor: lightColors.border,
+        borderRadius: radii.card,
+        backgroundColor: lightColors.card,
+      },
+      cardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.md },
+      cardTitleWrap: { flex: 1 },
+      promptWord: { color: lightColors.text, fontSize: 20, fontWeight: '800' },
+      question: {
+        marginTop: spacing.xs,
+        color: lightColors.text,
+        fontSize: 15,
+        lineHeight: 21,
+      },
+      levelBadge: {
+        paddingHorizontal: spacing.sm,
+        paddingVertical: spacing.xs,
+        borderRadius: radii.input,
+        backgroundColor: lightColors.primaryLight,
+      },
+      levelBadgeText: { color: lightColors.primary, fontSize: 13, fontWeight: '800' },
+      metadataRow: {
+        marginTop: spacing.sm,
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        flexWrap: 'wrap',
+        gap: spacing.sm,
+      },
+      metadataText: { color: lightColors.muted, fontSize: 13 },
+      footer: { paddingVertical: spacing.xl, alignItems: 'center' },
+    });
+  });
+
+  it('renders nothing while signed out and recaptures identity-scoped query state', async () => {
+    (mockAuth as { user: User | null }).user = null;
+    const signedOut = await renderRecordings();
+    expect(signedOut.toJSON()).toBeNull();
+    expect(apiGetRecordings).not.toHaveBeenCalled();
+    await signedOut.unmount();
+
+    (mockAuth as { user: User | null }).user = USER;
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const mounted = await renderRecordings(client);
+    await screen.findByText('courage');
+    const firstLease = capturedLease;
+    expect(mockAuth.captureSessionLease).toHaveBeenLastCalledWith();
+
+    const nextUser = { ...USER, id: '550e8400-e29b-41d4-a716-446655440099' };
+    const nextLease = { id: ++leaseSerial } as unknown as SessionLease;
+    capturedLease = nextLease;
+    (mockAuth as { user: User | null }).user = nextUser;
+    mockAuth.sessionVersion += 1;
+    const callsBeforeIdentityChange = mockAuth.captureSessionLease.mock.calls.length;
+    await act(async () => {
+      mounted.rerender(
+        <QueryClientProvider client={client}>
+          <I18nProvider accountLanguage="en">
+            <RecordingsScreen />
+          </I18nProvider>
+        </QueryClientProvider>,
+      );
+    });
+
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    expect(mockAuth.captureSessionLease).toHaveBeenCalledTimes(callsBeforeIdentityChange + 1);
+    expect(firstLease).not.toBe(nextLease);
+    await waitFor(() =>
+      expect(client.getQueryState(['recordings', nextUser.id])?.status).toBe('success'),
+    );
+  });
+
   it('renders a polished loading, empty, and error state with joined manual retries', async () => {
     let resolve!: (value: { items: RecordingItem[]; nextCursor: null }) => void;
     asMock(apiGetRecordings).mockReturnValue(
@@ -115,32 +334,80 @@ describe('recordings library', () => {
     );
     const loading = await renderRecordings();
     expect(screen.getByText(t('recordings.loading'))).toBeTruthy();
+    expect(screen.getByLabelText(t('recordings.loading'))).toBeTruthy();
     resolve({ items: [], nextCursor: null });
     await waitFor(() => expect(screen.getByText(t('recordings.emptyTitle'))).toBeTruthy());
+    expect(screen.getByText(t('recordings.emptyBody'))).toBeTruthy();
     await loading.unmount();
 
-    asMock(apiGetRecordings).mockRejectedValueOnce(new ApiError(0, 'offline'));
+    asMock(apiGetRecordings).mockRejectedValueOnce(new Error('internal detail'));
+    const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     await renderRecordings();
     await waitFor(() => expect(screen.getByText(t('recordings.loadFailedTitle'))).toBeTruthy());
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
     asMock(apiGetRecordings).mockResolvedValueOnce({ items: [], nextCursor: null });
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    expect(refetch).toHaveBeenLastCalledWith({ cancelRefetch: false });
     await waitFor(() => expect(screen.getByText(t('recordings.emptyTitle'))).toBeTruthy());
   });
 
-  it('renders metadata, native context, pending state, and contextual playback', async () => {
+  it('renders every context/status label, mixed pending controls, and exact playback props', async () => {
     asMock(apiGetRecordings).mockResolvedValue({
       items: [
         recording({ context: 'practice-native', status: 'retention_pending', availableAt: null }),
+        recording({
+          id: SECOND_ID,
+          context: 'diagnostic',
+          promptWord: 'placement',
+          status: 'available',
+        }),
+        recording({
+          id: THIRD_ID,
+          context: 'practice',
+          promptWord: 'review',
+          status: 'unavailable',
+          availableAt: null,
+        }),
       ],
       nextCursor: null,
     });
+    const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     await renderRecordings();
     await waitFor(() => expect(screen.getByText('courage')).toBeTruthy());
     expect(screen.getByText(t('recordings.contextNative'))).toBeTruthy();
+    expect(screen.getByText(t('recordings.contextDiagnostic'))).toBeTruthy();
+    expect(screen.getByText(t('recordings.contextPractice'))).toBeTruthy();
     expect(screen.getByText(t('recordings.statusPending'))).toBeTruthy();
-    expect(screen.getByText('0:08 · 2 KB')).toBeTruthy();
+    expect(screen.getByText(t('recordings.statusAvailable'))).toBeTruthy();
+    expect(screen.getByText(t('recordings.statusUnavailable'))).toBeTruthy();
+    expect(screen.getAllByText('0:08 · 2 KB')).toHaveLength(3);
     expect(screen.getByText(`player:${RECORDING_ID}`)).toBeTruthy();
+    expect(screen.getByText(t('recordings.intro'))).toBeTruthy();
+    expect(asMock(RecordingPlayback).mock.calls.map(([props]) => props)).toEqual([
+      {
+        compact: true,
+        ownerId: USER.id,
+        recordingId: RECORDING_ID,
+        recordingLabel: 'courage',
+        recordingStatus: 'retention_pending',
+      },
+      {
+        compact: true,
+        ownerId: USER.id,
+        recordingId: SECOND_ID,
+        recordingLabel: 'placement',
+        recordingStatus: 'available',
+      },
+      {
+        compact: true,
+        ownerId: USER.id,
+        recordingId: THIRD_ID,
+        recordingLabel: 'review',
+        recordingStatus: 'unavailable',
+      },
+    ]);
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.checkPending') }));
+    expect(refetch).toHaveBeenLastCalledWith({ cancelRefetch: false });
     await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
   });
 
@@ -161,9 +428,11 @@ describe('recordings library', () => {
     await waitFor(() => expect(screen.getByText('500 B')).toBeTruthy());
     expect(screen.getByText('2:00 · 2.0 MB')).toBeTruthy();
     expect(screen.getByText(t('recordings.statusUnavailable'))).toBeTruthy();
+    expect(screen.queryByRole('button', { name: t('recordings.checkPending') })).toBeNull();
   });
 
   it('pages older recordings once and rejects cursor cycles', async () => {
+    const fetchNextPage = jest.spyOn(InfiniteQueryObserver.prototype, 'fetchNextPage');
     asMock(apiGetRecordings)
       .mockResolvedValueOnce({ items: [recording()], nextCursor: RECORDING_ID })
       .mockResolvedValueOnce({
@@ -175,9 +444,50 @@ describe('recordings library', () => {
       expect(screen.getByRole('button', { name: t('recordings.loadMore') })).toBeTruthy(),
     );
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
+    expect(fetchNextPage).toHaveBeenLastCalledWith({ cancelRefetch: false });
     await waitFor(() => expect(screen.getByText('travel')).toBeTruthy());
     expect(screen.queryByRole('button', { name: t('recordings.loadMore') })).toBeNull();
     expect(apiGetRecordings).toHaveBeenNthCalledWith(2, RECORDING_ID, expect.any(AbortSignal));
+    const list = asMock(FlatList).mock.calls.at(-1)?.[0];
+    expect(list.keyExtractor(recording())).toBe(RECORDING_ID);
+  });
+
+  it('uses onEndReached once, coalesces a pending page, and does nothing without a next page', async () => {
+    const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
+    let resolveOlder!: (value: { items: RecordingItem[]; nextCursor: null }) => void;
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: RECORDING_ID })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveOlder = resolve;
+        }),
+      );
+    const first = await renderRecordings();
+    await screen.findByText('courage');
+    const list = asMock(FlatList).mock.calls.at(-1)?.[0];
+    await act(async () => list.onEndReached());
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(t('recordings.loadingMore'))).toBeTruthy());
+    await act(async () => list.onEndReached());
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
+    expect(refetch).not.toHaveBeenCalled();
+    await act(async () => {
+      resolveOlder({
+        items: [recording({ id: SECOND_ID, promptWord: 'travel' })],
+        nextCursor: null,
+      });
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('travel')).toBeTruthy();
+    await first.unmount();
+
+    asMock(apiGetRecordings)
+      .mockReset()
+      .mockResolvedValue({ items: [recording()], nextCursor: null });
+    await renderRecordings();
+    await screen.findByText('courage');
+    await act(async () => asMock(FlatList).mock.calls.at(-1)?.[0].onEndReached());
+    expect(apiGetRecordings).toHaveBeenCalledTimes(1);
   });
 
   it('does not page after its captured session lease expires', async () => {
@@ -194,7 +504,7 @@ describe('recordings library', () => {
   it('keeps loaded recordings visible and requires an explicit retry after an older page fails', async () => {
     asMock(apiGetRecordings)
       .mockResolvedValueOnce({ items: [recording()], nextCursor: RECORDING_ID })
-      .mockRejectedValueOnce(new ApiError(503, 'busy'))
+      .mockRejectedValueOnce(new Error('internal page failure'))
       .mockResolvedValueOnce({
         items: [recording({ id: SECOND_ID, promptWord: 'travel' })],
         nextCursor: null,
@@ -205,7 +515,10 @@ describe('recordings library', () => {
     );
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
     expect(screen.getByText('courage')).toBeTruthy();
+    await act(async () => asMock(FlatList).mock.calls.at(-1)?.[0].onEndReached());
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
     await waitFor(() => expect(screen.getByText('travel')).toBeTruthy());
   });
@@ -226,9 +539,11 @@ describe('recordings library', () => {
     });
     asMock(apiGetRecordings).mockReturnValueOnce(refresh).mockReturnValueOnce(older);
     const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
+    const fetchNextPage = jest.spyOn(InfiniteQueryObserver.prototype, 'fetchNextPage');
     await renderRecordings(client);
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
     expect(refetch).toHaveBeenCalledTimes(1);
+    expect(refetch).toHaveBeenLastCalledWith({ cancelRefetch: false });
     await act(async () => {
       resolveRefresh({ items: [recording()], nextCursor: RECORDING_ID });
       await new Promise((resolve) => setTimeout(resolve, 0));
@@ -240,6 +555,159 @@ describe('recordings library', () => {
       });
       await Promise.resolve();
     });
+    expect(fetchNextPage).toHaveBeenLastCalledWith({ cancelRefetch: false });
     expect(await screen.findByText('travel')).toBeTruthy();
+  });
+
+  it('drops an errored queued refresh and releases its token for the next refresh', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['recordings', USER.id], {
+      pages: [{ items: [recording()], nextCursor: RECORDING_ID }],
+      pageParams: [undefined],
+    });
+    let rejectFirst!: (error: Error) => void;
+    const firstRefresh = new Promise<never>((_resolve, reject) => {
+      rejectFirst = reject;
+    });
+    let resolveSecond!: (value: { items: RecordingItem[]; nextCursor: string }) => void;
+    const secondRefresh = new Promise<{ items: RecordingItem[]; nextCursor: string }>((resolve) => {
+      resolveSecond = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockReturnValueOnce(firstRefresh)
+      .mockReturnValueOnce(secondRefresh)
+      .mockResolvedValueOnce({
+        items: [recording({ id: SECOND_ID, promptWord: 'travel' })],
+        nextCursor: null,
+      });
+    await renderRecordings(client);
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
+    await act(async () => {
+      rejectFirst(new Error('refresh failed'));
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(client.getQueryState(['recordings', USER.id])?.fetchStatus).toBe('idle'),
+    );
+    expect(apiGetRecordings).toHaveBeenCalledTimes(1);
+
+    const secondRun = client.refetchQueries({ queryKey: ['recordings', USER.id], exact: true });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
+    await act(async () => {
+      resolveSecond({ items: [recording()], nextCursor: RECORDING_ID });
+      await secondRun;
+    });
+    expect(await screen.findByText('travel')).toBeTruthy();
+    expect(apiGetRecordings).toHaveBeenCalledTimes(3);
+  });
+
+  it.each(['lease expiry', 'unmount'] as const)(
+    'drops a queued page when its refresh finishes after %s',
+    async (ending) => {
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      client.setQueryData(['recordings', USER.id], {
+        pages: [{ items: [recording()], nextCursor: RECORDING_ID }],
+        pageParams: [undefined],
+      });
+      let resolveRefresh!: (value: { items: RecordingItem[]; nextCursor: string }) => void;
+      const refresh = new Promise<{ items: RecordingItem[]; nextCursor: string }>((resolve) => {
+        resolveRefresh = resolve;
+      });
+      asMock(apiGetRecordings)
+        .mockReturnValueOnce(refresh)
+        .mockResolvedValueOnce({
+          items: [recording({ id: SECOND_ID, promptWord: 'must-not-load' })],
+          nextCursor: null,
+        });
+      const view = await renderRecordings(client);
+      const retainedLoadMore = screen.getByRole('button', { name: t('recordings.loadMore') });
+      const retainedPress = (
+        asMock(FlatList).mock.calls.at(-1)?.[0].ListFooterComponent as React.ReactElement<{
+          onPress: () => void;
+        }>
+      ).props.onPress;
+      await fireEvent.press(retainedLoadMore);
+      if (ending === 'lease expiry') {
+        leaseCurrent = false;
+      } else {
+        await view.unmount();
+        await act(async () => retainedPress());
+      }
+      await act(async () => {
+        resolveRefresh({ items: [recording()], nextCursor: RECORDING_ID });
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(apiGetRecordings).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('keeps a new account queue when the old account refresh finalizer settles', async () => {
+    const nextUser = { ...USER, id: '550e8400-e29b-41d4-a716-446655440099' };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['recordings', USER.id], {
+      pages: [{ items: [recording()], nextCursor: RECORDING_ID }],
+      pageParams: [undefined],
+    });
+    client.setQueryData(['recordings', nextUser.id], {
+      pages: [
+        {
+          items: [recording({ id: THIRD_ID, promptWord: 'new-owner' })],
+          nextCursor: SECOND_ID,
+        },
+      ],
+      pageParams: [undefined],
+    });
+    let resolveOld!: (value: { items: RecordingItem[]; nextCursor: string }) => void;
+    const oldRefresh = new Promise<{ items: RecordingItem[]; nextCursor: string }>((resolve) => {
+      resolveOld = resolve;
+    });
+    let resolveNew!: (value: { items: RecordingItem[]; nextCursor: string }) => void;
+    const newRefresh = new Promise<{ items: RecordingItem[]; nextCursor: string }>((resolve) => {
+      resolveNew = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockReturnValueOnce(oldRefresh)
+      .mockReturnValueOnce(newRefresh)
+      .mockResolvedValueOnce({
+        items: [recording({ id: SECOND_ID, promptWord: 'travel' })],
+        nextCursor: null,
+      });
+    const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
+    const view = await renderRecordings(client);
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
+    expect(refetch).toHaveBeenCalledTimes(1);
+
+    capturedLease = { id: ++leaseSerial } as unknown as SessionLease;
+    (mockAuth as { user: User | null }).user = nextUser;
+    mockAuth.sessionVersion += 1;
+    await view.rerender(
+      <QueryClientProvider client={client}>
+        <I18nProvider accountLanguage="en">
+          <RecordingsScreen />
+        </I18nProvider>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    const newLoadMore = screen.getByRole('button', { name: t('recordings.loadMore') });
+    await fireEvent.press(newLoadMore);
+    expect(refetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveOld({ items: [recording()], nextCursor: RECORDING_ID });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await fireEvent.press(newLoadMore);
+    expect(refetch).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      resolveNew({
+        items: [recording({ id: THIRD_ID, promptWord: 'new-owner' })],
+        nextCursor: SECOND_ID,
+      });
+      await Promise.resolve();
+    });
+    expect(await screen.findByText('travel')).toBeTruthy();
+    expect(apiGetRecordings).toHaveBeenNthCalledWith(3, SECOND_ID, expect.any(AbortSignal));
   });
 });

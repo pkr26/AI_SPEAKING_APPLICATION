@@ -6,7 +6,6 @@ import { AssessOptions } from './assess';
 import { measureAudioDuration } from './audio-inspection';
 import {
   discardSubmittedPresignedAudio,
-  finalizeSubmittedPresignedAudio,
   isOwnedAudioKey,
   ownSubmittedPresignedAudio,
   preserveSubmittedPresignedAudio,
@@ -246,7 +245,10 @@ export async function runAssessmentSubmission<Claim, Result>(
             s3VersionId: audioFile.retainedSource.s3VersionId,
             contentType: audioFile.retainedSource.contentType,
             sizeBytes: audioFile.retainedSource.sizeBytes,
-            ...(durationMs === undefined ? {} : { durationMs }),
+            // Downstream persistence deliberately normalizes undefined to SQL
+            // NULL. Keeping the stable capture shape avoids a semantically
+            // redundant presence/absence branch in mock mode.
+            durationMs,
             ...(audioFile.retainedSource.etag ? { etag: audioFile.retainedSource.etag } : {}),
           }
         : undefined;
@@ -259,11 +261,10 @@ export async function runAssessmentSubmission<Claim, Result>(
         void tryRetainRecording(recording.id);
       }
       completed = true;
-      try {
-        return res.json(response);
-      } finally {
-        await finalizeSubmittedPresignedAudio(res);
-      }
+      // The response middleware owns finish/close finalization. At this point
+      // every successful retained recording is already marked preserve=true,
+      // so an additional synchronous finalizer would only repeat that no-op.
+      return res.json(response);
     } finally {
       if (claim) await hooks.clearClaim(user, question, claim);
       if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);

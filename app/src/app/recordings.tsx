@@ -6,13 +6,17 @@ import Button from '../components/Button';
 import RecordingPlayback from '../components/RecordingPlayback';
 import { apiGetRecordings, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
-import { useI18n, type UiLanguage } from '../lib/i18n';
+import { useI18n, type MessageKey, type UiLanguage } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
-import type { RecordingItem } from '../lib/types';
+import type { RecordingItem, RecordingPage } from '../lib/types';
 
 const RECORDING_MAX_PAGES = 500;
 
-const DATE_LOCALES: Record<UiLanguage, string> = {
+interface RecordingFetchMeta {
+  fetchMore: { direction: 'forward' | 'backward' };
+}
+
+export const RECORDING_DATE_LOCALES: Record<UiLanguage, string> = {
   en: 'en-US',
   te: 'te-IN',
   hi: 'hi-IN',
@@ -20,17 +24,32 @@ const DATE_LOCALES: Record<UiLanguage, string> = {
   zh: 'zh-Hans',
 };
 
-function formatDuration(durationMs: number | null): string | null {
+export function formatRecordingDuration(durationMs: number | null): string | null {
   if (durationMs === null) return null;
   const seconds = Math.max(1, Math.round(durationMs / 1_000));
   const minutes = Math.floor(seconds / 60);
   return `${minutes}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
-function formatSize(sizeBytes: number): string {
+export function formatRecordingSize(sizeBytes: number): string {
   if (sizeBytes < 1_024) return `${sizeBytes} B`;
   if (sizeBytes < 1024 * 1_024) return `${Math.max(1, Math.round(sizeBytes / 1_024))} KB`;
   return `${(sizeBytes / (1024 * 1_024)).toFixed(1)} MB`;
+}
+
+export function nextRecordingPageParam(
+  lastPage: RecordingPage,
+  allPages: RecordingPage[],
+): string | undefined {
+  const next = lastPage.nextCursor;
+  if (next === null || allPages.length >= RECORDING_MAX_PAGES) return undefined;
+  return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
+}
+
+export function recordingContextMessageKey(context: RecordingItem['context']): MessageKey {
+  if (context === 'diagnostic') return 'recordings.contextDiagnostic';
+  if (context === 'practice-native') return 'recordings.contextNative';
+  return 'recordings.contextPractice';
 }
 
 function RecordingCard({
@@ -44,19 +63,14 @@ function RecordingCard({
 }) {
   const { t } = useI18n();
   const styles = themedStyles(useTheme());
-  const contextLabel =
-    item.context === 'diagnostic'
-      ? t('recordings.contextDiagnostic')
-      : item.context === 'practice-native'
-        ? t('recordings.contextNative')
-        : t('recordings.contextPractice');
+  const contextLabel = t(recordingContextMessageKey(item.context));
   const statusLabel =
     item.status === 'available'
       ? t('recordings.statusAvailable')
       : item.status === 'retention_pending'
         ? t('recordings.statusPending')
         : t('recordings.statusUnavailable');
-  const duration = formatDuration(item.durationMs);
+  const duration = formatRecordingDuration(item.durationMs);
   return (
     <View style={styles.card}>
       <View style={styles.cardHeader}>
@@ -77,7 +91,7 @@ function RecordingCard({
       <View style={styles.metadataRow}>
         <Text style={styles.metadataText}>{statusLabel}</Text>
         <Text style={styles.metadataText}>
-          {[duration, formatSize(item.sizeBytes)].filter(Boolean).join(' · ')}
+          {[duration, formatRecordingSize(item.sizeBytes)].filter(Boolean).join(' · ')}
         </Text>
       </View>
       <RecordingPlayback
@@ -97,8 +111,10 @@ export default function RecordingsScreen() {
   const theme = useTheme();
   const styles = themedStyles(theme);
   const queryClient = useQueryClient();
-  const mountedRef = useRef(false);
-  const queuedOlderRef = useRef<symbol | null>(null);
+  // Null distinguishes the pre-effect render from both mounted states and
+  // avoids lying during React's Strict Effects setup/cleanup/setup probe.
+  const mountedRef = useRef<boolean | null>(null);
+  const queuedOlderRef = useRef(false);
   const userId = user?.id ?? null;
   const queryKey = useMemo(() => ['recordings', userId] as const, [userId]);
   const sessionLease = useMemo(() => {
@@ -109,25 +125,17 @@ export default function RecordingsScreen() {
 
   useEffect(() => {
     mountedRef.current = true;
+    queuedOlderRef.current = false;
     return () => {
       mountedRef.current = false;
-      queuedOlderRef.current = null;
     };
   }, []);
-
-  useEffect(() => {
-    queuedOlderRef.current = null;
-  }, [queryKey]);
 
   const recordingsQuery = useInfiniteQuery({
     queryKey,
     queryFn: async ({ pageParam, signal }) => apiGetRecordings(pageParam, signal),
     initialPageParam: undefined as string | undefined,
-    getNextPageParam: (lastPage, allPages) => {
-      const next = lastPage.nextCursor ?? undefined;
-      if (!next || allPages.length >= RECORDING_MAX_PAGES) return undefined;
-      return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
-    },
+    getNextPageParam: nextRecordingPageParam,
     enabled: !!user,
     retry: false,
   });
@@ -139,7 +147,10 @@ export default function RecordingsScreen() {
 
   if (!user) return null;
 
-  if (items.length === 0 && recordingsQuery.isPending) {
+  // TanStack's pending state has no successful page data, so `items` is
+  // necessarily empty here. Avoid carrying that library invariant as a
+  // redundant branch.
+  if (recordingsQuery.isPending) {
     return (
       <View style={styles.center}>
         <ActivityIndicator
@@ -186,28 +197,34 @@ export default function RecordingsScreen() {
   const loadOlder = () => {
     if (!recordingsQuery.hasNextPage || !mountedRef.current || !isSessionLeaseCurrent(sessionLease))
       return;
-    const queryState = queryClient.getQueryState(queryKey);
-    if (recordingsQuery.isFetchingNextPage) return;
-    if (queryState?.fetchStatus === 'fetching') {
+    // useInfiniteQuery has already created the observer state for this exact
+    // key before a rendered list can expose loadOlder.
+    const queryState = queryClient.getQueryState(queryKey)!;
+    const fetchDirection = (queryState.fetchMeta as RecordingFetchMeta | null)?.fetchMore.direction;
+    // fetchMeta changes synchronously when fetchNextPage starts, closing the
+    // same-render gap before isFetchingNextPage publishes its next result.
+    if (
+      recordingsQuery.isFetchingNextPage ||
+      (queryState.fetchStatus === 'fetching' && fetchDirection === 'forward')
+    ) {
+      return;
+    }
+    if (queryState.fetchStatus === 'fetching') {
       if (queuedOlderRef.current) return;
-      const token = Symbol('queued-recordings-page');
-      queuedOlderRef.current = token;
+      queuedOlderRef.current = true;
       void recordingsQuery
         .refetch({ cancelRefetch: false })
         .then((result) => {
-          if (
-            result.isError ||
-            queuedOlderRef.current !== token ||
-            !mountedRef.current ||
-            !isSessionLeaseCurrent(sessionLease)
-          ) {
+          if (result.isError || !mountedRef.current || !isSessionLeaseCurrent(sessionLease)) {
             return;
           }
           return recordingsQuery.fetchNextPage({ cancelRefetch: false });
         })
         .catch(() => undefined)
         .finally(() => {
-          if (queuedOlderRef.current === token) queuedOlderRef.current = null;
+          // TanStack resolves/cancels the joined observer promise before a
+          // query-key replacement can expose another account's load handler.
+          queuedOlderRef.current = false;
         });
       return;
     }
@@ -222,7 +239,7 @@ export default function RecordingsScreen() {
       data={items}
       keyExtractor={(item) => item.id}
       renderItem={({ item }) => (
-        <RecordingCard item={item} ownerId={user.id} locale={DATE_LOCALES[language]} />
+        <RecordingCard item={item} ownerId={user.id} locale={RECORDING_DATE_LOCALES[language]} />
       )}
       onEndReachedThreshold={0.4}
       onEndReached={() => {
@@ -270,7 +287,7 @@ export default function RecordingsScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   list: {
     flex: 1,
     backgroundColor: colors.background,
@@ -366,3 +383,5 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignItems: 'center',
   },
 }));
+
+const themedStyles = recordingsThemedStyles;

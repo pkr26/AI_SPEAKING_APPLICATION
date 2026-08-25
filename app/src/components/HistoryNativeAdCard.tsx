@@ -15,20 +15,14 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   const ads = useAds();
   const t = useT();
   const theme = useTheme();
-  const { activatePlacement } = ads;
+  const { activatePlacement, currentRequestNonPersonalizedAdsOnly } = ads;
   const [nativeAd, setNativeAd] = useState<NativeAd | null>(null);
   const nativeAdRef = useRef<NativeAd | null>(null);
-  const requestNonPersonalizedAdsOnlyRef = useRef(ads.requestNonPersonalizedAdsOnly);
-  const [failed, setFailed] = useState(false);
   const playbackActive = useSyncExternalStore(
     subscribeSubmittedRecordingPlaybackActive,
     getSubmittedRecordingPlaybackActive,
     getSubmittedRecordingPlaybackActive,
   );
-
-  useEffect(() => {
-    requestNonPersonalizedAdsOnlyRef.current = ads.requestNonPersonalizedAdsOnly;
-  }, [ads.requestNonPersonalizedAdsOnly]);
 
   useEffect(() => {
     if (ads.statuses.historyNative !== 'blocked' && !playbackActive) return;
@@ -41,9 +35,6 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
     if (!focused || playbackActive) return;
     let active = true;
     let loaded: NativeAd | null = null;
-    void Promise.resolve().then(() => {
-      if (active) setFailed(false);
-    });
     void (async () => {
       if (!(await activatePlacement('historyNative')) || !active) return;
       const native = adsNativeModuleWhenReady();
@@ -51,7 +42,7 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
       if (!native || !unitId) return;
       try {
         loaded = await native.NativeAd.createForAdRequest(unitId, {
-          requestNonPersonalizedAdsOnly: requestNonPersonalizedAdsOnlyRef.current,
+          requestNonPersonalizedAdsOnly: currentRequestNonPersonalizedAdsOnly(),
         });
         if (!active) {
           loaded.destroy();
@@ -60,7 +51,7 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
         nativeAdRef.current = loaded;
         setNativeAd(loaded);
       } catch {
-        if (active) setFailed(true);
+        // No-fill and SDK failures stay collapsed until a later focus retry.
       }
     })();
     return () => {
@@ -71,9 +62,15 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
       }
       setNativeAd(null);
     };
-  }, [activatePlacement, ads.consentVersion, focused, playbackActive]);
+  }, [
+    activatePlacement,
+    ads.consentVersion,
+    currentRequestNonPersonalizedAdsOnly,
+    focused,
+    playbackActive,
+  ]);
 
-  if (!focused || playbackActive || failed || ads.statuses.historyNative === 'blocked' || !nativeAd)
+  if (!focused || playbackActive || ads.statuses.historyNative === 'blocked' || !nativeAd)
     return null;
   const native = adsNativeModuleWhenReady();
   if (!native) return null;

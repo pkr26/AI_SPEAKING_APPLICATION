@@ -41,6 +41,9 @@ export function publicClientConfig(policy: AdsPolicyConfig): PublicClientConfig 
 
 export function createClientConfigRouter(policy: AdsPolicyConfig): Router {
   const router = Router();
+  // Stryker disable next-line StringLiteral: Express intentionally aliases an
+  // empty router path and '/' to the same mounted route; supertest pins the
+  // externally observable /client-config contract.
   router.get('/', (_req, res) => {
     res.set('Cache-Control', 'no-store');
     res.json(publicClientConfig(policy));

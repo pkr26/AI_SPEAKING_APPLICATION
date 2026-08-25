@@ -2061,6 +2061,395 @@ if (recorderReviewedMutantIds.size !== 186) {
   );
 }
 
+// Exact survivors from the completed consent-safe ads campaign. Every
+// behaviorally distinct mutant in this lane is killed; these entries retain
+// only framework or invariant-level equivalences.
+const adsEquivalentMutants = Object.freeze([
+  {
+    file: 'src/components/HistoryNativeAdCard.tsx',
+    mutator: 'StringLiteral',
+    original: "const unitId = adUnitIdFor('historyNative');",
+    replacements: ['""'],
+    reason:
+      "adUnitIdFor is a closed binary selector: only 'homeBanner' selects the Home key, so every other value selects the same History key.",
+    locations: exactLocations(41, 34, 41, 49),
+  },
+  {
+    file: 'src/components/HistoryNativeAdCard.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'if (!native || !unitId) return;',
+    replacements: ['false'],
+    reason:
+      'A true history activation has just required the same cached native module and validated unit ID; neither can disappear in production before these synchronous reads.',
+    locations: exactLocations(42, 11, 42, 29),
+  },
+  {
+    file: 'src/components/HistoryNativeAdCard.tsx',
+    mutator: 'LogicalOperator',
+    original: 'if (!native || !unitId) return;',
+    replacements: ['!native && !unitId'],
+    reason:
+      'Both operands are false after a successful provider activation, so OR and AND produce the same result.',
+    locations: exactLocations(42, 11, 42, 29),
+  },
+  {
+    file: 'src/components/HistoryNativeAdCard.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'if (!native) return null;',
+    replacements: ['false'],
+    reason:
+      'nativeAd is assigned only after reading a non-null cached native module; production has no cache-reset operation between that assignment and render.',
+    locations: exactLocations(76, 7, 76, 14),
+  },
+  {
+    file: 'src/components/HomeBannerAd.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'if (active) setValidatedForFocus(ready);',
+    replacements: ['true'],
+    reason:
+      'While mounted the latch is true; after cleanup the continuation can only target a detached component instance, whose state update React 19 discards without a visible effect.',
+    locations: exactLocations(24, 11, 24, 17),
+  },
+  {
+    file: 'src/components/HomeBannerAd.tsx',
+    mutator: 'BlockStatement',
+    original: 'return () => {\n      active = false;\n    };',
+    replacements: ['{}'],
+    reason:
+      'Removing this cleanup only permits the same post-unmount update to a detached component; it cannot validate the newly mounted focus-cycle instance.',
+    locations: exactLocations(26, 18, 28, 6),
+  },
+  {
+    file: 'src/components/HomeBannerAd.tsx',
+    mutator: 'BooleanLiteral',
+    original: 'active = false;',
+    replacements: ['true'],
+    reason:
+      'Leaving the detached instance latch true has the same unobservable post-unmount state-update behavior as removing its cleanup block.',
+    locations: exactLocations(27, 16, 27, 21),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ObjectLiteral',
+    original: '}>({ promise: null });',
+    replacements: ['{}'],
+    reason:
+      'The policy promise slot is only truthiness-tested before its first assignment, making an initial undefined value indistinguishable from null.',
+    locations: exactLocations(124, 6, 124, 23),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['[],', '}, []);'],
+    replacements: ['["Stryker was here"]'],
+    count: 3,
+    reason:
+      'Each dependency array receives one constant primitive instead of an empty array; the value compares equal on every render, preserving callback identity and lifetime.',
+    locations: exactLocations(135, 5, 135, 7, 148, 6, 148, 8, 168, 6, 168, 8),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ArrowFunction',
+    originals: [
+      '.catch(() => null)',
+      'const gdprApplies = await ads.AdsConsent.getGdprApplies().catch(() => null);',
+      'const choices = await ads.AdsConsent.getUserChoices().catch(() => null);',
+      'consent = await ads.AdsConsent.getConsentInfo().catch(() => null);',
+    ],
+    replacements: ['() => undefined'],
+    count: 4,
+    reason:
+      'These failure fallbacks are consumed only through falsiness, optional access, or a later nullish check; null and undefined take the same fail-closed path.',
+    locations: exactLocations(
+      143,
+      14,
+      143,
+      24,
+      151,
+      69,
+      151,
+      79,
+      156,
+      67,
+      156,
+      77,
+      181,
+      67,
+      181,
+      77,
+    ),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!ads) return false;', 'if (!consent) return false;'],
+    replacements: ['false'],
+    count: 3,
+    reason:
+      'Removing any of these null guards only moves the null dereference into its enclosing try/catch, which returns the same false result before a publishable side effect.',
+    locations: exactLocations(175, 13, 175, 17, 184, 15, 184, 23, 243, 9, 243, 13),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'BooleanLiteral',
+    original: 'if (expectedConsentEpoch !== consentEpochRef.current) return false;',
+    replacements: ['true'],
+    count: 2,
+    reason:
+      'These returns occur only after privacy invalidation changed both the consent epoch and placement token; every activation consumer rejects itself regardless of the stale promise value.',
+    locations: exactLocations(183, 72, 183, 77, 191, 72, 191, 77),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'if (!ready && initializationPromiseRef.current === initialization) {',
+    replacements: ['true'],
+    reason:
+      'No newer initialization can be installed before the old promise settles: a privacy transition clears the slot and waits for that old promise before permitting new initialization.',
+    locations: exactLocations(200, 23, 200, 74),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['[updateConsentRequestMode],', '[initializeSdk, loadPolicy],'],
+    replacements: ['[]'],
+    count: 2,
+    reason:
+      'All removed dependencies are useCallback values with permanent identities, so the dependent callback is recreated on exactly the same renders.',
+    locations: exactLocations(206, 5, 206, 31, 237, 5, 237, 32),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ArithmeticOperator',
+    original: 'const activationToken = activationTokensRef.current[placement] + 1;',
+    replacements: ['activationTokensRef.current[placement] - 1'],
+    reason:
+      'Activation tokens are compared only for exact identity; changing direction still creates one distinct token and the consent epoch independently fences privacy transitions.',
+    locations: exactLocations(211, 31, 211, 73),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ConditionalExpression',
+    original: 'consentEpochRef.current === consentEpoch;',
+    replacements: ['true'],
+    reason:
+      'Every consent-epoch change synchronously advances both placement tokens, so the sibling token equality already makes the activation stale.',
+    locations: exactLocations(216, 9, 216, 49),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'ArrowFunction',
+    original: 'const transitionAllowsAds = await privacyTransition.catch(() => false);',
+    replacements: ['() => undefined'],
+    reason:
+      'A rejected privacy transition treats this fallback only as a falsy allow/deny value; false and undefined both block activation.',
+    locations: exactLocations(222, 67, 222, 78),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'AssignmentOperator',
+    original: 'consentEpochRef.current += 1;',
+    replacements: ['consentEpochRef.current -= 1'],
+    reason:
+      'The consent epoch is an equality-only generation token; either operation changes its identity.',
+    locations: exactLocations(251, 7, 251, 35),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'AssignmentOperator',
+    original: 'activationTokensRef.current.homeBanner += 1;',
+    replacements: ['activationTokensRef.current.homeBanner -= 1'],
+    reason:
+      'The Home activation token is equality-only; either direction invalidates every captured token.',
+    locations: exactLocations(252, 7, 252, 50),
+  },
+  {
+    file: 'src/lib/ads.tsx',
+    mutator: 'AssignmentOperator',
+    original: 'activationTokensRef.current.historyNative += 1;',
+    replacements: ['activationTokensRef.current.historyNative -= 1'],
+    reason:
+      'The History activation token is equality-only; either direction invalidates every captured token.',
+    locations: exactLocations(253, 7, 253, 53),
+  },
+]);
+
+// Exact survivors from the completed retained-recordings campaign. Every
+// reachable race, state, cache, accessibility, and presentation mutant is
+// killed; these are only React lifecycle or correlated-token equivalences.
+const recordingsEquivalentMutants = Object.freeze([
+  {
+    file: 'src/app/recordings.tsx',
+    reviewedMutantId: '77',
+    mutator: 'BooleanLiteral',
+    original: 'const queuedOlderRef = useRef(false);',
+    replacements: ['true'],
+    reason:
+      'The mount effect overwrites this seed with false before a rendered list can expose any paging handler, including after the Strict Effects setup/cleanup/setup probe.',
+    locations: exactLocations(117, 33, 117, 38),
+  },
+  {
+    file: 'src/app/recordings.tsx',
+    reviewedMutantId: '89',
+    mutator: 'ArrayDeclaration',
+    original: '}, []);',
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'Both dependency literals contain values that stay Object.is-equal for the component lifetime, so the mount cleanup cadence is identical.',
+    locations: exactLocations(132, 6, 132, 8),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '288',
+    mutator: 'StringLiteral',
+    original: "const [phase, setPhase] = useState<PlaybackPhase>('idle');",
+    replacements: ['""'],
+    reason:
+      "The identity layout effect synchronously sets phase to 'idle' before paint on the initial mount; before that effect, both values render the same default Play controls and no handler is callable.",
+    locations: exactLocations(134, 53, 134, 59),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '322',
+    mutator: 'ArrayDeclaration',
+    original: '}, []);',
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'cancelDelete receives a constant dependency in either form, so its callback identity never changes.',
+    locations: exactLocations(178, 6, 178, 8),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '326',
+    mutator: 'OptionalChaining',
+    original: 'playerListenerRef.current?.remove();',
+    replacements: ['playerListenerRef.current.remove'],
+    reason:
+      'When the listener is null the direct dereference throws inside the surrounding best-effort catch; both forms then clear the ref and continue through identical player cleanup.',
+    locations: exactLocations(186, 7, 186, 40),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '328',
+    mutator: 'OptionalChaining',
+    original: 'player?.pause();',
+    replacements: ['player.pause'],
+    reason:
+      'When player is null the direct dereference is swallowed by the same best-effort catch; all following release state is identical.',
+    locations: exactLocations(194, 7, 194, 20),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '330',
+    mutator: 'OptionalChaining',
+    original: 'player?.remove();',
+    replacements: ['player.remove'],
+    reason:
+      'When player is null the direct dereference is swallowed by the same best-effort catch; owner release and ref cleanup are unchanged.',
+    locations: exactLocations(199, 7, 199, 21),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '332',
+    mutator: 'ArrayDeclaration',
+    original: '}, []);',
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'releasePlayer receives a constant dependency in either form, so its callback identity never changes.',
+    locations: exactLocations(205, 6, 205, 8),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '335',
+    mutator: 'ConditionalExpression',
+    original: 'if (mountedRef.current !== true) return;',
+    replacements: ['false'],
+    reason:
+      'The only added reset calls target an already detached component after layout cleanup; React discards those state setters, while every mounted call already passes the guard.',
+    locations: exactLocations(208, 9, 208, 36),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '339',
+    mutator: 'ArrayDeclaration',
+    original: '}, []);',
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'resetPlaybackUi receives a constant dependency in either form, so its callback identity never changes.',
+    locations: exactLocations(212, 6, 212, 8),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '341',
+    mutator: 'ArrayDeclaration',
+    original: '}, [releasePlayer, resetPlaybackUi]);',
+    replacements: ['[]'],
+    reason:
+      'Both dependencies are empty-dependency callbacks with permanently stable identities, so omitting them cannot change stopPlayback.',
+    locations: exactLocations(217, 6, 217, 38),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '346',
+    mutator: 'ArrayDeclaration',
+    original: '}, [cancelDelete, releasePlayer]);',
+    replacements: ['[]'],
+    reason:
+      'Both layout-cleanup dependencies are empty-dependency callbacks with permanently stable identities, so effect cadence is unchanged.',
+    locations: exactLocations(226, 6, 226, 35),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '354',
+    mutator: 'ArrayDeclaration',
+    original: '}, [cancelDelete, stopPlayback]),',
+    replacements: ['[]'],
+    reason:
+      'Both focus-effect dependencies have permanently stable identities, so removing them does not alter focus setup or cleanup.',
+    locations: exactLocations(250, 8, 250, 36),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '363',
+    mutator: 'ArrayDeclaration',
+    original: '}, [cancelDelete, stopPlayback]);',
+    replacements: ['[]'],
+    reason:
+      'Both AppState-effect dependencies have permanently stable identities, so removing them does not alter subscription lifetime.',
+    locations: exactLocations(261, 6, 261, 34),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '417',
+    mutator: 'ConditionalExpression',
+    original: 'committedIdentityRef.current === identityToken &&',
+    replacements: ['true'],
+    reason:
+      'After the entry identity fence creates an operation, every identity change synchronously replaces both its operation token and lifecycle symbol; either unchanged guard rejects the same continuations.',
+    locations: exactLocations(312, 7, 312, 53),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '505',
+    mutator: 'ConditionalExpression',
+    original: 'committedIdentityRef.current !== expectedIdentity ||',
+    replacements: ['false'],
+    reason:
+      'The destructive callback carries the lifecycle captured with this identity token, and every identity commit replaces that lifecycle synchronously; the adjacent context guard rejects exactly the same stale callback.',
+    locations: exactLocations(390, 9, 390, 58),
+  },
+  {
+    file: 'src/components/RecordingPlayback.tsx',
+    reviewedMutantId: '517',
+    mutator: 'ConditionalExpression',
+    original: 'committedIdentityRef.current === expectedIdentity && contextIsCurrent(lifecycle);',
+    replacements: ['true'],
+    reason:
+      'The delete operation retains the lifecycle captured with expectedIdentity; an identity change replaces that lifecycle, so contextIsCurrent becomes false on every path where this equality becomes false.',
+    locations: exactLocations(405, 9, 405, 58),
+  },
+]);
+
 export const equivalentMutants = Object.freeze(
   [
     {
@@ -3808,6 +4197,8 @@ export const equivalentMutants = Object.freeze(
         'currentQuestionKey is a complete leaf key and no longer practice-question descendant exists, so exact and prefix cancellation match the same query.',
     },
     ...recorderEquivalentMutants,
+    ...adsEquivalentMutants,
+    ...recordingsEquivalentMutants,
   ].map((entry, index) => {
     const locations = entry.locations ?? equivalentMutantLocations[index];
     const expected = entry.count ?? 1;
@@ -3829,12 +4220,15 @@ export const equivalentMutants = Object.freeze(
 );
 
 if (
-  equivalentMutantLocations.length + recorderEquivalentMutants.length !==
+  equivalentMutantLocations.length +
+    recorderEquivalentMutants.length +
+    adsEquivalentMutants.length +
+    recordingsEquivalentMutants.length !==
   equivalentMutants.length
 ) {
   throw new Error(
     `Equivalent mutant location sources account for ` +
-      `${equivalentMutantLocations.length + recorderEquivalentMutants.length} entries for ` +
+      `${equivalentMutantLocations.length + recorderEquivalentMutants.length + adsEquivalentMutants.length + recordingsEquivalentMutants.length} entries for ` +
       `${equivalentMutants.length} registry entries`,
   );
 }

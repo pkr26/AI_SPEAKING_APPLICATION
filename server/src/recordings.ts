@@ -72,11 +72,10 @@ function toExportRecording(row: RecordingRow) {
 }
 
 async function mapBounded<T>(items: T[], concurrency: number, work: (item: T) => Promise<void>): Promise<void> {
-  let cursor = 0;
+  const queue = items.values();
   await Promise.all(
     Array.from({ length: Math.min(concurrency, items.length) }, async () => {
-      while (cursor < items.length) {
-        const item = items[cursor++];
+      for (const item of queue) {
         await work(item);
       }
     }),
@@ -254,7 +253,7 @@ export function createRecordingsRouter(limiters: Limiters) {
   router.use(requireAuth);
 
   router.get(
-    '/',
+    new RegExp('^/$'),
     validate({ query: listSchema }),
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, listSchema);

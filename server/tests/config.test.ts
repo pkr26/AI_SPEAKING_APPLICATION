@@ -219,6 +219,12 @@ describe('config env validation', () => {
       uploadUrlTtlSeconds: 300,
       operationTimeoutMs: 30_000,
     });
+    expect(config.recordings).toEqual({
+      playbackUrlTtlSeconds: 60,
+      maintenanceIntervalMs: 60_000,
+      maintenanceBatchSize: 50,
+      maintenanceConcurrency: 4,
+    });
   });
 
   it('uses the documented development and real-provider defaults when their variables are absent', async () => {
@@ -368,6 +374,7 @@ describe('config env validation', () => {
       homeBannerEnabled: true,
       historyNativeEnabled: true,
     });
+    expect((await loadConfig(baseEnv({ ADS_AUDIENCE_MODE: 'child' }))).ads.audienceMode).toBe('child');
     await expectInvalid(baseEnv({ ADS_AUDIENCE_MODE: 'teen' }), 'ADS_AUDIENCE_MODE');
     await expectInvalid(baseEnv({ ADS_ENABLED: 'yes' }), "must be one of 'true', 'false', '1', or '0'");
   });

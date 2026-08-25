@@ -1,25 +1,33 @@
 import { InfiniteData, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { createAudioPlayer } from 'expo-audio';
 import React from 'react';
-import { Alert, AppState } from 'react-native';
+import { AccessibilityInfo, Alert, AppState, StyleSheet } from 'react-native';
 
 import RecordingPlayback, {
   applyRecordingDeletionToCache,
+  formatPlaybackTime,
   removeRecordingFromHistoryPages,
   removeRecordingFromPages,
+  waitAbortable,
 } from '../src/components/RecordingPlayback';
 import { ApiError, apiDeleteRecording, apiGetRecordingPlaybackGrant } from '../src/lib/api';
 import {
   claimPlaybackOwner,
+  configurePlaybackAudioMode,
+  configureRecordingAudioMode,
   getSubmittedRecordingPlaybackActive,
+  serializeAudioMode,
   stopActivePlayback,
   subscribeSubmittedRecordingPlaybackActive,
 } from '../src/lib/audio-session';
 import { useAuth } from '../src/lib/auth';
 import { translateFor } from '../src/lib/i18n';
+import { lightColors, radii, spacing } from '../src/lib/theme';
 import type { HistoryPage, RecordingPage } from '../src/lib/types';
 
 const OWNER_ID = '550e8400-e29b-41d4-a716-446655440000';
+const OTHER_OWNER_ID = '550e8400-e29b-41d4-a716-446655440099';
 const RECORDING_ID = '550e8400-e29b-41d4-a716-446655440011';
 const OTHER_RECORDING_ID = '550e8400-e29b-41d4-a716-446655440012';
 const t = (key: Parameters<typeof translateFor>[1], params?: Record<string, string | number>) =>
@@ -33,17 +41,24 @@ interface MockPlayer {
   remove: jest.Mock;
   addListener: jest.Mock;
   emit: (status: Record<string, unknown>) => void;
+  emitStale: (status: Record<string, unknown>) => void;
+  listenerRemove: jest.Mock;
 }
 
 const players: MockPlayer[] = [];
+let mockNextPlayerPlayError: Error | null = null;
+let mockNextAddListenerError: Error | null = null;
 const mockSetAudioModeAsync = jest.fn<Promise<void>, [unknown]>(
   async (_options: unknown) => undefined,
 );
 let mockAppStateListener: ((state: string) => void) | null = null;
+const mockAppStateSubscriptionRemove = jest.fn(() => (mockAppStateListener = null));
 
 jest.mock('expo-audio', () => ({
   createAudioPlayer: jest.fn(() => {
     let listener: ((status: Record<string, unknown>) => void) | null = null;
+    let lastListener: ((status: Record<string, unknown>) => void) | null = null;
+    const listenerRemove = jest.fn(() => (listener = null));
     const player: MockPlayer = {
       play: jest.fn(),
       pause: jest.fn(),
@@ -51,10 +66,27 @@ jest.mock('expo-audio', () => ({
       remove: jest.fn(),
       addListener: jest.fn((_event: string, next: (status: Record<string, unknown>) => void) => {
         listener = next;
-        return { remove: jest.fn(() => (listener = null)) };
+        lastListener = next;
+        return { remove: listenerRemove };
       }),
       emit: (status) => listener?.(status),
+      emitStale: (status) => lastListener?.(status),
+      listenerRemove,
     };
+    if (mockNextPlayerPlayError) {
+      const error = mockNextPlayerPlayError;
+      mockNextPlayerPlayError = null;
+      player.play.mockImplementationOnce(() => {
+        throw error;
+      });
+    }
+    if (mockNextAddListenerError) {
+      const error = mockNextAddListenerError;
+      mockNextAddListenerError = null;
+      player.addListener.mockImplementationOnce(() => {
+        throw error;
+      });
+    }
     players.push(player);
     return player;
   }),
@@ -87,6 +119,7 @@ jest.mock('expo-router', () => {
 });
 
 let leaseCurrent = true;
+let leaseGeneration = 1;
 const mockAuth = {
   token: 'token',
   user: {
@@ -103,8 +136,12 @@ const mockAuth = {
   restoreError: null,
   retrySessionRestore: jest.fn(),
   resetStoredSession: jest.fn(),
-  captureSessionLease: jest.fn(() => ({}) as never),
-  isSessionLeaseCurrent: jest.fn(() => leaseCurrent),
+  captureSessionLease: jest.fn(() => ({ generation: leaseGeneration }) as never),
+  isSessionLeaseCurrent: jest.fn(
+    (lease: unknown) =>
+      (lease as { generation?: number } | undefined)?.generation === leaseGeneration &&
+      leaseCurrent,
+  ),
   login: jest.fn(),
   register: jest.fn(),
   logout: jest.fn(),
@@ -134,12 +171,81 @@ function grant(recordingId = RECORDING_ID) {
   };
 }
 
+function distinctGrant(recordingId: string) {
+  return {
+    ...grant(recordingId),
+    playbackUrl: grant(recordingId).playbackUrl.replace('/object?', `/${recordingId}?`),
+  };
+}
+
+function recordingItem(id: string): RecordingPage['items'][number] {
+  return {
+    id,
+    questionId: OTHER_RECORDING_ID,
+    context: 'practice',
+    promptWord: 'courage',
+    questionText: 'Describe courage.',
+    cefrLevel: 'B1',
+    contentType: 'audio/mp4',
+    sizeBytes: 100,
+    durationMs: 1_000,
+    status: 'available',
+    createdAt: '2026-08-25T00:00:00.000Z',
+    availableAt: '2026-08-25T00:00:01.000Z',
+  };
+}
+
+function historyItem(id: string, recordingId: string | null): HistoryPage['items'][number] {
+  return {
+    id,
+    questionId: OTHER_RECORDING_ID,
+    promptWord: 'courage',
+    questionText: 'Describe courage.',
+    cefrLevel: 'B1',
+    context: 'practice',
+    attemptNo: 1,
+    score: 80,
+    passed: true,
+    transcript: 'I was brave.',
+    feedback: 'Good answer.',
+    createdAt: '2026-08-25T00:00:00.000Z',
+    recordingId,
+    recordingStatus: recordingId ? 'available' : null,
+  };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((next) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((next, fail) => {
     resolve = next;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
+}
+
+async function flushMicrotasks(turns = 10): Promise<void> {
+  for (let turn = 0; turn < turns; turn += 1) await Promise.resolve();
+}
+
+function setAppState(state: 'active' | 'background' | 'inactive'): void {
+  Object.defineProperty(AppState, 'currentState', {
+    configurable: true,
+    writable: true,
+    value: state,
+  });
+}
+
+async function emitAppState(state: 'active' | 'background' | 'inactive'): Promise<void> {
+  setAppState(state);
+  await act(async () => mockAppStateListener?.(state));
+}
+
+async function refocus(index = 0): Promise<void> {
+  await act(async () => {
+    const nextCleanup = focusRegistrations[index].callback();
+    focusRegistrations[index].cleanup = typeof nextCleanup === 'function' ? nextCleanup : null;
+  });
 }
 
 const queryClients: QueryClient[] = [];
@@ -154,24 +260,47 @@ async function renderPlayback(props: Partial<React.ComponentProps<typeof Recordi
   return { ...result, queryClient };
 }
 
-beforeEach(() => {
+function rawButtonHandler(accessibilityLabel: string): () => void {
+  type PressFiber = { memoizedProps?: { onPress?: unknown }; return: PressFiber | null };
+  let fiber = screen.getByRole('button', { name: accessibilityLabel })
+    .unstable_fiber as PressFiber | null;
+  while (fiber && typeof fiber.memoizedProps?.onPress !== 'function') fiber = fiber.return;
+  if (typeof fiber?.memoizedProps?.onPress !== 'function') {
+    throw new Error(`Missing Button handler for ${accessibilityLabel}`);
+  }
+  return fiber.memoizedProps.onPress as () => void;
+}
+
+beforeEach(async () => {
+  await stopActivePlayback();
   leaseCurrent = true;
+  leaseGeneration = 1;
+  mockAuth.sessionVersion = 1;
+  setAppState('active');
   players.length = 0;
+  mockNextPlayerPlayError = null;
+  mockNextAddListenerError = null;
   focusRegistrations.length = 0;
   asMock(useAuth).mockClear();
+  mockAuth.captureSessionLease.mockClear();
+  mockAuth.isSessionLeaseCurrent.mockClear();
   asMock(apiGetRecordingPlaybackGrant).mockReset();
   asMock(apiDeleteRecording).mockReset();
   asMock(apiGetRecordingPlaybackGrant).mockResolvedValue(grant());
   asMock(apiDeleteRecording).mockResolvedValue(undefined);
   mockSetAudioModeAsync.mockClear();
+  mockAppStateSubscriptionRemove.mockClear();
+  asMock(createAudioPlayer).mockClear();
   jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
   jest.spyOn(AppState, 'addEventListener').mockImplementation(((
     _event: string,
     listener: (state: string) => void,
   ) => {
     mockAppStateListener = listener;
-    return { remove: jest.fn(() => (mockAppStateListener = null)) };
+    return { remove: mockAppStateSubscriptionRemove };
   }) as never);
+  jest.spyOn(AccessibilityInfo, 'announceForAccessibility').mockImplementation(() => undefined);
+  asMock(AccessibilityInfo.announceForAccessibility).mockClear();
 });
 
 afterEach(async () => {
@@ -181,7 +310,147 @@ afterEach(async () => {
   jest.useRealTimers();
 });
 
+describe('recording playback primitives', () => {
+  it('formats whole, fractional, negative, and non-finite native times', () => {
+    expect(formatPlaybackTime(0)).toBe('0:00');
+    expect(formatPlaybackTime(9.99)).toBe('0:09');
+    expect(formatPlaybackTime(59)).toBe('0:59');
+    expect(formatPlaybackTime(60)).toBe('1:00');
+    expect(formatPlaybackTime(3_661.9)).toBe('61:01');
+    expect(formatPlaybackTime(-9)).toBe('0:00');
+    expect(formatPlaybackTime(Number.NaN)).toBe('0:00');
+    expect(formatPlaybackTime(Number.POSITIVE_INFINITY)).toBe('0:00');
+  });
+
+  it('rejects a pre-aborted wait with the stable AbortError contract', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(waitAbortable(60_000, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+      message: 'Aborted',
+    });
+  });
+
+  it('registers one abort listener and removes it when the timer resolves', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const add = jest.spyOn(controller.signal, 'addEventListener');
+    const remove = jest.spyOn(controller.signal, 'removeEventListener');
+    let outcome = 'pending';
+    void waitAbortable(1_250, controller.signal).then(
+      () => (outcome = 'resolved'),
+      () => (outcome = 'rejected'),
+    );
+
+    expect(add).toHaveBeenCalledWith('abort', expect.any(Function), { once: true });
+    await jest.advanceTimersByTimeAsync(1_249);
+    expect(outcome).toBe('pending');
+    await jest.advanceTimersByTimeAsync(1);
+    expect(outcome).toBe('resolved');
+    expect(remove).toHaveBeenCalledWith('abort', add.mock.calls[0][1]);
+  });
+
+  it('cancels the timer and rejects when abort fires during the wait', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const remove = jest.spyOn(controller.signal, 'removeEventListener');
+    let outcome: unknown = 'pending';
+    void waitAbortable(10_000, controller.signal).then(
+      () => (outcome = 'resolved'),
+      (error: unknown) => (outcome = error),
+    );
+
+    controller.abort();
+    await flushMicrotasks();
+    expect(outcome).toMatchObject({ name: 'AbortError', message: 'Aborted' });
+    await jest.advanceTimersByTimeAsync(10_000);
+    expect(outcome).toMatchObject({ name: 'AbortError' });
+    expect(remove).not.toHaveBeenCalled();
+  });
+});
+
 describe('RecordingPlayback', () => {
+  beforeAll(async () => {
+    leaseCurrent = true;
+    setAppState('active');
+    asMock(apiGetRecordingPlaybackGrant).mockReset().mockResolvedValue(grant());
+    mockSetAudioModeAsync.mockResolvedValue(undefined);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const view = await render(
+      <QueryClientProvider client={queryClient}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+
+    const press = fireEvent.press(view.getByRole('button', { name: t('recordings.playLabel') }));
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    await press;
+
+    await view.unmount();
+    queryClient.clear();
+    await stopActivePlayback();
+  });
+
+  it('renders the idle controls, accessibility contract, and complete light-theme layout', async () => {
+    await renderPlayback();
+
+    const play = screen.getByRole('button', { name: t('recordings.playLabel') });
+    const remove = screen.getByRole('button', { name: t('recordings.deleteAction') });
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(play.props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(remove.props.accessibilityHint).toBe(t('recordings.deleteHint'));
+    expect(remove.props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(AppState.addEventListener).toHaveBeenCalledWith('change', expect.any(Function));
+    expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
+
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-container').props.style),
+    ).toEqual({
+      marginTop: spacing.md,
+      padding: spacing.md,
+      borderWidth: 1,
+      borderColor: lightColors.border,
+      borderRadius: radii.input,
+      backgroundColor: lightColors.background,
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-actions').props.style),
+    ).toEqual({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      gap: spacing.sm,
+    });
+  });
+
+  it('applies only the compact padding override when requested', async () => {
+    await renderPlayback({ compact: true });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-container').props.style),
+    ).toEqual(expect.objectContaining({ padding: spacing.sm, marginTop: spacing.md }));
+  });
+
+  it('renders retention-pending copy only while idle with its exact status style', async () => {
+    const pending = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(pending.promise);
+    await renderPlayback({ recordingStatus: 'retention_pending' });
+    const status = screen.getByTestId('recording-playback-pending');
+    expect(status).toHaveTextContent(t('recordings.pending'));
+    expect(status.props.accessibilityLiveRegion).toBe('polite');
+    expect(StyleSheet.flatten(status.props.style)).toEqual({
+      marginTop: spacing.sm,
+      color: lightColors.muted,
+      fontSize: 14,
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+  });
+
   it('fetches a short-lived URL only after Play and handles play, progress, pause, and rewind', async () => {
     await renderPlayback();
     expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
@@ -198,7 +467,14 @@ describe('RecordingPlayback', () => {
       playsInSilentMode: true,
       shouldPlayInBackground: false,
     });
+    expect(createAudioPlayer).toHaveBeenCalledWith(grant().playbackUrl, { updateInterval: 250 });
+    expect(players[0].addListener).toHaveBeenCalledWith(
+      'playbackStatusUpdate',
+      expect.any(Function),
+    );
     expect(players[0].play).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+    expect(screen.queryByText(t('recorder.play'))).toBeNull();
 
     await act(async () => {
       players[0].emit({
@@ -210,9 +486,47 @@ describe('RecordingPlayback', () => {
       });
     });
     expect(screen.getByText('0:02 / 0:08')).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-progress').props).toMatchObject({
+      accessible: true,
+      accessibilityRole: 'progressbar',
+      accessibilityLabel: t('recordings.progressLabel'),
+      accessibilityValue: { min: 0, max: 8, now: 2 },
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-progress').props.style),
+    ).toEqual({
+      marginTop: spacing.sm,
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-progress-track').props.style),
+    ).toEqual({
+      height: 5,
+      overflow: 'hidden',
+      borderRadius: radii.input,
+      backgroundColor: lightColors.border,
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-progress-fill').props.style),
+    ).toEqual({ height: '100%', backgroundColor: lightColors.primary, width: '25%' });
+    expect(StyleSheet.flatten(screen.getByTestId('recording-playback-time').props.style)).toEqual({
+      marginTop: spacing.xs,
+      color: lightColors.muted,
+      fontSize: 13,
+    });
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
     expect(players[0].pause).toHaveBeenCalled();
+    expect(screen.getByTestId('recording-playback-progress')).toBeTruthy();
+    await act(async () => {
+      players[0].emit({
+        currentTime: 2,
+        duration: 8,
+        playing: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
     expect(players[0].play).toHaveBeenCalledTimes(2);
@@ -227,6 +541,30 @@ describe('RecordingPlayback', () => {
       });
     });
     expect(players[0].seekTo).toHaveBeenCalledWith(0);
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-progress')).toBeTruthy();
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: 8,
+        duration: 8,
+        playing: true,
+        didJustFinish: true,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: 0,
+        duration: 8,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
   });
 
   it('never publishes or creates a player after the captured session lease expires', async () => {
@@ -239,12 +577,390 @@ describe('RecordingPlayback', () => {
     expect(players).toHaveLength(0);
   });
 
+  it('captures a fresh session lease when the auth generation changes', async () => {
+    const view = await renderPlayback();
+    expect(mockAuth.captureSessionLease).toHaveBeenCalledTimes(1);
+    mockAuth.sessionVersion = 2;
+    leaseGeneration = 2;
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+    expect(mockAuth.captureSessionLease).toHaveBeenCalledTimes(2);
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+  });
+
+  it('coalesces repeated presses from one retained Play handler while a grant is pending', async () => {
+    const pending = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(pending.promise);
+    await renderPlayback();
+    const play = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => {
+      play();
+      play();
+    });
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+
+    await act(async () => pending.resolve(grant()));
+    await waitFor(() => expect(players).toHaveLength(1));
+  });
+
   it('does not let a retained Play handler resume audio after focus is lost', async () => {
     await renderPlayback();
     const play = screen.getByRole('button', { name: t('recordings.playLabel') });
     await act(async () => focusRegistrations[0].cleanup?.());
     await fireEvent.press(play);
     expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+  });
+
+  it.each(['background', 'inactive'] as const)(
+    'does not start playback while AppState is %s even if focus has not emitted cleanup',
+    async (state) => {
+      await renderPlayback();
+      setAppState(state);
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+      expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+      expect(players).toHaveLength(0);
+    },
+  );
+
+  it('invalidates an old grant across blur/refocus and preserves the replacement operation token', async () => {
+    const first = deferred<ReturnType<typeof grant>>();
+    const second = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    await renderPlayback({ recordingStatus: 'retention_pending' });
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+    await act(async () => retainedPlay());
+    const firstSignal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
+    expect(firstSignal.aborted).toBe(false);
+
+    await act(async () => focusRegistrations[0].cleanup?.());
+    expect(firstSignal.aborted).toBe(true);
+    await refocus();
+    expect(screen.getByTestId('recording-playback-pending')).toHaveTextContent(
+      t('recordings.pending'),
+    );
+    await act(async () => retainedPlay());
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2);
+    const secondSignal = asMock(apiGetRecordingPlaybackGrant).mock.calls[1][1] as AbortSignal;
+
+    await act(async () => first.resolve(grant()));
+    expect(players).toHaveLength(0);
+    await act(async () => retainedPlay());
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2);
+
+    await emitAppState('background');
+    expect(secondSignal.aborted).toBe(true);
+    await act(async () => second.resolve(grant()));
+    expect(players).toHaveLength(0);
+  });
+
+  it('ignores a stale grant failure after a replacement player is active', async () => {
+    const staleGrant = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant)
+      .mockReturnValueOnce(staleGrant.promise)
+      .mockResolvedValueOnce(distinctGrant(RECORDING_ID));
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+    await act(async () => retainedPlay());
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus();
+    await act(async () => retainedPlay());
+    await waitFor(() => expect(players).toHaveLength(1));
+
+    await act(async () => staleGrant.reject(new Error('late stale grant failure')));
+    await flushMicrotasks();
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+  });
+
+  it('ignores active app-state notifications but invalidates work across inactive/reactivation', async () => {
+    const pending = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(pending.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    const signal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
+
+    await emitAppState('active');
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+    await emitAppState('inactive');
+    expect(signal.aborted).toBe(true);
+    setAppState('active');
+    await act(async () => pending.resolve(grant()));
+    expect(players).toHaveLength(0);
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+  });
+
+  it.each([
+    ['owner', '550e8400-e29b-41d4-a716-446655440099', RECORDING_ID],
+    ['recording', OWNER_ID, OTHER_RECORDING_ID],
+  ] as const)(
+    'invalidates an old grant when only the %s identity changes',
+    async (_kind, nextOwner, nextId) => {
+      const pending = deferred<ReturnType<typeof grant>>();
+      asMock(apiGetRecordingPlaybackGrant)
+        .mockReturnValueOnce(pending.promise)
+        .mockResolvedValueOnce(grant(nextId));
+      const view = await renderPlayback();
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+      const firstSignal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
+
+      await view.rerender(
+        <QueryClientProvider client={view.queryClient}>
+          <RecordingPlayback ownerId={nextOwner} recordingId={nextId} />
+        </QueryClientProvider>,
+      );
+      expect(mockAuth.captureSessionLease).toHaveBeenCalledTimes(_kind === 'owner' ? 2 : 1);
+      expect(firstSignal.aborted).toBe(true);
+      await act(async () => pending.resolve(grant()));
+      expect(players).toHaveLength(0);
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+      await waitFor(() => expect(players).toHaveLength(1));
+      expect(apiGetRecordingPlaybackGrant).toHaveBeenLastCalledWith(
+        nextId,
+        expect.any(AbortSignal),
+      );
+    },
+  );
+
+  it('clears an error and a durable deleted state when the recording identity changes', async () => {
+    asMock(apiGetRecordingPlaybackGrant).mockRejectedValueOnce(new ApiError(503, 'busy'));
+    const view = await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
+
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback
+          ownerId={OWNER_ID}
+          recordingId={RECORDING_ID}
+          recordingStatus="retention_pending"
+        />
+      </QueryClientProvider>,
+    );
+    expect(screen.queryByTestId('recording-playback-deleted')).toBeNull();
+    expect(screen.getByTestId('recording-playback-pending')).toHaveTextContent(
+      t('recordings.pending'),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+  });
+
+  it('preserves active playback across a same-identity rerender', async () => {
+    const view = await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback
+          ownerId={OWNER_ID}
+          recordingId={RECORDING_ID}
+          recordingLabel="same recording, new presentation"
+        />
+      </QueryClientProvider>,
+    );
+
+    expect(players[0].listenerRemove).not.toHaveBeenCalled();
+    expect(players[0].pause).not.toHaveBeenCalled();
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+  });
+
+  it('rejects a retained Play handler after its recording identity is replaced', async () => {
+    const view = await renderPlayback();
+    const stalePlay = rawButtonHandler(t('recordings.playLabel'));
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OTHER_OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+
+    await act(async () => stalePlay());
+    expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() =>
+      expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledWith(
+        OTHER_RECORDING_ID,
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
+  it('rejects a retained Pause handler before it can pause the replacement player', async () => {
+    asMock(apiGetRecordingPlaybackGrant).mockImplementation(async (recordingId: string) =>
+      distinctGrant(recordingId),
+    );
+    const view = await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    const stalePause = rawButtonHandler(t('recordings.pauseLabel'));
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OTHER_OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(2));
+
+    await act(async () => stalePause());
+    expect(players[1].pause).not.toHaveBeenCalled();
+    expect(players[1].remove).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+  });
+
+  it('rejects a retained destructive Alert action after identity replacement', async () => {
+    const view = await renderPlayback();
+    const staleConfirm = rawButtonHandler(t('recordings.deleteAction'));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const staleActions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    const staleDestroy = staleActions.find((action) => action.style === 'destructive')?.onPress;
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OTHER_OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+
+    await act(async () => staleConfirm());
+    expect(Alert.alert).toHaveBeenCalledTimes(1);
+    await act(async () => staleDestroy?.());
+    expect(apiDeleteRecording).not.toHaveBeenCalled();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    expect(Alert.alert).toHaveBeenCalledTimes(2);
+    const currentActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      currentActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    expect(apiDeleteRecording).toHaveBeenCalledWith(OTHER_RECORDING_ID, expect.any(AbortSignal));
+  });
+
+  it('rejects retained confirm and modal actions after blur or unmount', async () => {
+    const view = await renderPlayback();
+    const staleConfirm = rawButtonHandler(t('recordings.deleteAction'));
+    await act(async () => staleConfirm());
+    const modalActions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    const staleDestroy = modalActions.find((action) => action.style === 'destructive')?.onPress;
+    await act(async () => focusRegistrations[0].cleanup?.());
+
+    await act(async () => staleConfirm());
+    expect(Alert.alert).toHaveBeenCalledTimes(1);
+    await refocus();
+    await act(async () => staleDestroy?.());
+    expect(apiDeleteRecording).not.toHaveBeenCalled();
+
+    await view.unmount();
+    await act(async () => staleConfirm());
+    expect(Alert.alert).toHaveBeenCalledTimes(1);
+    expect(apiDeleteRecording).not.toHaveBeenCalled();
+  });
+
+  it('never lets a stale grant displace a newer player owned by another surface', async () => {
+    const staleGrant = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockImplementation((recordingId: string) =>
+      recordingId === RECORDING_ID
+        ? staleGrant.promise
+        : Promise.resolve(distinctGrant(recordingId)),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClients.push(client);
+    await render(
+      <QueryClientProvider client={client}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+    const playButtons = screen.getAllByRole('button', { name: t('recordings.playLabel') });
+    await fireEvent.press(playButtons[0]);
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await fireEvent.press(playButtons[1]);
+    await waitFor(() => expect(players).toHaveLength(1));
+    expect(createAudioPlayer).toHaveBeenLastCalledWith(
+      distinctGrant(OTHER_RECORDING_ID).playbackUrl,
+      {
+        updateInterval: 250,
+      },
+    );
+
+    await act(async () => staleGrant.resolve(distinctGrant(RECORDING_ID)));
+    await flushMicrotasks();
+    expect(players).toHaveLength(1);
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+  });
+
+  it('releases a claim that becomes stale mid-handoff without disturbing the queued newer player', async () => {
+    const oldStopped = deferred<void>();
+    await claimPlaybackOwner(Symbol('handoff-blocker'), () => oldStopped.promise);
+    asMock(apiGetRecordingPlaybackGrant).mockImplementation(async (recordingId: string) =>
+      distinctGrant(recordingId),
+    );
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClients.push(client);
+    await render(
+      <QueryClientProvider client={client}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+    const playButtons = screen.getAllByRole('button', { name: t('recordings.playLabel') });
+    await fireEvent.press(playButtons[0]);
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus(0);
+    await fireEvent.press(playButtons[1]);
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2));
+
+    await act(async () => oldStopped.resolve());
+    await waitFor(() => expect(players).toHaveLength(1));
+    expect(mockSetAudioModeAsync).toHaveBeenCalledTimes(1);
+    expect(mockSetAudioModeAsync).toHaveBeenCalledWith({
+      allowsRecording: false,
+      allowsBackgroundRecording: false,
+      playsInSilentMode: true,
+      shouldPlayInBackground: false,
+    });
+    expect(createAudioPlayer).toHaveBeenLastCalledWith(
+      distinctGrant(OTHER_RECORDING_ID).playbackUrl,
+      {
+        updateInterval: 250,
+      },
+    );
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
   });
 
   it('stops the previous component when another recording claims playback ownership', async () => {
@@ -285,8 +1001,12 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(players).toHaveLength(1));
+    const completedGrantSignal = asMock(apiGetRecordingPlaybackGrant).mock
+      .calls[0][1] as AbortSignal;
+    expect(completedGrantSignal.aborted).toBe(false);
     await act(async () => mockAppStateListener?.('background'));
     expect(players[0].remove).toHaveBeenCalled();
+    expect(completedGrantSignal.aborted).toBe(false);
 
     await view.rerender(
       <QueryClientProvider client={view.queryClient}>
@@ -294,6 +1014,38 @@ describe('RecordingPlayback', () => {
       </QueryClientProvider>,
     );
     expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
+  });
+
+  it('continues teardown when listener, pause, and remove each throw', async () => {
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    await act(async () => {
+      players[0].emit({
+        currentTime: 4,
+        duration: 8,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    players[0].listenerRemove.mockImplementationOnce(() => {
+      throw new Error('listener already gone');
+    });
+    players[0].pause.mockImplementationOnce(() => {
+      throw new Error('pause already gone');
+    });
+    players[0].remove.mockImplementationOnce(() => {
+      throw new Error('player already gone');
+    });
+
+    await emitAppState('background');
+    expect(players[0].listenerRemove).toHaveBeenCalledTimes(1);
+    expect(players[0].pause).toHaveBeenCalledTimes(1);
+    expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
   });
 
   it('reports native playback and rewind failures without retaining a stale player', async () => {
@@ -304,16 +1056,20 @@ describe('RecordingPlayback', () => {
       players[0].emit({
         currentTime: 1,
         duration: 2,
-        playing: false,
-        didJustFinish: false,
+        playing: true,
+        didJustFinish: true,
         error: 'decode',
       });
     });
     expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.queryByText(t('recorder.pause'))).toBeNull();
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
     expect(players[0].remove).toHaveBeenCalled();
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(players).toHaveLength(2));
+    expect(screen.queryByRole('alert')).toBeNull();
     players[1].seekTo.mockRejectedValue(new Error('seek failed'));
     await act(async () => {
       players[1].emit({
@@ -325,6 +1081,152 @@ describe('RecordingPlayback', () => {
       });
     });
     await waitFor(() => expect(players[1].remove).toHaveBeenCalled());
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+  });
+
+  it('reports audio-mode configuration failure without creating or retaining a player', async () => {
+    mockSetAudioModeAsync.mockRejectedValueOnce(new Error('mode failed'));
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed')),
+    );
+    expect(players).toHaveLength(0);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+  });
+
+  it.each(['listener', 'play'] as const)(
+    'releases a partially created player when %s setup throws',
+    async (failurePoint) => {
+      if (failurePoint === 'listener') mockNextAddListenerError = new Error('listener failed');
+      else mockNextPlayerPlayError = new Error('play failed');
+      await renderPlayback();
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed')),
+      );
+      expect(players).toHaveLength(1);
+      expect(players[0].pause).toHaveBeenCalledTimes(1);
+      expect(players[0].remove).toHaveBeenCalledTimes(1);
+      expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    },
+  );
+
+  it('ignores a removed stale listener after a replacement player starts', async () => {
+    await renderPlayback();
+    const play = screen.getByRole('button', { name: t('recordings.playLabel') });
+    await fireEvent.press(play);
+    await waitFor(() => expect(players).toHaveLength(1));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
+    players[0].play.mockImplementationOnce(() => {
+      throw new Error('expired native player');
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(2));
+
+    await act(async () => {
+      players[0].emitStale({
+        currentTime: 9,
+        duration: 10,
+        playing: false,
+        didJustFinish: false,
+        error: 'stale decode error',
+      });
+    });
+    expect(players[1].remove).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('does not let a stale rewind rejection tear down its replacement player', async () => {
+    const rewind = deferred<void>();
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    players[0].seekTo.mockReturnValueOnce(rewind.promise);
+    await act(async () => {
+      players[0].emit({
+        currentTime: 2,
+        duration: 2,
+        playing: true,
+        didJustFinish: true,
+        error: null,
+      });
+    });
+    players[0].play.mockImplementationOnce(() => {
+      throw new Error('cannot resume old player');
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(2));
+
+    await act(async () => rewind.reject(new Error('late rewind failure')));
+    expect(players[1].remove).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('clamps hostile native progress and hides non-finite or zero-duration progress', async () => {
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: 150,
+        duration: 100,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByTestId('recording-playback-progress').props.accessibilityValue).toEqual({
+      min: 0,
+      max: 100,
+      now: 100,
+    });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-progress-fill').props.style),
+    ).toEqual(expect.objectContaining({ width: '100%' }));
+    expect(screen.getByTestId('recording-playback-time')).toHaveTextContent('2:30 / 1:40');
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: -25,
+        duration: 80,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByTestId('recording-playback-progress').props.accessibilityValue.now).toBe(0);
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-progress-fill').props.style),
+    ).toEqual(expect.objectContaining({ width: '0%' }));
+    expect(screen.getByTestId('recording-playback-time')).toHaveTextContent('0:00 / 1:20');
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: Number.NaN,
+        duration: Number.POSITIVE_INFINITY,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+
+    await act(async () => {
+      players[0].emit({
+        currentTime: 0,
+        duration: 0,
+        playing: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
   });
 
   it('replaces an expired or failed paused player and reports a synchronous pause failure', async () => {
@@ -344,6 +1246,30 @@ describe('RecordingPlayback', () => {
     });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
     expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.queryByText(t('recorder.pause'))).toBeNull();
+  });
+
+  it('reuses a grant only while it remains strictly beyond the ten-second safety window', async () => {
+    jest.useFakeTimers();
+    jest.setSystemTime(new Date('2026-08-25T00:00:00.000Z'));
+    asMock(apiGetRecordingPlaybackGrant).mockResolvedValue({ ...grant(), expiresIn: 20 });
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
+
+    jest.setSystemTime(new Date('2026-08-25T00:00:09.999Z'));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    expect(players[0].play).toHaveBeenCalledTimes(2);
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
+
+    jest.setSystemTime(new Date('2026-08-25T00:00:10.000Z'));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(2));
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2);
+    expect(players[0].remove).toHaveBeenCalledTimes(1);
   });
 
   it('abandons a grant while playback mode is still configuring after focus loss', async () => {
@@ -357,6 +1283,22 @@ describe('RecordingPlayback', () => {
     expect(players).toHaveLength(0);
   });
 
+  it('releases a playback claim that finishes after blur and refocus', async () => {
+    const previousStopped = deferred<void>();
+    await claimPlaybackOwner(Symbol('blocking-owner'), () => previousStopped.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus();
+
+    await act(async () => previousStopped.resolve());
+    await flushMicrotasks();
+    expect(players).toHaveLength(0);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+  });
+
   it('aborts a bounded pending retry when its playback surface unmounts', async () => {
     jest.useFakeTimers();
     asMock(apiGetRecordingPlaybackGrant).mockRejectedValue(
@@ -365,9 +1307,36 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback({ recordingStatus: 'retention_pending' });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+    const signal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
     await view.unmount();
+    expect(signal.aborted).toBe(true);
+    expect(mockAppStateSubscriptionRemove).toHaveBeenCalledTimes(1);
     await act(async () => jest.runOnlyPendingTimersAsync());
     expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses the layout-mounted guard when an aborted delete settles before passive focus cleanup', async () => {
+    const staleDelete = deferred<void>();
+    const onDeleted = jest.fn();
+    asMock(apiDeleteRecording).mockReturnValue(staleDelete.promise);
+    const view = await renderPlayback({ onDeleted });
+    const cancelQueries = jest.spyOn(view.queryClient, 'cancelQueries');
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    const deleteSignal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
+
+    focusRegistrations[0].cleanup = () => undefined;
+    await view.unmount();
+    expect(deleteSignal.aborted).toBe(true);
+    await act(async () => staleDelete.resolve());
+    await flushMicrotasks();
+
+    expect(cancelQueries).not.toHaveBeenCalled();
+    expect(onDeleted).not.toHaveBeenCalled();
   });
 
   it('shows a retryable deletion error and does not mutate owner caches', async () => {
@@ -380,7 +1349,336 @@ describe('RecordingPlayback', () => {
     }[];
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    const alert = screen.getByTestId('recording-playback-error');
+    expect(alert).toHaveTextContent(t('error.serverBusy'));
+    expect(alert.props.accessibilityRole).toBe('alert');
+    expect(StyleSheet.flatten(alert.props.style)).toEqual({
+      marginTop: spacing.sm,
+      color: lightColors.danger,
+      fontSize: 14,
+    });
+  });
+
+  it('cleans up a failed delete for immediate retry without aborting its completed signal', async () => {
+    asMock(apiDeleteRecording)
+      .mockRejectedValueOnce(new Error('local delete transport failed'))
+      .mockResolvedValueOnce(undefined);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.deleteFailed')),
+    );
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+    const completedDeleteSignal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    expect(Alert.alert).toHaveBeenCalledTimes(2);
+    await act(async () => focusRegistrations[0].cleanup?.());
+    expect(completedDeleteSignal.aborted).toBe(false);
+    await refocus();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    expect(Alert.alert).toHaveBeenCalledTimes(3);
+    const retryActions = asMock(Alert.alert).mock.calls[2][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      retryActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy();
+  });
+
+  it('does not publish a deletion after the captured session lease expires', async () => {
+    const pending = deferred<void>();
+    const onDeleted = jest.fn();
+    asMock(apiDeleteRecording).mockReturnValue(pending.promise);
+    await renderPlayback({ onDeleted });
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    leaseCurrent = false;
+    await act(async () => pending.resolve());
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('recording-playback-deleted')).toBeNull();
+    expect(AccessibilityInfo.announceForAccessibility).not.toHaveBeenCalled();
+  });
+
+  it('runs a retained destructive callback at most once during and after deletion', async () => {
+    const pending = deferred<void>();
+    asMock(apiDeleteRecording).mockReturnValue(pending.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    const destroy = actions.find((action) => action.style === 'destructive')?.onPress;
+
+    await act(async () => {
+      destroy?.();
+      destroy?.();
+    });
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
+
+    await act(async () => pending.resolve());
+    await waitFor(() => expect(screen.getByText(t('recordings.deleted'))).toBeTruthy());
+    await act(async () => destroy?.());
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
+  });
+
+  it('confirms unnamed deletion and leaves cancellation side-effect free', async () => {
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    expect(Alert.alert).toHaveBeenCalledWith(
+      t('recordings.deleteTitle'),
+      t('recordings.deleteBody'),
+      expect.any(Array),
+    );
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      text: string;
+      style?: string;
+      onPress?: () => void;
+    }[];
+    expect(actions.map(({ text, style }) => ({ text, style }))).toEqual([
+      { text: t('common.cancel'), style: 'cancel' },
+      { text: t('recordings.deleteAction'), style: 'destructive' },
+    ]);
+    expect(actions[0].onPress).toBeUndefined();
+    expect(apiDeleteRecording).not.toHaveBeenCalled();
+  });
+
+  it('blocks retained play and confirm handlers while deletion is pending', async () => {
+    const pending = deferred<void>();
+    asMock(apiDeleteRecording).mockReturnValue(pending.promise);
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+    const retainedConfirm = rawButtonHandler(t('recordings.deleteAction'));
+    await act(async () => retainedConfirm());
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(1));
+
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: false });
+    expect(
+      screen.getByRole('button', { name: t('recordings.deleteAction') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+    await act(async () => {
+      retainedPlay();
+      retainedConfirm();
+    });
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
+    expect(Alert.alert).toHaveBeenCalledTimes(1);
+
+    await act(async () => pending.resolve());
+    await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
+    await act(async () => {
+      retainedPlay();
+      retainedConfirm();
+    });
+    expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+    expect(Alert.alert).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancels an in-flight playback grant before deletion without reviving that grant', async () => {
+    const playback = deferred<ReturnType<typeof grant>>();
+    const deletion = deferred<void>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(playback.promise);
+    asMock(apiDeleteRecording).mockReturnValue(deletion.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    const playbackSignal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    expect(playbackSignal.aborted).toBe(true);
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
+
+    await act(async () => playback.resolve(grant()));
+    expect(players).toHaveLength(0);
+    expect(screen.getByText(t('recordings.deleteAction'))).toBeTruthy();
+    await act(async () => deletion.reject(new ApiError(503, 'busy')));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+  });
+
+  it('releases active playback before issuing a delete request', async () => {
+    const deletion = deferred<void>();
+    asMock(apiDeleteRecording).mockReturnValue(deletion.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    expect(players[0].listenerRemove).toHaveBeenCalledTimes(1);
+    expect(players[0].pause).toHaveBeenCalledTimes(1);
+    expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
+    deletion.reject(new ApiError(503, 'busy'));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+  });
+
+  it('cancels a pending deletion on blur and permits a fresh retry after refocus', async () => {
+    const firstDelete = deferred<void>();
+    asMock(apiDeleteRecording)
+      .mockReturnValueOnce(firstDelete.promise)
+      .mockResolvedValueOnce(undefined);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(1));
+
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await act(async () => {
+      const nextCleanup = focusRegistrations[0].callback();
+      focusRegistrations[0].cleanup = typeof nextCleanup === 'function' ? nextCleanup : null;
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const secondActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      secondActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByText(t('recordings.deleted'))).toBeTruthy());
+
+    await act(async () => firstDelete.reject(new Error('stale delete failure')));
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(2);
+    expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('does not let a stale delete success cancel caches or stop replacement playback', async () => {
+    const staleDelete = deferred<void>();
+    const onDeleted = jest.fn();
+    asMock(apiDeleteRecording).mockReturnValue(staleDelete.promise);
+    const view = await renderPlayback({ onDeleted });
+    const cancelQueries = jest.spyOn(view.queryClient, 'cancelQueries');
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+
+    await act(async () => staleDelete.resolve());
+    await flushMicrotasks();
+    expect(cancelQueries).not.toHaveBeenCalled();
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('recording-playback-deleted')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+  });
+
+  it('abandons deletion after focus loss while owner-cache cancellation is pending', async () => {
+    const cacheBarrier = deferred<void>();
+    const onDeleted = jest.fn();
+    const view = await renderPlayback({ onDeleted });
+    const cancelQueries = jest
+      .spyOn(view.queryClient, 'cancelQueries')
+      .mockImplementation(() => cacheBarrier.promise);
+    const invalidateQueries = jest.spyOn(view.queryClient, 'invalidateQueries');
+    view.queryClient.setQueryData<InfiniteData<RecordingPage>>(['recordings', OWNER_ID], {
+      pages: [{ items: [recordingItem(RECORDING_ID)], nextCursor: null }],
+      pageParams: [undefined],
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await waitFor(() => expect(cancelQueries).toHaveBeenCalledTimes(2));
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus();
+    await act(async () => cacheBarrier.resolve());
+    await flushMicrotasks();
+
+    expect(onDeleted).not.toHaveBeenCalled();
+    expect(invalidateQueries).not.toHaveBeenCalled();
+    expect(
+      view.queryClient.getQueryData<InfiniteData<RecordingPage>>(['recordings', OWNER_ID])?.pages[0]
+        .items,
+    ).toHaveLength(1);
+    expect(screen.queryByTestId('recording-playback-deleted')).toBeNull();
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+  });
+
+  it('does not let an old delete finally clear or de-abort a replacement delete', async () => {
+    const first = deferred<void>();
+    const second = deferred<void>();
+    asMock(apiDeleteRecording)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () =>
+      firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
+    );
+    await act(async () => focusRegistrations[0].cleanup?.());
+    await refocus();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const secondActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    const secondDestroy = secondActions.find((action) => action.style === 'destructive')?.onPress;
+    await act(async () => secondDestroy?.());
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(2);
+    const secondSignal = asMock(apiDeleteRecording).mock.calls[1][1] as AbortSignal;
+
+    await act(async () => first.resolve());
+    await act(async () => secondDestroy?.());
+    expect(apiDeleteRecording).toHaveBeenCalledTimes(2);
+    await emitAppState('background');
+    expect(secondSignal.aborted).toBe(true);
+    await act(async () => second.resolve());
+    expect(screen.queryByTestId('recording-playback-deleted')).toBeNull();
   });
 
   it('bounds pending-retention retries and exposes a retryable error', async () => {
@@ -395,6 +1693,54 @@ describe('RecordingPlayback', () => {
     });
     await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(4));
     expect(screen.getByRole('alert')).toBeTruthy();
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
+  });
+
+  it.each([
+    ['missing', undefined, 2_000],
+    ['zero', 0, 1_000],
+    ['negative', -8, 1_000],
+    ['ordinary', 3, 3_000],
+    ['oversized', 99, 5_000],
+  ] as const)('clamps the %s REQUEST_IN_FLIGHT retry delay', async (_label, retryAfter, delay) => {
+    jest.useFakeTimers();
+    asMock(apiGetRecordingPlaybackGrant)
+      .mockRejectedValueOnce(
+        new ApiError(409, 'pending', retryAfter, { code: 'REQUEST_IN_FLIGHT' }),
+      )
+      .mockResolvedValueOnce(grant());
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+
+    await act(async () => jest.advanceTimersByTimeAsync(delay - 1));
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    await act(async () => jest.advanceTimersByTimeAsync(1));
+    await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(players).toHaveLength(1));
+  });
+
+  it.each([
+    ['wrong status', new ApiError(408, 'not pending', 1, { code: 'REQUEST_IN_FLIGHT' })],
+    ['wrong code', new ApiError(409, 'different conflict', 1, { code: 'STATE_CHANGED' })],
+    [
+      'wrong class',
+      Object.assign(new Error('lookalike'), {
+        status: 409,
+        code: 'REQUEST_IN_FLIGHT',
+        retryAfterSeconds: 1,
+      }),
+    ],
+  ])('never retries a %s failure', async (_label, failure) => {
+    jest.useFakeTimers();
+    asMock(apiGetRecordingPlaybackGrant).mockRejectedValue(failure);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+    await act(async () => jest.advanceTimersByTimeAsync(20_000));
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    expect(players).toHaveLength(0);
   });
 
   it('renders an unavailable state without offering a misleading retry', async () => {
@@ -403,11 +1749,20 @@ describe('RecordingPlayback', () => {
     expect(button.props.accessibilityState.disabled).toBe(true);
     expect(screen.getAllByText(t('recordings.unavailable'))).toHaveLength(2);
     expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
+    const status = screen.getByTestId('recording-playback-unavailable');
+    expect(status.props.accessibilityLiveRegion).toBe('polite');
+    expect(StyleSheet.flatten(status.props.style)).toEqual({
+      marginTop: spacing.sm,
+      color: lightColors.muted,
+      fontSize: 14,
+    });
   });
 
   it('confirms named deletion, updates both caches, and keeps written results outside its scope', async () => {
     const onDeleted = jest.fn();
     const { queryClient } = await renderPlayback({ recordingLabel: 'courage', onDeleted });
+    const cancelQueries = jest.spyOn(queryClient, 'cancelQueries');
+    const invalidateQueries = jest.spyOn(queryClient, 'invalidateQueries');
     queryClient.setQueryData<InfiniteData<RecordingPage>>(['recordings', OWNER_ID], {
       pages: [
         {
@@ -474,6 +1829,14 @@ describe('RecordingPlayback', () => {
       expect(apiDeleteRecording).toHaveBeenCalledWith(RECORDING_ID, expect.any(AbortSignal)),
     );
     expect(onDeleted).toHaveBeenCalledWith(RECORDING_ID);
+    expect(cancelQueries.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ['recordings', OWNER_ID], exact: true },
+      { queryKey: ['practice-history', OWNER_ID], exact: true },
+    ]);
+    expect(invalidateQueries.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ['recordings', OWNER_ID], exact: true },
+      { queryKey: ['practice-history', OWNER_ID], exact: true },
+    ]);
     const recordingData = queryClient.getQueryData<InfiniteData<RecordingPage>>([
       'recordings',
       OWNER_ID,
@@ -489,6 +1852,62 @@ describe('RecordingPlayback', () => {
       recordingId: null,
       recordingStatus: null,
     });
+    expect(AccessibilityInfo.announceForAccessibility).toHaveBeenCalledWith(
+      t('recordings.deleted'),
+    );
+    const deleted = screen.getByTestId('recording-playback-deleted');
+    expect(deleted).toHaveTextContent(t('recordings.deleted'));
+    expect(deleted.props.accessibilityLiveRegion).toBe('polite');
+    expect(StyleSheet.flatten(deleted.props.style)).toEqual({
+      marginTop: spacing.sm,
+      color: lightColors.muted,
+      fontSize: 14,
+      fontStyle: 'italic',
+    });
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('delivers deletion only to the latest callback prop', async () => {
+    const stale = jest.fn();
+    const current = jest.fn();
+    const view = await renderPlayback({ onDeleted: stale });
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} onDeleted={current} />
+      </QueryClientProvider>,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await waitFor(() => expect(current).toHaveBeenCalledWith(RECORDING_ID));
+    expect(stale).not.toHaveBeenCalled();
+  });
+
+  it('binds a post-rerender delete to the latest owner and recording identity', async () => {
+    const view = await renderPlayback();
+    const cancelQueries = jest.spyOn(view.queryClient, 'cancelQueries');
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OTHER_OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const actions = asMock(Alert.alert).mock.calls[0][2] as {
+      style?: string;
+      onPress?: () => void;
+    }[];
+    await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
+    await waitFor(() =>
+      expect(apiDeleteRecording).toHaveBeenCalledWith(OTHER_RECORDING_ID, expect.any(AbortSignal)),
+    );
+    expect(cancelQueries.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ['recordings', OTHER_OWNER_ID], exact: true },
+      { queryKey: ['practice-history', OTHER_OWNER_ID], exact: true },
+    ]);
   });
 });
 
@@ -501,12 +1920,243 @@ describe('recording cache helpers', () => {
     client.clear();
   });
 
+  it('preserves page metadata and every non-target recording while removing all target copies', () => {
+    const first = recordingItem(RECORDING_ID);
+    const keep = recordingItem(OTHER_RECORDING_ID);
+    const data: InfiniteData<RecordingPage> = {
+      pages: [
+        { items: [first, keep], nextCursor: 'cursor-1' },
+        { items: [recordingItem(RECORDING_ID)], nextCursor: null },
+      ],
+      pageParams: [undefined, 'cursor-1'],
+    };
+
+    const result = removeRecordingFromPages(data, RECORDING_ID);
+    expect(result).toEqual({
+      pages: [
+        { items: [keep], nextCursor: 'cursor-1' },
+        { items: [], nextCursor: null },
+      ],
+      pageParams: [undefined, 'cursor-1'],
+    });
+    expect(data.pages[0].items).toEqual([first, keep]);
+  });
+
+  it('nulls only matching history media links and preserves all written assessment fields', () => {
+    const target = historyItem('attempt-target', RECORDING_ID);
+    const keep = historyItem('attempt-keep', OTHER_RECORDING_ID);
+    const alreadyEmpty = historyItem('attempt-empty', null);
+    const data: InfiniteData<HistoryPage> = {
+      pages: [
+        { items: [target, keep], nextCursor: 'cursor-1' },
+        { items: [alreadyEmpty], nextCursor: null },
+      ],
+      pageParams: [undefined, 'cursor-1'],
+    };
+
+    const result = removeRecordingFromHistoryPages(data, RECORDING_ID);
+    expect(result).toEqual({
+      pages: [
+        {
+          items: [{ ...target, recordingId: null, recordingStatus: null }, keep],
+          nextCursor: 'cursor-1',
+        },
+        { items: [alreadyEmpty], nextCursor: null },
+      ],
+      pageParams: [undefined, 'cursor-1'],
+    });
+    expect(data.pages[0].items[0]).toBe(target);
+    expect(result?.pages[0].items[1]).toBe(keep);
+  });
+
+  it('writes only the exact owner-scoped recording and history cache keys', () => {
+    const setQueryData = jest.fn();
+    applyRecordingDeletionToCache(
+      { setQueryData } as unknown as QueryClient,
+      OWNER_ID,
+      RECORDING_ID,
+    );
+    expect(setQueryData).toHaveBeenCalledTimes(2);
+    expect(setQueryData.mock.calls.map(([key]) => key)).toEqual([
+      ['recordings', OWNER_ID],
+      ['practice-history', OWNER_ID],
+    ]);
+
+    const recordingUpdater = setQueryData.mock.calls[0][1] as (
+      value: InfiniteData<RecordingPage>,
+    ) => InfiniteData<RecordingPage>;
+    const historyUpdater = setQueryData.mock.calls[1][1] as (
+      value: InfiniteData<HistoryPage>,
+    ) => InfiniteData<HistoryPage>;
+    expect(
+      recordingUpdater({
+        pages: [{ items: [recordingItem(RECORDING_ID)], nextCursor: null }],
+        pageParams: [undefined],
+      }).pages[0].items,
+    ).toEqual([]);
+    expect(
+      historyUpdater({
+        pages: [{ items: [historyItem('attempt', RECORDING_ID)], nextCursor: null }],
+        pageParams: [undefined],
+      }).pages[0].items[0],
+    ).toMatchObject({ recordingId: null, recordingStatus: null });
+  });
+
   it('stops and releases the globally active playback owner before recording', async () => {
     const stop = jest.fn(async () => undefined);
     await claimPlaybackOwner(Symbol('direct-owner-test'), stop);
     expect(getSubmittedRecordingPlaybackActive()).toBe(true);
     await stopActivePlayback();
     expect(stop).toHaveBeenCalledTimes(1);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+  });
+});
+
+describe('submitted-recording audio session', () => {
+  it('initializes a fresh module with playback inactive', () => {
+    jest.isolateModules(() => {
+      const isolated = jest.requireActual<typeof import('../src/lib/audio-session')>(
+        '../src/lib/audio-session',
+      );
+      expect(isolated.getSubmittedRecordingPlaybackActive()).toBe(false);
+    });
+  });
+
+  it('configures the exact playback and recording audio modes', async () => {
+    await configurePlaybackAudioMode();
+    await configureRecordingAudioMode();
+    expect(mockSetAudioModeAsync.mock.calls).toEqual([
+      [
+        {
+          allowsRecording: false,
+          allowsBackgroundRecording: false,
+          playsInSilentMode: true,
+          shouldPlayInBackground: false,
+        },
+      ],
+      [
+        {
+          allowsRecording: true,
+          allowsBackgroundRecording: false,
+          playsInSilentMode: true,
+          shouldPlayInBackground: false,
+        },
+      ],
+    ]);
+  });
+
+  it('serializes audio-mode work and recovers the queue after a rejected operation', async () => {
+    const first = deferred<void>();
+    const calls: string[] = [];
+    const firstResult = serializeAudioMode(async () => {
+      calls.push('first:start');
+      await first.promise;
+      calls.push('first:end');
+    });
+    const secondResult = serializeAudioMode(async () => {
+      calls.push('second');
+    });
+    await flushMicrotasks();
+    expect(calls).toEqual(['first:start']);
+
+    const failure = new Error('native mode failed');
+    first.reject(failure);
+    await expect(firstResult).rejects.toBe(failure);
+    await secondResult;
+    expect(calls).toEqual(['first:start', 'second']);
+
+    await serializeAudioMode(async () => {
+      calls.push('third');
+    });
+    expect(calls).toEqual(['first:start', 'second', 'third']);
+  });
+
+  it('publishes only real active-state transitions and actually unsubscribes listeners', async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeSubmittedRecordingPlaybackActive(listener);
+    const token = Symbol('same-owner');
+    const firstStop = jest.fn();
+    const replacementStop = jest.fn();
+    const firstRelease = await claimPlaybackOwner(token, firstStop);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    const replacementRelease = await claimPlaybackOwner(token, replacementStop);
+    expect(firstStop).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledTimes(1);
+    firstRelease();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(2);
+
+    replacementRelease();
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe();
+    const finalRelease = await claimPlaybackOwner(Symbol('after-unsubscribe'), jest.fn());
+    finalRelease();
+    expect(listener).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps suppression continuously active while a foreign owner is being stopped', async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeSubmittedRecordingPlaybackActive(listener);
+    const stopped = deferred<void>();
+    let oldRelease: () => void = () => {
+      throw new Error('old release was not installed');
+    };
+    const previousStop = jest.fn(() => {
+      expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+      oldRelease();
+      return stopped.promise;
+    });
+    oldRelease = await claimPlaybackOwner(Symbol('old'), previousStop);
+    const claim = claimPlaybackOwner(Symbol('new'), jest.fn());
+    await flushMicrotasks();
+    expect(previousStop).toHaveBeenCalledTimes(1);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+
+    stopped.resolve();
+    const newRelease = await claim;
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    oldRelease();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+    newRelease();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
+
+  it('publishes inactive and leaves no owner when replacing-owner teardown fails', async () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeSubmittedRecordingPlaybackActive(listener);
+    const failure = new Error('could not stop native player');
+    await claimPlaybackOwner(Symbol('failing-old'), () => {
+      throw failure;
+    });
+
+    await expect(claimPlaybackOwner(Symbol('never-claimed'), jest.fn())).rejects.toBe(failure);
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(2);
+    await expect(stopActivePlayback()).resolves.toBeUndefined();
+    unsubscribe();
+  });
+
+  it('serializes a queued stop behind a foreign claim and stops the newly installed owner', async () => {
+    const oldStopped = deferred<void>();
+    const oldStop = jest.fn(() => oldStopped.promise);
+    const newStop = jest.fn();
+    await claimPlaybackOwner(Symbol('queued-old'), oldStop);
+    const claim = claimPlaybackOwner(Symbol('queued-new'), newStop);
+    const stop = stopActivePlayback();
+    await flushMicrotasks();
+    expect(oldStop).toHaveBeenCalledTimes(1);
+    expect(newStop).not.toHaveBeenCalled();
+
+    oldStopped.resolve();
+    await claim;
+    await stop;
+    expect(newStop).toHaveBeenCalledTimes(1);
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
   });
 });

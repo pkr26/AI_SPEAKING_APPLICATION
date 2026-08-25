@@ -126,6 +126,14 @@ test('provenance fingerprints both split S3 destinations and no obsolete single-
   assert.equal(mutationEnvironmentVariableNames.includes('S3_REGION'), false);
 });
 
+test('provenance fingerprints every documented server environment variable', async () => {
+  const example = await fs.readFile(path.join(serverDirectory, '.env.example'), 'utf8');
+  const documentedNames = [...example.matchAll(/^([A-Z][A-Z0-9_]*)=/gm)].map((match) => match[1]);
+  const missingNames = documentedNames.filter((name) => !mutationEnvironmentVariableNames.includes(name));
+
+  assert.deepEqual(missingNames, []);
+});
+
 test('catalog Stryker config uses bounded parallelism and routes reporters into the wrapper staging directory', async () => {
   const previous = process.env.MUTATION_REPORT_DIR;
   const staging = path.join(os.tmpdir(), 'catalog-provenance-staging');

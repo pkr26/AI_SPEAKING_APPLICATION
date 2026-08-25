@@ -16,7 +16,7 @@ concurrency:
 jobs:
   server-code:
     runs-on: ubuntu-24.04
-    # Nineteen disjoint source/test lanes retain static mutants without making
+    # Twenty-one disjoint source/test lanes retain static mutants without making
     # each one reload the complete integration suite. They run sequentially
     # because every lane recreates the same guarded mutation database.
     timeout-minutes: 360

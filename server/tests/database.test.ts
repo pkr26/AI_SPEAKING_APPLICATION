@@ -188,7 +188,10 @@ describe('migration 010/011 invariants', () => {
     );
 
     await expect(pool.query('DELETE FROM questions WHERE id = $1', [question.rows[0].id])).rejects.toMatchObject({
-      code: '23503', // foreign_key_violation: attempts history survives content ops
+      // PostgreSQL 18 reports the SQL-standard RESTRICT code; older supported
+      // releases report the more specific foreign-key violation. Both prove
+      // the same required contract: attempt history prevents deletion.
+      code: expect.stringMatching(/^(23001|23503)$/),
     });
     await pool.query('DELETE FROM users WHERE id = $1', [user.rows[0].id]);
   });

@@ -50,6 +50,11 @@ jobs:
           cache: npm
           cache-dependency-path: server/package-lock.json
       - run: npm ci
+      # Server contract lanes execute the app's real pure parsers; their
+      # tsconfig extends Expo's package-owned base configuration.
+      - name: Install app contract dependencies
+        working-directory: app
+        run: npm ci
       - name: Verify media inspector dependency
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then

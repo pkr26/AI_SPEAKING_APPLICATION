@@ -5430,7 +5430,10 @@ describe('Recorder', () => {
         expect(nextResult).not.toHaveBeenCalled();
         expect(nextRecovery).not.toHaveBeenCalled();
         expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
-        expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+        // The stale stop promise and the identity cleanup are independent
+        // consumers of the same native stop. Wait for the latter's state
+        // publication instead of assuming their final microtasks are ordered.
+        await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
       },
     );
 

@@ -136,9 +136,10 @@ jobs:
       # Docker to report it healthy. Boot gating refuses traffic until the
       # release schema and question catalog exist, so provision the service's
       # default database with the image's own compiled migration/catalog
-      # commands first. NODE_ENV=development permits MOCK_AI and the local
-      # upload fallback; the baked-in production mode rejects MOCK_AI and
-      # requires distinct diagnostic and practice S3 buckets.
+      # commands first. NODE_ENV=test permits MOCK_AI and the local upload
+      # fallback without loading development-only transports such as
+      # pino-pretty from the production-pruned image. The baked-in production
+      # mode rejects MOCK_AI and requires distinct S3 buckets.
       - name: Exercise container healthcheck
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
@@ -149,7 +150,7 @@ jobs:
           docker run --rm --network host -e DATABASE_URL ai-english-server:ci \
             sh -c "node dist/db/run.js migrate && node dist/db/run.js catalog"
           docker run --detach --name ai-english-healthcheck --network host \
-            -e NODE_ENV=development \
+            -e NODE_ENV=test \
             -e DATABASE_URL \
             -e JWT_SECRET \
             -e MOCK_AI=true \

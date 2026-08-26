@@ -15,6 +15,7 @@ import {
   parsePracticeQuestion,
   parsePracticeStats,
   parseRecordingExportPage,
+  parseRecordingItem,
   parseRecordingPage,
   parseRecordingPlaybackGrant,
   parseUser,
@@ -2323,5 +2324,315 @@ describe('user data export page parser', () => {
 describe('CEFR level order', () => {
   it('pins the promotion ladder', () => {
     expect(CEFR_LEVELS).toEqual(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']);
+  });
+});
+
+describe('recording contract mutation boundaries', () => {
+  const recordingId = '550e8400-e29b-41d4-a716-446655440050';
+  const otherRecordingId = '550e8400-e29b-41d4-a716-446655440051';
+  const requestId = '550e8400-e29b-41d4-a716-446655440052';
+  const cursor = '550e8400-e29b-41d4-a716-446655440053';
+  const timestamp = '2026-08-25T00:00:00.000Z';
+  const availableAt = '2026-08-25T00:00:01.000Z';
+  const recording = {
+    id: recordingId,
+    questionId: question.id,
+    context: 'practice' as const,
+    promptWord: question.promptWord,
+    questionText: question.questionText,
+    cefrLevel: question.cefrLevel,
+    contentType: 'audio/mp4',
+    sizeBytes: 2_048,
+    durationMs: 8_000,
+    status: 'available' as const,
+    createdAt: timestamp,
+    availableAt,
+  };
+
+  const signedPlaybackUrl = ({
+    protocol = 'https',
+    authority = 'private.s3.us-west-1.amazonaws.com',
+    expiresIn = 60,
+    algorithm = 'AWS4-HMAC-SHA256',
+    omit,
+    fragment = '',
+  }: {
+    protocol?: string;
+    authority?: string;
+    expiresIn?: number;
+    algorithm?: string;
+    omit?: string;
+    fragment?: string;
+  } = {}): string => {
+    const params = new URLSearchParams({
+      'X-Amz-Algorithm': algorithm,
+      'X-Amz-Credential': 'credential',
+      'X-Amz-Date': '20260825T000000Z',
+      'X-Amz-Expires': String(expiresIn),
+      'X-Amz-SignedHeaders': 'host',
+      'X-Amz-Signature': 'signature',
+    });
+    if (omit !== undefined) params.delete(omit);
+    return `${protocol}://${authority}/object?${params.toString()}${fragment}`;
+  };
+
+  const playbackGrant = (expiresIn = 60) => ({
+    recordingId,
+    playbackUrl: signedPlaybackUrl({ expiresIn }),
+    expiresIn,
+    contentType: 'audio/mp4',
+  });
+
+  it('preserves optional recording ids without materializing absent fields', () => {
+    const diagnostic = {
+      passed: true,
+      score: 80,
+      transcript: 'A complete answer.',
+      feedback: 'Good.',
+      done: true,
+      level: 'B1',
+    } as const;
+    const diagnosticWithRecording = { ...diagnostic, recordingId };
+
+    expect(parseDiagnosticAnswerResult(diagnostic)).toStrictEqual(diagnostic);
+    expect(Object.hasOwn(parseDiagnosticAnswerResult(diagnostic), 'recordingId')).toBe(false);
+    expect(parseDiagnosticAnswerResult(diagnosticWithRecording)).toStrictEqual(
+      diagnosticWithRecording,
+    );
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({ ...diagnostic, recordingId: 'not-a-uuid' }),
+    );
+
+    const english = {
+      passed: true,
+      mastered: false,
+      attemptNo: 1,
+      score: 70,
+      transcript: 'A complete answer.',
+      feedback: 'Good.',
+      next: practicePayload,
+    } as const;
+    expect(parseAttemptResult(english)).toStrictEqual(english);
+    expect(Object.hasOwn(parseAttemptResult(english), 'recordingId')).toBe(false);
+
+    const native = {
+      mode: 'native',
+      understood: true,
+      transcript: 'జవాబు.',
+      modelAnswer: 'An answer.',
+      feedback: 'Good.',
+    } as const;
+    const nativeWithRecording = { ...native, recordingId };
+    expect(parseNativeAttemptResult(native)).toStrictEqual(native);
+    expect(Object.hasOwn(parseNativeAttemptResult(native), 'recordingId')).toBe(false);
+    expect(parseNativeAttemptResult(nativeWithRecording)).toStrictEqual(nativeWithRecording);
+    expectContractError(() => parseNativeAttemptResult({ ...native, recordingId: 'not-a-uuid' }));
+  });
+
+  it.each([
+    ['diagnostic', { context: 'diagnostic' }],
+    ['practice', { context: 'practice' }],
+    ['practice-native', { context: 'practice-native' }],
+    ['null duration', { durationMs: null }],
+    ['one-byte object', { sizeBytes: 1 }],
+    ['maximum-size object', { sizeBytes: 25 * 1024 * 1024 }],
+    ['minimum duration', { durationMs: 500 }],
+    ['maximum duration', { durationMs: 120_500 }],
+    ['retention pending', { status: 'retention_pending', availableAt: null }],
+    ['unavailable', { status: 'unavailable', availableAt: null }],
+  ])('accepts recording metadata at the %s boundary', (_label, patch) => {
+    const value = { ...recording, ...patch };
+    expect(parseRecordingItem(value)).toStrictEqual(value);
+  });
+
+  it.each([
+    ['an unknown context', { context: 'homework' }],
+    ['one byte above the size cap', { sizeBytes: 25 * 1024 * 1024 + 1 }],
+    ['a string duration', { durationMs: '500' }],
+    ['a fractional duration', { durationMs: 500.5 }],
+    ['one millisecond below the duration floor', { durationMs: 499 }],
+    ['one millisecond above the duration ceiling', { durationMs: 120_501 }],
+    ['an unknown status', { status: 'deleted', availableAt: null }],
+  ])('rejects recording metadata with %s and no masking error', (_label, patch) => {
+    expectContractError(() => parseRecordingItem({ ...recording, ...patch }));
+  });
+
+  it('rejects a non-record recording item with the public contract error', () => {
+    expectContractError(() => parseRecordingItem(null));
+  });
+
+  it('enforces every recording-page envelope and pagination boundary', () => {
+    const fifty = Array.from({ length: 50 }, () => recording);
+    expect(parseRecordingPage({ items: [], nextCursor: null })).toStrictEqual({
+      items: [],
+      nextCursor: null,
+    });
+    expect(parseRecordingPage({ items: [recording], nextCursor: cursor })).toStrictEqual({
+      items: [recording],
+      nextCursor: cursor,
+    });
+    expect(parseRecordingPage({ items: fifty, nextCursor: cursor })).toStrictEqual({
+      items: fifty,
+      nextCursor: cursor,
+    });
+    expectContractError(() => parseRecordingPage(null));
+    expectContractError(() => parseRecordingPage({ items: 'recordings', nextCursor: null }));
+    expectContractError(() =>
+      parseRecordingPage({ items: [...fifty, recording], nextCursor: null }),
+    );
+    expectContractError(() => parseRecordingPage({ items: [recording], nextCursor: 'next' }));
+    expectContractError(() => parseRecordingPage({ items: [], nextCursor: cursor }));
+  });
+
+  it('enforces every recording-export envelope, row, and pagination boundary', () => {
+    const exportRecording = { ...recording, requestId, attemptId: null };
+    const fiveHundred = Array.from({ length: 500 }, () => exportRecording);
+    expect(parseRecordingExportPage({ recordings: [], nextCursor: null })).toStrictEqual({
+      recordings: [],
+      nextCursor: null,
+    });
+    expect(
+      parseRecordingExportPage({ recordings: [exportRecording], nextCursor: cursor }),
+    ).toStrictEqual({ recordings: [exportRecording], nextCursor: cursor });
+    expect(parseRecordingExportPage({ recordings: fiveHundred, nextCursor: cursor })).toStrictEqual(
+      { recordings: fiveHundred, nextCursor: cursor },
+    );
+    expect(
+      parseRecordingExportPage({
+        recordings: [{ ...exportRecording, attemptId: otherRecordingId }],
+        nextCursor: null,
+      }),
+    ).toStrictEqual({
+      recordings: [{ ...exportRecording, attemptId: otherRecordingId }],
+      nextCursor: null,
+    });
+    expectContractError(() => parseRecordingExportPage(null));
+    expectContractError(() =>
+      parseRecordingExportPage({ recordings: 'recordings', nextCursor: null }),
+    );
+    expectContractError(() =>
+      parseRecordingExportPage({
+        recordings: [...fiveHundred, exportRecording],
+        nextCursor: null,
+      }),
+    );
+    expectContractError(() =>
+      parseRecordingExportPage({ recordings: [exportRecording], nextCursor: 'next' }),
+    );
+    expectContractError(() => parseRecordingExportPage({ recordings: [], nextCursor: cursor }));
+    expectContractError(() =>
+      parseRecordingExportPage({
+        recordings: [{ ...exportRecording, requestId: 'not-a-uuid' }],
+        nextCursor: null,
+      }),
+    );
+    expectContractError(() =>
+      parseRecordingExportPage({
+        recordings: [{ ...exportRecording, attemptId: 'not-a-uuid' }],
+        nextCursor: null,
+      }),
+    );
+  });
+
+  it('accepts both playback lifetime boundaries and an omitted expected id', () => {
+    for (const expiresIn of [30, 300]) {
+      expect(parseRecordingPlaybackGrant(playbackGrant(expiresIn))).toStrictEqual(
+        playbackGrant(expiresIn),
+      );
+    }
+  });
+
+  it('accepts a fully signed playback URL exactly at the response length cap', () => {
+    const ordinary = signedPlaybackUrl();
+    const query = ordinary.slice(ordinary.indexOf('?'));
+    const prefix = 'https://private.s3.us-west-1.amazonaws.com/';
+    const playbackUrl = `${prefix}${'x'.repeat(16_384 - prefix.length - query.length)}${query}`;
+    const grant = { ...playbackGrant(), playbackUrl };
+
+    expect(playbackUrl).toHaveLength(16_384);
+    expect(parseRecordingPlaybackGrant(grant, recordingId)).toStrictEqual(grant);
+  });
+
+  it.each([
+    ['cleartext transport', signedPlaybackUrl({ protocol: 'http' })],
+    ['a non-AWS host', signedPlaybackUrl({ authority: 'attacker.example' })],
+    ['a username', signedPlaybackUrl({ authority: 'user@private.s3.us-west-1.amazonaws.com' })],
+    ['a password', signedPlaybackUrl({ authority: ':secret@private.s3.us-west-1.amazonaws.com' })],
+    ['a fragment', signedPlaybackUrl({ fragment: '#fragment' })],
+    ['the wrong algorithm', signedPlaybackUrl({ algorithm: 'AWS3' })],
+    ['no algorithm', signedPlaybackUrl({ omit: 'X-Amz-Algorithm' })],
+    ['no credential', signedPlaybackUrl({ omit: 'X-Amz-Credential' })],
+    ['no signing date', signedPlaybackUrl({ omit: 'X-Amz-Date' })],
+    ['no signed headers', signedPlaybackUrl({ omit: 'X-Amz-SignedHeaders' })],
+    ['no signature', signedPlaybackUrl({ omit: 'X-Amz-Signature' })],
+    ['a mismatched signed expiry', signedPlaybackUrl({ expiresIn: 61 })],
+    ['invalid URL syntax', 'https://['],
+  ])('rejects an otherwise-valid playback URL with %s', (_label, playbackUrl) => {
+    expectContractError(() =>
+      parseRecordingPlaybackGrant({ ...playbackGrant(), playbackUrl }, recordingId),
+    );
+  });
+
+  it('rejects malformed playback envelopes, ids, and lifetimes independently', () => {
+    expectContractError(() => parseRecordingPlaybackGrant(null));
+    expectContractError(() =>
+      parseRecordingPlaybackGrant({ ...playbackGrant(), recordingId: 'not-a-uuid' }),
+    );
+    expectContractError(() => parseRecordingPlaybackGrant(playbackGrant(), otherRecordingId));
+    for (const expiresIn of [29, 301]) {
+      expectContractError(() => parseRecordingPlaybackGrant(playbackGrant(expiresIn), recordingId));
+    }
+    for (const expiresIn of ['60', 60.5, Number.NaN]) {
+      expectContractError(() =>
+        parseRecordingPlaybackGrant({ ...playbackGrant(), expiresIn }, recordingId),
+      );
+    }
+  });
+});
+
+describe('history recording-field mutation boundaries', () => {
+  const recordingId = '550e8400-e29b-41d4-a716-446655440060';
+  const item = {
+    id: '550e8400-e29b-41d4-a716-446655440061',
+    questionId: question.id,
+    promptWord: question.promptWord,
+    questionText: question.questionText,
+    cefrLevel: question.cefrLevel,
+    context: 'practice' as const,
+    attemptNo: 1,
+    score: 70,
+    passed: true,
+    transcript: 'A complete answer.',
+    feedback: 'Good.',
+    createdAt: '2026-08-25T00:00:00.000Z',
+  };
+
+  const parseItem = (value: unknown) =>
+    parsePracticeHistory({ items: [value], nextCursor: null }).items[0];
+
+  it('preserves each valid recording-field state exactly', () => {
+    expect(parseItem(item)).toStrictEqual(item);
+    expect(Object.hasOwn(parseItem(item)!, 'recordingId')).toBe(false);
+
+    const deleted = { ...item, recordingId: null, recordingStatus: null };
+    expect(parseItem(deleted)).toStrictEqual(deleted);
+
+    for (const recordingStatus of ['retention_pending', 'available', 'unavailable']) {
+      const retained = { ...item, recordingId, recordingStatus };
+      expect(parseItem(retained)).toStrictEqual(retained);
+    }
+  });
+
+  it.each([
+    ['a null id with a status', { recordingId: null, recordingStatus: 'available' }],
+    ['a UUID with null status', { recordingId, recordingStatus: null }],
+    ['an undefined id with null status', { recordingId: undefined, recordingStatus: null }],
+    ['a null id with undefined status', { recordingId: null, recordingStatus: undefined }],
+    ['a UUID with undefined status', { recordingId, recordingStatus: undefined }],
+    ['an undefined id with a status', { recordingId: undefined, recordingStatus: 'available' }],
+    ['a malformed id with a status', { recordingId: 'not-a-uuid', recordingStatus: 'available' }],
+    ['a UUID with an unknown status', { recordingId, recordingStatus: 'deleted' }],
+  ])('rejects history recording fields with %s', (_label, fields) => {
+    expectContractError(() => parseItem({ ...item, ...fields }));
   });
 });

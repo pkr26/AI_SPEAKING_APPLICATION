@@ -115,6 +115,19 @@ describe('reminder hour validation', () => {
     // anything else (a callable, say) is not one, however well-formed it looks.
     expect(parseDailyReminder(Object.assign(() => undefined, { hour: 8 }))).toBeNull();
   });
+
+  it('round-trips every supported UI language and rejects every other stored language', () => {
+    for (const uiLanguage of ['en', 'te', 'hi', 'es', 'zh'] as const) {
+      expect(parseDailyReminder({ hour: 8, uiLanguage })).toStrictEqual({ hour: 8, uiLanguage });
+    }
+    for (const uiLanguage of ['', 'fr', 'EN', null, 7, true]) {
+      expect(parseDailyReminder({ hour: 8, uiLanguage })).toBeNull();
+    }
+
+    const legacy = parseDailyReminder({ hour: 8 });
+    expect(legacy).toStrictEqual({ hour: 8 });
+    expect(legacy).not.toHaveProperty('uiLanguage');
+  });
 });
 
 describe('getDailyReminder', () => {

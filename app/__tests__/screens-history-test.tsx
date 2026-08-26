@@ -1,13 +1,21 @@
 import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { StyleSheet, useColorScheme } from 'react-native';
+import { SectionList, StyleSheet, useColorScheme } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import HistoryScreen, { groupHistoryByDay } from '../src/app/history';
+import HistoryNativeAdCard from '../src/components/HistoryNativeAdCard';
+import RecordingPlayback from '../src/components/RecordingPlayback';
 import { apiGetPracticeHistory, ApiError } from '../src/lib/api';
 import { type SessionLease, useAuth } from '../src/lib/auth';
-import { I18nProvider, setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
+import {
+  I18nProvider,
+  setActiveLanguage,
+  translateFor,
+  type MessageKey,
+  type UiLanguage,
+} from '../src/lib/i18n';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import {
   PRACTICE_MASTER_SCORE,
@@ -22,6 +30,21 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
 
 const asMock = (fn: unknown) => fn as jest.Mock;
 
+// Keep React Native's real SectionList behavior while retaining the exact
+// route-level props that the host RCTScrollView does not expose.
+jest.mock('react-native', () => {
+  const actual = jest.requireActual<typeof import('react-native')>('react-native');
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  const MockSectionList = jest.fn((props: Record<string, unknown>) =>
+    ReactActual.createElement(actual.SectionList as React.ElementType, props),
+  );
+  return new Proxy(actual, {
+    get(target, property, receiver) {
+      return property === 'SectionList' ? MockSectionList : Reflect.get(target, property, receiver);
+    },
+  });
+});
+
 // History renders in the light palette unless a test flips the OS scheme; the
 // dark palette carries its own on-fill ink decisions.
 jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
@@ -29,10 +52,12 @@ jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
   default: jest.fn(() => 'light'),
 }));
 
+let mockHistoryIsFocused = true;
+
 jest.mock('expo-router', () => ({
   router: { push: jest.fn(), replace: jest.fn(), back: jest.fn(), dismissTo: jest.fn() },
   useFocusEffect: jest.fn(),
-  useIsFocused: () => true,
+  useIsFocused: () => mockHistoryIsFocused,
 }));
 
 type AuthValue = ReturnType<typeof useAuth>;
@@ -102,20 +127,21 @@ jest.mock('../src/components/RecordingPlayback', () => {
   const { Text } = jest.requireActual<typeof import('react-native')>('react-native');
   return {
     __esModule: true,
-    default: ({ recordingId }: { recordingId: string }) =>
+    default: jest.fn(({ recordingId }: { recordingId: string }) =>
       ReactActual.createElement(Text, null, `recording-player:${recordingId}`),
+    ),
   };
 });
 
 jest.mock('../src/components/HistoryNativeAdCard', () => ({
   __esModule: true,
-  default: () => {
+  default: jest.fn(() => {
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const ReactActual = require('react') as typeof import('react');
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { Text } = require('react-native') as typeof import('react-native');
     return ReactActual.createElement(Text, { testID: 'history-native-ad' }, 'history-native-ad');
-  },
+  }),
 }));
 
 const mockGetHistory = apiGetPracticeHistory as jest.Mock;
@@ -229,6 +255,12 @@ function listView(): TestInstance {
   return node;
 }
 
+function sectionListProps(): Record<string, unknown> {
+  const props = asMock(SectionList).mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+  if (!props) throw new Error('No SectionList rendered');
+  return props;
+}
+
 /** The row header, addressed the way a screen reader announces it. */
 function rowHeader(promptWord: string, score: number): TestInstance {
   return screen.getByRole('button', {
@@ -324,6 +356,10 @@ beforeEach(() => {
   setActiveLanguage('en');
   mockGetHistory.mockReset();
   mockAuthValue = makeAuth();
+  mockHistoryIsFocused = true;
+  asMock(SectionList).mockClear();
+  asMock(RecordingPlayback).mockClear();
+  asMock(HistoryNativeAdCard).mockClear();
 });
 
 afterEach(async () => {
@@ -559,6 +595,19 @@ describe('history screen', () => {
       maxWidth: layout.contentMaxWidth,
       alignSelf: 'center',
     });
+    const listProps = sectionListProps();
+    expect(listProps).toMatchObject({
+      contentInsetAdjustmentBehavior: 'automatic',
+      initialNumToRender: 12,
+      onEndReachedThreshold: 0.4,
+    });
+    const sectionData = listProps.sections as { title: string; data: HistoryItem[] }[];
+    expect(sectionData.map((section) => section.data.map((item) => item.id))).toEqual([
+      ['550e8400-e29b-41d4-a716-446655440031'],
+      ['550e8400-e29b-41d4-a716-446655440044'],
+    ]);
+    const keyExtractor = listProps.keyExtractor as (item: HistoryItem) => string;
+    expect(keyExtractor(sectionData[1].data[0])).toBe('550e8400-e29b-41d4-a716-446655440044');
     // The day header pins to the top of the list while its rows scroll past on
     // iOS, so it pads its own opaque band rather than floating on margins.
     expect(flattenedStyle(screen.getByText(dayHeading('2026-08-15T10:00:00.000Z')))).toEqual({
@@ -585,6 +634,39 @@ describe('history screen', () => {
     });
     expect(screen.getByText(heading)).toBeTruthy();
     expect(screen.queryByText(dayHeading('2026-08-15T10:00:00.000Z'))).toBeNull();
+  });
+
+  it('re-groups dates and retranslates rows when the UI language changes in place', async () => {
+    const client = makeQueryClient(Infinity);
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [{ items: [historyItem()], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    let language: UiLanguage = 'en';
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <I18nProvider accountLanguage={language}>
+          <HistoryScreen />
+        </I18nProvider>
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+
+    const englishHeading = dayHeading('2026-08-15T10:00:00.000Z');
+    expect(screen.getByText(englishHeading)).toBeTruthy();
+    expect(screen.getByText(translateFor('en', 'history.contextPractice'))).toBeTruthy();
+
+    language = 'es';
+    await rendered.rerender(tree());
+
+    const spanishHeading = new Date('2026-08-15T10:00:00.000Z').toLocaleDateString('es-ES', {
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+    });
+    expect(screen.getByText(spanishHeading)).toBeTruthy();
+    expect(screen.getByText(translateFor('es', 'history.contextPractice'))).toBeTruthy();
+    if (spanishHeading !== englishHeading) expect(screen.queryByText(englishHeading)).toBeNull();
   });
 
   it('lays each answer out as a card with a touch-safe header', async () => {
@@ -845,6 +927,33 @@ describe('history screen', () => {
     await renderHistory();
     await waitFor(() => expect(screen.getByTestId('history-native-ad')).toBeTruthy());
     expect(screen.getAllByTestId('history-native-ad')).toHaveLength(1);
+    expect(flattenedStyle(parentOf(screen.getByTestId('history-native-ad')))).toEqual({
+      marginTop: 24,
+      marginBottom: 24,
+    });
+  });
+
+  it('forwards live route focus to the anchored native ad across a same-mount rerender', async () => {
+    const items = Array.from({ length: 8 }, (_, index) =>
+      historyItem({
+        id: `550e8400-e29b-41d4-a716-4466554402${String(index).padStart(2, '0')}`,
+        promptWord: `focus-word-${index + 1}`,
+      }),
+    );
+    mockGetHistory.mockResolvedValue({ items, nextCursor: null });
+    const client = makeQueryClient();
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    await screen.findByTestId('history-native-ad');
+    expect(asMock(HistoryNativeAdCard).mock.calls.at(-1)?.[0]).toEqual({ focused: true });
+
+    mockHistoryIsFocused = false;
+    await rendered.rerender(tree());
+    expect(asMock(HistoryNativeAdCard).mock.calls.at(-1)?.[0]).toEqual({ focused: false });
   });
 
   it('mounts contextual owner playback only while an expanded row has a recording', async () => {
@@ -859,8 +968,65 @@ describe('history screen', () => {
     await fireEvent.press(screen.getByRole('button', { expanded: false }));
     expect(screen.getByText(t('recordings.yourRecording'))).toBeTruthy();
     expect(screen.getByText(`recording-player:${recordingId}`)).toBeTruthy();
+    expect(asMock(RecordingPlayback).mock.calls.map(([props]) => props)).toEqual([
+      {
+        compact: true,
+        ownerId: USER.id,
+        recordingId,
+        recordingLabel: 'courage',
+        recordingStatus: 'available',
+      },
+    ]);
     await fireEvent.press(screen.getByRole('button', { expanded: true }));
     expect(screen.queryByText(`recording-player:${recordingId}`)).toBeNull();
+  });
+
+  it('keeps expansion while replacing every payload field for the same history id', async () => {
+    const firstRecordingId = '550e8400-e29b-41d4-a716-446655440090';
+    const nextRecordingId = '550e8400-e29b-41d4-a716-446655440091';
+    const first = historyItem({
+      recordingId: firstRecordingId,
+      recordingStatus: 'available',
+    });
+    const replacement = historyItem({
+      promptWord: 'bravery',
+      questionText: 'How did your bravery help somebody?',
+      transcript: 'I helped a teammate.',
+      feedback: 'Clear updated detail.',
+      recordingId: nextRecordingId,
+      recordingStatus: 'retention_pending',
+    });
+    mockGetHistory
+      .mockResolvedValueOnce({ items: [first], nextCursor: null })
+      .mockResolvedValueOnce({ items: [replacement], nextCursor: null });
+    const client = makeQueryClient();
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+    await screen.findByText('courage');
+    await fireEvent.press(rowHeader('courage', 82));
+    expect(screen.getByText('“I was brave at work.”')).toBeTruthy();
+
+    await act(async () => {
+      await client.invalidateQueries({ queryKey: ['practice-history', USER.id], exact: true });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await waitFor(() => expect(screen.getByText('bravery')).toBeTruthy());
+    expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
+    expect(screen.getByText('How did your bravery help somebody?')).toBeTruthy();
+    expect(screen.getByText('“I helped a teammate.”')).toBeTruthy();
+    expect(screen.getByText('Clear updated detail.')).toBeTruthy();
+    expect(screen.queryByText('“I was brave at work.”')).toBeNull();
+    expect(asMock(RecordingPlayback).mock.calls.at(-1)?.[0]).toEqual({
+      compact: true,
+      ownerId: USER.id,
+      recordingId: nextRecordingId,
+      recordingLabel: 'bravery',
+      recordingStatus: 'retention_pending',
+    });
   });
 
   it('sets the expanded detail block off from the row header', async () => {

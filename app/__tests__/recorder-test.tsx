@@ -99,6 +99,7 @@ import {
   AUDIO_TIMEOUT_MS,
   resolveAudioFileDescriptor,
 } from '../src/lib/api';
+import { claimPlaybackOwner, getSubmittedRecordingPlaybackActive } from '../src/lib/audio-session';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import {
   capturePendingAssessmentGeneration,
@@ -2843,6 +2844,21 @@ describe('Recorder', () => {
       expect(pulseRingProps()).toMatchObject({ accessible: false });
       expect(props.onError).not.toHaveBeenCalledWith(t('recorder.errStartFailed'));
       expect(AudioModule.requestRecordingPermissionsAsync).not.toHaveBeenCalled();
+    });
+
+    it('stops submitted-recording playback before preparing the microphone', async () => {
+      const stopPlayback = jest.fn(async () => undefined);
+      await claimPlaybackOwner(Symbol('submitted-recording'), stopPlayback);
+      expect(getSubmittedRecordingPlaybackActive()).toBe(true);
+
+      await renderRecorder();
+      await startRecording();
+
+      expect(stopPlayback).toHaveBeenCalledTimes(1);
+      expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+      expect(stopPlayback.mock.invocationCallOrder[0]).toBeLessThan(
+        mockRecorder.prepareToRecordAsync.mock.invocationCallOrder[0],
+      );
     });
 
     it('publishes and renders an operation lock while Start permission is unresolved', async () => {

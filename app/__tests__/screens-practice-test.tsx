@@ -11,6 +11,7 @@ import AttemptScreen from '../src/app/practice/attempt';
 import FeedbackScreen from '../src/app/practice/feedback';
 import HelpScreen from '../src/app/practice/help';
 import PracticeScreen from '../src/app/practice/index';
+import RecordingPlayback from '../src/components/RecordingPlayback';
 import { ApiError, apiFetch, apiSkipPracticeWord } from '../src/lib/api';
 import { LogoutCleanupError, useAuth, type SessionLease } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
@@ -139,10 +140,22 @@ interface CapturedRecorderProps {
 }
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
+let mockRecorderInstanceSerial = 0;
+let mockRecorderMounts: number[] = [];
+let mockRecorderUnmounts: number[] = [];
 
 // A host node stands in for the real recorder so tests can reach the slot the
 // screens reserve for it (`styles.recorderArea`) the same way a user's eye does.
 function MockRecorder(props: CapturedRecorderProps) {
+  const instanceRef = React.useRef<number | null>(null);
+  if (instanceRef.current === null) instanceRef.current = ++mockRecorderInstanceSerial;
+  React.useEffect(() => {
+    const instance = instanceRef.current!;
+    mockRecorderMounts.push(instance);
+    return () => {
+      mockRecorderUnmounts.push(instance);
+    };
+  }, []);
   React.useEffect(() => {
     mockRecorderProps = props;
   });
@@ -156,11 +169,11 @@ jest.mock('../src/components/Recorder', () => ({
 
 jest.mock('../src/components/RecordingPlayback', () => ({
   __esModule: true,
-  default: ({ recordingId }: { recordingId: string }) => {
+  default: jest.fn(({ recordingId }: { recordingId: string }) => {
     const ReactActual = jest.requireActual<typeof import('react')>('react');
     const { Text: NativeText } = jest.requireActual<typeof import('react-native')>('react-native');
     return ReactActual.createElement(NativeText, null, `recording-player:${recordingId}`);
-  },
+  }),
 }));
 
 // ----- auth mock -----
@@ -538,6 +551,10 @@ beforeEach(() => {
   mockApiFetch.mockReset();
   mockSkipWord.mockReset();
   mockRecorderProps = null;
+  mockRecorderInstanceSerial = 0;
+  mockRecorderMounts = [];
+  mockRecorderUnmounts = [];
+  asMock(RecordingPlayback).mockClear();
   mockSearchParams = {};
   mockCurrentNavigation = mockNavigation;
   mockDeferFocusSetup = false;
@@ -732,6 +749,26 @@ describe('practice home screen', () => {
 
     expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
+  });
+
+  it('remounts the practice Recorder when answer mode changes endpoint in place', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rerenderScreen = await renderRerenderable(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    expect(mockRecorderMounts).toHaveLength(1);
+    const englishInstance = mockRecorderMounts[0];
+    expect(recorderProps().endpoint).toBe('/practice/attempt');
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await act(async () => {
+      await rerenderScreen(<PracticeScreen />);
+    });
+
+    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
+    expect(recorderProps().parseResult).toBe(parseNativeAttemptResult);
+    expect(mockRecorderMounts).toHaveLength(2);
+    expect(mockRecorderUnmounts).toEqual([englishInstance]);
+    expect(mockRecorderMounts[1]).not.toBe(englishInstance);
   });
 
   it('gives the language switch a touch-safe target and outlined off state', async () => {
@@ -1603,6 +1640,27 @@ describe('practice attempt screen', () => {
     expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
   });
 
+  it('remounts the Practice Mode Recorder when answer mode changes endpoint in place', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    expect(mockRecorderMounts).toHaveLength(1);
+    const englishInstance = mockRecorderMounts[0];
+    expect(recorderProps().endpoint).toBe('/practice/attempt');
+
+    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
+    await act(async () => {
+      await rerenderScreen(<AttemptScreen />);
+    });
+
+    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
+    expect(recorderProps().parseResult).toBe(parseNativeAttemptResult);
+    expect(mockRecorderMounts).toHaveLength(2);
+    expect(mockRecorderUnmounts).toEqual([englishInstance]);
+    expect(mockRecorderMounts[1]).not.toBe(englishInstance);
+  });
+
   it('locks the help-entry language switch during recording and submission', async () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockResolvedValue(HELP_CONTENT);
@@ -2125,6 +2183,16 @@ describe('practice feedback screen', () => {
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
   });
 
+  it('does not mount submitted-recording playback when the outcome omits its additive id', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+
+    expect(screen.queryByText(t('recordings.yourRecording'))).toBeNull();
+    expect(asMock(RecordingPlayback)).not.toHaveBeenCalled();
+  });
+
   it('shows contextual submitted-recording playback when the additive id is present', async () => {
     const recordingId = '550e8400-e29b-41d4-a716-446655440090';
     mockPracticeFlow = makePracticeFlow({
@@ -2133,6 +2201,9 @@ describe('practice feedback screen', () => {
     await renderScreen(<FeedbackScreen />);
     expect(screen.getByText(t('recordings.yourRecording'))).toBeTruthy();
     expect(screen.getByText(`recording-player:${recordingId}`)).toBeTruthy();
+    expect(asMock(RecordingPlayback).mock.calls.map(([props]) => props)).toEqual([
+      { ownerId: USER.id, recordingId },
+    ]);
   });
 
   it('renders the mastered variant and seeds the next question', async () => {

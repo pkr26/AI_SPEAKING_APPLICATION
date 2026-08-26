@@ -146,6 +146,11 @@ const LANGUAGE_CHIPS = [
   { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
 ] as const;
 
+const UI_LANGUAGE_CHIPS = [
+  { code: 'en', english: 'English', native: 'English' },
+  ...LANGUAGE_CHIPS,
+] as const;
+
 const chipLabel = (index: number) =>
   `${LANGUAGE_CHIPS[index].english}, ${LANGUAGE_CHIPS[index].native}`;
 
@@ -295,6 +300,13 @@ function languageChip(index: number): TestInstance {
 function appLanguageChip(index: number): TestInstance {
   return screen.getByRole('button', {
     name: `${t('settings.appLanguageLabel')}: ${chipLabel(index)}`,
+  });
+}
+
+function uiLanguageChip(index: number): TestInstance {
+  const language = UI_LANGUAGE_CHIPS[index];
+  return screen.getByRole('button', {
+    name: `${t('settings.appLanguageLabel')}: ${language.english}, ${language.native}`,
   });
 }
 
@@ -455,6 +467,45 @@ describe('settings profile card', () => {
       expect(within(chip).getByText(language.native)).toBeTruthy();
       expect(within(chip).getByText(language.english)).toBeTruthy();
     }
+  });
+
+  it('renders every app-language prop, label, and selected style exactly', async () => {
+    await renderSettings();
+
+    expect(screen.getByText(t('settings.appLanguageLabel'))).toBeTruthy();
+    expect(screen.getByText(t('settings.learningLanguageLabel'))).toBeTruthy();
+    const helpStyle = {
+      marginBottom: spacing.sm,
+      color: colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
+    };
+    expect(flattenedStyle(screen.getByText(t('settings.appLanguageHelp')))).toEqual(helpStyle);
+    expect(flattenedStyle(screen.getByText(t('settings.learningLanguageHelp')))).toEqual(helpStyle);
+
+    for (const [index, language] of UI_LANGUAGE_CHIPS.entries()) {
+      const chip = uiLanguageChip(index);
+      expect(chip.props.accessibilityState).toMatchObject({
+        selected: index === 0,
+        disabled: false,
+      });
+      expect(flattenedStyle(chip)).toMatchObject({
+        flexBasis: '47%',
+        flexGrow: 1,
+        borderWidth: 1.5,
+        borderColor: index === 0 ? colors.primary : colors.inputBorder,
+        borderRadius: radii.input,
+        paddingVertical: spacing.md,
+        alignItems: 'center',
+        backgroundColor: index === 0 ? colors.primaryLight : colors.card,
+      });
+      expect(flattenedStyle(chip).opacity).toBeUndefined();
+      const nativeCopy = within(chip).getAllByText(language.native)[0];
+      const englishCopy = within(chip).getAllByText(language.english).at(-1)!;
+      expect(flattenedStyle(nativeCopy).color).toBe(index === 0 ? colors.primary : colors.text);
+      expect(flattenedStyle(englishCopy).color).toBe(index === 0 ? colors.primary : colors.muted);
+    }
+    expect(languageSpinners()).toHaveLength(0);
   });
 
   it('sends the code of the tapped chip, Spanish and Chinese included', async () => {
@@ -932,6 +983,74 @@ describe('settings profile card', () => {
     expect(mockEnableReminder).not.toHaveBeenCalled();
   });
 
+  it('keeps the selected app language inert and submits a new one once per render', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(0));
+    expect(mockUpdateProfile).not.toHaveBeenCalled();
+
+    const chooseHindi = committedPressHandler(uiLanguageChip(2));
+    await act(async () => {
+      void chooseHindi();
+      void chooseHindi();
+      await Promise.resolve();
+    });
+
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
+    expect(mockUpdateProfile).toHaveBeenCalledWith({ uiLanguage: 'hi' });
+    for (const [index] of UI_LANGUAGE_CHIPS.entries()) {
+      const chip = uiLanguageChip(index);
+      expect(chip.props.accessibilityState).toMatchObject({
+        selected: index === 0,
+        disabled: true,
+      });
+      expect(flattenedStyle(chip).opacity).toBe(index === 0 ? undefined : 0.5);
+    }
+    expect(languageSpinners()).toHaveLength(1);
+    expect(flattenedStyle(languageSpinners()[0])).toEqual({ marginTop: spacing.sm });
+
+    await act(async () => {
+      update.resolve({ ...USER, uiLanguage: 'hi' });
+      await Promise.resolve();
+    });
+    expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
+    for (const [index] of UI_LANGUAGE_CHIPS.entries()) {
+      expect(uiLanguageChip(index).props.accessibilityState).toMatchObject({ disabled: false });
+    }
+    expect(languageSpinners()).toHaveLength(0);
+  });
+
+  it('scopes a current app-language PATCH failure to the app-language controls', async () => {
+    mockUpdateProfile.mockRejectedValue(new Error('offline'));
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(2));
+
+    const errors = await screen.findAllByRole('alert');
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toHaveTextContent(t('settings.updateFailed'));
+    expect(languageSpinners()).toHaveLength(0);
+    expect(uiLanguageChip(2).props.accessibilityState).toMatchObject({ disabled: false });
+  });
+
+  it('publishes no stale app-language failure or finalizer after identity replacement', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    const view = await renderSettings();
+    await fireEvent.press(uiLanguageChip(2));
+    expect(mockUpdateProfile).toHaveBeenCalledWith({ uiLanguage: 'hi' });
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    mockSetOptions.mockClear();
+    update.reject(new Error('late failure'));
+    await act(async () => Promise.resolve());
+
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
   it('re-schedules an enabled daily reminder in the new language', async () => {
     mockGetReminder.mockResolvedValue({ hour: 19 });
     mockRefreshReminderLanguage.mockResolvedValue({ hour: 19 });
@@ -1239,6 +1358,143 @@ describe('settings profile card', () => {
     await act(async () => Promise.resolve());
 
     expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+    expect(mockSetOptions).not.toHaveBeenCalled();
+  });
+
+  it('single-flights privacy options, blocks retained navigation, and cleanly re-arms', async () => {
+    const privacyResult = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockReturnValueOnce(privacyResult.promise);
+    await renderSettings();
+
+    const privacyButton = () => screen.getByRole('button', { name: t('ads.privacyOptions') });
+    await expectPressFeedback(
+      privacyButton,
+      { borderBottomWidth: 1 },
+      { backgroundColor: colors.background },
+    );
+    const openPrivacy = committedPressHandler(privacyButton());
+    const retainedRecordings = committedPressHandler(
+      screen.getByRole('button', { name: t('header.recordings') }),
+    );
+    await act(async () => {
+      void openPrivacy();
+      void openPrivacy();
+      await Promise.resolve();
+    });
+
+    expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(1);
+    expect(privacyButton().props.accessibilityState).toEqual({ busy: true, disabled: true });
+    expect(flattenedStyle(privacyButton()).opacity).toBe(0.5);
+    const privacySpinner = screen.container.queryAll(
+      (node) =>
+        node.type === 'ActivityIndicator' &&
+        node.props.accessibilityLabel === t('ads.privacyOptions'),
+    );
+    expect(privacySpinner).toHaveLength(1);
+    expect(flattenedStyle(privacySpinner[0])).toEqual({ marginTop: spacing.sm });
+    expect(flattenedStyle(screen.getByText(t('ads.privacyOptionsHelp')))).toEqual({
+      marginTop: spacing.md,
+      color: colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
+    });
+
+    await act(async () => retainedRecordings());
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    privacyResult.resolve(true);
+    await waitFor(() =>
+      expect(privacyButton().props.accessibilityState).toEqual({ busy: false, disabled: false }),
+    );
+    expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+    expect(
+      screen.container.queryAll(
+        (node) =>
+          node.type === 'ActivityIndicator' &&
+          node.props.accessibilityLabel === t('ads.privacyOptions'),
+      ),
+    ).toHaveLength(0);
+
+    mockShowAdPrivacyOptions.mockResolvedValueOnce(true);
+    await fireEvent.press(privacyButton());
+    expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(2);
+  });
+
+  it('shows the dedicated privacy error for a current rejected form', async () => {
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockRejectedValueOnce(new Error('UMP unavailable'));
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('ads.privacyFailed'));
+    expect(
+      screen.getByRole('button', { name: t('ads.privacyOptions') }).props.accessibilityState,
+    ).toEqual({ busy: false, disabled: false });
+  });
+
+  it('does not let an old privacy operation release its replacement owner', async () => {
+    const oldPrivacy = deferred<boolean>();
+    const newPrivacy = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions
+      .mockReturnValueOnce(oldPrivacy.promise)
+      .mockReturnValueOnce(newPrivacy.promise);
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(2);
+
+    mockSetOptions.mockClear();
+    oldPrivacy.reject(new Error('old account failed'));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('ads.privacyOptions') }).props.accessibilityState,
+    ).toEqual({ busy: true, disabled: true });
+    expect(mockSetOptions).not.toHaveBeenCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
+    const preventDefault = jest.fn();
+    mockBeforeRemoveListener?.({
+      data: { action: { type: 'GO_BACK' } },
+      preventDefault,
+    });
+    expect(preventDefault).toHaveBeenCalledTimes(1);
+
+    newPrivacy.resolve(true);
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: t('ads.privacyOptions') }).props.accessibilityState,
+      ).toEqual({ busy: false, disabled: false }),
+    );
+  });
+
+  it('does not publish a privacy finalizer after its session lease expires', async () => {
+    const privacyResult = deferred<boolean>();
+    let leaseCurrent = true;
+    mockPrivacyOptionsRequired = true;
+    mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
+    mockShowAdPrivacyOptions.mockReturnValueOnce(privacyResult.promise);
+    await renderSettings();
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+
+    leaseCurrent = false;
+    mockSetOptions.mockClear();
+    privacyResult.resolve(true);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
     expect(mockSetOptions).not.toHaveBeenCalled();
   });
 
@@ -1664,6 +1920,112 @@ describe('data export', () => {
     expect(lastFileContents).not.toContain('playbackUrl');
     expect(lastFileContents).not.toContain('audioKey');
     expect(lastFileContents).not.toContain('s3VersionId');
+  });
+
+  it('streams multiple recording pages with one prefix and exact comma and encoding options', async () => {
+    const firstRecording = { id: 'recording-one', status: 'available' };
+    const secondRecording = { id: 'recording-two', status: 'unavailable' };
+    const thirdRecording = { id: 'recording-three', status: 'retention_pending' };
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await consumeRecordings(
+        {
+          recordings: [firstRecording, secondRecording],
+          nextCursor: '550e8400-e29b-41d4-a716-446655440041',
+        },
+        0,
+      );
+      await consumeRecordings({ recordings: [thirdRecording], nextCursor: null }, 1);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(lastFileContents).toBe(
+      JSON.stringify({
+        user: USER,
+        attempts: [],
+        recordings: [firstRecording, secondRecording, thirdRecording],
+      }),
+    );
+    expect(mockWrite).toHaveBeenNthCalledWith(2, '],"recordings":[', {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(
+      3,
+      `${JSON.stringify(firstRecording)},${JSON.stringify(secondRecording)}`,
+      { append: true, encoding: 'utf8' },
+    );
+    expect(mockWrite).toHaveBeenNthCalledWith(4, `,${JSON.stringify(thirdRecording)}`, {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockShareAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts a recording callback delivered before the user document exists', async () => {
+    let exportSignal: AbortSignal | undefined;
+    mockConsumeExportPages.mockImplementation(async (_consumePage, consumeRecordings, signal) => {
+      exportSignal = signal;
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(exportSignal?.aborted).toBe(true);
+    expect(mockFile).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('aborts a recording callback after its session lease expires', async () => {
+    let leaseCurrent = true;
+    let exportSignal: AbortSignal | undefined;
+    mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings, signal) => {
+      exportSignal = signal;
+      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      leaseCurrent = false;
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(exportSignal?.aborted).toBe(true);
+    expect(lastFileContents).toBe(`{"user":${JSON.stringify(USER)},"attempts":[`);
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unserializable recording before writing or sharing it', async () => {
+    const invalidRecording = { toJSON: () => undefined };
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await consumeRecordings({ recordings: [invalidRecording], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(lastFileContents).toBe(`{"user":${JSON.stringify(USER)},"attempts":[],"recordings":[`);
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a walker that returns without emitting a recording page', async () => {
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
   });
 
   it('deletes a partial file and never shares when a later page fails', async () => {
@@ -2407,6 +2769,7 @@ describe('retake placement test', () => {
 
 describe('account actions', () => {
   it.each([
+    [t('header.recordings'), '/recordings'],
     [t('header.changePassword'), '/settings/change-password'],
     [t('header.privacy'), '/settings/privacy'],
     [t('header.terms'), '/settings/terms'],
@@ -2422,6 +2785,43 @@ describe('account actions', () => {
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
     expect(mockRouter.push).not.toHaveBeenCalled();
+  });
+
+  it('renders the recording-library row with exact idle, pressed, and busy props', async () => {
+    const exportResult = deferred<unknown>();
+    mockExportData.mockReturnValue(exportResult.promise);
+    await renderSettings();
+    const recordingsRow = () => screen.getByRole('button', { name: t('header.recordings') });
+
+    expect(flattenedStyle(recordingsRow())).toMatchObject({
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingVertical: spacing.md,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    });
+    expect(flattenedStyle(screen.getByText(t('header.recordings')))).toEqual({
+      fontSize: 16,
+      fontWeight: '600',
+      color: colors.primary,
+    });
+    await expectPressFeedback(
+      recordingsRow,
+      { borderBottomWidth: 1 },
+      { backgroundColor: colors.background },
+    );
+
+    const retainedRecordings = committedPressHandler(recordingsRow());
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    expect(recordingsRow().props.accessibilityState).toMatchObject({ disabled: true });
+    expect(flattenedStyle(recordingsRow()).opacity).toBe(0.5);
+    await act(async () => retainedRecordings());
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      exportResult.resolve({ user: USER, attempts: [] });
+      await Promise.resolve();
+    });
   });
 
   it('re-arms singleton navigation on focus and blocks saved handlers after blur', async () => {
@@ -3243,6 +3643,24 @@ describe('settings async race fences', () => {
     await act(async () => Promise.resolve());
     expect(invalidate).not.toHaveBeenCalled();
     expect(mockRefreshReminderLanguage).not.toHaveBeenCalled();
+  });
+
+  it('does not retire native-help caches after a language response loses its lease', async () => {
+    const update = deferred<User>();
+    let leaseCurrent = true;
+    mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
+    mockUpdateProfile.mockReturnValue(update.promise);
+    const client = makeQueryClient();
+    const remove = jest.spyOn(client, 'removeQueries');
+    await renderSettings(client);
+    await fireEvent.press(languageChip(1));
+
+    leaseCurrent = false;
+    update.resolve({ ...USER, nativeLanguage: 'hi' });
+    await act(async () => Promise.resolve());
+
+    expect(mockAuthValue.setUser).not.toHaveBeenCalled();
+    expect(remove).not.toHaveBeenCalledWith({ queryKey: ['question-help'] });
   });
 
   it('does not release another reminder operation when language refresh finishes first', async () => {

@@ -5,6 +5,7 @@ import { BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import HomeScreen from '../src/app/home';
+import HomeBannerAd from '../src/components/HomeBannerAd';
 import { apiGetPracticeStats, ApiError } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
 import { I18nProvider, setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
@@ -28,6 +29,7 @@ interface MockFocusRegistration {
 
 const mockHomeFocusRegistrations: MockFocusRegistration[] = [];
 let mockHomeAutoFocus = true;
+let mockHomeIsFocused = true;
 
 jest.mock('expo-router', () => {
   const ReactActual = jest.requireActual<typeof import('react')>('react');
@@ -53,9 +55,14 @@ jest.mock('expo-router', () => {
         };
       }, [callback]);
     },
-    useIsFocused: () => true,
+    useIsFocused: () => mockHomeIsFocused,
   };
 });
+
+jest.mock('../src/components/HomeBannerAd', () => ({
+  __esModule: true,
+  default: jest.fn(() => null),
+}));
 
 type AuthValue = ReturnType<typeof useAuth>;
 
@@ -263,6 +270,8 @@ beforeEach(() => {
   mockRouter.canGoBack.mockReturnValue(false);
   mockHomeFocusRegistrations.length = 0;
   mockHomeAutoFocus = true;
+  mockHomeIsFocused = true;
+  jest.mocked(HomeBannerAd).mockClear();
   backHandlers = [];
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
     backHandlers.push(handler as () => boolean);
@@ -660,6 +669,24 @@ describe('home screen', () => {
     });
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
+  });
+
+  it('forwards live route focus to the Home banner across a same-mount rerender', async () => {
+    mockGetStats.mockResolvedValue(STATS);
+    const client = makeQueryClient();
+    const tree = () => (
+      <QueryClientProvider client={client}>
+        <HomeScreen />
+      </QueryClientProvider>
+    );
+    const rendered = await render(tree());
+    await screen.findByText('B1');
+
+    expect(jest.mocked(HomeBannerAd).mock.calls.at(-1)?.[0]).toEqual({ focused: true });
+
+    mockHomeIsFocused = false;
+    await rendered.rerender(tree());
+    expect(jest.mocked(HomeBannerAd).mock.calls.at(-1)?.[0]).toEqual({ focused: false });
   });
 
   it('fails closed until the focus lifecycle grants navigation ownership', async () => {

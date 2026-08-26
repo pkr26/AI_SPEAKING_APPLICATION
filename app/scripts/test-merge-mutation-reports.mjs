@@ -496,8 +496,12 @@ test('equivalence matching normalizes whitespace while retaining the exact locat
   assert.deepEqual(staleEntries, []);
 });
 
-test('every checked-in equivalence entry is complete and reviewable', () => {
-  assert.ok(equivalentMutants.length > 0);
+test('445 checked-in equivalence entries pin 506 exact reviewed mutants', () => {
+  assert.equal(equivalentMutants.length, 445);
+  assert.equal(
+    equivalentMutants.reduce((total, entry) => total + (entry.count ?? 1), 0),
+    506,
+  );
   for (const entry of equivalentMutants) {
     assert.match(entry.file, /^src\//, 'file must be a repo-relative source path');
     assert.ok(entry.mutator.length > 0, `${entry.file} entry has no mutator`);
@@ -528,45 +532,56 @@ test('every checked-in equivalence entry is complete and reviewable', () => {
   }
 });
 
-test('the Recorder review pins 186 equivalents without exempting final gaps', () => {
+test('the Recorder review pins 188 equivalents without exempting final gaps', () => {
   const recorderEntries = equivalentMutants.filter(
     (entry) => entry.file === 'src/components/Recorder.tsx',
   );
   const reviewedIds = recorderEntries.map((entry) => entry.reviewedMutantId);
-  assert.equal(recorderEntries.length, 186);
-  assert.equal(new Set(reviewedIds).size, 186, 'canonical Recorder IDs must be unique');
+  assert.equal(recorderEntries.length, 188);
+  assert.equal(new Set(reviewedIds).size, 188, 'canonical Recorder IDs must be unique');
   assert.ok(reviewedIds.every((id) => /^\d+$/u.test(id)));
 
-  assert.ok(reviewedIds.includes('1910'), 'reviewed post-unmount setter invariant is missing');
+  assert.ok(reviewedIds.includes('1903'), 'reviewed post-unmount setter invariant is missing');
 
-  const reclassifiedInvariantIds = ['1231', '2201', '2202', '2220', '2272', '2280', '2325', '2354'];
+  const reclassifiedInvariantIds = [
+    '1136',
+    '1224',
+    '2194',
+    '2195',
+    '2213',
+    '2261',
+    '2269',
+    '2314',
+    '2343',
+    '2461',
+  ];
   for (const id of reclassifiedInvariantIds) {
     assert.ok(reviewedIds.includes(id), `reviewed invariant ${id} is missing`);
   }
 
-  const finalGapIds = ['457', '1734'];
+  const finalGapIds = ['2252'];
   for (const id of finalGapIds) {
     assert.equal(reviewedIds.includes(id), false, `mutant ${id} must remain unexplained`);
   }
 
   const simplificationIds = [
-    '2037',
+    '2030',
+    '2032',
+    '2034',
+    '2035',
+    '2036',
+    '2038',
     '2039',
+    '2040',
     '2041',
     '2042',
-    '2043',
-    '2045',
+    '2044',
     '2046',
     '2047',
-    '2048',
     '2049',
-    '2051',
-    '2053',
+    '2052',
     '2054',
-    '2056',
-    '2059',
-    '2061',
-    '2064',
+    '2057',
   ];
   for (const id of simplificationIds) {
     const entry = recorderEntries.find((candidate) => candidate.reviewedMutantId === id);

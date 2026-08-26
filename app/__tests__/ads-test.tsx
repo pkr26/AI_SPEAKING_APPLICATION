@@ -27,6 +27,7 @@ const mockSetRequestConfiguration = jest.fn();
 const mockInitialize = jest.fn();
 const mockNativeAdCreate = jest.fn();
 const mockNativeAdViewRender = jest.fn();
+const mockNativeAssetRender = jest.fn();
 const mockBannerMount = jest.fn();
 const mockBannerProps = jest.fn();
 
@@ -93,20 +94,25 @@ jest.mock('react-native-google-mobile-ads', () => {
     NativeAdView: ({
       accessibilityLabel,
       children,
+      nativeAd,
       style,
     }: {
       accessibilityLabel?: string;
       children: React.ReactNode;
+      nativeAd: unknown;
       style?: React.ComponentProps<typeof NativeView>['style'];
     }) => {
-      mockNativeAdViewRender({ accessibilityLabel, style });
+      mockNativeAdViewRender({ accessibilityLabel, nativeAd, style });
       return ReactModule.createElement(
         NativeView,
         { accessibilityLabel, style, testID: 'native-ad-view' },
         children,
       );
     },
-    NativeAsset: ({ children }: { children: React.ReactNode }) => children,
+    NativeAsset: ({ assetType, children }: { assetType: string; children: React.ReactNode }) => {
+      mockNativeAssetRender({ assetType });
+      return children;
+    },
     NativeAssetType: { HEADLINE: 'headline', BODY: 'body', CALL_TO_ACTION: 'callToAction' },
   };
 });
@@ -631,6 +637,7 @@ describe('AdsProvider consent and initialization', () => {
     await waitFor(() => expect(screen.getByTestId('privacy')).toHaveTextContent('true'));
     await fireEvent.press(screen.getByTestId('privacy-action'));
     expect(mockShowPrivacyOptionsForm).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(screen.getByTestId('privacy-result')).toHaveTextContent('true'));
   });
 
   it('blocks active placements and invalidates readiness when privacy options revoke ad requests', async () => {
@@ -853,7 +860,11 @@ describe('AdsProvider consent and initialization', () => {
       canRequestAds: false,
       privacyOptionsRequirementStatus: 1,
     });
-    await expect(latestAds!.showPrivacyOptions()).resolves.toBe(true);
+    let thirdResult: boolean | undefined;
+    await act(async () => {
+      thirdResult = await latestAds!.showPrivacyOptions();
+    });
+    expect(thirdResult).toBe(true);
     expect(mockShowPrivacyOptionsForm).toHaveBeenCalledTimes(2);
   });
 
@@ -874,7 +885,11 @@ describe('AdsProvider consent and initialization', () => {
     );
     await fireEvent.press(screen.getByTestId('activate'));
     await waitFor(() => expect(screen.getByTestId('privacy')).toHaveTextContent('true'));
-    await expect(latestAds!.showPrivacyOptions()).resolves.toBe(true);
+    let privacyResult: boolean | undefined;
+    await act(async () => {
+      privacyResult = await latestAds!.showPrivacyOptions();
+    });
+    expect(privacyResult).toBe(true);
     await waitFor(() => expect(screen.getByTestId('privacy')).toHaveTextContent('false'));
   });
 
@@ -1318,6 +1333,44 @@ describe('ad surfaces', () => {
     expect(mockBannerMount).toHaveBeenCalledTimes(2);
   });
 
+  it('ignores a stale banner failure callback after consent remounts the placement', async () => {
+    jest.mocked(apiFetch).mockResolvedValue(remoteEnabled);
+    mockGatherConsent.mockResolvedValue({
+      canRequestAds: true,
+      privacyOptionsRequirementStatus: 1,
+    });
+    mockShowPrivacyOptionsForm.mockResolvedValue({
+      canRequestAds: true,
+      privacyOptionsRequirementStatus: 2,
+    });
+    await render(
+      <AdsProvider>
+        <Probe />
+        <HomeBannerAd focused />
+      </AdsProvider>,
+    );
+    await waitFor(() => expect(mockBannerMount).toHaveBeenCalledTimes(1));
+    const staleFailure = (mockBannerProps.mock.calls[0][0] as { onAdFailedToLoad: () => void })
+      .onAdFailedToLoad;
+
+    mockGatherConsent.mockResolvedValue({
+      canRequestAds: true,
+      privacyOptionsRequirementStatus: 2,
+    });
+    await fireEvent.press(screen.getByTestId('privacy-action'));
+    await waitFor(() => expect(screen.getByTestId('consent-version')).toHaveTextContent('1'));
+    await waitFor(() => expect(mockBannerMount).toHaveBeenCalledTimes(2));
+    const currentFailure = (mockBannerProps.mock.calls[1][0] as { onAdFailedToLoad: () => void })
+      .onAdFailedToLoad;
+
+    await act(async () => staleFailure());
+    expect(screen.getByTestId('banner-ad')).toBeTruthy();
+    expect(mockBannerMount).toHaveBeenCalledTimes(2);
+
+    await act(async () => currentFailure());
+    await waitFor(() => expect(screen.queryByTestId('banner-ad')).toBeNull());
+  });
+
   it('destroys and hides a History native ad during submitted-recording playback', async () => {
     jest.mocked(apiFetch).mockResolvedValue({
       ads: {
@@ -1612,6 +1665,9 @@ describe('ad surfaces', () => {
       </AdsProvider>,
     );
     expect(await screen.findByText('Headline only')).toBeTruthy();
+    expect(mockNativeAssetRender.mock.calls.map(([props]) => props.assetType)).toEqual([
+      'headline',
+    ]);
     expect(screen.queryByText('A test ad')).toBeNull();
     expect(screen.queryByText('Open')).toBeNull();
   });
@@ -1631,6 +1687,12 @@ describe('ad surfaces', () => {
     );
     const card = await screen.findByTestId('native-ad-view');
     const ad = await mockNativeAdCreate.mock.results[0].value;
+    expect(mockNativeAdViewRender.mock.calls.at(-1)?.[0].nativeAd).toBe(ad);
+    expect(mockNativeAssetRender.mock.calls.map(([props]) => props.assetType)).toEqual([
+      'headline',
+      'body',
+      'callToAction',
+    ]);
     expect(card.props.accessibilityLabel).toBe('Advertisement');
     expect(StyleSheet.flatten(card.props.style)).toEqual({
       borderWidth: 1,

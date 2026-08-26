@@ -1026,6 +1026,7 @@ describe('signup screen', () => {
     expect(screen.getByText(t('login.passwordLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('login.passwordLabel')).props.value).toBe('');
     expect(screen.getByText(t('signup.languageLabel'))).toBeTruthy();
+    expect(screen.getByText(t('signup.languageHelp'))).toBeTruthy();
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.getByText(t('signup.footerPrompt'))).toBeTruthy();
     expect(screen.getByRole('link', { name: t('signup.footerLink') }).props.href).toBe('/login');
@@ -1057,6 +1058,12 @@ describe('signup screen', () => {
       fontSize: 15,
       color: colors.muted,
       textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('signup.languageHelp')))).toEqual({
+      marginBottom: spacing.sm,
+      color: colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
     });
 
     const nameLabel = screen.getByText(t('signup.nameLabel'));

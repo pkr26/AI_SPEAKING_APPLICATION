@@ -31,7 +31,7 @@ interface RecordingPlaybackProps {
   recordingStatus?: RecordingStatus | null;
   compact?: boolean;
   recordingLabel?: string;
-  onDeleted?: (recordingId: string) => void;
+  onDeleted?: (recordingId: string) => void | Promise<void>;
 }
 
 const PLAYBACK_EXPIRY_SAFETY_MS = 10_000;
@@ -150,15 +150,18 @@ export default function RecordingPlayback({
   const playbackOwnerRef = useRef(Symbol());
   const committedIdentityRef = useRef(identityToken);
   const onDeletedRef = useRef(onDeleted);
+  const recordingLabelRef = useRef(recordingLabel);
+  const playbackUnavailableRef = useRef(recordingStatus === 'unavailable');
   const sessionLease = useMemo(() => {
     void ownerId;
     void sessionVersion;
     return captureSessionLease();
   }, [captureSessionLease, ownerId, sessionVersion]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     onDeletedRef.current = onDeleted;
-  }, [onDeleted]);
+    recordingLabelRef.current = recordingLabel;
+  }, [onDeleted, recordingLabel]);
 
   const contextIsCurrent = useCallback(
     (lifecycle: symbol) =>
@@ -238,6 +241,20 @@ export default function RecordingPlayback({
     resetPlaybackUi();
   }, [cancelDelete, identityToken, releasePlayer, resetPlaybackUi]);
 
+  useLayoutEffect(() => {
+    const unavailable = recordingStatus === 'unavailable';
+    playbackUnavailableRef.current = unavailable;
+    if (!unavailable) return;
+
+    releasePlayer();
+    // An availability refresh may race an explicit deletion. It invalidates
+    // playback only; an active or committed deletion keeps its own controller
+    // and visible phase. Every other prior playback phase/error is obsolete.
+    if (deleteOperationRef.current !== null || deletedRef.current === true) return;
+    setErrorMessage(null);
+    resetPlaybackUi();
+  }, [recordingStatus, releasePlayer, resetPlaybackUi]);
+
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
@@ -287,7 +304,12 @@ export default function RecordingPlayback({
   );
 
   const startPlayback = useCallback(async () => {
-    if (operationRef.current || deleteOperationRef.current || deletedRef.current === true) {
+    if (
+      playbackUnavailableRef.current ||
+      operationRef.current ||
+      deleteOperationRef.current ||
+      deletedRef.current === true
+    ) {
       return;
     }
     const lifecycle = lifecycleRef.current;
@@ -370,6 +392,7 @@ export default function RecordingPlayback({
     if (committedIdentityRef.current !== identityToken || !contextIsCurrent(lifecycle)) {
       return;
     }
+    if (playbackUnavailableRef.current) return;
     if (phase === 'playing') {
       try {
         playerRef.current!.pause();
@@ -418,7 +441,13 @@ export default function RecordingPlayback({
           exact: true,
         });
         deletedRef.current = true;
-        onDeletedRef.current?.(recordingId);
+        try {
+          void Promise.resolve(onDeletedRef.current?.(recordingId)).catch(() => undefined);
+        } catch {
+          // The server and local caches already committed the deletion. A
+          // synchronous or asynchronous consumer failure cannot roll that
+          // successful state back.
+        }
         setPhase('deleted');
         AccessibilityInfo.announceForAccessibility(t('recordings.deleted'));
       } catch (error) {
@@ -443,10 +472,11 @@ export default function RecordingPlayback({
     ) {
       return;
     }
+    const currentRecordingLabel = recordingLabelRef.current;
     Alert.alert(
       t('recordings.deleteTitle'),
-      recordingLabel
-        ? t('recordings.deleteBodyNamed', { name: recordingLabel })
+      currentRecordingLabel
+        ? t('recordings.deleteBodyNamed', { name: currentRecordingLabel })
         : t('recordings.deleteBody'),
       [
         { text: t('common.cancel'), style: 'cancel' },

@@ -18,6 +18,7 @@ import RootLayout, { ErrorBoundary } from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { SessionLease, useAuth } from '../src/lib/auth';
+import { refreshDailyReminderLanguage } from '../src/lib/daily-reminder';
 import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -35,8 +36,8 @@ jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
 
 // Screens rendered without an I18nProvider (Gate, NotFound, ErrorBoundary)
 // translate with the module-level language, which beforeEach pins to English.
-// RootLayout mounts the real provider fed by the mocked user's nativeLanguage,
-// so copy inside it renders in that language instead.
+// RootLayout mounts the real provider fed by the mocked user's uiLanguage, so
+// copy inside it renders in that language instead.
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
 
@@ -109,7 +110,9 @@ const USER: User = {
   name: 'Ada Lovelace',
   email: 'ada@example.com',
   nativeLanguage: 'te',
-  uiLanguage: 'te',
+  // Deliberately differs from nativeLanguage: interface copy must never follow
+  // the language used for learning help and native-answer assessment.
+  uiLanguage: 'hi',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
@@ -165,6 +168,10 @@ jest.mock('../src/lib/practice-flow', () => ({
   }),
 }));
 
+jest.mock('../src/lib/daily-reminder', () => ({
+  refreshDailyReminderLanguage: jest.fn(async () => undefined),
+}));
+
 // ----- api mock (apiFetch only; keep real ApiError/userMessageForError) -----
 
 jest.mock('../src/lib/api', () => ({
@@ -173,6 +180,7 @@ jest.mock('../src/lib/api', () => ({
 }));
 
 const mockApiFetch = apiFetch as jest.Mock;
+const mockRefreshDailyReminderLanguage = refreshDailyReminderLanguage as jest.Mock;
 
 // ----- helpers -----
 
@@ -289,11 +297,12 @@ afterEach(async () => {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  // RootLayout renders with a 'te' user sync the module-level language via the
+  // RootLayout renders with a Hindi UI user and syncs the module-level language via the
   // real I18nProvider's effect; pin it back so every test starts in English.
   setActiveLanguage('en');
   asMock(useColorScheme).mockReturnValue('light');
   mockApiFetch.mockReset();
+  mockRefreshDailyReminderLanguage.mockReset().mockResolvedValue(undefined);
   capturedStackProps.length = 0;
   capturedScreenProps.length = 0;
   capturedProtectedProps.length = 0;
@@ -345,27 +354,79 @@ describe('root layout route guards', () => {
       titleFor('practice/attempt'),
       titleFor('practice/feedback'),
       titleFor('history'),
+      titleFor('recordings'),
       titleFor('settings/index'),
       titleFor('settings/change-password'),
       titleFor('settings/delete-account'),
       titleFor('settings/privacy'),
       titleFor('settings/terms'),
-      // RootLayout mounts the real I18nProvider fed by the mocked user's 'te'
-      // native language, so header titles come from the Telugu catalog.
+      // RootLayout mounts the real I18nProvider fed by the mocked user's Hindi
+      // UI language, despite the account's Telugu learning language.
     ]).toEqual([
-      translateFor('te', 'header.diagnostic'),
-      translateFor('te', 'header.home'),
-      translateFor('te', 'header.practice'),
-      translateFor('te', 'header.help'),
-      translateFor('te', 'header.attempt'),
-      translateFor('te', 'header.feedback'),
-      translateFor('te', 'header.history'),
-      translateFor('te', 'header.settings'),
-      translateFor('te', 'header.changePassword'),
-      translateFor('te', 'header.deleteAccount'),
-      translateFor('te', 'header.privacy'),
-      translateFor('te', 'header.terms'),
+      translateFor('hi', 'header.diagnostic'),
+      translateFor('hi', 'header.home'),
+      translateFor('hi', 'header.practice'),
+      translateFor('hi', 'header.help'),
+      translateFor('hi', 'header.attempt'),
+      translateFor('hi', 'header.feedback'),
+      translateFor('hi', 'header.history'),
+      translateFor('hi', 'header.recordings'),
+      translateFor('hi', 'header.settings'),
+      translateFor('hi', 'header.changePassword'),
+      translateFor('hi', 'header.deleteAccount'),
+      translateFor('hi', 'header.privacy'),
+      translateFor('hi', 'header.terms'),
     ]);
+  });
+
+  it('relocalizes and refreshes reminder copy only from UI-language and account changes', async () => {
+    const firstUser = { ...USER, nativeLanguage: 'te' as const, uiLanguage: 'hi' as const };
+    mockAuthValue = makeAuth({ user: firstUser });
+    const rendered = await render(<RootLayout />);
+    await waitFor(() =>
+      expect(mockRefreshDailyReminderLanguage).toHaveBeenCalledWith(firstUser.uiLanguage),
+    );
+
+    const latestTitle = (name: string) =>
+      (
+        capturedScreenProps.filter((props) => props?.name === name).at(-1)?.options as
+          { title?: unknown } | undefined
+      )?.title;
+    expect(latestTitle('home')).toBe(translateFor('hi', 'header.home'));
+
+    mockRefreshDailyReminderLanguage.mockClear();
+    mockAuthValue = makeAuth({
+      user: { ...firstUser, nativeLanguage: 'zh' },
+    });
+    await rendered.rerender(<RootLayout />);
+    expect(latestTitle('home')).toBe(translateFor('hi', 'header.home'));
+    expect(mockRefreshDailyReminderLanguage).not.toHaveBeenCalled();
+
+    mockAuthValue = makeAuth({
+      user: { ...firstUser, nativeLanguage: 'zh', uiLanguage: 'es' },
+    });
+    await rendered.rerender(<RootLayout />);
+    await waitFor(() => expect(mockRefreshDailyReminderLanguage).toHaveBeenCalledWith('es'));
+    expect(latestTitle('home')).toBe(translateFor('es', 'header.home'));
+
+    mockRefreshDailyReminderLanguage.mockClear();
+    mockAuthValue = makeAuth({
+      user: {
+        ...firstUser,
+        id: '550e8400-e29b-41d4-a716-446655440099',
+        nativeLanguage: 'zh',
+        uiLanguage: 'es',
+      },
+    });
+    await rendered.rerender(<RootLayout />);
+    await waitFor(() => expect(mockRefreshDailyReminderLanguage).toHaveBeenCalledWith('es'));
+    expect(mockRefreshDailyReminderLanguage).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not refresh reminder copy without a complete signed-in profile', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    await render(<RootLayout />);
+    expect(mockRefreshDailyReminderLanguage).not.toHaveBeenCalled();
   });
 
   it('configures bounded retries and a five-minute stale window for queries', async () => {
@@ -494,14 +555,20 @@ describe('root layout route guards', () => {
     ] as const;
     for (const [name, key] of locked) {
       expect(optionsFor(name)).toEqual({
-        title: translateFor('te', key),
+        title: translateFor('hi', key),
         headerBackVisible: false,
         gestureEnabled: false,
       });
     }
 
     // Routes the user may leave freely keep the default back affordances.
-    for (const name of ['practice/help', 'practice/attempt', 'history', 'settings/index']) {
+    for (const name of [
+      'practice/help',
+      'practice/attempt',
+      'history',
+      'recordings',
+      'settings/index',
+    ]) {
       expect(optionsFor(name)).not.toHaveProperty('headerBackVisible');
       expect(optionsFor(name)).not.toHaveProperty('gestureEnabled');
     }

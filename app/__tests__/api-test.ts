@@ -3287,6 +3287,20 @@ describe('typed endpoint helpers', () => {
     expect(fetchMock.mock.calls[2][1]).toEqual(expect.objectContaining({ method: 'DELETE' }));
   });
 
+  it('URL-encodes the recordings cursor', async () => {
+    const controller = new AbortController();
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ items: [recordingBody], nextCursor: null }) }),
+    );
+
+    await api.apiGetRecordings('older page / + ?', controller.signal);
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'http://localhost:4000/recordings?limit=20&cursor=older%20page%20%2F%20%2B%20%3F',
+    );
+    expect(fetchMock.mock.calls[0][1].method).toBe('GET');
+  });
+
   it('rejects a playback grant that echoes another recording id', async () => {
     fetchMock.mockResolvedValue(
       fakeResponse({
@@ -3380,6 +3394,120 @@ describe('typed endpoint helpers', () => {
     expect(fetchMock.mock.calls[1][0]).toBe(
       `http://localhost:4000/recordings/export?limit=500&cursor=${cursor}`,
     );
+  });
+
+  it('walks distinct recording-export pages with increasing indices and one caller signal', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440099';
+    const controller = new AbortController();
+    const consume = jest.fn();
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            recordings: [{ ...recordingBody, requestId: HISTORY_ITEM.questionId, attemptId: null }],
+            nextCursor: cursor,
+          }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({ json: async () => ({ recordings: [], nextCursor: null }) }),
+      );
+
+    await api.apiConsumeRecordingExportPages(consume, controller.signal);
+
+    expect(consume.mock.calls.map(([, page]) => page)).toEqual([0, 1]);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost:4000/recordings/export?limit=500',
+      `http://localhost:4000/recordings/export?limit=500&cursor=${cursor}`,
+    ]);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.signal).toBeDefined();
+      expect(init.signal?.aborted).toBe(false);
+    }
+  });
+
+  it('aborts a later recording-export page through the caller signal', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440099';
+    const controller = new AbortController();
+    const reason = new Error('stop recording export');
+    let markSecondRequestStarted!: () => void;
+    const secondRequestStarted = new Promise<void>((resolve) => {
+      markSecondRequestStarted = resolve;
+    });
+    fetchMock
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({
+            recordings: [{ ...recordingBody, requestId: HISTORY_ITEM.questionId, attemptId: null }],
+            nextCursor: cursor,
+          }),
+        }),
+      )
+      .mockImplementationOnce((_url, init?: RequestInit) => {
+        const signal = init?.signal;
+        if (!signal) throw new Error('recording export omitted its signal');
+        markSecondRequestStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          const fail = () => reject(signal.reason);
+          if (signal.aborted) fail();
+          else signal.addEventListener('abort', fail, { once: true });
+        });
+      });
+
+    const exportWalk = api.apiConsumeRecordingExportPages(jest.fn(), controller.signal);
+    const exportOutcome = exportWalk.catch((error: unknown) => error);
+    await secondRequestStarted;
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    controller.abort(reason);
+
+    await expect(exportOutcome).resolves.toBe(reason);
+  });
+
+  it('rejects the ten-thousandth nonterminal recording-export page before emitting it', async () => {
+    let request = 0;
+    const consume = jest.fn();
+    fetchMock.mockImplementation(async () => {
+      if (request >= 10_000) {
+        throw new Error('recording export exceeded its request bound');
+      }
+      const cursor = `550e8400-e29b-41d4-8000-${String(request++).padStart(12, '0')}`;
+      return fakeResponse({
+        json: async () => ({
+          recordings: [{ ...recordingBody, requestId: HISTORY_ITEM.questionId, attemptId: null }],
+          nextCursor: cursor,
+        }),
+      });
+    });
+
+    await expect(api.apiConsumeRecordingExportPages(consume)).rejects.toBeInstanceOf(ContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(10_000);
+    expect(consume).toHaveBeenCalledTimes(9_999);
+    expect(consume.mock.calls.at(-1)?.[1]).toBe(9_998);
+  });
+
+  it.each([
+    ['custom reason', new Error('export lease changed')],
+    ['null reason', null],
+  ] as const)('stops between account-export stages for a %s', async (_label, reason) => {
+    const controller = new AbortController();
+    const consumeUser = jest.fn(() => controller.abort(reason));
+    const consumeRecordings = jest.fn();
+    fetchMock.mockResolvedValue(
+      fakeResponse({ json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }) }),
+    );
+
+    const outcome = api.apiConsumeAccountExportPages(
+      consumeUser,
+      consumeRecordings,
+      controller.signal,
+    );
+    if (reason) {
+      await expect(outcome).rejects.toBe(reason);
+    } else {
+      await expect(outcome).rejects.toMatchObject({ name: 'AbortError', message: 'Aborted' });
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(consumeRecordings).not.toHaveBeenCalled();
   });
 
   it('apiSkipPracticeWord POSTs the question id to /practice/skip', async () => {
@@ -3663,6 +3791,7 @@ describe('typed endpoint helpers', () => {
       'apiGetPracticeHistory',
       (signal: AbortSignal) => api.apiGetPracticeHistory(undefined, signal),
     ],
+    ['apiGetRecordings', (signal: AbortSignal) => api.apiGetRecordings(undefined, signal)],
     [
       'apiConsumeUserDataPages',
       (signal: AbortSignal) => api.apiConsumeUserDataPages(jest.fn(), signal),

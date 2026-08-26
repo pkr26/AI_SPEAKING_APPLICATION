@@ -383,6 +383,12 @@ describe('recordings library', () => {
     expect(screen.getAllByText('0:08 · 2 KB')).toHaveLength(3);
     expect(screen.getByText(`player:${RECORDING_ID}`)).toBeTruthy();
     expect(screen.getByText(t('recordings.intro'))).toBeTruthy();
+    expect(asMock(FlatList).mock.calls.at(-1)?.[0]).toEqual(
+      expect.objectContaining({
+        contentInsetAdjustmentBehavior: 'automatic',
+        onEndReachedThreshold: 0.4,
+      }),
+    );
     expect(asMock(RecordingPlayback).mock.calls.map(([props]) => props)).toEqual([
       {
         compact: true,

@@ -193,6 +193,13 @@ describe('formatTemplate', () => {
 });
 
 describe('translateFor and translate', () => {
+  it('defaults a fresh module to English before any language setter runs', () => {
+    jest.isolateModules(() => {
+      const isolated = jest.requireActual<typeof import('../src/lib/i18n')>('../src/lib/i18n');
+      expect(isolated.getActiveLanguage()).toBe('en');
+    });
+  });
+
   it('formats parameters for an explicit language', () => {
     expect(translateFor('en', 'practice.greeting', { name: 'Ada' })).toBe('Hi, Ada');
     expect(translateFor('zh', 'practice.greeting', { name: 'Ada' })).toBe('你好，Ada');
@@ -370,5 +377,12 @@ describe('useI18n / useT without a provider', () => {
     setActiveLanguage('hi');
     await render(<HookProbe />);
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.hi['common.tryAgain']);
+  });
+
+  it('exposes the live active language without a provider', async () => {
+    setActiveLanguage('es');
+    await render(<Probe />);
+    expect(screen.getByTestId('lang')).toHaveTextContent('es');
+    expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.es['login.submit']);
   });
 });

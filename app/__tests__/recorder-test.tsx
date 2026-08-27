@@ -1856,7 +1856,31 @@ describe('sleepAbortable', () => {
   });
 });
 
+let recorderRenderSentinelAttempted = false;
+let recorderStopLabelSentinelPassed = false;
+let recorderStatusSentinelPassed = false;
+let recorderWebStopWaitSentinelAttempted = false;
+let recorderWebStopWaitSentinelPassed = false;
+let recorderWebLifecycleWaitSentinelAttempted = false;
+let recorderWebLifecycleWaitSentinelPassed = false;
+
 describe('Recorder', () => {
+  beforeEach(() => {
+    // Conditional-render mutations on the recording label/status otherwise
+    // cascade through hundreds of interaction tests, including deliberate
+    // deferred races. Once the early sentinel has detected either bad render,
+    // fail each remaining case at setup so no timeout can hide the assertion.
+    if (!recorderRenderSentinelAttempted) return;
+    expect(recorderStopLabelSentinelPassed).toBe(true);
+    expect(recorderStatusSentinelPassed).toBe(true);
+    if (recorderWebStopWaitSentinelAttempted) {
+      expect(recorderWebStopWaitSentinelPassed).toBe(true);
+    }
+    if (recorderWebLifecycleWaitSentinelAttempted) {
+      expect(recorderWebLifecycleWaitSentinelPassed).toBe(true);
+    }
+  });
+
   it('renders idle with a start button and no permission banner', async () => {
     const currentDelete = jest.fn();
     const audioOrphanDelete = jest.fn();
@@ -1922,6 +1946,28 @@ describe('Recorder', () => {
     // Cache cleanup is process-start work. A later mount must not inspect a URI
     // another native recorder may just have prepared but not rendered.
     expect(Directory).not.toHaveBeenCalled();
+  });
+
+  it('renders the recording button label and status before longer lifecycle cases run', async () => {
+    recorderRenderSentinelAttempted = true;
+    const { view } = await renderRecorder();
+
+    try {
+      await fireEvent.press(view.getByLabelText(START_LABEL));
+      recorderStopLabelSentinelPassed = screen.queryByLabelText(STOP_LABEL) !== null;
+      recorderStatusSentinelPassed = screen.queryByText(recordingStatusText('0:00')) !== null;
+
+      expect(recorderStopLabelSentinelPassed).toBe(true);
+      expect(recorderStatusSentinelPassed).toBe(true);
+    } finally {
+      // A failed render assertion must not leave the shared audio-session owner
+      // recording while Jest advances to the rest of this lane.
+      const recordButton = screen.queryByLabelText(RECORD_BUTTON_LABEL);
+      if (mockRecorder.isRecording && recordButton) {
+        mockRecorderState.durationMillis = 5_000;
+        await fireEvent.press(recordButton);
+      }
+    }
   });
 
   describe('deterministic mutation boundaries 1001-1500', () => {
@@ -2150,6 +2196,100 @@ describe('Recorder', () => {
       expect(settledBeforeWait).toBe(false);
       expect(settled).toBe(true);
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('does not schedule a native completion wait for a normal web Stop', async () => {
+      jest.useFakeTimers();
+      const platformDescriptor = Object.getOwnPropertyDescriptor(Platform, 'OS');
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+      const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+      let settled = false;
+      let stop: Promise<void> | null = null;
+      try {
+        mockRecorder.stop.mockImplementation(async () => {
+          mockRecorder.isRecording = false;
+          mockRecorder.uri = RECORDING_URI;
+        });
+        const { view } = await renderRecorder();
+        await startRecording();
+        mockRecorderState.durationMillis = 5_000;
+        const completionWaitsBeforeStop = timeoutSpy.mock.calls.filter(
+          ([, delay]) => delay === 500,
+        ).length;
+        recorderWebStopWaitSentinelAttempted = true;
+
+        await act(() => {
+          stop = invokePressHandler(view, STOP_LABEL).then(() => {
+            settled = true;
+          });
+        });
+        await flushAct();
+
+        const completionWaitsAfterStop = timeoutSpy.mock.calls.filter(
+          ([, delay]) => delay === 500,
+        ).length;
+        recorderWebStopWaitSentinelPassed = completionWaitsAfterStop === completionWaitsBeforeStop;
+        expect(completionWaitsAfterStop).toBe(completionWaitsBeforeStop);
+        expect(settled).toBe(true);
+        expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+      } finally {
+        const pendingStop = stop;
+        if (pendingStop) {
+          // A forced native-only branch is allowed to settle only after the
+          // no-wait assertion above has already killed it.
+          await act(async () => {
+            jest.advanceTimersByTime(500);
+            await pendingStop;
+            await flushMicrotasks();
+          });
+        }
+        if (platformDescriptor) Object.defineProperty(Platform, 'OS', platformDescriptor);
+      }
+    });
+
+    it('does not schedule a native completion wait after a resolved web lifecycle stop', async () => {
+      jest.useFakeTimers();
+      const platformDescriptor = Object.getOwnPropertyDescriptor(Platform, 'OS');
+      Object.defineProperty(Platform, 'OS', { configurable: true, value: 'web' });
+      const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+      try {
+        mockRecorder.stop.mockImplementation(async () => {
+          mockRecorder.isRecording = false;
+          mockRecorder.uri = RECORDING_URI;
+        });
+        await renderRecorder();
+        await startRecording();
+        mockRecorder.uri = RECORDING_URI;
+        const completionWaitsBeforeBackground = timeoutSpy.mock.calls.filter(
+          ([, delay]) => delay === 500,
+        ).length;
+        recorderWebLifecycleWaitSentinelAttempted = true;
+
+        backgroundApp();
+        await act(async () => {
+          for (const handler of appStateHandlers) handler('background');
+          await flushMicrotasks();
+        });
+        await flushAct();
+
+        const completionWaitsAfterBackground = timeoutSpy.mock.calls.filter(
+          ([, delay]) => delay === 500,
+        ).length;
+        recorderWebLifecycleWaitSentinelPassed =
+          completionWaitsAfterBackground === completionWaitsBeforeBackground;
+        expect(completionWaitsAfterBackground).toBe(completionWaitsBeforeBackground);
+        expect(mockRecorder.stop).toHaveBeenCalledTimes(1);
+        expect(deletedRecordingUris()).toContain(RECORDING_URI);
+        expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      } finally {
+        // If the web predicate is forced to the native branch, let its bounded
+        // fallback finish only after the timer assertion has already failed.
+        await act(async () => {
+          jest.advanceTimersByTime(500);
+          await flushMicrotasks();
+        });
+        if (platformDescriptor) Object.defineProperty(Platform, 'OS', platformDescriptor);
+      }
     });
 
     it('does not schedule native completion waits for idle lifecycle cleanup', async () => {

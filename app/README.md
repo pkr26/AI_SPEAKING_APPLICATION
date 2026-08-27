@@ -41,6 +41,7 @@ npm run lint
 npm run typecheck
 npm test
 npm run mutation
+npm run mutation:conditional-rendering
 npm run doctor
 npm run audit:ci
 ```
@@ -57,16 +58,41 @@ some of those statuses and has no notion of a reviewed exemption, so the merged
 report is re-checked against that stricter rule and Stryker's own break
 threshold is disabled.
 
+Stryker 9.6.1 does not force a ternary selector when its predicate is a plain
+identifier, member access, call, unary expression, or another non-boolean
+operator expression. That leaves React branches such as
+`focused ? <Ad /> : null` outside the general campaign. Run
+`npm run mutation:conditional-rendering` for the required supplement. It finds
+every otherwise-unmutated ternary whose result is inside JSX or whose arm is
+JSX/`null`, instruments test transforms only, then runs the owning lane tests
+with each predicate forced to `true` and `false` in separate Jest processes.
+It never rewrites production source. Its gate is deliberately stricter than
+the general campaign: every forced mutant must be Killed by an assertion;
+Survived, Error, and Timeout all fail. Reports are written to
+`reports/mutation/conditional-rendering/conditional-rendering.{json,md}`.
+
+The supplemental runner validates the lane manifest, pins its discovery count
+in tooling tests, verifies exact true/false result identity, runs a clean
+baseline first, and hashes every production source, owning test, campaign
+tool/config file, installed tool version, runtime, and behavior-affecting
+environment before and after execution. It shares `.mutation-campaign.lock`
+with Stryker, removes prior canonical reports before starting, and publishes
+JSON last as the complete-report marker. The weekly mutation workflow runs
+both campaigns even when one fails, so either report remains available for
+triage.
+
 Equivalent mutants — ones no test could ever kill, such as a `typeof` guard that
 exists only to narrow a type — are recorded in `scripts/mutation-equivalents.mjs`
 with the reasoning for each. Entries match on file, mutator, replacement,
-mutated source text, and Stryker's exact start/end node location. Every expected
-mutant has a mechanically pinned span, so even a one-for-one survivor swap on
-the same source line makes both the new mutant unexplained and the old exemption
-stale. The gate fails both on a survivor that matches no entry _and_ on an entry
-that matches nothing, so an exemption cannot outlive or drift away from the code
-it excused. Refresh spans only from a fresh full campaign after reviewing the
-survivors again. A `// Stryker disable` directive is not an exemption: it
+mutated source text, Stryker's exact start/end node location, and a reviewed
+SHA-256 of the complete production file. Every expected mutant has a
+mechanically pinned span, and any source edit invalidates every exemption in
+that file; therefore even a same-text, same-location replacement inside a new
+function cannot inherit an old exemption. The gate fails both on a survivor
+that matches no entry _and_ on an entry that matches nothing, so an exemption
+cannot outlive or drift away from the code it excused. Refresh spans and the
+file hash only from a fresh full campaign after reviewing the survivors again.
+A `// Stryker disable` directive is not an exemption: it
 produces Ignored mutants, which the strict gate rejects unless they are
 explicitly reviewed. Keep exemptions in the allowlist, where their scope and
 continued relevance are validated.
@@ -113,12 +139,20 @@ rather than `perTest` because module-level memoisation — `createThemedStyles`,
 the i18n device-language cache, the API token snapshot — makes "which tests
 executed the mutated line" the wrong question.
 
+Recorder's coverage-off integration pass also sets `maxTestRunnerReuse` to 1.
+One run executes the full 843-test Recorder suite, so every integration mutant
+gets a freshly recycled worker. This prevents cross-mutant heap accumulation
+without increasing Node's heap or weakening the mutant set.
+
 Useful knobs:
 
 ```bash
 npm run mutation:lanes:verify          # manifest only, no mutants
 node scripts/run-mutation.mjs ui types # re-run named lanes; reuse only current reports
 MUTATION_PARALLEL_LANES=3 MUTATION_CONCURRENCY=2 npm run mutation
+npm run mutation:conditional-rendering # every Stryker-blind JSX ternary, true + false
+node scripts/run-conditional-rendering-mutation.mjs --list
+node scripts/run-conditional-rendering-mutation.mjs --lane practice --report-dir /tmp/practice-render-mutants
 ```
 
 The mutation tests mock network access and do not need the backend. Running the

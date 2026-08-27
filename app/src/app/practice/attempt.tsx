@@ -50,7 +50,8 @@ export default function AttemptScreen() {
   const recoveryExitRef = useRef<string | null>(null);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
-  const validQuestionId = isUuid(questionId) ? questionId : null;
+  let validQuestionId: string | null = null;
+  if (isUuid(questionId)) validQuestionId = questionId;
   const nativeMode = answerMode === 'native';
   const userId = user?.id ?? null;
   const renderOwner = `${sessionVersion}:${userId ?? 'anonymous'}`;
@@ -59,9 +60,8 @@ export default function AttemptScreen() {
     void userId;
     return captureSessionLease();
   }, [captureSessionLease, sessionVersion, userId]);
-  const recorderOwner = validQuestionId
-    ? `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`
-    : null;
+  const recorderOwner =
+    validQuestionId && `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`;
   const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
   const practiceQuestionKey = useMemo(
     () => ['practice-question', user?.id, user?.cefrLevel] as const,

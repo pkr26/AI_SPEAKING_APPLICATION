@@ -15,8 +15,9 @@
  *
  * So exemptions live here, and `Ignored` is not treated as a resolved status.
  *
- * Entries are matched on file, mutator, replacement, source text, and the exact
- * start/end location Stryker reported for the mutated node. They must excuse
+ * Entries are matched on file, mutator, replacement, source text, the exact
+ * start/end location Stryker reported for the mutated node, and the reviewed
+ * production-file hash. They must excuse
  * exactly the number of mutants they declare. The gate fails on a survivor that
  * matches nothing here, on an entry that matches nothing, and on an entry that
  * matches more than it claims — so source drift, a stale exemption, or a newly
@@ -67,10 +68,10 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(139, 6, 139, 8),
   exactLocations(104, 7, 104, 33),
   exactLocations(104, 35, 106, 4),
-  exactLocations(35, 54, 35, 65),
-  exactLocations(51, 52, 51, 57),
-  exactLocations(52, 58, 52, 60),
-  exactLocations(118, 11, 118, 52),
+  exactLocations(54, 54, 54, 65),
+  exactLocations(67, 52, 67, 57),
+  exactLocations(68, 58, 68, 60),
+  exactLocations(134, 11, 134, 52),
   exactLocations(55, 5, 55, 44),
   exactLocations(93, 6, 93, 44),
   exactLocations(26, 8, 26, 10),
@@ -87,10 +88,10 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(95, 9, 95, 16),
   exactLocations(96, 19, 96, 41),
   exactLocations(77, 6, 77, 8),
-  exactLocations(213, 7, 214, 16),
-  exactLocations(213, 7, 214, 16),
-  exactLocations(414, 35, 414, 66, 549, 31, 549, 62, 562, 31, 562, 62),
-  exactLocations(514, 35, 514, 43, 514, 46, 514, 55),
+  exactLocations(214, 7, 215, 16),
+  exactLocations(214, 7, 215, 16),
+  exactLocations(415, 35, 415, 66, 550, 31, 550, 62, 563, 31, 563, 62),
+  exactLocations(515, 35, 515, 43, 515, 46, 515, 55),
   exactLocations(79, 6, 79, 8),
   exactLocations(169, 7, 170, 23),
   exactLocations(169, 7, 170, 23),
@@ -106,11 +107,6 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(207, 25, 209, 4),
   exactLocations(209, 6, 209, 18),
   exactLocations(211, 9, 211, 53),
-  exactLocations(219, 40, 219, 89),
-  exactLocations(219, 61, 219, 65),
-  exactLocations(219, 83, 219, 87),
-  exactLocations(272, 9, 272, 39),
-  exactLocations(272, 9, 272, 39),
   exactLocations(292, 11, 292, 17),
   exactLocations(296, 18, 298, 6),
   exactLocations(297, 16, 297, 21),
@@ -127,7 +123,6 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(544, 11, 544, 33),
   exactLocations(544, 51, 544, 84),
   exactLocations(559, 9, 559, 35),
-  exactLocations(537, 11, 537, 29),
   exactLocations(616, 9, 616, 47),
   exactLocations(616, 9, 616, 47),
   exactLocations(644, 9, 644, 77),
@@ -151,7 +146,6 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(342, 10, 342, 35),
   exactLocations(342, 10, 342, 61),
   exactLocations(351, 7, 351, 14),
-  exactLocations(357, 5, 357, 32),
   exactLocations(389, 13, 389, 17),
   exactLocations(474, 11, 474, 29, 474, 11, 474, 29),
   exactLocations(474, 11, 474, 29),
@@ -189,49 +183,49 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(292, 54, 292, 59, 283, 62, 283, 67),
   // Diagnostic lifecycle and async ownership.
   exactLocations(
-    54,
+    70,
     56,
-    54,
+    70,
     61,
-    55,
+    71,
     36,
-    55,
+    71,
     41,
-    56,
+    72,
     32,
-    56,
+    72,
     37,
-    57,
+    73,
     48,
-    57,
+    73,
     53,
-    58,
+    74,
     35,
-    58,
+    74,
     40,
-    60,
+    76,
     29,
-    60,
+    76,
     34,
   ),
-  exactLocations(59, 29, 59, 33, 61, 35, 61, 39),
-  exactLocations(76, 25, 85, 4, 78, 18, 84, 6),
-  exactLocations(79, 28, 79, 33, 80, 28, 80, 33),
-  exactLocations(81, 34, 81, 38, 93, 36, 93, 40),
-  exactLocations(85, 6, 85, 8, 95, 8, 95, 10),
-  exactLocations(111, 33, 111, 38, 112, 23, 112, 28),
-  exactLocations(117, 18, 119, 6),
-  exactLocations(118, 11, 118, 52),
-  exactLocations(118, 11, 118, 52),
-  exactLocations(132, 9, 132, 50),
-  exactLocations(179, 7, 179, 21),
-  exactLocations(188, 14, 188, 18),
-  exactLocations(254, 32, 254, 36, 255, 29, 255, 33),
-  exactLocations(257, 17, 257, 22),
-  exactLocations(270, 11, 270, 74, 270, 33, 270, 74),
-  exactLocations(270, 11, 270, 74),
-  exactLocations(272, 13, 272, 18),
-  exactLocations(402, 57, 402, 79),
+  exactLocations(75, 29, 75, 33, 77, 35, 77, 39),
+  exactLocations(92, 25, 101, 4, 94, 18, 100, 6),
+  exactLocations(95, 28, 95, 33, 96, 28, 96, 33),
+  exactLocations(97, 34, 97, 38, 109, 36, 109, 40),
+  exactLocations(101, 6, 101, 8, 111, 8, 111, 10),
+  exactLocations(127, 33, 127, 38, 128, 23, 128, 28),
+  exactLocations(133, 18, 135, 6),
+  exactLocations(134, 11, 134, 52),
+  exactLocations(134, 11, 134, 52),
+  exactLocations(148, 9, 148, 50),
+  exactLocations(204, 7, 204, 21),
+  exactLocations(213, 14, 213, 18),
+  exactLocations(279, 32, 279, 36, 280, 29, 280, 33),
+  exactLocations(282, 17, 282, 22),
+  exactLocations(295, 11, 295, 74, 295, 33, 295, 74),
+  exactLocations(295, 11, 295, 74),
+  exactLocations(297, 13, 297, 18),
+  exactLocations(427, 57, 427, 79),
   // Change-password/delete-account screens.
   exactLocations(51, 29, 51, 34),
   exactLocations(45, 29, 45, 34),
@@ -247,22 +241,22 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(62, 54, 62, 65),
   exactLocations(72, 28, 72, 33, 73, 28, 73, 33),
   exactLocations(74, 38, 74, 42),
-  exactLocations(117, 53, 117, 61, 117, 64, 117, 73),
-  exactLocations(132, 7, 132, 51),
-  exactLocations(139, 7, 139, 21),
-  exactLocations(146, 5, 146, 7),
-  exactLocations(169, 40, 169, 44),
-  exactLocations(217, 7, 217, 39),
-  exactLocations(223, 73, 223, 77),
-  exactLocations(325, 17, 325, 22),
-  exactLocations(340, 13, 340, 18),
+  exactLocations(119, 58, 119, 66, 119, 69, 119, 78),
+  exactLocations(133, 7, 133, 51),
+  exactLocations(140, 7, 140, 21),
+  exactLocations(147, 5, 147, 7),
+  exactLocations(170, 40, 170, 44),
+  exactLocations(218, 7, 218, 39),
+  exactLocations(224, 73, 224, 77),
+  exactLocations(326, 17, 326, 22),
+  exactLocations(341, 13, 341, 18),
   // Practice Mode equivalents.
   exactLocations(38, 6, 38, 36),
   exactLocations(38, 29, 38, 34),
   exactLocations(41, 36, 41, 41),
   exactLocations(45, 29, 45, 33, 47, 39, 47, 43),
-  exactLocations(56, 54, 56, 65),
-  exactLocations(63, 57, 63, 65, 63, 68, 63, 77),
+  exactLocations(57, 54, 57, 65),
+  exactLocations(64, 74, 64, 82, 64, 85, 64, 94),
   exactLocations(74, 28, 74, 33, 75, 28, 75, 33),
   exactLocations(76, 38, 76, 42),
   exactLocations(94, 7, 94, 21),
@@ -271,15 +265,16 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(179, 76, 179, 80),
   exactLocations(202, 7, 202, 40),
   // Feedback-card equivalents.
-  exactLocations(71, 57, 72, 83),
-  exactLocations(72, 16, 72, 76),
-  exactLocations(74, 44, 74, 60, 74, 84, 74, 96),
-  exactLocations(84, 29, 84, 33),
-  exactLocations(93, 28, 93, 33, 92, 28, 92, 33),
-  exactLocations(96, 6, 96, 8, 108, 8, 108, 10),
-  exactLocations(150, 7, 151, 26),
-  exactLocations(150, 7, 151, 26),
-  exactLocations(186, 77, 186, 81),
+  exactLocations(71, 63, 74, 4),
+  exactLocations(72, 9, 72, 18),
+  exactLocations(73, 12, 73, 72),
+  exactLocations(75, 44, 75, 60, 75, 84, 75, 96),
+  exactLocations(85, 29, 85, 33),
+  exactLocations(93, 28, 93, 33, 94, 28, 94, 33),
+  exactLocations(97, 6, 97, 8, 109, 8, 109, 10),
+  exactLocations(152, 7, 153, 26),
+  exactLocations(152, 7, 153, 26),
+  exactLocations(188, 77, 188, 81),
   // Fresh cross-lane equivalents reviewed after the state/prop campaign.
   exactLocations(936, 37, 936, 42),
   exactLocations(936, 7, 936, 28),
@@ -2532,6 +2527,51 @@ const recordingsEquivalentMutants = Object.freeze([
   },
 ]);
 
+// A location can be reused by unrelated code after a refactor. Pinning the
+// complete reviewed source file makes that collision fail closed even when the
+// new node happens to have identical text and coordinates.
+export const equivalentMutantSourceHashes = Object.freeze({
+  'src/app/(auth)/forgot-password.tsx':
+    'b35974583e9ca8ba9b54172b2793b3773f6e51dc7402fe931aea6413a7c80eba',
+  'src/app/(auth)/login.tsx': '2985fdcb13fdbca2284cf5a477624dadf950e17e5016a99cd06e90352ded6aaf',
+  'src/app/(auth)/reset-password.tsx':
+    'b0b83c1281540c3dd7df32d5bc6e6494ee887b560d71cefe8367a4fd5910ca13',
+  'src/app/(auth)/signup.tsx': 'a950fd2836f2a44be777de2a792375fd89ffefd339b3a4decd265f6118230923',
+  'src/app/_layout.tsx': '6c7850ac7c8776245e8cc157eed898057d09abb60fa38043dc06bf0a1d572d4c',
+  'src/app/diagnostic.tsx': '4880c12de348fda25d704c50a388d5b70ea4f7e987c308df08ca8e9ec37b244d',
+  'src/app/history.tsx': 'c821e6de24cb082a61000a52431313fe40906d217da6338b34b6e7e56ab5b772',
+  'src/app/home.tsx': '45f70ed710758d26fe062a43d16ca89319ca12f4eed2f7ffd30f139cb3989848',
+  'src/app/index.tsx': '42f4ca1eb7e58cd338593b60f698123bfa4401a9653a133fac92d3f832ddff44',
+  'src/app/practice/attempt.tsx':
+    'ca8b2301593854a1495517f0f6881adea8194220ef78e133a18eed5362535031',
+  'src/app/practice/feedback.tsx':
+    '755f9a10aa3a98ebf4b65727ca2dec8b5b7fa9273c16ee8ee2b3cfcebc03fd63',
+  'src/app/practice/index.tsx': 'ddf80887e74e2ff14e3cc53d1e4d33080e60c4548c0d6f9156e64b091fcd8ef3',
+  'src/app/recordings.tsx': '2dce0c91c8606f5b41117be9467b4b2eae62037af7c95ccc87be9aaf1782a019',
+  'src/app/settings/change-password.tsx':
+    '9dfdfb5ea277f9af6acb24f5a66c7880fb3f09ac3340eafc71c42192434f42d2',
+  'src/app/settings/delete-account.tsx':
+    'ba5a27673c4e348b0eb01fde0f59eb9108e56018e5f804b1a4588809878f5bbe',
+  'src/app/settings/index.tsx': 'b7efacb953833e353b65aa04fd1df56ceb0b17577e078c80a225c1de2f986568',
+  'src/components/HistoryNativeAdCard.tsx':
+    '2b59bc73e1f672865e38702859fc966eeb5918ac0a638d5051fad82fc2aba5e0',
+  'src/components/HomeBannerAd.tsx':
+    '911751a27c01a13b17dfb04da564602aed053dd8c20a67687e2b44a2dd01c1d8',
+  'src/components/Recorder.tsx': '425e7cb53d6b5f0cb63a7e3844bef745e324323ff939f09ea18191010bb10ce8',
+  'src/components/RecordingPlayback.tsx':
+    '9b8a83dc19a52592942cc6fee3c0ef9a0e8e896c1c2623fa44e0d77138ea09ff',
+  'src/lib/ads.tsx': '4db444735e7e7e675332e7d6f86dfa98def9afa941b49099d19dc929b6bd2854',
+  'src/lib/api.ts': 'b85cb24698a237d30438d63692d1bbc100528c6ff6f4064d05a3fb8811a17955',
+  'src/lib/auth.tsx': 'a5b51a6e7a2e6e8712d850f59e3a398c8af248209c91cafd1ccdf56b04d46a48',
+  'src/lib/daily-reminder.ts': '51586320e0b0b2045059306dd41d902890409aa29ada2f47a8fc0d936a1cd4c6',
+  'src/lib/pending-assessment.ts':
+    'aa491bfd5238aca7e646dbbc90e8f50cff608d185d44a5cf29c0a24c235c2404',
+  'src/lib/practice-flow.tsx': '8dee61dc592844e63735c3eea17fe3479de3998c4a9ec55021ff879b5aaee5fd',
+  'src/lib/types.ts': '4b4c2b5d7d1b35cfabdca6d1a14bc1ed291069f9b116d7c02c57e44904f98a94',
+  'src/lib/use-hardware-back.ts':
+    '5475b83704855734d76575346649f1d1df70dcf9c8e48b270d15364425f279f2',
+});
+
 export const equivalentMutants = Object.freeze(
   [
     {
@@ -3063,48 +3103,6 @@ export const equivalentMutants = Object.freeze(
     },
     {
       file: 'src/app/settings/index.tsx',
-      mutator: 'ObjectLiteral',
-      original:
-        'navigationRef.current.setOptions({ headerBackVisible: true, gestureEnabled: true });',
-      replacements: ['{}'],
-      reason:
-        'setRetakeConfirming(false) drives screenBusy false and the screenBusy layout effect publishes the same unlocked options. This direct write is redundant.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
-      mutator: 'BooleanLiteral',
-      original:
-        'navigationRef.current.setOptions({ headerBackVisible: true, gestureEnabled: true });',
-      replacements: ['false'],
-      reason:
-        'The headerBackVisible value is redundantly restored by the screenBusy layout effect.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
-      mutator: 'BooleanLiteral',
-      original:
-        'navigationRef.current.setOptions({ headerBackVisible: true, gestureEnabled: true });',
-      replacements: ['false'],
-      reason: 'The gestureEnabled value is redundantly restored by the screenBusy layout effect.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!renderCanHandle() || !current || current.id !== updated.id) return false;',
-      replacements: ['false'],
-      reason:
-        'This node removes only the render/current prefix. commitUser independently rechecks identity, null current is unreachable for a live profile handler, and the separate updated-id clause remains.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
-      mutator: 'LogicalOperator',
-      original: 'if (!renderCanHandle() || !current || current.id !== updated.id) return false;',
-      replacements: ['!renderCanHandle() && !current'],
-      reason:
-        'Weakening the render/current pair is still covered by commitUser, while the independent updated-id mismatch clause remains intact.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
       mutator: 'ConditionalExpression',
       original: 'if (active) {',
       replacements: ['true'],
@@ -3196,7 +3194,7 @@ export const equivalentMutants = Object.freeze(
       original: "if (!documentStarted) throw new Error('The export returned no pages.');",
       replacements: ['false'],
       reason:
-        'Without a page, completedFile is absent and the following write fails inside the same sanitized catch. With a page, this condition is already false.',
+        'Without an attempt page, the following recordingsStarted guard throws the same sanitized export failure; with a page, this condition is already false.',
     },
     {
       file: 'src/app/settings/index.tsx',
@@ -3227,14 +3225,6 @@ export const equivalentMutants = Object.freeze(
       replacements: ['exportFile.current.delete'],
       reason:
         'When no file exists, direct dereference throws inside the surrounding best-effort catch; when a file exists, both variants delete it.',
-    },
-    {
-      file: 'src/app/settings/index.tsx',
-      mutator: 'ConditionalExpression',
-      original: 'if (!renderCanHandle()) return;',
-      replacements: ['false'],
-      reason:
-        'toggleReminder immediately delegates to applyReminder, which repeats renderCanHandle before any device or state effect.',
     },
     {
       file: 'src/app/settings/index.tsx',
@@ -3423,14 +3413,6 @@ export const equivalentMutants = Object.freeze(
       replacements: ['false'],
       reason:
         "The only falsy headers are null and '', and Number(null) === Number('') === 0, which boundedSeconds already rejects through `value > 0`. The guard is a readability shortcut, not a behavioural branch.",
-    },
-    {
-      file: 'src/lib/api.ts',
-      mutator: 'OptionalChaining',
-      original: "signal?.removeEventListener('abort', listener);",
-      replacements: ['signal.removeEventListener'],
-      reason:
-        'removeAbortListener wraps cleanup in a best-effort try/catch. With no signal the mutant’s dereference is swallowed; with a signal both variants remove the listener, so request settlement is identical.',
     },
     {
       file: 'src/lib/api.ts',
@@ -4014,7 +3996,7 @@ export const equivalentMutants = Object.freeze(
     {
       file: 'src/app/practice/index.tsx',
       mutator: 'StringLiteral',
-      original: "? `${renderOwner}:${question.id}:${nativeMode ? 'native' : 'english'}`",
+      original: "`${renderOwner}:${recorderQuestionId}:${nativeMode ? 'native' : 'english'}`;",
       replacements: ['""'],
       count: 2,
       reason:
@@ -4129,7 +4111,8 @@ export const equivalentMutants = Object.freeze(
     {
       file: 'src/app/practice/attempt.tsx',
       mutator: 'StringLiteral',
-      original: "? `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`",
+      original:
+        "validQuestionId && `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`;",
       replacements: ['""'],
       count: 2,
       reason:
@@ -4195,20 +4178,28 @@ export const equivalentMutants = Object.freeze(
     // Feedback card equivalents.
     {
       file: 'src/app/practice/feedback.tsx',
-      mutator: 'ArrowFunction',
+      mutator: 'BlockStatement',
       original:
-        'const [card, setCard] = useState<FeedbackCard | null>(() =>\n    feedback ? { questionId: feedback.questionId, result: feedback.result } : null,',
-      replacements: ['() => undefined'],
+        'const [card, setCard] = useState<FeedbackCard | null>(() => {\n    if (!feedback) return null;\n    return { questionId: feedback.questionId, result: feedback.result };\n  });',
+      replacements: ['{}'],
       reason:
         'With feedback, the render-phase identity correction immediately replaces undefined before commit; without feedback both paths render the no-result state.',
     },
     {
       file: 'src/app/practice/feedback.tsx',
+      mutator: 'ConditionalExpression',
+      original: 'if (!feedback) return null;',
+      replacements: ['true'],
+      reason:
+        'With feedback, the forced null initializer is synchronously replaced by the render-phase card correction before commit; without feedback both forms return null.',
+    },
+    {
+      file: 'src/app/practice/feedback.tsx',
       mutator: 'ObjectLiteral',
-      original: 'feedback ? { questionId: feedback.questionId, result: feedback.result } : null,',
+      original: 'return { questionId: feedback.questionId, result: feedback.result };',
       replacements: ['{}'],
       reason:
-        'An empty object mismatches the current feedback and is synchronously replaced by the render-phase card correction before the first commit.',
+        'With feedback, the empty initializer mismatches and is synchronously replaced by the render-phase card correction before commit; without feedback the preceding guard returns null.',
     },
     {
       file: 'src/app/practice/feedback.tsx',
@@ -4481,8 +4472,22 @@ function expectedMatches(entry) {
  * to be killed has started surviving behind an existing exemption. Both are
  * reported so neither can pass quietly.
  */
-export function applyEquivalenceAllowlist(survivors, entries = equivalentMutants) {
+export function applyEquivalenceAllowlist(
+  survivors,
+  entries = equivalentMutants,
+  sourceHashesByFile,
+) {
   for (const [index, entry] of entries.entries()) assertEntryLocations(entry, index);
+  if (sourceHashesByFile !== undefined) {
+    for (const [index, entry] of entries.entries()) {
+      const sourceHash = sourceHashesByFile[entry.file];
+      if (!/^[a-f0-9]{64}$/u.test(sourceHash ?? '')) {
+        throw new Error(
+          `Equivalence entry ${index} (${entry.file ?? 'unknown file'}) must pin its source hash`,
+        );
+      }
+    }
+  }
   const matchCounts = new Map();
   const accepted = [];
   const unexplained = [];
@@ -4491,6 +4496,8 @@ export function applyEquivalenceAllowlist(survivors, entries = equivalentMutants
     const index = entries.findIndex(
       (entry) =>
         entry.file === survivor.file &&
+        (sourceHashesByFile === undefined ||
+          survivor.sourceSha256 === sourceHashesByFile[entry.file]) &&
         entry.mutator === survivor.mutatorName &&
         entry.replacements.some(
           (replacement) => normalize(replacement) === normalize(survivor.replacement),

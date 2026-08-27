@@ -596,6 +596,7 @@ describe('practice home screen', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<PracticeScreen />);
     expect(screen.getByText(t('practice.loadingQuestion'))).toBeTruthy();
+    expect(screen.queryByTestId('recorder')).toBeNull();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
     expect(
       screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
@@ -1545,10 +1546,12 @@ describe('practice attempt screen', () => {
     mockSearchParams = { questionId: 'not-a-uuid' };
     await renderScreen(<AttemptScreen />);
 
-    expect(screen.getByText(t('help.invalidLinkTitle'))).toBeTruthy();
+    expect(screen.getByRole('header', { name: t('help.invalidLinkTitle') })).toBeTruthy();
     // Practice Mode sends the learner back a different way than help does.
     expect(screen.getByText(t('attempt.invalidLinkBody'))).toBeTruthy();
     expect(screen.queryByText(t('help.invalidLinkBody'))).toBeNull();
+    expect(screen.queryByTestId('recorder')).toBeNull();
+    expect(screen.queryByText(t('attempt.loading'))).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { backgroundColor: colors.primary },
@@ -2122,8 +2125,10 @@ describe('practice feedback screen', () => {
   it('handles missing feedback with a way back to practice', async () => {
     await renderScreen(<FeedbackScreen />);
 
-    expect(screen.getByText(t('feedback.noResultTitle'))).toBeTruthy();
+    expect(screen.getByRole('header', { name: t('feedback.noResultTitle') })).toBeTruthy();
     expect(screen.getByText(t('feedback.noResultBody'))).toBeTruthy();
+    expect(screen.queryByText(t('feedback.passedTitle'))).toBeNull();
+    expect(screen.queryByText(t('feedback.nextQuestion'))).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { alignItems: 'center', backgroundColor: colors.primary },
@@ -5045,6 +5050,18 @@ describe('practice home presentation', () => {
 
   it('explains every locked control while the recorder holds a take', async () => {
     await renderLoadedHome();
+
+    expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint,
+    ).toBeUndefined();
+
     await act(async () => recorderProps().onInteractionLockChange?.(true));
 
     const hint = t('hint.finishRecordingFirst');
@@ -5052,6 +5069,9 @@ describe('practice home presentation', () => {
     expect(
       screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
         .accessibilityHint,
+    ).toBe(hint);
+    expect(
+      screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
     ).toBe(hint);
     expect(
       screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
@@ -5066,7 +5086,17 @@ describe('practice home presentation', () => {
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(screen.getByLabelText(t('practice.helpLabel')).props.accessibilityHint).toBeUndefined();
     expect(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
+    ).toBeUndefined();
+    expect(
       screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
+    ).toBeUndefined();
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint,
     ).toBeUndefined();
     expect(
       flattenedStyle(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }))

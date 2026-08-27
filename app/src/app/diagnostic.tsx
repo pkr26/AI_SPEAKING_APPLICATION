@@ -24,6 +24,25 @@ interface AnswerRecord {
   passed: boolean;
 }
 
+interface DiagnosticProgress {
+  asked: number;
+  maxQuestions: number;
+}
+
+interface DiagnosticViewState {
+  question: Question | null;
+  progress: DiagnosticProgress | null;
+  result: DiagnosticAnswerResult | null;
+  level: CefrLevel | null;
+}
+
+const EMPTY_DIAGNOSTIC_VIEW_STATE: DiagnosticViewState = Object.freeze({
+  question: null,
+  progress: null,
+  result: null,
+  level: null,
+});
+
 export default function DiagnosticScreen() {
   const { user, setUser, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } =
     useAuth();
@@ -40,10 +59,7 @@ export default function DiagnosticScreen() {
   }, [captureSessionLease, identityKey]);
 
   const [question, setQuestion] = useState<Question | null>(null);
-  const [progress, setProgress] = useState<{
-    asked: number;
-    maxQuestions: number;
-  } | null>(null);
+  const [progress, setProgress] = useState<DiagnosticProgress | null>(null);
   const [result, setResult] = useState<DiagnosticAnswerResult | null>(null);
   const [level, setLevel] = useState<CefrLevel | null>(null);
   // One-shot per test state: tapping Start hides the intro for this session.
@@ -151,12 +167,21 @@ export default function DiagnosticScreen() {
     }
   }, [identityKey, isSessionLeaseCurrent, nextQuery.data, sessionLease, userId]);
 
-  const stateIsCurrent = stateIdentity === identityKey;
-  const currentQuestion = stateIsCurrent ? question : null;
-  const currentProgress = stateIsCurrent ? progress : null;
-  const currentResult = stateIsCurrent ? result : null;
-  const currentLevel = stateIsCurrent ? level : null;
-  const recorderOwner = currentQuestion ? `${identityKey}:${currentQuestion.id}` : null;
+  // Select the identity-owned state as one unit. Field-by-field selectors are
+  // equivalent once the identity differs, and make it easier for one stale
+  // field to be added later without the account boundary. The explicit
+  // equality remains covered by the standard mutation campaign.
+  const currentViewState: DiagnosticViewState =
+    stateIdentity === identityKey
+      ? { question, progress, result, level }
+      : EMPTY_DIAGNOSTIC_VIEW_STATE;
+  const {
+    question: currentQuestion,
+    progress: currentProgress,
+    result: currentResult,
+    level: currentLevel,
+  } = currentViewState;
+  const recorderOwner = currentQuestion !== null ? `${identityKey}:${currentQuestion.id}` : null;
 
   useLayoutEffect(() => {
     activeRecorderOwnerRef.current = recorderOwner;
@@ -401,6 +426,11 @@ export default function DiagnosticScreen() {
   // test (asked > 0) goes straight to its question.
   const showIntro = !introStarted && !currentResult && (currentProgress?.asked ?? 0) === 0;
   const accountActionsLocked = recorderLocked || logoutBusy;
+  // Keep the result branch safe even when mutation testing deliberately forces
+  // it with no result. The outer rendering selector is then rejected by direct
+  // mount-state assertions instead of cascading through a null dereference.
+  const resultActionTitle =
+    currentResult?.done === true ? t('diag.seeLevel') : t('diag.nextQuestion');
 
   // ----- Question view -----
   return (
@@ -470,7 +500,7 @@ export default function DiagnosticScreen() {
               <Text style={styles.resultTitle}>{t('diag.answerSavedTitle')}</Text>
               <Text style={styles.resultText}>{t('diag.answerSavedBody')}</Text>
               <Button
-                title={currentResult.done ? t('diag.seeLevel') : t('diag.nextQuestion')}
+                title={resultActionTitle}
                 fullWidth
                 onPress={advance}
                 style={styles.primaryAction}

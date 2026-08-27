@@ -68,9 +68,10 @@ export default function FeedbackScreen() {
   // screen. Latch the outcome so the card slides away as itself instead of
   // flipping to the no-result state for the whole transition; a freshly
   // submitted outcome replaces the latched one.
-  const [card, setCard] = useState<FeedbackCard | null>(() =>
-    feedback ? { questionId: feedback.questionId, result: feedback.result } : null,
-  );
+  const [card, setCard] = useState<FeedbackCard | null>(() => {
+    if (!feedback) return null;
+    return { questionId: feedback.questionId, result: feedback.result };
+  });
   if (feedback && (feedback.questionId !== card?.questionId || feedback.result !== card?.result)) {
     setCard({ questionId: feedback.questionId, result: feedback.result });
   }
@@ -108,9 +109,9 @@ export default function FeedbackScreen() {
     }, []),
   );
 
-  const variant: Variant | null = !result
-    ? null
-    : isNativeOutcome(result)
+  let variant: Variant | null = null;
+  if (result) {
+    variant = isNativeOutcome(result)
       ? result.transcript === ''
         ? 'native-nospeech'
         : 'native'
@@ -125,6 +126,7 @@ export default function FeedbackScreen() {
           : (result.attemptsLeft ?? 0) > 0
             ? 'retry'
             : 'final';
+  }
 
   // Mastery (and the level-up it can earn) deserves a physical cheer; haptics
   // are best effort (web/simulator).

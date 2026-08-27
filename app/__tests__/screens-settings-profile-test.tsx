@@ -816,6 +816,29 @@ describe('settings profile card', () => {
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
   });
 
+  it('rejects a delayed profile response after the route loses focus', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    await renderSettings();
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
+
+    const focus = mockFocusCallback;
+    if (!focus) throw new Error('Settings did not register its focus lifecycle');
+    await act(async () => {
+      const cleanup = focus();
+      cleanup?.();
+    });
+
+    const setUser = mockAuthValue.setUser;
+    await act(async () => update.resolve({ ...USER, name: 'Ada King' }));
+
+    expect(setUser).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.saved'))).toBeNull();
+  });
+
   it('accepts a name of exactly the maximum length but not one character more', async () => {
     await renderSettings();
     const input = screen.getByLabelText(t('signup.nameLabel'));
@@ -1043,6 +1066,10 @@ describe('settings profile card', () => {
     expect(mockUpdateProfile).toHaveBeenCalledWith({ uiLanguage: 'hi' });
 
     await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: true,
+      gestureEnabled: true,
+    });
     mockSetOptions.mockClear();
     update.reject(new Error('late failure'));
     await act(async () => Promise.resolve());
@@ -2142,8 +2169,9 @@ describe('data export', () => {
   it('deletes without closing or sharing when the lease expires after the final page', async () => {
     let leaseCurrent = true;
     mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
-    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
       await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: null }, 0);
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
       leaseCurrent = false;
     });
     await renderSettings();

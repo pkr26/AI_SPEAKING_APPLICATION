@@ -113,9 +113,10 @@ export default function PracticeScreen() {
   const question = questionQuery.data?.question;
   const kind = questionQuery.data?.kind;
   const progress = questionQuery.data?.progress;
-  const recorderOwner = question
-    ? `${renderOwner}:${question.id}:${nativeMode ? 'native' : 'english'}`
-    : null;
+  const recorderQuestionId = question?.id ?? null;
+  const recorderOwner =
+    recorderQuestionId &&
+    `${renderOwner}:${recorderQuestionId}:${nativeMode ? 'native' : 'english'}`;
   const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
 
   useLayoutEffect(() => {

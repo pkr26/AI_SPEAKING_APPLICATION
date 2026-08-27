@@ -13,7 +13,11 @@ import {
   summarizeMutants,
   unresolvedStatusSummary,
 } from './merge-mutation-reports.mjs';
-import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
+import {
+  applyEquivalenceAllowlist,
+  equivalentMutants,
+  equivalentMutantSourceHashes,
+} from './mutation-equivalents.mjs';
 import {
   createMutationMergePolicyProvenance,
   mutationMergePolicyFiles,
@@ -441,6 +445,34 @@ test('a same-line one-for-one survivor swap fails closed on exact columns', () =
   assert.equal(staleEntries.length, 1, 'the original exact-span exemption must become stale');
 });
 
+test('a same-text same-location survivor cannot inherit an exemption from changed source', () => {
+  const entry = {
+    file: 'src/a.ts',
+    mutator: 'ConditionalExpression',
+    original: 'if (!renderCanHandle()) return;',
+    replacements: ['false'],
+    locations: [location(12, 5, 34)],
+    reason: 'fixture',
+  };
+  const survivor = {
+    file: 'src/a.ts',
+    status: 'Survived',
+    mutatorName: 'ConditionalExpression',
+    replacement: 'false',
+    original: 'if (!renderCanHandle()) return;',
+    sourceSha256: 'b'.repeat(64),
+    location: location(12, 5, 34),
+    line: 12,
+  };
+
+  const result = applyEquivalenceAllowlist([survivor], [entry], {
+    'src/a.ts': 'a'.repeat(64),
+  });
+  assert.deepEqual(result.accepted, []);
+  assert.equal(result.unexplained.length, 1);
+  assert.equal(result.staleEntries.length, 1);
+});
+
 test('every equivalence entry must declare its exact start and end locations', () => {
   const incomplete = {
     file: 'src/a.ts',
@@ -496,11 +528,11 @@ test('equivalence matching normalizes whitespace while retaining the exact locat
   assert.deepEqual(staleEntries, []);
 });
 
-test('445 checked-in equivalence entries pin 506 exact reviewed mutants', () => {
-  assert.equal(equivalentMutants.length, 445);
+test('439 checked-in equivalence entries pin 500 exact reviewed mutants', () => {
+  assert.equal(equivalentMutants.length, 439);
   assert.equal(
     equivalentMutants.reduce((total, entry) => total + (entry.count ?? 1), 0),
-    506,
+    500,
   );
   for (const entry of equivalentMutants) {
     assert.match(entry.file, /^src\//, 'file must be a repo-relative source path');
@@ -529,6 +561,13 @@ test('445 checked-in equivalence entries pin 506 exact reviewed mutants', () => 
       `${entry.file} [${entry.mutator}] must explain WHY no test can kill it`,
     );
     assert.ok(Object.isFrozen(entry), 'entries must be frozen');
+  }
+  assert.deepEqual(
+    Object.keys(equivalentMutantSourceHashes).toSorted(),
+    [...new Set(equivalentMutants.map(({ file }) => file))].toSorted(),
+  );
+  for (const sourceHash of Object.values(equivalentMutantSourceHashes)) {
+    assert.match(sourceHash, /^[a-f0-9]{64}$/u);
   }
 });
 

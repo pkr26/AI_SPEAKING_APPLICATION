@@ -74,9 +74,16 @@ interface CapturedRecorderProps {
 }
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
+const mockRecorderPublications: CapturedRecorderProps[] = [];
 
 function MockRecorder(props: CapturedRecorderProps) {
-  mockRecorderProps = props;
+  React.useLayoutEffect(() => {
+    mockRecorderPublications.push(props);
+    mockRecorderProps = props;
+    return () => {
+      if (mockRecorderProps === props) mockRecorderProps = null;
+    };
+  }, [props]);
   return null;
 }
 
@@ -192,6 +199,8 @@ function deferred<T>() {
 let alertSpy: jest.SpyInstance;
 let backHandlers: (() => boolean)[];
 let backSubscriptionRemove: jest.Mock;
+let diagnosticRenderSentinelAttempted = false;
+let diagnosticRenderSentinelPassed = false;
 
 function pressHardwareBack(): boolean {
   if (backHandlers.length === 0) throw new Error('No hardware back handler registered');
@@ -223,13 +232,20 @@ async function renderScreen(queryClient = makeQueryClient()) {
 }
 
 function recorderProps(): CapturedRecorderProps {
-  if (!mockRecorderProps) throw new Error('Recorder was not rendered');
+  if (!mockRecorderProps) throw new Error('Recorder is not mounted');
   return mockRecorderProps;
 }
 
 /** A fresh test (asked === 0) opens on the one-shot intro card; press Start. */
 async function startFreshTest() {
-  await fireEvent.press(await screen.findByRole('button', { name: t('diag.introStart') }));
+  const start = await screen.findByRole('button', { name: t('diag.introStart') });
+  await fireEvent.press(start);
+  // These are intentionally synchronous postconditions. Conditional-render
+  // mutants that pin the intro or result branch must fail here instead of
+  // leaving every owning test to exhaust an async element lookup.
+  expect(screen.queryByRole('button', { name: t('diag.introStart') })).toBeNull();
+  expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
+  expect(mockRecorderProps).not.toBeNull();
 }
 
 type SemanticStyle = Record<string, unknown>;
@@ -324,6 +340,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockApiFetch.mockReset();
   mockRecorderProps = null;
+  mockRecorderPublications.length = 0;
   mockAuthValue = makeAuth();
   mockFocusRegistrations.length = 0;
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
@@ -333,6 +350,13 @@ beforeEach(() => {
     backHandlers.push(handler as () => boolean);
     return { remove: backSubscriptionRemove };
   });
+  // A forced intro/result branch otherwise sends most of this lane through
+  // deliberate async races and query waits. Once the first render sentinel has
+  // found a bad branch, fail every remaining case during setup without mounting
+  // another mutated DiagnosticScreen.
+  if (diagnosticRenderSentinelAttempted) {
+    expect(diagnosticRenderSentinelPassed).toBe(true);
+  }
 });
 
 afterEach(async () => {
@@ -349,10 +373,27 @@ afterEach(async () => {
 });
 
 describe('diagnostic screen', () => {
+  it('leaves the fresh intro for the Recorder before longer diagnostic cases run', async () => {
+    diagnosticRenderSentinelAttempted = true;
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+
+    const start = await screen.findByRole('button', { name: t('diag.introStart') });
+    await fireEvent.press(start);
+    const introExited = screen.queryByText(t('diag.introTitle')) === null;
+    const recorderEntered =
+      mockRecorderProps !== null && screen.queryByText(t('diag.answerSavedTitle')) === null;
+    diagnosticRenderSentinelPassed = introExited && recorderEntered;
+
+    expect(introExited).toBe(true);
+    expect(recorderEntered).toBe(true);
+  });
+
   it('shows a preparing message while the first question loads', async () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen();
     expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    expect(mockRecorderProps).toBeNull();
   });
 
   it('renders the question, progress, and wires the recorder', async () => {
@@ -494,6 +535,12 @@ describe('diagnostic screen', () => {
       ownerId: OTHER_USER.id,
       questionId: QUESTION_2.id,
     });
+    expect(mockRecorderPublications).not.toContainEqual(
+      expect.objectContaining({
+        ownerId: OTHER_USER.id,
+        questionId: QUESTION_1.id,
+      }),
+    );
     mockRouter.navigate.mockClear();
     await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
     expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
@@ -899,6 +946,7 @@ describe('diagnostic screen', () => {
     await act(async () => recorderProps().onResult(result));
 
     expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(mockRecorderProps).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('diag.nextQuestion') }),
       {
@@ -1167,7 +1215,7 @@ describe('diagnostic screen', () => {
 
     expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
-    expect(mockRecorderProps?.questionId).toBe(QUESTION_1.id);
+    expect(mockRecorderProps).toBeNull();
   });
 
   it('ignores stale acknowledgement handlers after diagnostic state advances', async () => {

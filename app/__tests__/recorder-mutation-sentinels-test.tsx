@@ -186,6 +186,10 @@ const pendingCleanup = new Set<() => void>();
 let containedLifecycleErrors: unknown[] = [];
 let containedLifecycleFailure: unknown = null;
 const originalPlatform = Object.getOwnPropertyDescriptor(Platform, 'OS');
+const clearNativeTimeout = globalThis.clearTimeout.bind(globalThis);
+const clearNativeInterval = globalThis.clearInterval.bind(globalThis);
+let realTimeoutSpy: jest.SpyInstance;
+let realIntervalSpy: jest.SpyInstance;
 
 const asMock = (value: unknown) => value as jest.Mock;
 
@@ -460,7 +464,13 @@ function createReplacementRecorder(uri: string | null = null): MockRecorder {
 }
 
 beforeEach(() => {
+  // A destructive timer-cleanup mutant must not leave native handles alive for
+  // a later Jest environment. Re-establish real timers before capturing every
+  // handle this test creates; fake-timer cases may replace the globals later.
+  jest.useRealTimers();
   jest.clearAllMocks();
+  realTimeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+  realIntervalSpy = jest.spyOn(globalThis, 'setInterval');
   containedLifecycleErrors = [];
   // Once a destructive teardown mutant has violated the dedicated contract,
   // do not let its half-invalidated module globals poison later sentinel cases
@@ -589,6 +599,16 @@ afterEach(async () => {
   } finally {
     pendingCleanup.clear();
     if (originalPlatform) Object.defineProperty(Platform, 'OS', originalPlatform);
+    for (const result of realTimeoutSpy.mock.results) {
+      if (result.type === 'return')
+        clearNativeTimeout(result.value as ReturnType<typeof setTimeout>);
+    }
+    for (const result of realIntervalSpy.mock.results) {
+      if (result.type === 'return') {
+        clearNativeInterval(result.value as ReturnType<typeof setInterval>);
+      }
+    }
+    jest.useRealTimers();
     jest.restoreAllMocks();
   }
   expect([cleanupError, ...containedLifecycleErrors].filter(Boolean)).toEqual([]);
@@ -1379,6 +1399,24 @@ describe('Recorder mutation sentinels', () => {
     });
 
     expect(signal.aborted).toBe(true);
+  });
+
+  it('ID 1963: unmount clears every remaining-time announcement', async () => {
+    jest.useFakeTimers();
+    const announce = asMock(AccessibilityInfo.announceForAccessibility);
+    const { view } = await renderRecorder();
+    await startRecording();
+    await unmountWithContainedLifecycle(view);
+    announce.mockClear();
+
+    await act(async () => {
+      jest.advanceTimersByTime(110_000);
+      await flushMicrotasks();
+    });
+
+    expect(announce).not.toHaveBeenCalledWith(t('recorder.oneMinuteLeft'));
+    expect(announce).not.toHaveBeenCalledWith(t('recorder.thirtySecondsLeft'));
+    expect(announce).not.toHaveBeenCalledWith(t('recorder.tenSecondsLeft'));
   });
 
   it('completion/lifecycle slow sentinels: native missing event waits exactly 500ms', async () => {

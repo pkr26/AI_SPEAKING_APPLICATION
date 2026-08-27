@@ -364,9 +364,13 @@ beforeEach(() => {
 
 afterEach(async () => {
   await act(async () => {
+    for (const client of queryClients) client.clear();
+    // TanStack Query batches observer notifications onto timers. Drain both
+    // the clear publication and any timer it schedules before Jest tears down
+    // this screen's React environment.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  for (const client of queryClients) client.clear();
   queryClients.length = 0;
   jest.restoreAllMocks();
 });

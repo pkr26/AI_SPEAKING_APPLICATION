@@ -134,6 +134,12 @@ jobs:
       # kill it. The report artifact still uploads on failure (if: always()).
       - name: Run app mutation campaign
         run: npm run mutation
+      # Stryker 9.6.1 does not force simple ternary selectors. Run the
+      # render-specific supplement even when the general campaign fails so
+      # neither report can hide missing evidence from the other.
+      - name: Run conditional-rendering mutation campaign
+        if: always()
+        run: npm run mutation:conditional-rendering
       - name: Upload mutation reports
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

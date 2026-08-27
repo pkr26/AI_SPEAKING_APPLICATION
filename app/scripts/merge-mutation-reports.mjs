@@ -1,10 +1,15 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
 
-import { applyEquivalenceAllowlist, equivalentMutants } from './mutation-equivalents.mjs';
+import {
+  applyEquivalenceAllowlist,
+  equivalentMutants,
+  equivalentMutantSourceHashes,
+} from './mutation-equivalents.mjs';
 import {
   createMutationMergePolicyProvenance,
   mutationMergePolicyFiles,
@@ -285,6 +290,7 @@ function mutantSourceText(source, location) {
 function collectUnresolvedMutants(files) {
   const unresolved = [];
   for (const [fileName, file] of Object.entries(files)) {
+    const sourceSha256 = createHash('sha256').update(String(file.source)).digest('hex');
     for (const mutant of file.mutants) {
       if (resolvedStatuses.includes(mutant.status)) continue;
       unresolved.push({
@@ -293,6 +299,7 @@ function collectUnresolvedMutants(files) {
         mutatorName: mutant.mutatorName,
         replacement: mutant.replacement,
         original: mutantSourceText(file.source, mutant.location),
+        sourceSha256,
         location: mutant.location,
         line: mutant.location.start.line,
       });
@@ -319,6 +326,9 @@ export function mergeMutationReportData({
   expectedFiles,
   mergePolicy,
   equivalences = equivalentMutants,
+  equivalenceSourceHashes = equivalences === equivalentMutants
+    ? equivalentMutantSourceHashes
+    : undefined,
 }) {
   if (!isRecord(reportsByLane))
     throw new Error('reportsByLane must be an object keyed by lane name');
@@ -456,6 +466,7 @@ export function mergeMutationReportData({
   const { accepted, unexplained, staleEntries } = applyEquivalenceAllowlist(
     collectUnresolvedMutants(orderedFiles),
     equivalences,
+    equivalenceSourceHashes,
   );
   const summary = {
     schemaVersion: 1,

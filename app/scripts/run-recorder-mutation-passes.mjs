@@ -39,6 +39,10 @@ export const RECORDER_MUTATION_HTML_FILE = 'recorder.html';
 export const RECORDER_MUTATION_PASS_SIDECAR_FILE = 'recorder.multipass.json';
 export const RECORDER_MUTATION_OUTCOME_FILE = 'outcome.json';
 export const RECORDER_MUTATION_STOP_GRACE_MS = 5_000;
+// One integration "run" executes all 843 Recorder tests. Recycle before a
+// second mutant can inherit that heap; larger ceilings reproducibly OOM even
+// when they look small relative to the mutant count.
+export const RECORDER_INTEGRATION_MAX_TEST_RUNNER_REUSE = 1;
 
 function parsePositiveInteger(value, label, fallback) {
   if (value === undefined || value === '') return fallback;
@@ -664,7 +668,15 @@ export function createRecorderMutationPassInvocation({
     tempDirName,
   ];
   if (mode === RECORDER_PASS_MODE_COVERAGE_OFF_INCREMENTAL) {
-    args.push('--coverageAnalysis', 'off', '--incremental', '--incrementalFile', incrementalFile);
+    args.push(
+      '--coverageAnalysis',
+      'off',
+      '--incremental',
+      '--incrementalFile',
+      incrementalFile,
+      '--maxTestRunnerReuse',
+      String(RECORDER_INTEGRATION_MAX_TEST_RUNNER_REUSE),
+    );
   }
   return {
     command: process.execPath,

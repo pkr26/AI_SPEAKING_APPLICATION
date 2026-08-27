@@ -13,6 +13,7 @@ import {
 } from './recorder-mutation-plan.mjs';
 import {
   createRecorderMutationPassInvocation,
+  RECORDER_INTEGRATION_MAX_TEST_RUNNER_REUSE,
   RECORDER_MUTATION_HTML_FILE,
   RECORDER_MUTATION_OUTCOME_FILE,
   RECORDER_MUTATION_PASS_SIDECAR_FILE,
@@ -115,6 +116,11 @@ test('physical source line counting excludes a terminal newline', () => {
 });
 
 test('a pass invocation selects one owned test, one exact range, and a unique temp directory', async () => {
+  assert.equal(
+    RECORDER_INTEGRATION_MAX_TEST_RUNNER_REUSE,
+    1,
+    'every Recorder integration mutant must run in a freshly recycled worker',
+  );
   const plan = await currentPlan();
   assert.equal(plan.passes.length, 5);
   const pass = plan.passes[1];
@@ -142,6 +148,7 @@ test('a pass invocation selects one owned test, one exact range, and a unique te
   assert.equal(invocation.options.environment.MUTATION_REPORT_DIR, '/tmp/recorder-pass-report');
   assert.equal(invocation.options.environment.SENTINEL, 'kept');
   assert.equal(invocation.options.logPath, '/tmp/recorder-pass-report/stryker.log');
+  assert.equal(invocation.args.includes('--maxTestRunnerReuse'), false);
 
   const incremental = createRecorderMutationPassInvocation({
     appDir,
@@ -155,12 +162,14 @@ test('a pass invocation selects one owned test, one exact range, and a unique te
     signal: controller.signal,
     tempDirName: '.stryker-recorder-integration-tmp',
   });
-  assert.deepEqual(incremental.args.slice(-5), [
+  assert.deepEqual(incremental.args.slice(-7), [
     '--coverageAnalysis',
     'off',
     '--incremental',
     '--incrementalFile',
     '/tmp/integration-attempt/incremental-working.json',
+    '--maxTestRunnerReuse',
+    String(RECORDER_INTEGRATION_MAX_TEST_RUNNER_REUSE),
   ]);
   assert.equal(incremental.args.includes('--force'), false);
 });

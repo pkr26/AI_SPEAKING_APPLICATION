@@ -453,19 +453,26 @@ describe('cancelDailyReminderQuietly', () => {
       persisted = null;
     });
     const scheduled = deferred<string>();
-    mockScheduleNotificationAsync.mockReturnValueOnce(scheduled.promise);
+    const scheduleStarted = deferred<void>();
+    mockScheduleNotificationAsync.mockImplementationOnce(async () => {
+      scheduleStarted.resolve();
+      return scheduled.promise;
+    });
 
     const enabling = enableDailyReminder(19);
-    // Drive the queue through the permission check and into its held schedule.
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(mockScheduleNotificationAsync).toHaveBeenCalledTimes(1);
-
+    await scheduleStarted.promise;
     const loggingOut = cancelDailyReminderQuietly();
-    // The queued cancellation must not delete midway through the enable.
-    expect(deleteItemAsync).not.toHaveBeenCalled();
-    scheduled.resolve('notification-id');
+    try {
+      // The queued cancellation must not even begin its storage read midway
+      // through the enable. This synchronously exposes a removed module lock.
+      expect(getItemAsync).not.toHaveBeenCalled();
+      expect(deleteItemAsync).not.toHaveBeenCalled();
+    } finally {
+      // Never strand reminderQueue when a mutation makes an ownership
+      // assertion fail: release and settle both queued operations first.
+      scheduled.resolve('notification-id');
+      await Promise.allSettled([enabling, loggingOut]);
+    }
 
     await expect(enabling).resolves.toBe('enabled');
     await expect(loggingOut).resolves.toBeUndefined();

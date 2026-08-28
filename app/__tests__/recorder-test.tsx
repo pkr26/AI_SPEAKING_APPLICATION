@@ -353,6 +353,11 @@ function deferred<T>() {
     rawResolve = res;
     rawReject = rej;
   });
+  // A mutant can bypass the mocked bridge call that would normally consume a
+  // deliberately rejected deferred. Mark the original promise as handled so
+  // that bypass cannot become an unrelated unhandled-rejection crash. Awaiting
+  // the original promise still observes the rejection and exercises its owner.
+  void promise.catch(() => undefined);
   const settleForCleanup = () => {
     if (settled) return;
     settled = true;
@@ -429,6 +434,20 @@ async function flushAct(): Promise<void> {
   await act(async () => {
     await flushMicrotasks();
   });
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs = 1_500): Promise<boolean> {
+  let timeout: ReturnType<typeof nativeSetTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timeout = nativeSetTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) nativeClearTimeout(timeout);
+  }
 }
 
 async function advancePolls(times: number): Promise<void> {
@@ -15518,38 +15537,51 @@ describe('Recorder', () => {
     it('audit 80 rechecks lifecycle before taking a released global audio session', async () => {
       const firstProps = recorderTestProps();
       const secondProps = recorderTestProps({ questionId: OTHER_QUESTION_ID });
-      const view = await render(
-        <>
-          <Recorder {...firstProps} />
-          <Recorder {...secondProps} />
-        </>,
-      );
-      await flushAct();
-      const firstStart = compositePressablePropsForNode(screen.getAllByLabelText(START_LABEL)[0])
-        .onPress as () => unknown;
-      await act(async () => {
-        await Promise.resolve(firstStart());
-      });
-      const secondStart = compositePressablePropsForNode(screen.getByLabelText(START_LABEL))
-        .onPress as () => unknown;
-      let waitingStart!: Promise<void>;
-      await act(() => {
-        waitingStart = Promise.resolve(secondStart()).then(() => undefined);
-      });
-      await flushAct();
+      let view: RenderResult | undefined;
+      let waitingStart: Promise<void> | undefined;
+      try {
+        view = await render(
+          <>
+            <Recorder {...firstProps} />
+            <Recorder {...secondProps} />
+          </>,
+        );
+        await flushAct();
+        const firstStart = compositePressablePropsForNode(screen.getAllByLabelText(START_LABEL)[0])
+          .onPress as () => unknown;
+        await act(async () => {
+          await Promise.resolve(firstStart());
+        });
+        const secondStart = compositePressablePropsForNode(screen.getByLabelText(START_LABEL))
+          .onPress as () => unknown;
+        await act(() => {
+          waitingStart = Promise.resolve(secondStart()).then(() => undefined);
+        });
+        await flushAct();
 
-      await act(async () => {
-        blurScreen();
-        await waitingStart;
-        await flushMicrotasks();
-      });
+        let releasedWhileBlurred = false;
+        await act(async () => {
+          blurScreen();
+          releasedWhileBlurred = await settlesWithin(waitingStart!);
+          await flushMicrotasks();
+        });
+        expect(releasedWhileBlurred).toBe(true);
 
-      const recordingModeCalls = asMock(setAudioModeAsync).mock.calls.filter(
-        ([options]) => (options as { allowsRecording: boolean }).allowsRecording,
-      );
-      expect(recordingModeCalls).toHaveLength(1);
-      expect(secondProps.onError).not.toHaveBeenCalled();
-      await view.unmount();
+        const recordingModeCalls = asMock(setAudioModeAsync).mock.calls.filter(
+          ([options]) => (options as { allowsRecording: boolean }).allowsRecording,
+        );
+        expect(recordingModeCalls).toHaveLength(1);
+        expect(secondProps.onError).not.toHaveBeenCalled();
+      } finally {
+        // Unmount releases the first recorder's global session even if the
+        // focus-teardown assertion fails. The bounded flush lets the queued
+        // second Start observe that release without recreating a test hang.
+        await view?.unmount();
+        await act(async () => {
+          if (waitingStart) await settlesWithin(waitingStart);
+          await flushMicrotasks();
+        });
+      }
     });
   });
 

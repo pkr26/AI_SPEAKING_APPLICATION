@@ -1,7 +1,8 @@
-import React, { useEffect, useMemo } from 'react';
-import { ActivityIndicator, Text, View } from 'react-native';
+import React, { type PropsWithChildren, useEffect, useMemo } from 'react';
+import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import { Redirect } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
 import { ApiError, apiFetch, userMessageForError } from '../lib/api';
@@ -10,16 +11,27 @@ import { useT } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import { parseUserResponse } from '../lib/types';
 
+function FallbackScreen({ children }: PropsWithChildren) {
+  const styles = themedStyles(useTheme());
+  return (
+    <SafeAreaView style={styles.screen}>
+      <ScrollView contentContainerStyle={styles.center}>
+        <View style={styles.content}>{children}</View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
 function LoadingView({ label }: { label: string }) {
   const theme = useTheme();
   const styles = themedStyles(theme);
   return (
-    <View style={styles.center}>
+    <FallbackScreen>
       <ActivityIndicator accessibilityLabel={label} size="large" color={theme.colors.primary} />
       <Text accessibilityLiveRegion="polite" style={styles.muted}>
         {label}
       </Text>
-    </View>
+    </FallbackScreen>
   );
 }
 
@@ -75,7 +87,7 @@ export default function Gate() {
 
   if (restoreError) {
     return (
-      <View style={styles.center}>
+      <FallbackScreen>
         <Text accessibilityRole="header" style={styles.title}>
           {t('gate.sessionErrorTitle')}
         </Text>
@@ -93,7 +105,7 @@ export default function Gate() {
           onPress={resetStoredSession}
           style={styles.resetButton}
         />
-      </View>
+      </FallbackScreen>
     );
   }
 
@@ -112,7 +124,7 @@ export default function Gate() {
       return <LoadingView label={t('gate.signingOut')} />;
     }
     return (
-      <View style={styles.center}>
+      <FallbackScreen>
         <Text accessibilityRole="header" style={styles.title}>
           {t('gate.serverErrorTitle')}
         </Text>
@@ -124,7 +136,7 @@ export default function Gate() {
           onPress={() => void meQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
-      </View>
+      </FallbackScreen>
     );
   }
 
@@ -136,13 +148,21 @@ export default function Gate() {
   return <Redirect href={profile.diagnosticCompleted ? '/home' : '/diagnostic'} />;
 }
 
-const themedStyles = createThemedStyles(({ colors, spacing }) => ({
-  center: {
+const themedStyles = createThemedStyles(({ colors, layout, spacing }) => ({
+  screen: {
     flex: 1,
+    backgroundColor: colors.background,
+  },
+  center: {
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
-    backgroundColor: colors.background,
+  },
+  content: {
+    width: '100%',
+    maxWidth: layout.formMaxWidth,
+    alignItems: 'center',
   },
   title: {
     fontSize: 20,

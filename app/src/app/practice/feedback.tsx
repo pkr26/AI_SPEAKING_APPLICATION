@@ -237,7 +237,7 @@ export default function FeedbackScreen() {
 
   if (!result) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.title}>
           {t('feedback.noResultTitle')}
         </Text>
@@ -248,7 +248,7 @@ export default function FeedbackScreen() {
           onPress={() => router.replace('/practice')}
           style={styles.noResultButton}
         />
-      </View>
+      </ScrollView>
     );
   }
 
@@ -434,29 +434,31 @@ export default function FeedbackScreen() {
       </ScrollView>
 
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-        {variant === 'retry' && <Button title={t('common.tryAgain')} onPress={retry} />}
+        <View style={styles.bottomBarContent}>
+          {variant === 'retry' && <Button title={t('common.tryAgain')} onPress={retry} />}
 
-        {(variant === 'levelup' ||
-          variant === 'mastered' ||
-          variant === 'passed' ||
-          variant === 'final') && (
-          <Button title={t('feedback.nextQuestion')} onPress={goToNextQuestion} />
-        )}
+          {(variant === 'levelup' ||
+            variant === 'mastered' ||
+            variant === 'passed' ||
+            variant === 'final') && (
+            <Button title={t('feedback.nextQuestion')} onPress={goToNextQuestion} />
+          )}
 
-        {variant === 'native' && (
-          <Button title={t('feedback.tryInEnglish')} onPress={tryInEnglish} />
-        )}
+          {variant === 'native' && (
+            <Button title={t('feedback.tryInEnglish')} onPress={tryInEnglish} />
+          )}
 
-        {variant === 'native-nospeech' && (
-          <Button title={t('feedback.tryAgainNative')} onPress={backToPractice} />
-        )}
+          {variant === 'native-nospeech' && (
+            <Button title={t('feedback.tryAgainNative')} onPress={backToPractice} />
+          )}
 
-        {variant === 'nospeech' && (
-          <View style={styles.buttonColumn}>
-            <Button title={t('common.tryAgain')} onPress={retry} />
-            <Button title={t('feedback.seeHelp')} variant="secondary" onPress={openHelp} />
-          </View>
-        )}
+          {variant === 'nospeech' && (
+            <View style={styles.buttonColumn}>
+              <Button title={t('common.tryAgain')} onPress={retry} />
+              <Button title={t('feedback.seeHelp')} variant="secondary" onPress={openHelp} />
+            </View>
+          )}
+        </View>
       </View>
     </View>
   );
@@ -468,10 +470,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.background,
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   content: {
@@ -565,6 +570,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
+  },
+  bottomBarContent: {
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
   },
   buttonColumn: {
     gap: 10,

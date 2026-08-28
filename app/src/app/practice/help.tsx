@@ -52,7 +52,7 @@ export default function HelpScreen() {
 
   if (!validQuestionId) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
           {t('help.invalidLinkTitle')}
         </Text>
@@ -62,14 +62,18 @@ export default function HelpScreen() {
           onPress={() => router.replace('/practice')}
           style={styles.retryButton}
         />
-      </View>
+      </ScrollView>
     );
   }
 
   return (
     <View style={styles.container}>
       {!help && helpQuery.isPending && (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          style={styles.stateScroll}
+          contentContainerStyle={styles.center}
+        >
           <ActivityIndicator
             accessibilityLabel={t('help.loading')}
             size="large"
@@ -78,7 +82,7 @@ export default function HelpScreen() {
           <Text accessibilityLiveRegion="polite" style={styles.muted}>
             {t('help.loading')}
           </Text>
-        </View>
+        </ScrollView>
       )}
 
       {/* Practice Mode observes this same query key, so the shared cache can
@@ -86,7 +90,11 @@ export default function HelpScreen() {
           holds content. Offer the retry card only when there is nothing to
           show, or it stacks on top of the help the learner is reading. */}
       {!help && helpQuery.isError && (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          style={styles.stateScroll}
+          contentContainerStyle={styles.center}
+        >
           <Text accessibilityRole="header" style={styles.errorTitle}>
             {t('help.loadFailedTitle')}
           </Text>
@@ -98,7 +106,7 @@ export default function HelpScreen() {
             onPress={() => void helpQuery.refetch({ cancelRefetch: false })}
             style={styles.retryButton}
           />
-        </View>
+        </ScrollView>
       )}
 
       {help && (
@@ -143,17 +151,19 @@ export default function HelpScreen() {
           </ScrollView>
 
           <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
-            <Button
-              title={t('help.startPractice')}
-              onPress={() =>
-                router.navigate({
-                  pathname: '/practice/attempt',
-                  params: {
-                    questionId: validQuestionId,
-                  },
-                })
-              }
-            />
+            <View style={styles.bottomBarContent}>
+              <Button
+                title={t('help.startPractice')}
+                onPress={() =>
+                  router.navigate({
+                    pathname: '/practice/attempt',
+                    params: {
+                      questionId: validQuestionId,
+                    },
+                  })
+                }
+              />
+            </View>
           </View>
         </>
       )}
@@ -167,10 +177,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.background,
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
+    backgroundColor: colors.background,
+  },
+  stateScroll: {
+    flex: 1,
   },
   content: {
     padding: layout.screenPadding,
@@ -242,5 +259,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.card,
     borderTopWidth: 1,
     borderTopColor: colors.border,
+  },
+  bottomBarContent: {
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
   },
 }));

@@ -10,7 +10,13 @@ import PrivacyPolicyScreen from '../src/app/settings/privacy';
 import TermsScreen from '../src/app/settings/terms';
 import { ApiError } from '../src/lib/api';
 import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
-import { translateFor, type MessageKey } from '../src/lib/i18n';
+import {
+  I18nProvider,
+  setActiveLanguage,
+  translateFor,
+  type MessageKey,
+  type UiLanguage,
+} from '../src/lib/i18n';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
@@ -180,6 +186,15 @@ function renderScreen(ui: React.ReactElement, queryClient?: QueryClient) {
   return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
 }
 
+function renderLocalizedScreen(ui: React.ReactElement, language: UiLanguage) {
+  const client = makeQueryClient();
+  return render(
+    <QueryClientProvider client={client}>
+      <I18nProvider accountLanguage={language}>{ui}</I18nProvider>
+    </QueryClientProvider>,
+  );
+}
+
 type SemanticStyle = Record<string, unknown>;
 
 function flattenedStyle(node: TestInstance): SemanticStyle {
@@ -223,13 +238,14 @@ const FIELD_LABEL_STYLE: SemanticStyle = {
   marginTop: spacing.md,
 };
 
-/** The row that positions the Show/Hide control over the password field. */
+/** The responsive row that keeps the password field and localized action separate. */
 const INPUT_ROW_STYLE: SemanticStyle = {
-  position: 'relative',
-  justifyContent: 'center',
+  flexDirection: 'row',
+  alignItems: 'center',
+  gap: spacing.sm,
 };
 
-/** A password input, including the right-hand gutter kept clear for Show. */
+/** A password input that may shrink without ever running beneath its action. */
 const PASSWORD_INPUT_STYLE: SemanticStyle = {
   borderWidth: 1,
   borderColor: colors.inputBorder,
@@ -239,13 +255,15 @@ const PASSWORD_INPUT_STYLE: SemanticStyle = {
   fontSize: 16,
   color: colors.text,
   backgroundColor: colors.inputBackground,
-  paddingRight: 64,
+  flexGrow: 1,
+  flexShrink: 1,
+  minWidth: 0,
 };
 
-/** The Show/Hide pressable, sized to the minimum accessible target. */
+/** The bounded Show/Hide sibling, safe for long translations and large text. */
 const INPUT_ACTION_STYLE: SemanticStyle = {
-  position: 'absolute',
-  right: 4,
+  flexShrink: 1,
+  maxWidth: '45%',
   minHeight: layout.minimumTarget,
   minWidth: layout.minimumTarget,
   justifyContent: 'center',
@@ -255,9 +273,11 @@ const INPUT_ACTION_STYLE: SemanticStyle = {
 
 /** The Show/Hide caption itself. */
 const INPUT_ACTION_TEXT_STYLE: SemanticStyle = {
+  flexShrink: 1,
   color: colors.primary,
   fontSize: 14,
   fontWeight: '600',
+  textAlign: 'center',
 };
 
 /** Inline, per-field validation copy. */
@@ -410,6 +430,7 @@ function expectFirstNavigationUpdate(expected: typeof LOCKED_NAVIGATION_OPTIONS)
 
 beforeEach(() => {
   jest.clearAllMocks();
+  setActiveLanguage('en');
   mockBeforeRemoveListener = null;
   mockHardwareBackHandler = null;
   mockNavigation = {
@@ -524,13 +545,13 @@ describe('change password screen', () => {
     expect(flattenedStyle(updateButton())).toMatchObject({ marginTop: spacing.lg });
   });
 
-  it('overlays a reveal control inside every password field', async () => {
+  it('places a responsive reveal action beside every password field', async () => {
     await renderScreen(<ChangePasswordScreen />);
 
     for (const key of ['cp.currentLabel', 'cp.newLabel', 'cp.confirmLabel'] as const) {
       const input = screen.getByLabelText(t(key));
       expect(flattenedStyle(parentOf(input))).toEqual(INPUT_ROW_STYLE);
-      // Each field reserves room on the right so its text never runs under Show.
+      // The field yields horizontal space while the intrinsically sized action does not.
       expect(flattenedStyle(input)).toEqual(PASSWORD_INPUT_STYLE);
     }
     for (const toggle of screen.getAllByRole('button', { name: t('common.showPassword') })) {
@@ -592,12 +613,12 @@ describe('change password screen', () => {
     );
   });
 
-  it('marks the focused password field with a two-pixel accent border', async () => {
+  it('changes only the password border color while focused', async () => {
     await renderScreen(<ChangePasswordScreen />);
 
     await fireEvent(screen.getByLabelText(t('cp.currentLabel')), 'focus');
     expect(flattenedStyle(screen.getByLabelText(t('cp.currentLabel')))).toMatchObject({
-      borderWidth: 2,
+      borderWidth: 1,
       borderColor: colors.primary,
     });
     // Only one field carries the focus treatment at a time.
@@ -616,7 +637,7 @@ describe('change password screen', () => {
 
       await fireEvent(input(), 'focus');
       expect(flattenedStyle(input())).toMatchObject({
-        borderWidth: 2,
+        borderWidth: 1,
         borderColor: colors.primary,
       });
 
@@ -627,6 +648,27 @@ describe('change password screen', () => {
       });
     }
   });
+
+  it.each(['es', 'te'] as const)(
+    'keeps the %s reveal label as an intrinsic sibling instead of a fixed-width overlay',
+    async (language) => {
+      await renderLocalizedScreen(<ChangePasswordScreen />, language);
+
+      const localizedAction = translateFor(language, 'common.showPassword');
+      const localizedCaption = translateFor(language, 'common.show');
+      const toggles = screen.getAllByRole('button', { name: localizedAction });
+      expect(toggles).toHaveLength(3);
+      expect(screen.getAllByText(localizedCaption)).toHaveLength(3);
+      for (const toggle of toggles) {
+        expect(flattenedStyle(toggle)).toEqual(INPUT_ACTION_STYLE);
+        expect(flattenedStyle(toggle).position).toBeUndefined();
+        expect(flattenedStyle(toggle).width).toBeUndefined();
+      }
+      expect(
+        flattenedStyle(screen.getByLabelText(translateFor(language, 'cp.currentLabel'))),
+      ).toEqual(PASSWORD_INPUT_STYLE);
+    },
+  );
 
   it('toggles visibility per password field without affecting the others', async () => {
     await renderScreen(<ChangePasswordScreen />);
@@ -1068,12 +1110,12 @@ describe('delete account screen', () => {
     expect(flattenedStyle(deleteButton())).toMatchObject({ marginTop: spacing.lg });
   });
 
-  it('overlays the reveal control inside the password field', async () => {
+  it('places the reveal action beside the password field', async () => {
     await renderScreen(<DeleteAccountScreen />);
 
     const input = screen.getByLabelText(t('da.passwordLabel'));
     expect(flattenedStyle(parentOf(input))).toEqual(INPUT_ROW_STYLE);
-    // The field reserves room on the right so the text never runs under Show.
+    // Flex sizing, rather than a guessed text gutter, prevents overlap.
     expect(flattenedStyle(input)).toEqual(PASSWORD_INPUT_STYLE);
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual(
       INPUT_ACTION_STYLE,
@@ -1123,7 +1165,7 @@ describe('delete account screen', () => {
     expect(mockAuthValue.deleteAccount).not.toHaveBeenCalled();
   });
 
-  it('marks the focused password field with a two-pixel accent border', async () => {
+  it('changes only the password border color while focused', async () => {
     await renderScreen(<DeleteAccountScreen />);
     const passwordInput = () => screen.getByLabelText(t('da.passwordLabel'));
 
@@ -1134,7 +1176,7 @@ describe('delete account screen', () => {
 
     await fireEvent(passwordInput(), 'focus');
     expect(flattenedStyle(passwordInput())).toMatchObject({
-      borderWidth: 2,
+      borderWidth: 1,
       borderColor: colors.primary,
     });
 
@@ -1596,10 +1638,10 @@ describe('delete account screen', () => {
 });
 
 /**
- * Privacy and terms share one static reading layout: a centred measure, a
- * primary-tinted placeholder note, and evenly spaced body paragraphs.
+ * Privacy and terms share one static reading layout below the native Stack
+ * title: a centred measure, a primary-tinted note, and spaced paragraphs.
  */
-function expectLegalLayout(headerKey: MessageKey, paragraphKeys: readonly MessageKey[]): void {
+function expectLegalLayout(paragraphKeys: readonly MessageKey[]): void {
   expect(scrollContentStyle()).toEqual({
     flexGrow: 1,
     padding: layout.screenPadding,
@@ -1608,15 +1650,10 @@ function expectLegalLayout(headerKey: MessageKey, paragraphKeys: readonly Messag
     alignSelf: 'center',
     backgroundColor: colors.background,
   });
-  expect(flattenedStyle(screen.getByRole('header', { name: t(headerKey) }))).toEqual({
-    fontSize: 24,
-    fontWeight: '800',
-    color: colors.text,
-  });
+  expect(screen.queryByRole('header')).toBeNull();
 
   const note = screen.getByText(t('legal.placeholderNote'));
   expect(flattenedStyle(parentOf(note))).toEqual({
-    marginTop: spacing.md,
     backgroundColor: colors.primaryLight,
     borderColor: colors.primary,
     borderWidth: 1,
@@ -1640,22 +1677,20 @@ function expectLegalLayout(headerKey: MessageKey, paragraphKeys: readonly Messag
 }
 
 describe('legal screens', () => {
-  it('renders the privacy policy header, placeholder note, and all paragraphs', async () => {
+  it('relies on the native privacy title and renders the note and all paragraphs', async () => {
     await renderScreen(<PrivacyPolicyScreen />);
 
-    const title = screen.getByRole('header', { name: t('header.privacy') });
-    expect(flattenedStyle(title)).toMatchObject({ color: colors.text });
+    expect(screen.queryByRole('header', { name: t('header.privacy') })).toBeNull();
     expect(screen.getByText(t('legal.placeholderNote'))).toBeTruthy();
     expect(screen.getByText(t('privacy.p1'))).toBeTruthy();
     expect(screen.getByText(t('privacy.p2'))).toBeTruthy();
     expect(screen.getByText(t('privacy.p3'))).toBeTruthy();
   });
 
-  it('renders the terms header, placeholder note, and all paragraphs', async () => {
+  it('relies on the native terms title and renders the note and all paragraphs', async () => {
     await renderScreen(<TermsScreen />);
 
-    const title = screen.getByRole('header', { name: t('header.terms') });
-    expect(flattenedStyle(title)).toMatchObject({ color: colors.text });
+    expect(screen.queryByRole('header', { name: t('header.terms') })).toBeNull();
     expect(screen.getByText(t('legal.placeholderNote'))).toBeTruthy();
     expect(screen.getByText(t('terms.p1'))).toBeTruthy();
     expect(screen.getByText(t('terms.p2'))).toBeTruthy();
@@ -1665,12 +1700,12 @@ describe('legal screens', () => {
   it('lays out the privacy policy on the shared reading measure', async () => {
     await renderScreen(<PrivacyPolicyScreen />);
 
-    expectLegalLayout('header.privacy', ['privacy.p1', 'privacy.p2', 'privacy.p3']);
+    expectLegalLayout(['privacy.p1', 'privacy.p2', 'privacy.p3']);
   });
 
   it('lays out the terms on the shared reading measure', async () => {
     await renderScreen(<TermsScreen />);
 
-    expectLegalLayout('header.terms', ['terms.p1', 'terms.p2', 'terms.p3']);
+    expectLegalLayout(['terms.p1', 'terms.p2', 'terms.p3']);
   });
 });

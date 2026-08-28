@@ -1,6 +1,7 @@
 import { router, Stack } from 'expo-router';
 import React from 'react';
-import { Text, View } from 'react-native';
+import { ScrollView, Text, View } from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
 import { useT } from '../lib/i18n';
@@ -15,19 +16,18 @@ export default function NotFoundScreen() {
           Stack.Screen declaring one: without this the native stack falls back
           to the route name and prints the raw "+not-found" above the card. */}
       <Stack.Screen options={{ title: t('notFound.title') }} />
-      <View style={styles.screen}>
-        <View style={styles.card}>
-          <Text accessibilityRole="header" style={styles.title}>
-            {t('notFound.title')}
-          </Text>
-          <Text style={styles.body}>{t('notFound.body')}</Text>
-          <Button
-            title={t('notFound.goHome')}
-            onPress={() => router.replace('/')}
-            style={styles.button}
-          />
-        </View>
-      </View>
+      <SafeAreaView edges={['left', 'right', 'bottom']} style={styles.screen}>
+        <ScrollView contentContainerStyle={styles.content}>
+          <View style={styles.card}>
+            <Text style={styles.body}>{t('notFound.body')}</Text>
+            <Button
+              title={t('notFound.goHome')}
+              onPress={() => router.replace('/')}
+              style={styles.button}
+            />
+          </View>
+        </ScrollView>
+      </SafeAreaView>
     </>
   );
 }
@@ -35,10 +35,13 @@ export default function NotFoundScreen() {
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   screen: {
     flex: 1,
+    backgroundColor: colors.background,
+  },
+  content: {
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
-    backgroundColor: colors.background,
   },
   card: {
     width: '100%',
@@ -50,14 +53,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.card,
     padding: spacing.xl,
   },
-  title: {
-    color: colors.text,
-    fontSize: 24,
-    fontWeight: '800',
-    textAlign: 'center',
-  },
   body: {
-    marginTop: 10,
     color: colors.muted,
     fontSize: 16,
     lineHeight: 23,

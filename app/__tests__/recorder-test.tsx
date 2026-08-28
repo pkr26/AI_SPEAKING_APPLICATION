@@ -87,6 +87,7 @@ import Recorder, {
   shouldRunRecordingCacheJanitor,
   shouldPublishRecordingStatus,
   sleepAbortable,
+  scrollToExpandedRecorderControls,
   terminalEventQuarantineIndex,
   waitForForeground,
   type RecorderResultMetadata,
@@ -627,6 +628,7 @@ type IdentityHarnessRecorderProps<T> = {
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExpandedControlsLayout?: () => void;
   onRecoveryEndpointMismatch?: (
     endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
   ) => boolean;
@@ -658,6 +660,7 @@ type RecorderTestOverrides = {
   onError?: (message: string) => void;
   onRecoveryUnresolved?: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExpandedControlsLayout?: () => void;
   onRecoveryEndpointMismatch?: (
     endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
   ) => boolean;
@@ -1091,6 +1094,17 @@ afterEach(async () => {
 });
 
 describe('Recorder pure behavior contracts', () => {
+  it('scrolls expanded controls into view only for the current screen owner', () => {
+    const target = { scrollToEnd: jest.fn() };
+
+    scrollToExpandedRecorderControls(null, true);
+    scrollToExpandedRecorderControls(target, false);
+    expect(target.scrollToEnd).not.toHaveBeenCalled();
+
+    scrollToExpandedRecorderControls(target, true);
+    expect(target.scrollToEnd).toHaveBeenCalledWith({ animated: true });
+  });
+
   // Fresh Recorder mutation IDs 6, 8, 66, 68, 69, 102-115.
   it('uses a monotonic clock when available and a wall-clock fallback otherwise', () => {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'performance');
@@ -5765,6 +5779,47 @@ describe('Recorder', () => {
   });
 
   describe('submission', () => {
+    it('asks the host to reveal recorded review actions only after their layout commits', async () => {
+      const onExpandedControlsLayout = jest.fn();
+      await renderRecorder({ onExpandedControlsLayout });
+      await recordAndStop();
+      expect(onExpandedControlsLayout).not.toHaveBeenCalled();
+
+      await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
+        nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 180 } },
+      });
+      expect(onExpandedControlsLayout).toHaveBeenCalledTimes(1);
+    });
+
+    it('publishes expanded-control layout only to the latest callback prop', async () => {
+      const first = jest.fn();
+      const second = jest.fn();
+      const { view, props } = await renderRecorder({ onExpandedControlsLayout: first });
+      await recordAndStop();
+      await view.rerender(<Recorder {...props} onExpandedControlsLayout={second} />);
+
+      await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
+        nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 180 } },
+      });
+      expect(first).not.toHaveBeenCalled();
+      expect(second).toHaveBeenCalledTimes(1);
+    });
+
+    it('asks the host to reveal upload controls after their layout commits', async () => {
+      const onExpandedControlsLayout = jest.fn();
+      asMock(apiRequestAudioUpload).mockReturnValue(new Promise(() => undefined));
+      await renderRecorder({ onExpandedControlsLayout });
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
+
+      onExpandedControlsLayout.mockClear();
+      await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
+        nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 120 } },
+      });
+      expect(onExpandedControlsLayout).toHaveBeenCalledTimes(1);
+    });
+
     it('renders the submit action with cancellable pressed feedback without submitting', async () => {
       await renderRecorder();
       await recordAndStop();
@@ -15936,6 +15991,8 @@ describe('Recorder', () => {
       await renderRecorder();
 
       expect(flattenedStyle(recorderContainerNode())).toEqual({
+        width: '100%',
+        alignSelf: 'stretch',
         alignItems: 'center',
         paddingVertical: spacing.xl,
       });
@@ -16092,10 +16149,17 @@ describe('Recorder', () => {
 
     it('stacks the review actions with the shared gap and stretch', async () => {
       await renderRecorder();
+      const idleContainerStyle = flattenedStyle(recorderContainerNode());
+      const idleMicWrapStyle = flattenedStyle(recordButtonWrapNode());
       await recordAndStop();
       const actions = screen.getByRole('button', { name: SUBMIT_TEXT }).parent;
       if (!actions) throw new Error('Review actions row not found');
 
+      // Phase-specific controls append below the same responsive root and mic
+      // wrapper; neither gains centering that would move the microphone.
+      expect(flattenedStyle(recorderContainerNode())).toEqual(idleContainerStyle);
+      expect(flattenedStyle(recordButtonWrapNode())).toEqual(idleMicWrapStyle);
+      expect(flattenedStyle(recorderContainerNode()).justifyContent).toBeUndefined();
       expect(flattenedStyle(actions)).toEqual({
         marginTop: spacing.xl,
         alignSelf: 'stretch',

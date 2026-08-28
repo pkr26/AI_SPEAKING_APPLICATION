@@ -93,7 +93,9 @@ export default function SettingsScreen() {
   const [nameError, setNameError] = useState<string | null>(null);
 
   const [languageBusy, setLanguageBusy] = useState(false);
-  const [languageOperation, setLanguageOperation] = useState<'ui' | 'native' | null>(null);
+  const [languageTarget, setLanguageTarget] = useState<
+    { scope: 'ui'; code: UiLanguage } | { scope: 'native'; code: NativeLanguage } | null
+  >(null);
   const [languageError, setLanguageError] = useState<string | null>(null);
   const [languageErrorScope, setLanguageErrorScope] = useState<'ui' | 'native' | null>(null);
 
@@ -213,9 +215,14 @@ export default function SettingsScreen() {
       // the header lock owned by the account that just left this route.
       retakeConfirmingRef.current = null;
       privacyBusyRef.current = null;
+      languageBusyRef.current = false;
       setRetakeConfirming(false);
       setPrivacyBusy(false);
       setPrivacyError(null);
+      setLanguageBusy(false);
+      setLanguageTarget(null);
+      setLanguageError(null);
+      setLanguageErrorScope(null);
       navigationRef.current.setOptions({ headerBackVisible: true, gestureEnabled: true });
     }
     activeIdentityRef.current = activeIdentity;
@@ -367,7 +374,7 @@ export default function SettingsScreen() {
     languageBusyRef.current = true;
     publishNavigationLock();
     setLanguageBusy(true);
-    setLanguageOperation('native');
+    setLanguageTarget({ scope: 'native', code });
     setLanguageError(null);
     setLanguageErrorScope(null);
     try {
@@ -389,7 +396,7 @@ export default function SettingsScreen() {
       if (renderOwnsIdentity()) {
         publishNavigationLock();
         setLanguageBusy(false);
-        setLanguageOperation(null);
+        setLanguageTarget(null);
       }
     }
   };
@@ -406,7 +413,7 @@ export default function SettingsScreen() {
     languageBusyRef.current = true;
     publishNavigationLock();
     setLanguageBusy(true);
-    setLanguageOperation('ui');
+    setLanguageTarget({ scope: 'ui', code });
     setLanguageError(null);
     setLanguageErrorScope(null);
     try {
@@ -454,7 +461,7 @@ export default function SettingsScreen() {
       if (renderOwnsIdentity()) {
         publishNavigationLock();
         setLanguageBusy(false);
-        setLanguageOperation(null);
+        setLanguageTarget(null);
       }
     }
   };
@@ -764,11 +771,6 @@ export default function SettingsScreen() {
     }
   };
 
-  const selectedUiLanguage = UI_LANGUAGES.find((lang) => lang.code === user.uiLanguage);
-  const selectedLearningLanguage = LEARNING_LANGUAGES.find(
-    (lang) => lang.code === user.nativeLanguage,
-  );
-
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
@@ -823,6 +825,7 @@ export default function SettingsScreen() {
             disabled={!canSaveName || logoutBusy}
             loading={nameBusy}
             onPress={() => void saveName()}
+            style={styles.nameAction}
           />
         </View>
         {nameSaved && (
@@ -851,12 +854,14 @@ export default function SettingsScreen() {
         <View style={styles.languageGrid}>
           {UI_LANGUAGES.map((lang) => {
             const selected = user.uiLanguage === lang.code;
+            const saving =
+              languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === lang.code;
             return (
               <Pressable
                 key={lang.code}
                 accessibilityRole="button"
                 accessibilityLabel={`${t('settings.appLanguageLabel')}: ${lang.english}, ${lang.native}`}
-                accessibilityState={{ selected }}
+                accessibilityState={{ selected, busy: saving }}
                 disabled={languageBusy || logoutBusy}
                 onPress={() => void chooseUiLanguage(lang.code)}
                 style={[
@@ -871,13 +876,20 @@ export default function SettingsScreen() {
                 <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
                   {lang.english}
                 </Text>
+                <View testID={`app-language-status-${lang.code}`} style={styles.languageChipStatus}>
+                  {saving && (
+                    <ActivityIndicator
+                      accessibilityElementsHidden
+                      importantForAccessibility="no-hide-descendants"
+                      size="small"
+                      color={colors.primary}
+                    />
+                  )}
+                </View>
               </Pressable>
             );
           })}
         </View>
-        {selectedUiLanguage && languageBusy && languageOperation === 'ui' && (
-          <ActivityIndicator style={styles.languageSpinner} color={colors.primary} />
-        )}
         {languageError && languageErrorScope === 'ui' && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {languageError}
@@ -889,12 +901,16 @@ export default function SettingsScreen() {
         <View style={styles.languageGrid}>
           {LEARNING_LANGUAGES.map((lang) => {
             const selected = user.nativeLanguage === lang.code;
+            const saving =
+              languageBusy &&
+              languageTarget?.scope === 'native' &&
+              languageTarget.code === lang.code;
             return (
               <Pressable
                 key={lang.code}
                 accessibilityRole="button"
                 accessibilityLabel={`${lang.english}, ${lang.native}`}
-                accessibilityState={{ selected }}
+                accessibilityState={{ selected, busy: saving }}
                 disabled={languageBusy || logoutBusy}
                 onPress={() => void chooseNativeLanguage(lang.code)}
                 style={[
@@ -909,13 +925,23 @@ export default function SettingsScreen() {
                 <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
                   {lang.english}
                 </Text>
+                <View
+                  testID={`learning-language-status-${lang.code}`}
+                  style={styles.languageChipStatus}
+                >
+                  {saving && (
+                    <ActivityIndicator
+                      accessibilityElementsHidden
+                      importantForAccessibility="no-hide-descendants"
+                      size="small"
+                      color={colors.primary}
+                    />
+                  )}
+                </View>
               </Pressable>
             );
           })}
         </View>
-        {selectedLearningLanguage && languageBusy && languageOperation === 'native' && (
-          <ActivityIndicator style={styles.languageSpinner} color={colors.primary} />
-        )}
         {languageError && languageErrorScope === 'native' && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {languageError}
@@ -990,41 +1016,45 @@ export default function SettingsScreen() {
             {reminderError}
           </Text>
         )}
-        {(privacyOptionsRequired || privacyBusy || privacyError) && (
-          <>
-            {privacyOptionsRequired && (
-              <>
-                <Text style={styles.privacyHelp}>{t('ads.privacyOptionsHelp')}</Text>
-                <Pressable
-                  accessibilityRole="button"
-                  accessibilityState={{ busy: privacyBusy, disabled: screenBusy }}
-                  disabled={screenBusy}
-                  onPress={() => void openAdPrivacyOptions()}
-                  style={({ pressed }) => [
-                    styles.actionRow,
-                    screenBusy && styles.controlDisabled,
-                    pressed && styles.actionRowPressed,
-                  ]}
-                >
-                  <Text style={styles.actionText}>{t('ads.privacyOptions')}</Text>
-                </Pressable>
-              </>
-            )}
-            {privacyBusy && (
-              <ActivityIndicator
-                accessibilityLabel={t('ads.privacyOptions')}
-                style={styles.privacySpinner}
-                color={colors.primary}
-              />
-            )}
-            {privacyError && (
-              <Text accessibilityRole="alert" style={styles.fieldError}>
-                {privacyError}
-              </Text>
-            )}
-          </>
-        )}
       </View>
+
+      {(privacyOptionsRequired || privacyBusy || privacyError) && (
+        <View style={styles.card}>
+          <Text accessibilityRole="header" style={styles.cardTitle}>
+            {t('ads.privacyOptions')}
+          </Text>
+          {privacyOptionsRequired && (
+            <>
+              <Text style={styles.privacyHelp}>{t('ads.privacyOptionsHelp')}</Text>
+              <Pressable
+                accessibilityRole="button"
+                accessibilityState={{ busy: privacyBusy, disabled: screenBusy }}
+                disabled={screenBusy}
+                onPress={() => void openAdPrivacyOptions()}
+                style={({ pressed }) => [
+                  styles.actionRow,
+                  screenBusy && styles.controlDisabled,
+                  pressed && styles.actionRowPressed,
+                ]}
+              >
+                <Text style={styles.actionText}>{t('ads.privacyOptions')}</Text>
+              </Pressable>
+            </>
+          )}
+          {privacyBusy && (
+            <ActivityIndicator
+              accessibilityLabel={t('ads.privacyOptions')}
+              style={styles.privacySpinner}
+              color={colors.primary}
+            />
+          )}
+          {privacyError && (
+            <Text accessibilityRole="alert" style={styles.fieldError}>
+              {privacyError}
+            </Text>
+          )}
+        </View>
+      )}
 
       <View style={styles.card}>
         <Text accessibilityRole="header" style={styles.cardTitle}>
@@ -1196,6 +1226,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   nameRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     gap: spacing.sm,
   },
@@ -1210,11 +1241,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.inputBackground,
   },
   inputFocused: {
-    borderWidth: 2,
     borderColor: colors.primary,
   },
   nameInput: {
-    flex: 1,
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 200,
+    minWidth: 0,
+  },
+  nameAction: {
+    flexShrink: 0,
   },
   savedNote: {
     marginTop: 6,
@@ -1239,7 +1275,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   languageChip: {
     flexBasis: '47%',
-    flexGrow: 1,
+    flexGrow: 0,
+    flexShrink: 0,
     borderWidth: 1.5,
     borderColor: colors.inputBorder,
     borderRadius: radii.input,
@@ -1264,8 +1301,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   languageTextSelected: {
     color: colors.primary,
   },
-  languageSpinner: {
-    marginTop: spacing.sm,
+  languageChipStatus: {
+    height: spacing.lg,
+    marginTop: spacing.xs,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   controlDisabled: {
     opacity: 0.5,
@@ -1306,8 +1346,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexDirection: 'row',
     alignItems: 'center',
     gap: spacing.md,
+    width: '100%',
   },
   hourButton: {
+    flexShrink: 0,
     width: layout.minimumTarget,
     height: layout.minimumTarget,
     borderRadius: radii.input,
@@ -1325,9 +1367,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.primary,
   },
   reminderTimeText: {
+    flexGrow: 1,
+    flexShrink: 1,
+    minWidth: 0,
     fontSize: 16,
     color: colors.text,
     fontWeight: '600',
+    textAlign: 'center',
   },
   actionRow: {
     minHeight: layout.minimumTarget,

@@ -4,7 +4,10 @@ import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'exp
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../../components/Button';
-import Recorder, { type RecorderResultMetadata } from '../../components/Recorder';
+import Recorder, {
+  scrollToExpandedRecorderControls,
+  type RecorderResultMetadata,
+} from '../../components/Recorder';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
@@ -35,6 +38,7 @@ export default function AttemptScreen() {
   const styles = themedStyles(theme);
   const queryClient = useQueryClient();
   const navigation = useNavigation();
+  const scrollViewRef = useRef<ScrollView>(null);
   const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const [recorderLockState, setRecorderLockState] = useState<{
     owner: string | null;
@@ -98,6 +102,9 @@ export default function AttemptScreen() {
       owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
     [renderOwnsWork],
   );
+  const revealExpandedRecorderControls = useCallback(() => {
+    scrollToExpandedRecorderControls(scrollViewRef.current, recorderOwnsWork(recorderOwner));
+  }, [recorderOwner, recorderOwnsWork]);
   const publishNavigationLock = useCallback(() => {
     if (!mountedRef.current || !focusedRef.current) return;
     navigation.setOptions(
@@ -237,7 +244,7 @@ export default function AttemptScreen() {
 
   if (!validQuestionId) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
           {t('help.invalidLinkTitle')}
         </Text>
@@ -247,14 +254,17 @@ export default function AttemptScreen() {
           onPress={() => router.replace('/practice')}
           style={styles.retryButton}
         />
-      </View>
+      </ScrollView>
     );
   }
 
   if (!promptWord || !questionText) {
     if (helpQuery.isPending) {
       return (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.center}
+        >
           <ActivityIndicator
             accessibilityLabel={t('attempt.loading')}
             size="large"
@@ -263,12 +273,15 @@ export default function AttemptScreen() {
           <Text accessibilityLiveRegion="polite" style={styles.muted}>
             {t('attempt.loading')}
           </Text>
-        </View>
+        </ScrollView>
       );
     }
     if (helpQuery.isError) {
       return (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.center}
+        >
           <Text accessibilityRole="header" style={styles.errorTitle}>
             {t('attempt.loadFailedTitle')}
           </Text>
@@ -280,18 +293,22 @@ export default function AttemptScreen() {
             onPress={() => void helpQuery.refetch({ cancelRefetch: false })}
             style={styles.retryButton}
           />
-        </View>
+        </ScrollView>
       );
     }
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <ActivityIndicator size="large" color={theme.colors.primary} />
-      </View>
+      </ScrollView>
     );
   }
 
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
+    <ScrollView
+      ref={scrollViewRef}
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={styles.container}
+    >
       <View style={styles.card}>
         {attemptStatus !== null && attemptStatus.questionId === validQuestionId && (
           <View style={styles.attemptChip}>
@@ -353,6 +370,7 @@ export default function AttemptScreen() {
           onRecoveryUnresolved={handleRecoveryUnresolved}
           onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
           onInteractionLockChange={handleLockChange}
+          onExpandedControlsLayout={revealExpandedRecorderControls}
         />
       </View>
     </ScrollView>
@@ -369,10 +387,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.background,
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   muted: {
@@ -453,8 +474,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.onPrimary,
   },
   recorderArea: {
-    flex: 1,
-    justifyContent: 'center',
+    width: '100%',
+    alignSelf: 'stretch',
+    justifyContent: 'flex-start',
   },
   rateLimitCard: {
     marginTop: spacing.md,

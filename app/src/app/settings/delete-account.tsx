@@ -169,7 +169,7 @@ export default function DeleteAccountScreen() {
           <View style={styles.inputRow}>
             <TextInput
               accessibilityLabel={t('da.passwordLabel')}
-              style={[styles.input, styles.inputWithAction, passwordFocused && styles.inputFocused]}
+              style={[styles.input, styles.passwordInput, passwordFocused && styles.inputFocused]}
               value={password}
               onChangeText={setPassword}
               onFocus={() => setPasswordFocused(true)}
@@ -286,19 +286,21 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.inputBackground,
   },
   inputFocused: {
-    borderWidth: 2,
     borderColor: colors.primary,
   },
   inputRow: {
-    position: 'relative',
-    justifyContent: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
   },
-  inputWithAction: {
-    paddingRight: 64,
+  passwordInput: {
+    flexGrow: 1,
+    flexShrink: 1,
+    minWidth: 0,
   },
   inputAction: {
-    position: 'absolute',
-    right: 4,
+    flexShrink: 1,
+    maxWidth: '45%',
     minHeight: layout.minimumTarget,
     minWidth: layout.minimumTarget,
     justifyContent: 'center',
@@ -306,9 +308,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     paddingHorizontal: spacing.sm,
   },
   inputActionText: {
+    flexShrink: 1,
     color: colors.primary,
     fontSize: 14,
     fontWeight: '600',
+    textAlign: 'center',
   },
   error: {
     marginTop: 14,

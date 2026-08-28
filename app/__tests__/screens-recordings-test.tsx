@@ -1,7 +1,7 @@
 import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { FlatList } from 'react-native';
+import { FlatList, StyleSheet } from 'react-native';
 
 import RecordingsScreen, {
   formatRecordingDuration,
@@ -142,6 +142,23 @@ async function renderRecordings(
   return Object.assign(view, { client });
 }
 
+function expectScrollableState(): void {
+  const [stateScroll] = screen.container.queryAll(
+    (candidate) => candidate.props.contentContainerStyle !== undefined,
+  );
+  expect(stateScroll?.props.contentInsetAdjustmentBehavior).toBe('automatic');
+  expect(StyleSheet.flatten(stateScroll?.props.contentContainerStyle)).toEqual({
+    flexGrow: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
+    backgroundColor: lightColors.background,
+  });
+}
+
 beforeEach(() => {
   leaseCurrent = true;
   capturedLease = { id: ++leaseSerial } as unknown as SessionLease;
@@ -229,10 +246,13 @@ describe('recordings library', () => {
         alignSelf: 'center',
       },
       center: {
-        flex: 1,
+        flexGrow: 1,
         alignItems: 'center',
         justifyContent: 'center',
         padding: spacing.xl,
+        width: '100%',
+        maxWidth: layout.contentMaxWidth,
+        alignSelf: 'center',
         backgroundColor: lightColors.background,
       },
       title: {
@@ -335,10 +355,12 @@ describe('recordings library', () => {
     const loading = await renderRecordings();
     expect(screen.getByText(t('recordings.loading')).props.accessibilityLiveRegion).toBe('polite');
     expect(screen.getByLabelText(t('recordings.loading'))).toBeTruthy();
+    expectScrollableState();
     resolve({ items: [], nextCursor: null });
     await waitFor(() =>
       expect(screen.getByText(t('recordings.emptyTitle')).props.accessibilityRole).toBe('header'),
     );
+    expectScrollableState();
     expect(screen.getByText(t('recordings.emptyBody'))).toBeTruthy();
     await loading.unmount();
 
@@ -351,6 +373,7 @@ describe('recordings library', () => {
       ),
     );
     expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
+    expectScrollableState();
     asMock(apiGetRecordings).mockResolvedValueOnce({ items: [], nextCursor: null });
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
     expect(refetch).toHaveBeenLastCalledWith({ cancelRefetch: false });
@@ -403,6 +426,7 @@ describe('recordings library', () => {
         recordingId: RECORDING_ID,
         recordingLabel: 'courage',
         recordingStatus: 'retention_pending',
+        showStatus: false,
       },
       {
         compact: true,
@@ -410,6 +434,7 @@ describe('recordings library', () => {
         recordingId: SECOND_ID,
         recordingLabel: 'placement',
         recordingStatus: 'available',
+        showStatus: false,
       },
       {
         compact: true,
@@ -417,6 +442,7 @@ describe('recordings library', () => {
         recordingId: THIRD_ID,
         recordingLabel: 'review',
         recordingStatus: 'unavailable',
+        showStatus: false,
       },
     ]);
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.checkPending') }));

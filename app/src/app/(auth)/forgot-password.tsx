@@ -215,7 +215,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.inputBackground,
   },
   inputFocused: {
-    borderWidth: 2,
     borderColor: colors.primary,
   },
   error: {
@@ -229,6 +228,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   footerLink: {
     marginTop: spacing.xl,
+    minHeight: layout.minimumTarget,
     paddingVertical: spacing.md,
     fontSize: 15,
     color: colors.primary,

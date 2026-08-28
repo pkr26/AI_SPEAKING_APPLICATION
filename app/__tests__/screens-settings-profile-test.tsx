@@ -503,12 +503,14 @@ describe('settings profile card', () => {
     for (const [index, language] of UI_LANGUAGE_CHIPS.entries()) {
       const chip = uiLanguageChip(index);
       expect(chip.props.accessibilityState).toMatchObject({
+        busy: false,
         selected: index === 0,
         disabled: false,
       });
       expect(flattenedStyle(chip)).toMatchObject({
         flexBasis: '47%',
-        flexGrow: 1,
+        flexGrow: 0,
+        flexShrink: 0,
         borderWidth: 1.5,
         borderColor: index === 0 ? colors.primary : colors.inputBorder,
         borderRadius: radii.input,
@@ -521,6 +523,30 @@ describe('settings profile card', () => {
       const englishCopy = within(chip).getAllByText(language.english).at(-1)!;
       expect(flattenedStyle(nativeCopy).color).toBe(index === 0 ? colors.primary : colors.text);
       expect(flattenedStyle(englishCopy).color).toBe(index === 0 ? colors.primary : colors.muted);
+    }
+    // Five choices keep equal half-width columns; the unpaired fifth option
+    // must not stretch across the whole final row.
+    expect(flattenedStyle(uiLanguageChip(4)).flexBasis).toBe(
+      flattenedStyle(uiLanguageChip(0)).flexBasis,
+    );
+    // A 320-point screen leaves about 238 points inside the Settings card.
+    // Two 47% columns plus the 10-point gap still fit on that narrow budget.
+    expect(2 * 0.47 * 238 + 10).toBeLessThanOrEqual(238);
+    const stableStatus = {
+      height: spacing.lg,
+      marginTop: spacing.xs,
+      alignItems: 'center',
+      justifyContent: 'center',
+    };
+    for (const language of UI_LANGUAGE_CHIPS) {
+      expect(flattenedStyle(screen.getByTestId(`app-language-status-${language.code}`))).toEqual(
+        stableStatus,
+      );
+    }
+    for (const language of LANGUAGE_CHIPS) {
+      expect(
+        flattenedStyle(screen.getByTestId(`learning-language-status-${language.code}`)),
+      ).toEqual(stableStatus);
     }
     expect(languageSpinners()).toHaveLength(0);
   });
@@ -1057,7 +1083,21 @@ describe('settings profile card', () => {
       expect(flattenedStyle(chip).opacity).toBe(index === 0 ? undefined : 0.5);
     }
     expect(languageSpinners()).toHaveLength(1);
-    expect(flattenedStyle(languageSpinners()[0])).toEqual({ marginTop: spacing.sm });
+    expect(languageSpinners()[0].props).toMatchObject({
+      accessibilityElementsHidden: true,
+      importantForAccessibility: 'no-hide-descendants',
+      size: 'small',
+    });
+    expect(flattenedStyle(parentOf(languageSpinners()[0]))).toEqual({
+      height: spacing.lg,
+      marginTop: spacing.xs,
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+    expect(parentOf(parentOf(languageSpinners()[0])).props.accessibilityLabel).toBe(
+      `${t('settings.appLanguageLabel')}: Hindi, हिन्दी`,
+    );
+    expect(uiLanguageChip(2).props.accessibilityState).toMatchObject({ busy: true });
 
     await act(async () => {
       update.resolve({ ...USER, uiLanguage: 'hi' });
@@ -1094,6 +1134,11 @@ describe('settings profile card', () => {
     expect(mockSetOptions).toHaveBeenLastCalledWith({
       headerBackVisible: true,
       gestureEnabled: true,
+    });
+    expect(languageSpinners()).toHaveLength(0);
+    expect(uiLanguageChip(2).props.accessibilityState).toMatchObject({
+      busy: false,
+      disabled: false,
     });
     mockSetOptions.mockClear();
     update.reject(new Error('late failure'));
@@ -1347,7 +1392,12 @@ describe('settings profile card', () => {
 
     mockPrivacyOptionsRequired = true;
     await renderSettings();
-    expect(screen.getByText(t('ads.privacyOptionsHelp'))).toBeTruthy();
+    const privacyTitle = screen.getByRole('header', { name: t('ads.privacyOptions') });
+    const reminderTitle = screen.getByRole('header', { name: t('reminder.toggleLabel') });
+    const privacyHelp = screen.getByText(t('ads.privacyOptionsHelp'));
+    // UMP controls own a dedicated card instead of being nested in Daily Reminder.
+    expect(parentOf(privacyTitle)).toBe(parentOf(privacyHelp));
+    expect(parentOf(privacyTitle)).not.toBe(parentOf(reminderTitle));
     await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
     expect(mockShowAdPrivacyOptions).toHaveBeenCalledTimes(1);
   });
@@ -1570,27 +1620,46 @@ describe('settings profile card', () => {
       await fireEvent.press(languageChip(1));
     });
 
-    expect(languageChip(1).props.accessibilityState).toEqual({ disabled: true, selected: false });
-    expect(languageChip(0).props.accessibilityState).toEqual({ disabled: true, selected: true });
+    expect(languageChip(1).props.accessibilityState).toMatchObject({
+      busy: true,
+      disabled: true,
+      selected: false,
+    });
+    expect(languageChip(0).props.accessibilityState).toMatchObject({
+      busy: false,
+      disabled: true,
+      selected: true,
+    });
     // Only the chips you could still move to are dimmed; the current one keeps
     // its full-strength selected treatment.
     expect(flattenedStyle(languageChip(1)).opacity).toBe(0.5);
     expect(flattenedStyle(languageChip(2)).opacity).toBe(0.5);
     expect(flattenedStyle(languageChip(0)).opacity).toBeUndefined();
     expect(languageSpinners()).toHaveLength(1);
-    expect(flattenedStyle(languageSpinners()[0])).toEqual({ marginTop: spacing.sm });
+    expect(languageSpinners()[0].props).toMatchObject({
+      accessibilityElementsHidden: true,
+      importantForAccessibility: 'no-hide-descendants',
+      size: 'small',
+    });
+    expect(parentOf(parentOf(languageSpinners()[0])).props.accessibilityLabel).toBe(
+      'Hindi, हिन्दी',
+    );
     expect(languageSpinners()[0].props.color).toBe(colors.primary);
 
     await act(async () => {
       resolveUpdate({ ...USER, nativeLanguage: 'hi' });
     });
 
-    expect(languageChip(1).props.accessibilityState).toEqual({ disabled: false, selected: false });
+    expect(languageChip(1).props.accessibilityState).toMatchObject({
+      busy: false,
+      disabled: false,
+      selected: false,
+    });
     expect(flattenedStyle(languageChip(1)).opacity).toBeUndefined();
     expect(languageSpinners()).toHaveLength(0);
   });
 
-  it('hides the spinner when the account language is not one on offer', async () => {
+  it('attaches the spinner to the requested chip when the current language is unknown', async () => {
     mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'fr' as never } });
     mockUpdateProfile.mockReturnValue(new Promise(() => undefined));
     await renderSettings();
@@ -1603,10 +1672,14 @@ describe('settings profile card', () => {
       await fireEvent.press(languageChip(1));
     });
 
-    // The spinner sits under the selected chip; with no chip selected there is
-    // nothing for it to annotate.
-    expect(languageChip(1).props.accessibilityState).toMatchObject({ disabled: true });
-    expect(languageSpinners()).toHaveLength(0);
+    expect(languageChip(1).props.accessibilityState).toMatchObject({
+      busy: true,
+      disabled: true,
+    });
+    expect(languageSpinners()).toHaveLength(1);
+    expect(parentOf(parentOf(languageSpinners()[0])).props.accessibilityLabel).toBe(
+      'Hindi, हिन्दी',
+    );
   });
 
   it('surfaces a language-change failure without touching the session user', async () => {
@@ -1631,7 +1704,11 @@ describe('settings profile card', () => {
 
     expect(await screen.findByText(t('settings.updateFailed'))).toBeTruthy();
     // The change can be retried straight away.
-    expect(languageChip(1).props.accessibilityState).toEqual({ disabled: false, selected: false });
+    expect(languageChip(1).props.accessibilityState).toMatchObject({
+      busy: false,
+      disabled: false,
+      selected: false,
+    });
     expect(flattenedStyle(languageChip(1)).opacity).toBeUndefined();
     expect(languageSpinners()).toHaveLength(0);
   });
@@ -1685,6 +1762,7 @@ describe('settings screen layout', () => {
 
     expect(flattenedStyle(parentOf(input()))).toEqual({
       flexDirection: 'row',
+      flexWrap: 'wrap',
       alignItems: 'center',
       gap: spacing.sm,
     });
@@ -1697,7 +1775,10 @@ describe('settings screen layout', () => {
       fontSize: 16,
       color: colors.text,
       backgroundColor: colors.inputBackground,
-      flex: 1,
+      flexGrow: 1,
+      flexShrink: 1,
+      flexBasis: 200,
+      minWidth: 0,
     };
     expect(flattenedStyle(input())).toEqual(resting);
 
@@ -1706,7 +1787,7 @@ describe('settings screen layout', () => {
     });
     expect(flattenedStyle(input())).toEqual({
       ...resting,
-      borderWidth: 2,
+      borderWidth: 1,
       borderColor: colors.primary,
     });
 
@@ -1714,6 +1795,9 @@ describe('settings screen layout', () => {
       await fireEvent(input(), 'blur');
     });
     expect(flattenedStyle(input())).toEqual(resting);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('settings.saveName') })),
+    ).toMatchObject({ flexShrink: 0 });
   });
 
   it('paints the selected language chip in brand ink and the rest at rest', async () => {
@@ -1726,7 +1810,8 @@ describe('settings screen layout', () => {
     });
     const chip = {
       flexBasis: '47%',
-      flexGrow: 1,
+      flexGrow: 0,
+      flexShrink: 0,
       borderWidth: 1.5,
       borderRadius: radii.input,
       paddingVertical: spacing.md,
@@ -1803,11 +1888,16 @@ describe('settings screen layout', () => {
       flexDirection: 'row',
       alignItems: 'center',
       gap: spacing.md,
+      width: '100%',
     });
     expect(flattenedStyle(timeText)).toEqual({
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 0,
       fontSize: 16,
       color: colors.text,
       fontWeight: '600',
+      textAlign: 'center',
     });
 
     const glyph = { fontSize: 20, fontWeight: '700', color: colors.primary };
@@ -1815,6 +1905,7 @@ describe('settings screen layout', () => {
     expect(flattenedStyle(screen.getByText('+'))).toEqual(glyph);
 
     const hourButton = {
+      flexShrink: 0,
       width: layout.minimumTarget,
       height: layout.minimumTarget,
       borderRadius: radii.input,

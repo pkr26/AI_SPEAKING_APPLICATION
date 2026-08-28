@@ -10,9 +10,6 @@ export default function TermsScreen() {
   const styles = themedStyles(useTheme());
   return (
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
-      <Text accessibilityRole="header" style={styles.title}>
-        {t('header.terms')}
-      </Text>
       <View style={styles.noteCard}>
         <Text style={styles.noteText}>{t('legal.placeholderNote')}</Text>
       </View>
@@ -32,13 +29,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'center',
     backgroundColor: colors.background,
   },
-  title: {
-    fontSize: 24,
-    fontWeight: '800',
-    color: colors.text,
-  },
   noteCard: {
-    marginTop: spacing.md,
     backgroundColor: colors.primaryLight,
     borderColor: colors.primary,
     borderWidth: 1,

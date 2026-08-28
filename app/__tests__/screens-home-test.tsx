@@ -532,6 +532,16 @@ describe('home screen', () => {
     expect(updateUser(null)).toBeNull();
     expect(screen.getByText(t('gate.loadingProfile')).props.accessibilityLiveRegion).toBe('polite');
     expect(screen.getByLabelText(t('gate.loadingProfile'))).toBeTruthy();
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      padding: layout.screenPadding,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+      backgroundColor: colors.background,
+    });
     expect(screen.queryByRole('button', { name: t('home.startPractice') })).toBeNull();
     expect(
       client.getQueryCache().find({
@@ -940,9 +950,15 @@ describe('home screen presentation', () => {
     });
     expect(flattenedStyle(parentOf(parentOf(levelLabel)))).toEqual({
       flexDirection: 'row',
+      flexWrap: 'wrap',
       justifyContent: 'space-between',
       alignItems: 'flex-start',
       gap: spacing.sm,
+    });
+    expect(flattenedStyle(parentOf(levelLabel))).toEqual({
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 160,
     });
 
     expect(flattenedStyle(screen.getByText('B1'))).toEqual({
@@ -957,9 +973,19 @@ describe('home screen presentation', () => {
       color: colors.muted,
     });
     expect(flattenedStyle(screen.getByText(t('home.dueChip', { count: 4 })))).toEqual({
+      flexShrink: 1,
       fontSize: 13,
       fontWeight: '700',
       color: colors.primary,
+    });
+    expect(flattenedStyle(parentOf(screen.getByText(t('home.dueChip', { count: 4 }))))).toEqual({
+      maxWidth: '100%',
+      flexShrink: 1,
+      backgroundColor: colors.primaryLight,
+      borderRadius: radii.pill,
+      paddingVertical: 6,
+      paddingHorizontal: 14,
+      marginTop: spacing.md,
     });
   });
 

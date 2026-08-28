@@ -464,15 +464,17 @@ describe('login screen', () => {
     });
   });
 
-  it('overlays the password reveal control inside the password field', async () => {
+  it('lays the reveal control beside a flexible password field', async () => {
     await render(<LoginScreen />);
     const passwordInput = screen.getByLabelText(t('login.passwordLabel'));
 
     expect(flattenedStyle(parentOf(passwordInput))).toEqual({
-      position: 'relative',
-      justifyContent: 'center',
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
     });
-    // The field reserves room on the right so the text never runs under Show.
+    // The input owns the remaining row width instead of reserving a fixed
+    // English-sized gutter that translated reveal labels can overlap.
     expect(flattenedStyle(passwordInput)).toEqual({
       borderWidth: 1,
       borderColor: colors.inputBorder,
@@ -482,11 +484,12 @@ describe('login screen', () => {
       fontSize: 16,
       color: colors.text,
       backgroundColor: colors.inputBackground,
-      paddingRight: 64,
+      flex: 1,
+      minWidth: 0,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      position: 'absolute',
-      right: 4,
+      flexShrink: 1,
+      maxWidth: '45%',
       minHeight: layout.minimumTarget,
       minWidth: layout.minimumTarget,
       justifyContent: 'center',
@@ -494,11 +497,42 @@ describe('login screen', () => {
       paddingHorizontal: spacing.sm,
     });
     expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+      flexShrink: 1,
       color: colors.primary,
       fontSize: 14,
       fontWeight: '600',
+      textAlign: 'center',
     });
   });
+
+  it.each(['te', 'es'] as const)(
+    'keeps the %s reveal label and auth footer responsive',
+    async (language) => {
+      const localT = (key: MessageKey) => translateFor(language, key);
+      await render(
+        <I18nProvider accountLanguage={language}>
+          <LoginScreen />
+        </I18nProvider>,
+      );
+
+      const passwordInput = screen.getByLabelText(localT('login.passwordLabel'));
+      const reveal = screen.getByRole('button', { name: localT('common.showPassword') });
+      expect(flattenedStyle(passwordInput)).toMatchObject({ flex: 1, minWidth: 0 });
+      expect(flattenedStyle(reveal)).toMatchObject({
+        flexShrink: 1,
+        maxWidth: '45%',
+        minHeight: layout.minimumTarget,
+        minWidth: layout.minimumTarget,
+      });
+      expect(flattenedStyle(screen.getByText(localT('common.show')))).toMatchObject({
+        flexShrink: 1,
+        textAlign: 'center',
+      });
+      expect(
+        flattenedStyle(parentOf(screen.getByText(localT('login.footerPrompt')))),
+      ).toMatchObject({ flexWrap: 'wrap' });
+    },
+  );
 
   it('spaces the submit button, forgot link, and signup footer', async () => {
     await render(<LoginScreen />);
@@ -506,6 +540,7 @@ describe('login screen', () => {
     expect(flattenedStyle(logInButton())).toMatchObject({ marginTop: spacing.lg });
     expect(flattenedStyle(screen.getByRole('link', { name: t('login.forgot') }))).toEqual({
       marginTop: spacing.ml,
+      minHeight: layout.minimumTarget,
       paddingVertical: spacing.md,
       fontSize: 15,
       color: colors.primary,
@@ -518,15 +553,24 @@ describe('login screen', () => {
       marginTop: spacing.xl,
       minHeight: layout.minimumTarget,
       flexDirection: 'row',
+      flexWrap: 'wrap',
       alignItems: 'center',
       justifyContent: 'center',
     });
-    expect(flattenedStyle(footerText)).toEqual({ fontSize: 15, color: colors.muted });
+    expect(flattenedStyle(footerText)).toEqual({
+      flexShrink: 1,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
     expect(flattenedStyle(screen.getByRole('link', { name: t('login.footerLink') }))).toEqual({
+      flexShrink: 1,
+      minHeight: layout.minimumTarget,
       paddingVertical: spacing.md,
       fontSize: 15,
       color: colors.primary,
       fontWeight: '600',
+      textAlign: 'center',
     });
   });
 
@@ -653,7 +697,7 @@ describe('login screen', () => {
     expect(mockAuthValue.login).toHaveBeenCalledWith('ada@example.com', 'password1');
   });
 
-  it('marks the focused field with a two-pixel accent border', async () => {
+  it('changes only the focused field border color so focus does not move the form', async () => {
     await render(<LoginScreen />);
     const emailInput = () => screen.getByLabelText(t('login.emailLabel'));
     const passwordInput = () => screen.getByLabelText(t('login.passwordLabel'));
@@ -665,7 +709,7 @@ describe('login screen', () => {
 
     await fireEvent(emailInput(), 'focus');
     expect(flattenedStyle(emailInput())).toMatchObject({
-      borderWidth: 2,
+      borderWidth: 1,
       borderColor: colors.primary,
     });
     // Only one field carries the focus treatment at a time.
@@ -682,7 +726,7 @@ describe('login screen', () => {
 
     await fireEvent(passwordInput(), 'focus');
     expect(flattenedStyle(passwordInput())).toMatchObject({
-      borderWidth: 2,
+      borderWidth: 1,
       borderColor: colors.primary,
     });
     await fireEvent(passwordInput(), 'blur');
@@ -1095,15 +1139,15 @@ describe('signup screen', () => {
     });
   });
 
-  it('overlays the password reveal control inside the signup password field', async () => {
+  it('lays the reveal control beside a flexible signup password field', async () => {
     await render(<SignupScreen />);
     const passwordInput = screen.getByLabelText(t('login.passwordLabel'));
 
     expect(flattenedStyle(parentOf(passwordInput))).toEqual({
-      position: 'relative',
-      justifyContent: 'center',
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
     });
-    // The field reserves room on the right so the text never runs under Show.
     expect(flattenedStyle(passwordInput)).toEqual({
       borderWidth: 1,
       borderColor: colors.inputBorder,
@@ -1113,11 +1157,12 @@ describe('signup screen', () => {
       fontSize: 16,
       color: colors.text,
       backgroundColor: colors.inputBackground,
-      paddingRight: 64,
+      flex: 1,
+      minWidth: 0,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      position: 'absolute',
-      right: 4,
+      flexShrink: 1,
+      maxWidth: '45%',
       minHeight: layout.minimumTarget,
       minWidth: layout.minimumTarget,
       justifyContent: 'center',
@@ -1125,9 +1170,11 @@ describe('signup screen', () => {
       paddingHorizontal: spacing.sm,
     });
     expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+      flexShrink: 1,
       color: colors.primary,
       fontSize: 14,
       fontWeight: '600',
+      textAlign: 'center',
     });
   });
 
@@ -1146,15 +1193,24 @@ describe('signup screen', () => {
       marginTop: spacing.xl,
       minHeight: layout.minimumTarget,
       flexDirection: 'row',
+      flexWrap: 'wrap',
       alignItems: 'center',
       justifyContent: 'center',
     });
-    expect(flattenedStyle(footerText)).toEqual({ fontSize: 15, color: colors.muted });
+    expect(flattenedStyle(footerText)).toEqual({
+      flexShrink: 1,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
     expect(flattenedStyle(screen.getByRole('link', { name: t('signup.footerLink') }))).toEqual({
+      flexShrink: 1,
+      minHeight: layout.minimumTarget,
       paddingVertical: spacing.md,
       fontSize: 15,
       color: colors.primary,
       fontWeight: '600',
+      textAlign: 'center',
     });
   });
 
@@ -1397,7 +1453,7 @@ describe('signup screen', () => {
     expect(passwordFocus).not.toHaveBeenCalled();
   });
 
-  it('marks the focused signup field with a two-pixel accent border', async () => {
+  it('changes only the focused signup border color so focus does not move the form', async () => {
     await render(<SignupScreen />);
 
     for (const label of [t('signup.nameLabel'), t('login.emailLabel'), t('login.passwordLabel')]) {
@@ -1409,7 +1465,7 @@ describe('signup screen', () => {
 
       await fireEvent(input(), 'focus');
       expect(flattenedStyle(input())).toMatchObject({
-        borderWidth: 2,
+        borderWidth: 1,
         borderColor: colors.primary,
       });
 

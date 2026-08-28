@@ -153,7 +153,7 @@ export default function ChangePasswordScreen() {
               accessibilityLabel={t('cp.currentLabel')}
               style={[
                 styles.input,
-                styles.inputWithAction,
+                styles.passwordInput,
                 focusedField === 'current' && styles.inputFocused,
               ]}
               value={currentPassword}
@@ -186,7 +186,7 @@ export default function ChangePasswordScreen() {
               accessibilityLabel={t('cp.newLabel')}
               style={[
                 styles.input,
-                styles.inputWithAction,
+                styles.passwordInput,
                 focusedField === 'next' && styles.inputFocused,
               ]}
               value={newPassword}
@@ -219,7 +219,7 @@ export default function ChangePasswordScreen() {
               accessibilityLabel={t('cp.confirmLabel')}
               style={[
                 styles.input,
-                styles.inputWithAction,
+                styles.passwordInput,
                 focusedField === 'confirm' && styles.inputFocused,
               ]}
               value={confirmPassword}
@@ -301,19 +301,21 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.inputBackground,
   },
   inputFocused: {
-    borderWidth: 2,
     borderColor: colors.primary,
   },
   inputRow: {
-    position: 'relative',
-    justifyContent: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
   },
-  inputWithAction: {
-    paddingRight: 64,
+  passwordInput: {
+    flexGrow: 1,
+    flexShrink: 1,
+    minWidth: 0,
   },
   inputAction: {
-    position: 'absolute',
-    right: 4,
+    flexShrink: 1,
+    maxWidth: '45%',
     minHeight: layout.minimumTarget,
     minWidth: layout.minimumTarget,
     justifyContent: 'center',
@@ -321,9 +323,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     paddingHorizontal: spacing.sm,
   },
   inputActionText: {
+    flexShrink: 1,
     color: colors.primary,
     fontSize: 14,
     fontWeight: '600',
+    textAlign: 'center',
   },
   fieldError: {
     marginTop: 6,

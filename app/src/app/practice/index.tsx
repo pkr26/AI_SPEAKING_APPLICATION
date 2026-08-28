@@ -5,7 +5,10 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'rea
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
-import Recorder, { type RecorderResultMetadata } from '../../components/Recorder';
+import Recorder, {
+  scrollToExpandedRecorderControls,
+  type RecorderResultMetadata,
+} from '../../components/Recorder';
 import { apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
@@ -35,6 +38,7 @@ export default function PracticeScreen() {
   const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
   const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
+  const scrollViewRef = useRef<ScrollView>(null);
   const [recorderLockState, setRecorderLockState] = useState<{
     owner: string | null;
     locked: boolean;
@@ -144,6 +148,9 @@ export default function PracticeScreen() {
       owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
     [renderOwnsWork],
   );
+  const revealExpandedRecorderControls = useCallback(() => {
+    scrollToExpandedRecorderControls(scrollViewRef.current, recorderOwnsWork(recorderOwner));
+  }, [recorderOwner, recorderOwnsWork]);
 
   const interactionLocked = recorderLocked || skipBusy || logoutBusy;
   const interactionLockedNow = useCallback(
@@ -358,6 +365,7 @@ export default function PracticeScreen() {
   return (
     <View style={styles.container}>
       <ScrollView
+        ref={scrollViewRef}
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.content}
         keyboardShouldPersistTaps="handled"
@@ -415,28 +423,6 @@ export default function PracticeScreen() {
 
         {question && (
           <>
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel={t('practice.helpLabel')}
-              accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-              disabled={interactionLocked}
-              hitSlop={4}
-              style={({ pressed }) => [
-                styles.helpButton,
-                interactionLocked && styles.controlDisabled,
-                pressed && styles.helpButtonPressed,
-              ]}
-              onPress={() => {
-                if (!claimNavigation()) return;
-                router.navigate({
-                  pathname: '/practice/help',
-                  params: { questionId: question.id },
-                });
-              }}
-            >
-              <Text style={styles.helpButtonText}>?</Text>
-            </Pressable>
-
             <View style={styles.card}>
               <View style={styles.badgeRow}>
                 <View style={styles.levelBadge}>
@@ -481,7 +467,33 @@ export default function PracticeScreen() {
               <Text accessibilityRole="header" style={styles.promptWord}>
                 {question.promptWord}
               </Text>
-              <Text style={styles.cardLabel}>{t('label.question')}</Text>
+              <View style={styles.questionHeadingRow}>
+                <Text style={[styles.cardLabel, styles.questionCardLabel]}>
+                  {t('label.question')}
+                </Text>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={t('practice.helpLabel')}
+                  accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
+                  accessibilityState={{ disabled: interactionLocked }}
+                  disabled={interactionLocked}
+                  hitSlop={4}
+                  style={({ pressed }) => [
+                    styles.helpButton,
+                    interactionLocked && styles.controlDisabled,
+                    pressed && styles.helpButtonPressed,
+                  ]}
+                  onPress={() => {
+                    if (!claimNavigation()) return;
+                    router.navigate({
+                      pathname: '/practice/help',
+                      params: { questionId: question.id },
+                    });
+                  }}
+                >
+                  <Text style={styles.helpButtonText}>?</Text>
+                </Pressable>
+              </View>
               <Text style={styles.questionText}>{question.questionText}</Text>
             </View>
 
@@ -531,6 +543,7 @@ export default function PracticeScreen() {
                 onRecoveryUnresolved={handleRecoveryUnresolved}
                 onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
                 onInteractionLockChange={handleLockChange}
+                onExpandedControlsLayout={revealExpandedRecorderControls}
               />
             </View>
 
@@ -615,7 +628,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     marginTop: spacing.lg,
   },
   helpButton: {
-    alignSelf: 'flex-end',
     width: layout.minimumTarget,
     height: layout.minimumTarget,
     borderRadius: radii.pill,
@@ -659,6 +671,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   },
   badgeRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     gap: spacing.sm,
     marginBottom: spacing.xs,
@@ -762,6 +775,18 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     letterSpacing: 0.8,
     marginTop: spacing.md,
   },
+  questionHeadingRow: {
+    marginTop: spacing.md,
+    minHeight: layout.minimumTarget,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: spacing.md,
+  },
+  questionCardLabel: {
+    marginTop: 0,
+    flexShrink: 1,
+  },
   promptWord: {
     marginTop: spacing.xs,
     fontSize: 30,
@@ -775,8 +800,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     color: colors.text,
   },
   recorderArea: {
-    minHeight: 330,
-    justifyContent: 'center',
+    width: '100%',
+    alignSelf: 'stretch',
+    justifyContent: 'flex-start',
   },
   rateLimitCard: {
     marginTop: spacing.md,

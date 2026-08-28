@@ -134,6 +134,7 @@ interface CapturedRecorderProps {
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExpandedControlsLayout?: () => void;
   onRateLimited?: (message: string) => void;
   onRecoveryEndpointMismatch?: (
     endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
@@ -149,6 +150,7 @@ let mockRecorderProps: CapturedRecorderProps | null = null;
 let mockRecorderInstanceSerial = 0;
 let mockRecorderMounts: number[] = [];
 let mockRecorderUnmounts: number[] = [];
+const mockScrollToExpandedRecorderControls = jest.fn();
 
 // A host node stands in for the real recorder so tests can reach the slot the
 // screens reserve for it (`styles.recorderArea`) the same way a user's eye does.
@@ -178,6 +180,8 @@ function MockRecorder(props: MockRecorderProps) {
 jest.mock('../src/components/Recorder', () => ({
   __esModule: true,
   default: MockRecorder,
+  scrollToExpandedRecorderControls: (...args: unknown[]) =>
+    mockScrollToExpandedRecorderControls(...args),
 }));
 
 jest.mock('../src/components/RecordingPlayback', () => ({
@@ -551,9 +555,13 @@ function recorderAreaStyle(): SemanticStyle {
 }
 
 function buttonContainerPaddingBottom(name: string): unknown {
-  const parent = screen.getByRole('button', { name }).parent;
-  if (!parent) throw new Error(`Button "${name}" has no container`);
-  return StyleSheet.flatten(parent.props.style)?.paddingBottom;
+  let ancestor = screen.getByRole('button', { name }).parent;
+  while (ancestor) {
+    const paddingBottom = StyleSheet.flatten(ancestor.props.style)?.paddingBottom;
+    if (paddingBottom !== undefined) return paddingBottom;
+    ancestor = ancestor.parent;
+  }
+  throw new Error(`Button "${name}" has no padded container`);
 }
 
 beforeEach(() => {
@@ -649,6 +657,9 @@ describe('practice home screen', () => {
       endpoint: '/practice/attempt',
       disabled: false,
     });
+    expect(recorderProps().onExpandedControlsLayout).toEqual(expect.any(Function));
+    expect(() => recorderProps().onExpandedControlsLayout?.()).not.toThrow();
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
     // The screen chooses which response contract the recorder parses with; a
     // swapped parser breaks the flow at runtime, so pin the wiring.
     expect(recorderProps().parseResult).toBe(parseAttemptResult);
@@ -664,6 +675,19 @@ describe('practice home screen', () => {
         exact: true,
       })?.options,
     ).toEqual(expect.objectContaining({ enabled: true, retry: false, staleTime: Infinity }));
+  });
+
+  it('does not scroll expanded Recorder controls after Practice loses ownership', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    const rendered = await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const reveal = recorderProps().onExpandedControlsLayout!;
+    mockScrollToExpandedRecorderControls.mockClear();
+
+    await rendered.unmount();
+    reveal();
+
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(null, false);
   });
 
   it('shows the new-word badge and progress line for a fresh word', async () => {
@@ -1385,7 +1409,6 @@ describe('practice home screen', () => {
       () => screen.getByLabelText(t('practice.helpLabel')),
       {
         alignItems: 'center',
-        alignSelf: 'flex-end',
         backgroundColor: colors.primary,
         height: layout.minimumTarget,
         justifyContent: 'center',
@@ -1672,6 +1695,9 @@ describe('practice attempt screen', () => {
       questionId: QUESTION.id,
       endpoint: '/practice/attempt',
     });
+    expect(recorderProps().onExpandedControlsLayout).toEqual(expect.any(Function));
+    expect(() => recorderProps().onExpandedControlsLayout?.()).not.toThrow();
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
     // The screen chooses which response contract the recorder parses with; a
     // swapped parser breaks the flow at runtime, so pin the wiring.
     expect(recorderProps().parseResult).toBe(parseAttemptResult);
@@ -1691,6 +1717,20 @@ describe('practice attempt screen', () => {
     expect(screen.queryByText('ధైర్యం')).toBeNull();
     expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt/native')).toBe(true);
     expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
+  });
+
+  it('does not scroll expanded controls after Practice Mode loses ownership', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    const rendered = await renderScreen(<AttemptScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+    const reveal = recorderProps().onExpandedControlsLayout!;
+    mockScrollToExpandedRecorderControls.mockClear();
+
+    await rendered.unmount();
+    reveal();
+
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(null, false);
   });
 
   it('preserves native mode when practice is entered from help', async () => {
@@ -4916,9 +4956,13 @@ describe('practice home presentation', () => {
       color: colors.muted,
       marginBottom: spacing.md,
     });
-    // The recorder gets a reserved, vertically centred slot so the layout does
-    // not jump between its idle, recording, and uploading heights.
-    expect(recorderAreaStyle()).toEqual({ minHeight: 330, justifyContent: 'center' });
+    // Recorder phases grow downward from one stable top edge; the ScrollView
+    // owns any extra height so review and upload actions stay reachable.
+    expect(recorderAreaStyle()).toEqual({
+      width: '100%',
+      alignSelf: 'stretch',
+      justifyContent: 'flex-start',
+    });
   });
 
   it('renders the question card, its labels, and the progress lines from the tokens', async () => {
@@ -4947,7 +4991,11 @@ describe('practice home presentation', () => {
     });
     // Both halves of the card are named for the learner.
     expect(flattenedStyle(screen.getByText(t('label.word')))).toEqual(CARD_LABEL);
-    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual({
+      ...CARD_LABEL,
+      marginTop: 0,
+      flexShrink: 1,
+    });
     expect(flattenedStyle(screen.getByText(t('cefr.B1')))).toEqual({
       fontSize: 13,
       color: colors.muted,
@@ -4982,6 +5030,7 @@ describe('practice home presentation', () => {
     });
     expect(flattenedStyle(parentOf(parentOf(levelBadgeText)))).toEqual({
       flexDirection: 'row',
+      flexWrap: 'wrap',
       alignItems: 'center',
       gap: spacing.sm,
       marginBottom: spacing.xs,
@@ -5077,7 +5126,6 @@ describe('practice home presentation', () => {
     await renderLoadedHome();
 
     expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel')))).toEqual({
-      alignSelf: 'flex-end',
       width: layout.minimumTarget,
       height: layout.minimumTarget,
       borderRadius: radii.pill,
@@ -5095,6 +5143,27 @@ describe('practice home presentation', () => {
       fontSize: 20,
       fontWeight: '800',
     });
+
+    const questionLabel = screen.getByText(t('label.question'));
+    const help = screen.getByLabelText(t('practice.helpLabel'));
+    const questionHeadingRow = parentOf(questionLabel);
+    const questionCard = parentOf(questionHeadingRow);
+    expect(parentOf(help)).toBe(questionHeadingRow);
+    expect(parentOf(screen.getByText(QUESTION.questionText))).toBe(questionCard);
+    expect(flattenedStyle(questionHeadingRow)).toEqual({
+      marginTop: spacing.md,
+      minHeight: layout.minimumTarget,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'space-between',
+      gap: spacing.md,
+    });
+    expect(questionHeadingRow.children.indexOf(questionLabel)).toBeLessThan(
+      questionHeadingRow.children.indexOf(help),
+    );
+    expect(questionCard.children.indexOf(questionHeadingRow)).toBeLessThan(
+      questionCard.children.indexOf(screen.getByText(QUESTION.questionText)),
+    );
   });
 
   it('deepens the help-button shadow in the dark palette', async () => {
@@ -5318,10 +5387,13 @@ describe('practice attempt presentation', () => {
   }
 
   const CENTERED_STATE = {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   };
 
@@ -5343,9 +5415,12 @@ describe('practice attempt presentation', () => {
       alignSelf: 'center',
       backgroundColor: colors.background,
     });
-    // Practice Mode gives the recorder the rest of the screen instead of a
-    // fixed slot: there is nothing below it to protect from reflow.
-    expect(recorderAreaStyle()).toEqual({ flex: 1, justifyContent: 'center' });
+    // Review/upload controls extend the scroll content below a top-anchored mic.
+    expect(recorderAreaStyle()).toEqual({
+      width: '100%',
+      alignSelf: 'stretch',
+      justifyContent: 'flex-start',
+    });
   });
 
   it('renders the stripped-back question card from the tokens', async () => {
@@ -5431,7 +5506,7 @@ describe('practice attempt presentation', () => {
 
     const loading = screen.getByText(t('attempt.loading'));
     expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
-    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
 
     mockApiFetch.mockReset();
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
@@ -5445,7 +5520,7 @@ describe('practice attempt presentation', () => {
       fontWeight: '700',
       color: colors.text,
     });
-    expect(flattenedStyle(parentOf(failureTitle))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
@@ -5455,7 +5530,8 @@ describe('practice attempt presentation', () => {
     await renderScreen(<AttemptScreen />);
 
     const brokenLinkTitle = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
-    expect(flattenedStyle(parentOf(brokenLinkTitle))).toEqual(CENTERED_STATE);
+    expect(brokenLinkTitle).toBeTruthy();
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
     expect(flattenedStyle(screen.getByText(t('attempt.invalidLinkBody')))).toEqual(MUTED_BODY);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
@@ -5494,10 +5570,14 @@ describe('practice help presentation', () => {
   }
 
   const CENTERED_STATE = {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
+    backgroundColor: colors.background,
   };
 
   const MUTED_BODY = {
@@ -5518,9 +5598,13 @@ describe('practice help presentation', () => {
       maxWidth: layout.contentMaxWidth,
       alignSelf: 'center',
     });
-    expect(
-      flattenedStyle(parentOf(screen.getByRole('button', { name: t('help.startPractice') }))),
-    ).toEqual({
+    const barContent = parentOf(screen.getByRole('button', { name: t('help.startPractice') }));
+    expect(flattenedStyle(barContent)).toEqual({
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(parentOf(barContent))).toEqual({
       padding: spacing.ml,
       backgroundColor: colors.card,
       borderTopWidth: 1,
@@ -5592,7 +5676,7 @@ describe('practice help presentation', () => {
 
     const loading = screen.getByText(t('help.loading'));
     expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
-    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
 
     mockApiFetch.mockReset();
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
@@ -5604,7 +5688,7 @@ describe('practice help presentation', () => {
       fontWeight: '700',
       color: colors.text,
     });
-    expect(flattenedStyle(parentOf(failureTitle))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
@@ -5614,7 +5698,8 @@ describe('practice help presentation', () => {
     await renderScreen(<HelpScreen />);
 
     const brokenLinkTitle = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
-    expect(flattenedStyle(parentOf(brokenLinkTitle))).toEqual(CENTERED_STATE);
+    expect(brokenLinkTitle).toBeTruthy();
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
     expect(flattenedStyle(screen.getByText(t('help.invalidLinkBody')))).toEqual(MUTED_BODY);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
@@ -5997,9 +6082,13 @@ describe('practice feedback presentation', () => {
       lineHeight: 24,
       color: colors.text,
     });
-    expect(
-      flattenedStyle(parentOf(screen.getByRole('button', { name: t('feedback.nextQuestion') }))),
-    ).toEqual({
+    const barContent = parentOf(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
+    expect(flattenedStyle(barContent)).toEqual({
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(parentOf(barContent))).toEqual({
       padding: spacing.ml,
       backgroundColor: colors.card,
       borderTopWidth: 1,
@@ -6053,7 +6142,13 @@ describe('practice feedback presentation', () => {
 
     const column = parentOf(screen.getByRole('button', { name: t('common.tryAgain') }));
     expect(flattenedStyle(column)).toEqual({ gap: 10 });
-    expect(flattenedStyle(parentOf(column))).toEqual({
+    const barContent = parentOf(column);
+    expect(flattenedStyle(barContent)).toEqual({
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
+    });
+    expect(flattenedStyle(parentOf(barContent))).toEqual({
       padding: spacing.ml,
       backgroundColor: colors.card,
       borderTopWidth: 1,
@@ -6066,11 +6161,15 @@ describe('practice feedback presentation', () => {
     await renderScreen(<FeedbackScreen />);
 
     const title = screen.getByRole('header', { name: t('feedback.noResultTitle') });
-    expect(flattenedStyle(parentOf(title))).toEqual({
-      flex: 1,
+    expect(title).toBeTruthy();
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
       padding: spacing.xl,
+      width: '100%',
+      maxWidth: layout.contentMaxWidth,
+      alignSelf: 'center',
       backgroundColor: colors.background,
     });
     expect(flattenedStyle(screen.getByText(t('feedback.noResultBody')))).toEqual({

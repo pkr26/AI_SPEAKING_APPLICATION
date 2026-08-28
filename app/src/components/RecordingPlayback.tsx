@@ -29,6 +29,8 @@ interface RecordingPlaybackProps {
   ownerId: string;
   recordingId: string;
   recordingStatus?: RecordingStatus | null;
+  /** Hide duplicate status copy when the parent already renders it as metadata. */
+  showStatus?: boolean;
   compact?: boolean;
   recordingLabel?: string;
   onDeleted?: (recordingId: string) => void | Promise<void>;
@@ -118,6 +120,7 @@ export default function RecordingPlayback({
   ownerId,
   recordingId,
   recordingStatus,
+  showStatus = true,
   compact = false,
   recordingLabel,
   onDeleted,
@@ -515,15 +518,11 @@ export default function RecordingPlayback({
       <View testID="recording-playback-actions" style={styles.actions}>
         <Button
           title={
-            unavailable
-              ? t('recordings.unavailable')
-              : loading
-                ? t('recordings.preparing')
-                : phase === 'playing'
-                  ? t('recorder.pause')
-                  : phase === 'error'
-                    ? t('common.tryAgain')
-                    : t('recorder.play')
+            phase === 'playing'
+              ? t('recorder.pause')
+              : phase === 'error'
+                ? t('common.tryAgain')
+                : t('recorder.play')
           }
           accessibilityLabel={
             phase === 'playing' ? t('recordings.pauseLabel') : t('recordings.playLabel')
@@ -543,52 +542,69 @@ export default function RecordingPlayback({
           onPress={confirmDelete}
         />
       </View>
-      {(phase === 'playing' || phase === 'paused') && Number.isFinite(duration) && duration > 0 && (
-        <View
-          accessible
-          accessibilityRole="progressbar"
-          accessibilityLabel={t('recordings.progressLabel')}
-          accessibilityValue={{ min: 0, max: progressMax, now: progressNow }}
-          style={styles.progressRow}
-          testID="recording-playback-progress"
-        >
-          <View testID="recording-playback-progress-track" style={styles.progressTrack}>
-            <View
-              testID="recording-playback-progress-fill"
-              style={[
-                styles.progressFill,
-                { width: `${Math.round((progressNow / progressMax) * 100)}%` },
-              ]}
-            />
-          </View>
-          <Text testID="recording-playback-time" style={styles.timeText}>
-            {formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}
+      <View testID="recording-playback-detail-slot" style={styles.detailSlot}>
+        {loading && (
+          <Text
+            accessibilityLiveRegion="polite"
+            style={styles.statusText}
+            testID="recording-playback-preparing"
+          >
+            {t('recordings.preparing')}
           </Text>
-        </View>
-      )}
-      {recordingStatus === 'retention_pending' && phase === 'idle' && (
-        <Text
-          accessibilityLiveRegion="polite"
-          style={styles.statusText}
-          testID="recording-playback-pending"
-        >
-          {t('recordings.pending')}
-        </Text>
-      )}
-      {unavailable && (
-        <Text
-          accessibilityLiveRegion="polite"
-          style={styles.statusText}
-          testID="recording-playback-unavailable"
-        >
-          {t('recordings.unavailable')}
-        </Text>
-      )}
-      {errorMessage && (
-        <Text accessibilityRole="alert" style={styles.errorText} testID="recording-playback-error">
-          {errorMessage}
-        </Text>
-      )}
+        )}
+        {(phase === 'playing' || phase === 'paused') &&
+          Number.isFinite(duration) &&
+          duration > 0 && (
+            <View
+              accessible
+              accessibilityRole="progressbar"
+              accessibilityLabel={t('recordings.progressLabel')}
+              accessibilityValue={{ min: 0, max: progressMax, now: progressNow }}
+              style={styles.progressRow}
+              testID="recording-playback-progress"
+            >
+              <View testID="recording-playback-progress-track" style={styles.progressTrack}>
+                <View
+                  testID="recording-playback-progress-fill"
+                  style={[
+                    styles.progressFill,
+                    { width: `${Math.round((progressNow / progressMax) * 100)}%` },
+                  ]}
+                />
+              </View>
+              <Text testID="recording-playback-time" style={styles.timeText}>
+                {formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}
+              </Text>
+            </View>
+          )}
+        {showStatus && recordingStatus === 'retention_pending' && phase === 'idle' && (
+          <Text
+            accessibilityLiveRegion="polite"
+            style={styles.statusText}
+            testID="recording-playback-pending"
+          >
+            {t('recordings.pending')}
+          </Text>
+        )}
+        {showStatus && unavailable && (
+          <Text
+            accessibilityLiveRegion="polite"
+            style={styles.statusText}
+            testID="recording-playback-unavailable"
+          >
+            {t('recordings.unavailable')}
+          </Text>
+        )}
+        {errorMessage && (
+          <Text
+            accessibilityRole="alert"
+            style={styles.errorText}
+            testID="recording-playback-error"
+          >
+            {errorMessage}
+          </Text>
+        )}
+      </View>
     </View>
   );
 }
@@ -606,10 +622,13 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing }) => ({
     padding: spacing.sm,
   },
   actions: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    alignItems: 'center',
+    alignSelf: 'stretch',
     gap: spacing.sm,
+  },
+  detailSlot: {
+    // Reserve enough room for the longest shipped two/three-line status copy
+    // so Play/Pause/error transitions do not move surrounding list rows.
+    minHeight: 88,
   },
   progressRow: {
     marginTop: spacing.sm,

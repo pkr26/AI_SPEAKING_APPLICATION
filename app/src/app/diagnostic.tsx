@@ -4,7 +4,7 @@ import { router, useFocusEffect } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../components/Button';
-import Recorder from '../components/Recorder';
+import Recorder, { scrollToExpandedRecorderControls } from '../components/Recorder';
 import { apiFetch, userMessageForError } from '../lib/api';
 import { LogoutCleanupError, useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
@@ -77,6 +77,7 @@ export default function DiagnosticScreen() {
   const accountActionRef = useRef(true);
   const activeRecorderOwnerRef = useRef<string | null>(null);
   const recoveryRefreshRef = useRef<string | null>(null);
+  const questionScrollRef = useRef<ScrollView>(null);
   // Mirrors the on-screen answer card for the /next effect below (effects must
   // not depend on `result`, or clearing it would reapply the stale question).
   // Mutate it at the same time as state: a passive-effect mirror leaves a
@@ -204,6 +205,9 @@ export default function DiagnosticScreen() {
       owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),
     [renderOwnsWork],
   );
+  const revealExpandedRecorderControls = useCallback(() => {
+    scrollToExpandedRecorderControls(questionScrollRef.current, recorderOwnsWork(recorderOwner));
+  }, [recorderOwner, recorderOwnsWork]);
 
   const handleResult = (data: DiagnosticAnswerResult) => {
     if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
@@ -345,15 +349,21 @@ export default function DiagnosticScreen() {
   if (!currentLevel && !currentQuestion) {
     if (nextQuery.isPending) {
       return (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.centerScroll}
+        >
           <ActivityIndicator size="large" color={theme.colors.primary} />
           <Text style={styles.muted}>{t('diag.preparing')}</Text>
-        </View>
+        </ScrollView>
       );
     }
     if (nextQuery.isError) {
       return (
-        <View style={styles.center}>
+        <ScrollView
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.centerScroll}
+        >
           <Text accessibilityRole="header" style={styles.errorTitle}>
             {t('diag.loadFailedTitle')}
           </Text>
@@ -366,7 +376,7 @@ export default function DiagnosticScreen() {
             onPress={() => void nextQuery.refetch({ cancelRefetch: false })}
             style={styles.primaryAction}
           />
-        </View>
+        </ScrollView>
       );
     }
   }
@@ -434,29 +444,11 @@ export default function DiagnosticScreen() {
 
   // ----- Question view -----
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
-      <Text accessibilityRole="header" style={styles.heading}>
-        {t('header.diagnostic')}
-      </Text>
-      <View style={styles.accountActions}>
-        <Button
-          title={t('header.settings')}
-          variant="secondary"
-          size="sm"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={accountActionsLocked}
-          onPress={handleSettings}
-        />
-        <Button
-          title={t('common.logOut')}
-          variant="secondary"
-          size="sm"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={accountActionsLocked}
-          onPress={() => void handleLogout()}
-        />
-      </View>
-
+    <ScrollView
+      ref={questionScrollRef}
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={styles.container}
+    >
       {showIntro ? (
         <View style={styles.card}>
           <Text accessibilityRole="header" style={styles.resultTitle}>
@@ -516,22 +508,35 @@ export default function DiagnosticScreen() {
               onError={handleError}
               onRecoveryUnresolved={handleRecoveryUnresolved}
               onInteractionLockChange={handleRecorderLockChange}
+              onExpandedControlsLayout={revealExpandedRecorderControls}
             />
           )}
         </>
       )}
+
+      <View style={styles.accountActions}>
+        <Button
+          title={t('header.settings')}
+          variant="secondary"
+          size="sm"
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
+          disabled={accountActionsLocked}
+          onPress={handleSettings}
+        />
+        <Button
+          title={t('common.logOut')}
+          variant="secondary"
+          size="sm"
+          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
+          disabled={accountActionsLocked}
+          onPress={() => void handleLogout()}
+        />
+      </View>
     </ScrollView>
   );
 }
 
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
-  center: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl,
-    backgroundColor: colors.background,
-  },
   centerScroll: {
     flexGrow: 1,
     alignItems: 'center',
@@ -550,22 +555,18 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'center',
     backgroundColor: colors.background,
   },
-  heading: {
-    fontSize: 26,
-    fontWeight: '800',
-    color: colors.text,
-  },
   progressText: {
     marginTop: spacing.xs,
     fontSize: 14,
     color: colors.muted,
   },
   accountActions: {
-    alignSelf: 'flex-start',
+    alignSelf: 'stretch',
     flexDirection: 'row',
     flexWrap: 'wrap',
+    justifyContent: 'center',
     gap: spacing.sm,
-    marginTop: spacing.md,
+    marginTop: spacing.xl,
   },
   card: {
     marginTop: spacing.lg,
@@ -639,6 +640,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginTop: spacing.ml,
     fontSize: 16,
     color: colors.muted,
+    textAlign: 'center',
   },
   levelBadge: {
     marginTop: spacing.sm,

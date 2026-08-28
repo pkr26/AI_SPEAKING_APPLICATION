@@ -66,6 +66,17 @@ export interface RecorderResultMetadata {
   requestId: string;
 }
 
+export interface RecorderScrollTarget {
+  scrollToEnd: (options: { animated: boolean }) => void;
+}
+
+export function scrollToExpandedRecorderControls(
+  target: RecorderScrollTarget | null,
+  ownsWork: boolean,
+): void {
+  if (ownsWork) target?.scrollToEnd?.({ animated: true });
+}
+
 interface RecorderCommonProps<T> {
   ownerId: string;
   questionId: string;
@@ -87,6 +98,8 @@ interface RecorderCommonProps<T> {
   onRecoveryUnresolved: () => void;
   /** Locks controls that would discard or retarget the current recording. */
   onInteractionLockChange?: (locked: boolean) => void;
+  /** Requests that the host reveal review/upload actions after they are laid out. */
+  onExpandedControlsLayout?: () => void;
   /** Lets a screen restore the endpoint saved with an interrupted submission. */
   onRecoveryEndpointMismatch?: (endpoint: AssessmentEndpoint) => boolean;
 }
@@ -868,6 +881,7 @@ export default function Recorder<T>({
   onRateLimited,
   onRecoveryUnresolved,
   onInteractionLockChange,
+  onExpandedControlsLayout,
   onRecoveryEndpointMismatch,
 }: RecorderProps<T>) {
   const mountedRef = useRef(true);
@@ -999,6 +1013,7 @@ export default function Recorder<T>({
     disabled,
     isStartBlocked,
     onError,
+    onExpandedControlsLayout,
     onInteractionLockChange,
     onRateLimited,
     onRecoveryEndpointMismatch,
@@ -1061,6 +1076,7 @@ export default function Recorder<T>({
       disabled,
       isStartBlocked,
       onError,
+      onExpandedControlsLayout,
       onInteractionLockChange,
       onRateLimited,
       onRecoveryEndpointMismatch,
@@ -1073,6 +1089,7 @@ export default function Recorder<T>({
     disabled,
     isStartBlocked,
     onError,
+    onExpandedControlsLayout,
     onInteractionLockChange,
     onRateLimited,
     onRecoveryEndpointMismatch,
@@ -3287,6 +3304,9 @@ export default function Recorder<T>({
       : waitElapsedMillis >= UPLOAD_STAGE_LISTENING_MS
         ? t('recorder.stageListening')
         : t('recorder.stageUploading');
+  const revealExpandedControls = useCallback(() => {
+    callbacksRef.current.onExpandedControlsLayout?.();
+  }, []);
 
   return (
     <View style={styles.container}>
@@ -3382,7 +3402,11 @@ export default function Recorder<T>({
       <Text style={styles.privacyText}>{t('recorder.privacyNote')}</Text>
 
       {busy && (
-        <>
+        <View
+          testID="recorder-expanded-controls"
+          style={styles.expandedControls}
+          onLayout={revealExpandedControls}
+        >
           <ActivityIndicator
             accessibilityLabel={
               phase === 'recovering' ? t('recorder.a11yRecovering') : t('recorder.a11yUploading')
@@ -3418,11 +3442,15 @@ export default function Recorder<T>({
               style={styles.cancelButton}
             />
           )}
-        </>
+        </View>
       )}
 
       {phase === 'recorded' && (
-        <View style={styles.actions}>
+        <View
+          testID="recorder-expanded-controls"
+          style={styles.actions}
+          onLayout={revealExpandedControls}
+        >
           <Button
             title={previewPlaying ? t('recorder.pause') : t('recorder.play')}
             variant="secondary"
@@ -3449,6 +3477,8 @@ export default function Recorder<T>({
 
 const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => ({
   container: {
+    width: '100%',
+    alignSelf: 'stretch',
     alignItems: 'center',
     paddingVertical: spacing.xl,
   },
@@ -3567,6 +3597,10 @@ const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => 
   },
   spinner: {
     marginTop: spacing.ml,
+  },
+  expandedControls: {
+    alignSelf: 'stretch',
+    alignItems: 'center',
   },
   actions: {
     marginTop: spacing.xl,

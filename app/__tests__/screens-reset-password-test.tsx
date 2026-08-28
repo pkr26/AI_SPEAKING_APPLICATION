@@ -317,7 +317,6 @@ const restingInput: SemanticStyle = {
 
 const focusedInput: SemanticStyle = {
   ...restingInput,
-  borderWidth: 2,
   borderColor: colors.primary,
 };
 
@@ -330,6 +329,7 @@ const formError: SemanticStyle = {
 
 const footerLink: SemanticStyle = {
   marginTop: spacing.xl,
+  minHeight: layout.minimumTarget,
   paddingVertical: spacing.md,
   fontSize: 15,
   color: colors.primary,
@@ -580,7 +580,7 @@ describe('forgot-password screen', () => {
     );
   });
 
-  it('marks the request email field with a two-pixel accent border while focused', async () => {
+  it('changes the request field border color without changing its width', async () => {
     await render(<ForgotPasswordScreen />);
     const input = () => screen.getByLabelText(t('login.emailLabel'));
 
@@ -910,7 +910,7 @@ describe('reset-password screen', () => {
     );
   });
 
-  it('marks the focused field with a two-pixel accent border', async () => {
+  it('changes only the focused field border color so focus does not move the form', async () => {
     await render(<ResetPasswordScreen />);
 
     for (const label of [t('login.emailLabel'), t('reset.codeLabel'), t('cp.newLabel')]) {
@@ -922,7 +922,7 @@ describe('reset-password screen', () => {
 
       await fireEvent(input(), 'focus');
       expect(flattenedStyle(input())).toMatchObject({
-        borderWidth: 2,
+        borderWidth: 1,
         borderColor: colors.primary,
       });
 
@@ -1082,19 +1082,19 @@ describe('reset-password screen', () => {
     );
   });
 
-  it('overlays the reveal control inside the new-password field', async () => {
+  it('lays the reveal control beside a flexible new-password field', async () => {
     await render(<ResetPasswordScreen />);
     const password = screen.getByLabelText(t('cp.newLabel'));
 
     expect(flattenedStyle(parentOf(password))).toEqual({
-      position: 'relative',
-      justifyContent: 'center',
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
     });
-    // The field reserves room on the right so the text never runs under Show.
-    expect(flattenedStyle(password)).toEqual({ ...restingInput, paddingRight: 64 });
+    expect(flattenedStyle(password)).toEqual({ ...restingInput, flex: 1, minWidth: 0 });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      position: 'absolute',
-      right: 4,
+      flexShrink: 1,
+      maxWidth: '45%',
       minHeight: layout.minimumTarget,
       minWidth: layout.minimumTarget,
       justifyContent: 'center',
@@ -1102,9 +1102,11 @@ describe('reset-password screen', () => {
       paddingHorizontal: spacing.sm,
     });
     expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+      flexShrink: 1,
       color: colors.primary,
       fontSize: 14,
       fontWeight: '600',
+      textAlign: 'center',
     });
   });
 

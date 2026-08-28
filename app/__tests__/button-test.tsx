@@ -4,6 +4,7 @@ import { StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import Button from '../src/components/Button';
+import { translateFor } from '../src/lib/i18n';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 
 function flattenedStyle(node: TestInstance): Record<string, unknown> {
@@ -30,6 +31,7 @@ describe('shared Button', () => {
       backgroundColor: colors.primary,
       borderRadius: radii.button,
       minHeight: layout.minimumTarget,
+      maxWidth: '100%',
       // Spinner and label sit on one row, gap apart, centred on both axes.
       flexDirection: 'row',
       gap: spacing.sm,
@@ -42,6 +44,7 @@ describe('shared Button', () => {
       color: colors.onPrimary,
       fontSize: 17,
       fontWeight: '600',
+      flexShrink: 1,
       // Labels stay centred when a caller stretches the button.
       textAlign: 'center',
     });
@@ -123,6 +126,17 @@ describe('shared Button', () => {
 
     await render(<Button title="Wide" fullWidth onPress={jest.fn()} />);
     expect(flattenedStyle(button('Wide'))).toMatchObject({ alignSelf: 'stretch' });
+  });
+
+  it('lets long localized labels wrap without making the button wider than its parent', async () => {
+    const localizedTitle = translateFor('te', 'recordings.checkPending');
+    await render(<Button title={localizedTitle} onPress={jest.fn()} />);
+
+    expect(flattenedStyle(button(localizedTitle))).toMatchObject({ maxWidth: '100%' });
+    expect(flattenedStyle(screen.getByText(localizedTitle))).toMatchObject({
+      flexShrink: 1,
+      textAlign: 'center',
+    });
   });
 
   it('merges caller layout style last', async () => {

@@ -427,11 +427,12 @@ describe('RecordingPlayback', () => {
     expect(
       StyleSheet.flatten(screen.getByTestId('recording-playback-actions').props.style),
     ).toEqual({
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      alignItems: 'center',
+      alignSelf: 'stretch',
       gap: spacing.sm,
     });
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-detail-slot').props.style),
+    ).toEqual({ minHeight: 88 });
   });
 
   it('applies only the compact padding override when requested', async () => {
@@ -446,6 +447,7 @@ describe('RecordingPlayback', () => {
     asMock(apiGetRecordingPlaybackGrant).mockReturnValue(pending.promise);
     await renderPlayback({ recordingStatus: 'retention_pending' });
     const status = screen.getByTestId('recording-playback-pending');
+    expect(status.parent?.props.testID).toBe('recording-playback-detail-slot');
     expect(status).toHaveTextContent(t('recordings.pending'));
     expect(status.props.accessibilityLiveRegion).toBe('polite');
     expect(StyleSheet.flatten(status.props.style)).toEqual({
@@ -457,6 +459,10 @@ describe('RecordingPlayback', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
     expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-preparing').parent?.props.testID).toBe(
+      'recording-playback-detail-slot',
+    );
     expect(
       screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
     ).toEqual({ disabled: true, busy: true });
@@ -503,6 +509,9 @@ describe('RecordingPlayback', () => {
       accessibilityLabel: t('recordings.progressLabel'),
       accessibilityValue: { min: 0, max: 8, now: 2 },
     });
+    expect(screen.getByTestId('recording-playback-progress').parent?.props.testID).toBe(
+      'recording-playback-detail-slot',
+    );
     expect(
       StyleSheet.flatten(screen.getByTestId('recording-playback-progress').props.style),
     ).toEqual({
@@ -1540,6 +1549,7 @@ describe('RecordingPlayback', () => {
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
     const alert = screen.getByTestId('recording-playback-error');
+    expect(alert.parent?.props.testID).toBe('recording-playback-detail-slot');
     expect(alert).toHaveTextContent(t('error.serverBusy'));
     expect(alert.props.accessibilityRole).toBe('alert');
     expect(StyleSheet.flatten(alert.props.style)).toEqual({
@@ -1894,15 +1904,28 @@ describe('RecordingPlayback', () => {
     await renderPlayback({ recordingStatus: 'unavailable' });
     const button = screen.getByRole('button', { name: t('recordings.playLabel') });
     expect(button.props.accessibilityState.disabled).toBe(true);
-    expect(screen.getAllByText(t('recordings.unavailable'))).toHaveLength(2);
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(screen.getAllByText(t('recordings.unavailable'))).toHaveLength(1);
     expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
     const status = screen.getByTestId('recording-playback-unavailable');
+    expect(status.parent?.props.testID).toBe('recording-playback-detail-slot');
     expect(status.props.accessibilityLiveRegion).toBe('polite');
     expect(StyleSheet.flatten(status.props.style)).toEqual({
       marginTop: spacing.sm,
       color: lightColors.muted,
       fontSize: 14,
     });
+  });
+
+  it('suppresses duplicate status copy when its parent already renders metadata', async () => {
+    await renderPlayback({ recordingStatus: 'unavailable', showStatus: false });
+
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    expect(screen.queryByTestId('recording-playback-unavailable')).toBeNull();
+    expect(screen.queryByText(t('recordings.unavailable'))).toBeNull();
+    expect(screen.getByTestId('recording-playback-detail-slot')).toBeTruthy();
   });
 
   it('confirms named deletion, updates both caches, and keeps written results outside its scope', async () => {

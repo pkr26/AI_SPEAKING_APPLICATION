@@ -2,7 +2,7 @@ import React, { useEffect } from 'react';
 import { Stack, type ErrorBoundaryProps } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { AppState, Text, View } from 'react-native';
+import { AppState, ScrollView, Text, View } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
@@ -148,15 +148,17 @@ export function ErrorBoundary({ retry }: ErrorBoundaryProps) {
   const styles = themedStyles(useTheme());
   return (
     <SafeAreaView style={styles.errorScreen}>
-      <View style={styles.errorCard}>
-        <Text accessibilityRole="header" style={styles.errorTitle}>
-          {translate('boundary.title')}
-        </Text>
-        <Text accessibilityRole="alert" style={styles.errorBody}>
-          {translate('boundary.body')}
-        </Text>
-        <Button title={translate('common.tryAgain')} onPress={retry} style={styles.errorButton} />
-      </View>
+      <ScrollView contentContainerStyle={styles.errorContent}>
+        <View style={styles.errorCard}>
+          <Text accessibilityRole="header" style={styles.errorTitle}>
+            {translate('boundary.title')}
+          </Text>
+          <Text accessibilityRole="alert" style={styles.errorBody}>
+            {translate('boundary.body')}
+          </Text>
+          <Button title={translate('common.tryAgain')} onPress={retry} style={styles.errorButton} />
+        </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
@@ -184,10 +186,13 @@ export default function RootLayout() {
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   errorScreen: {
     flex: 1,
+    backgroundColor: colors.background,
+  },
+  errorContent: {
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
-    backgroundColor: colors.background,
   },
   errorCard: {
     width: '100%',

@@ -114,7 +114,10 @@ export default function HomeScreen() {
   // above updates the route gate for a cross-device diagnostic reset.
   if (user.diagnosticCompleted && stats?.level === null) {
     return (
-      <View style={styles.center}>
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={styles.fullScreenCenter}
+      >
         <ActivityIndicator
           accessibilityLabel={t('gate.loadingProfile')}
           size="large"
@@ -123,7 +126,7 @@ export default function HomeScreen() {
         <Text accessibilityLiveRegion="polite" style={styles.muted}>
           {t('gate.loadingProfile')}
         </Text>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -209,7 +212,7 @@ export default function HomeScreen() {
       {stats && (
         <View style={styles.card}>
           <View style={styles.levelRow}>
-            <View>
+            <View style={styles.levelSummary}>
               <Text style={styles.cardLabel}>{t('home.levelLabel')}</Text>
               {level && (
                 <>
@@ -327,6 +330,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignItems: 'center',
     justifyContent: 'center',
   },
+  fullScreenCenter: {
+    flexGrow: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: layout.screenPadding,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
+    backgroundColor: colors.background,
+  },
   greeting: {
     fontSize: 15,
     color: colors.muted,
@@ -389,9 +402,15 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   levelRow: {
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
     gap: spacing.sm,
+  },
+  levelSummary: {
+    flexGrow: 1,
+    flexShrink: 1,
+    minWidth: 160,
   },
   cardLabel: {
     fontSize: 12,
@@ -413,6 +432,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.muted,
   },
   dueChip: {
+    maxWidth: '100%',
+    flexShrink: 1,
     backgroundColor: colors.primaryLight,
     borderRadius: radii.pill,
     paddingVertical: 6,
@@ -420,6 +441,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginTop: spacing.md,
   },
   dueChipText: {
+    flexShrink: 1,
     fontSize: 13,
     fontWeight: '700',
     color: colors.primary,

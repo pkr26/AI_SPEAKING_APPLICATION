@@ -40,6 +40,7 @@ export interface ButtonProps {
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   base: {
     minHeight: layout.minimumTarget,
+    maxWidth: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -84,6 +85,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.primaryLight,
   },
   text: {
+    flexShrink: 1,
     fontWeight: '600',
     textAlign: 'center',
   },

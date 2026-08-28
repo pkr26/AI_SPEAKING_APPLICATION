@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import Constants from 'expo-constants';
 import React from 'react';
-import { Platform, Pressable, StyleSheet, Text } from 'react-native';
+import { Dimensions, Platform, Pressable, StyleSheet, Text } from 'react-native';
 
 import { apiFetch } from '../src/lib/api';
 import {
@@ -13,8 +13,10 @@ import {
   resetAdsModuleForTests,
   useAds,
 } from '../src/lib/ads';
-import HomeBannerAd from '../src/components/HomeBannerAd';
-import HistoryNativeAdCard from '../src/components/HistoryNativeAdCard';
+import HomeBannerAd, { homeBannerContentWidth } from '../src/components/HomeBannerAd';
+import HistoryNativeAdCard, {
+  historyNativeAdReservedHeight,
+} from '../src/components/HistoryNativeAdCard';
 import { claimPlaybackOwner } from '../src/lib/audio-session';
 import { lightColors } from '../src/lib/theme';
 
@@ -73,10 +75,15 @@ jest.mock('react-native-google-mobile-ads', () => {
     },
     AdsConsentPrivacyOptionsRequirementStatus: { REQUIRED: 1, NOT_REQUIRED: 2 },
     MaxAdContentRating: { PG: 'PG' },
-    BannerAdSize: { ANCHORED_ADAPTIVE_BANNER: 'ANCHORED' },
+    BannerAdSize: {
+      ANCHORED_ADAPTIVE_BANNER: 'ANCHORED',
+      INLINE_ADAPTIVE_BANNER: 'INLINE',
+    },
     BannerAd: (props: {
       onAdFailedToLoad: () => void;
       requestOptions: { requestNonPersonalizedAdsOnly: boolean };
+      size: string;
+      width: number;
     }) => {
       ReactModule.useEffect(() => {
         mockBannerProps(props);
@@ -86,7 +93,13 @@ jest.mock('react-native-google-mobile-ads', () => {
       }, []);
       return ReactModule.createElement(
         NativeText,
-        { onPress: props.onAdFailedToLoad, testID: 'banner-ad' },
+        {
+          accessibilityValue: {
+            text: `${props.size}:${props.width}`,
+          },
+          onPress: props.onAdFailedToLoad,
+          testID: 'banner-ad',
+        },
         'banner',
       );
     },
@@ -1182,6 +1195,14 @@ describe('native capability and unit-id gates', () => {
 });
 
 describe('ad surfaces', () => {
+  it('caps the Home adaptive width to its padded phone/tablet content column', () => {
+    expect([
+      homeBannerContentWidth(320),
+      homeBannerContentWidth(1_024),
+      homeBannerContentWidth(30),
+    ]).toEqual([280, 720, 1]);
+  });
+
   it('reserves and loads a banner only while Home is focused', async () => {
     jest.mocked(apiFetch).mockResolvedValue(remoteEnabled);
     const view = await render(
@@ -1199,12 +1220,13 @@ describe('ad surfaces', () => {
       expect.objectContaining({
         unitId: expectedHomeUnitId,
         size: 'ANCHORED',
+        width: expect.any(Number),
         requestOptions: { requestNonPersonalizedAdsOnly: false },
         onAdFailedToLoad: expect.any(Function),
       }),
     );
     expect(StyleSheet.flatten(screen.getByLabelText('Advertisement').props.style)).toEqual({
-      minHeight: 64,
+      minHeight: 108,
       marginTop: 24,
       alignItems: 'center',
       justifyContent: 'center',
@@ -1215,6 +1237,18 @@ describe('ad surfaces', () => {
       fontSize: 10,
       marginBottom: 2,
       color: lightColors.muted,
+    });
+    await fireEvent(screen.getByLabelText('Advertisement'), 'layout', {
+      nativeEvent: { layout: { width: 280, height: 108, x: 0, y: 0 } },
+    });
+    expect(screen.getByTestId('banner-ad').props.accessibilityValue).toEqual({
+      text: 'ANCHORED:280',
+    });
+    await fireEvent(screen.getByLabelText('Advertisement'), 'layout', {
+      nativeEvent: { layout: { width: 720, height: 108, x: 0, y: 0 } },
+    });
+    expect(screen.getByTestId('banner-ad').props.accessibilityValue).toEqual({
+      text: 'ANCHORED:720',
     });
     await view.rerender(
       <AdsProvider>
@@ -1397,6 +1431,64 @@ describe('ad surfaces', () => {
     await act(async () => release());
     await waitFor(() => expect(screen.getByText('Learn today')).toBeTruthy());
     await view.unmount();
+  });
+
+  it('reserves the complete History card height while its native creative loads', async () => {
+    jest.mocked(apiFetch).mockResolvedValue({
+      ads: {
+        enabled: true,
+        audienceMode: 'adult-only',
+        placements: { homeBanner: false, historyNative: true },
+      },
+    });
+    let resolveAd!: (value: {
+      headline: string;
+      body: string;
+      callToAction: string;
+      destroy: jest.Mock;
+    }) => void;
+    mockNativeAdCreate.mockReturnValue(
+      new Promise((resolve) => {
+        resolveAd = resolve;
+      }),
+    );
+    await render(
+      <AdsProvider>
+        <HistoryNativeAdCard focused />
+      </AdsProvider>,
+    );
+
+    const reserved = screen.getByTestId('history-native-ad-reserved');
+    const reservedHeight = historyNativeAdReservedHeight(Dimensions.get('window').fontScale);
+    expect(reserved.props.accessibilityLabel).toBe('Advertisement');
+    expect(StyleSheet.flatten(reserved.props.style)).toEqual({
+      marginTop: 24,
+      marginBottom: 24,
+      borderWidth: 1,
+      borderRadius: 12,
+      padding: 14,
+      fontSize: 11,
+      fontWeight: '600',
+      textTransform: 'uppercase',
+      textAlign: 'center',
+      textAlignVertical: 'top',
+      minHeight: reservedHeight,
+      backgroundColor: lightColors.card,
+      borderColor: lightColors.border,
+      color: lightColors.muted,
+    });
+
+    await waitFor(() => expect(mockNativeAdCreate).toHaveBeenCalledTimes(1));
+    await act(async () =>
+      resolveAd({
+        headline: 'Reserved ad',
+        body: 'Body',
+        callToAction: 'Open',
+        destroy: jest.fn(),
+      }),
+    );
+    expect(await screen.findByText('Reserved ad')).toBeTruthy();
+    expect(screen.queryByTestId('history-native-ad-reserved')).toBeNull();
   });
 
   it('removes a loaded native card in the same commit that remote policy blocks it', async () => {
@@ -1697,24 +1789,30 @@ describe('ad surfaces', () => {
     expect(StyleSheet.flatten(card.props.style)).toEqual({
       borderWidth: 1,
       borderRadius: 12,
+      marginTop: 24,
+      marginBottom: 24,
       paddingTop: 28,
       paddingHorizontal: 14,
       paddingBottom: 14,
       gap: 8,
+      minHeight: historyNativeAdReservedHeight(Dimensions.get('window').fontScale),
       backgroundColor: lightColors.card,
       borderColor: lightColors.border,
     });
     expect(StyleSheet.flatten(screen.getByText('Advertisement').props.style)).toEqual({
       fontSize: 11,
+      lineHeight: 14,
       fontWeight: '600',
       textTransform: 'uppercase',
       color: lightColors.muted,
     });
     expect(StyleSheet.flatten(screen.getByText('Learn today').props.style)).toEqual({
       fontSize: 17,
+      lineHeight: 22,
       fontWeight: '700',
       color: lightColors.text,
     });
+    expect(screen.getByText('Learn today').props.numberOfLines).toBe(2);
     expect(StyleSheet.flatten(screen.getByText('A test ad').props.style)).toEqual({
       fontSize: 14,
       lineHeight: 20,
@@ -1722,6 +1820,7 @@ describe('ad surfaces', () => {
     });
     expect(screen.getByText('A test ad').props.numberOfLines).toBe(3);
     expect(screen.getByText('Open').props.accessibilityRole).toBe('button');
+    expect(screen.getByText('Open').props.numberOfLines).toBe(2);
     expect(StyleSheet.flatten(screen.getByText('Open').props.style)).toEqual({
       minHeight: 44,
       textAlign: 'center',
@@ -1729,10 +1828,20 @@ describe('ad surfaces', () => {
       borderRadius: 8,
       paddingHorizontal: 16,
       paddingVertical: 12,
+      fontSize: 15,
+      lineHeight: 20,
       fontWeight: '700',
       backgroundColor: lightColors.primary,
       color: lightColors.onPrimary,
     });
+    // Two headline lines, three body lines, and a two-line CTA all remain
+    // within the scale-aware placeholder/card reservation.
+    expect(28 + 14 + 8 + 44 + 8 + 60 + 8 + 64 + 14).toBeLessThanOrEqual(
+      historyNativeAdReservedHeight(1),
+    );
+    expect([historyNativeAdReservedHeight(2), historyNativeAdReservedHeight(Number.NaN)]).toEqual([
+      520, 260,
+    ]);
     mockNativeAdViewRender.mockClear();
     await view.rerender(
       <AdsProvider>

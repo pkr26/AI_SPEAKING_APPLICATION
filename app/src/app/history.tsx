@@ -1,7 +1,7 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import { useIsFocused } from 'expo-router';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, SectionList, Text, View } from 'react-native';
+import { ActivityIndicator, Pressable, ScrollView, SectionList, Text, View } from 'react-native';
 
 import Button from '../components/Button';
 import HistoryNativeAdCard from '../components/HistoryNativeAdCard';
@@ -206,7 +206,7 @@ export default function HistoryScreen() {
 
   if (items.length === 0 && historyQuery.isPending) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <ActivityIndicator
           accessibilityLabel={t('history.loading')}
           size="large"
@@ -215,13 +215,13 @@ export default function HistoryScreen() {
         <Text accessibilityLiveRegion="polite" style={styles.muted}>
           {t('history.loading')}
         </Text>
-      </View>
+      </ScrollView>
     );
   }
 
   if (items.length === 0 && historyQuery.isError) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
           {t('history.loadFailedTitle')}
         </Text>
@@ -233,18 +233,18 @@ export default function HistoryScreen() {
           onPress={() => void historyQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
-      </View>
+      </ScrollView>
     );
   }
 
   if (items.length === 0) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
           {t('history.emptyTitle')}
         </Text>
         <Text style={styles.muted}>{t('history.emptyBody')}</Text>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -311,11 +311,7 @@ export default function HistoryScreen() {
       renderItem={({ item }) => (
         <>
           <HistoryRow item={item} ownerId={user.id} t={t} />
-          {item.id === historyAdAnchorId ? (
-            <View style={styles.historyAdSlot}>
-              <HistoryNativeAdCard focused={focused} />
-            </View>
-          ) : null}
+          {item.id === historyAdAnchorId ? <HistoryNativeAdCard focused={focused} /> : null}
         </>
       )}
       renderSectionHeader={({ section }) => (
@@ -377,10 +373,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'center',
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   muted: {
@@ -530,10 +529,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontStyle: 'italic',
     lineHeight: 22,
     color: colors.text,
-  },
-  historyAdSlot: {
-    marginTop: 24,
-    marginBottom: 24,
   },
   footer: {
     paddingVertical: spacing.lg,

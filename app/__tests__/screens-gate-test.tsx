@@ -255,6 +255,20 @@ function parentOf(node: TestInstance): TestInstance {
   return parent;
 }
 
+function hostNode(type: string): TestInstance {
+  const [node] = screen.container.queryAll((candidate) => candidate.type === type);
+  if (!node) throw new Error(`${type} was not rendered`);
+  return node;
+}
+
+function scrollContentStyle(): SemanticStyle {
+  return StyleSheet.flatten(hostNode('RCTScrollView').props.contentContainerStyle) ?? {};
+}
+
+function safeAreaStyle(): SemanticStyle {
+  return flattenedStyle(hostNode('RNCSafeAreaView'));
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -700,18 +714,21 @@ describe('root fallback screens', () => {
     expect(retry).toHaveBeenCalledTimes(1);
   });
 
-  it('lays the route-crash card out as a centered themed card', async () => {
+  it('lays the route-crash card in a safe, scrollable centered container', async () => {
     await render(<ErrorBoundary error={new Error('sensitive stack details')} retry={jest.fn()} />);
 
     const title = screen.getByRole('header', { name: t('boundary.title') });
     const card = parentOf(title);
 
-    expect(flattenedStyle(parentOf(card))).toEqual({
+    expect(safeAreaStyle()).toEqual({
       flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
       padding: spacing.xl,
-      backgroundColor: colors.background,
     });
     expect(flattenedStyle(card)).toEqual({
       width: '100%',
@@ -741,9 +758,8 @@ describe('root fallback screens', () => {
   it('returns an invalid deep link to the protected entry gate', async () => {
     await render(<NotFoundScreen />);
 
-    expect(screen.getByRole('header', { name: t('notFound.title') })).toBeTruthy();
     // The body explains that the link is dead — without it the screen is a
-    // bare title with a button.
+    // bare native title with a button.
     expect(screen.getByText(t('notFound.body'))).toBeTruthy();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('notFound.goHome') }),
@@ -769,18 +785,28 @@ describe('root fallback screens', () => {
     expect(capturedScreenProps[0]?.options).toEqual({ title: t('notFound.title') });
   });
 
-  it('lays the dead-link screen out as a centered themed card', async () => {
+  it('lays the dead-link screen in a safe, scrollable centered container', async () => {
     await render(<NotFoundScreen />);
 
-    const title = screen.getByRole('header', { name: t('notFound.title') });
-    const card = parentOf(title);
+    const body = screen.getByText(t('notFound.body'));
+    const card = parentOf(body);
 
-    expect(flattenedStyle(parentOf(card))).toEqual({
+    const safeArea = hostNode('RNCSafeAreaView');
+    expect(flattenedStyle(safeArea)).toEqual({
       flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(safeArea.props.edges).toEqual({
+      top: 'off',
+      right: 'additive',
+      bottom: 'additive',
+      left: 'additive',
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
       padding: spacing.xl,
-      backgroundColor: colors.background,
     });
     expect(flattenedStyle(card)).toEqual({
       width: '100%',
@@ -792,14 +818,7 @@ describe('root fallback screens', () => {
       backgroundColor: colors.card,
       padding: spacing.xl,
     });
-    expect(flattenedStyle(title)).toEqual({
-      color: colors.text,
-      fontSize: 24,
-      fontWeight: '800',
-      textAlign: 'center',
-    });
-    expect(flattenedStyle(screen.getByText(t('notFound.body')))).toEqual({
-      marginTop: 10,
+    expect(flattenedStyle(body)).toEqual({
       color: colors.muted,
       fontSize: 16,
       lineHeight: 23,
@@ -880,7 +899,7 @@ describe('index gate', () => {
     expect(resetStoredSession).toHaveBeenCalledTimes(1);
   });
 
-  it('centers the session-error copy and spaces its two recovery actions', async () => {
+  it('centers the session-error copy in a safe scroll container and spaces its actions', async () => {
     mockAuthValue = makeAuth({
       restoreError: 'Secure session storage is temporarily unavailable.',
     });
@@ -888,11 +907,19 @@ describe('index gate', () => {
 
     const title = screen.getByRole('header', { name: t('gate.sessionErrorTitle') });
     expect(flattenedStyle(parentOf(title))).toEqual({
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignItems: 'center',
+    });
+    expect(safeAreaStyle()).toEqual({
       flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
       padding: spacing.xl,
-      backgroundColor: colors.background,
     });
     expect(flattenedStyle(title)).toEqual({
       fontSize: 20,
@@ -915,17 +942,25 @@ describe('index gate', () => {
     ).toMatchObject({ marginTop: spacing.ml });
   });
 
-  it('centers the loading state on the same themed screen', async () => {
+  it('centers the loading state in the same safe scroll container', async () => {
     mockAuthValue = makeAuth({ isRestoring: true });
     await renderGate();
 
     const label = screen.getByText(t('gate.restoring'));
     expect(flattenedStyle(parentOf(label))).toEqual({
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignItems: 'center',
+    });
+    expect(safeAreaStyle()).toEqual({
       flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollContentStyle()).toEqual({
+      flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
       padding: spacing.xl,
-      backgroundColor: colors.background,
     });
     expect(flattenedStyle(label)).toEqual({
       marginTop: spacing.md,

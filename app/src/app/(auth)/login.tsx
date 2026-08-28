@@ -303,6 +303,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   forgotLink: {
     marginTop: spacing.ml,
+    minHeight: layout.minimumTarget,
     paddingVertical: spacing.md,
     fontSize: 15,
     color: colors.primary,
@@ -335,19 +336,20 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.inputBackground,
   },
   inputFocused: {
-    borderWidth: 2,
     borderColor: colors.primary,
   },
   inputRow: {
-    position: 'relative',
-    justifyContent: 'center',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
   },
   inputWithAction: {
-    paddingRight: 64,
+    flex: 1,
+    minWidth: 0,
   },
   inputAction: {
-    position: 'absolute',
-    right: 4,
+    flexShrink: 1,
+    maxWidth: '45%',
     minHeight: layout.minimumTarget,
     minWidth: layout.minimumTarget,
     justifyContent: 'center',
@@ -355,9 +357,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     paddingHorizontal: spacing.sm,
   },
   inputActionText: {
+    flexShrink: 1,
     color: colors.primary,
     fontSize: 14,
     fontWeight: '600',
+    textAlign: 'center',
   },
   error: {
     marginTop: 14,
@@ -377,17 +381,23 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginTop: spacing.xl,
     minHeight: layout.minimumTarget,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     alignItems: 'center',
     justifyContent: 'center',
   },
   footerLink: {
+    flexShrink: 1,
+    minHeight: layout.minimumTarget,
     paddingVertical: spacing.md,
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',
+    textAlign: 'center',
   },
   footerText: {
+    flexShrink: 1,
     fontSize: 15,
     color: colors.muted,
+    textAlign: 'center',
   },
 }));

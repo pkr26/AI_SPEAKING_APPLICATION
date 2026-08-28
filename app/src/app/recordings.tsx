@@ -1,6 +1,6 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import React, { useEffect, useMemo, useRef } from 'react';
-import { ActivityIndicator, FlatList, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, ScrollView, Text, View } from 'react-native';
 
 import Button from '../components/Button';
 import RecordingPlayback from '../components/RecordingPlayback';
@@ -100,6 +100,7 @@ function RecordingCard({
         recordingId={item.id}
         recordingLabel={item.promptWord}
         recordingStatus={item.status}
+        showStatus={false}
       />
     </View>
   );
@@ -152,7 +153,7 @@ export default function RecordingsScreen() {
   // redundant branch.
   if (recordingsQuery.isPending) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <ActivityIndicator
           accessibilityLabel={t('recordings.loading')}
           size="large"
@@ -161,13 +162,13 @@ export default function RecordingsScreen() {
         <Text accessibilityLiveRegion="polite" style={styles.muted}>
           {t('recordings.loading')}
         </Text>
-      </View>
+      </ScrollView>
     );
   }
 
   if (items.length === 0 && recordingsQuery.isError) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.title}>
           {t('recordings.loadFailedTitle')}
         </Text>
@@ -179,18 +180,18 @@ export default function RecordingsScreen() {
           onPress={() => void recordingsQuery.refetch({ cancelRefetch: false })}
           style={styles.action}
         />
-      </View>
+      </ScrollView>
     );
   }
 
   if (items.length === 0) {
     return (
-      <View style={styles.center}>
+      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.title}>
           {t('recordings.emptyTitle')}
         </Text>
         <Text style={styles.muted}>{t('recordings.emptyBody')}</Text>
-      </View>
+      </ScrollView>
     );
   }
 
@@ -299,10 +300,13 @@ export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radi
     alignSelf: 'center',
   },
   center: {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   },
   title: {

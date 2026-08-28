@@ -1,5 +1,5 @@
 import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { SectionList, StyleSheet, useColorScheme } from 'react-native';
 import type { TestInstance } from 'test-renderer';
@@ -228,6 +228,20 @@ function parentOf(node: TestInstance): TestInstance {
   return parent;
 }
 
+function centeredStateStyle(node: TestInstance): SemanticStyle {
+  const [scrollView] = screen.container.queryAll(
+    (candidate) => candidate.props.contentContainerStyle !== undefined,
+  );
+  if (scrollView) return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
+  let current: TestInstance | null = node.parent;
+  while (current) {
+    const style = flattenedStyle(current);
+    if (style.flexGrow === 1 && style.justifyContent === 'center') return style;
+    current = current.parent;
+  }
+  throw new Error('Centered scroll content was not found');
+}
+
 function committedPressHandler(node: TestInstance): () => void {
   type Fiber = {
     memoizedProps: { onPress?: unknown } | null;
@@ -278,10 +292,13 @@ function responderEvent() {
 
 /** The centered full-screen slot the loading, error, and empty states sit in. */
 const CENTER_STATE: SemanticStyle = {
-  flex: 1,
+  flexGrow: 1,
   alignItems: 'center',
   justifyContent: 'center',
   padding: spacing.xl,
+  width: '100%',
+  maxWidth: layout.contentMaxWidth,
+  alignSelf: 'center',
   backgroundColor: colors.background,
 };
 
@@ -363,6 +380,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  await cleanup();
   await act(async () => {
     for (const client of queryClients) client.clear();
     // TanStack Query batches observer notifications onto timers. Drain both
@@ -410,7 +428,7 @@ describe('history screen', () => {
     expect(screen.getByLabelText(t('history.loading'))).toBeTruthy();
 
     expect(flattenedStyle(screen.getByText(t('history.loading')))).toEqual(MUTED_TEXT);
-    expect(flattenedStyle(parentOf(screen.getByText(t('history.loading'))))).toEqual(CENTER_STATE);
+    expect(centeredStateStyle(screen.getByText(t('history.loading')))).toEqual(CENTER_STATE);
   });
 
   it('shows a retryable error when the first page fails', async () => {
@@ -426,7 +444,7 @@ describe('history screen', () => {
 
     expect(flattenedStyle(screen.getByText(t('history.loadFailedTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_TEXT);
-    expect(flattenedStyle(parentOf(screen.getByText(t('error.serverBusy'))))).toEqual(CENTER_STATE);
+    expect(centeredStateStyle(screen.getByText(t('error.serverBusy')))).toEqual(CENTER_STATE);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
     ).toMatchObject({ marginTop: spacing.lg });
@@ -561,9 +579,7 @@ describe('history screen', () => {
 
     expect(flattenedStyle(screen.getByText(t('history.emptyTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('history.emptyBody')))).toEqual(MUTED_TEXT);
-    expect(flattenedStyle(parentOf(screen.getByText(t('history.emptyBody'))))).toEqual(
-      CENTER_STATE,
-    );
+    expect(centeredStateStyle(screen.getByText(t('history.emptyBody')))).toEqual(CENTER_STATE);
   });
 
   it('renders rows grouped by day with score chips and context badges', async () => {
@@ -937,7 +953,9 @@ describe('history screen', () => {
     await renderHistory();
     await waitFor(() => expect(screen.getByTestId('history-native-ad')).toBeTruthy());
     expect(screen.getAllByTestId('history-native-ad')).toHaveLength(1);
-    expect(flattenedStyle(parentOf(screen.getByTestId('history-native-ad')))).toEqual({
+    // Spacing now belongs to the real ad/placeholder itself, so a null ad
+    // cannot leave an otherwise empty 48-point route-owned wrapper behind.
+    expect(flattenedStyle(parentOf(screen.getByTestId('history-native-ad')))).not.toMatchObject({
       marginTop: 24,
       marginBottom: 24,
     });

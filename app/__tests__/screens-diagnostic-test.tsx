@@ -71,10 +71,12 @@ interface CapturedRecorderProps {
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExpandedControlsLayout?: () => void;
 }
 
 let mockRecorderProps: CapturedRecorderProps | null = null;
 const mockRecorderPublications: CapturedRecorderProps[] = [];
+const mockScrollToExpandedRecorderControls = jest.fn();
 
 function MockRecorder(props: CapturedRecorderProps) {
   React.useLayoutEffect(() => {
@@ -90,6 +92,8 @@ function MockRecorder(props: CapturedRecorderProps) {
 jest.mock('../src/components/Recorder', () => ({
   __esModule: true,
   default: MockRecorder,
+  scrollToExpandedRecorderControls: (...args: unknown[]) =>
+    mockScrollToExpandedRecorderControls(...args),
 }));
 
 // ----- auth mock -----
@@ -406,7 +410,7 @@ describe('diagnostic screen', () => {
     expect(mockUserMessageForError).not.toHaveBeenCalled();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText(t('diag.progress', { current: 1, max: 5 }))).toBeTruthy();
-    expect(screen.getByText(t('header.diagnostic')).props.accessibilityRole).toBe('header');
+    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
     // Both halves of the prompt card are named for the learner.
     expect(screen.getByText(t('label.word'))).toBeTruthy();
     expect(screen.getByText(t('label.question'))).toBeTruthy();
@@ -416,6 +420,9 @@ describe('diagnostic screen', () => {
       questionId: QUESTION_1.id,
       endpoint: '/diagnostic/answer',
     });
+    expect(recorderProps().onExpandedControlsLayout).toEqual(expect.any(Function));
+    expect(() => recorderProps().onExpandedControlsLayout?.()).not.toThrow();
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
     expect(mockApiFetch).toHaveBeenCalledWith(
       '/diagnostic/next',
       expect.objectContaining({ signal: expect.anything() }),
@@ -426,6 +433,19 @@ describe('diagnostic screen', () => {
         exact: true,
       }),
     ).toBeDefined();
+  });
+
+  it('does not scroll expanded Recorder controls after Diagnostic loses ownership', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    const rendered = await renderScreen();
+    await startFreshTest();
+    const reveal = recorderProps().onExpandedControlsLayout!;
+    mockScrollToExpandedRecorderControls.mockClear();
+
+    await rendered.unmount();
+    reveal();
+
+    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(null, false);
   });
 
   it('recaptures the session lease when its auth capture callback changes for the same identity', async () => {
@@ -1968,12 +1988,15 @@ describe('diagnostic screen', () => {
 });
 
 describe('diagnostic presentation', () => {
-  /** The full-bleed, vertically centred slot the pre-question states sit in. */
+  /** The scrollable, vertically centred column the pre-question states sit in. */
   const CENTERED_STATE = {
-    flex: 1,
+    flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
     padding: spacing.xl,
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    alignSelf: 'center',
     backgroundColor: colors.background,
   };
 
@@ -2019,6 +2042,7 @@ describe('diagnostic presentation', () => {
   /** Full-width brand CTA, spaced off the card it closes. */
   const PRIMARY_ACTION = {
     minHeight: layout.minimumTarget,
+    maxWidth: '100%',
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
@@ -2037,7 +2061,7 @@ describe('diagnostic presentation', () => {
 
     const preparing = screen.getByText(t('diag.preparing'));
     expect(flattenedStyle(preparing)).toEqual(MUTED_BODY);
-    expect(flattenedStyle(parentOf(preparing))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
   });
 
   it('centres the load failure on the page tokens', async () => {
@@ -2050,7 +2074,7 @@ describe('diagnostic presentation', () => {
       fontWeight: '700',
       color: colors.text,
     });
-    expect(flattenedStyle(parentOf(title))).toEqual(CENTERED_STATE);
+    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') }))).toEqual(
       PRIMARY_ACTION,
@@ -2070,23 +2094,23 @@ describe('diagnostic presentation', () => {
       alignSelf: 'center',
       backgroundColor: colors.background,
     });
-    expect(flattenedStyle(screen.getByText(t('header.diagnostic')))).toEqual({
-      fontSize: 26,
-      fontWeight: '800',
-      color: colors.text,
-    });
-    // The account actions wrap onto a second line rather than stretching.
-    expect(
-      flattenedStyle(parentOf(screen.getByRole('button', { name: t('header.settings') }))),
-    ).toEqual({
-      alignSelf: 'flex-start',
+    expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
+    const accountActions = parentOf(screen.getByRole('button', { name: t('header.settings') }));
+    expect(flattenedStyle(accountActions)).toEqual({
+      alignSelf: 'stretch',
       flexDirection: 'row',
       flexWrap: 'wrap',
+      justifyContent: 'center',
       gap: spacing.sm,
-      marginTop: spacing.md,
+      marginTop: spacing.xl,
     });
     expect(flattenedStyle(introTitle)).toEqual(CARD_TITLE);
-    expect(flattenedStyle(parentOf(introTitle))).toEqual(CARD);
+    const introCard = parentOf(introTitle);
+    expect(flattenedStyle(introCard)).toEqual(CARD);
+    expect(parentOf(introCard)).toBe(parentOf(accountActions));
+    expect(parentOf(introCard).children.indexOf(introCard)).toBeLessThan(
+      parentOf(accountActions).children.indexOf(accountActions),
+    );
     for (const line of [
       t('diag.introWhat'),
       t('diag.introCount', { count: 5 }),
@@ -2117,7 +2141,8 @@ describe('diagnostic presentation', () => {
       fontWeight: '800',
       color: colors.primary,
     });
-    expect(flattenedStyle(parentOf(promptWord))).toEqual(CARD);
+    const questionCard = parentOf(promptWord);
+    expect(flattenedStyle(questionCard)).toEqual(CARD);
     expect(flattenedStyle(screen.getByText('Describe a time you showed courage.'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 18,
@@ -2127,6 +2152,11 @@ describe('diagnostic presentation', () => {
     // Both halves of the card are named for the learner.
     expect(flattenedStyle(screen.getByText(t('label.word')))).toEqual(CARD_LABEL);
     expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+    const accountActions = parentOf(screen.getByRole('button', { name: t('header.settings') }));
+    expect(parentOf(questionCard)).toBe(parentOf(accountActions));
+    expect(parentOf(questionCard).children.indexOf(questionCard)).toBeLessThan(
+      parentOf(accountActions).children.indexOf(accountActions),
+    );
   });
 
   it('renders the saved-answer card from the tokens', async () => {
@@ -2206,6 +2236,7 @@ describe('diagnostic presentation', () => {
       marginTop: spacing.ml,
       fontSize: 16,
       color: colors.muted,
+      textAlign: 'center',
     });
 
     const levelBadgeText = screen.getByText('B2');

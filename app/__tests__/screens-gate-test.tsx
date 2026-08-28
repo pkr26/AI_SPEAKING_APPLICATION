@@ -823,7 +823,11 @@ describe('index gate', () => {
   it('shows a restoring message while the session is being read', async () => {
     mockAuthValue = makeAuth({ isRestoring: true });
     await renderGate();
-    expect(screen.getByText(t('gate.restoring'))).toBeTruthy();
+    const message = screen.getByText(t('gate.restoring'));
+    expect(message.props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.getByLabelText(t('gate.restoring')).props.accessibilityLabel).toBe(
+      t('gate.restoring'),
+    );
     expect(screen.queryByTestId('redirect')).toBeNull();
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -1113,7 +1117,7 @@ describe('index gate', () => {
     expect(await screen.findByText(t('gate.serverErrorTitle'))).toBeTruthy();
     // The error title is a screen-reader landmark for the failure state.
     expect(screen.getByRole('header', { name: t('gate.serverErrorTitle') })).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { backgroundColor: colors.primary, minHeight: layout.minimumTarget },

@@ -405,7 +405,7 @@ describe('history screen', () => {
   it('shows a loading state while the first page loads', async () => {
     mockGetHistory.mockReturnValue(new Promise(() => undefined));
     await renderHistory();
-    expect(screen.getByText(t('history.loading'))).toBeTruthy();
+    expect(screen.getByText(t('history.loading')).props.accessibilityLiveRegion).toBe('polite');
     // The spinner itself is the only labelled node: screen readers announce it.
     expect(screen.getByLabelText(t('history.loading'))).toBeTruthy();
 
@@ -419,8 +419,10 @@ describe('history screen', () => {
       .mockResolvedValueOnce({ items: [historyItem()], nextCursor: null });
     await renderHistory();
 
-    expect(await screen.findByText(t('history.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect((await screen.findByText(t('history.loadFailedTitle'))).props.accessibilityRole).toBe(
+      'header',
+    );
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
 
     expect(flattenedStyle(screen.getByText(t('history.loadFailedTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_TEXT);
@@ -552,7 +554,9 @@ describe('history screen', () => {
     mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
     await renderHistory();
 
-    expect(await screen.findByText(t('history.emptyTitle'))).toBeTruthy();
+    expect((await screen.findByText(t('history.emptyTitle'))).props.accessibilityRole).toBe(
+      'header',
+    );
     expect(screen.getByText(t('history.emptyBody'))).toBeTruthy();
 
     expect(flattenedStyle(screen.getByText(t('history.emptyTitle')))).toEqual(STATE_TITLE);
@@ -581,7 +585,9 @@ describe('history screen', () => {
     await renderHistory();
 
     expect(await screen.findByText('courage')).toBeTruthy();
-    expect(screen.getByText(dayHeading('2026-08-15T10:00:00.000Z'))).toBeTruthy();
+    expect(screen.getByText(dayHeading('2026-08-15T10:00:00.000Z')).props.accessibilityRole).toBe(
+      'header',
+    );
     expect(screen.getByText(dayHeading('2026-08-13T10:00:00.000Z'))).toBeTruthy();
 
     expect(screen.getByText(t('feedback.scoreLine', { score: 82 }))).toBeTruthy();
@@ -1365,6 +1371,7 @@ describe('history screen', () => {
     expect(refetchSpy).not.toHaveBeenCalled();
 
     const footerLabel = screen.getByText(t('history.loadingMore'));
+    expect(footerLabel.props.accessibilityLiveRegion).toBe('polite');
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
     expect(flattenedStyle(footerLabel)).toEqual(MUTED_TEXT);
     expect(flattenedStyle(parentOf(footerLabel))).toEqual({

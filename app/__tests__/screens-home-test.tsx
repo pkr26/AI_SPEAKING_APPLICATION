@@ -530,7 +530,7 @@ describe('home screen', () => {
     const otherUser = { ...USER, id: '550e8400-e29b-41d4-a716-446655440099' };
     expect(updateUser(otherUser)).toBe(otherUser);
     expect(updateUser(null)).toBeNull();
-    expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+    expect(screen.getByText(t('gate.loadingProfile')).props.accessibilityLiveRegion).toBe('polite');
     expect(screen.getByLabelText(t('gate.loadingProfile'))).toBeTruthy();
     expect(screen.queryByRole('button', { name: t('home.startPractice') })).toBeNull();
     expect(
@@ -749,7 +749,7 @@ describe('home screen', () => {
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
 
-    expect(await screen.findByText(t('summary.title'))).toBeTruthy();
+    expect((await screen.findByText(t('summary.title'))).props.accessibilityRole).toBe('header');
     expect(screen.getByText(t('summary.attempts', { count: 5 }))).toBeTruthy();
     expect(screen.getByText(t('summary.passed', { count: 3 }))).toBeTruthy();
     expect(screen.getByText(t('summary.mastered', { count: 2 }))).toBeTruthy();

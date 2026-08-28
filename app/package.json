@@ -56,8 +56,10 @@
     "test:quick": "jest --runInBand",
     "mutation": "npm run test:mutation-tooling && node scripts/run-mutation.mjs",
     "mutation:conditional-rendering": "node scripts/run-conditional-rendering-mutation.mjs",
+    "mutation:event-handling": "node scripts/run-jsx-attribute-mutation.mjs --mode event",
+    "mutation:accessibility": "node scripts/run-jsx-attribute-mutation.mjs --mode accessibility",
     "mutation:lanes:verify": "node scripts/mutation-lanes.mjs",
-    "test:mutation-tooling": "node --test scripts/test-mutation-lanes.mjs scripts/test-merge-mutation-reports.mjs scripts/test-recorder-killed-incremental-seed.mjs scripts/test-recorder-mutation-pass-merge.mjs scripts/test-run-recorder-mutation-passes.mjs scripts/test-conditional-rendering-mutation.mjs",
+    "test:mutation-tooling": "node --test scripts/test-mutation-lanes.mjs scripts/test-merge-mutation-reports.mjs scripts/test-recorder-killed-incremental-seed.mjs scripts/test-recorder-mutation-pass-merge.mjs scripts/test-run-recorder-mutation-passes.mjs scripts/test-conditional-rendering-mutation.mjs scripts/test-jsx-attribute-mutation.mjs",
     "typecheck": "tsc --noEmit",
     "doctor": "expo-doctor",
     "audit:ci": "node scripts/check-audit.mjs"

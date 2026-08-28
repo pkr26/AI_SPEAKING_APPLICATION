@@ -395,8 +395,13 @@ describe('Recorder audio-owner mutation contract', () => {
     actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
     try {
       const starts = rawPressHandlers(renderer, START_LABEL);
-      ownerStart = Promise.resolve(starts[0]());
-      racerStart = Promise.resolve(starts[1]());
+      expect(starts).toHaveLength(2);
+      expect(starts[0]).toEqual(expect.any(Function));
+      expect(starts[1]).toEqual(expect.any(Function));
+      const ownerPress = starts[0]!;
+      const racerPress = starts[1]!;
+      ownerStart = Promise.resolve(ownerPress());
+      racerStart = Promise.resolve(racerPress());
       await flushMicrotasks(30);
       permissions.resolve({ granted: true });
       await flushMicrotasks(100);
@@ -405,7 +410,7 @@ describe('Recorder audio-owner mutation contract', () => {
       if (recorders[0].record.mock.calls.length === 1 && racerRecordsAfterSimultaneousStart === 0) {
         // The same contender retries only after the owner is fully recording,
         // so it must await the owner's captured release promise this time.
-        lateStart = Promise.resolve(starts[1]()).finally(() => {
+        lateStart = Promise.resolve(racerPress()).finally(() => {
           lateStartSettled = true;
         });
         await flushMicrotasks(30);

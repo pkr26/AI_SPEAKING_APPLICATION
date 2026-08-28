@@ -392,6 +392,13 @@ describe('login entry points', () => {
     expect(screen.getByText(t('reset.doneBanner'))).toBeTruthy();
   });
 
+  it('uses the first repeated notice parameter', async () => {
+    mockSearchParams = { notice: ['reset', 'ignored'] };
+    await render(<LoginScreen />);
+
+    expect(screen.getByText(t('reset.doneBanner'))).toBeTruthy();
+  });
+
   it('shows no reset banner on a plain visit', async () => {
     await render(<LoginScreen />);
     expect(screen.queryByText(t('reset.doneBanner'))).toBeNull();
@@ -438,7 +445,7 @@ describe('forgot-password screen', () => {
     });
 
     expect(mockForgot).toHaveBeenCalledWith('ada@example.com');
-    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
+    expect((await screen.findByText(t('reset.sentTitle'))).props.accessibilityRole).toBe('header');
     // The neutral copy never says whether the account exists.
     expect(screen.getByText(t('reset.sentBody'))).toBeTruthy();
 
@@ -839,6 +846,15 @@ describe('reset-password screen', () => {
     expect(screen.getByLabelText(t('login.emailLabel')).props.value).toBe('ada@example.com');
   });
 
+  it('prefills the first repeated email parameter', async () => {
+    mockSearchParams = { email: ['first@example.com', 'ignored@example.com'] };
+    await expect(
+      Promise.resolve().then(() => render(<ResetPasswordScreen />)),
+    ).resolves.toBeDefined();
+
+    expect(screen.getByLabelText(t('login.emailLabel')).props.value).toBe('first@example.com');
+  });
+
   it('keeps the submit disabled until email, code, and a valid password exist', async () => {
     mockSearchParams = { email: 'ada@example.com' };
     await render(<ResetPasswordScreen />);
@@ -941,6 +957,17 @@ describe('reset-password screen', () => {
     // replace would only swap this screen, leaving the request step and its
     // "check your email" state one back-gesture away with a spent code.
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('preserves leading and trailing whitespace in the new password', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'reset-code');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), ' NewPass123 ');
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+
+    expect(mockReset).toHaveBeenCalledWith('ada@example.com', 'reset-code', ' NewPass123 ');
   });
 
   it('maps RESET_INVALID onto the localized invalid-code copy', async () => {

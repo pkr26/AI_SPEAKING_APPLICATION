@@ -42,6 +42,8 @@ npm run typecheck
 npm test
 npm run mutation
 npm run mutation:conditional-rendering
+npm run mutation:event-handling
+npm run mutation:accessibility
 npm run doctor
 npm run audit:ci
 ```
@@ -77,9 +79,28 @@ baseline first, and hashes every production source, owning test, campaign
 tool/config file, installed tool version, runtime, and behavior-affecting
 environment before and after execution. It shares `.mutation-campaign.lock`
 with Stryker, removes prior canonical reports before starting, and publishes
-JSON last as the complete-report marker. The weekly mutation workflow runs
-both campaigns even when one fails, so either report remains available for
-triage.
+JSON last as the complete-report marker. The weekly mutation workflow runs the
+general campaign and all three supplements independently, so a failure or
+timeout in one cannot hide the other reports.
+
+Stryker also mutates callback bodies but does not disconnect an individual JSX
+callback prop, and it does not remove an individual React Native accessibility
+attribute. The mode-driven JSX attribute supplement covers those blind spots
+without rewriting production source:
+
+- `npm run mutation:event-handling` replaces each authored JSX `onX` callback
+  value with a variadic no-op while leaving the prop present.
+- `npm run mutation:accessibility` removes each authored `accessible`,
+  `accessibility*`, or `importantForAccessibility` prop from its element.
+
+Each site runs only its lane-owned Jest files after one clean union baseline.
+Only a failed assertion kills a mutant; runtime errors and timeouts fail the
+campaign separately. Mode-specific reports live under
+`reports/mutation/event-handling/` and
+`reports/mutation/accessibility-attributes/`. The runner fingerprints every
+production source, owning test, tool input/version, runtime, and relevant
+environment before and after execution, and shares the app mutation lock with
+Stryker and the conditional-rendering supplement.
 
 Equivalent mutants — ones no test could ever kill, such as a `typeof` guard that
 exists only to narrow a type — are recorded in `scripts/mutation-equivalents.mjs`
@@ -151,7 +172,11 @@ npm run mutation:lanes:verify          # manifest only, no mutants
 node scripts/run-mutation.mjs ui types # re-run named lanes; reuse only current reports
 MUTATION_PARALLEL_LANES=3 MUTATION_CONCURRENCY=2 npm run mutation
 npm run mutation:conditional-rendering # every Stryker-blind JSX ternary, true + false
+JSX_ATTRIBUTE_MUTATION_CONCURRENCY=2 npm run mutation:event-handling
+npm run mutation:accessibility          # remove each authored a11y prop in isolation
 node scripts/run-conditional-rendering-mutation.mjs --list
+node scripts/run-jsx-attribute-mutation.mjs --mode event --list
+node scripts/run-jsx-attribute-mutation.mjs --mode accessibility --lane ui
 node scripts/run-conditional-rendering-mutation.mjs --lane practice --report-dir /tmp/practice-render-mutants
 ```
 

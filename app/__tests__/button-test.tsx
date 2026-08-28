@@ -156,6 +156,7 @@ describe('shared Button', () => {
       includeHiddenElements: true,
     });
     expect(spinner.props.accessibilityElementsHidden).toBe(true);
+    expect(spinner.props.importantForAccessibility).toBe('no-hide-descendants');
     expect(spinner.props.color).toBe(colors.onPrimary);
     await fireEvent.press(button('Signing in…'));
     expect(onPress).not.toHaveBeenCalled();

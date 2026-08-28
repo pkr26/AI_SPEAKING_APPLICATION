@@ -528,11 +528,11 @@ test('equivalence matching normalizes whitespace while retaining the exact locat
   assert.deepEqual(staleEntries, []);
 });
 
-test('439 checked-in equivalence entries pin 500 exact reviewed mutants', () => {
-  assert.equal(equivalentMutants.length, 439);
+test('436 checked-in equivalence entries pin 495 exact reviewed mutants', () => {
+  assert.equal(equivalentMutants.length, 436);
   assert.equal(
     equivalentMutants.reduce((total, entry) => total + (entry.count ?? 1), 0),
-    500,
+    495,
   );
   for (const entry of equivalentMutants) {
     assert.match(entry.file, /^src\//, 'file must be a repo-relative source path');

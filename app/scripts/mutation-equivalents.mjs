@@ -6,9 +6,9 @@
  *
  * 1. The directives are scoped to a line and a mutator name, but these sites put
  *    a killable and an unkillable mutant on the same line under the same mutator.
- *    In `boundedSeconds`, forcing `value > 0` to true is detectable while forcing
- *    the `typeof value === 'number'` beside it is not, and both are
- *    `ConditionalExpression` on one line. A comment would silence real coverage.
+ *    In `boundedSeconds`, weakening the positive-number bound is detectable while
+ *    joining the redundant `typeof value === 'number'` / `Number.isFinite(value)`
+ *    checks with OR is not. A line-scoped comment would silence real coverage.
  * 2. A `disable all` whose matching `restore` fails to take effect is invisible.
  *    One such pair in `login.tsx` silenced 157 mutants from the disable comment
  *    to the end of the file, and the campaign still reported a 100% score.
@@ -90,8 +90,7 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(77, 6, 77, 8),
   exactLocations(214, 7, 215, 16),
   exactLocations(214, 7, 215, 16),
-  exactLocations(415, 35, 415, 66, 550, 31, 550, 62, 563, 31, 563, 62),
-  exactLocations(515, 35, 515, 43, 515, 46, 515, 55),
+  exactLocations(514, 35, 514, 43, 514, 46, 514, 55),
   exactLocations(79, 6, 79, 8),
   exactLocations(169, 7, 170, 23),
   exactLocations(169, 7, 170, 23),
@@ -143,13 +142,12 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(40, 82, 44, 4),
   exactLocations(55, 39, 55, 49, 55, 39, 55, 49),
   exactLocations(136, 10, 136, 35),
-  exactLocations(342, 10, 342, 35),
+  exactLocations(357, 5, 357, 32),
   exactLocations(342, 10, 342, 61),
   exactLocations(351, 7, 351, 14),
   exactLocations(389, 13, 389, 17),
   exactLocations(474, 11, 474, 29, 474, 11, 474, 29),
   exactLocations(474, 11, 474, 29),
-  exactLocations(487, 7, 487, 32),
   exactLocations(487, 7, 488, 29),
   exactLocations(854, 7, 854, 35),
   exactLocations(1078, 22, 1078, 45, 1108, 22, 1108, 45),
@@ -172,7 +170,6 @@ const equivalentMutantLocations = Object.freeze([
   exactLocations(54, 9, 54, 28),
   exactLocations(72, 11, 72, 29, 76, 11, 76, 29, 79, 11, 79, 29),
   exactLocations(99, 11, 99, 29, 102, 11, 102, 29),
-  exactLocations(108, 33, 108, 51),
   // Home and history.
   exactLocations(61, 8, 61, 10),
   exactLocations(157, 29, 157, 34),
@@ -2532,7 +2529,7 @@ const recordingsEquivalentMutants = Object.freeze([
 // new node happens to have identical text and coordinates.
 export const equivalentMutantSourceHashes = Object.freeze({
   'src/app/(auth)/forgot-password.tsx':
-    'b35974583e9ca8ba9b54172b2793b3773f6e51dc7402fe931aea6413a7c80eba',
+    'fbcd03033e59a9c854484cc0f62a3922fe3c7f42cc4448e449a9932128d04438',
   'src/app/(auth)/login.tsx': '2985fdcb13fdbca2284cf5a477624dadf950e17e5016a99cd06e90352ded6aaf',
   'src/app/(auth)/reset-password.tsx':
     'b0b83c1281540c3dd7df32d5bc6e6494ee887b560d71cefe8367a4fd5910ca13',
@@ -2546,7 +2543,7 @@ export const equivalentMutantSourceHashes = Object.freeze({
     'ca8b2301593854a1495517f0f6881adea8194220ef78e133a18eed5362535031',
   'src/app/practice/feedback.tsx':
     '755f9a10aa3a98ebf4b65727ca2dec8b5b7fa9273c16ee8ee2b3cfcebc03fd63',
-  'src/app/practice/index.tsx': 'ddf80887e74e2ff14e3cc53d1e4d33080e60c4548c0d6f9156e64b091fcd8ef3',
+  'src/app/practice/index.tsx': '4f59ca3e9071603c5c1d517435f4b0bf96ccd3fa9f532bfa78b32b62f00cfda7',
   'src/app/recordings.tsx': '2dce0c91c8606f5b41117be9467b4b2eae62037af7c95ccc87be9aaf1782a019',
   'src/app/settings/change-password.tsx':
     '9dfdfb5ea277f9af6acb24f5a66c7880fb3f09ac3340eafc71c42192434f42d2',
@@ -2966,15 +2963,6 @@ export const equivalentMutants = Object.freeze(
     },
     {
       file: 'src/app/practice/index.tsx',
-      mutator: 'ObjectLiteral',
-      original: 'accessibilityState={{ disabled: interactionLocked }}',
-      replacements: ['{}'],
-      count: 3,
-      reason:
-        'Pressable rebuilds accessibilityState from its own non-null disabled prop, so omitting the explicit disabled key leaves the same accessible state at all three controls.',
-    },
-    {
-      file: 'src/app/practice/index.tsx',
       mutator: 'StringLiteral',
       original: "key={nativeMode ? 'native' : 'english'}",
       replacements: ['""'],
@@ -3390,12 +3378,11 @@ export const equivalentMutants = Object.freeze(
     },
     {
       file: 'src/lib/api.ts',
-      mutator: 'ConditionalExpression',
-      original:
-        "return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= maxSeconds",
-      replacements: ['true'],
+      mutator: 'OptionalChaining',
+      original: "signal?.removeEventListener('abort', listener);",
+      replacements: ['signal.removeEventListener'],
       reason:
-        'Number.isFinite is already false for every non-number, so forcing the typeof test true cannot change the outcome. It exists to narrow unknown to number for TypeScript.',
+        "When signal is present both forms remove the same listener. When it is absent, the direct property access throws inside removeAbortListener's best-effort try/catch and is swallowed, so callers observe the same no-throw cleanup.",
     },
     {
       file: 'src/lib/api.ts',
@@ -3438,14 +3425,6 @@ export const equivalentMutants = Object.freeze(
       replacements: ['res.status !== 503'],
       reason:
         'Reversing the same selector only swaps two branches whose maximum is the identical value 120.',
-    },
-    {
-      file: 'src/lib/api.ts',
-      mutator: 'ConditionalExpression',
-      original: "typeof hours === 'number' &&",
-      replacements: ['true'],
-      reason:
-        'Number.isFinite is already false for every non-number, so forcing the typeof check true cannot change the outcome.',
     },
     {
       file: 'src/lib/api.ts',
@@ -3621,14 +3600,6 @@ export const equivalentMutants = Object.freeze(
       count: 2,
       reason:
         'Across reset-password catch and finally paths, forcing a late mounted check only targets detached React state; the nested navigation publisher retains its own mounted fence.',
-    },
-    {
-      file: 'src/app/(auth)/forgot-password.tsx',
-      mutator: 'ObjectLiteral',
-      original: 'accessibilityState={{ disabled: busy }}',
-      replacements: ['{}'],
-      reason:
-        'This back link is rendered only in the post-request sent state, after busy has returned to false, so omitting disabled:false preserves the same accessibility state.',
     },
     {
       file: 'src/app/home.tsx',

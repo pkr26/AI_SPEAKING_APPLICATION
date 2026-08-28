@@ -407,6 +407,7 @@ async function renderRecorder(overrides: Partial<SentinelRecorderProps> = {}) {
   const recorderProps = props(overrides);
   const view = await render(<Recorder {...recorderProps} />);
   await act(async () => flushMicrotasks());
+  expect(view.getByRole('button', { name: START_LABEL })).toBeTruthy();
   return { view, recorderProps };
 }
 
@@ -1477,14 +1478,14 @@ describe('Recorder mutation sentinels', () => {
       await Promise.resolve(stalePlay());
       await flushMicrotasks();
     });
-    if (!oldStatusListener) throw new Error('Old preview listener was not installed');
+    expect(oldStatusListener).toEqual(expect.any(Function));
 
     oldPlayer.seekTo.mockImplementation(() => {
-      oldStatusListener?.({ error: new Error('old player failed re-entrantly') });
+      oldStatusListener!({ error: new Error('old player failed re-entrantly') });
       return Promise.resolve();
     });
     await act(async () => {
-      oldStatusListener?.({ didJustFinish: true });
+      oldStatusListener!({ didJustFinish: true });
       await flushMicrotasks(100);
     });
 

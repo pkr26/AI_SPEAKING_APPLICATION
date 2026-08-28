@@ -1234,9 +1234,13 @@ describe('help and attempt detail boundaries', () => {
   });
 
   it('rejects response strings and collections beyond server contract bounds', () => {
-    expect(
-      parseUser({ ...user, name: 'x'.repeat(100), email: `${'e'.repeat(242)}@example.com` }),
-    ).toMatchObject({
+    const boundaryUser = {
+      ...user,
+      name: 'x'.repeat(100),
+      email: `${'e'.repeat(242)}@example.com`,
+    };
+    expect(() => parseUser(boundaryUser)).not.toThrow();
+    expect(parseUser(boundaryUser)).toMatchObject({
       name: 'x'.repeat(100),
       email: `${'e'.repeat(242)}@example.com`,
     });
@@ -1273,6 +1277,10 @@ describe('help and attempt detail boundaries', () => {
 
     expectContractError(() => parseUser({ ...user, name: 'x'.repeat(101) }));
     expectContractError(() => parseUser({ ...user, email: 'x'.repeat(255) }));
+    expect(parseUser({ ...user, name: '😀'.repeat(50) })).toMatchObject({
+      name: '😀'.repeat(50),
+    });
+    expectContractError(() => parseUser({ ...user, name: '😀'.repeat(51) }));
     expectContractError(() =>
       parsePracticeQuestion({
         ...practicePayload,

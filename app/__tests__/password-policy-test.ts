@@ -1,6 +1,8 @@
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import {
   comparablePasswordError,
+  MAX_EMAIL_LENGTH,
+  MAX_NAME_LENGTH,
   MAX_PASSWORD_UTF8_BYTES,
   passwordPolicyError,
   utf8ByteLength,
@@ -10,6 +12,12 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
 
 describe('UTF-8 password policy', () => {
+  it('pins the identity and bcrypt limits shared with the server contract', () => {
+    expect(MAX_NAME_LENGTH).toBe(100);
+    expect(MAX_EMAIL_LENGTH).toBe(254);
+    expect(MAX_PASSWORD_UTF8_BYTES).toBe(72);
+  });
+
   test.each([
     ['', 0],
     ['ascii', 5],

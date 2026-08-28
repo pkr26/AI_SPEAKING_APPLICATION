@@ -428,8 +428,8 @@ async function renderRerenderable(ui: React.ReactElement, queryClient?: QueryCli
 }
 
 function recorderProps(): CapturedRecorderProps {
-  if (!mockRecorderProps) throw new Error('Recorder was not rendered');
-  return mockRecorderProps;
+  expect(mockRecorderProps).not.toBeNull();
+  return mockRecorderProps!;
 }
 
 type SemanticStyle = Record<string, unknown>;
@@ -595,7 +595,9 @@ describe('practice home screen', () => {
   it('shows a loading state while the question loads', async () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<PracticeScreen />);
-    expect(screen.getByText(t('practice.loadingQuestion'))).toBeTruthy();
+    expect(screen.getByText(t('practice.loadingQuestion')).props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
     expect(screen.queryByTestId('recorder')).toBeNull();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
     expect(
@@ -619,8 +621,9 @@ describe('practice home screen', () => {
     await renderScreen(<PracticeScreen />, queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
-    expect(screen.getByText('courage')).toBeTruthy();
+    expect(screen.getByRole('header', { name: 'courage' })).toBeTruthy();
     expect(screen.getByText('B1')).toBeTruthy();
+    expect(screen.getByRole('button', { name: t('practice.helpLabel') })).toBeTruthy();
     // The plain-language CEFR explainer sits under the badge row.
     expect(screen.getByText(t('cefr.B1'))).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
@@ -670,6 +673,7 @@ describe('practice home screen', () => {
     await screen.findByText('Describe a time you showed courage.');
 
     expect(await screen.findByText(t('practiceIntro.title'))).toBeTruthy();
+    expect(screen.getByRole('header', { name: t('practiceIntro.title') })).toBeTruthy();
     expect(mockPracticeIntro.hasSeenPracticeIntro).toHaveBeenCalledWith(USER.id);
     expect(
       screen.getByText(t('practiceIntro.master', { score: PRACTICE_MASTER_SCORE })),
@@ -1343,7 +1347,7 @@ describe('practice home screen', () => {
     await renderScreen(<PracticeScreen />);
 
     expect(await screen.findByText(t('practice.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { backgroundColor: colors.primary },
@@ -1566,7 +1570,7 @@ describe('practice attempt screen', () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<AttemptScreen />);
-    expect(screen.getByText(t('attempt.loading'))).toBeTruthy();
+    expect(screen.getByText(t('attempt.loading')).props.accessibilityLiveRegion).toBe('polite');
     // The spinner itself is labelled, so the wait is announced without sight.
     expect(screen.getByLabelText(t('attempt.loading'))).toBeTruthy();
   });
@@ -1578,7 +1582,7 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />, queryClient);
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
-    expect(screen.getByText('courage')).toBeTruthy();
+    expect(screen.getByRole('header', { name: 'courage' })).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledWith(
       `/practice/question/${QUESTION.id}/help`,
       expect.objectContaining({ signal: expect.anything() }),
@@ -2096,7 +2100,7 @@ describe('practice attempt screen', () => {
     await renderScreen(<AttemptScreen />);
 
     expect(await screen.findByText(t('attempt.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { backgroundColor: colors.primary },
@@ -3022,7 +3026,7 @@ describe('practice help screen', () => {
     mockSearchParams = { questionId: QUESTION.id };
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<HelpScreen />);
-    expect(screen.getByText(t('help.loading'))).toBeTruthy();
+    expect(screen.getByText(t('help.loading')).props.accessibilityLiveRegion).toBe('polite');
     // The spinner itself is labelled, so the wait is announced without sight.
     expect(screen.getByLabelText(t('help.loading'))).toBeTruthy();
     expect(screen.queryByText(t('help.loadFailedTitle'))).toBeNull();
@@ -3122,7 +3126,7 @@ describe('practice help screen', () => {
     await renderScreen(<HelpScreen />);
 
     expect(await screen.findByText(t('help.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       { alignItems: 'center', backgroundColor: colors.primary },
@@ -4301,6 +4305,7 @@ describe('practice mutation ownership sentinels', () => {
         void logout();
         await Promise.resolve();
       });
+      expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
       await blurScreen();
       mockRouter.replace.mockClear();
       alertSpy.mockClear();
@@ -4332,6 +4337,7 @@ describe('practice mutation ownership sentinels', () => {
       void committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }))();
       await Promise.resolve();
     });
+    expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
 
     mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
     await view.rerender(withProviders(<PracticeScreen />, client, 0));

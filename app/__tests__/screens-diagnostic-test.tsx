@@ -232,8 +232,8 @@ async function renderScreen(queryClient = makeQueryClient()) {
 }
 
 function recorderProps(): CapturedRecorderProps {
-  if (!mockRecorderProps) throw new Error('Recorder is not mounted');
-  return mockRecorderProps;
+  expect(mockRecorderProps).not.toBeNull();
+  return mockRecorderProps!;
 }
 
 /** A fresh test (asked === 0) opens on the one-shot intro card; press Start. */
@@ -406,7 +406,7 @@ describe('diagnostic screen', () => {
     expect(mockUserMessageForError).not.toHaveBeenCalled();
     expect(screen.getByText('courage')).toBeTruthy();
     expect(screen.getByText(t('diag.progress', { current: 1, max: 5 }))).toBeTruthy();
-    expect(screen.getByText(t('header.diagnostic'))).toBeTruthy();
+    expect(screen.getByText(t('header.diagnostic')).props.accessibilityRole).toBe('header');
     // Both halves of the prompt card are named for the learner.
     expect(screen.getByText(t('label.word'))).toBeTruthy();
     expect(screen.getByText(t('label.question'))).toBeTruthy();
@@ -459,7 +459,7 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
 
-    expect(await screen.findByText(t('diag.introTitle'))).toBeTruthy();
+    expect((await screen.findByText(t('diag.introTitle'))).props.accessibilityRole).toBe('header');
     expect(screen.getByText(t('diag.introWhat'))).toBeTruthy();
     expect(screen.getByText(t('diag.introCount', { count: 5 }))).toBeTruthy();
     expect(screen.getByText(t('diag.introRecorded'))).toBeTruthy();
@@ -880,7 +880,9 @@ describe('diagnostic screen', () => {
     currentLease = { owner: 'replacement-session' };
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
 
-    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(
+      parentOf(screen.getByText(t('diag.answerSavedTitle'))).props.accessibilityLiveRegion,
+    ).toBe('polite');
     expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
     expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
   });
@@ -899,7 +901,9 @@ describe('diagnostic screen', () => {
     const removeSpy = jest.spyOn(queryClient, 'removeQueries');
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
     await renderScreen(queryClient);
-    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect((await screen.findByText(t('diag.completeTitle'))).props.accessibilityRole).toBe(
+      'header',
+    );
 
     currentLease = { owner: 'replacement-session' };
     await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
@@ -1416,8 +1420,10 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen();
 
-    expect(await screen.findByText(t('diag.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy'))).toBeTruthy();
+    expect((await screen.findByText(t('diag.loadFailedTitle'))).props.accessibilityRole).toBe(
+      'header',
+    );
+    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       {

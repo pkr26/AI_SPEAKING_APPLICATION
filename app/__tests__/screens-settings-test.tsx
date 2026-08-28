@@ -349,14 +349,19 @@ async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): 
   }
 }
 
+function latestAlertCall(): (typeof alertSpy.mock.calls)[number] {
+  expect(alertSpy).toHaveBeenCalled();
+  const call = alertSpy.mock.calls.at(-1);
+  expect(call).toBeDefined();
+  return call!;
+}
+
 function alertButtons(): {
   text?: string;
   style?: 'default' | 'cancel' | 'destructive';
   onPress?: () => void;
 }[] {
-  const calls = alertSpy.mock.calls;
-  if (calls.length === 0) throw new Error('Alert.alert was not called');
-  return (calls[calls.length - 1][2] ?? []) as {
+  return (latestAlertCall()[2] ?? []) as {
     text?: string;
     style?: 'default' | 'cancel' | 'destructive';
     onPress?: () => void;
@@ -365,8 +370,8 @@ function alertButtons(): {
 
 async function pressAlertButton(text: string) {
   const button = alertButtons().find((candidate) => candidate.text === text);
-  if (!button?.onPress) throw new Error(`Alert button "${text}" not found`);
-  await act(async () => button.onPress?.());
+  expect(button?.onPress).toEqual(expect.any(Function));
+  await act(async () => button!.onPress!());
 }
 
 function hardwareBackIsHandled(): boolean {
@@ -689,6 +694,15 @@ describe('change password screen', () => {
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
+  it('treats password whitespace as significant when confirming', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'NewPass123 ', 'NewPass123');
+
+    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe('polite');
+    expect(updateButton().props.accessibilityState.disabled).toBe(true);
+    expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
+  });
+
   it('enforces the password policy on the new password', async () => {
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'short', 'short');
@@ -727,6 +741,18 @@ describe('change password screen', () => {
 
     await pressAlertButton(t('common.ok'));
     expect(mockRouter.back).toHaveBeenCalled();
+  });
+
+  it('preserves opaque whitespace and accepts a legacy current password', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword(' old ', ' NewPass123 ', ' NewPass123 ');
+
+    expect(updateButton().props.accessibilityState.disabled).toBe(false);
+    await fireEvent.press(updateButton());
+
+    await waitFor(() =>
+      expect(mockAuthValue.changePassword).toHaveBeenCalledWith(' old ', ' NewPass123 '),
+    );
   });
 
   it('shows the busy state while updating', async () => {
@@ -843,10 +869,10 @@ describe('change password screen', () => {
     await fireEvent.press(updateButton());
     await waitFor(() => expect(alertSpy).toHaveBeenCalled());
     const confirm = alertButtons().find((button) => button.text === t('common.ok'))?.onPress;
-    if (!confirm) throw new Error('Password success callback was not registered');
+    expect(confirm).toEqual(expect.any(Function));
 
     await rendered.unmount();
-    await act(async () => confirm());
+    await act(async () => confirm!());
 
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
@@ -1194,12 +1220,13 @@ describe('delete account screen', () => {
     const confirmDelete = alertButtons().find(
       (button) => button.text === t('da.confirmDelete'),
     )?.onPress;
-    if (!cancel || !confirmDelete) throw new Error('Delete callbacks were not registered');
+    expect(cancel).toEqual(expect.any(Function));
+    expect(confirmDelete).toEqual(expect.any(Function));
     mockSetOptions.mockClear();
 
     await act(async () => {
-      cancel();
-      confirmDelete();
+      cancel!();
+      confirmDelete!();
       await Promise.resolve();
     });
 
@@ -1215,19 +1242,20 @@ describe('delete account screen', () => {
     await typePassword('password1');
     await fireEvent.press(deleteButton());
 
-    const confirmationCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const confirmationCall = latestAlertCall();
     const buttons = (confirmationCall?.[2] ?? []) as {
       text?: string;
       onPress?: () => void;
     }[];
     const confirmDelete = buttons.find((button) => button.text === t('da.confirmDelete'))?.onPress;
     const onDismiss = (confirmationCall?.[3] as { onDismiss?: () => void } | undefined)?.onDismiss;
-    if (!confirmDelete || !onDismiss) throw new Error('Delete confirmation callbacks are missing');
+    expect(confirmDelete).toEqual(expect.any(Function));
+    expect(onDismiss).toEqual(expect.any(Function));
     mockSetOptions.mockClear();
 
     await act(async () => {
-      confirmDelete();
-      onDismiss();
+      confirmDelete!();
+      onDismiss!();
       await Promise.resolve();
     });
 
@@ -1246,7 +1274,7 @@ describe('delete account screen', () => {
     await typePassword('password1');
     await fireEvent.press(deleteButton());
 
-    const confirmationCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const confirmationCall = latestAlertCall();
     const buttons = (confirmationCall?.[2] ?? []) as {
       text?: string;
       onPress?: () => void;
@@ -1293,6 +1321,17 @@ describe('delete account screen', () => {
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
+  it('preserves an opaque legacy password through destructive confirmation', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword(' old ');
+
+    expect(deleteButton().props.accessibilityState.disabled).toBe(false);
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+
+    await waitFor(() => expect(mockAuthValue.deleteAccount).toHaveBeenCalledWith(' old '));
+  });
+
   it('makes the deletion-success Alert action inert after the protected screen is gone', async () => {
     const rendered = await renderScreen(<DeleteAccountScreen />);
     await typePassword('password1');
@@ -1306,10 +1345,10 @@ describe('delete account screen', () => {
       ),
     );
     const acknowledge = alertButtons().find((button) => button.text === t('common.ok'))?.onPress;
-    if (!acknowledge) throw new Error('Deletion success callback was not registered');
+    expect(acknowledge).toEqual(expect.any(Function));
 
     await rendered.unmount();
-    await act(async () => acknowledge());
+    await act(async () => acknowledge!());
 
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });

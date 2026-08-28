@@ -310,6 +310,30 @@ let appStateSubscriptionRemove: jest.Mock;
 let reduceMotionSubscriptionRemove: jest.Mock;
 let mockRecoveryPostAttempts: number;
 let mockRecorderStatusReads: number;
+
+type PreviewStatusEvent = {
+  didJustFinish: boolean;
+  error?: string | null;
+};
+
+function previewStatusListener(
+  player: MockPreviewPlayer = mockPreviewPlayer,
+): (status: PreviewStatusEvent) => void {
+  expect(player.addListener).toHaveBeenCalledWith('playbackStatusUpdate', expect.any(Function));
+  const listener = player.addListener.mock.calls[0]?.[1];
+  expect(listener).toEqual(expect.any(Function));
+  return listener as (status: PreviewStatusEvent) => void;
+}
+
+function previewListenerSubscription(player: MockPreviewPlayer = mockPreviewPlayer): {
+  remove: jest.Mock;
+} {
+  expect(player.addListener).toHaveBeenCalledWith('playbackStatusUpdate', expect.any(Function));
+  const subscription = player.addListener.mock.results[0]?.value as
+    { remove?: unknown } | undefined;
+  expect(subscription?.remove).toEqual(expect.any(Function));
+  return subscription as { remove: jest.Mock };
+}
 const nativeSetTimeout = globalThis.setTimeout;
 const nativeClearTimeout = globalThis.clearTimeout;
 const nativeSetInterval = globalThis.setInterval;
@@ -509,8 +533,8 @@ function waitSpinnerNode(accessibilityLabel: string): TestInstance {
   const spinner = screen
     .getAllByLabelText(accessibilityLabel)
     .find((node) => node.props.size === 'large');
-  if (!spinner) throw new Error('Wait spinner not found');
-  return spinner;
+  expect(spinner).toBeDefined();
+  return spinner!;
 }
 
 type SemanticStyle = Record<string, unknown>;
@@ -638,6 +662,7 @@ async function renderRecorder(overrides: RecorderTestOverrides = {}) {
   const view = await render(<Recorder {...props} />);
   await flushAct();
   await flushAct();
+  expect(view.getByRole('button', { name: START_LABEL })).toBeTruthy();
   return { view, props };
 }
 
@@ -11002,10 +11027,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-        error: string | null;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: false, error: 'native decoder failed' });
@@ -11062,10 +11084,7 @@ describe('Recorder', () => {
       const pauseOnPress = compositePressablePropsForNode(
         screen.getByRole('button', { name: t('recorder.pauseLabel') }),
       ).onPress as () => unknown;
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-        error: string | null;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: false, error: 'decoder stopped' });
@@ -11127,9 +11146,7 @@ describe('Recorder', () => {
         'playbackStatusUpdate',
         expect.any(Function),
       );
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: false });
@@ -11150,9 +11167,7 @@ describe('Recorder', () => {
       await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: true });
@@ -11182,9 +11197,7 @@ describe('Recorder', () => {
       await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: true });
@@ -11224,9 +11237,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
       await act(async () => onStatus({ didJustFinish: true }));
       let replay!: Promise<void>;
       await act(() => {
@@ -11255,10 +11266,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-        error?: string | null;
-      }) => void;
+      const onStatus = previewStatusListener();
       await act(async () => onStatus({ didJustFinish: true }));
       let replay!: Promise<void>;
       await act(() => {
@@ -11282,9 +11290,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: true });
@@ -11305,9 +11311,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const onStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const onStatus = previewStatusListener();
 
       await act(async () => {
         onStatus({ didJustFinish: true });
@@ -11322,9 +11326,7 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const subscription = mockPreviewPlayer.addListener.mock.results[0].value as {
-        remove: jest.Mock;
-      };
+      const subscription = previewListenerSubscription();
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
@@ -11348,9 +11350,7 @@ describe('Recorder', () => {
       const { view } = await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const subscription = mockPreviewPlayer.addListener.mock.results[0].value as {
-        remove: jest.Mock;
-      };
+      const subscription = previewListenerSubscription();
 
       await view.unmount();
       await flushAct();
@@ -11395,9 +11395,7 @@ describe('Recorder', () => {
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
       const stalePlayer = mockPreviewPlayer;
-      const staleStatus = stalePlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const staleStatus = previewStatusListener(stalePlayer);
       stalePlayer.seekTo.mockRejectedValue(new Error('released player rewind failed'));
 
       await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
@@ -11433,10 +11431,7 @@ describe('Recorder', () => {
         await recordAndStop();
         await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
         const stalePlayer = mockPreviewPlayer;
-        const staleStatus = stalePlayer.addListener.mock.calls[0][1] as (status: {
-          didJustFinish: boolean;
-          error?: string | null;
-        }) => void;
+        const staleStatus = previewStatusListener(stalePlayer);
 
         await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
         await waitFor(() => expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy());
@@ -11475,9 +11470,7 @@ describe('Recorder', () => {
         const { props } = await renderRecorder();
         await recordAndStop();
         await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-        const staleStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-          didJustFinish: boolean;
-        }) => void;
+        const staleStatus = previewStatusListener();
         await act(async () => staleStatus({ didJustFinish: true }));
 
         await fireEvent.press(screen.getByRole('button', { name: RERECORD_TEXT }));
@@ -11490,9 +11483,7 @@ describe('Recorder', () => {
         mockPreviewPlayer.seekTo.mockReturnValue(currentRewind.promise);
         await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
         const currentPlayer = mockPreviewPlayer;
-        const currentStatus = currentPlayer.addListener.mock.calls[0][1] as (status: {
-          didJustFinish: boolean;
-        }) => void;
+        const currentStatus = previewStatusListener(currentPlayer);
         await act(async () => currentStatus({ didJustFinish: true }));
 
         await act(async () => {
@@ -11527,9 +11518,7 @@ describe('Recorder', () => {
       await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const staleStatus = mockPreviewPlayer.addListener.mock.calls[0][1] as (status: {
-        didJustFinish: boolean;
-      }) => void;
+      const staleStatus = previewStatusListener();
       await act(async () => staleStatus({ didJustFinish: true }));
       let staleReplay!: Promise<void>;
       await act(() => {
@@ -14447,8 +14436,7 @@ describe('Recorder', () => {
       await renderRecorder();
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: t('recorder.playLabel') }));
-      const listener = mockPreviewPlayer.addListener.mock.results[0]?.value as
-        { remove: jest.Mock } | undefined;
+      const listener = previewListenerSubscription();
 
       backgroundApp();
       await act(async () => {
@@ -14457,7 +14445,7 @@ describe('Recorder', () => {
       });
 
       expect(mockPreviewPlayer.remove).toHaveBeenCalledTimes(1);
-      expect(listener?.remove).toHaveBeenCalledTimes(1);
+      expect(listener.remove).toHaveBeenCalledTimes(1);
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 

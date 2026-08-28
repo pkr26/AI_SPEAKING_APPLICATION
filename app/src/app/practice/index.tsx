@@ -412,7 +412,6 @@ export default function PracticeScreen() {
               accessibilityRole="button"
               accessibilityLabel={t('practice.helpLabel')}
               accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-              accessibilityState={{ disabled: interactionLocked }}
               disabled={interactionLocked}
               hitSlop={4}
               style={({ pressed }) => [
@@ -547,7 +546,6 @@ export default function PracticeScreen() {
         <Pressable
           accessibilityRole="button"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          accessibilityState={{ disabled: interactionLocked }}
           disabled={interactionLocked}
           hitSlop={4}
           style={[styles.footerButton, interactionLocked && styles.controlDisabled]}
@@ -560,7 +558,6 @@ export default function PracticeScreen() {
         <Pressable
           accessibilityRole="button"
           accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          accessibilityState={{ disabled: interactionLocked }}
           disabled={interactionLocked}
           hitSlop={4}
           style={[styles.footerButton, interactionLocked && styles.controlDisabled]}

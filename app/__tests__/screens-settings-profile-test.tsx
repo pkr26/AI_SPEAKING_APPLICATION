@@ -201,13 +201,30 @@ const mockRouter = jest.requireMock('expo-router').router as {
 
 let alertSpy: jest.SpyInstance;
 
+function latestAlertCall(): (typeof alertSpy.mock.calls)[number] {
+  expect(alertSpy).toHaveBeenCalled();
+  const call = alertSpy.mock.calls.at(-1);
+  expect(call).toBeDefined();
+  return call!;
+}
+
+function latestAlertButtons(): { text?: string; onPress?: () => void }[] {
+  const buttons = latestAlertCall()[2] as { text?: string; onPress?: () => void }[] | undefined;
+  expect(buttons).toEqual(expect.any(Array));
+  return buttons!;
+}
+
 async function pressAlertButton(text: string) {
-  const calls = alertSpy.mock.calls;
-  const buttons = calls[calls.length - 1][2] as
-    { text?: string; onPress?: () => void }[] | undefined;
+  const buttons = latestAlertButtons();
   const button = buttons?.find((candidate) => candidate.text === text);
-  if (!button?.onPress) throw new Error(`Alert button "${text}" not found`);
-  await act(async () => button.onPress?.());
+  expect(button?.onPress).toEqual(expect.any(Function));
+  await act(async () => button!.onPress!());
+}
+
+function parsedExportContents(): unknown {
+  expect(lastFileContents).not.toBe('');
+  expect(() => JSON.parse(lastFileContents)).not.toThrow();
+  return JSON.parse(lastFileContents);
 }
 
 const queryClients: QueryClient[] = [];
@@ -719,6 +736,7 @@ describe('settings profile card', () => {
     expect(mockUpdateProfile).toHaveBeenCalledWith({ name: 'Ada King' });
     expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
     const saved = await screen.findByText(t('settings.saved'));
+    expect(saved.props.accessibilityLiveRegion).toBe('polite');
     expect(flattenedStyle(saved)).toEqual({
       marginTop: 6,
       color: colors.success,
@@ -848,6 +866,12 @@ describe('settings profile card', () => {
     expect(saveButton().props.accessibilityState).toMatchObject({ disabled: false });
 
     await fireEvent.changeText(input, 'a'.repeat(MAX_NAME_LENGTH + 1));
+    expect(saveButton().props.accessibilityState).toMatchObject({ disabled: true });
+
+    await fireEvent.changeText(input, '😀'.repeat(50));
+    expect(saveButton().props.accessibilityState).toMatchObject({ disabled: false });
+
+    await fireEvent.changeText(input, '😀'.repeat(51));
     expect(saveButton().props.accessibilityState).toMatchObject({ disabled: true });
   });
 
@@ -980,7 +1004,8 @@ describe('settings profile card', () => {
       await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
     });
 
-    const error = await screen.findByText(t('settings.updateFailed'));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent(t('settings.updateFailed'));
     expect(flattenedStyle(error)).toEqual({ marginTop: 6, color: colors.danger, fontSize: 13 });
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
     // A failed save must never leave a "Saved" confirmation behind.
@@ -1592,7 +1617,7 @@ describe('settings profile card', () => {
       await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
     });
 
-    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('error.serverBusy'));
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
   });
 
@@ -1909,7 +1934,7 @@ describe('data export', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
 
     expect(lastFileContents).toBe(JSON.stringify(expected));
-    expect(JSON.parse(lastFileContents)).toEqual(expected);
+    expect(parsedExportContents()).toEqual(expected);
     expect(mockWrite).toHaveBeenCalledTimes(5);
     expect(mockShareAsync).toHaveBeenCalledTimes(1);
     expect(mockDelete).toHaveBeenCalledTimes(1);
@@ -1939,7 +1964,7 @@ describe('data export', () => {
     await renderSettings();
     await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
 
-    expect(JSON.parse(lastFileContents)).toEqual({
+    expect(parsedExportContents()).toEqual({
       user: USER,
       attempts: [],
       recordings: [exportedRecording],
@@ -2243,7 +2268,9 @@ describe('data export', () => {
       await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
     });
 
-    expect(await screen.findByText(`${t('error.tooMany')} ${t('wait.minute')}`)).toBeTruthy();
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      `${t('error.tooMany')} ${t('wait.minute')}`,
+    );
     expect(mockFile).not.toHaveBeenCalled();
     expect(mockDelete).not.toHaveBeenCalled();
     expect(mockShareAsync).not.toHaveBeenCalled();
@@ -2469,7 +2496,8 @@ describe('daily reminder controls', () => {
       await fireEvent.press(screen.getByRole('switch', { name: t('reminder.toggleLabel') }));
     });
 
-    const error = await screen.findByText(t('reminder.failed'));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent(t('reminder.failed'));
     expect(flattenedStyle(error)).toEqual({ marginTop: 6, color: colors.danger, fontSize: 13 });
     expect(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
@@ -2644,15 +2672,14 @@ describe('retake placement test', () => {
     const retakeRow = screen.getByRole('button', { name: t('settings.retake') });
     const reopen = committedPressHandler(retakeRow);
     await fireEvent.press(retakeRow);
-    const calls = alertSpy.mock.calls;
-    const buttons = calls[calls.length - 1][2] as { text?: string; onPress?: () => void }[];
+    const buttons = latestAlertButtons();
     const confirm = buttons.find((candidate) => candidate.text === t('retake.confirm'))?.onPress;
-    if (!confirm) throw new Error('retake confirmation button not found');
+    expect(confirm).toEqual(expect.any(Function));
 
     await act(async () => {
-      confirm();
+      confirm!();
       reopen();
-      confirm();
+      confirm!();
     });
 
     expect(mockRestartDiagnostic).toHaveBeenCalledTimes(1);
@@ -2686,24 +2713,25 @@ describe('retake placement test', () => {
     await renderSettings();
     const row = () => screen.getByRole('button', { name: t('settings.retake') });
     await fireEvent.press(row());
-    const firstCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const firstCall = latestAlertCall();
     const firstButtons = firstCall[2] as { text?: string; onPress?: () => void }[];
     const firstCancel = firstButtons.find((button) => button.text === t('common.cancel'))?.onPress;
     const firstDismiss = (firstCall[3] as { onDismiss?: () => void }).onDismiss;
-    if (!firstCancel || !firstDismiss) throw new Error('First confirmation callbacks are missing');
-    await act(async () => firstCancel());
+    expect(firstCancel).toEqual(expect.any(Function));
+    expect(firstDismiss).toEqual(expect.any(Function));
+    await act(async () => firstCancel!());
 
     await fireEvent.press(row());
-    const secondCall = alertSpy.mock.calls[alertSpy.mock.calls.length - 1];
+    const secondCall = latestAlertCall();
     const secondButtons = secondCall[2] as { text?: string; onPress?: () => void }[];
     const secondConfirm = secondButtons.find(
       (button) => button.text === t('retake.confirm'),
     )?.onPress;
-    if (!secondConfirm) throw new Error('Second confirmation callback is missing');
+    expect(secondConfirm).toEqual(expect.any(Function));
 
     await act(async () => {
-      firstDismiss();
-      secondConfirm();
+      firstDismiss!();
+      secondConfirm!();
       await Promise.resolve();
     });
 
@@ -2773,7 +2801,7 @@ describe('retake placement test', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
     await pressAlertButton(t('retake.confirm'));
 
-    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('error.serverBusy'));
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
@@ -3350,13 +3378,10 @@ describe('settings async race fences', () => {
   it('makes every retake Alert callback inert after unmount', async () => {
     const view = await renderSettings();
     await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
-    const alertCalls = alertSpy.mock.calls;
-    const buttons = alertCalls[alertCalls.length - 1]?.[2] as
-      { text?: string; onPress?: () => void }[] | undefined;
+    const buttons = latestAlertButtons();
     const cancel = buttons?.find((button) => button.text === t('common.cancel'))?.onPress;
     const confirm = buttons?.find((button) => button.text === t('retake.confirm'))?.onPress;
-    const options = alertCalls[alertCalls.length - 1]?.[3] as
-      { onDismiss?: () => void } | undefined;
+    const options = latestAlertCall()[3] as { onDismiss?: () => void } | undefined;
     expect(cancel).toEqual(expect.any(Function));
     expect(confirm).toEqual(expect.any(Function));
     await view.unmount();
@@ -3560,6 +3585,7 @@ describe('settings async race fences', () => {
   it.each([
     ['blank', '   '],
     ['overlong', 'a'.repeat(MAX_NAME_LENGTH + 1)],
+    ['astral-overlong', '😀'.repeat(51)],
     ['canonical', USER.name],
   ])('revalidates a same-frame %s draft before PATCH', async (_label, unsafeDraft) => {
     mockUpdateProfile.mockResolvedValue({ ...USER, name: 'Ada King' });
@@ -3906,11 +3932,9 @@ describe('settings async race fences', () => {
     mockRestartDiagnostic.mockResolvedValue(undefined);
     const { rerenderSettings } = await renderSettings();
     await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
-    const alertCalls = alertSpy.mock.calls;
-    const buttons = alertCalls[alertCalls.length - 1]?.[2] as
-      { text?: string; onPress?: () => void }[] | undefined;
+    const buttons = latestAlertButtons();
     const confirm = buttons?.find((button) => button.text === t('retake.confirm'))?.onPress;
-    if (!confirm) throw new Error('Retake confirm callback was not registered');
+    expect(confirm).toEqual(expect.any(Function));
 
     const setUser = mockAuthValue.setUser;
     mockAuthValue = makeAuth({
@@ -3927,7 +3951,7 @@ describe('settings async race fences', () => {
       screen.getByRole('button', { name: t('settings.retake') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
     mockSetOptions.mockClear();
-    await act(async () => confirm());
+    await act(async () => confirm!());
 
     expect(mockRestartDiagnostic).not.toHaveBeenCalled();
     expect(mockSetOptions).not.toHaveBeenCalled();
@@ -3976,17 +4000,16 @@ describe('settings async race fences', () => {
     mockRestartDiagnostic.mockResolvedValue(undefined);
     await renderSettings();
     await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
-    const alertCalls = alertSpy.mock.calls;
-    const buttons = alertCalls[alertCalls.length - 1]?.[2] as
-      { text?: string; onPress?: () => void }[] | undefined;
+    const buttons = latestAlertButtons();
     const cancel = buttons?.find((button) => button.text === t('common.cancel'))?.onPress;
     const confirm = buttons?.find((button) => button.text === t('retake.confirm'))?.onPress;
-    if (!cancel || !confirm) throw new Error('Retake confirmation callbacks were not registered');
+    expect(cancel).toEqual(expect.any(Function));
+    expect(confirm).toEqual(expect.any(Function));
     mockSetOptions.mockClear();
 
     await act(async () => {
-      cancel();
-      confirm();
+      cancel!();
+      confirm!();
       await Promise.resolve();
     });
 

@@ -777,6 +777,17 @@ describe('login screen', () => {
     expect(mockAuthValue.login).toHaveBeenCalledWith('ada@example.com', 'password1');
   });
 
+  it('preserves an opaque legacy password even when it fails the new-password policy', async () => {
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', ' old ');
+
+    expect(logInButton().props.accessibilityState.disabled).toBe(false);
+    await fireEvent.press(logInButton());
+
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(mockAuthValue.login).toHaveBeenCalledWith('ada@example.com', ' old ');
+  });
+
   it('shows the busy state while the login request is in flight', async () => {
     const login = deferred<User>();
     mockAuthValue.login = jest.fn(() => login.promise);
@@ -1193,6 +1204,8 @@ describe('signup screen', () => {
     const telugu = screen.getByLabelText('Telugu, తెలుగు');
     const spanish = screen.getByLabelText('Spanish, Español');
 
+    expect(telugu.props.accessibilityRole).toBe('button');
+    expect(spanish.props.accessibilityRole).toBe('button');
     expect(telugu.props.accessibilityState).toEqual({ selected: false });
     expect(spanish.props.accessibilityState).toEqual({ selected: false });
     expect(flattenedStyle(telugu)).toMatchObject({
@@ -1280,6 +1293,17 @@ describe('signup screen', () => {
     await fillSignup('n'.repeat(MAX_NAME_LENGTH + 1), 'ada@example.com', 'password1', 'te');
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
     await fillSignup('Ada', 'e'.repeat(MAX_EMAIL_LENGTH + 1), 'password1', 'te');
+    expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
+  });
+
+  it('measures the name limit in UTF-16 code units like the server contract', async () => {
+    await render(<SignupScreen />);
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+
+    await fillSignup('😀'.repeat(50), 'ada@example.com', 'password1', 'te');
+    expect(signUpButton('te').props.accessibilityState.disabled).toBe(false);
+
+    await fillSignup('😀'.repeat(51), 'ada@example.com', 'password1', 'te');
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
   });
 
@@ -1486,6 +1510,21 @@ describe('signup screen', () => {
       'Ada',
       'ada@example.com',
       'password1',
+      'es',
+    );
+  });
+
+  it('preserves leading and trailing whitespace in a new password', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', ' Password1 ');
+    await fireEvent.press(screen.getByLabelText('Spanish, Español'));
+    await fireEvent.press(signUpButton('es'));
+
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(mockAuthValue.register).toHaveBeenCalledWith(
+      'Ada',
+      'ada@example.com',
+      ' Password1 ',
       'es',
     );
   });

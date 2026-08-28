@@ -976,6 +976,38 @@ describe('apiFetch', () => {
     removeSpy.mockRestore();
   });
 
+  it('preserves the caller abort when response-stream cancellation rejects', async () => {
+    const caller = new AbortController();
+    const reason = new Error('learner left while the body was open');
+    const jsonStarted = deferred<void>();
+    const jsonBody = deferred<unknown>();
+    const cancel = jest.fn(() => Promise.reject(new Error('stream cancellation failed')));
+    fetchMock.mockResolvedValueOnce({
+      ...fakeResponse({
+        json: () => {
+          jsonStarted.resolve();
+          return jsonBody.promise;
+        },
+      }),
+      body: { cancel },
+    } as unknown as Response);
+
+    const request = catchAsync(
+      api.apiFetch('/body-abort-with-failed-cleanup', {
+        signal: caller.signal,
+        timeoutMs: 60_000,
+      }),
+    );
+    await expectBarrierBeforeSettlement(jsonStarted.promise, request);
+    caller.abort(reason);
+    jsonBody.resolve({ late: true });
+
+    await expect(request).resolves.toBe(reason);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
   it('does not start reading a body after a pre-aborted fetch resolves headers', async () => {
     const caller = new AbortController();
     const reason = new Error('cancelled before headers');
@@ -2117,6 +2149,66 @@ describe('apiUploadAudio', () => {
       ),
     ).rejects.toBe(reason);
     expect(onRequestStarted).not.toHaveBeenCalled();
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
+  });
+
+  it('forwards a pre-aborted signal to the local web recording fetch', async () => {
+    mockPlatform.OS = 'web';
+    const caller = new AbortController();
+    const reason = new Error('cancelled before reading the browser recording');
+    const platformFailure = new Error('browser fetch observed cancellation');
+    caller.abort(reason);
+    fetchMock.mockRejectedValueOnce(platformFailure);
+
+    await expect(
+      api.apiUploadAudio(
+        '/practice/attempt',
+        'blob:https://app/audio-1',
+        {},
+        { signal: caller.signal },
+      ),
+    ).rejects.toBe(platformFailure);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].signal).toBeInstanceOf(AbortSignal);
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
+  });
+
+  it('aborts a pending local web recording-body read before the direct API upload', async () => {
+    mockPlatform.OS = 'web';
+    const caller = new AbortController();
+    const reason = new Error('screen left while reading the direct-upload recording');
+    const blobStarted = deferred<void>();
+    const blobBody = deferred<Blob>();
+    const cancel = jest.fn(async () => undefined);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      blob: () => {
+        blobStarted.resolve();
+        return blobBody.promise;
+      },
+      body: { cancel },
+    } as unknown as Response);
+
+    const upload = catchAsync(
+      api.apiUploadAudio(
+        '/practice/attempt',
+        'blob:https://app/audio-1',
+        {},
+        { signal: caller.signal },
+      ),
+    );
+    await expectBarrierBeforeSettlement(blobStarted.promise, upload);
+    caller.abort(reason);
+    blobBody.resolve(new Blob(['late audio'], { type: 'audio/webm' }));
+
+    await expect(upload).resolves.toBe(reason);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it('reports 401 uploads to the unauthorized handler', async () => {
@@ -2938,6 +3030,103 @@ describe('apiPostPresignedAudio', () => {
     ).rejects.toMatchObject({ status: 403 });
   });
 
+  it('aborts a pending browser recording-body read before posting to S3', async () => {
+    mockPlatform.OS = 'web';
+    const caller = new AbortController();
+    const reason = new Error('screen left while reading the browser recording');
+    const blobStarted = deferred<void>();
+    const blobBody = deferred<Blob>();
+    const cancel = jest.fn(async () => undefined);
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      blob: () => {
+        blobStarted.resolve();
+        return blobBody.promise;
+      },
+      body: { cancel },
+    } as unknown as Response);
+
+    const upload = catchAsync(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        { ...uploadFields, 'Content-Type': 'audio/webm' },
+        'blob:https://app/audio-1',
+        'audio/webm',
+        maxBytes,
+        { signal: caller.signal },
+      ),
+    );
+    await expectBarrierBeforeSettlement(blobStarted.promise, upload);
+    caller.abort(reason);
+    blobBody.resolve(new Blob(['late audio'], { type: 'audio/webm' }));
+
+    await expect(upload).resolves.toBe(reason);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('forwards a pre-aborted signal to the browser recording fetch for an S3 upload', async () => {
+    mockPlatform.OS = 'web';
+    const caller = new AbortController();
+    const reason = new Error('cancelled before the S3 handoff read');
+    const platformFailure = new Error('browser fetch observed cancellation');
+    caller.abort(reason);
+    fetchMock.mockRejectedValueOnce(platformFailure);
+
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        { ...uploadFields, 'Content-Type': 'audio/webm' },
+        'blob:https://app/audio-1',
+        'audio/webm',
+        maxBytes,
+        { signal: caller.signal },
+      ),
+    ).rejects.toBe(platformFailure);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
+  });
+
+  it('forwards caller cancellation to the final browser S3 POST', async () => {
+    mockPlatform.OS = 'web';
+    const caller = new AbortController();
+    const reason = new Error('cancelled during the S3 POST');
+    const platformFailure = new Error('S3 transport observed cancellation');
+    const postStarted = deferred<void>();
+    const postTransport = deferred<Response>();
+    const body = new Blob(['web-audio'], { type: 'audio/webm' });
+    fetchMock
+      .mockResolvedValueOnce({ ok: true, status: 200, blob: async () => body } as Response)
+      .mockImplementationOnce((_url, init?: RequestInit) => {
+        postStarted.resolve();
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+        return postTransport.promise;
+      });
+
+    const upload = api.apiPostPresignedAudio(
+      uploadUrl,
+      { ...uploadFields, 'Content-Type': 'audio/webm' },
+      'blob:https://app/audio-1',
+      'audio/webm',
+      maxBytes,
+      { signal: caller.signal },
+    );
+    const outcome = catchAsync(upload);
+    await expectBarrierBeforeSettlement(postStarted.promise, upload);
+    const postSignal = fetchMock.mock.calls[1][1].signal as AbortSignal;
+    caller.abort(reason);
+    const signalWasAborted = postSignal.aborted;
+    const forwardedReason = postSignal.reason;
+    postTransport.reject(platformFailure);
+
+    await expect(outcome).resolves.toBe(platformFailure);
+    expect(signalWasAborted).toBe(true);
+    expect(forwardedReason).toBe(reason);
+  });
+
   it('never sends X-Client-Version to S3 — presigned POSTs go to AWS, not our API', async () => {
     mockVersion.value = '1.0.0';
     mockPlatform.OS = 'web';
@@ -3539,7 +3728,7 @@ describe('typed endpoint helpers', () => {
     await api.saveToken('secret-token');
     fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
 
-    await api.apiResetPassword('ada@example.com', 'abcdef123456', 'NewPass123');
+    await api.apiResetPassword('ada@example.com', 'abcdef123456', ' NewPass123 ');
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('http://localhost:4000/auth/reset-password');
     expect(init.method).toBe('POST');
@@ -3547,7 +3736,7 @@ describe('typed endpoint helpers', () => {
       JSON.stringify({
         email: 'ada@example.com',
         token: 'abcdef123456',
-        newPassword: 'NewPass123',
+        newPassword: ' NewPass123 ',
       }),
     );
     expect(init.headers).not.toHaveProperty('Authorization');
@@ -3792,6 +3981,11 @@ describe('typed endpoint helpers', () => {
       (signal: AbortSignal) => api.apiGetPracticeHistory(undefined, signal),
     ],
     ['apiGetRecordings', (signal: AbortSignal) => api.apiGetRecordings(undefined, signal)],
+    [
+      'apiGetRecordingPlaybackGrant',
+      (signal: AbortSignal) => api.apiGetRecordingPlaybackGrant(recordingId, signal),
+    ],
+    ['apiDeleteRecording', (signal: AbortSignal) => api.apiDeleteRecording(recordingId, signal)],
     [
       'apiConsumeUserDataPages',
       (signal: AbortSignal) => api.apiConsumeUserDataPages(jest.fn(), signal),

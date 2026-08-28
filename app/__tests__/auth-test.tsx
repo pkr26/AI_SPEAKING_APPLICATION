@@ -370,12 +370,12 @@ describe('login', () => {
 
     let loggedIn: User | undefined;
     await act(async () => {
-      loggedIn = await auth!.login('a@example.com', 'secret1');
+      loggedIn = await auth!.login('a@example.com', ' secret1 ');
     });
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/login', {
       method: 'POST',
-      body: { email: 'a@example.com', password: 'secret1' },
+      body: { email: 'a@example.com', password: ' secret1 ' },
       auth: false,
       expireSessionOn401: false,
     });
@@ -437,7 +437,7 @@ describe('register', () => {
 
     let registered: User | undefined;
     await act(async () => {
-      registered = await auth!.register('Test User', 'a@example.com', 'secret1', 'hi');
+      registered = await auth!.register('Test User', 'a@example.com', ' secret1 ', 'hi');
     });
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/register', {
@@ -445,7 +445,7 @@ describe('register', () => {
       body: {
         name: 'Test User',
         email: 'a@example.com',
-        password: 'secret1',
+        password: ' secret1 ',
         nativeLanguage: 'hi',
       },
       auth: false,
@@ -872,12 +872,12 @@ describe('changePassword', () => {
     mockedApiFetch.mockResolvedValueOnce(authResponse('tok-rotated'));
 
     await act(async () => {
-      await auth!.changePassword('secret1', 'secret2');
+      await auth!.changePassword(' secret1 ', ' Secret2 ');
     });
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/change-password', {
       method: 'POST',
-      body: { currentPassword: 'secret1', newPassword: 'secret2' },
+      body: { currentPassword: ' secret1 ', newPassword: ' Secret2 ' },
       expireSessionOn401: false,
     });
     expect(mockedSaveToken).toHaveBeenCalledWith('tok-rotated');
@@ -1026,12 +1026,12 @@ describe('deleteAccount', () => {
     mockedApiFetch.mockResolvedValueOnce(undefined);
 
     await act(async () => {
-      await auth!.deleteAccount('secret1');
+      await auth!.deleteAccount(' secret1 ');
     });
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/account', {
       method: 'DELETE',
-      body: { password: 'secret1' },
+      body: { password: ' secret1 ' },
       expireSessionOn401: false,
       expectedStatus: 204,
     });

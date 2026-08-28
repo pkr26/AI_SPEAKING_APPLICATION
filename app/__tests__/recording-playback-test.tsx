@@ -271,6 +271,17 @@ function rawButtonHandler(accessibilityLabel: string): () => void {
   return fiber.memoizedProps.onPress as () => void;
 }
 
+type AlertAction = { style?: string; onPress?: () => void };
+
+function alertActions(callIndex = 0): AlertAction[] {
+  expect(Alert.alert).toHaveBeenCalled();
+  const call = asMock(Alert.alert).mock.calls.at(callIndex);
+  expect(call).toBeDefined();
+  const actions = call?.[2];
+  expect(actions).toEqual(expect.any(Array));
+  return actions as AlertAction[];
+}
+
 beforeEach(async () => {
   await stopActivePlayback();
   leaseCurrent = true;
@@ -746,10 +757,7 @@ describe('RecordingPlayback', () => {
     expect(screen.getByText(t('recorder.play'))).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
 
@@ -1035,10 +1043,7 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback();
     const staleConfirm = rawButtonHandler(t('recordings.deleteAction'));
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const staleActions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const staleActions = alertActions();
     const staleDestroy = staleActions.find((action) => action.style === 'destructive')?.onPress;
     await view.rerender(
       <QueryClientProvider client={view.queryClient}>
@@ -1052,10 +1057,7 @@ describe('RecordingPlayback', () => {
     expect(apiDeleteRecording).not.toHaveBeenCalled();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
     expect(Alert.alert).toHaveBeenCalledTimes(2);
-    const currentActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const currentActions = alertActions(-1);
     await act(async () =>
       currentActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1066,10 +1068,7 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback();
     const staleConfirm = rawButtonHandler(t('recordings.deleteAction'));
     await act(async () => staleConfirm());
-    const modalActions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const modalActions = alertActions();
     const staleDestroy = modalActions.find((action) => action.style === 'destructive')?.onPress;
     await act(async () => focusRegistrations[0].cleanup?.());
 
@@ -1519,10 +1518,7 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback({ onDeleted });
     const cancelQueries = jest.spyOn(view.queryClient, 'cancelQueries');
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     const deleteSignal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
 
@@ -1540,10 +1536,7 @@ describe('RecordingPlayback', () => {
     asMock(apiDeleteRecording).mockRejectedValue(new ApiError(503, 'busy'));
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
     const alert = screen.getByTestId('recording-playback-error');
@@ -1562,10 +1555,7 @@ describe('RecordingPlayback', () => {
       .mockResolvedValueOnce(undefined);
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const firstActions = alertActions();
     await act(async () =>
       firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1583,10 +1573,7 @@ describe('RecordingPlayback', () => {
     await refocus();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
     expect(Alert.alert).toHaveBeenCalledTimes(3);
-    const retryActions = asMock(Alert.alert).mock.calls[2][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const retryActions = alertActions(2);
     await act(async () =>
       retryActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1600,10 +1587,7 @@ describe('RecordingPlayback', () => {
     asMock(apiDeleteRecording).mockReturnValue(pending.promise);
     await renderPlayback({ onDeleted });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     leaseCurrent = false;
     await act(async () => pending.resolve());
@@ -1617,10 +1601,7 @@ describe('RecordingPlayback', () => {
     asMock(apiDeleteRecording).mockReturnValue(pending.promise);
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     const destroy = actions.find((action) => action.style === 'destructive')?.onPress;
 
     await act(async () => {
@@ -1643,11 +1624,7 @@ describe('RecordingPlayback', () => {
       t('recordings.deleteBody'),
       expect.any(Array),
     );
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      text: string;
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions() as (AlertAction & { text: string })[];
     expect(actions.map(({ text, style }) => ({ text, style }))).toEqual([
       { text: t('common.cancel'), style: 'cancel' },
       { text: t('recordings.deleteAction'), style: 'destructive' },
@@ -1663,10 +1640,7 @@ describe('RecordingPlayback', () => {
     const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
     const retainedConfirm = rawButtonHandler(t('recordings.deleteAction'));
     await act(async () => retainedConfirm());
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(1));
 
@@ -1704,10 +1678,7 @@ describe('RecordingPlayback', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     const playbackSignal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     expect(playbackSignal.aborted).toBe(true);
     expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
@@ -1726,10 +1697,7 @@ describe('RecordingPlayback', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(players).toHaveLength(1));
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     expect(players[0].listenerRemove).toHaveBeenCalledTimes(1);
     expect(players[0].pause).toHaveBeenCalledTimes(1);
@@ -1748,10 +1716,7 @@ describe('RecordingPlayback', () => {
     await renderPlayback();
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const firstActions = alertActions();
     await act(async () =>
       firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1763,10 +1728,7 @@ describe('RecordingPlayback', () => {
       focusRegistrations[0].cleanup = typeof nextCleanup === 'function' ? nextCleanup : null;
     });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const secondActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const secondActions = alertActions(-1);
     await act(async () =>
       secondActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1786,10 +1748,7 @@ describe('RecordingPlayback', () => {
     const view = await renderPlayback({ onDeleted });
     const cancelQueries = jest.spyOn(view.queryClient, 'cancelQueries');
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await act(async () => focusRegistrations[0].cleanup?.());
     await refocus();
@@ -1820,10 +1779,7 @@ describe('RecordingPlayback', () => {
     });
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(cancelQueries).toHaveBeenCalledTimes(2));
     await act(async () => focusRegistrations[0].cleanup?.());
@@ -1849,10 +1805,7 @@ describe('RecordingPlayback', () => {
       .mockReturnValueOnce(second.promise);
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const firstActions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const firstActions = alertActions();
     await act(async () =>
       firstActions.find((action) => action.style === 'destructive')?.onPress?.(),
     );
@@ -1860,10 +1813,7 @@ describe('RecordingPlayback', () => {
     await refocus();
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const secondActions = asMock(Alert.alert).mock.calls.at(-1)?.[2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const secondActions = alertActions(-1);
     const secondDestroy = secondActions.find((action) => action.style === 'destructive')?.onPress;
     await act(async () => secondDestroy?.());
     expect(apiDeleteRecording).toHaveBeenCalledTimes(2);
@@ -2017,10 +1967,7 @@ describe('RecordingPlayback', () => {
       t('recordings.deleteBodyNamed', { name: 'courage' }),
       expect.any(Array),
     );
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() =>
       expect(apiDeleteRecording).toHaveBeenCalledWith(RECORDING_ID, expect.any(AbortSignal)),
@@ -2074,10 +2021,7 @@ describe('RecordingPlayback', () => {
       </QueryClientProvider>,
     );
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(current).toHaveBeenCalledWith(RECORDING_ID));
     expect(stale).not.toHaveBeenCalled();
@@ -2090,10 +2034,7 @@ describe('RecordingPlayback', () => {
     asMock(apiDeleteRecording).mockReturnValue(deletion.promise);
     const view = await renderPlayback({ recordingStatus: 'available', onDeleted: stale });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     const signal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
 
@@ -2132,10 +2073,7 @@ describe('RecordingPlayback', () => {
     const onDeleted = jest.fn();
     const view = await renderPlayback({ recordingStatus: 'available', onDeleted });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
     expect(onDeleted).toHaveBeenCalledTimes(1);
@@ -2167,10 +2105,7 @@ describe('RecordingPlayback', () => {
     });
     await renderPlayback({ onDeleted });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
 
     await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
@@ -2188,10 +2123,7 @@ describe('RecordingPlayback', () => {
     });
     await renderPlayback({ onDeleted });
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await flushMicrotasks();
 
@@ -2211,10 +2143,7 @@ describe('RecordingPlayback', () => {
     );
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
-    const actions = asMock(Alert.alert).mock.calls[0][2] as {
-      style?: string;
-      onPress?: () => void;
-    }[];
+    const actions = alertActions();
     await act(async () => actions.find((action) => action.style === 'destructive')?.onPress?.());
     await waitFor(() =>
       expect(apiDeleteRecording).toHaveBeenCalledWith(OTHER_RECORDING_ID, expect.any(AbortSignal)),

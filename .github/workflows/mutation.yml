@@ -148,3 +148,43 @@ jobs:
           path: app/reports/mutation/
           if-no-files-found: warn
           retention-days: 30
+
+  # JSX callback disconnection and accessibility-attribute removal are
+  # independent strict campaigns. Matrix jobs keep either report available if
+  # the other campaign fails or times out.
+  app-jsx-attributes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - campaign: event-handling
+            command: mutation:event-handling
+            report-directory: event-handling
+          - campaign: accessibility
+            command: mutation:accessibility
+            report-directory: accessibility-attributes
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - run: npm ci
+      - name: Run ${{ matrix.campaign }} mutation campaign
+        run: npm run ${{ matrix.command }}
+      - name: Upload ${{ matrix.campaign }} mutation report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: app-${{ matrix.campaign }}-mutation-report
+          path: app/reports/mutation/${{ matrix.report-directory }}/
+          if-no-files-found: warn
+          retention-days: 30

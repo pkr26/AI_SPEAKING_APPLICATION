@@ -103,12 +103,7 @@ export default function ForgotPasswordScreen() {
             }
             style={styles.submitButton}
           />
-          <Link
-            href="/login"
-            accessibilityState={{ disabled: busy }}
-            onPress={blockLinkWhileBusy}
-            style={styles.footerLink}
-          >
+          <Link href="/login" style={styles.footerLink}>
             {t('reset.backToLogin')}
           </Link>
         </ScrollView>

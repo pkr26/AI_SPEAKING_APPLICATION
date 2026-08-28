@@ -333,17 +333,23 @@ describe('recordings library', () => {
       }),
     );
     const loading = await renderRecordings();
-    expect(screen.getByText(t('recordings.loading'))).toBeTruthy();
+    expect(screen.getByText(t('recordings.loading')).props.accessibilityLiveRegion).toBe('polite');
     expect(screen.getByLabelText(t('recordings.loading'))).toBeTruthy();
     resolve({ items: [], nextCursor: null });
-    await waitFor(() => expect(screen.getByText(t('recordings.emptyTitle'))).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByText(t('recordings.emptyTitle')).props.accessibilityRole).toBe('header'),
+    );
     expect(screen.getByText(t('recordings.emptyBody'))).toBeTruthy();
     await loading.unmount();
 
     asMock(apiGetRecordings).mockRejectedValueOnce(new Error('internal detail'));
     const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     await renderRecordings();
-    await waitFor(() => expect(screen.getByText(t('recordings.loadFailedTitle'))).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByText(t('recordings.loadFailedTitle')).props.accessibilityRole).toBe(
+        'header',
+      ),
+    );
     expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
     asMock(apiGetRecordings).mockResolvedValueOnce({ items: [], nextCursor: null });
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
@@ -374,6 +380,7 @@ describe('recordings library', () => {
     const refetch = jest.spyOn(InfiniteQueryObserver.prototype, 'refetch');
     await renderRecordings();
     await waitFor(() => expect(screen.getByText('courage')).toBeTruthy());
+    expect(screen.getByText('courage').props.accessibilityRole).toBe('header');
     expect(screen.getByText(t('recordings.contextNative'))).toBeTruthy();
     expect(screen.getByText(t('recordings.contextDiagnostic'))).toBeTruthy();
     expect(screen.getByText(t('recordings.contextPractice'))).toBeTruthy();
@@ -473,7 +480,11 @@ describe('recordings library', () => {
     const list = asMock(FlatList).mock.calls.at(-1)?.[0];
     await act(async () => list.onEndReached());
     await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByText(t('recordings.loadingMore'))).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.getByText(t('recordings.loadingMore')).props.accessibilityLiveRegion).toBe(
+        'polite',
+      ),
+    );
     await act(async () => list.onEndReached());
     expect(apiGetRecordings).toHaveBeenCalledTimes(2);
     expect(refetch).not.toHaveBeenCalled();

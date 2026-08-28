@@ -388,7 +388,10 @@ function pendingRecord(overrides: Partial<PendingAssessment> = {}): PendingAsses
   };
 }
 
-type SentinelRecorderProps = React.ComponentProps<typeof Recorder>;
+type SentinelRecorderProps = Extract<
+  React.ComponentProps<typeof Recorder>,
+  { onResult: (data: unknown) => void }
+>;
 
 function props(overrides: Partial<SentinelRecorderProps> = {}): SentinelRecorderProps {
   return {

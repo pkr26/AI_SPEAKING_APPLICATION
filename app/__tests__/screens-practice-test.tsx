@@ -11,6 +11,7 @@ import AttemptScreen from '../src/app/practice/attempt';
 import FeedbackScreen from '../src/app/practice/feedback';
 import HelpScreen from '../src/app/practice/help';
 import PracticeScreen from '../src/app/practice/index';
+import type { RecorderResultMetadata } from '../src/components/Recorder';
 import RecordingPlayback from '../src/components/RecordingPlayback';
 import { ApiError, apiFetch, apiSkipPracticeWord } from '../src/lib/api';
 import { LogoutCleanupError, useAuth, type SessionLease } from '../src/lib/auth';
@@ -129,7 +130,7 @@ interface CapturedRecorderProps {
   isStartBlocked?: () => boolean;
   endpoint: string;
   parseResult: (data: unknown) => PracticeOutcome;
-  onResult: (data: PracticeOutcome) => void;
+  onResult: (data: PracticeOutcome, metadata?: RecorderResultMetadata) => void;
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
@@ -139,6 +140,11 @@ interface CapturedRecorderProps {
   ) => boolean;
 }
 
+interface MockRecorderProps extends Omit<CapturedRecorderProps, 'onResult'> {
+  onResult?: (data: PracticeOutcome, metadata?: RecorderResultMetadata) => void;
+  onResultWithMetadata?: (data: PracticeOutcome, metadata: RecorderResultMetadata) => void;
+}
+
 let mockRecorderProps: CapturedRecorderProps | null = null;
 let mockRecorderInstanceSerial = 0;
 let mockRecorderMounts: number[] = [];
@@ -146,7 +152,7 @@ let mockRecorderUnmounts: number[] = [];
 
 // A host node stands in for the real recorder so tests can reach the slot the
 // screens reserve for it (`styles.recorderArea`) the same way a user's eye does.
-function MockRecorder(props: CapturedRecorderProps) {
+function MockRecorder(props: MockRecorderProps) {
   const instanceRef = React.useRef<number | null>(null);
   if (instanceRef.current === null) instanceRef.current = ++mockRecorderInstanceSerial;
   React.useEffect(() => {
@@ -157,7 +163,14 @@ function MockRecorder(props: CapturedRecorderProps) {
     };
   }, []);
   React.useEffect(() => {
-    mockRecorderProps = props;
+    const defaultResultMetadata = { requestId: `mock-request-${instanceRef.current!}` };
+    mockRecorderProps = {
+      ...props,
+      onResult: (data, metadata = defaultResultMetadata) => {
+        if (props.onResultWithMetadata) props.onResultWithMetadata(data, metadata);
+        else props.onResult?.(data, metadata);
+      },
+    };
   });
   return <View testID="recorder" />;
 }
@@ -1054,6 +1067,73 @@ describe('practice home screen', () => {
     expect(mockRouter.push).toHaveBeenCalledTimes(1);
   });
 
+  it('accepts a distinct second attempt after refocus and rejects request replays', async () => {
+    const firstMiss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'My first answer.',
+      feedback: 'Add more detail.',
+    };
+    const secondMiss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 2,
+      attemptsLeft: 1,
+      score: 52,
+      transcript: 'My second answer.',
+      feedback: 'Add one specific example.',
+    };
+    const firstMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440101' };
+    const secondMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440102' };
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+
+    await act(async () => recorderProps().onResult(firstMiss, firstMetadata));
+    await blurScreen();
+    await focusScreen();
+    await act(async () => {
+      const callbacks = recorderProps();
+      callbacks.onResult(firstMiss, firstMetadata);
+      callbacks.onResult(secondMiss, secondMetadata);
+    });
+    await blurScreen();
+    await focusScreen();
+    await act(async () => recorderProps().onResult(secondMiss, secondMetadata));
+
+    expect(mockRecorderMounts).toHaveLength(1);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(2);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(1, QUESTION.id, firstMiss);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(2, QUESTION.id, secondMiss);
+    expect(mockRouter.push).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds handled practice request IDs while retaining the newest duplicates', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const requestIds = Array.from(
+      { length: 9 },
+      (_, index) => `550e8400-e29b-41d4-a716-44665544011${index}`,
+    );
+
+    for (const requestId of requestIds) {
+      await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId }));
+      await blurScreen();
+      await focusScreen();
+    }
+    await act(async () =>
+      recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[requestIds.length - 1]! }),
+    );
+    await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[0]! }));
+
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(10);
+    expect(mockRouter.push).toHaveBeenCalledTimes(10);
+  });
+
   it.each(['blur', 'session lease'] as const)(
     'drops every queued recorder continuation after %s ownership is lost',
     async (boundary) => {
@@ -1894,6 +1974,75 @@ describe('practice attempt screen', () => {
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(1);
     expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(QUESTION.id, PASSED_RESULT);
     expect(mockRouter.push).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a distinct second Practice Mode attempt after refocus and rejects replays', async () => {
+    const firstMiss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'My first answer.',
+      feedback: 'Add more detail.',
+    };
+    const secondMiss: AttemptResult = {
+      passed: false,
+      mastered: false,
+      attemptNo: 2,
+      attemptsLeft: 1,
+      score: 52,
+      transcript: 'My second answer.',
+      feedback: 'Add one specific example.',
+    };
+    const firstMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440201' };
+    const secondMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440202' };
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+
+    await act(async () => recorderProps().onResult(firstMiss, firstMetadata));
+    await blurScreen();
+    await focusScreen();
+    await act(async () => {
+      const callbacks = recorderProps();
+      callbacks.onResult(firstMiss, firstMetadata);
+      callbacks.onResult(secondMiss, secondMetadata);
+    });
+    await blurScreen();
+    await focusScreen();
+    await act(async () => recorderProps().onResult(secondMiss, secondMetadata));
+
+    expect(mockRecorderMounts).toHaveLength(1);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(2);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(1, QUESTION.id, firstMiss);
+    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(2, QUESTION.id, secondMiss);
+    expect(mockRouter.push).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds handled Practice Mode request IDs while retaining newest duplicates', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<AttemptScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const requestIds = Array.from(
+      { length: 9 },
+      (_, index) => `550e8400-e29b-41d4-a716-44665544021${index}`,
+    );
+
+    for (const requestId of requestIds) {
+      await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId }));
+      await blurScreen();
+      await focusScreen();
+    }
+    await act(async () =>
+      recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[requestIds.length - 1]! }),
+    );
+    await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[0]! }));
+
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(10);
+    expect(mockRouter.push).toHaveBeenCalledTimes(10);
   });
 
   it.each(['blur', 'session lease'] as const)(

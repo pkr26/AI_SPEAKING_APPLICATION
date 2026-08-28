@@ -5,7 +5,7 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'rea
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
-import Recorder from '../../components/Recorder';
+import Recorder, { type RecorderResultMetadata } from '../../components/Recorder';
 import { apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
@@ -21,6 +21,10 @@ import {
   type PracticeOutcome,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
+
+// Silence retries are unbounded, so retain only a small recent window while
+// still suppressing recovery replays for the current recorder owner.
+const MAX_HANDLED_RESULT_REQUEST_IDS = 8;
 
 export default function PracticeScreen() {
   const { user, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
@@ -51,7 +55,7 @@ export default function PracticeScreen() {
   const focusedRef = useRef(false);
   const activeRenderOwnerRef = useRef<string | null>(null);
   const activeRecorderOwnerRef = useRef<string | null>(null);
-  const resultClaimRef = useRef<string | null>(null);
+  const handledResultRequestIdsRef = useRef(new Set<string>());
   const recoveryRefreshRef = useRef<string | null>(null);
   // First-practice-visit one-shot explainer of the mastery rules. The stored
   // flag is keyed by account so a stale read from a previous session's user
@@ -121,7 +125,7 @@ export default function PracticeScreen() {
 
   useLayoutEffect(() => {
     activeRecorderOwnerRef.current = recorderOwner;
-    resultClaimRef.current = null;
+    handledResultRequestIdsRef.current = new Set();
     recoveryRefreshRef.current = null;
     recorderLockedRef.current = false;
   }, [recorderOwner]);
@@ -208,18 +212,21 @@ export default function PracticeScreen() {
     [publishNavigationLock, recorderOwner, recorderOwnsWork],
   );
 
-  const handleResult = (result: PracticeOutcome) => {
+  const handleResult = (result: PracticeOutcome, metadata: RecorderResultMetadata) => {
     const owner = recorderOwner;
     if (
       !user ||
       !question ||
       !recorderOwnsWork(owner) ||
       navigationStartedRef.current ||
-      resultClaimRef.current === owner
+      handledResultRequestIdsRef.current.has(metadata.requestId)
     ) {
       return;
     }
-    resultClaimRef.current = owner;
+    handledResultRequestIdsRef.current.add(metadata.requestId);
+    handledResultRequestIdsRef.current = new Set(
+      [...handledResultRequestIdsRef.current].slice(-MAX_HANDLED_RESULT_REQUEST_IDS),
+    );
     navigationStartedRef.current = true;
     void queryClient.cancelQueries({ queryKey: questionQueryKey, exact: true });
     setRateLimitNotice(null);
@@ -518,7 +525,7 @@ export default function PracticeScreen() {
                 isStartBlocked={() => skipBusyRef.current || logoutBusyRef.current}
                 endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
                 parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
-                onResult={handleResult}
+                onResultWithMetadata={handleResult}
                 onError={handleError}
                 onRateLimited={handleRateLimited}
                 onRecoveryUnresolved={handleRecoveryUnresolved}

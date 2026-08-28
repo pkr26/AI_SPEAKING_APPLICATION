@@ -89,6 +89,7 @@ import Recorder, {
   sleepAbortable,
   terminalEventQuarantineIndex,
   waitForForeground,
+  type RecorderResultMetadata,
 } from '../src/components/Recorder';
 import {
   ApiError,
@@ -663,6 +664,18 @@ async function renderRecorder(overrides: RecorderTestOverrides = {}) {
   await flushAct();
   await flushAct();
   expect(view.getByRole('button', { name: START_LABEL })).toBeTruthy();
+  return { view, props };
+}
+
+async function renderMetadataRecorder(overrides: RecorderTestOverrides = {}) {
+  const { onResult: legacyOnResult, ...baseProps } = recorderTestProps(overrides);
+  const onResultWithMetadata = jest.fn<void, [{ parsed: unknown }, RecorderResultMetadata]>();
+  const props = { ...baseProps, onResultWithMetadata };
+  const view = await render(<Recorder {...props} />);
+  await flushAct();
+  await flushAct();
+  expect(view.getByRole('button', { name: START_LABEL })).toBeTruthy();
+  expect(legacyOnResult).not.toHaveBeenCalled();
   return { view, props };
 }
 
@@ -2665,13 +2678,16 @@ describe('Recorder', () => {
         response: { score: 93 },
       });
 
-      const { props } = await renderRecorder();
+      const { props } = await renderMetadataRecorder();
 
       expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
         signal: expect.any(AbortSignal),
       });
-      expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 93 } });
+      expect(props.onResultWithMetadata).toHaveBeenCalledWith(
+        { parsed: { score: 93 } },
+        { requestId: REQUEST_ID },
+      );
     });
 
     it('stops announcing remaining time once the recording ends', async () => {
@@ -5761,7 +5777,7 @@ describe('Recorder', () => {
     it.each(['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const)(
       'uses Recorder endpoint %s for a fresh grant and direct durable submission',
       async (assessmentEndpoint) => {
-        const { props } = await renderRecorder({ endpoint: assessmentEndpoint });
+        const { props } = await renderMetadataRecorder({ endpoint: assessmentEndpoint });
         await recordAndStop();
 
         await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
@@ -5790,7 +5806,10 @@ describe('Recorder', () => {
           expect.objectContaining({ signal: expect.any(AbortSignal) }),
         );
         expect(props.parseResult).toHaveBeenCalledWith({ ok: true });
-        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } });
+        expect(props.onResultWithMetadata).toHaveBeenCalledWith(
+          { parsed: { ok: true } },
+          { requestId: REQUEST_ID },
+        );
         expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
         expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
         expect(deletedRecordingUris()).toContain(RECORDING_URI);
@@ -8957,13 +8976,16 @@ describe('Recorder', () => {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
       mockStartedApiFetchResultOnce({ score: 77 });
-      const { props } = await renderRecorder();
+      const { props } = await renderMetadataRecorder();
 
       // Do not race a possibly-started original POST on the first 404.
       expect(apiFetch).toHaveBeenCalledTimes(1);
       await advancePolls(5);
 
-      expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 77 } });
+      expect(props.onResultWithMetadata).toHaveBeenCalledWith(
+        { parsed: { score: 77 } },
+        { requestId: REQUEST_ID },
+      );
       expect(apiFetch).toHaveBeenNthCalledWith(1, `/assessments/${REQUEST_ID}`, {
         timeoutMs: 5000,
         signal: expect.any(AbortSignal),

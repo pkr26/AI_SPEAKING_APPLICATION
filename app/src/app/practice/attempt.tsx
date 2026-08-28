@@ -4,7 +4,7 @@ import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'exp
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../../components/Button';
-import Recorder from '../../components/Recorder';
+import Recorder, { type RecorderResultMetadata } from '../../components/Recorder';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
@@ -19,6 +19,10 @@ import {
   type PracticeOutcome,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
+
+// Silence retries are unbounded, so retain only a small recent window while
+// still suppressing recovery replays for the current recorder owner.
+const MAX_HANDLED_RESULT_REQUEST_IDS = 8;
 
 /**
  * Practice Mode: deliberately minimal — only the prompt word, the question,
@@ -46,7 +50,7 @@ export default function AttemptScreen() {
   const focusedRef = useRef(false);
   const navigationStartedRef = useRef(true);
   const activeRecorderOwnerRef = useRef<string | null>(null);
-  const resultClaimRef = useRef<string | null>(null);
+  const handledResultRequestIdsRef = useRef(new Set<string>());
   const recoveryExitRef = useRef<string | null>(null);
   const params = useLocalSearchParams<{ questionId?: string }>();
   const questionId = firstParam(params.questionId);
@@ -80,7 +84,7 @@ export default function AttemptScreen() {
 
   useLayoutEffect(() => {
     activeRecorderOwnerRef.current = recorderOwner;
-    resultClaimRef.current = null;
+    handledResultRequestIdsRef.current = new Set();
     recoveryExitRef.current = null;
     recorderLockedRef.current = false;
   }, [recorderOwner]);
@@ -163,18 +167,21 @@ export default function AttemptScreen() {
     [publishNavigationLock, recorderOwner, recorderOwnsWork],
   );
 
-  const handleResult = (result: PracticeOutcome) => {
+  const handleResult = (result: PracticeOutcome, metadata: RecorderResultMetadata) => {
     const owner = recorderOwner;
     if (
       !user ||
       !validQuestionId ||
       !recorderOwnsWork(owner) ||
       navigationStartedRef.current ||
-      resultClaimRef.current === owner
+      handledResultRequestIdsRef.current.has(metadata.requestId)
     ) {
       return;
     }
-    resultClaimRef.current = owner;
+    handledResultRequestIdsRef.current.add(metadata.requestId);
+    handledResultRequestIdsRef.current = new Set(
+      [...handledResultRequestIdsRef.current].slice(-MAX_HANDLED_RESULT_REQUEST_IDS),
+    );
     navigationStartedRef.current = true;
     void queryClient.cancelQueries({ queryKey: practiceQuestionKey, exact: true });
     setRateLimitNotice(null);
@@ -340,7 +347,7 @@ export default function AttemptScreen() {
           questionId={validQuestionId}
           endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
           parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
-          onResult={handleResult}
+          onResultWithMetadata={handleResult}
           onError={handleError}
           onRateLimited={handleRateLimited}
           onRecoveryUnresolved={handleRecoveryUnresolved}

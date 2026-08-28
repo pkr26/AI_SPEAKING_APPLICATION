@@ -62,7 +62,11 @@ import Button from './Button';
 
 export type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering';
 
-interface RecorderProps<T> {
+export interface RecorderResultMetadata {
+  requestId: string;
+}
+
+interface RecorderCommonProps<T> {
   ownerId: string;
   questionId: string;
   /** Externally disables recorder actions while a sibling mutation is active. */
@@ -72,7 +76,6 @@ interface RecorderProps<T> {
   /** Assessment endpoint that accepts audio + questionId + retry-stable requestId. */
   endpoint: AssessmentEndpoint;
   parseResult: (data: unknown) => T;
-  onResult: (data: T) => void;
   onError: (message: string) => void;
   /**
    * Rate/daily-limit rejections (HTTP 429) carry a localized "when can I try
@@ -87,6 +90,18 @@ interface RecorderProps<T> {
   /** Lets a screen restore the endpoint saved with an interrupted submission. */
   onRecoveryEndpointMismatch?: (endpoint: AssessmentEndpoint) => boolean;
 }
+
+type RecorderProps<T> = RecorderCommonProps<T> &
+  (
+    | {
+        onResult: (data: T) => void;
+        onResultWithMetadata?: never;
+      }
+    | {
+        onResult?: never;
+        onResultWithMetadata: (data: T, metadata: RecorderResultMetadata) => void;
+      }
+  );
 
 interface RecordingCompletion {
   status: RecordingStatus;
@@ -848,6 +863,7 @@ export default function Recorder<T>({
   endpoint,
   parseResult,
   onResult,
+  onResultWithMetadata,
   onError,
   onRateLimited,
   onRecoveryUnresolved,
@@ -988,8 +1004,17 @@ export default function Recorder<T>({
     onRecoveryEndpointMismatch,
     onRecoveryUnresolved,
     onResult,
+    onResultWithMetadata,
     parseResult,
   });
+  const deliverResult = useCallback((data: T, requestId: string) => {
+    const callbacks = callbacksRef.current;
+    if (callbacks.onResultWithMetadata) {
+      callbacks.onResultWithMetadata(data, { requestId });
+    } else {
+      callbacks.onResult?.(data);
+    }
+  }, []);
   const acquireAudioSession = useCallback(() => {
     const instanceId = instanceIdRef.current;
     if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) throw new Error();
@@ -1041,6 +1066,7 @@ export default function Recorder<T>({
       onRecoveryEndpointMismatch,
       onRecoveryUnresolved,
       onResult,
+      onResultWithMetadata,
       parseResult,
     };
   }, [
@@ -1052,6 +1078,7 @@ export default function Recorder<T>({
     onRecoveryEndpointMismatch,
     onRecoveryUnresolved,
     onResult,
+    onResultWithMetadata,
     parseResult,
   ]);
 
@@ -1885,7 +1912,7 @@ export default function Recorder<T>({
             }
             discardRecording();
             updatePhase('idle');
-            callbacksRef.current.onResult(data);
+            deliverResult(data, pending.requestId);
             void clearRequestTracking(pending.requestId);
             return;
           } else {
@@ -1993,7 +2020,7 @@ export default function Recorder<T>({
                 if (!isCurrent()) return;
                 discardRecording();
                 updatePhase('idle');
-                callbacksRef.current.onResult(data);
+                deliverResult(data, pending.requestId);
                 void clearRequestTracking(pending.requestId);
                 return;
               } catch (retryError) {
@@ -2132,6 +2159,7 @@ export default function Recorder<T>({
   }, [
     beginOperation,
     clearRequestTracking,
+    deliverResult,
     discardRecording,
     endOperation,
     endpoint,
@@ -2960,7 +2988,7 @@ export default function Recorder<T>({
       }
       if (!canContinueSubmission()) return;
       updatePhase('idle');
-      callbacksRef.current.onResult(data);
+      deliverResult(data, requestId);
       void clearRequestTracking(requestId);
     } catch (error) {
       if (controller.signal.aborted) {

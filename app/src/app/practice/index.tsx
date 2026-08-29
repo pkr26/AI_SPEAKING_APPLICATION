@@ -560,7 +560,15 @@ export default function PracticeScreen() {
     } catch (error) {
       if (error instanceof LogoutCleanupError) {
         Alert.alert(t('logout.cleanupTitle'), error.message);
-      } else if (renderOwnsWork()) {
+      } else if (
+        mountedRef.current &&
+        focusedRef.current &&
+        activeRenderOwnerRef.current === renderOwner &&
+        isSessionLeaseCurrent(sessionLease, { identityOnly: true })
+      ) {
+        // Auth intentionally invalidates the render lease while logout is in
+        // flight. A failed request rearms leases asynchronously, so reporting
+        // this same-identity failure must use the stable mounted identity.
         Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
         rearm = true;
       }

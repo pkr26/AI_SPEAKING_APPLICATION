@@ -4,7 +4,7 @@ import {
   QueryClientProvider,
   QueryObserver,
 } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 import React from 'react';
 import {
@@ -464,7 +464,10 @@ let attemptCycleSentinelPassed = false;
 
 function makeQueryClient() {
   const client = new QueryClient({
-    defaultOptions: { queries: { retry: false } },
+    // Tests own cache lifetime explicitly in afterEach. Disable TanStack's
+    // five-minute GC handles so query-key handoff cases cannot keep Jest alive
+    // after their observers have been unmounted and the cache was cleared.
+    defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
   queryClients.push(client);
   return client;
@@ -530,6 +533,29 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function abortableApiResult<T>(source: ReturnType<typeof deferred<T>>) {
+  return (_path: string, options?: { signal?: AbortSignal }) =>
+    new Promise<T>((resolve, reject) => {
+      const signal = options?.signal;
+      const abort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
+      if (signal?.aborted) {
+        abort();
+        return;
+      }
+      signal?.addEventListener('abort', abort, { once: true });
+      void source.promise.then(
+        (value) => {
+          signal?.removeEventListener('abort', abort);
+          resolve(value);
+        },
+        (error: unknown) => {
+          signal?.removeEventListener('abort', abort);
+          reject(error);
+        },
+      );
+    });
 }
 
 async function blurScreen(): Promise<void> {
@@ -676,6 +702,7 @@ afterEach(async () => {
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
+    await cleanup();
     for (const client of queryClients) client.clear();
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
@@ -697,7 +724,8 @@ describe('practice home screen', () => {
   });
 
   it('shows a loading state while the question loads', async () => {
-    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    const replacement = deferred<unknown>();
+    mockApiFetch.mockReturnValue(replacement.promise);
     await renderScreen(<PracticeScreen />);
     expect(screen.getByText(t('practice.loadingQuestion')).props.accessibilityLiveRegion).toBe(
       'polite',
@@ -710,13 +738,24 @@ describe('practice home screen', () => {
     expect(
       screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
     ).toEqual({ disabled: false });
+    await act(async () => {
+      replacement.resolve(PRACTICE_QUESTION);
+      await replacement.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
   });
 
   it('keeps footer actions above a larger device safe-area inset', async () => {
-    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    const replacement = deferred<unknown>();
+    mockApiFetch.mockReturnValue(replacement.promise);
     await renderScreen(<PracticeScreen />, undefined, 34);
 
     expect(buttonContainerPaddingBottom(t('practice.settings'))).toBe(34);
+    await act(async () => {
+      replacement.resolve(PRACTICE_QUESTION);
+      await replacement.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
   });
 
   it('renders the question and wires the recorder', async () => {
@@ -2104,6 +2143,82 @@ describe('practice attempt screen', () => {
     mockScrollToExpandedRecorderControls.mockClear();
     recorderProps().onExpandedControlsLayout?.();
     expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
+  });
+
+  it('keeps the active Recorder mounted across a remote mother-tongue refresh', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValueOnce(HELP_CONTENT);
+    const queryClient = makeQueryClient();
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />, queryClient);
+    await screen.findByText(QUESTION.questionText);
+    expect(mockRecorderMounts).toHaveLength(1);
+    const recorderInstance = mockRecorderMounts[0];
+
+    // ProfileRefreshBridge publishes the remotely changed account profile while
+    // retiring only inactive old-language help. The replacement request stays
+    // pending to exercise the key handoff that used to replace Recorder.
+    const replacement = deferred<unknown>();
+    mockApiFetch.mockImplementation(abortableApiResult(replacement));
+    await act(async () => {
+      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'hi' } });
+      await rerenderScreen(<AttemptScreen />);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
+    expect(screen.getByTestId('recorder')).toBeTruthy();
+    expect(mockRecorderMounts).toEqual([recorderInstance]);
+    expect(mockRecorderUnmounts).toEqual([]);
+    expect(recorderProps()).toMatchObject({
+      ownerId: USER.id,
+      questionId: QUESTION.id,
+      cycleId: CYCLE_ID,
+    });
+
+    await act(async () => {
+      replacement.resolve(HELP_CONTENT);
+      await replacement.promise;
+    });
+    await waitFor(() => expect(screen.queryByText(t('refresh.updating'))).toBeNull());
+    await act(async () => {
+      await queryClient.cancelQueries();
+      await cleanup();
+      queryClient.clear();
+    });
+  });
+
+  it('keeps the active Recorder and offers retry when replacement help fails', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValueOnce(HELP_CONTENT);
+    const queryClient = makeQueryClient();
+    const rerenderScreen = await renderRerenderable(<AttemptScreen />, queryClient);
+    await screen.findByText(QUESTION.questionText);
+    const replacement = deferred<unknown>();
+    mockApiFetch.mockImplementation(abortableApiResult(replacement));
+
+    await act(async () => {
+      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'hi' } });
+      await rerenderScreen(<AttemptScreen />);
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('recorder')).toBeTruthy();
+
+    await act(async () => {
+      replacement.reject(new ApiError(500, 'replacement failed'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved'));
+    expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
+    expect(screen.getByTestId('recorder')).toBeTruthy();
+    expect(mockRecorderMounts).toEqual([expect.anything()]);
+    expect(mockRecorderUnmounts).toEqual([]);
+    await act(async () => {
+      await queryClient.cancelQueries();
+      await cleanup();
+      queryClient.clear();
+    });
   });
 
   it('locks the help-entry language switch during recording and submission', async () => {

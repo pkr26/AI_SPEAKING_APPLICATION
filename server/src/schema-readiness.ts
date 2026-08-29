@@ -2,7 +2,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
-import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
+import { RUNTIME_SCHEMA_CUTOVERS } from '../db/schema-cutover';
 import { pool } from './db';
 import { boundedQuestionInventoryQuery, questionInventoryIssues } from './question-inventory';
 
@@ -103,10 +103,14 @@ export async function assertDatabaseSchemaCurrent(
       }
     | undefined
   >;
-  const fenceRows = actualWithFences.filter((row) => row?.name === RECORDING_PRIVACY_CUTOVER.name);
-  const actual = actualWithFences.filter((row) => row?.name !== RECORDING_PRIVACY_CUTOVER.name);
-  const cutoverRequired = expected.some(({ name }) => name === RECORDING_PRIVACY_CUTOVER.requiredMigration);
-  const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === RECORDING_PRIVACY_CUTOVER.checksum;
+  const fenceNames = new Set<string>(RUNTIME_SCHEMA_CUTOVERS.map(({ name }) => name));
+  const actual = actualWithFences.filter((row) => typeof row?.name !== 'string' || !fenceNames.has(row.name));
+  const cutoversValid = RUNTIME_SCHEMA_CUTOVERS.every((cutover) => {
+    const fenceRows = actualWithFences.filter((row) => row?.name === cutover.name);
+    const cutoverRequired = expected.some(({ name }) => name === cutover.requiredMigration);
+    const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === cutover.checksum;
+    return !(fenceRows.length > 0 && !cutoverValid) && cutoverRequired === cutoverValid;
+  });
 
   // Ordinary migration rows use prefix-subset matching: during a rolling
   // additive deploy, an old replica legitimately sees trailing rows it does
@@ -124,7 +128,7 @@ export async function assertDatabaseSchemaCurrent(
   // remove only the exact verified fence before applying the normal additive
   // prefix rule. A missing, altered, duplicated, or out-of-sequence fence is
   // never treated as an ordinary newer migration.
-  if (!manifestMatches || (fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
+  if (!manifestMatches || !cutoversValid) {
     throw new Error(`Database migrations do not match this release through ${latest.name}`);
   }
 

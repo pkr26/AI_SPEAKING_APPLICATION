@@ -187,6 +187,8 @@ interface SubmittedAudioCleanup {
   userId: string;
   audioKey: string;
   preserve: boolean;
+  settled: boolean;
+  finalized: boolean;
   finalizing?: Promise<void>;
 }
 
@@ -510,30 +512,42 @@ export function ownSubmittedPresignedAudio(res: Response): void {
   if (cleanup) cleanup.preserve = false;
 }
 
+/**
+ * Mark the fresh owner's terminal decision and perform its cleanup even when
+ * the transport closed before Express could emit `finish`.
+ */
+export function completeSubmittedPresignedAudio(res: Response): Promise<void> {
+  const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
+  if (!cleanup) return Promise.resolve();
+  cleanup.settled = true;
+  return finalizeSubmittedPresignedAudio(res);
+}
+
 /** Idempotently discard after the owning route no longer needs the object. */
 export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
   const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
   if (!cleanup) return Promise.resolve();
+  if (cleanup.finalized) return Promise.resolve();
   if (cleanup.finalizing) return cleanup.finalizing;
-  if (cleanup.preserve) return Promise.resolve();
+  // `close` can fire while the durable claim/provider is still active. It is
+  // only a transport event, not permission to delete: the later persistence
+  // result may still retain the exact S3 version. The route explicitly settles
+  // successful owners, while `finish` settles final error/replay responses.
+  if (!cleanup.settled || cleanup.preserve) return Promise.resolve();
+
+  // Only a successful fresh route owner may delete. Every replay or rejected
+  // request either has no new durable binding or abandons it before the error
+  // response finishes. A check-then-DeleteObject cleanup for that unbound key
+  // has an unavoidable cross-replica gap: retain all non-success outcomes and
+  // let the mandatory bucket lifecycle collect them.
+  if (res.statusCode < 200 || res.statusCode >= 300) return Promise.resolve();
 
   cleanup.finalizing = (async () => {
-    // Only a successful fresh route owner may delete. Every replay or rejected
-    // request either has no new durable binding or abandons
-    // it before the error response finishes. A check-then-DeleteObject cleanup
-    // for that unbound key has an unavoidable cross-replica gap: a valid retry
-    // can claim the key after the check and lose it to the late delete. Retain
-    // all non-success outcomes and let the mandatory bucket lifecycle collect
-    // them. This covers terminal 4xx as well as retryable 409/429/5xx; client
-    // behavior is not a synchronization primitive.
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      return;
-    }
-    // Keep a final defensive check for a live worker. The durable unique
-    // object binding prevents a new request from appearing after this lookup;
-    // this query covers a worker whose processing transaction is already live
-    // when a successful owner reaches cleanup.
     try {
+      // Keep a final defensive check for a live worker. A no-op here is not a
+      // terminal memoized result: an early close may reach this check before
+      // the owner commits, and its explicit completion must be allowed to try
+      // again after the processing row changes state.
       if (await isAudioKeyClaimedForProcessing(cleanup.userId, cleanup.audioKey)) {
         return;
       }
@@ -544,7 +558,12 @@ export function finalizeSubmittedPresignedAudio(res: Response): Promise<void> {
       return;
     }
     await discardPresignedAudio(cleanup.scope, cleanup.userId, cleanup.audioKey);
-  })();
+    // DeleteObject is best effort and the lifecycle is the fallback, so one
+    // completed attempt is terminal even if the provider call was unavailable.
+    cleanup.finalized = true;
+  })().finally(() => {
+    cleanup.finalizing = undefined;
+  });
   return cleanup.finalizing;
 }
 
@@ -573,18 +592,31 @@ export function discardSubmittedPresignedAudio(scope: AudioStorageScope): Reques
       userId: req.user.id,
       audioKey,
       preserve: true,
+      settled: false,
+      finalized: false,
     };
     // Finalize on a microtask so every synchronous finish listener observes
     // the completed response first. An error after a client abort
     // intentionally retains the object (no `finish` fires); the bucket
     // lifecycle bounds it.
-    res.once('finish', () => queueMicrotask(() => void finalizeSubmittedPresignedAudio(res)));
+    res.once('finish', () => {
+      const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
+      if (cleanup) cleanup.settled = true;
+      queueMicrotask(() => void finalizeSubmittedPresignedAudio(res));
+    });
     // `close` can precede route/claim resolution when a client disconnects.
     // In that case retain the object for the active worker and let the
     // mandatory S3 lifecycle rule collect any orphan; a normal post-finish
     // close is harmless. The preserve-default finalizer is itself safe before
     // finish, so both close orderings can share the same idempotent call.
-    res.once('close', () => void finalizeSubmittedPresignedAudio(res));
+    res.once('close', () => {
+      const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
+      // A normal completed response can emit close immediately after finish;
+      // writableFinished is the terminal proof. An aborted transport keeps the
+      // decision unsettled until the route itself completes successfully.
+      if (cleanup && res.writableFinished) cleanup.settled = true;
+      void finalizeSubmittedPresignedAudio(res);
+    });
     return next();
   };
 }

@@ -9,7 +9,11 @@ import React from 'react';
 import { SectionList, StyleSheet, useColorScheme } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
-import HistoryScreen, { groupHistoryByDay } from '../src/app/history';
+import HistoryScreen, {
+  groupHistoryByDay,
+  HISTORY_MAX_PAGES,
+  nextHistoryPageParam,
+} from '../src/app/history';
 import HistoryNativeAdCard from '../src/components/HistoryNativeAdCard';
 import RecordingPlayback from '../src/components/RecordingPlayback';
 import { apiGetPracticeHistory, ApiError } from '../src/lib/api';
@@ -26,6 +30,7 @@ import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_PASS_SCORE,
   type HistoryItem,
+  type HistoryPage,
   type NativeLanguage,
   type User,
 } from '../src/lib/types';
@@ -236,9 +241,9 @@ function markOrdinaryFetchInFlight(client: QueryClient, queryKey: readonly unkno
   query.setState({ fetchStatus: 'fetching', fetchMeta: null });
 }
 
-function renderHistory() {
+function renderHistory(queryClient = makeQueryClient()) {
   return render(
-    <QueryClientProvider client={makeQueryClient()}>
+    <QueryClientProvider client={queryClient}>
       <HistoryScreen />
     </QueryClientProvider>,
   );
@@ -495,6 +500,24 @@ describe('groupHistoryByDay', () => {
 
   it('returns no sections for no items', () => {
     expect(groupHistoryByDay([], 'en-US')).toEqual([]);
+  });
+
+  it('bounds cursor pagination and rejects repeated cursor cycles', () => {
+    const page = (nextCursor: string | null): HistoryPage => ({ items: [], nextCursor });
+    const first = page('cursor-first');
+    expect(nextHistoryPageParam(page(null), [page(null)])).toBeUndefined();
+    expect(nextHistoryPageParam(first, [first])).toBe('cursor-first');
+    expect(
+      nextHistoryPageParam(page('cursor-first'), [first, page('cursor-first')]),
+    ).toBeUndefined();
+
+    const bounded = Array.from({ length: HISTORY_MAX_PAGES }, (_, index) =>
+      page(`cursor-${index}`),
+    );
+    expect(nextHistoryPageParam(bounded.at(-1)!, bounded)).toBeUndefined();
+    expect(nextHistoryPageParam(bounded.at(-2)!, bounded.slice(0, -1))).toBe(
+      `cursor-${HISTORY_MAX_PAGES - 2}`,
+    );
   });
 });
 
@@ -1386,7 +1409,7 @@ describe('history screen', () => {
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
   });
 
-  it('keeps paging beyond 500 pages when the cursor remains distinct', async () => {
+  it('stops visibly at 500 pages even when the cursor remains distinct', async () => {
     const client = makeQueryClient(Infinity);
     mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
     const pages = Array.from({ length: 500 }, (_, index) => ({
@@ -1406,9 +1429,11 @@ describe('history screen', () => {
     );
 
     expect(screen.getByText('courage')).toBeTruthy();
-    expect(screen.getByText(t('history.loadMore'))).toBeTruthy();
+    const terminal = screen.getByText(t('pagination.safetyStop'));
+    expect(terminal.props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
     await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
-    expect(mockGetHistory).toHaveBeenCalledWith('cursor-500', expect.anything());
+    expect(mockGetHistory).not.toHaveBeenCalled();
   });
 
   it('pages older answers when the list is scrolled to its end', async () => {

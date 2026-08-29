@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import {
+  type AssessmentQuestionSnapshot,
   abandonAssessmentRequest,
   claimAssessmentRequest as claimAssessmentRequestWithCycle,
   cleanupAssessmentRequests,
@@ -20,7 +21,7 @@ describe('assessment request recovery', () => {
   let ownerToken: string;
   let outsiderToken: string;
   let questionId: string;
-  let question: { id: string; cefrLevel: string; promptWord: string; questionText: string };
+  let question: AssessmentQuestionSnapshot & { id: string };
   let practiceCycleId: string;
 
   beforeAll(async () => {
@@ -32,7 +33,7 @@ describe('assessment request recovery', () => {
     ownerToken = owner.res.body.token;
     outsiderToken = outsider.res.body.token;
     question = (
-      await pool.query<{ id: string; cefrLevel: string; promptWord: string; questionText: string }>(
+      await pool.query<AssessmentQuestionSnapshot & { id: string }>(
         `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
          FROM questions ORDER BY id LIMIT 1`,
       )
@@ -145,6 +146,63 @@ describe('assessment request recovery', () => {
       cycleId: practiceCycleId,
       question,
     });
+  });
+
+  it('returns the exact claim-time question snapshot after the catalog changes', async () => {
+    const requestId = randomUUID();
+    const originalQuestion = {
+      cefrLevel: question.cefrLevel,
+      promptWord: question.promptWord,
+      questionText: question.questionText,
+    };
+    const revisedPrompt = `revised-${randomUUID().slice(0, 8)}`;
+    const revisedText = 'This wording was published after the route loaded its grading context.';
+    try {
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        revisedPrompt,
+        revisedText,
+      ]);
+      const claim = await claimAssessmentRequestWithCycle(
+        ownerId,
+        requestId,
+        'practice',
+        questionId,
+        undefined,
+        practiceCycleId,
+        true,
+        undefined,
+        originalQuestion,
+      );
+      expect(claim.kind).toBe('claimed');
+
+      const status = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${ownerToken}`);
+      expect(status.status).toBe(200);
+      expect(status.body).toMatchObject({ status: 'processing', question: { id: questionId, ...originalQuestion } });
+      expect(status.body.question).not.toMatchObject({ promptWord: revisedPrompt, questionText: revisedText });
+      expect(
+        (
+          await pool.query(
+            `SELECT question_cefr_level, question_prompt_word, question_text
+             FROM assessment_requests WHERE user_id = $1 AND request_id = $2`,
+            [ownerId, requestId],
+          )
+        ).rows,
+      ).toEqual([
+        {
+          question_cefr_level: originalQuestion.cefrLevel,
+          question_prompt_word: originalQuestion.promptWord,
+          question_text: originalQuestion.questionText,
+        },
+      ]);
+    } finally {
+      await pool.query('DELETE FROM assessment_requests WHERE user_id = $1 AND request_id = $2', [ownerId, requestId]);
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        originalQuestion.promptWord,
+        originalQuestion.questionText,
+      ]);
+    }
   });
 
   it('returns a null cycle with the original question for a diagnostic request', async () => {
@@ -353,6 +411,13 @@ describe('assessment request recovery', () => {
       questionId,
       undefined,
       practiceCycleId,
+      true,
+      undefined,
+      {
+        cefrLevel: question.cefrLevel,
+        promptWord: question.promptWord,
+        questionText: question.questionText,
+      },
     );
     expect(replacement.kind).toBe('claimed');
     if (replacement.kind !== 'claimed') throw new Error('expected a replacement claim');

@@ -170,6 +170,8 @@ const en = {
   'network.offlineBody': 'Reconnect to load this screen. It will continue automatically.',
   'refresh.updating': 'Updating…',
   'refresh.failedUsingSaved': 'Could not refresh. Showing your saved information.',
+  'pagination.safetyStop':
+    'This list stopped at its safe display limit. Pull down to refresh the newest items.',
   'upgrade.title': 'Update required',
   'upgrade.body':
     'You need a newer version of AI English Coach to keep using your learning data safely.',
@@ -806,6 +808,8 @@ const te: Record<MessageKey, string> = {
     'ఈ స్క్రీన్ లోడ్ కావడానికి మళ్లీ కనెక్ట్ అవ్వండి. అది స్వయంగా కొనసాగుతుంది.',
   'refresh.updating': 'అప్‌డేట్ చేస్తున్నాము…',
   'refresh.failedUsingSaved': 'రిఫ్రెష్ చేయలేకపోయాము. సేవ్ చేసిన సమాచారాన్ని చూపిస్తున్నాము.',
+  'pagination.safetyStop':
+    'ఈ జాబితా సురక్షిత ప్రదర్శన పరిమితి వద్ద ఆగింది. కొత్త అంశాల కోసం క్రిందికి లాగి రిఫ్రెష్ చేయండి.',
   'upgrade.title': 'అప్‌డేట్ అవసరం',
   'upgrade.body':
     'మీ అభ్యాస డేటాను సురక్షితంగా ఉపయోగించడం కొనసాగించడానికి AI English Coach కొత్త వెర్షన్ అవసరం.',
@@ -1420,6 +1424,8 @@ const hi: Record<MessageKey, string> = {
   'network.offlineBody': 'यह स्क्रीन लोड करने के लिए फिर जुड़ें। यह अपने आप जारी रहेगी।',
   'refresh.updating': 'अपडेट हो रहा है…',
   'refresh.failedUsingSaved': 'रीफ़्रेश नहीं हो सका। आपकी सेव की हुई जानकारी दिखाई जा रही है।',
+  'pagination.safetyStop':
+    'यह सूची सुरक्षित प्रदर्शन सीमा पर रुक गई। नई चीज़ें देखने के लिए नीचे खींचकर रीफ़्रेश करें।',
   'upgrade.title': 'अपडेट ज़रूरी है',
   'upgrade.body':
     'अपने सीखने के डेटा का सुरक्षित उपयोग जारी रखने के लिए AI English Coach का नया संस्करण चाहिए।',
@@ -2028,6 +2034,8 @@ const es: Record<MessageKey, string> = {
     'Vuelve a conectarte para cargar esta pantalla. Continuará automáticamente.',
   'refresh.updating': 'Actualizando…',
   'refresh.failedUsingSaved': 'No se pudo actualizar. Mostramos tu información guardada.',
+  'pagination.safetyStop':
+    'Esta lista se detuvo en su límite seguro de visualización. Desliza hacia abajo para actualizar los elementos más recientes.',
   'upgrade.title': 'Debes actualizar la app',
   'upgrade.body':
     'Necesitas una versión más nueva de AI English Coach para seguir usando tus datos de aprendizaje de forma segura.',
@@ -2627,6 +2635,7 @@ const zh: Record<MessageKey, string> = {
   'network.offlineBody': '重新联网以加载此页面。它会自动继续。',
   'refresh.updating': '正在更新…',
   'refresh.failedUsingSaved': '无法刷新。正在显示已保存的信息。',
+  'pagination.safetyStop': '此列表已达到安全显示上限。下拉刷新以查看最新项目。',
   'upgrade.title': '需要更新',
   'upgrade.body': '你需要更新版 AI English Coach，才能继续安全使用学习数据。',
   'upgrade.action': '更新应用',

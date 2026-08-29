@@ -450,7 +450,7 @@ describe('config env validation', () => {
     expect(prod.isProduction).toBe(true);
     expect(prod.s3.diagnostic.bucket).toBe('diagnostic-audio-bucket');
     expect(prod.s3.practice.bucket).toBe('practice-audio-bucket');
-    expect(prod.minClientVersion).toBe('1.1.0');
+    expect(prod.minClientVersion).toBe('1.1.1');
 
     const lowerConfiguredFloor = await loadConfig(
       baseEnv({
@@ -459,11 +459,11 @@ describe('config env validation', () => {
         OPENAI_API_KEY: 'sk-real',
         ...TEST_S3_BUCKETS,
         DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
-        MIN_CLIENT_VERSION: '1.0.99',
+        MIN_CLIENT_VERSION: '1.1.0',
         ...PRODUCTION_MAIL,
       }),
     );
-    expect(lowerConfiguredFloor.minClientVersion).toBe('1.1.0');
+    expect(lowerConfiguredFloor.minClientVersion).toBe('1.1.1');
 
     const higherConfiguredFloor = await loadConfig(
       baseEnv({

@@ -43,9 +43,9 @@ npm ci
 npx expo start
 ```
 
-The cycle-aware mobile contract is release `1.1.0` (`app.json`, `package.json`,
+The diagnostic-run-aware mobile contract is release `1.1.1` (`app.json`, `package.json`,
 and `package-lock.json` stay aligned); its iOS build number and Android version
-code are both `2`. Production API deployments must reject earlier app versions.
+code are both `3`. Production API deployments must reject earlier app versions.
 An exact `426 CLIENT_UPGRADE_REQUIRED` response from the first-party API latches
 a non-dismissible update overlay without unmounting the active route. Production
 builds must inject both store URLs from `.env.example`; until a real numeric iOS

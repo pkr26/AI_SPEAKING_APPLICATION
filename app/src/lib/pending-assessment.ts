@@ -267,6 +267,25 @@ export async function clearPendingAssessment(expectedRequestId?: string): Promis
 }
 
 /**
+ * Deletes the slot only when it still contains the expected logical request.
+ * Unlike the backward-compatible void clear API, the result lets replay
+ * consumers distinguish a successful retirement from a race they must re-read.
+ */
+export async function clearPendingAssessmentIfRequestMatches(
+  expectedRequestId: string,
+): Promise<boolean> {
+  if (!isUuid(expectedRequestId)) return false;
+  return serializeStorage(async () => {
+    const current = await loadPendingUnsafe();
+    if (current?.requestId !== expectedRequestId) return false;
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
+    memoryValue = null;
+    memoryLoaded = true;
+    return true;
+  });
+}
+
+/**
  * Persist a handoff tombstone before UI delivery. If navigation, backgrounding,
  * or process death races delivery, the next focused screen refreshes canonical
  * state rather than polling/replaying or enabling another paid submission.
@@ -303,15 +322,17 @@ export async function markPendingAssessmentFeedbackPending(
   return serializeStorage(async () => {
     const current = await loadPendingUnsafe();
     if (!current || current.requestId !== requestId) return false;
-    if (feedbackReadyAt < current.createdAt) {
-      throw new RangeError('feedbackReadyAt cannot predate the assessment');
-    }
     if (current.stage === 'feedback-pending') return true;
+    // Date.now() can move backwards while an assessment is in flight (manual
+    // clock correction, NTP, or simulator time changes). Preserve the schema's
+    // ordering invariant without turning an already-paid result into a pointer
+    // that can never be persisted.
+    const normalizedFeedbackReadyAt = Math.max(feedbackReadyAt, current.createdAt);
     const next = parsePendingAssessment({
       ...current,
       stage: 'feedback-pending',
       audioKey: undefined,
-      feedbackReadyAt,
+      feedbackReadyAt: normalizedFeedbackReadyAt,
     });
     if (!next) throw new Error('Invalid pending assessment metadata');
     await savePendingUnsafe(next);
@@ -342,7 +363,15 @@ export async function acknowledgePendingAssessmentFeedback(
   });
 }
 
-/** True once a delivered feedback pointer falls outside the server replay SLA. */
+/**
+ * True once a delivered feedback pointer falls outside the server replay SLA.
+ *
+ * The server's 48-hour retention starts when it completes the assessment, not
+ * when this client eventually rediscovers it. The handoff is created before
+ * that completion, so anchoring the local deadline to `createdAt` can expire a
+ * pointer early but can never intentionally extend it beyond the server's
+ * guarantee after a delayed recovery.
+ */
 export function pendingAssessmentFeedbackIsExpired(
   pending: PendingAssessment,
   now = Date.now(),
@@ -351,8 +380,7 @@ export function pendingAssessmentFeedbackIsExpired(
     throw new RangeError('now must be a positive safe integer');
   }
   return (
-    pending.stage === 'feedback-pending' &&
-    now >= pending.feedbackReadyAt! + PENDING_FEEDBACK_RETENTION_MS
+    pending.stage === 'feedback-pending' && now >= pending.createdAt + PENDING_FEEDBACK_RETENTION_MS
   );
 }
 

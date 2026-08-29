@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import { Client } from 'pg';
-import { RECORDING_PRIVACY_CUTOVER } from './schema-cutover';
+import { RUNTIME_SCHEMA_CUTOVERS } from './schema-cutover';
 
 const CONNECTION_TIMEOUT_MS = 10_000;
 
@@ -155,12 +155,15 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
       const { rows } = await client.query<{ name: string; checksum: string | null }>(
         'SELECT name, checksum FROM schema_migrations',
       );
-      const fenceRows = rows.filter(({ name }) => name === RECORDING_PRIVACY_CUTOVER.name);
-      const ordinaryRows = rows.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.name);
-      const cutoverRequired = ordinaryRows.some(({ name }) => name === RECORDING_PRIVACY_CUTOVER.requiredMigration);
-      const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === RECORDING_PRIVACY_CUTOVER.checksum;
-      if ((fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
-        throw new Error('database recording-privacy cutover fence is missing, invalid, or out of sequence');
+      const fenceNames = new Set<string>(RUNTIME_SCHEMA_CUTOVERS.map(({ name }) => name));
+      const ordinaryRows = rows.filter(({ name }) => !fenceNames.has(name));
+      for (const cutover of RUNTIME_SCHEMA_CUTOVERS) {
+        const fenceRows = rows.filter(({ name }) => name === cutover.name);
+        const cutoverRequired = ordinaryRows.some(({ name }) => name === cutover.requiredMigration);
+        const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === cutover.checksum;
+        if ((fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
+          throw new Error(`database runtime cutover fence ${cutover.name} is missing, invalid, or out of sequence`);
+        }
       }
 
       const done = new Map(ordinaryRows.map((r) => [r.name, r.checksum]));

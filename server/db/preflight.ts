@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 import { Client } from 'pg';
 import { boundedQuestionInventoryQuery, questionInventoryIssues } from '../src/question-inventory';
-import { RECORDING_PRIVACY_CUTOVER } from './schema-cutover';
+import { RUNTIME_SCHEMA_CUTOVERS } from './schema-cutover';
 
 interface IntegrityCheck {
   name: string;
@@ -179,31 +179,31 @@ function integrityChecks(): IntegrityCheck[] {
           WHERE low_idx NOT BETWEEN 0 AND 6 OR high_idx NOT BETWEEN -1 AND 5
              OR questions_asked NOT BETWEEN 0 AND 5 OR low_idx > high_idx + 1`,
     },
-    {
-      name: 'invalid recording privacy cutover fence',
-      // Pre-upgrade databases legitimately have neither row. Once migration
-      // 023 is recorded, the exact out-of-band fence must exist; the inverse
-      // (a fence without 023) is also an interrupted/manual deployment.
+    // Pre-upgrade databases legitimately have neither row. Once a cutover's
+    // migration is recorded, its exact out-of-band fence must exist; the
+    // inverse is also an interrupted/manual deployment.
+    ...RUNTIME_SCHEMA_CUTOVERS.map((cutover) => ({
+      name: `invalid runtime cutover fence ${cutover.name}`,
       sql: `SELECT CASE WHEN
           (
             EXISTS (
               SELECT 1 FROM schema_migrations
-              WHERE name = '${RECORDING_PRIVACY_CUTOVER.requiredMigration}'
+              WHERE name = '${cutover.requiredMigration}'
             )
             IS DISTINCT FROM
             EXISTS (
               SELECT 1 FROM schema_migrations
-              WHERE name = '${RECORDING_PRIVACY_CUTOVER.name}'
-                AND checksum = '${RECORDING_PRIVACY_CUTOVER.checksum}'
+              WHERE name = '${cutover.name}'
+                AND checksum = '${cutover.checksum}'
             )
           )
           OR EXISTS (
             SELECT 1 FROM schema_migrations
-            WHERE name = '${RECORDING_PRIVACY_CUTOVER.name}'
-              AND checksum IS DISTINCT FROM '${RECORDING_PRIVACY_CUTOVER.checksum}'
+            WHERE name = '${cutover.name}'
+              AND checksum IS DISTINCT FROM '${cutover.checksum}'
           )
         THEN 1 ELSE 0 END::int AS n`,
-    },
+    })),
   ];
 }
 

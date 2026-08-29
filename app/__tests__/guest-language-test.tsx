@@ -217,6 +217,67 @@ describe('GuestLanguageProvider restore and persistence', () => {
     expect(mockDeleteItem).not.toHaveBeenCalled();
   });
 
+  it('lets a signed-in caller observe a failed account-language mirror', async () => {
+    mockSetItem.mockRejectedValueOnce(new Error('store unavailable'));
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+
+    await act(async () => {
+      await expect(preference!.mirrorAccountLanguage('hi')).rejects.toThrow('store unavailable');
+    });
+
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('hi');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent(
+      translateFor('hi', 'language.saveFailed'),
+    );
+  });
+
+  it('does not join a stale same-language mirror across an intervening device choice', async () => {
+    const firstHi = deferred<void>();
+    const spanish = deferred<void>();
+    const finalHi = deferred<void>();
+    mockSetItem
+      .mockReturnValueOnce(firstHi.promise)
+      .mockReturnValueOnce(spanish.promise)
+      .mockReturnValueOnce(finalHi.promise);
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+
+    let firstMirror!: Promise<void>;
+    let secondMirror!: Promise<void>;
+    await act(async () => {
+      firstMirror = preference!.mirrorAccountLanguage('hi');
+      await Promise.resolve();
+      preference!.setLanguage('es');
+      secondMirror = preference!.mirrorAccountLanguage('hi');
+      await Promise.resolve();
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstHi.resolve();
+      await firstMirror;
+      await Promise.resolve();
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(2);
+    expect(mockSetItem.mock.calls[1]?.[1]).toBe('es');
+
+    await act(async () => {
+      spanish.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(3);
+    expect(mockSetItem.mock.calls[2]?.[1]).toBe('hi');
+
+    await act(async () => {
+      finalHi.resolve();
+      await secondMirror;
+    });
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('hi');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent('none');
+  });
+
   it('ignores invalid runtime values and stale callbacks after unmount', async () => {
     const rendered = await render(provider(<PreferenceProbe />));
     await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));

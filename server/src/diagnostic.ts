@@ -4,7 +4,7 @@ import { PoolClient } from 'pg';
 import { z } from 'zod';
 import { AssessResult, assessSpeaking } from './assess';
 import { buildAssessmentSubmissionChain, runAssessmentSubmission } from './assessment-pipeline';
-import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
+import { pool, QuestionRow } from './db';
 import { completeAssessmentRequest } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
@@ -21,6 +21,7 @@ const MAX_QUESTIONS = 3;
 
 interface DiagnosticStateRow {
   user_id: string;
+  diagnostic_run_id: string;
   low_idx: number;
   high_idx: number;
   questions_asked: number;
@@ -132,7 +133,7 @@ interface DiagnosticClaim {
  * serializes submissions across API instances without holding a pool client
  * while transcription and grading run.
  */
-async function claimDiagnosticAnswer(userId: string, questionId: string): Promise<DiagnosticClaim> {
+async function claimDiagnosticAnswer(userId: string, question: QuestionRow): Promise<DiagnosticClaim> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -151,15 +152,9 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
       throw new HttpError(400, 'Diagnostic already completed', 'DIAGNOSTIC_DONE');
     }
     const state = await lockState(client, userId);
-    if (!state.current_question_id || state.current_question_id !== questionId) {
+    if (!state.current_question_id || state.current_question_id !== question.id) {
       throw new HttpError(409, 'Question mismatch', 'QUESTION_MISMATCH');
     }
-
-    const { rows } = await client.query<QuestionRow>(`SELECT ${QUESTION_ROW_COLUMNS} FROM questions WHERE id = $1`, [
-      questionId,
-    ]);
-    const question = rows[0];
-    if (!question) throw new HttpError(404, 'Question not found');
 
     const claimId = randomUUID();
     const claimed = await client.query(
@@ -167,7 +162,7 @@ async function claimDiagnosticAnswer(userId: string, questionId: string): Promis
        SET processing_question_id = $1, processing_started_at = now(), processing_claim_id = $2
        WHERE user_id = $3
          AND (processing_claim_id IS NULL OR processing_started_at < now() - interval '5 minutes')`,
-      [questionId, claimId, userId],
+      [question.id, claimId, userId],
     );
     if (claimed.rowCount !== 1) {
       throw new HttpError(409, 'An assessment is already in progress', 'ASSESSMENT_IN_PROGRESS');
@@ -400,7 +395,8 @@ export function createDiagnosticRouter(limiters: Limiters) {
           }
           await client.query(
             `UPDATE diagnostic_state
-             SET low_idx = 0, high_idx = 5, questions_asked = 0,
+             SET diagnostic_run_id = gen_random_uuid(),
+                 low_idx = 0, high_idx = 5, questions_asked = 0,
                  current_question_id = NULL, processing_question_id = NULL,
                  processing_started_at = NULL, processing_claim_id = NULL
              WHERE user_id = $1`,
@@ -490,7 +486,8 @@ export function createDiagnosticRouter(limiters: Limiters) {
         await lockState(client, user.id);
         await client.query(
           `UPDATE diagnostic_state
-           SET low_idx = 0, high_idx = 5, questions_asked = 0,
+           SET diagnostic_run_id = gen_random_uuid(),
+               low_idx = 0, high_idx = 5, questions_asked = 0,
                current_question_id = NULL, processing_question_id = NULL,
                processing_started_at = NULL, processing_claim_id = NULL
            WHERE user_id = $1`,
@@ -556,7 +553,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
             throw new HttpError(400, 'Diagnostic already completed', 'DIAGNOSTIC_DONE');
           }
         },
-        claimAttempt: (user, question) => claimDiagnosticAnswer(user.id, question.id),
+        claimAttempt: (user, question) => claimDiagnosticAnswer(user.id, question),
         // The claim's question is authoritative (it must match the served
         // current_question_id), so the prompt context comes from the claim.
         assess: (audioPath, user, _question, claim, options) =>

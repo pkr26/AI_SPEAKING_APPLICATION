@@ -60,7 +60,7 @@ interface GuestLanguageContextValue {
   /** Optimistically changes and durably saves the device preference. */
   setLanguage: (language: UiLanguage) => void;
   /** Saves a confirmed account preference for the next restore/sign-out. */
-  mirrorAccountLanguage: (language: UiLanguage) => void;
+  mirrorAccountLanguage: (language: UiLanguage) => Promise<void>;
 }
 
 const FALLBACK_CONTEXT: GuestLanguageContextValue = {
@@ -68,7 +68,7 @@ const FALLBACK_CONTEXT: GuestLanguageContextValue = {
   isRestoring: false,
   persistenceError: null,
   setLanguage: () => undefined,
-  mirrorAccountLanguage: () => undefined,
+  mirrorAccountLanguage: async () => undefined,
 };
 
 const GuestLanguageContext = createContext<GuestLanguageContextValue | null>(null);
@@ -88,6 +88,7 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
   const epochRef = useRef(0);
   const languageRef = useRef<UiLanguage>(fallback);
   const confirmedRef = useRef<UiLanguage | null>(null);
+  const pendingMirrorRef = useRef<{ language: UiLanguage; promise: Promise<void> } | null>(null);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -122,7 +123,7 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     };
   }, [fallback]);
 
-  const persistLanguage = useCallback((nextLanguage: UiLanguage) => {
+  const persistLanguage = useCallback(async (nextLanguage: UiLanguage): Promise<void> => {
     if (!mountedRef.current || !isUiLanguage(nextLanguage)) return;
     const operationEpoch = ++epochRef.current;
     languageRef.current = nextLanguage;
@@ -130,21 +131,33 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     setLanguageState(nextLanguage);
     setPersistenceError(null);
 
-    const write = writeStoredLanguage(nextLanguage);
-    void write.then(
-      () => {
-        if (!mountedRef.current || operationEpoch !== epochRef.current) return;
-        confirmedRef.current = nextLanguage;
-      },
-      () => {
-        if (!mountedRef.current || operationEpoch !== epochRef.current) return;
+    try {
+      await writeStoredLanguage(nextLanguage);
+      if (!mountedRef.current || operationEpoch !== epochRef.current) return;
+      confirmedRef.current = nextLanguage;
+    } catch (error) {
+      if (mountedRef.current && operationEpoch === epochRef.current) {
         setPersistenceError(translateFor(nextLanguage, 'language.saveFailed'));
-      },
-    );
+      }
+      throw error;
+    }
   }, []);
 
+  const setLanguage = useCallback(
+    (nextLanguage: UiLanguage) => {
+      // Public signed-out pickers render persistenceError themselves. Absorb
+      // the promise rejection here so an event callback never creates an
+      // unhandled rejection.
+      // A later account mirror must not join a same-language write that this
+      // explicit intervening choice has already superseded.
+      pendingMirrorRef.current = null;
+      void persistLanguage(nextLanguage).catch(() => undefined);
+    },
+    [persistLanguage],
+  );
+
   const mirrorAccountLanguage = useCallback(
-    (accountLanguage: UiLanguage) => {
+    async (accountLanguage: UiLanguage): Promise<void> => {
       if (!isUiLanguage(accountLanguage)) return;
       // Avoid a keychain write on every profile refresh. A different in-memory
       // value still updates immediately; an unconfirmed same-language device
@@ -152,7 +165,19 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
       if (languageRef.current === accountLanguage && confirmedRef.current === accountLanguage) {
         return;
       }
-      persistLanguage(accountLanguage);
+      const existing = pendingMirrorRef.current;
+      if (existing?.language === accountLanguage && languageRef.current === accountLanguage) {
+        await existing.promise;
+        return;
+      }
+      const promise = persistLanguage(accountLanguage);
+      const pending = { language: accountLanguage, promise };
+      pendingMirrorRef.current = pending;
+      try {
+        await promise;
+      } finally {
+        if (pendingMirrorRef.current === pending) pendingMirrorRef.current = null;
+      }
     },
     [persistLanguage],
   );
@@ -162,10 +187,10 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
       language,
       isRestoring,
       persistenceError,
-      setLanguage: persistLanguage,
+      setLanguage,
       mirrorAccountLanguage,
     }),
-    [isRestoring, language, mirrorAccountLanguage, persistLanguage, persistenceError],
+    [isRestoring, language, mirrorAccountLanguage, persistenceError, setLanguage],
   );
 
   return <GuestLanguageContext.Provider value={value}>{children}</GuestLanguageContext.Provider>;

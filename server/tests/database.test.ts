@@ -6,7 +6,7 @@ import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
 import { assertSafeDestructiveDatabase } from '../db/database-safety';
 import { renderSeedSql } from '../db/generate-seed';
-import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
+import { ASSESSMENT_RECOVERY_CUTOVER, RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
 import { questions, type QuestionSeed } from '../db/seed-data';
 import { assertDatabaseSchemaCurrent, resetQuestionInventoryReadinessCacheForTests } from '../src/schema-readiness';
 import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
@@ -57,7 +57,7 @@ describe('database content seeding', () => {
   it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
     resetQuestionInventoryReadinessCacheForTests();
     await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-      latestMigration: '023_recording_bulk_cleanup.sql',
+      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
     });
     const expectInventoryRejected = async () => {
       resetQuestionInventoryReadinessCacheForTests();
@@ -357,6 +357,7 @@ describe('migration 014 attempt-result invariants', () => {
       await client.query('BEGIN');
       await client.query(`CREATE SCHEMA "${schema}"`);
       await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL)');
       await client.query(`CREATE TABLE attempts (
         context TEXT NOT NULL CHECK (context IN ('diagnostic', 'practice')),
         attempt_no INT NOT NULL,
@@ -770,6 +771,197 @@ describe('migration 023 recording bulk cleanup generation', () => {
       expect((await client.query('SELECT user_id, cutoff_epoch FROM recording_bulk_cleanup_jobs')).rows).toEqual([
         { user_id: ownerId, cutoff_epoch: '8' },
       ]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 024 diagnostic runs and question snapshots', () => {
+  it('retires every unverifiable legacy run and protects draining old writers across an identical reset', async () => {
+    const client = await pool.connect();
+    const schema = `diagnostic_runs_${randomUUID().replace(/-/g, '')}`;
+    const userId = randomUUID();
+    const questionId = randomUUID();
+    const completedRequestId = randomUUID();
+    const processingRequestId = randomUUID();
+    const currentRequestId = randomUUID();
+    const practiceRequestId = randomUUID();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL)');
+      await client.query(`CREATE TABLE questions (
+        id UUID PRIMARY KEY,
+        cefr_level TEXT NOT NULL,
+        prompt_word TEXT NOT NULL,
+        question_text TEXT NOT NULL
+      )`);
+      await client.query(`CREATE TABLE diagnostic_state (
+        user_id UUID PRIMARY KEY,
+        low_idx INTEGER NOT NULL,
+        high_idx INTEGER NOT NULL,
+        questions_asked INTEGER NOT NULL,
+        current_question_id UUID,
+        processing_question_id UUID,
+        processing_started_at TIMESTAMPTZ,
+        processing_claim_id UUID
+      )`);
+      await client.query(`CREATE TABLE assessment_requests (
+        user_id UUID NOT NULL,
+        request_id UUID NOT NULL,
+        context TEXT NOT NULL,
+        question_id UUID NOT NULL,
+        status TEXT NOT NULL,
+        response_body JSONB,
+        completed_at TIMESTAMPTZ,
+        response_version SMALLINT NOT NULL DEFAULT 2,
+        PRIMARY KEY (user_id, request_id),
+        CONSTRAINT assessment_requests_response_check CHECK (
+          (status = 'processing' AND response_body IS NULL AND completed_at IS NULL)
+          OR (status = 'completed' AND response_body IS NOT NULL AND completed_at IS NOT NULL)
+        )
+      )`);
+      await client.query(
+        `INSERT INTO questions (id, cefr_level, prompt_word, question_text)
+         VALUES ($1, 'B1', 'snapshot', 'Describe an immutable snapshot.')`,
+        [questionId],
+      );
+      await client.query(
+        `INSERT INTO diagnostic_state
+           (user_id, low_idx, high_idx, questions_asked, current_question_id)
+         VALUES ($1, 0, 5, 0, NULL)`,
+        [userId],
+      );
+      await client.query(
+        `INSERT INTO assessment_requests
+           (user_id, request_id, context, question_id, status, response_body, completed_at)
+         VALUES
+           ($1, $2, 'diagnostic', $4, 'completed', '{"legacy":true}'::jsonb, now()),
+           ($1, $3, 'diagnostic', $4, 'processing', NULL, NULL)`,
+        [userId, completedRequestId, processingRequestId, questionId],
+      );
+
+      const sql = fs.readFileSync(
+        path.join(__dirname, '../db/migrations/024_diagnostic_runs_and_question_snapshots.sql'),
+        'utf8',
+      );
+      await client.query(sql);
+      expect((await client.query('SELECT name, checksum FROM schema_migrations')).rows).toEqual([
+        {
+          name: ASSESSMENT_RECOVERY_CUTOVER.name,
+          checksum: ASSESSMENT_RECOVERY_CUTOVER.checksum,
+        },
+      ]);
+
+      const stateBeforeReset = await client.query<{ diagnostic_run_id: string }>(
+        'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1',
+        [userId],
+      );
+      const originalRunId = stateBeforeReset.rows[0].diagnostic_run_id;
+      const legacy = await client.query<{
+        request_id: string;
+        diagnostic_run_id: string;
+        status: string;
+        response_version: number;
+        response_body: Record<string, unknown>;
+        question_cefr_level: string;
+        question_prompt_word: string;
+        question_text: string;
+      }>(
+        `SELECT request_id, diagnostic_run_id, status, response_version, response_body,
+                question_cefr_level, question_prompt_word, question_text
+         FROM assessment_requests
+         ORDER BY request_id`,
+      );
+      expect(legacy.rows).toHaveLength(2);
+      for (const row of legacy.rows) {
+        expect(row.diagnostic_run_id).not.toBe(originalRunId);
+        expect(row.status).toBe('completed');
+        expect(row.response_version).toBe(1);
+        expect(row).toMatchObject({
+          question_cefr_level: 'B1',
+          question_prompt_word: 'snapshot',
+          question_text: 'Describe an immutable snapshot.',
+        });
+      }
+      expect(legacy.rows.find(({ request_id }) => request_id === processingRequestId)?.response_body).toEqual({});
+
+      // A draining pre-024 writer omits every new column. The INSERT trigger
+      // snapshots the current run and public question fields for it.
+      await client.query(
+        `INSERT INTO assessment_requests (user_id, request_id, context, question_id, status)
+         VALUES ($1, $2, 'diagnostic', $3, 'processing')`,
+        [userId, currentRequestId, questionId],
+      );
+      expect(
+        (
+          await client.query(
+            `SELECT diagnostic_run_id, question_cefr_level, question_prompt_word, question_text
+             FROM assessment_requests WHERE user_id = $1 AND request_id = $2`,
+            [userId, currentRequestId],
+          )
+        ).rows,
+      ).toEqual([
+        {
+          diagnostic_run_id: originalRunId,
+          question_cefr_level: 'B1',
+          question_prompt_word: 'snapshot',
+          question_text: 'Describe an immutable snapshot.',
+        },
+      ]);
+
+      // This is the exact old-binary reset shape, and every old field is
+      // already pristine. The trigger must still rotate and retire the request.
+      await client.query(
+        `UPDATE diagnostic_state
+         SET low_idx = 0, high_idx = 5, questions_asked = 0,
+             current_question_id = NULL, processing_question_id = NULL,
+             processing_started_at = NULL, processing_claim_id = NULL
+         WHERE user_id = $1`,
+        [userId],
+      );
+      const stateAfterReset = await client.query<{ diagnostic_run_id: string }>(
+        'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1',
+        [userId],
+      );
+      expect(stateAfterReset.rows[0].diagnostic_run_id).not.toBe(originalRunId);
+      expect(
+        (
+          await client.query(
+            `SELECT status, response_version, response_body
+             FROM assessment_requests WHERE user_id = $1 AND request_id = $2`,
+            [userId, currentRequestId],
+          )
+        ).rows,
+      ).toEqual([{ status: 'completed', response_version: 1, response_body: {} }]);
+
+      await client.query(
+        `INSERT INTO assessment_requests (user_id, request_id, context, question_id, status)
+         VALUES ($1, $2, 'practice', $3, 'processing')`,
+        [userId, practiceRequestId, questionId],
+      );
+      expect(
+        (
+          await client.query(
+            `SELECT diagnostic_run_id, question_prompt_word
+             FROM assessment_requests WHERE user_id = $1 AND request_id = $2`,
+            [userId, practiceRequestId],
+          )
+        ).rows,
+      ).toEqual([{ diagnostic_run_id: null, question_prompt_word: 'snapshot' }]);
+
+      await client.query('SAVEPOINT before_invalid_snapshot');
+      await expect(
+        client.query(
+          `UPDATE assessment_requests SET question_prompt_word = E'\t\n'
+           WHERE user_id = $1 AND request_id = $2`,
+          [userId, practiceRequestId],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_snapshot');
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();

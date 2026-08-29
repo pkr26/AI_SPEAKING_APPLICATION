@@ -1,3 +1,4 @@
+import { onlineManager } from '@tanstack/react-query';
 import { Directory, File, Paths } from 'expo-file-system';
 import * as Crypto from 'expo-crypto';
 import { useFocusEffect } from 'expo-router';
@@ -1053,6 +1054,9 @@ export default function Recorder<T>({
   const webAutoStopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const recoveringRef = useRef(false);
   const recoveryAttemptRef = useRef<symbol | null>(null);
+  // Distinguishes an automatic connectivity pause from the learner's explicit
+  // Check Later choice. Only the former resumes itself on a known reconnect.
+  const offlineRecoveryParkedRef = useRef(false);
   const deferredRecoveryRequestedRef = useRef(false);
   const recoverPendingRef = useRef<() => Promise<void>>(async () => undefined);
   const recoveryGenerationRef = useRef(0);
@@ -1331,6 +1335,21 @@ export default function Recorder<T>({
     }
   }, []);
 
+  const prepareOfflineRecoveryResume = useCallback(() => {
+    if (
+      !offlineRecoveryParkedRef.current ||
+      phaseRef.current !== 'parked' ||
+      !onlineManager.isOnline()
+    ) {
+      return false;
+    }
+    // Consume the one-shot marker before publishing the phase so duplicate
+    // native/query reconnect notifications cannot launch competing owners.
+    offlineRecoveryParkedRef.current = false;
+    updatePhase('recovering');
+    return true;
+  }, [updatePhase]);
+
   /**
    * Every terminal recovery failure goes through here: the recorder stays in
    * 'recovering' (the pending state is genuinely unresolved) but the retry
@@ -1519,6 +1538,11 @@ export default function Recorder<T>({
   }, [clearWebAutoStopTimer, recorder, stopNativeRecording, waitForRecordingCompletion]);
 
   const stopForLifecycle = useCallback(() => {
+    // An automatic offline park is scoped to this active foreground/focus
+    // interval. Durable recovery will re-establish it if the next active
+    // interval is still offline; carrying the marker across lifecycle cleanup
+    // could later turn an explicit Stop Waiting park into an automatic resume.
+    offlineRecoveryParkedRef.current = false;
     if (lifecycleStopPromiseRef.current) {
       return lifecycleStopPromiseRef.current;
     }
@@ -1837,6 +1861,17 @@ export default function Recorder<T>({
         await releaseUnclaimedHandoff();
         return;
       }
+      const parkForKnownOffline = () => {
+        if (!isCurrent() || onlineManager.isOnline()) return false;
+        offlineRecoveryParkedRef.current = true;
+        updatePhase('parked');
+        return true;
+      };
+      // Reading SecureStore is local and establishes whether controls should
+      // be locked. Once a real handoff is known, however, do not start its
+      // five-minute lease or spend any status/POST budget while native network
+      // monitoring already proves the device is offline.
+      if (parkForKnownOffline()) return;
       const finishUnresolved = async (
         message: string,
         allowRecordedRetry: boolean,
@@ -1935,6 +1970,7 @@ export default function Recorder<T>({
         recoveryPollsRemaining-- > 0 &&
         (firstStatusRead || monotonicNow() - recoveryStartedMonotonic <= recoveryDuration)
       ) {
+        if (parkForKnownOffline()) return;
         firstStatusRead = false;
         let nextPollDelayMs = RECOVERY_POLL_MS;
         try {
@@ -2045,6 +2081,15 @@ export default function Recorder<T>({
           if (isIncompatibleSavedAssessment(error)) {
             await retireIncompatibleSavedAssessment(pending.requestId, isCurrent);
             return;
+          }
+          if (
+            !onlineManager.isOnline() &&
+            (!(error instanceof ApiError) || error.status === 0 || error.status === 408)
+          ) {
+            // The transport could not establish an HTTP outcome and native
+            // reachability now confirms why. Keep the same request and local
+            // take parked; reconnect starts a fresh bounded GET-only window.
+            if (parkForKnownOffline()) return;
           }
           if (error instanceof ApiError && error.status === 404) {
             notFoundCount += 1;
@@ -2339,11 +2384,53 @@ export default function Recorder<T>({
     recoverPendingRef.current = recoverPending;
   }, [recoverPending]);
 
+  useEffect(
+    () =>
+      onlineManager.subscribe((online) => {
+        if (!online) {
+          if (
+            recoveringRef.current &&
+            phaseRef.current === 'recovering' &&
+            recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState)
+          ) {
+            // Native reachability is stronger than a long Retry-After sleep.
+            // Abort this window immediately, preserve its pointer/take, and
+            // let a later reconnect acquire a fresh bounded window.
+            offlineRecoveryParkedRef.current = true;
+            invalidateRecovery();
+            updatePhase('parked');
+          }
+          return;
+        }
+        if (
+          !recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState) ||
+          !prepareOfflineRecoveryResume()
+        ) {
+          return;
+        }
+        void (async () => {
+          await lifecycleStopPromiseRef.current;
+          if (
+            recorderContextIsActive(
+              mountedRef.current,
+              focusedRef.current,
+              AppState.currentState,
+            ) &&
+            phaseRef.current === 'recovering'
+          ) {
+            await recoverPendingRef.current();
+          }
+        })();
+      }),
+    [invalidateRecovery, prepareOfflineRecoveryResume, updatePhase],
+  );
+
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
       void (async () => {
         await lifecycleStopPromiseRef.current;
+        prepareOfflineRecoveryResume();
         await recoverPending();
       })();
       return () => {
@@ -2351,7 +2438,7 @@ export default function Recorder<T>({
         invalidateRecovery();
         void stopForLifecycle();
       };
-    }, [invalidateRecovery, recoverPending, stopForLifecycle]),
+    }, [invalidateRecovery, prepareOfflineRecoveryResume, recoverPending, stopForLifecycle]),
   );
 
   useEffect(() => {
@@ -2416,6 +2503,7 @@ export default function Recorder<T>({
               }
             }
           }
+          prepareOfflineRecoveryResume();
           await recoverPending();
         })();
       } else if (
@@ -2436,7 +2524,7 @@ export default function Recorder<T>({
       subscription.remove();
       void stopForLifecycle();
     };
-  }, [recoverPending, stopForLifecycle]);
+  }, [prepareOfflineRecoveryResume, recoverPending, stopForLifecycle]);
 
   useLayoutEffect(() => {
     const previous = previousIdentityRef.current;
@@ -3245,6 +3333,7 @@ export default function Recorder<T>({
           // The learner explicitly chose Stop Waiting. Keep the same durable
           // request for a later GET, but do not start another foreground poll.
           recoverAfterUpload = false;
+          offlineRecoveryParkedRef.current = false;
           updatePhase('parked');
           return;
         }
@@ -3405,12 +3494,14 @@ export default function Recorder<T>({
   // Escape hatch for a terminally failed recovery (e.g. SecureStore threw):
   // re-run the same recovery path the focus/foreground triggers would run.
   const retryRecovery = () => {
+    offlineRecoveryParkedRef.current = false;
     if (phaseRef.current === 'parked') updatePhase('recovering');
     void recoverPending();
   };
 
   const checkRecoveryLater = () => {
     if (phaseRef.current !== 'recovering') return;
+    offlineRecoveryParkedRef.current = false;
     // This is not cancellation: keep every durable claim/key/counter intact.
     // Only stop this screen's GET loop and release route exits.
     invalidateRecovery();

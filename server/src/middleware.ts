@@ -245,10 +245,9 @@ export function parseClientVersion(value: string): number[] | undefined {
 
 /**
  * X-Client-Version handshake: when MIN_CLIENT_VERSION is configured and the
- * client advertises an older version, fail fast with 426 so a stale client
- * updates instead of misreading responses it predates. The response contract
- * is additive-only, so an absent or unparseable header passes through — this
- * is a compatibility gate, not a security control.
+ * client is older or cannot advertise a well-formed version, fail fast with
+ * 426 so a stale/pre-handshake build cannot bypass an incompatible contract.
+ * Operational probes and stable privacy/account exits are exempt below.
  */
 const RECORDING_DELETE_PATH =
   /^\/recordings\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -256,11 +255,20 @@ const RECORDING_DELETE_PATH =
 /** Stable privacy/account exits remain usable while an old build updates. */
 export function clientVersionGateExempt(method: string | undefined, path: string | undefined) {
   if (!method || !path) return false;
-  if (method === 'POST' && path === '/auth/logout') return true;
-  if (method === 'DELETE' && path === '/auth/account') return true;
-  if (method === 'GET' && (path === '/auth/me/data' || path === '/recordings/export')) return true;
-  if (method === 'DELETE' && path === '/recordings') return true;
-  return method === 'DELETE' && RECORDING_DELETE_PATH.test(path);
+  const normalizedMethod = method.toUpperCase();
+  // Express accepts one trailing slash for these routes. Normalize exactly
+  // one so the exemption mirrors routing without accidentally blessing broad
+  // prefixes or arbitrary repeated slashes. Express routing is case-insensitive
+  // by default and automatically serves HEAD through matching GET handlers.
+  const routePath = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
+  const normalizedPath = routePath.toLowerCase();
+  const readsRoute = normalizedMethod === 'GET' || normalizedMethod === 'HEAD';
+  if (readsRoute && ['/health', '/ready', '/metrics'].includes(normalizedPath)) return true;
+  if (normalizedMethod === 'POST' && normalizedPath === '/auth/logout') return true;
+  if (normalizedMethod === 'DELETE' && normalizedPath === '/auth/account') return true;
+  if (readsRoute && ['/auth/me/data', '/recordings/export'].includes(normalizedPath)) return true;
+  if (normalizedMethod === 'DELETE' && normalizedPath === '/recordings') return true;
+  return normalizedMethod === 'DELETE' && RECORDING_DELETE_PATH.test(routePath);
 }
 
 export const clientVersionGate: RequestHandler = (req, _res, next) => {
@@ -268,10 +276,14 @@ export const clientVersionGate: RequestHandler = (req, _res, next) => {
   const minimumRaw = config.minClientVersion;
   if (!minimumRaw) return next();
   const header = req.headers['x-client-version'];
-  if (typeof header !== 'string') return next();
-  const clientVersion = parseClientVersion(header);
   const minimum = parseClientVersion(minimumRaw);
-  if (!clientVersion || !minimum) return next();
+  if (!minimum) return next(new Error('configured minimum client version is invalid'));
+  const clientVersion = typeof header === 'string' ? parseClientVersion(header) : undefined;
+  if (!clientVersion) {
+    return next(
+      new HttpError(426, 'This app version is no longer supported; please update it', 'CLIENT_UPGRADE_REQUIRED'),
+    );
+  }
   for (const index of [0, 1, 2] as const) {
     const diff = (clientVersion[index] ?? 0) - (minimum[index] ?? 0);
     if (diff < 0) {

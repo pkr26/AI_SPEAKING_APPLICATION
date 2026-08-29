@@ -75,6 +75,7 @@ vi.mock('../src/audio-inspection', async (importOriginal) => {
 import { config } from '../src/config';
 import {
   assertRetainedAudioStorageAvailable,
+  completeSubmittedPresignedAudio,
   createPresignedRecordingPlaybackUrl,
   createAudioSizeCap,
   discardPresignedAudio as discardScopedPresignedAudio,
@@ -1109,7 +1110,7 @@ describe('submitted S3 cleanup lifecycle', () => {
       discardSubmittedPresignedAudio(req, res, vi.fn());
       ownSubmittedPresignedAudio(res);
       preserveSubmittedPresignedAudio(res);
-      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
 
       expect(ownershipQuery).not.toHaveBeenCalled();
       expect(sendMock).not.toHaveBeenCalled();
@@ -1205,7 +1206,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     await finalizeSubmittedPresignedAudio(res as never);
   });
 
-  it('preserves on an early close, then owner finalization deletes exactly once', async () => {
+  it('does not memoize an early close after ownership and deletes once the route settles', async () => {
     const userId = randomUUID();
     const audioKey = ownedKey(userId);
     const req = {
@@ -1224,12 +1225,12 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     discardSubmittedPresignedAudio(req, res, next);
     expect(next).toHaveBeenCalledOnce();
+    ownSubmittedPresignedAudio(res);
     listeners.get('close')?.();
     expect(sendMock).not.toHaveBeenCalled();
 
-    ownSubmittedPresignedAudio(res);
     sendMock.mockResolvedValue({});
-    await finalizeSubmittedPresignedAudio(res);
+    await completeSubmittedPresignedAudio(res);
     await finalizeSubmittedPresignedAudio(res);
     expect(sendMock).toHaveBeenCalledOnce();
     expect((sendMock.mock.calls[0][0] as { kind: string }).kind).toBe('delete');
@@ -1294,7 +1295,7 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     discardSubmittedPresignedAudio(req, res, vi.fn());
     ownSubmittedPresignedAudio(res);
-    await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+    await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
     expect(sendMock).not.toHaveBeenCalled();
     await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
   });
@@ -1371,7 +1372,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     try {
       discardSubmittedPresignedAudio(req, res, vi.fn());
       ownSubmittedPresignedAudio(res);
-      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
       expect(query).toHaveBeenCalledOnce();
       expect(sendMock).not.toHaveBeenCalled();
       expect(warn).toHaveBeenCalledWith({ err: ownershipError, userId }, 'failed to verify S3 audio cleanup ownership');
@@ -1399,7 +1400,7 @@ describe('submitted S3 cleanup lifecycle', () => {
     try {
       discardSubmittedPresignedAudio(req, res, vi.fn());
       ownSubmittedPresignedAudio(res);
-      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
       expect(sendMock).not.toHaveBeenCalled();
 
       sendMock.mockRejectedValueOnce(new Error('delete failed'));
@@ -1447,7 +1448,7 @@ describe('submitted S3 cleanup lifecycle', () => {
 
     discardSubmittedPresignedAudio(req, res, vi.fn());
     ownSubmittedPresignedAudio(res);
-    const first = finalizeSubmittedPresignedAudio(res);
+    const first = completeSubmittedPresignedAudio(res);
     const second = finalizeSubmittedPresignedAudio(res);
 
     expect(second).toBe(first);
@@ -2768,19 +2769,37 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     }
   });
 
-  it('deletes owned S3 audio after the client disconnects before the diagnostic response', async () => {
+  it('deletes opted-out S3 audio after disconnecting during provider work', async () => {
     const a = app();
     const { token, userId, questionId } = await registerAndGetQuestion(a);
     const uploadsBefore = (await fs.readdir(uploadsDir)).sort();
     const audioKey = ownedKey(userId);
     const requestId = randomUUID();
-    let releaseDownload: ((value: { Body: Readable }) => void) | undefined;
+    const providerStarted = deferred<void>();
+    const releaseProvider = deferred<void>();
     sendMock.mockImplementation((command: { kind: string }) => {
-      if (command.kind !== 'get') return Promise.resolve({});
-      return new Promise((resolve) => {
-        releaseDownload = resolve;
-      });
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
     });
+    routeMocks.useLiveAssess = true;
+    routeMocks.assess.mockImplementationOnce(
+      async (
+        _audioPath: string,
+        _question: unknown,
+        _userId: string,
+        options?: { onCapacityReserved?: () => void },
+      ) => {
+        options?.onCapacityReserved?.();
+        providerStarted.resolve(undefined);
+        await releaseProvider.promise;
+        return {
+          transcript: 'A completed opt-out response after disconnect.',
+          score: 80,
+          passed: true,
+          feedback: 'Clear and relevant.',
+        };
+      },
+    );
 
     const server = createServer(a);
     let responseFinished = false;
@@ -2805,7 +2824,7 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       throw new Error('test server did not bind to a TCP port');
     }
 
-    const payload = JSON.stringify({ questionId, requestId, audioKey });
+    const payload = JSON.stringify({ questionId, requestId, audioKey, retainRecording: false });
     const clientRequest = request(`http://127.0.0.1:${address.port}`)
       .post('/diagnostic/answer')
       .set('Authorization', `Bearer ${token}`)
@@ -2817,22 +2836,130 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     );
 
     try {
-      await vi.waitFor(() => expect(releaseDownload).toBeTypeOf('function'));
+      await providerStarted.promise;
       clientRequest.abort();
       await vi.waitFor(() => expect(responseWritableFinishedOnClose).toBe(false));
-      releaseDownload!({ Body: Readable.from(fakeM4aBuffer()) });
+      releaseProvider.resolve(undefined);
       await clientOutcome;
 
-      await vi.waitFor(() => {
-        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
+      await vi.waitFor(async () => {
+        const stored = await pool.query<{ status: string; response_body: Record<string, unknown> }>(
+          `SELECT status, response_body FROM assessment_requests
+           WHERE user_id = $1 AND request_id = $2`,
+          [userId, requestId],
+        );
+        expect(stored.rows[0]).toMatchObject({ status: 'completed' });
+        expect(stored.rows[0].response_body).not.toHaveProperty('recordingId');
       });
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+      });
+      expect((await pool.query('SELECT 1 FROM recordings WHERE user_id = $1', [userId])).rowCount).toBe(0);
       await new Promise<void>((resolve) => setImmediate(resolve));
       expect((await fs.readdir(uploadsDir)).sort()).toEqual(uploadsBefore);
       expect(responseFinished).toBe(false);
     } finally {
-      if (releaseDownload) releaseDownload({ Body: Readable.from(fakeM4aBuffer()) });
+      releaseProvider.resolve(undefined);
       clientRequest.abort();
       await clientOutcome;
+      routeMocks.useLiveAssess = false;
+      await new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    }
+  });
+
+  it('deletes generation-fenced retain=true audio after disconnecting during provider work', async () => {
+    const providerStarted = deferred<void>();
+    const releaseProvider = deferred<void>();
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+    routeMocks.useLiveAssess = true;
+    routeMocks.assess.mockImplementationOnce(
+      async (
+        _audioPath: string,
+        _question: unknown,
+        _userId: string,
+        options?: { onCapacityReserved?: () => void },
+      ) => {
+        options?.onCapacityReserved?.();
+        providerStarted.resolve(undefined);
+        await releaseProvider.promise;
+        return {
+          transcript: 'A completed generation-fenced response after disconnect.',
+          score: 80,
+          passed: true,
+          feedback: 'Clear and relevant.',
+        };
+      },
+    );
+
+    const server = createServer(a);
+    let responseFinished = false;
+    let responseWritableFinishedOnClose: boolean | undefined;
+    server.prependListener('request', (incoming, outgoing) => {
+      if (incoming.url === '/diagnostic/answer') {
+        outgoing.once('finish', () => {
+          responseFinished = true;
+        });
+        outgoing.once('close', () => {
+          responseWritableFinishedOnClose = outgoing.writableFinished;
+        });
+      }
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === 'string') {
+      server.close();
+      throw new Error('test server did not bind to a TCP port');
+    }
+    const clientRequest = request(`http://127.0.0.1:${address.port}`)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .set('Content-Type', 'application/json')
+      .send(JSON.stringify({ questionId, requestId, audioKey, retainRecording: true }));
+    const clientOutcome = clientRequest.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    try {
+      await providerStarted.promise;
+      clientRequest.abort();
+      await vi.waitFor(() => expect(responseWritableFinishedOnClose).toBe(false));
+      const deleted = await request(a).delete('/recordings').set('Authorization', `Bearer ${token}`);
+      expect(deleted.status).toBe(204);
+      releaseProvider.resolve(undefined);
+      await clientOutcome;
+
+      await vi.waitFor(async () => {
+        const stored = await pool.query<{ status: string; response_body: Record<string, unknown> }>(
+          `SELECT status, response_body FROM assessment_requests
+           WHERE user_id = $1 AND request_id = $2`,
+          [userId, requestId],
+        );
+        expect(stored.rows[0]).toMatchObject({ status: 'completed' });
+        expect(stored.rows[0].response_body).not.toHaveProperty('recordingId');
+      });
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'delete']);
+      });
+      expect((await pool.query('SELECT 1 FROM recordings WHERE user_id = $1', [userId])).rowCount).toBe(0);
+      expect(responseFinished).toBe(false);
+    } finally {
+      releaseProvider.resolve(undefined);
+      clientRequest.abort();
+      await clientOutcome;
+      routeMocks.useLiveAssess = false;
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });

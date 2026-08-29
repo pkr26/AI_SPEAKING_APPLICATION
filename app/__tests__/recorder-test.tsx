@@ -7,6 +7,7 @@ import {
   waitFor,
   type RenderResult,
 } from '@testing-library/react-native';
+import { onlineManager } from '@tanstack/react-query';
 import {
   AudioModule,
   createAudioPlayer,
@@ -896,6 +897,7 @@ beforeEach(() => {
   mockFocusSubscribers = [];
   mockScreenFocused = true;
   mockRecoveryPostAttempts = 0;
+  onlineManager.setOnline(true);
   mockRecorderStatusReads = 0;
   // Module factory mocks outlive restoreAllMocks; re-arm the light default.
   asMock(useColorScheme).mockReset();
@@ -7971,6 +7973,123 @@ describe('Recorder', () => {
   });
 
   describe('crash recovery', () => {
+    it('ignores an online notification when no offline recovery is parked', async () => {
+      await renderRecorder();
+      const pendingReads = asMock(loadPendingAssessment).mock.calls.length;
+
+      await act(async () => {
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+        await flushMicrotasks();
+      });
+
+      expect(asMock(loadPendingAssessment)).toHaveBeenCalledTimes(pendingReads);
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('parks when a status transport observes known offline before its failure is caught', async () => {
+      let online = true;
+      jest.spyOn(onlineManager, 'isOnline').mockImplementation(() => online);
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockImplementation(async () => {
+        online = false;
+        throw new ApiError(0, 'network disconnected');
+      });
+      const { props } = await renderRecorder();
+
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(t('replay.failedBody')),
+      );
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+    });
+
+    it('parks a surviving take for an offline interval longer than the lease and resumes on reconnect', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValue(pendingRecord());
+      mockStartedUploadFailure(new ApiError(0, 'connection interrupted'));
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      asMock(File).mockClear();
+      onlineManager.setOnline(false);
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(screen.getByRole('alert')).toHaveTextContent(t('replay.failedBody')),
+      );
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
+
+      await act(async () => {
+        jest.advanceTimersByTime(6 * 60_000);
+        await flushMicrotasks();
+      });
+
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toEqual([]);
+
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { score: 91 },
+      });
+      await act(async () => {
+        onlineManager.setOnline(true);
+        await flushMicrotasks();
+      });
+
+      await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 91 } }));
+      expect(deletedRecordingUris()).toEqual([RECORDING_URI]);
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+    });
+
+    it('aborts a long recovery sleep as soon as reachability becomes offline', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch)
+        .mockRejectedValueOnce(new ApiError(503, 'retry later', 120))
+        .mockResolvedValueOnce({
+          status: 'completed',
+          context: 'practice',
+          questionId: QUESTION_ID,
+          response: { score: 92 },
+        });
+      const { props } = await renderRecorder();
+
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      await act(async () => {
+        onlineManager.setOnline(false);
+        await flushMicrotasks();
+      });
+      expect(screen.getByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+
+      await act(async () => {
+        jest.advanceTimersByTime(6 * 60_000);
+        await flushMicrotasks();
+      });
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+
+      await act(async () => {
+        onlineManager.setOnline(true);
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 92 } }));
+    });
+
     it('does not expose manual retry while an ambiguous handoff is still loading', async () => {
       const recoveryLoad = deferred<PendingAssessment | null>();
       asMock(loadPendingAssessment)
@@ -11508,6 +11627,76 @@ describe('Recorder', () => {
         signal: expect.any(AbortSignal),
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('does not auto-resume Stop Waiting after an earlier offline park crosses focus cleanup', async () => {
+      onlineManager.setOnline(false);
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: QUESTION_ID,
+        response: { ok: 'earlier recovery' },
+      });
+      const { props } = await renderRecorder();
+
+      // The first durable handoff parks automatically because reachability is
+      // already known to be offline. Navigating away runs lifecycle cleanup;
+      // reconnecting while unfocused must not consume that old park marker.
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      expect(apiFetch).not.toHaveBeenCalled();
+      await act(async () => {
+        blurScreen();
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(screen.getByText(IDLE_TEXT)).toBeTruthy());
+      const blurredReads = asMock(loadPendingAssessment).mock.calls.length;
+      await act(async () => {
+        onlineManager.setOnline(true);
+        await flushMicrotasks();
+      });
+      expect(loadPendingAssessment).toHaveBeenCalledTimes(blurredReads);
+      expect(apiFetch).not.toHaveBeenCalled();
+
+      // Focus owns the ordinary durable recovery. Once it finishes, the same
+      // mounted Recorder can create a later, independent posted submission.
+      await act(async () => {
+        focusScreen();
+        await flushMicrotasks();
+      });
+      await waitFor(() =>
+        expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'earlier recovery' } }),
+      );
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+
+      asMock(loadPendingAssessment).mockResolvedValue(null);
+      asMock(apiUploadAudio).mockImplementation(abortRejectingUpload());
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      expect(markPendingAssessmentCancelled).toHaveBeenCalledWith(REQUEST_ID);
+
+      // Model the new posted handoff still present in storage. Duplicate
+      // foreground/reachability notifications after the learner explicitly
+      // chose Stop Waiting must neither read it nor start a status poll.
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      const readsBeforeNotifications = asMock(loadPendingAssessment).mock.calls.length;
+      const pollsBeforeNotifications = asMock(apiFetch).mock.calls.length;
+      const resultsBeforeNotifications = props.onResult.mock.calls.length;
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        onlineManager.setOnline(false);
+        onlineManager.setOnline(true);
+        await flushMicrotasks();
+      });
+
+      expect(loadPendingAssessment).toHaveBeenCalledTimes(readsBeforeNotifications);
+      expect(apiFetch).toHaveBeenCalledTimes(pollsBeforeNotifications);
+      expect(props.onResult).toHaveBeenCalledTimes(resultsBeforeNotifications);
+      expect(screen.getByRole('alert')).toHaveTextContent(t('replay.failedBody'));
     });
 
     it('persists cancel intent before lifecycle cleanup aborts a posted request', async () => {

@@ -24,6 +24,7 @@ import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_PASS_SCORE,
   type HistoryItem,
+  type HistoryPage,
   type NativeLanguage,
 } from '../lib/types';
 
@@ -46,6 +47,24 @@ const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
 interface DaySection {
   title: string;
   data: HistoryItem[];
+}
+
+export const HISTORY_MAX_PAGES = 500;
+
+export function nextHistoryPageParam(
+  lastPage: HistoryPage,
+  allPages: HistoryPage[],
+): string | undefined {
+  const next = lastPage.nextCursor ?? undefined;
+  if (!next || allPages.length >= HISTORY_MAX_PAGES) return undefined;
+  // A malformed server must not keep onEndReached walking the same cursor (or
+  // a cursor cycle) forever and appending duplicate pages.
+  return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
+}
+
+function historyPaginationStopped(pages: HistoryPage[] | undefined): boolean {
+  if (!pages?.length || pages.at(-1)?.nextCursor === null) return false;
+  return nextHistoryPageParam(pages[pages.length - 1]!, pages) === undefined;
 }
 
 interface HistoryFetchMeta {
@@ -273,13 +292,7 @@ export default function HistoryScreen() {
     queryKey,
     queryFn: async ({ pageParam, signal }) => apiGetPracticeHistory(pageParam, signal),
     initialPageParam: undefined as string | undefined,
-    getNextPageParam: (lastPage, allPages) => {
-      const next = lastPage.nextCursor ?? undefined;
-      if (!next) return undefined;
-      // A malformed server must not keep onEndReached walking the same cursor
-      // (or a cursor cycle) forever and appending duplicate pages.
-      return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
-    },
+    getNextPageParam: nextHistoryPageParam,
     enabled: !!user,
     retry: false,
   });
@@ -293,6 +306,7 @@ export default function HistoryScreen() {
     [items, language],
   );
   const historyAdAnchorId = items[7]?.id ?? null;
+  const paginationStopped = historyPaginationStopped(historyQuery.data?.pages);
 
   // The route gate redirects after logout/session expiry.
   if (!user) return null;
@@ -477,6 +491,12 @@ export default function HistoryScreen() {
                 onPress={loadOlder}
                 style={styles.retryButton}
               />
+            </View>
+          ) : paginationStopped ? (
+            <View style={styles.footer}>
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('pagination.safetyStop')}
+              </Text>
             </View>
           ) : historyQuery.hasNextPage ? (
             <Button

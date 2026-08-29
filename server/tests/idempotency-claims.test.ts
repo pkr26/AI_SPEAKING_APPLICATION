@@ -3,6 +3,7 @@ import { randomUUID } from 'crypto';
 import request from 'supertest';
 import {
   ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS,
+  type AssessmentQuestionSnapshot,
   AssessmentRequestInFlightError,
   abandonAssessmentRequest,
   claimAssessmentRequest as claimAssessmentRequestWithCycle,
@@ -26,7 +27,8 @@ describe('claimAssessmentRequest ownership and replay', () => {
   let userId: string;
   let questionId: string;
   let otherQuestionId: string;
-  let question: { id: string; cefrLevel: string; promptWord: string; questionText: string };
+  let question: AssessmentQuestionSnapshot & { id: string };
+  let questions: Array<AssessmentQuestionSnapshot & { id: string }>;
   const cycleIds = new Map<string, string>();
 
   async function createClosedCycle(cycleUserId: string, cycleQuestionId: string): Promise<string> {
@@ -55,6 +57,8 @@ describe('claimAssessmentRequest ownership and replay', () => {
         ? undefined
         : (cycleIds.get(`${claimUserId}:${claimQuestionId}`) ?? cycleIds.get(`${userId}:${claimQuestionId}`));
     if (context !== 'diagnostic' && !cycleId) throw new Error('test fixture omitted a practice cycle');
+    const questionSnapshot = questions.find(({ id }) => id === claimQuestionId);
+    if (!questionSnapshot) throw new Error('test fixture omitted a question snapshot');
     return claimAssessmentRequestWithCycle(
       claimUserId,
       requestId,
@@ -63,6 +67,12 @@ describe('claimAssessmentRequest ownership and replay', () => {
       audioKey,
       cycleId,
       retainRecording,
+      undefined,
+      {
+        cefrLevel: questionSnapshot.cefrLevel,
+        promptWord: questionSnapshot.promptWord,
+        questionText: questionSnapshot.questionText,
+      },
     );
   }
 
@@ -70,15 +80,11 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const { res } = await registerUser(a);
     token = res.body.token;
     userId = res.body.user.id;
-    const { rows } = await pool.query<{
-      id: string;
-      cefrLevel: string;
-      promptWord: string;
-      questionText: string;
-    }>(
+    const { rows } = await pool.query<AssessmentQuestionSnapshot & { id: string }>(
       `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
        FROM questions ORDER BY id LIMIT 2`,
     );
+    questions = rows;
     [questionId, otherQuestionId] = [rows[0].id, rows[1].id];
     question = rows[0];
     await createClosedCycle(userId, questionId);
@@ -186,6 +192,25 @@ describe('claimAssessmentRequest ownership and replay', () => {
       'stored assessment response failed its public contract',
     );
     error.mockRestore();
+  });
+
+  it('rejects a missing or malformed claim-time question snapshot before opening a transaction', async () => {
+    const cycleId = cycleIds.get(`${userId}:${questionId}`)!;
+    for (const snapshot of [undefined, { cefrLevel: 'A1', promptWord: '\t\n', questionText: 'Valid text' }]) {
+      await expect(
+        claimAssessmentRequestWithCycle(
+          userId,
+          randomUUID(),
+          'practice',
+          questionId,
+          undefined,
+          cycleId,
+          true,
+          undefined,
+          snapshot as never,
+        ),
+      ).rejects.toThrow('assessment requests require a valid claim-time question snapshot');
+    }
   });
 
   it('refuses invalid or wrong-context response bodies before completing a claim', async () => {
@@ -662,7 +687,9 @@ describe('claimAssessmentRequest ownership and replay', () => {
         if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
-        if (text.includes('SELECT context, question_id, practice_cycle_id, retain_recording')) return { rows: [] };
+        if (text.includes('SELECT context, question_id, practice_cycle_id, diagnostic_run_id, retain_recording')) {
+          return { rows: [] };
+        }
         throw new Error(`unexpected query: ${text}`);
       }),
       release: vi.fn(),
@@ -694,7 +721,9 @@ describe('claimAssessmentRequest ownership and replay', () => {
         if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
-        if (text.includes('SELECT context, question_id, practice_cycle_id, retain_recording')) return { rows: [] };
+        if (text.includes('SELECT context, question_id, practice_cycle_id, diagnostic_run_id, retain_recording')) {
+          return { rows: [] };
+        }
         if (text.includes('SELECT status') && text.includes('audio_key = $2')) return { rows: [] };
         throw new Error(`unexpected query: ${text}`);
       }),
@@ -716,7 +745,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
         'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
         expect.stringContaining('DELETE FROM assessment_requests'),
         expect.stringContaining('INSERT INTO assessment_requests'),
-        expect.stringContaining('SELECT context, question_id, practice_cycle_id, retain_recording'),
+        expect.stringContaining('SELECT context, question_id, practice_cycle_id, diagnostic_run_id, retain_recording'),
         expect.stringContaining('SELECT status'),
         'ROLLBACK',
       ]);

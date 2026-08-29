@@ -73,8 +73,12 @@ interface AuthContextValue {
   signOutThisDevice?: () => Promise<void>;
   /** Captures the current session identity for guarding an async continuation. */
   captureSessionLease: () => SessionLease;
-  /** True only while the captured session identity is still current. */
-  isSessionLeaseCurrent: (lease: SessionLease) => boolean;
+  /**
+   * True only while the captured session is current. Account-operation error
+   * handlers may ignore the deliberately advanced transition epoch while
+   * still requiring the exact token and user identity to match.
+   */
+  isSessionLeaseCurrent: (lease: SessionLease, options?: { identityOnly?: boolean }) => boolean;
   login: (email: string, password: string) => Promise<User>;
   register: (
     name: string,
@@ -132,6 +136,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [user, setUserState] = useState<User | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
+  // Failed account mutations deliberately advance the synchronous lease epoch
+  // while their outcome is unknown. If the same identity survives, changing
+  // this private revision republishes captureSessionLease without rotating the
+  // session identity used to key navigators, queries, and practice state.
+  const [leaseRevision, setLeaseRevision] = useState(0);
   const [isRestoring, setIsRestoring] = useState(true);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [restoreAttempt, setRestoreAttempt] = useState(0);
@@ -158,26 +167,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUserState(resolved);
   }, []);
 
-  const captureSessionLease = useCallback(
-    (): SessionLease =>
-      Object.freeze({
-        [sessionLeaseBrand]: true as const,
-        epoch: epochRef.current,
-        token: tokenRef.current,
-        userId: userRef.current?.id ?? null,
-      }) satisfies SessionLeaseSnapshot,
+  const captureSessionLease = useCallback((): SessionLease => {
+    void leaseRevision;
+    return Object.freeze({
+      [sessionLeaseBrand]: true as const,
+      epoch: epochRef.current,
+      token: tokenRef.current,
+      userId: userRef.current?.id ?? null,
+    }) satisfies SessionLeaseSnapshot;
+  }, [leaseRevision]);
+
+  const isSessionLeaseCurrent = useCallback(
+    (lease: SessionLease, options?: { identityOnly?: boolean }): boolean => {
+      const snapshot = lease as SessionLeaseSnapshot;
+      return (
+        snapshot[sessionLeaseBrand] === true &&
+        (options?.identityOnly === true || snapshot.epoch === epochRef.current) &&
+        snapshot.token === tokenRef.current &&
+        snapshot.userId === (userRef.current?.id ?? null)
+      );
+    },
     [],
   );
-
-  const isSessionLeaseCurrent = useCallback((lease: SessionLease): boolean => {
-    const snapshot = lease as SessionLeaseSnapshot;
-    return (
-      snapshot[sessionLeaseBrand] === true &&
-      snapshot.epoch === epochRef.current &&
-      snapshot.token === tokenRef.current &&
-      snapshot.userId === (userRef.current?.id ?? null)
-    );
-  }, []);
 
   const schedulePendingCleanup = useCallback(() => {
     const cleanup = pendingCleanupTailRef.current.then(async () => {
@@ -329,16 +340,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const rearmSessionLeasesAfterFailedTransition = useCallback(
     (epoch: number, sessionToken: string | null, sessionUserId: string | null) => {
       // beginTransition fences every continuation immediately. If the operation
-      // then fails while the same signed-in identity remains, publish a render
-      // revision so memoized screen leases recapture that newer epoch instead
-      // of leaving an otherwise-valid visible session permanently inert.
+      // then fails while the same signed-in identity remains, republish the
+      // lease factory so memoized screen leases recapture that newer epoch.
+      // sessionVersion must stay stable: it keys the navigator and practice
+      // state and therefore represents identity, not an internal lease rearm.
       if (
         sessionToken !== null &&
         epoch === epochRef.current &&
         sessionToken === tokenRef.current &&
         sessionUserId === (userRef.current?.id ?? null)
       ) {
-        setSessionVersion((version) => version + 1);
+        setLeaseRevision((revision) => revision + 1);
       }
     },
     [],
@@ -382,13 +394,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         throw new LocalSignOutUnconfirmedError();
       }
 
-      void cancelDailyReminderQuietly();
-      void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
-      const pendingCleanup = await Promise.allSettled([schedulePendingCleanup()]);
-      if (!stillOwnsSession()) return;
+      // Once serialized reads prove the exact bearer absent, fence old work and
+      // close the protected UI synchronously. Pending-assessment cleanup can be
+      // slow or hung in the OS credential store and must not delay that fence.
+      const pendingCleanup = schedulePendingCleanup();
       epochRef.current += 1;
       resetMemorySession();
-      if (pendingCleanup[0]?.status === 'rejected') {
+      void cancelDailyReminderQuietly();
+      void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
+      try {
+        await pendingCleanup;
+      } catch {
         throw new LogoutCleanupError();
       }
     } finally {
@@ -424,7 +440,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       tokenRef.current = parsed.token;
       setToken(parsed.token);
       setUser(parsed.user);
-      mirrorAccountLanguage(parsed.user.uiLanguage);
+      void Promise.resolve(mirrorAccountLanguage(parsed.user.uiLanguage)).catch(() => undefined);
       setSessionVersion((version) => version + 1);
       return parsed.user;
     },

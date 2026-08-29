@@ -123,8 +123,8 @@ const envSchema = z
     ADS_HOME_BANNER_ENABLED: bool,
     ADS_HISTORY_NATIVE_ENABLED: bool,
     // Oldest app version the API still answers ("1.2.3"). Empty disables the
-    // gate outside production. Production has a hard 1.1.0 floor because
-    // earlier clients do not understand durable shared practice cycles.
+    // gate outside production. Production has a hard 1.1.1 floor because
+    // earlier clients do not understand diagnostic-run result retirement.
     MIN_CLIENT_VERSION: z
       .string()
       .trim()
@@ -457,14 +457,14 @@ export const config = {
     homeBannerEnabled: env.ADS_HOME_BANNER_ENABLED,
     historyNativeEnabled: env.ADS_HISTORY_NATIVE_ENABLED,
   },
-  // Practice serving cycles are a required request/response behavior, not an
+  // Diagnostic-run result retirement is required recovery behavior, not an
   // additive field older apps can safely ignore. Production therefore retires
-  // pre-cycle builds even when the deploy forgot to set the explicit knob.
+  // pre-1.1.1 builds even when the deploy forgot to set the explicit knob.
   minClientVersion:
     env.NODE_ENV === 'production'
-      ? compareDottedVersions(env.MIN_CLIENT_VERSION || '1.1.0', '1.1.0') < 0
-        ? '1.1.0'
-        : env.MIN_CLIENT_VERSION || '1.1.0'
+      ? compareDottedVersions(env.MIN_CLIENT_VERSION || '1.1.1', '1.1.1') < 0
+        ? '1.1.1'
+        : env.MIN_CLIENT_VERSION || '1.1.1'
       : env.MIN_CLIENT_VERSION || undefined,
   ffmpegPath: env.FFMPEG_PATH,
   ffprobePath: env.FFPROBE_PATH,

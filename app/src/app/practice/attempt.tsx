@@ -63,6 +63,11 @@ export default function AttemptScreen() {
   const activeRecorderOwnerRef = useRef<string | null>(null);
   const handledResultRequestIdsRef = useRef(new Set<string>());
   const recoveryExitRef = useRef<string | null>(null);
+  const [promptSnapshot, setPromptSnapshot] = useState<{
+    owner: string;
+    promptWord: string;
+    questionText: string;
+  } | null>(null);
   const params = useLocalSearchParams<{
     questionId?: string;
     cycleId?: string;
@@ -171,8 +176,35 @@ export default function AttemptScreen() {
     retry: false,
   });
 
-  const promptWord = helpQuery.data?.promptWord;
-  const questionText = helpQuery.data?.questionText;
+  // A cross-device mother-tongue edit changes the help query key and the root
+  // profile bridge retires the former language cache. Snapshot only the routed
+  // cycle's loaded English prompt, then use it through replacement loading or
+  // failure so Recorder stays mounted beside nonblocking retry UI. A new
+  // route, placement, session, or cycle cannot inherit the snapshot.
+  const promptOwner = `${renderOwner}:${user?.cefrLevel ?? 'unplaced'}:${validQuestionId ?? 'invalid'}:${
+    validCycleId ?? 'invalid'
+  }`;
+  const loadedPromptWord = helpQuery.data?.promptWord;
+  const loadedQuestionText = helpQuery.data?.questionText;
+  useLayoutEffect(() => {
+    if (!loadedPromptWord || !loadedQuestionText) return;
+    // Deliberate layout-phase handoff: the snapshot must exist before a later
+    // profile-refresh effect can remove the active help cache.
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Preserve an active recorder across the query-key handoff.
+    setPromptSnapshot({
+      owner: promptOwner,
+      promptWord: loadedPromptWord,
+      questionText: loadedQuestionText,
+    });
+  }, [loadedPromptWord, loadedQuestionText, promptOwner]);
+  const replacementPending =
+    !loadedPromptWord && !loadedQuestionText && (helpQuery.isPending || helpQuery.isFetching);
+  const retainedPrompt =
+    (replacementPending || helpQuery.isError) && promptSnapshot?.owner === promptOwner
+      ? promptSnapshot
+      : null;
+  const promptWord = loadedPromptWord || retainedPrompt?.promptWord;
+  const questionText = loadedQuestionText || retainedPrompt?.questionText;
 
   // Hardware back is a normal exit here, except while a recording, upload, or
   // recovery is active — popping then would let blur cleanup discard the take.
@@ -369,8 +401,8 @@ export default function AttemptScreen() {
       contentContainerStyle={styles.container}
     >
       <DataRefreshNotice
-        updating={helpQuery.isRefetching && !helpQuery.isRefetchError}
-        failed={helpQuery.isRefetchError}
+        updating={helpQuery.isFetching && !helpQuery.isError}
+        failed={helpQuery.isError}
         onRetry={() => void helpQuery.refetch({ cancelRefetch: false })}
       />
       <View style={styles.card}>

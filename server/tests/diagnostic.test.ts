@@ -152,6 +152,119 @@ describe('diagnostic', () => {
     expect(counts.rows[0]).toEqual({ attempts: 1, usage: 1 });
   });
 
+  it('burns a completed request tombstone and rejects both status and POST replay after restart', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const questionId = next.body.question.id as string;
+    const requestId = randomUUID();
+    const first = await answerForm(
+      request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+      questionId,
+      requestId,
+    );
+    expect(first.status).toBe(200);
+    const runBefore = await pool.query<{ diagnostic_run_id: string }>(
+      'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
+
+    const restarted = await request(a)
+      .post('/diagnostic/restart')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ confirm: true });
+    expect(restarted.status).toBe(204);
+    const runAfter = await pool.query<{ diagnostic_run_id: string }>(
+      'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
+    expect(runAfter.rows[0].diagnostic_run_id).not.toBe(runBefore.rows[0].diagnostic_run_id);
+
+    const retiredError = {
+      error: 'This diagnostic answer belongs to a restarted placement; record a new answer',
+      code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+    };
+    const oldStatus = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${token}`);
+    expect(oldStatus.status).toBe(409);
+    expect(oldStatus.body).toEqual(retiredError);
+
+    const oldReplay = await answerForm(
+      request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+      questionId,
+      requestId,
+    );
+    expect(oldReplay.status).toBe(409);
+    expect(oldReplay.body).toEqual(retiredError);
+    const tombstone = await pool.query<{
+      status: string;
+      response_version: number;
+      diagnostic_run_id: string;
+      attempts: number;
+      usage: number;
+    }>(
+      `SELECT request.status, request.response_version, request.diagnostic_run_id,
+              (SELECT count(*)::int FROM attempts
+               WHERE user_id = $1 AND context = 'diagnostic') AS attempts,
+              (SELECT count(*)::int FROM assessment_usage WHERE user_id = $1) AS usage
+       FROM assessment_requests AS request
+       WHERE request.user_id = $1 AND request.request_id = $2`,
+      [userId, requestId],
+    );
+    expect(tombstone.rows).toEqual([
+      {
+        status: 'completed',
+        response_version: 1,
+        diagnostic_run_id: runBefore.rows[0].diagnostic_run_id,
+        attempts: 1,
+        usage: 1,
+      },
+    ]);
+  });
+
+  it('converts a processing request into a non-replayable 48-hour tombstone on restart', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const questionId = next.body.question.id as string;
+    const requestId = randomUUID();
+    await pool.query(
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status)
+       VALUES ($1, $2, $3, 'diagnostic', $4, 'processing')`,
+      [userId, requestId, randomUUID(), questionId],
+    );
+
+    const restarted = await request(a)
+      .post('/diagnostic/restart')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ confirm: true });
+    expect(restarted.status).toBe(204);
+    const row = await pool.query<{
+      status: string;
+      response_version: number;
+      response_body: Record<string, unknown>;
+      completed_at: string | null;
+    }>(
+      `SELECT status, response_version, response_body, completed_at
+       FROM assessment_requests WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+    expect(row.rows).toEqual([
+      {
+        status: 'completed',
+        response_version: 1,
+        response_body: {},
+        completed_at: expect.any(Date),
+      },
+    ]);
+
+    const status = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${token}`);
+    expect(status.status).toBe(409);
+    expect(status.body.code).toBe('ASSESSMENT_RESULT_INCOMPATIBLE');
+  });
+
   it('POST /answer with a malformed UUID returns 400 (not a PG 22P02 500)', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;

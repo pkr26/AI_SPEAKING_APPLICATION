@@ -1202,6 +1202,25 @@ describe('settings profile card', () => {
     expect(uiLanguageChip(2).props.accessibilityState).toMatchObject({ disabled: false });
   });
 
+  it('surfaces a device-language mirror failure after the account update succeeds', async () => {
+    const updated = { ...USER, uiLanguage: 'hi' as const };
+    mockUpdateProfile.mockResolvedValue(updated);
+    mockMirrorAccountLanguage.mockRejectedValueOnce(new Error('keychain unavailable'));
+    await renderSettings();
+
+    await act(async () => {
+      await fireEvent.press(appLanguageChip(1));
+    });
+
+    expect(mockAuthValue.setUser).toHaveBeenCalledWith(updated);
+    expect(mockMirrorAccountLanguage).toHaveBeenCalledWith('hi');
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      translateFor('hi', 'language.saveFailed'),
+    );
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
+  });
+
   it('publishes no stale app-language failure or finalizer after identity replacement', async () => {
     const update = deferred<User>();
     mockUpdateProfile.mockReturnValue(update.promise);
@@ -3521,13 +3540,13 @@ describe('account actions', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
 
-    // AuthProvider fences the failed transition and then increments
-    // sessionVersion so mounted leases are recaptured. Token and user identity
-    // remain unchanged, so the already-visible native Alert must still work.
+    // AuthProvider fences the failed transition and then republishes its lease
+    // capture callback. sessionVersion remains identity-stable, so practice and
+    // navigation providers stay mounted while this visible Alert still works.
     mockAuthValue = makeAuth({
       token: 'token-abc',
       user: USER,
-      sessionVersion: 2,
+      sessionVersion: 1,
       logout,
       signOutThisDevice,
     });

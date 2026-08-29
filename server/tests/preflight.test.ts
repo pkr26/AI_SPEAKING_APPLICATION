@@ -15,7 +15,7 @@ vi.mock('pg', () => ({
 }));
 
 import { preflight, runPreflightCommand } from '../db/preflight';
-import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
+import { RUNTIME_SCHEMA_CUTOVERS } from '../db/schema-cutover';
 import { REQUIRED_CEFR_LEVELS } from '../src/question-inventory';
 
 const DATABASE_URL = 'postgres://localhost:5432/preflight_test';
@@ -29,7 +29,7 @@ const CHECK_NAMES = [
   'invalid assessment request cycle versions',
   'invalid pending diagnostic answer summaries',
   'invalid diagnostic states',
-  'invalid recording privacy cutover fence',
+  ...RUNTIME_SCHEMA_CUTOVERS.map(({ name }) => `invalid runtime cutover fence ${name}`),
 ] as const;
 
 function inventoryRow(cefr_level: string, prompt_word = 'word') {
@@ -78,9 +78,9 @@ describe('database integrity preflight', () => {
     });
     expect(connect).toHaveBeenCalledOnce();
     expect(query.mock.calls[0]).toEqual(["SET statement_timeout = '60s'"]);
-    expect(query).toHaveBeenCalledTimes(11);
-    const integritySql = query.mock.calls.slice(1, 10).map(([sql]) => String(sql));
-    expect(integritySql).toHaveLength(9);
+    expect(query).toHaveBeenCalledTimes(12);
+    const integritySql = query.mock.calls.slice(1, 11).map(([sql]) => String(sql));
+    expect(integritySql).toHaveLength(10);
     expect(integritySql[0]).toContain('token_version <= 0');
     expect(integritySql[0]).toContain('diagnostic_completed AND cefr_level IS NULL');
     expect(integritySql[0]).toContain("btrim(name, U&'\\0009");
@@ -107,11 +107,13 @@ describe('database integrity preflight', () => {
     expect(integritySql[6]).toContain('LIMIT state.questions_asked');
     expect(integritySql[6]).toContain("btrim(active_run.transcript, U&'\\0009");
     expect(integritySql[7]).toContain('low_idx > high_idx + 1');
-    expect(integritySql[8]).toContain(RECORDING_PRIVACY_CUTOVER.requiredMigration);
-    expect(integritySql[8]).toContain(RECORDING_PRIVACY_CUTOVER.name);
-    expect(integritySql[8]).toContain(RECORDING_PRIVACY_CUTOVER.checksum);
-    expect(integritySql[8]).toContain('IS DISTINCT FROM');
-    expect(query.mock.calls[10]).toEqual([
+    for (const [index, cutover] of RUNTIME_SCHEMA_CUTOVERS.entries()) {
+      expect(integritySql[8 + index]).toContain(cutover.requiredMigration);
+      expect(integritySql[8 + index]).toContain(cutover.name);
+      expect(integritySql[8 + index]).toContain(cutover.checksum);
+      expect(integritySql[8 + index]).toContain('IS DISTINCT FROM');
+    }
+    expect(query.mock.calls[11]).toEqual([
       expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations'),
       [601],
     ]);
@@ -129,7 +131,7 @@ describe('database integrity preflight', () => {
   );
 
   it('reports multiple integrity failures on separate operator-readable lines', async () => {
-    mockPreflightQueries([2, 0, 3, 0, 0, 0, 0, 0, 0]);
+    mockPreflightQueries([2, 0, 3, 0, 0, 0, 0, 0, 0, 0]);
 
     await expect(preflight(DATABASE_URL)).rejects.toThrow(
       'database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - invalid users: 2\n  - invalid question metadata: 3',

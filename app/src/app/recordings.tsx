@@ -16,6 +16,8 @@ interface RecordingFetchMeta {
   fetchMore: { direction: 'forward' | 'backward' };
 }
 
+export const RECORDING_MAX_PAGES = 500;
+
 export const RECORDING_DATE_LOCALES: Record<UiLanguage, string> = {
   en: 'en-US',
   te: 'te-IN',
@@ -42,8 +44,13 @@ export function nextRecordingPageParam(
   allPages: RecordingPage[],
 ): string | undefined {
   const next = lastPage.nextCursor;
-  if (next === null) return undefined;
+  if (next === null || allPages.length >= RECORDING_MAX_PAGES) return undefined;
   return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
+}
+
+function recordingPaginationStopped(pages: RecordingPage[] | undefined): boolean {
+  if (!pages?.length || pages.at(-1)?.nextCursor === null) return false;
+  return nextRecordingPageParam(pages[pages.length - 1]!, pages) === undefined;
 }
 
 export function recordingContextMessageKey(context: RecordingItem['context']): MessageKey {
@@ -147,6 +154,7 @@ export default function RecordingsScreen() {
     () => recordingsQuery.data?.pages.flatMap((page) => page.items) ?? [],
     [recordingsQuery.data],
   );
+  const paginationStopped = recordingPaginationStopped(recordingsQuery.data?.pages);
 
   if (!user) return null;
 
@@ -308,6 +316,12 @@ export default function RecordingsScreen() {
               {userMessageForError(recordingsQuery.error, t('recordings.loadFailed'))}
             </Text>
             <Button title={t('common.tryAgain')} variant="secondary" onPress={loadOlder} />
+          </View>
+        ) : paginationStopped ? (
+          <View style={styles.footer}>
+            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+              {t('pagination.safetyStop')}
+            </Text>
           </View>
         ) : recordingsQuery.hasNextPage ? (
           <Button

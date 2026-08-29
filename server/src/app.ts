@@ -54,8 +54,9 @@ export function createApp({
     }),
   );
 
-  // Outdated clients (per MIN_CLIENT_VERSION) get a cheap, deterministic 426
-  // before any budget or parsing work; probes and version-less clients pass.
+  // Outdated, version-less, or malformed clients (per MIN_CLIENT_VERSION) get
+  // a cheap deterministic 426 before budget/parsing work. Operational probes
+  // and the explicit privacy/account exits are exempt in middleware.ts.
   app.use(clientVersionGate);
 
   const limiters = buildLimiters();

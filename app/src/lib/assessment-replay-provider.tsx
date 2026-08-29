@@ -18,12 +18,13 @@ import { parseAssessmentReplayStatus } from './assessment-replay';
 import { useAuth } from './auth';
 import { useT } from './i18n';
 import {
-  clearPendingAssessment,
+  clearPendingAssessmentIfRequestMatches,
   getPendingAssessmentReplayRevision,
   loadPendingAssessment,
   markPendingAssessmentFeedbackPending,
   pendingAssessmentFeedbackIsExpired,
   subscribeToPendingAssessmentReplay,
+  type PendingAssessment,
 } from './pending-assessment';
 import { usePracticeFlow } from './practice-flow';
 import { createThemedStyles, useTheme } from './theme';
@@ -106,10 +107,32 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
+    let queriedPointer: Pick<PendingAssessment, 'requestId' | 'stage'> | null = null;
     if (!shouldCheck || !user) return () => controller.abort();
 
     const stillCurrent = () =>
       active && !controller.signal.aborted && isSessionLeaseCurrent(sessionLease);
+    const retireReplayPointer = async (requestId: string, refreshCanonical = true) => {
+      // The clear is request-conditional, so a late terminal response can
+      // never erase a newer handoff installed by Recorder or another screen.
+      const retired = await clearPendingAssessmentIfRequestMatches(requestId);
+      if (!stillCurrent()) return;
+      if (!retired) {
+        // A newer slot won the race. Change the check identity so this effect
+        // is replaced and the provider processes that current pointer instead
+        // of exposing children while it remains unresolved.
+        setRetryVersion((version) => version + 1);
+        return;
+      }
+      // Both assessment contexts can advance their canonical question after a
+      // completed/retired request. Drop either cached snapshot before exposing
+      // the protected app again.
+      if (refreshCanonical) {
+        queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
+        queryClient.removeQueries({ queryKey: ['practice-question'] });
+      }
+      setState({ ...initialState(identity, checkKey, false), phase: 'ready' });
+    };
     void (async () => {
       try {
         const pending = await loadPendingAssessment();
@@ -119,9 +142,7 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
           return;
         }
         if (pending.ownerId !== user.id) {
-          await clearPendingAssessment(pending.requestId);
-          if (stillCurrent())
-            setState({ ...initialState(identity, checkKey, false), phase: 'ready' });
+          await retireReplayPointer(pending.requestId, false);
           return;
         }
         if (pending.stage !== 'feedback-pending' && pending.stage !== 'reconcile') {
@@ -129,14 +150,14 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
           return;
         }
         if (pendingAssessmentFeedbackIsExpired(pending)) {
-          await clearPendingAssessment(pending.requestId);
-          if (!stillCurrent()) return;
-          queryClient.removeQueries({ queryKey: ['diagnostic-next'] });
-          queryClient.removeQueries({ queryKey: ['practice-question'] });
-          setState({ ...initialState(identity, checkKey, false), phase: 'ready' });
+          await retireReplayPointer(pending.requestId);
           return;
         }
 
+        // Bind every later status/error decision to the pointer whose request
+        // is actually being queried. The SecureStore slot may be replaced
+        // while this request is in flight.
+        queriedPointer = { requestId: pending.requestId, stage: pending.stage };
         const raw = await apiFetch<unknown>(
           `/assessments/${encodeURIComponent(pending.requestId)}`,
           { signal: controller.signal },
@@ -193,7 +214,39 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
         const pending = await loadPendingAssessment().catch(() => null);
         if (!stillCurrent()) return;
         if (
-          pending?.stage !== 'feedback-pending' &&
+          queriedPointer &&
+          (pending?.requestId !== queriedPointer.requestId ||
+            pending?.stage !== queriedPointer.stage)
+        ) {
+          // The HTTP error belongs to the old pointer. Re-run the provider for
+          // the current slot without clearing or classifying its replacement.
+          setRetryVersion((version) => version + 1);
+          return;
+        }
+        const terminalReplayRequestId =
+          queriedPointer?.stage === 'feedback-pending' &&
+          pending !== null &&
+          error instanceof ApiError &&
+          error.status === 404
+            ? queriedPointer.requestId
+            : queriedPointer !== null &&
+                pending !== null &&
+                error instanceof ApiError &&
+                error.status === 409 &&
+                error.code === 'ASSESSMENT_RESULT_INCOMPATIBLE'
+              ? queriedPointer.requestId
+              : null;
+        if (terminalReplayRequestId) {
+          try {
+            await retireReplayPointer(terminalReplayRequestId);
+          } catch {
+            if (stillCurrent()) {
+              setState({ ...initialState(identity, checkKey, false), phase: 'error' });
+            }
+          }
+        } else if (
+          queriedPointer !== null &&
+          queriedPointer.stage !== 'feedback-pending' &&
           error instanceof ApiError &&
           error.status === 404
         ) {

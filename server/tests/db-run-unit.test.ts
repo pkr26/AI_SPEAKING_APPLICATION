@@ -35,7 +35,7 @@ import {
   seed,
   setupDatabase,
 } from '../db/run';
-import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
+import { ASSESSMENT_RECOVERY_CUTOVER, RECORDING_PRIVACY_CUTOVER, RUNTIME_SCHEMA_CUTOVERS } from '../db/schema-cutover';
 
 const migrationsDir = path.join(__dirname, '../db/migrations');
 
@@ -54,7 +54,7 @@ function migrationRows(firstChecksum: string | null = 'recorded') {
 function appliedMigrationRows(firstChecksum: string | null = 'recorded') {
   return [
     ...migrationRows(firstChecksum),
-    { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
+    ...RUNTIME_SCHEMA_CUTOVERS.map(({ name, checksum }) => ({ name, checksum })),
   ];
 }
 
@@ -334,9 +334,12 @@ describe('database deployment runner', () => {
     expect(client.query.mock.calls.some(([sql]) => String(sql).startsWith('UPDATE schema_migrations'))).toBe(false);
   });
 
-  it('allows an unfenced pre-023 database to apply the cutover migration', async () => {
+  it('allows an unfenced pre-023 database to apply both ordered cutover migrations', async () => {
     const ordinary = migrationRows();
-    const beforeCutover = ordinary.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration);
+    const beforeCutover = ordinary.filter(
+      ({ name }) =>
+        name !== RECORDING_PRIVACY_CUTOVER.requiredMigration && name !== ASSESSMENT_RECOVERY_CUTOVER.requiredMigration,
+    );
     const client = provideClient(async (sql) => {
       if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: beforeCutover };
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
@@ -345,34 +348,52 @@ describe('database deployment runner', () => {
 
     await expect(migrate('postgres://localhost/release_test')).resolves.toEqual([
       RECORDING_PRIVACY_CUTOVER.requiredMigration,
+      ASSESSMENT_RECOVERY_CUTOVER.requiredMigration,
     ]);
 
     expect(client.query).toHaveBeenCalledWith(
       fs.readFileSync(path.join(migrationsDir, RECORDING_PRIVACY_CUTOVER.requiredMigration), 'utf8'),
     );
+    expect(client.query).toHaveBeenCalledWith(
+      fs.readFileSync(path.join(migrationsDir, ASSESSMENT_RECOVERY_CUTOVER.requiredMigration), 'utf8'),
+    );
   });
 
-  it('rejects a missing, altered, or out-of-sequence recording-privacy cutover fence', async () => {
-    const ordinary = migrationRows();
-    const cases = [
-      ordinary,
-      [...ordinary, { name: RECORDING_PRIVACY_CUTOVER.name, checksum: '0'.repeat(64) }],
-      [
-        ...ordinary.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration),
-        { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
-      ],
+  it('allows a fenced pre-024 database to apply the assessment-recovery cutover', async () => {
+    const rows = [
+      ...migrationRows().filter(({ name }) => name !== ASSESSMENT_RECOVERY_CUTOVER.requiredMigration),
+      { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
     ];
+    provideClient(async (sql) => {
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      return { rows: [] };
+    });
 
-    for (const rows of cases) {
-      const client = provideClient(async (sql) => {
-        if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
-        if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-        return { rows: [] };
-      });
-      await expect(migrate('postgres://localhost/release_test')).rejects.toThrow(
-        'database recording-privacy cutover fence is missing, invalid, or out of sequence',
-      );
-      expect(client.query).not.toHaveBeenCalledWith('BEGIN');
+    await expect(migrate('postgres://localhost/release_test')).resolves.toEqual([
+      ASSESSMENT_RECOVERY_CUTOVER.requiredMigration,
+    ]);
+  });
+
+  it('rejects every missing, altered, duplicated, or out-of-sequence runtime cutover fence', async () => {
+    const current = appliedMigrationRows();
+    for (const cutover of RUNTIME_SCHEMA_CUTOVERS) {
+      const cases = [
+        current.filter(({ name }) => name !== cutover.name),
+        current.map((row) => (row.name === cutover.name ? { ...row, checksum: '0'.repeat(64) } : row)),
+        [...current, { name: cutover.name, checksum: cutover.checksum }],
+        current.filter(({ name }) => name !== cutover.requiredMigration),
+      ];
+
+      for (const rows of cases) {
+        const client = provideClient(async (sql) => {
+          if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
+          if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+          return { rows: [] };
+        });
+        await expect(migrate('postgres://localhost/release_test')).rejects.toThrow(cutover.name);
+        expect(client.query).not.toHaveBeenCalledWith('BEGIN');
+      }
     }
   });
 

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react-native';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Text } from 'react-native';
 
 import {
@@ -25,6 +25,7 @@ import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { cancelDailyReminderQuietly } from '../src/lib/daily-reminder';
 import { clearPendingAssessment } from '../src/lib/pending-assessment';
 import { cleanupPrivateArtifacts } from '../src/lib/private-artifacts';
+import { PracticeFlowProvider, usePracticeFlow } from '../src/lib/practice-flow';
 import { markSessionExpiredNotice } from '../src/lib/session-notice';
 import { ContractError, type User } from '../src/lib/types';
 
@@ -116,6 +117,9 @@ function deferred<T>() {
 
 let auth: ReturnType<typeof useAuth> | null = null;
 let renderedSessionLease: SessionLease | null = null;
+let practiceFlow: ReturnType<typeof usePracticeFlow> | null = null;
+let reportLogoutFailure: (() => Promise<void>) | null = null;
+let compositionProbeMounts = 0;
 
 function Capture() {
   const value = useAuth();
@@ -138,7 +142,7 @@ function SessionDisplay() {
   );
 }
 
-/** Mirrors the sessionVersion-keyed lease pattern used by mounted screens. */
+/** Mirrors the identity-version plus capture-callback pattern used by screens. */
 function MemoizedSessionLeaseCapture() {
   const { sessionVersion, captureSessionLease } = useAuth();
   const lease = useMemo(() => {
@@ -149,6 +153,34 @@ function MemoizedSessionLeaseCapture() {
     renderedSessionLease = lease;
   }, [lease]);
   return null;
+}
+
+function AuthPracticeCompositionProbe() {
+  const authValue = useAuth();
+  const flowValue = usePracticeFlow();
+  const [reportedError, setReportedError] = useState('none');
+  useEffect(() => {
+    compositionProbeMounts += 1;
+  }, []);
+  useEffect(() => {
+    auth = authValue;
+    practiceFlow = flowValue;
+    reportLogoutFailure = async () => {
+      try {
+        await authValue.logout();
+      } catch (error) {
+        setReportedError(error instanceof Error ? error.message : 'reported');
+      }
+    };
+  });
+  return (
+    <>
+      <Text testID="composition-session-version">{String(authValue.sessionVersion)}</Text>
+      <Text testID="composition-answer-mode">{flowValue.answerMode}</Text>
+      <Text testID="composition-feedback">{flowValue.feedback?.questionId ?? 'none'}</Text>
+      <Text testID="composition-error">{reportedError}</Text>
+    </>
+  );
 }
 
 function text(testID: string): string {
@@ -197,6 +229,26 @@ async function renderLoggedIn(token = 'tok-1') {
   return rendered;
 }
 
+async function renderAuthPracticeComposition() {
+  const restore = deferred<string | null>();
+  mockedGetToken.mockReturnValue(restore.promise);
+  const queryClient = new QueryClient();
+  const rendered = await render(
+    <QueryClientProvider client={queryClient}>
+      <AuthProvider>
+        <PracticeFlowProvider>
+          <AuthPracticeCompositionProbe />
+        </PracticeFlowProvider>
+      </AuthProvider>
+    </QueryClientProvider>,
+  );
+  await act(async () => {
+    restore.resolve(null);
+    await restore.promise;
+  });
+  return { ...rendered, queryClient };
+}
+
 /**
  * Hands the provider a different QueryClient and returns a spy on the cache
  * that is live afterwards. Every session callback must clear the cache the tree
@@ -236,6 +288,9 @@ beforeEach(() => {
   jest.resetAllMocks();
   auth = null;
   renderedSessionLease = null;
+  practiceFlow = null;
+  reportLogoutFailure = null;
+  compositionProbeMounts = 0;
   mockedGetToken.mockResolvedValue(null);
   mockedSaveToken.mockResolvedValue(undefined);
   mockedClearToken.mockResolvedValue(true);
@@ -639,7 +694,7 @@ describe('logout', () => {
 
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
 
     mockedApiFetch.mockResolvedValueOnce(undefined);
     await act(async () => {
@@ -776,6 +831,32 @@ describe('verified local sign-out', () => {
     expect(text('sessionVersion')).toBe('3');
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
+  });
+
+  it('closes the protected session before pending cleanup settles', async () => {
+    await renderLoggedIn();
+    const cleanup = deferred<void>();
+    const lease = auth!.captureSessionLease();
+    mockedGetToken.mockResolvedValueOnce('tok-1').mockResolvedValueOnce(null);
+    mockedClearPendingAssessment.mockReturnValueOnce(cleanup.promise);
+
+    let signOut!: Promise<void>;
+    await act(async () => {
+      signOut = auth!.signOutThisDevice!();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+
+    await act(async () => {
+      cleanup.resolve();
+      await signOut;
+    });
   });
 
   it('keeps a valid session visible when the verification read still finds a token', async () => {
@@ -1082,7 +1163,7 @@ describe('changePassword', () => {
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1111,7 +1192,7 @@ describe('changePassword', () => {
 
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + change-password; no /auth/me
 
@@ -1141,7 +1222,7 @@ describe('changePassword', () => {
 
       expect(text('token')).toBe('tok-1');
       expect(text('userEmail')).toBe(USER.email);
-      expect(text('sessionVersion')).toBe('3');
+      expect(text('sessionVersion')).toBe('2');
       expect(mockedClearToken).not.toHaveBeenCalled();
 
       mockedApiFetch.mockReset();
@@ -1323,7 +1404,7 @@ describe('deleteAccount', () => {
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
 
     mockedApiFetch.mockReset();
@@ -1346,7 +1427,7 @@ describe('deleteAccount', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1362,7 +1443,7 @@ describe('deleteAccount', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1379,7 +1460,7 @@ describe('deleteAccount', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + DELETE; no misleading /auth/me probe
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1395,7 +1476,7 @@ describe('deleteAccount', () => {
 
     expect(mockedApiFetch).toHaveBeenCalledTimes(2);
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('3');
+    expect(text('sessionVersion')).toBe('2');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1694,6 +1775,7 @@ describe('session leases', () => {
         // beginTransition must still fence old screen continuations while the
         // mutation outcome is unknown.
         expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(false);
+        expect(auth!.isSessionLeaseCurrent(leaseBefore, { identityOnly: true })).toBe(true);
         await Promise.resolve();
       });
 
@@ -1709,12 +1791,47 @@ describe('session leases', () => {
 
       expect(text('token')).toBe('tok-1');
       expect(text('userEmail')).toBe(USER.email);
-      expect(text('sessionVersion')).toBe('3');
+      expect(text('sessionVersion')).toBe('2');
       expect(renderedSessionLease).not.toBe(leaseBefore);
       expect(auth!.isSessionLeaseCurrent(renderedSessionLease!)).toBe(true);
       expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(false);
+      expect(auth!.isSessionLeaseCurrent(leaseBefore, { identityOnly: true })).toBe(true);
     },
   );
+
+  it('reports a failed logout without remounting real root practice state', async () => {
+    await renderAuthPracticeComposition();
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-1'));
+    await act(async () => {
+      await auth!.login('a@example.com', 'secret1');
+    });
+    await act(async () => {
+      practiceFlow!.setAnswerMode('native');
+      practiceFlow!.showFeedback('question-kept', {
+        cycleId: '550e8400-e29b-41d4-a716-446655440020',
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 40,
+        transcript: 'I tried.',
+        feedback: 'Keep going.',
+      });
+    });
+    const mountsBeforeFailure = compositionProbeMounts;
+    const failure = new ApiError(503, 'server unavailable');
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await reportLogoutFailure!();
+    });
+
+    expect(screen.getByTestId('composition-session-version')).toHaveTextContent('2');
+    expect(screen.getByTestId('composition-answer-mode')).toHaveTextContent('native');
+    expect(screen.getByTestId('composition-feedback')).toHaveTextContent('question-kept');
+    expect(screen.getByTestId('composition-error')).toHaveTextContent('server unavailable');
+    expect(compositionProbeMounts).toBe(mountsBeforeFailure);
+  });
 
   it('keeps a lease current across a same-user profile update', async () => {
     await renderLoggedIn();

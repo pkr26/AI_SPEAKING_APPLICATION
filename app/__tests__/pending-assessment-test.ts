@@ -4,6 +4,7 @@ import {
   acknowledgePendingAssessmentFeedback,
   claimPendingAssessmentRecoveryPost,
   clearPendingAssessment,
+  clearPendingAssessmentIfRequestMatches,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
   markPendingAssessmentFeedbackPending,
@@ -116,6 +117,18 @@ describe('durable assessment handoff', () => {
     expect(await loadPendingAssessment()).toBeNull();
   });
 
+  it('reports whether a request-conditional retirement actually removed the slot', async () => {
+    await savePendingAssessment(pending);
+
+    await expect(
+      clearPendingAssessmentIfRequestMatches('550e8400-e29b-41d4-a716-446655440099'),
+    ).resolves.toBe(false);
+    expect(await loadPendingAssessment()).toEqual(pending);
+    await expect(clearPendingAssessmentIfRequestMatches('not-a-uuid')).resolves.toBe(false);
+    await expect(clearPendingAssessmentIfRequestMatches(pending.requestId)).resolves.toBe(true);
+    expect(await loadPendingAssessment()).toBeNull();
+  });
+
   it('keeps a server-replay pointer until the exact learner acknowledges feedback', async () => {
     const readyAt = pending.createdAt + 5_000;
     await savePendingAssessment({
@@ -170,8 +183,8 @@ describe('durable assessment handoff', () => {
     await clearPendingAssessment();
   });
 
-  it('expires feedback only at the 48-hour server replay boundary', () => {
-    const readyAt = pending.createdAt + 1;
+  it('expires feedback from handoff creation so delayed discovery cannot outlive server replay', () => {
+    const readyAt = pending.createdAt + 25 * 60 * 60_000;
     const feedbackPending: PendingAssessment = {
       ...pending,
       stage: 'feedback-pending',
@@ -181,9 +194,15 @@ describe('durable assessment handoff', () => {
     expect(
       pendingAssessmentFeedbackIsExpired(
         feedbackPending,
-        readyAt + PENDING_FEEDBACK_RETENTION_MS - 1,
+        pending.createdAt + PENDING_FEEDBACK_RETENTION_MS - 1,
       ),
     ).toBe(false);
+    expect(
+      pendingAssessmentFeedbackIsExpired(
+        feedbackPending,
+        pending.createdAt + PENDING_FEEDBACK_RETENTION_MS,
+      ),
+    ).toBe(true);
     expect(
       pendingAssessmentFeedbackIsExpired(feedbackPending, readyAt + PENDING_FEEDBACK_RETENTION_MS),
     ).toBe(true);
@@ -695,7 +714,7 @@ describe('pending assessment edge cases', () => {
     expect(await mod.loadPendingAssessment()).toEqual(feedbackPending);
   });
 
-  it('validates feedback timestamps before any secure-store access', async () => {
+  it('rejects invalid feedback timestamps and normalizes a backward wall-clock correction', async () => {
     const { secureStore, mod } = loadFresh();
 
     await expect(mod.markPendingAssessmentFeedbackPending(pending.requestId, 0)).rejects.toThrow(
@@ -705,10 +724,14 @@ describe('pending assessment edge cases', () => {
     jest.mocked(secureStore.setItemAsync).mockClear();
     await expect(
       mod.markPendingAssessmentFeedbackPending(pending.requestId, pending.createdAt - 1),
-    ).rejects.toThrow('feedbackReadyAt cannot predate the assessment');
+    ).resolves.toBe(true);
 
-    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
-    expect(await mod.loadPendingAssessment()).toEqual(pending);
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(1);
+    expect(await mod.loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: pending.createdAt,
+    });
   });
 
   it('conditionally acknowledges only a feedback-pending request', async () => {

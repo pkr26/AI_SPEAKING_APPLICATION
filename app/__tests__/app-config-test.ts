@@ -7,7 +7,7 @@ describe('app identity configuration', () => {
     expect(expo.name).toBe('AI English Coach');
     expect(expo.slug).toBe('ai-english-coach');
     expect(expo.scheme).toBe('aienglishcoach');
-    expect(expo.version).toBe('1.1.0');
+    expect(expo.version).toBe('1.1.1');
   });
 
   it('pins the platform bundle identifiers', () => {
@@ -18,8 +18,8 @@ describe('app identity configuration', () => {
   it('carries per-build store metadata both stores reject uploads without', () => {
     // Both stores reject a second upload that reuses a build identifier, so
     // these must exist to be bumped; `version` alone is not enough.
-    expect(expo.ios.buildNumber).toBe('2');
-    expect(expo.android.versionCode).toBe(2);
+    expect(expo.ios.buildNumber).toBe('3');
+    expect(expo.android.versionCode).toBe(3);
     // Declaring the app exempt from the US export-encryption filing (it only
     // uses HTTPS) keeps every App Store upload from stalling on the
     // encryption questionnaire.

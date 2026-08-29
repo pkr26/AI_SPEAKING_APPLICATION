@@ -328,6 +328,27 @@ describe('validated', () => {
     expect(res.body).toEqual({ value: 'SHOUT' });
   });
 
+  it('retains every parsed output when one middleware validates multiple schemas', async () => {
+    const paramsSchema = z.object({ slug: z.string().transform((value) => value.toUpperCase()) });
+    const bodySchema = z.object({ value: z.string().transform((value) => value.trim()) });
+    const a = express();
+    a.use(express.json());
+    a.post('/items/:slug', validate({ params: paramsSchema, body: bodySchema }), (req, res) => {
+      res.json({
+        params: validated(req, paramsSchema),
+        body: validated(req, bodySchema),
+      });
+    });
+    a.use(errorHandler);
+
+    const res = await request(a).post('/items/example').send({ value: '  preserved  ' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      params: { slug: 'EXAMPLE' },
+      body: { value: 'preserved' },
+    });
+  });
+
   it('throws loudly when a route reads a schema it never validated', async () => {
     const validatedSchema = z.object({ value: z.string() });
     const strangerSchema = z.object({ value: z.string() });
@@ -377,7 +398,7 @@ describe('clientVersionGate', () => {
 
   it('rejects an older client with the exact 426 upgrade contract', async () => {
     config.minClientVersion = '1.4.0';
-    const res = await request(a).get('/health').set('X-Client-Version', '1.3.9');
+    const res = await request(a).get('/client-config').set('X-Client-Version', '1.3.9');
     expect(res.status).toBe(426);
     expect(res.body).toEqual({
       error: 'This app version is no longer supported; please update it',
@@ -387,20 +408,35 @@ describe('clientVersionGate', () => {
 
   it('passes equal and newer versions, comparing missing segments as zero', async () => {
     config.minClientVersion = '1.4';
-    expect((await request(a).get('/health').set('X-Client-Version', '1.4.0')).status).toBe(200);
-    expect((await request(a).get('/health').set('X-Client-Version', '1.4')).status).toBe(200);
-    expect((await request(a).get('/health').set('X-Client-Version', '2')).status).toBe(200);
-    expect((await request(a).get('/health').set('X-Client-Version', '1.10.0')).status).toBe(200);
-    expect((await request(a).get('/health').set('X-Client-Version', '1.3.9')).status).toBe(426);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '1.4.0')).status).toBe(200);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '1.4')).status).toBe(200);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '2')).status).toBe(200);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '1.10.0')).status).toBe(200);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '1.3.9')).status).toBe(426);
   });
 
-  it('passes through when the gate is disabled or the header is absent or unparseable', async () => {
+  it('passes through when disabled but rejects an absent or malformed product-route header', async () => {
     config.minClientVersion = undefined;
-    expect((await request(a).get('/health').set('X-Client-Version', '0.0.1')).status).toBe(200);
+    expect((await request(a).get('/client-config').set('X-Client-Version', '0.0.1')).status).toBe(200);
 
     config.minClientVersion = '1.0.0';
-    expect((await request(a).get('/health')).status).toBe(200);
-    expect((await request(a).get('/health').set('X-Client-Version', 'not-a-version')).status).toBe(200);
+    for (const header of [undefined, 'not-a-version']) {
+      const pending = request(a).get('/client-config');
+      const response = await (header === undefined ? pending : pending.set('X-Client-Version', header));
+      expect(response.status).toBe(426);
+      expect(response.body).toEqual({
+        error: 'This app version is no longer supported; please update it',
+        code: 'CLIENT_UPGRADE_REQUIRED',
+      });
+    }
+  });
+
+  it('keeps operational probes usable regardless of version header', async () => {
+    config.minClientVersion = '9.0.0';
+    for (const path of ['/health', '/health/']) {
+      expect((await request(a).get(path)).status).toBe(200);
+      expect((await request(a).get(path).set('X-Client-Version', 'malformed')).status).toBe(200);
+    }
   });
 
   it('is exported as standalone middleware that forwards the 426 as an HttpError', () => {
@@ -415,12 +451,26 @@ describe('clientVersionGate', () => {
   });
 
   it.each([
+    ['GET', '/health'],
+    ['GET', '/health/'],
+    ['HEAD', '/health'],
+    ['HEAD', '/HEALTH/'],
+    ['GET', '/ready'],
+    ['GET', '/ready/'],
+    ['GET', '/metrics'],
+    ['GET', '/metrics/'],
     ['POST', '/auth/logout'],
+    ['POST', '/auth/logout/'],
+    ['POST', '/AUTH/LOGOUT'],
     ['DELETE', '/auth/account'],
+    ['DELETE', '/auth/account/'],
     ['GET', '/auth/me/data'],
     ['GET', '/recordings/export'],
+    ['GET', '/recordings/export/'],
+    ['HEAD', '/RECORDINGS/EXPORT/'],
     ['DELETE', '/recordings'],
     ['DELETE', '/recordings/550e8400-e29b-41d4-a716-446655440000'],
+    ['DELETE', '/recordings/550e8400-e29b-41d4-a716-446655440000/'],
   ])('keeps the stable privacy exit %s %s available to an outdated client', (method, path) => {
     expect(clientVersionGateExempt(method, path)).toBe(true);
     config.minClientVersion = '2.0.0';
@@ -436,6 +486,8 @@ describe('clientVersionGate', () => {
     ['POST', '/recordings'],
     ['GET', '/recordings/550e8400-e29b-41d4-a716-446655440000'],
     ['DELETE', '/recordings/not-a-uuid'],
+    ['GET', '/health//'],
+    ['POST', '/ready'],
     ['GET', '/practice/question'],
   ])('does not exempt unrelated or wrong-method route %s %s', (method, path) => {
     expect(clientVersionGateExempt(method, path)).toBe(false);

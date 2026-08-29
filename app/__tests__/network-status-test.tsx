@@ -12,7 +12,7 @@ import {
   NetworkStatusBridge,
   resetNetworkStatusModuleForTests,
 } from '../src/lib/network-status';
-import { darkColors } from '../src/lib/theme';
+import { darkColors, spacing } from '../src/lib/theme';
 
 const asMock = (value: unknown) => value as jest.Mock;
 
@@ -117,6 +117,17 @@ it('subscribes before sampling, ignores a stale sample, and announces reconnect 
   expect(flattenedStyle(screen.getByRole('alert')).backgroundColor).toBe(darkColors.warning);
   expect(flattenedStyle(statusDot()).backgroundColor).toBe(darkColors.onWarning);
   expect(flattenedStyle(screen.getByText(offlineMessage)).color).toBe(darkColors.onWarning);
+  const bannerHost = screen.getByTestId('network-status-banner');
+  expect(flattenedStyle(bannerHost)).toMatchObject({
+    flexShrink: 0,
+    paddingHorizontal: spacing.md,
+    paddingBottom: spacing.sm,
+    alignItems: 'center',
+    backgroundColor: darkColors.background,
+  });
+  expect(flattenedStyle(bannerHost).position).toBeUndefined();
+  expect(flattenedStyle(bannerHost).top).toBeUndefined();
+  expect(flattenedStyle(bannerHost).zIndex).toBeUndefined();
 
   await act(async () => {
     initial.resolve({ isConnected: true, isInternetReachable: true });

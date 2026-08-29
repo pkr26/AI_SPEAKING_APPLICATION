@@ -34,7 +34,7 @@ export default function NetworkStatusBanner() {
   return (
     <View
       pointerEvents="none"
-      style={[styles.host, { top: insets.top + theme.spacing.sm }]}
+      style={[styles.host, { paddingBottom: insets.bottom + theme.spacing.sm }]}
       testID="network-status-banner"
     >
       <View
@@ -54,12 +54,10 @@ export default function NetworkStatusBanner() {
 
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   host: {
-    position: 'absolute',
-    left: spacing.md,
-    right: spacing.md,
-    zIndex: 1_000,
-    elevation: 12,
+    flexShrink: 0,
+    paddingHorizontal: spacing.md,
     alignItems: 'center',
+    backgroundColor: colors.background,
   },
   banner: {
     width: '100%',

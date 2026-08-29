@@ -121,7 +121,7 @@ describe('transaction rollback error precedence', () => {
 });
 
 describe('diagnostic transaction rollback precedence', () => {
-  it('returns the exact 404 when the served question disappears before the diagnostic claim', async () => {
+  it('returns the exact 409 when the diagnostic processing claim is unavailable', async () => {
     const user: UserRow = {
       id: randomUUID(),
       name: 'Missing Question Test',
@@ -148,6 +148,9 @@ describe('diagnostic transaction rollback precedence', () => {
         if (text === 'BEGIN' || text === 'COMMIT') return { rows: [], rowCount: null };
         if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') {
           return { rows: [user], rowCount: 1 };
+        }
+        if (text === 'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1') {
+          return { rows: [{ diagnostic_run_id: randomUUID() }], rowCount: 1 };
         }
         if (text.includes('DELETE FROM assessment_requests')) return { rows: [], rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rows: [], rowCount: 1 };
@@ -177,16 +180,17 @@ describe('diagnostic transaction rollback precedence', () => {
             rowCount: 1,
           };
         }
-        if (text.includes('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions'))
+        if (text.includes('UPDATE diagnostic_state') && text.includes('SET processing_question_id = $1')) {
           return { rows: [], rowCount: 0 };
+        }
         throw new Error(`unexpected diagnostic query: ${text}`);
       }),
       release: vi.fn(),
     };
     vi.spyOn(pool, 'query').mockImplementation(async (text: string) => {
       if (text === 'SELECT * FROM users WHERE id = $1') return { rows: [user], rowCount: 1 } as never;
-      // The shared submission pipeline's typed-row pre-check still sees the
-      // question; it disappears before the claim transaction re-reads it.
+      // The shared submission pipeline snapshots this exact row into the
+      // durable request before the diagnostic-state claim is attempted.
       if (text === 'SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1') {
         return {
           rows: [
@@ -230,15 +234,18 @@ describe('diagnostic transaction rollback precedence', () => {
       .field('questionId', questionId)
       .field('requestId', requestId);
 
-    expect(response.status).toBe(404);
-    expect(response.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'An assessment is already in progress',
+      code: 'ASSESSMENT_IN_PROGRESS',
+    });
     expect(requestClaimClient.release).toHaveBeenCalledOnce();
     expect(diagnosticClient.release).toHaveBeenCalledOnce();
     expect(diagnosticClient.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
       'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
       expect.stringContaining('SELECT * FROM diagnostic_state'),
-      expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations FROM questions'),
+      expect.stringContaining('SET processing_question_id = $1'),
       'ROLLBACK',
     ]);
   });

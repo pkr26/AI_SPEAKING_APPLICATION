@@ -321,9 +321,10 @@ export default function SettingsScreen() {
       token !== null &&
       accountUserId !== null &&
       current.token === token &&
-      current.userId === accountUserId
+      current.userId === accountUserId &&
+      isSessionLeaseCurrent(renderSessionLease, { identityOnly: true })
     );
-  }, [accountUserId, token]);
+  }, [accountUserId, isSessionLeaseCurrent, renderSessionLease, token]);
 
   const navigateOnce = useCallback(
     (
@@ -510,7 +511,18 @@ export default function SettingsScreen() {
     try {
       const updated = await apiUpdateProfile({ uiLanguage: code });
       if (!mergeProfileField(updated, { uiLanguage: updated.uiLanguage })) return;
-      mirrorAccountLanguage(updated.uiLanguage);
+      try {
+        // The account PATCH already committed, but this non-sensitive mirror
+        // is what keeps signed-out and next-launch copy in sync. Await it so a
+        // keychain failure is visible here instead of being silently dropped.
+        await mirrorAccountLanguage(updated.uiLanguage);
+      } catch {
+        if (renderCanHandle()) {
+          setLanguageErrorScope('ui');
+          setLanguageError(translateFor(updated.uiLanguage, 'language.saveFailed'));
+        }
+      }
+      if (!renderCanHandle()) return;
 
       // Notification title/body/channel copy is baked into the OS schedule.
       // Rebuild it in the confirmed UI language. This is best effort: the

@@ -12,6 +12,7 @@ import RecordingsScreen, {
   formatRecordingDuration,
   formatRecordingSize,
   nextRecordingPageParam,
+  RECORDING_MAX_PAGES,
   recordingContextMessageKey,
   RECORDING_DATE_LOCALES,
   recordingsThemedStyles,
@@ -198,12 +199,40 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await cleanup();
-  for (const client of clients.splice(0)) client.clear();
+  await act(async () => {
+    await Promise.resolve();
+    cleanup();
+    for (const client of clients.splice(0)) client.clear();
+    // TanStack Query batches observer notifications; keep their teardown
+    // publication inside the same React act boundary as the mounted list.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
   jest.restoreAllMocks();
 });
 
 describe('recordings library', () => {
+  it('shows a terminal safety message when the finite page bound is reached', async () => {
+    const pages: RecordingPage[] = Array.from({ length: RECORDING_MAX_PAGES }, (_, index) => ({
+      items: index === 0 ? [recording()] : [],
+      nextCursor: `cursor-${index}`,
+    }));
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['recordings', USER.id], {
+      pages,
+      pageParams: Array.from({ length: RECORDING_MAX_PAGES }, () => undefined),
+    });
+
+    await renderRecordings(client);
+
+    const terminal = screen.getByText(t('pagination.safetyStop'));
+    expect(terminal.props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.queryByRole('button', { name: t('recordings.loadMore') })).toBeNull();
+    expect(apiGetRecordings).not.toHaveBeenCalled();
+  });
+
   it('shows an offline state instead of spinning before the first page', async () => {
     onlineManager.setOnline(false);
     asMock(apiGetRecordings).mockResolvedValue({ items: [], nextCursor: null });
@@ -255,7 +284,7 @@ describe('recordings library', () => {
     expect(nextRecordingPageParam(next, [page(RECORDING_ID), next])).toBeUndefined();
     expect(
       nextRecordingPageParam(next, Array.from({ length: 499 }, () => page(SECOND_ID)).concat(next)),
-    ).toBe(RECORDING_ID);
+    ).toBeUndefined();
     expect(
       nextRecordingPageParam(next, Array.from({ length: 498 }, () => page(SECOND_ID)).concat(next)),
     ).toBe(RECORDING_ID);
@@ -535,6 +564,7 @@ describe('recordings library', () => {
     expect(screen.getByText('2:00 · 2.0 MB')).toBeTruthy();
     expect(screen.getByText(t('recordings.statusUnavailable'))).toBeTruthy();
     expect(screen.queryByRole('button', { name: t('recordings.checkPending') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('recordings.loadMore') })).toBeNull();
   });
 
   it('pages older recordings once and rejects cursor cycles', async () => {

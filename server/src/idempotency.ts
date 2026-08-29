@@ -9,6 +9,25 @@ import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
 export type AssessmentNativeLanguage = 'te' | 'hi' | 'es' | 'zh';
+export interface AssessmentQuestionSnapshot {
+  cefrLevel: CefrLevel;
+  promptWord: string;
+  questionText: string;
+}
+
+const assessmentQuestionSnapshotSchema = z
+  .object({
+    cefrLevel: z.enum(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']),
+    promptWord: z
+      .string()
+      .max(100)
+      .refine((value) => value.trim().length > 0),
+    questionText: z
+      .string()
+      .max(1_000)
+      .refine((value) => value.trim().length > 0),
+  })
+  .strict();
 
 /**
  * Completed responses must outlive the app's 25-hour recovery window so a
@@ -23,6 +42,7 @@ interface RequestRow {
   context: AssessmentContext;
   question_id: string;
   practice_cycle_id: string | null;
+  diagnostic_run_id: string | null;
   retain_recording: boolean;
   response_version: number;
   status: 'processing' | 'completed';
@@ -31,6 +51,7 @@ interface RequestRow {
 }
 
 interface RequestStatusRow extends RequestRow {
+  current_diagnostic_run_id: string | null;
   question_cefr_level: CefrLevel;
   question_prompt_word: string;
   question_text: string;
@@ -341,6 +362,14 @@ export class AssessmentRequestInFlightError extends HttpError {
   }
 }
 
+function retiredDiagnosticRunError(): HttpError {
+  return new HttpError(
+    409,
+    'This diagnostic answer belongs to a restarted placement; record a new answer',
+    'ASSESSMENT_RESULT_INCOMPATIBLE',
+  );
+}
+
 /**
  * Claim a client request UUID before any quota/provider work. Completed rows
  * replay their exact response; concurrent processing returns 409 with a short
@@ -361,6 +390,7 @@ export async function claimAssessmentRequest(
   practiceCycleId?: string,
   retainRecording = true,
   nativeLanguage?: AssessmentNativeLanguage,
+  questionSnapshot?: AssessmentQuestionSnapshot,
 ): Promise<AssessmentRequestClaim> {
   if (
     (context === 'diagnostic' && practiceCycleId !== undefined) ||
@@ -370,6 +400,10 @@ export async function claimAssessmentRequest(
   }
   if ((context === 'practice-native') !== (nativeLanguage !== undefined)) {
     throw new Error('practice-native assessment requests require a language snapshot and other contexts must omit it');
+  }
+  const parsedQuestionSnapshot = assessmentQuestionSnapshotSchema.safeParse(questionSnapshot);
+  if (!parsedQuestionSnapshot.success) {
+    throw new Error('assessment requests require a valid claim-time question snapshot');
   }
   const client = await pool.connect();
   try {
@@ -381,6 +415,21 @@ export async function claimAssessmentRequest(
     const owner = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [userId]);
     if (owner.rowCount !== 1) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
+    // Restart takes the same parent lock before rotating this UUID, so a
+    // diagnostic claim is bound to exactly one run. Migration 024's INSERT
+    // trigger writes this identity (and the public question snapshot) in the
+    // same transaction, including for a draining pre-024 application writer.
+    let diagnosticRunId: string | undefined;
+    if (context === 'diagnostic') {
+      const diagnosticState = await client.query<{ diagnostic_run_id: string }>(
+        'SELECT diagnostic_run_id FROM diagnostic_state WHERE user_id = $1',
+        [userId],
+      );
+      diagnosticRunId = diagnosticState.rows[0]?.diagnostic_run_id;
+      if (!diagnosticRunId) {
+        throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+      }
     }
     // Only this request UUID or submitted object can block the insert below,
     // so expiry cleanup stays scoped to those two identities. Including the
@@ -400,9 +449,10 @@ export async function claimAssessmentRequest(
     const inserted = await client.query(
       `INSERT INTO assessment_requests
          (user_id, request_id, claim_id, context, question_id, status, audio_key, practice_cycle_id,
-          retain_recording, recording_retention_epoch, native_language)
+          retain_recording, recording_retention_epoch, native_language, diagnostic_run_id,
+          question_cefr_level, question_prompt_word, question_text)
        VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8,
-               (SELECT recording_retention_epoch FROM users WHERE id = $1), $9)
+               (SELECT recording_retention_epoch FROM users WHERE id = $1), $9, $10, $11, $12, $13)
        ON CONFLICT DO NOTHING`,
       [
         userId,
@@ -414,6 +464,10 @@ export async function claimAssessmentRequest(
         practiceCycleId ?? null,
         retainRecording,
         nativeLanguage ?? null,
+        diagnosticRunId ?? null,
+        parsedQuestionSnapshot.data.cefrLevel,
+        parsedQuestionSnapshot.data.promptWord,
+        parsedQuestionSnapshot.data.questionText,
       ],
     );
     if (inserted.rowCount === 1) {
@@ -422,7 +476,8 @@ export async function claimAssessmentRequest(
     }
 
     const existing = await client.query<RequestRow>(
-      `SELECT context, question_id, practice_cycle_id, retain_recording, response_version, status, response_body,
+      `SELECT context, question_id, practice_cycle_id, diagnostic_run_id, retain_recording,
+              response_version, status, response_body,
               EXISTS (
                 SELECT 1
                 FROM recordings AS replay_recording
@@ -462,6 +517,13 @@ export async function claimAssessmentRequest(
       throw new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
         retryAfterSeconds: 2,
       });
+    }
+    // A restart keeps the UUID row as a non-replayable tombstone. Check the
+    // run before mutable question/retention collision fields so both an old
+    // GET and an old POST get the stable result-retirement contract without
+    // another provider call.
+    if (context === 'diagnostic' && row.context === 'diagnostic' && row.diagnostic_run_id !== diagnosticRunId) {
+      throw retiredDiagnosticRunError();
     }
     if (
       row.context !== context ||
@@ -538,6 +600,15 @@ export async function completeAssessmentRequest(
      FROM owner
      WHERE requests.user_id = $2 AND requests.request_id = $3 AND requests.claim_id = $4
        AND requests.context = $5 AND requests.status = 'processing'
+       AND (
+         requests.context <> 'diagnostic'
+         OR EXISTS (
+           SELECT 1
+           FROM diagnostic_state AS current_diagnostic
+           WHERE current_diagnostic.user_id = requests.user_id
+             AND current_diagnostic.diagnostic_run_id = requests.diagnostic_run_id
+         )
+       )
      RETURNING requests.question_id, requests.audio_key,
        ($7::boolean
          AND requests.recording_retention_epoch = owner.recording_retention_epoch) AS recording_retained`,
@@ -621,7 +692,9 @@ export async function getAssessmentRequestStatus(
   requestId: string,
 ): Promise<AssessmentRequestStatus | undefined> {
   const { rows } = await pool.query<RequestStatusRow>(
-    `SELECT ar.context, ar.question_id, ar.practice_cycle_id, ar.response_version, ar.status, ar.response_body,
+    `SELECT ar.context, ar.question_id, ar.practice_cycle_id, ar.diagnostic_run_id,
+            current_diagnostic.diagnostic_run_id AS current_diagnostic_run_id,
+            ar.retain_recording, ar.response_version, ar.status, ar.response_body,
             EXISTS (
               SELECT 1
               FROM recordings AS replay_recording
@@ -632,10 +705,11 @@ export async function getAssessmentRequestStatus(
                 AND replay_recording.id::text = ar.response_body ->> 'recordingId'
                 AND replay_recording.recording_retention_epoch = replay_owner.recording_retention_epoch
             ) AS recording_visible,
-            q.cefr_level AS question_cefr_level, q.prompt_word AS question_prompt_word,
-            q.question_text AS question_text
+            ar.question_cefr_level, ar.question_prompt_word, ar.question_text
      FROM assessment_requests ar
-     JOIN questions q ON q.id = ar.question_id
+     LEFT JOIN diagnostic_state AS current_diagnostic
+       ON current_diagnostic.user_id = ar.user_id
+      AND ar.context = 'diagnostic'
      WHERE ar.user_id = $1 AND ar.request_id = $2
        AND (
          (ar.status = 'processing' AND ar.started_at >= now() - interval '5 minutes')
@@ -646,6 +720,9 @@ export async function getAssessmentRequestStatus(
   );
   const row = rows[0];
   if (!row) return undefined;
+  if (row.context === 'diagnostic' && row.diagnostic_run_id !== row.current_diagnostic_run_id) {
+    throw retiredDiagnosticRunError();
+  }
   const details: AssessmentRequestStatusBase = {
     context: row.context,
     questionId: row.question_id,

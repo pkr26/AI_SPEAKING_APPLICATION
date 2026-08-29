@@ -149,7 +149,9 @@ function LocalizedProviders({ children }: { children: React.ReactNode }) {
   const accountLanguage = user?.uiLanguage;
   const renderedLanguage = accountLanguage ?? guestLanguage;
   useEffect(() => {
-    if (accountLanguage) mirrorAccountLanguage(accountLanguage);
+    if (accountLanguage) {
+      void Promise.resolve(mirrorAccountLanguage(accountLanguage)).catch(() => undefined);
+    }
   }, [accountLanguage, mirrorAccountLanguage]);
   return (
     <I18nProvider accountLanguage={accountLanguage ?? null} guestLanguage={guestLanguage}>
@@ -259,7 +261,11 @@ export function ProfileRefreshBridge() {
     if (!isSessionLeaseCurrent(sessionLease)) return;
     const previous = userRef.current;
     if (previous?.nativeLanguage !== refreshed.nativeLanguage) {
-      queryClient.removeQueries({ queryKey: ['question-help'] });
+      // The active Attempt observer must survive long enough to hand its
+      // already-loaded English prompt to the replacement language query.
+      // Language is part of the key, so only inactive old-language entries
+      // need immediate retirement.
+      queryClient.removeQueries({ queryKey: ['question-help'], type: 'inactive' });
     }
     if (
       previous?.cefrLevel !== refreshed.cefrLevel ||

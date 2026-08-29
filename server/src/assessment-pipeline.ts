@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { AssessOptions } from './assess';
 import { measureAudioDuration } from './audio-inspection';
 import {
+  completeSubmittedPresignedAudio,
   discardSubmittedPresignedAudio,
   isOwnedAudioKey,
   ownSubmittedPresignedAudio,
@@ -238,6 +239,11 @@ export async function runAssessmentSubmission<Claim, Result>(
       practiceCycleId,
       retainRecording,
       hooks.context === 'practice-native' ? (user.native_language as AssessmentNativeLanguage) : undefined,
+      {
+        cefrLevel: question.cefr_level,
+        promptWord: question.prompt_word,
+        questionText: question.question_text,
+      },
     );
     if (requestClaim.kind === 'completed') {
       // Completed replays retain their object for the bucket lifecycle: an
@@ -313,11 +319,16 @@ export async function runAssessmentSubmission<Claim, Result>(
         void tryRetainRecording(recording.id);
       }
       completed = true;
-      // The response middleware owns finish/close finalization. At this point
-      // every successful retained recording is already marked preserve=true.
-      // A delete-all epoch mismatch intentionally leaves preserve=false so the
-      // successful opt-out cleanup removes that now-transient object.
-      return res.json(response);
+      // `finish` owns the normal response path, but a disconnected response has
+      // already emitted its one early `close` and will never emit `finish`.
+      // Settle the storage decision in a finally around res.json so opt-outs and
+      // delete-all epoch fences are still deleted after their durable commit.
+      // Every successfully retained recording is marked preserve=true first.
+      try {
+        return res.json(response);
+      } finally {
+        await completeSubmittedPresignedAudio(res);
+      }
     } finally {
       if (claim) await hooks.clearClaim(user, question, claim);
       if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);

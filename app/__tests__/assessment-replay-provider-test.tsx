@@ -10,7 +10,7 @@ import {
 import { apiFetch, ApiError } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
 import {
-  clearPendingAssessment,
+  clearPendingAssessmentIfRequestMatches,
   loadPendingAssessment,
   markPendingAssessmentFeedbackPending,
   notifyPendingAssessmentReplayReady,
@@ -64,7 +64,7 @@ jest.mock('../src/lib/api', () => ({
 jest.mock('../src/lib/auth', () => ({ useAuth: jest.fn() }));
 jest.mock('../src/lib/pending-assessment', () => ({
   ...jest.requireActual('../src/lib/pending-assessment'),
-  clearPendingAssessment: jest.fn(),
+  clearPendingAssessmentIfRequestMatches: jest.fn(),
   loadPendingAssessment: jest.fn(),
   markPendingAssessmentFeedbackPending: jest.fn(),
 }));
@@ -89,8 +89,7 @@ function ReplayProbe() {
   );
 }
 
-function tree() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function tree(client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   return (
     <QueryClientProvider client={client}>
       <AssessmentReplayProvider>
@@ -116,7 +115,7 @@ beforeEach(() => {
   jest.mocked(useAuth).mockImplementation(() => authValue);
   jest.mocked(usePracticeFlow).mockReturnValue({ restoreFeedback } as never);
   jest.mocked(loadPendingAssessment).mockResolvedValue(null);
-  jest.mocked(clearPendingAssessment).mockResolvedValue(undefined);
+  jest.mocked(clearPendingAssessmentIfRequestMatches).mockResolvedValue(true);
   jest.mocked(markPendingAssessmentFeedbackPending).mockResolvedValue(true);
 });
 
@@ -171,7 +170,7 @@ describe('AssessmentReplayProvider', () => {
     expect(apiFetch).toHaveBeenCalledTimes(1);
     expect(mockRouter.replace).toHaveBeenCalledTimes(1);
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice/feedback');
-    expect(clearPendingAssessment).not.toHaveBeenCalled();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
 
     await act(async () => Promise.resolve());
     expect(restoreFeedback).toHaveBeenCalledTimes(1);
@@ -221,7 +220,7 @@ describe('AssessmentReplayProvider', () => {
       pending.feedbackReadyAt,
     );
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice/feedback');
-    expect(clearPendingAssessment).not.toHaveBeenCalled();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
   });
 
   it('publishes a diagnostic replay for the diagnostic screen', async () => {
@@ -274,6 +273,83 @@ describe('AssessmentReplayProvider', () => {
     expect(await screen.findByText('protected app')).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(apiFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('retires a delivered pointer after an authoritative 404 and refreshes canonical caches', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['diagnostic-next'], { stale: 'diagnostic' });
+    client.setQueryData(['practice-question'], { stale: 'practice' });
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'replay expired'));
+
+    await render(tree(client));
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
+    expect(client.getQueryData(['diagnostic-next'])).toBeUndefined();
+    expect(client.getQueryData(['practice-question'])).toBeUndefined();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('does not apply an old request error to a replacement found by the catch reload', async () => {
+    const { feedbackReadyAt: _feedbackReadyAt, ...pendingBase } = pending;
+    const replacement = {
+      ...pendingBase,
+      requestId: '550e8400-e29b-41d4-a716-446655440098',
+      stage: 'prepared' as const,
+    };
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValue(replacement);
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'old replay expired'));
+
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(3));
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('re-reads a replacement pointer when terminal retirement loses the request race', async () => {
+    const { feedbackReadyAt: _feedbackReadyAt, ...pendingBase } = pending;
+    const replacement = {
+      ...pendingBase,
+      requestId: '550e8400-e29b-41d4-a716-446655440099',
+      stage: 'prepared' as const,
+    };
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValue(replacement);
+    jest.mocked(clearPendingAssessmentIfRequestMatches).mockResolvedValueOnce(false);
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'replay expired'));
+
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(3));
+    expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('retires an incompatible saved result instead of blocking startup', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValue(
+      new ApiError(409, 'saved result is incompatible', undefined, {
+        code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+      }),
+    );
+
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('keeps the recovery choice visible when its durable feedback marker changed', async () => {
@@ -351,7 +427,7 @@ describe('AssessmentReplayProvider', () => {
     await fireEvent.press(screen.getByRole('button', { name: 'Check Now' }));
     await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
-    expect(clearPendingAssessment).not.toHaveBeenCalled();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
   });
 
   it('keeps processing delivered feedback visible and retries it after reconnect', async () => {
@@ -449,12 +525,13 @@ describe('AssessmentReplayProvider', () => {
   it('clears an expired pointer and resumes canonical routing', async () => {
     jest.mocked(loadPendingAssessment).mockResolvedValue({
       ...pending,
+      createdAt: 1,
       feedbackReadyAt: 1,
     });
     await render(tree());
 
     await waitFor(() => expect(screen.getByText('protected app')).toBeTruthy());
-    expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+    expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
     expect(apiFetch).not.toHaveBeenCalled();
   });
 
@@ -466,7 +543,7 @@ describe('AssessmentReplayProvider', () => {
     await render(tree());
 
     await waitFor(() => expect(screen.getByText('protected app')).toBeTruthy());
-    expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+    expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
     expect(apiFetch).not.toHaveBeenCalled();
   });
 

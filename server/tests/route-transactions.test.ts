@@ -275,7 +275,10 @@ describe('assessment route transaction lifecycles', () => {
       statements.some((text) => text.includes('SET processing_question_id = $1, processing_started_at = now()')),
     );
     const restartLease = leases.find(({ statements }) =>
-      statements.some((text) => text.includes('SET low_idx = 0, high_idx = 5')),
+      statements.some(
+        (text) =>
+          text.includes('SET diagnostic_run_id = gen_random_uuid()') && text.includes('low_idx = 0, high_idx = 5'),
+      ),
     );
     for (const [lease, parentLock] of [
       [nextLease, nextParentLock],

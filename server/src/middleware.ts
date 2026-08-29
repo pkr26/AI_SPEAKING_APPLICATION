@@ -107,8 +107,18 @@ export interface UserRow {
   created_at: string;
 }
 
+/**
+ * The authenticated caller as requireAuth pins it: every user column EXCEPT
+ * the bcrypt hash. Selecting explicit columns (instead of the full row) keeps
+ * the password hash off the request object — one refactor away from leaking
+ * via a future log/serialization call site — while the routes that genuinely
+ * verify a credential (change-password, delete-account) fetch their own hash
+ * snapshot at the moment of verification.
+ */
+export type AuthUser = Omit<UserRow, 'password_hash'>;
+
 export interface AuthedRequest extends Request {
-  user?: UserRow;
+  user?: AuthUser;
 }
 
 /** Wrap an async route handler so rejections reach the error middleware. */
@@ -165,7 +175,12 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
   }
 
   try {
-    const { rows } = await pool.query<UserRow>('SELECT * FROM users WHERE id = $1', [claims.sub]);
+    const { rows } = await pool.query<AuthUser>(
+      `SELECT id, name, email, native_language, ui_language, cefr_level,
+              diagnostic_completed, diagnostic_acknowledged, token_version, created_at
+       FROM users WHERE id = $1`,
+      [claims.sub],
+    );
     const user = rows[0];
     if (!user) {
       return res.status(401).json({ error: 'Invalid token: user not found', code: 'UNAUTHENTICATED' });
@@ -309,6 +324,16 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     if (!res.writableEnded && !res.destroyed) res.end();
     return;
   }
+  // Headers already flushed (e.g. a streaming handler that wrote, then threw):
+  // res.status().json() would itself throw ERR_HTTP_HEADERS_SENT and fall
+  // through to Express's default handler, destroying the socket mid-body. End
+  // the partially-written response cleanly instead; the status line is already
+  // on the wire and cannot be changed.
+  if (res.headersSent) {
+    logger.error({ err, requestId: req.id }, 'error after response headers were sent; ending partial response');
+    res.end();
+    return;
+  }
   if (err instanceof HttpError) {
     // Uniform retry advertising: any error whose extras carry a retry hint
     // also emits the standard Retry-After header (always in seconds).
@@ -328,11 +353,12 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
   // backpressure, not an application fault: shed the request with 503 +
   // Retry-After so clients back off, never a raw 500. Proven under a
   // 1000-user signup burst, where these surfaced on every route.
-  // WARNING: this string-matches pg-pool's exact error message
-  // ('timeout exceeded when trying to connect'); a pg upgrade that rewords it
-  // silently degrades the shed to a 500 — re-check on every pg bump (pinned
-  // by middleware tests today).
-  if (err instanceof Error && err.message === 'timeout exceeded when trying to connect') {
+  // WARNING: pg-pool throws a bare Error for this condition — the message is
+  // the ONLY distinguishing signal it exposes (no code/name), so this match
+  // is unavoidably textual. It is case-insensitive to survive minor wording
+  // tweaks, and middleware tests pin it so a pg bump that rewords it fails
+  // loudly instead of silently degrading the shed to a 500.
+  if (err instanceof Error && /^timeout exceeded when trying to connect$/i.test(err.message)) {
     logger.warn({ requestId: req.id }, 'database pool saturated; shedding request');
     shedRequestsTotal.inc({ reason: 'pool_saturated' });
     res.set('Retry-After', '5');

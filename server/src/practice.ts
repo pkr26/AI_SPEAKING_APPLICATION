@@ -415,6 +415,13 @@ async function claimPracticeAttempt(
       throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
     }
 
+    // Steal-only-after-5-minutes lease semantics: a legitimate submission can
+    // never outlive this window because the whole request (S3 download +
+    // provider deadlines + inspection) is bounded well under it — config
+    // enforces request budget ≤ SHUTDOWN_DRAIN_MS and the provider timeouts
+    // cap at 70s per call. Only a crashed/abandoned worker leaves a claim this
+    // old, and the persist-side attempt/cycle guards make a stolen lease fail
+    // safe (409, no double-count) even if two workers ever race.
     await client.query(
       `DELETE FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2

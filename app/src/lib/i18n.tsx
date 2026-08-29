@@ -382,6 +382,8 @@ const en = {
     'We could not open the settings. Please open your phone settings and allow the microphone for this app.',
   'recorder.startLabel': 'Start recording',
   'recorder.stopLabel': 'Stop recording',
+  'recorder.startHint': 'Double tap to record your answer',
+  'recorder.stopHint': 'Double tap to stop and review your answer',
   'recorder.listening': 'Listening…',
   'recorder.statusRecording': 'Recording… {elapsed} of 2:00 — tap to stop',
   'recorder.statusRecorded': 'Recorded {elapsed} — ready to send. Keep this app open.',
@@ -529,6 +531,7 @@ const en = {
   'history.attemptNo': 'Try {number}',
   'history.showDetails': 'Show details',
   'history.hideDetails': 'Hide details',
+  'history.detailsHint': 'Double tap to expand or collapse this answer',
 
   // ----- Saved recordings -----
   'recordings.loading': 'Loading your recordings…',
@@ -1011,6 +1014,8 @@ const te: Record<MessageKey, string> = {
     'సెట్టింగ్స్ తెరవలేకపోయాము. దయచేసి ఫోన్ సెట్టింగ్స్ తెరిచి ఈ యాప్‌కు మైక్రోఫోన్ అనుమతించండి.',
   'recorder.startLabel': 'రికార్డింగ్ మొదలుపెట్టండి',
   'recorder.stopLabel': 'రికార్డింగ్ ఆపండి',
+  'recorder.startHint': 'మీ సమాధానం రికార్డ్ చేయడానికి రెండుసార్లు నొక్కండి',
+  'recorder.stopHint': 'ఆపి మీ సమాధానాన్ని సమీక్షించడానికి రెండుసార్లు నొక్కండి',
   'recorder.listening': 'వింటున్నాము…',
   'recorder.statusRecording': 'రికార్డ్ అవుతోంది… 2:00లో {elapsed} — ఆపడానికి నొక్కండి',
   'recorder.statusRecorded':
@@ -1155,6 +1160,7 @@ const te: Record<MessageKey, string> = {
   'history.attemptNo': 'ప్రయత్నం {number}',
   'history.showDetails': 'వివరాలు చూపించు',
   'history.hideDetails': 'వివరాలు దాచు',
+  'history.detailsHint': 'ఈ సమాధానాన్ని విప్పుటకు లేదా మూసివేయుటకు రెండుసార్లు నొక్కండి',
 
   'recordings.loading': 'మీ రికార్డింగ్స్ లోడ్ అవుతున్నాయి…',
   'recordings.loadFailedTitle': 'మీ రికార్డింగ్స్‌ను లోడ్ చేయలేకపోయాము',
@@ -1625,6 +1631,8 @@ const hi: Record<MessageKey, string> = {
   'recorder.openSettingsFailed':
     'हम सेटिंग्स नहीं खोल पाए। कृपया फ़ोन की सेटिंग्स खोलकर इस ऐप को माइक्रोफ़ोन की अनुमति दें।',
   'recorder.startLabel': 'रिकॉर्डिंग शुरू करें',
+  'recorder.startHint': 'अपना उत्तर रिकॉर्ड करने के लिए दो बार टैप करें',
+  'recorder.stopHint': 'रोककर अपना उत्तर देखने के लिए दो बार टैप करें',
   'recorder.stopLabel': 'रिकॉर्डिंग रोकें',
   'recorder.listening': 'सुन रहे हैं…',
   'recorder.statusRecording': 'रिकॉर्ड हो रहा है… 2:00 में से {elapsed} — रोकने के लिए टैप करें',
@@ -1768,6 +1776,7 @@ const hi: Record<MessageKey, string> = {
   'history.attemptNo': 'कोशिश {number}',
   'history.showDetails': 'विवरण दिखाएँ',
   'history.hideDetails': 'विवरण छिपाएँ',
+  'history.detailsHint': 'इस उत्तर को खोलने या बंद करने के लिए दो बार टैप करें',
 
   'recordings.loading': 'आपकी रिकॉर्डिंग लोड हो रही हैं…',
   'recordings.loadFailedTitle': 'हम आपकी रिकॉर्डिंग लोड नहीं कर पाए',
@@ -2233,6 +2242,8 @@ const es: Record<MessageKey, string> = {
   'recorder.openSettingsFailed':
     'No pudimos abrir los ajustes. Abre los ajustes de tu teléfono y permite el micrófono para esta app.',
   'recorder.startLabel': 'Empezar a grabar',
+  'recorder.startHint': 'Toca dos veces para grabar tu respuesta',
+  'recorder.stopHint': 'Toca dos veces para detener y revisar tu respuesta',
   'recorder.stopLabel': 'Parar la grabación',
   'recorder.listening': 'Escuchando…',
   'recorder.statusRecording': 'Grabando… {elapsed} de 2:00 — toca para parar',
@@ -2377,6 +2388,7 @@ const es: Record<MessageKey, string> = {
   'history.attemptNo': 'Intento {number}',
   'history.showDetails': 'Ver detalles',
   'history.hideDetails': 'Ocultar detalles',
+  'history.detailsHint': 'Toca dos veces para expandir o contraer esta respuesta',
 
   'recordings.loading': 'Cargando tus grabaciones…',
   'recordings.loadFailedTitle': 'No pudimos cargar tus grabaciones',
@@ -2822,6 +2834,8 @@ const zh: Record<MessageKey, string> = {
   'recorder.openSettings': '打开设置',
   'recorder.openSettingsFailed': '我们无法打开设置。请自己打开手机设置，允许这个应用使用麦克风。',
   'recorder.startLabel': '开始录音',
+  'recorder.startHint': '双击录制您的回答',
+  'recorder.stopHint': '双击停止并查看您的回答',
   'recorder.stopLabel': '停止录音',
   'recorder.listening': '正在听…',
   'recorder.statusRecording': '正在录音… {elapsed} / 2:00 — 点一下停止',
@@ -2945,6 +2959,7 @@ const zh: Record<MessageKey, string> = {
   'history.attemptNo': '第 {number} 次',
   'history.showDetails': '显示详情',
   'history.hideDetails': '隐藏详情',
+  'history.detailsHint': '双击展开或收起此回答',
 
   'recordings.loading': '正在加载你的录音…',
   'recordings.loadFailedTitle': '我们无法加载你的录音',
@@ -3104,19 +3119,26 @@ export function languageForLocale(locale: string): UiLanguage {
 
 let cachedDeviceLanguage: UiLanguage | null = null;
 
-/** The device locale mapped to a supported language; English when unknown. */
+/**
+ * The device locale mapped to a supported language; English when unknown.
+ * Cached for the process lifetime by design: the persisted preference (user
+ * pick or account mirror) always wins after first choice, so a mid-process OS
+ * locale change only affects the pre-preference fallback until relaunch — an
+ * accepted cosmetic window that keeps the root provider free of an extra
+ * AppState subscription.
+ */
 export function deviceLanguage(): UiLanguage {
-  if (cachedDeviceLanguage !== null) return cachedDeviceLanguage;
-  let detected: UiLanguage = 'en';
-  try {
-    // Hermes, web, and jest all provide Intl; expo-localization is not needed.
-    const locale = Intl.DateTimeFormat().resolvedOptions().locale;
-    if (typeof locale === 'string') detected = languageForLocale(locale);
-  } catch {
-    // No locale information available: fall back to English.
+  if (cachedDeviceLanguage === null) {
+    try {
+      // Hermes, web, and jest all provide Intl; expo-localization is not needed.
+      const locale = Intl.DateTimeFormat().resolvedOptions().locale;
+      if (typeof locale === 'string') cachedDeviceLanguage = languageForLocale(locale);
+    } catch {
+      // No locale information available: fall back to English.
+    }
+    if (cachedDeviceLanguage === null) cachedDeviceLanguage = 'en';
   }
-  cachedDeviceLanguage = detected;
-  return detected;
+  return cachedDeviceLanguage;
 }
 
 /**

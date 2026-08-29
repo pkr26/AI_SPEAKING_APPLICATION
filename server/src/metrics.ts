@@ -156,6 +156,18 @@ export const janitorRemovedTotal = new Counter({
   registers: [registry],
 });
 
+/**
+ * Ticks a janitor skipped because another replica held the advisory lock.
+ * Without this, a replica starved of ticks (a peer holding the lock) is
+ * indistinguishable from "nothing to delete" in janitor_removed_total.
+ */
+export const janitorSkippedTotal = new Counter({
+  name: 'janitor_skipped_total',
+  help: 'Janitor ticks skipped because another replica held the advisory lock, by janitor',
+  labelNames: ['janitor'] as const,
+  registers: [registry],
+});
+
 export const recordingMaintenanceTotal = new Counter({
   name: 'recording_maintenance_total',
   help: 'Durable recording retention/deletion maintenance outcomes',

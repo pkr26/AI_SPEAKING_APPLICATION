@@ -226,9 +226,13 @@ export function contentTypeToExt(contentType: string): string | undefined {
 export function isOwnedAudioKey(scope: AudioStorageScope, userId: string, key: unknown): key is string {
   if (typeof key !== 'string') return false;
   const exts = AUDIO_EXTS.join('|');
+  // Case-sensitive on purpose: `/audio-url` issues keys with lowercase hex
+  // UUIDs only, and S3 keys are case-sensitive — an uppercase variant can only
+  // come from a tampered/buggy client. Rejecting it here routes the submission
+  // to the terminal generic 400 instead of a refundable AUDIO_UPLOAD_MISSING
+  // download retry, matching the "no fresh upload for a generic 400" contract.
   return new RegExp(
     `^${KEY_PREFIX}/${scope}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
-    'i',
   ).test(key);
 }
 

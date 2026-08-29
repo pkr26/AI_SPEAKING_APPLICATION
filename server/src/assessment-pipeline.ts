@@ -23,7 +23,7 @@ import {
   type AssessmentNativeLanguage,
   claimAssessmentRequest,
 } from './idempotency';
-import { AuthedRequest, HttpError, UserRow, validate, validated } from './middleware';
+import { AuthedRequest, AuthUser, HttpError, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
 import { RecordingCapture } from './recording-store';
 import { tryRetainRecording } from './recordings';
@@ -143,20 +143,20 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
    * the request UUID is owned and before any audio work, so the rejection
    * abandons the claim without spending storage or provider budget.
    */
-  assertEligibleAfterOwned?: (user: UserRow) => void | Promise<void>;
+  assertEligibleAfterOwned?: (user: AuthUser) => void | Promise<void>;
   /** Take the per-question serialization claim (after every audio gate). */
-  claimAttempt: (user: UserRow, question: QuestionRow) => Promise<Claim>;
+  claimAttempt: (user: AuthUser, question: QuestionRow) => Promise<Claim>;
   /** Run the paid provider call; forward options to the assess pipeline. */
   assess: (
     audioPath: string,
-    user: UserRow,
+    user: AuthUser,
     question: QuestionRow,
     claim: Claim,
     options: AssessOptions,
   ) => Promise<Result>;
   /** Persist the result and complete the request claim; returns the response body. */
   persist: (
-    user: UserRow,
+    user: AuthUser,
     question: QuestionRow,
     claim: Claim,
     result: Result,
@@ -165,7 +165,7 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
     recording?: RecordingCapture,
   ) => Promise<Record<string, unknown>>;
   /** Best-effort release of the per-question claim (never throws). */
-  clearClaim: (user: UserRow, question: QuestionRow, claim: Claim) => Promise<void>;
+  clearClaim: (user: AuthUser, question: QuestionRow, claim: Claim) => Promise<void>;
 }
 
 /**

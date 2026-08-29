@@ -213,8 +213,25 @@ describe('isOwnedAudioKey', () => {
       ),
     ).toBe(true);
     expect(
-      isOwnedAudioKey('practice', userId, `audio-uploads/practice/${userId}/123E4567-E89B-42D3-A456-426614174001.WEBM`),
+      isOwnedAudioKey('practice', userId, `audio-uploads/practice/${userId}/123e4567-e89b-42d3-a456-426614174001.webm`),
     ).toBe(true);
+  });
+
+  it('rejects case-mangled variants of otherwise-owned keys', () => {
+    // `/audio-url` issues lowercase keys and S3 keys are case-sensitive, so an
+    // uppercase hex/extension variant cannot be a grant this API ever made.
+    // Rejecting it here routes the submission to the terminal generic 400
+    // instead of a refundable AUDIO_UPLOAD_MISSING download retry.
+    expect(
+      isOwnedAudioKey('practice', userId, `audio-uploads/practice/${userId}/123E4567-E89B-42D3-A456-426614174001.WEBM`),
+    ).toBe(false);
+    expect(
+      isOwnedAudioKey(
+        'diagnostic',
+        userId,
+        `audio-uploads/DIAGNOSTIC/${userId}/123e4567-e89b-42d3-a456-426614174001.m4a`,
+      ),
+    ).toBe(false);
   });
 
   it('rejects non-string values even when they coerce to an owned key', () => {

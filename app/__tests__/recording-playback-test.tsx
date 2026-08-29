@@ -674,6 +674,7 @@ describe('RecordingPlayback', () => {
       fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
       await flushMicrotasks();
     });
+    expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1);
     const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
     await act(async () => jest.advanceTimersByTimeAsync(29_999));
     expect(signal.aborted).toBe(false);
@@ -1128,6 +1129,47 @@ describe('RecordingPlayback', () => {
     expect(player.remove).not.toHaveBeenCalled();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('clears the preparation watchdog when the position advances without a playing status', async () => {
+    jest.useFakeTimers();
+    mockAutoLoadPlayer = false;
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => {
+      retainedPlay();
+      await flushMicrotasks();
+    });
+    const player = players[0];
+    await act(async () => {
+      // Loaded (so play() is requested), then decoding advances — but some
+      // Android decoders report playing=false irregularly even while audible.
+      // The advancing position must clear the 30s watchdog exactly like a
+      // playing=true status would.
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: false,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+      player.emit({
+        currentTime: 1.5,
+        duration: 8,
+        playing: false,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+    await act(async () => jest.advanceTimersByTimeAsync(30_000));
+    expect(player.remove).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('never publishes or creates a player after the captured session lease expires', async () => {

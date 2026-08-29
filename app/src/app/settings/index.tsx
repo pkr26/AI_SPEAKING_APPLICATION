@@ -115,7 +115,11 @@ export default function SettingsScreen() {
   const navigation = useNavigation();
   // Bind callbacks to the session that rendered them. A stale native event
   // must not be able to call captureSessionLease later and mint authority for
-  // whichever account happens to be active by then.
+  // whichever account happens to be active by then. Minted fresh every render
+  // on purpose ("capture during render" contract): do NOT memoize this —
+  // identity-only validity checks below read the latest closure through
+  // renderOwnsIdentityRef, and Auth's lease-recapture revision relies on
+  // mounted memoized leases recapturing without rotating sessionVersion.
   const renderSessionLease: SessionLease = captureSessionLease();
   const activeIdentity = sessionVersion;
   const accountUserId = user?.id ?? null;
@@ -535,18 +539,21 @@ export default function SettingsScreen() {
       try {
         const survived = await refreshDailyReminderLanguage(code);
         if (renderCanHandle()) {
-          setReminder({
+          // Functional update: the failure branch below also lands here after
+          // awaiting storage, and a concurrent applyReminder could have moved
+          // the displayed hour past this handler's render closure.
+          setReminder((previous) => ({
             enabled: survived !== null,
-            hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
-          });
+            hour: survived?.hour ?? previous?.hour ?? DEFAULT_REMINDER_HOUR,
+          }));
         }
       } catch {
         const survived = await getDailyReminder();
         if (renderCanHandle()) {
-          setReminder({
+          setReminder((previous) => ({
             enabled: survived !== null,
-            hour: survived?.hour ?? reminder?.hour ?? DEFAULT_REMINDER_HOUR,
-          });
+            hour: survived?.hour ?? previous?.hour ?? DEFAULT_REMINDER_HOUR,
+          }));
           setReminderError(translateFor(code, 'reminder.failed'));
         }
       } finally {
@@ -711,6 +718,10 @@ export default function SettingsScreen() {
       const completedArtifact = exportArtifact.current;
       if (completedArtifact === null) throw new Error('The export file is unavailable.');
       completedArtifact.file.write(']}', { append: true, encoding: 'utf8' });
+      // The OS share-sheet promise is deliberately unbounded (same contract
+      // as RecordingPlayback's share): the sheet resolves only when the user
+      // dismisses it. The PII cache file is owned and released by this
+      // operation's finally on every exit path.
       await Sharing.shareAsync(completedArtifact.file.uri, {
         mimeType: 'application/json',
         dialogTitle: t('settings.export'),

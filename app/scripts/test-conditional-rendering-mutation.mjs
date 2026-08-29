@@ -207,10 +207,10 @@ test('instrumentation selects every nested source predicate exactly once after B
   assert.equal(occurrences(generatedOutput, SITE_ENV), 0);
 });
 
-test('the checked-in campaign discovers the expected 106 sites and 212 forced mutants', async () => {
+test('the checked-in campaign discovers the expected 107 sites and 214 forced mutants', async () => {
   const sites = await discoverCampaignSites({ appDir: appDirectory });
-  assert.equal(sites.length, 106);
-  assert.equal(sites.length * 2, 212);
+  assert.equal(sites.length, 107);
+  assert.equal(sites.length * 2, 214);
   assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
   assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));
   assert.ok(sites.every(({ testFiles }) => testFiles.length > 0));

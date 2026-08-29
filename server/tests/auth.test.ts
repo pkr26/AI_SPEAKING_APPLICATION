@@ -883,3 +883,53 @@ describe('auth: data export', () => {
     expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor', code: 'VALIDATION_FAILED' });
   });
 });
+
+describe('auth: per-target-email registration budget', () => {
+  // buildLimiters() snapshots the config at app creation, so the app must be
+  // built AFTER the budget overrides below, not at describe-collection time.
+  const saved = {
+    registerWindowMs: config.rateLimit.registerWindowMs,
+    registerMax: config.rateLimit.registerMax,
+    registerEmailWindowMs: config.rateLimit.registerEmailWindowMs,
+    registerEmailMax: config.rateLimit.registerEmailMax,
+  };
+
+  beforeEach(async () => {
+    // Relax the per-IP register budget so only the email-keyed budget under
+    // test can reject; keep it above the number of requests this suite makes.
+    config.rateLimit.registerWindowMs = 60_000;
+    config.rateLimit.registerMax = 100;
+    config.rateLimit.registerEmailWindowMs = 60_000;
+    config.rateLimit.registerEmailMax = 2;
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace LIKE $1', ['register-email:%']);
+  });
+
+  afterEach(async () => {
+    Object.assign(config.rateLimit, saved);
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace LIKE $1', ['register-email:%']);
+  });
+
+  it('bounds repeated EMAIL_TAKEN probes of one address without touching other registrations', async () => {
+    const a = app();
+    const probed = uniqueEmail('enumerated');
+    expect((await registerUser(a, { email: probed })).res.status).toBe(201);
+
+    // The success refunded its hit, so the address's budget is intact: two
+    // 409 probes count, and the third duplicate submission is over budget.
+    expect((await registerUser(a, { email: probed })).res.status).toBe(409);
+    expect((await registerUser(a, { email: probed })).res.status).toBe(409);
+    const { res: limited } = await registerUser(a, { email: probed });
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many registration attempts, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    // The email-keyed budget must not advertise when the probe window ends
+    // (the per-IP register limiter ahead of it may still publish the caller's
+    // own budget via RateLimit-* — that is its documented behavior).
+    expect(limited.headers['retry-after']).toBeUndefined();
+
+    // A different address keeps its own budget.
+    expect((await registerUser(a, { email: uniqueEmail('other') })).res.status).toBe(201);
+  });
+});

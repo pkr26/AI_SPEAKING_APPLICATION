@@ -137,6 +137,7 @@ function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; 
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded }}
+        accessibilityHint={t('history.detailsHint')}
         accessibilityLabel={[item.promptWord, scoreLabel, contextLabel, attemptLabel, detailsLabel]
           .filter((part): part is string => part !== null)
           .join('. ')}

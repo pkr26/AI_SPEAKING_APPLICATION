@@ -261,6 +261,14 @@ async function processDeletionJob(job: DeletionJobRow): Promise<boolean> {
   try {
     const removed = await sweepPresignedAudioVersions(job.storage_scope, job.audio_key);
     const finalWindowReached = Date.now() >= new Date(job.finalize_after).getTime();
+    // A job completes only on an EMPTY sweep at/after finalize_after. The
+    // extra proof pass is deliberate, not waste: a non-empty final sweep means
+    // versions were (re)created during the quiet window and were just deleted,
+    // and only one further empty listing proves no grant reuse landed between
+    // that listing and the DELETEs. The alternative — completing on the first
+    // non-empty final sweep — would rely entirely on the transient lifecycle
+    // rule to expire any missed version; one extra ListObjectVersions call
+    // per job is the cheaper price for a verified-empty guarantee.
     if (finalWindowReached && removed === 0) {
       await pool.query(
         `DELETE FROM recording_deletion_jobs
@@ -493,6 +501,7 @@ export function createRecordingsRouter(limiters: Limiters) {
 
   router.delete(
     '/:id',
+    limiters.recordingDelete,
     validate({ params: paramsSchema }),
     h(async (req: AuthedRequest, res) => {
       await pool.query(

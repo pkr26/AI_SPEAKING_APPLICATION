@@ -233,6 +233,31 @@ describe('requireAuth', () => {
       verify.mockRestore();
     }
   });
+
+  it('never selects the password hash onto the request object', async () => {
+    const { res: registered } = await registerUser(a);
+    const original = pool.query.bind(pool);
+    const texts: string[] = [];
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...rest: unknown[]) => {
+      if (typeof text === 'string') texts.push(text);
+      return (original as (...args: unknown[]) => unknown)(text, ...rest);
+    }) as never);
+
+    try {
+      const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${registered.body.token}`);
+      expect(me.status).toBe(200);
+      // The public profile still serializes every non-sensitive column...
+      expect(me.body.user).toMatchObject({ id: registered.body.user.id, email: registered.body.user.email });
+      // ...but the authenticated lookup itself must not fetch password_hash:
+      // it would ride on req.user through every downstream handler, one
+      // refactor away from leaking through a future log/serialization site.
+      const authSelect = texts.find((text) => text.includes('FROM users WHERE id = $1'));
+      expect(authSelect).toBeDefined();
+      expect(authSelect).not.toMatch(/password_hash/i);
+    } finally {
+      query.mockRestore();
+    }
+  });
 });
 
 describe('validate', () => {
@@ -634,6 +659,65 @@ describe('errorHandler', () => {
     } finally {
       increment.mockRestore();
       warn.mockRestore();
+    }
+  });
+
+  it('still sheds a pool timeout when the driver message differs only in case', () => {
+    // pg-pool exposes no error code for this condition, so the discriminator
+    // is unavoidably textual; it must tolerate minor wording drift, and a pg
+    // bump that rewords the message entirely should fail HERE first.
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const increment = vi.spyOn(shedRequestsTotal, 'inc').mockImplementation(() => undefined as never);
+    const req = { id: 'pool-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+
+    try {
+      errorHandler(new Error('Timeout Exceeded When Trying To Connect'), req, res, vi.fn());
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
+    } finally {
+      increment.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('ends a partial response instead of double-writing after headers were sent', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const req = { id: 'flushed-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      headersSent: true,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+      end: vi.fn(),
+    } as unknown as express.Response;
+
+    try {
+      errorHandler(new HttpError(500, 'late failure'), req, res, vi.fn());
+      // res.status().json() after headersSent throws ERR_HTTP_HEADERS_SENT and
+      // would fall through to Express's default socket-destroying handler; the
+      // only safe action is ending the already-started response.
+      expect(res.end).toHaveBeenCalledOnce();
+      expect(res.status).not.toHaveBeenCalled();
+      expect(res.json).not.toHaveBeenCalled();
+      expect(error).toHaveBeenCalledWith(
+        { err: expect.anything(), requestId: 'flushed-request' },
+        'error after response headers were sent; ending partial response',
+      );
+    } finally {
+      error.mockRestore();
     }
   });
 

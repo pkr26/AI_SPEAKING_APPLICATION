@@ -35,7 +35,11 @@ COPY package.json package-lock.json ./
 RUN mkdir -p dist/uploads && chown node:node dist/uploads
 USER node
 EXPOSE 4000
-# Shell form so the probe follows the configured PORT (default 4000).
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-4000}/health" || exit 1
+# Shell form so the probe follows the configured PORT (default 4000). Probe
+# /ready, not /health: liveness alone cannot see post-start drift (DB pool
+# death, S3 versioning/lifecycle drift, ffmpeg loss), and AGENTS.md requires
+# routing health decisions to use readiness. The wider timeout covers /ready's
+# dependency checks on the probe that refreshes its 60s liveness cache.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 CMD wget -q -O /dev/null "http://127.0.0.1:${PORT:-4000}/ready" || exit 1
 ENTRYPOINT ["dumb-init", "--"]
 CMD ["node", "dist/src/index.js"]

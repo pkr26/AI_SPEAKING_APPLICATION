@@ -169,6 +169,14 @@ const UPLOAD_STAGE_ALMOST_DONE_MS = 25_000;
 const PERMISSION_PROMPT_RESUME_MS = 2_000;
 /** Briefly await the native completion event that carries stop failures. */
 const RECORDING_EVENT_WAIT_MS = 500;
+/**
+ * Ceiling for waiting on the module-level serialized audio-session queue
+ * (another instance's restore can hang if both of its bounded retries fail to
+ * settle natively). Every other wait in this file is deadline-bounded; this
+ * one must be too, or `startRecording` holds its operation token with all
+ * controls locked forever.
+ */
+const AUDIO_SESSION_RELEASE_WAIT_MS = 10_000;
 const MAX_TERMINAL_EVENT_QUARANTINES = 4;
 
 export function monotonicNow(): number {
@@ -242,6 +250,35 @@ export function sleepAbortable(ms: number, signal: AbortSignal): Promise<void> {
       resolve();
     }, ms);
     signal.addEventListener('abort', rejectAbort, { once: true });
+  });
+}
+
+/**
+ * Await the serialized audio-session queue with a deadline: a settled (or
+ * absent) promise resolves normally; a hung native restore rejects after
+ * `timeoutMs` so the caller can fail closed instead of blocking forever.
+ * The timer is always cleared, including when the promise wins the race.
+ * Exported for the pure-behavior contract tests.
+ */
+export function awaitAudioSessionSettled(
+  promise: Promise<void> | null,
+  timeoutMs: number,
+): Promise<void> {
+  if (!promise) return Promise.resolve();
+  return new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('audio session release did not settle in time'));
+    }, timeoutMs);
+    promise.then(
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error instanceof Error ? error : new Error('audio session release failed'));
+      },
+    );
   });
 }
 const WAIT_TICK_MS = 1_000;
@@ -935,6 +972,13 @@ export default function Recorder<T>({
     new Set<(completion: RecordingCompletion | null) => void>(),
   );
   const recordingTakeGenerationRef = useRef(0);
+  /**
+   * The last recorder-status URL together with the take generation that
+   * published it. Guards the completion-adoption fallback against adopting a
+   * previous take's URL from the snapshot state when this take's terminal
+   * event was quarantined and the live recorder reports no uri.
+   */
+  const takeScopedStatusUrlRef = useRef<{ url: string; takeGeneration: number } | null>(null);
   const terminalEventQuarantineRef = useRef<TerminalEventQuarantine[]>([]);
   const currentRecorderRef = useRef<AudioRecorder | null>(null);
   const suppressRecordingStatusRef = useRef(false);
@@ -1085,7 +1129,10 @@ export default function Recorder<T>({
   }, []);
   const acquireAudioSession = useCallback(() => {
     const instanceId = instanceIdRef.current;
-    if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) throw new Error();
+    if (!audioSessionCanBeAcquired(activeAudioSessionOwner, instanceId)) {
+      // Message for support triage; startRecording reports localized copy.
+      throw new Error('audio session is still owned by another recorder instance');
+    }
     if (activeAudioSessionOwner === null) {
       activeAudioSessionOwner = instanceId;
       activeAudioSessionReleasePromise = new Promise((resolve) => {
@@ -2265,23 +2312,30 @@ export default function Recorder<T>({
                   s3Reuploads < MAX_S3_REUPLOADS
                 ) {
                   const uri = activeUriRef.current;
+                  // Refund FIRST, before branching on local-take availability:
+                  // the server proved this resubmission committed nothing, so
+                  // the durable recovery-POST claim is owed back whether or not
+                  // a surviving take can spend it on the one fresh-key
+                  // re-upload. Keeping the refund inside the file-exists branch
+                  // would burn the claim when the take was evicted — a later
+                  // mount with the file restored could no longer use it.
+                  let refunded: boolean;
+                  try {
+                    refunded = await refundPendingAssessmentRecoveryPost(pending.requestId);
+                  } catch {
+                    if (isCurrent()) {
+                      failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
+                    }
+                    return;
+                  }
+                  if (!isCurrent()) return;
                   // recordingFileExists, not a bare `new File(uri).exists`: this
                   // runs inside catch (retryError), so a throw here escapes the
                   // retry loop and rejects recoverPending(), which the caller
                   // invokes as `void recoverPending()` — an unhandled rejection
                   // that strands the recorder in `recovering` with no message.
-                  if (uri !== null && routeMatches && recordingFileExists(uri)) {
-                    let refunded: boolean;
-                    try {
-                      refunded = await refundPendingAssessmentRecoveryPost(pending.requestId);
-                    } catch {
-                      if (isCurrent()) {
-                        failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
-                      }
-                      return;
-                    }
-                    if (!isCurrent()) return;
-                    if (refunded && (await reuploadRecording(uri, pending.requestId))) {
+                  if (refunded && uri !== null && routeMatches && recordingFileExists(uri)) {
+                    if (await reuploadRecording(uri, pending.requestId)) {
                       if (!isCurrent()) return;
                       s3Reuploads += 1;
                       // The fresh object is in place; resubmit it on the next
@@ -2705,6 +2759,16 @@ export default function Recorder<T>({
       hasObservedRecordingRef.current = true;
       return;
     }
+    // Remember the last status-snapshot URI under the take that published it.
+    // The adoption fallback below must never adopt a URL a PREVIOUS take
+    // left in the snapshot state when the terminal event was quarantined and
+    // the native recorder no longer reports a uri.
+    if (phaseRef.current === 'recording' && recorderState.url) {
+      takeScopedStatusUrlRef.current = {
+        url: recorderState.url,
+        takeGeneration: recordingTakeGenerationRef.current,
+      };
+    }
     if (
       recordingCompletionCanBeAdopted(
         phaseRef.current,
@@ -2716,7 +2780,13 @@ export default function Recorder<T>({
         recorderState.canRecord,
       )
     ) {
-      const uri = completion?.url ?? readRecorderUri(recorder) ?? recorderState.url;
+      const takeScopedStatusUrl = takeScopedStatusUrlRef.current;
+      const uri =
+        completion?.url ??
+        readRecorderUri(recorder) ??
+        (takeScopedStatusUrl?.takeGeneration === recordingTakeGenerationRef.current
+          ? takeScopedStatusUrl.url
+          : undefined);
       if (uri) {
         const recordingStartedAt = recordingStartedAtRef.current;
         const rawWallDuration =
@@ -2862,8 +2932,26 @@ export default function Recorder<T>({
         }
       }
       if (getSubmittedRecordingPlaybackActive()) await stopActivePlayback();
-      await audioRestorePromiseRef.current;
-      await activeAudioSessionReleasePromise;
+      // Both waits are deadline-bounded: the release promise is module-level
+      // and owned by whichever Recorder last held the session, so a hung
+      // native restore in another instance must fail this start closed (the
+      // shared catch restores the audio mode and reports a start failure)
+      // rather than locking the controls indefinitely.
+      try {
+        await awaitAudioSessionSettled(
+          audioRestorePromiseRef.current,
+          AUDIO_SESSION_RELEASE_WAIT_MS,
+        );
+        await awaitAudioSessionSettled(
+          activeAudioSessionReleasePromise,
+          AUDIO_SESSION_RELEASE_WAIT_MS,
+        );
+      } catch {
+        if (isCurrentLifecycle()) {
+          callbacksRef.current.onError(translate('recorder.errStartFailed'));
+        }
+        return;
+      }
       if (!isCurrentLifecycle()) return;
       acquireAudioSession();
       await configureRecordingAudioMode();
@@ -2875,6 +2963,7 @@ export default function Recorder<T>({
         recordingTakeGenerationRef.current,
       );
       recordingCompletionRef.current = null;
+      takeScopedStatusUrlRef.current = null;
       await recorder.prepareToRecordAsync();
       prepared = true;
       preparedCandidateUri = readRecorderUri(recorder);
@@ -3719,6 +3808,7 @@ export default function Recorder<T>({
         <Pressable
           accessibilityRole="button"
           accessibilityLabel={isRecording ? t('recorder.stopLabel') : t('recorder.startLabel')}
+          accessibilityHint={isRecording ? t('recorder.stopHint') : t('recorder.startHint')}
           accessibilityState={{ disabled: controlsDisabled }}
           disabled={controlsDisabled}
           onPress={handleMicPress}

@@ -563,6 +563,22 @@ describe('refreshDailyReminderLanguage', () => {
     await expect(getDailyReminder()).resolves.toEqual({ hour: 8, uiLanguage: 'hi' });
   });
 
+  it('returns the re-read persisted preference instead of a hand-built copy', async () => {
+    withPersistedReminder({ hour: 8 });
+    // Model the durable write canonicalizing the stored preference: whatever
+    // enableDailyReminderUnsafe wrote is the source of truth a later read
+    // (and therefore the return value) must agree with.
+    setItemAsync.mockImplementation(async (_key: string, value: string) => {
+      const parsed = JSON.parse(value) as { hour: number; uiLanguage: string };
+      getItemAsync.mockResolvedValue(JSON.stringify({ hour: 9, uiLanguage: parsed.uiLanguage }));
+    });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({
+      hour: 9,
+      uiLanguage: 'hi',
+    });
+  });
+
   it('does not rebuild notification copy when the stored UI language already matches', async () => {
     withPersistedReminder({ hour: 8, uiLanguage: 'hi' });
 

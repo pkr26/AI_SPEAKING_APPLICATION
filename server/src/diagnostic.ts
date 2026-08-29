@@ -388,6 +388,14 @@ export function createDiagnosticRouter(limiters: Limiters) {
         // it too; otherwise the 1.1 client cannot parse the blank summary it
         // must show. Historical placements backfilled as acknowledged remain
         // complete and simply omit their unavailable legacy summaries.
+        //
+        // Deliberately automatic on this GET (not moved behind an explicit
+        // POST): the repair runs at most once per affected account, is fully
+        // serialized under the user-row lock, and a second GET observes the
+        // already-repaired state — the trigger condition can never re-fire.
+        // It also cannot be reached by prefetching proxies or link previews:
+        // the route is behind requireAuth's bearer token. Only legacy data can
+        // trip it, and legacy clients cannot be taught a new handshake.
         if (hasLegacySilentAnswer(answers)) {
           if (lockedUserRow.diagnostic_completed && lockedUserRow.diagnostic_acknowledged) {
             await client.query('COMMIT');

@@ -39,6 +39,10 @@ const MANAGED_KEYS = [
   'FFPROBE_PATH',
   'MAIL_MODE',
   'MAIL_WEBHOOK_URL',
+  'MAIL_WEBHOOK_ALLOW_PRIVATE_ADDRESS',
+  'RATE_LIMIT_HASH_SECRET',
+  'RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS',
+  'RATE_LIMIT_REGISTER_EMAIL_MAX',
   'RATE_LIMIT_GLOBAL_WINDOW_MS',
   'RATE_LIMIT_GLOBAL_MAX',
   'RATE_LIMIT_GLOBAL_STORE',
@@ -196,6 +200,8 @@ describe('config env validation', () => {
       passwordMax: 10,
       registerWindowMs: 60 * 60 * 1000,
       registerMax: 10,
+      registerEmailWindowMs: 60 * 60 * 1000,
+      registerEmailMax: 20,
       forgotEmailWindowMs: 60 * 60 * 1000,
       forgotEmailMax: 5,
       assessWindowMs: 60 * 60 * 1000,
@@ -207,7 +213,10 @@ describe('config env validation', () => {
     });
     expect(config.trustProxy).toBe(false);
     expect(config.corsOrigins).toEqual([]);
-    expect(config.mail).toEqual({ mode: 'log', webhookUrl: '' });
+    expect(config.mail).toEqual({ mode: 'log', webhookUrl: '', webhookAllowPrivateAddress: false });
+    // No dedicated counter key: the store derives a domain-separated subkey
+    // from JWT_SECRET at boot.
+    expect(config.rateLimitHashSecret).toBe('');
     expect(config.mockAi).toBe(true);
     expect(config.openaiApiKey).toBe('');
     expect(config.s3).toEqual({
@@ -326,6 +335,34 @@ describe('config env validation', () => {
       'JWT_SECRET is required (no default — set a real secret)',
     );
     await expectInvalid(baseEnv({ JWT_SECRET: 'too-short' }), 'JWT_SECRET must be at least 32 characters');
+  });
+
+  it('validates the dedicated rate-limit hash secret knob', async () => {
+    await expectSingleInvalidIssue(
+      baseEnv({ RATE_LIMIT_HASH_SECRET: 'short' }),
+      'RATE_LIMIT_HASH_SECRET',
+      'RATE_LIMIT_HASH_SECRET must be at least 32 characters (or empty to derive from JWT_SECRET)',
+    );
+    const config = await loadConfig(baseEnv({ RATE_LIMIT_HASH_SECRET: 'a-dedicated-counter-hmac-key-32-chars' }));
+    expect(config.rateLimitHashSecret).toBe('a-dedicated-counter-hmac-key-32-chars');
+  });
+
+  it('parses the mail webhook private-address opt-in and register-email budget knobs', async () => {
+    const config = await loadConfig(
+      baseEnv({
+        MAIL_WEBHOOK_ALLOW_PRIVATE_ADDRESS: 'true',
+        RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS: '120000',
+        RATE_LIMIT_REGISTER_EMAIL_MAX: '7',
+      }),
+    );
+    expect(config.mail.webhookAllowPrivateAddress).toBe(true);
+    expect(config.rateLimit.registerEmailWindowMs).toBe(120_000);
+    expect(config.rateLimit.registerEmailMax).toBe(7);
+    await expectInvalid(baseEnv({ RATE_LIMIT_REGISTER_EMAIL_MAX: '0' }), 'RATE_LIMIT_REGISTER_EMAIL_MAX');
+    await expectInvalid(
+      baseEnv({ RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS: '10' }),
+      'RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS: Number must be greater than or equal to 1000',
+    );
   });
 
   it('rejects non-numeric and out-of-range ports', async () => {
@@ -733,11 +770,19 @@ describe('config env validation', () => {
     const webhook = await loadConfig(
       baseEnv({ MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: ' https://relay.example/hooks/mail ' }),
     );
-    expect(webhook.mail).toEqual({ mode: 'webhook', webhookUrl: 'https://relay.example/hooks/mail' });
+    expect(webhook.mail).toEqual({
+      mode: 'webhook',
+      webhookUrl: 'https://relay.example/hooks/mail',
+      webhookAllowPrivateAddress: false,
+    });
 
     // A relay URL may be pre-provisioned while the mode still logs.
     const provisioned = await loadConfig(baseEnv({ MAIL_WEBHOOK_URL: 'http://relay.internal:8080/mail' }));
-    expect(provisioned.mail).toEqual({ mode: 'log', webhookUrl: 'http://relay.internal:8080/mail' });
+    expect(provisioned.mail).toEqual({
+      mode: 'log',
+      webhookUrl: 'http://relay.internal:8080/mail',
+      webhookAllowPrivateAddress: false,
+    });
 
     await expectInvalid(baseEnv({ MAIL_MODE: 'smtp' }), "must be 'log' or 'webhook'");
     await expectSingleInvalidIssue(
@@ -804,11 +849,15 @@ describe('config env validation', () => {
       'http://[::1]:8080/mail',
     ]) {
       const config = await loadConfig(baseEnv({ ...production, MAIL_MODE: 'webhook', MAIL_WEBHOOK_URL: loopback }));
-      expect(config.mail).toEqual({ mode: 'webhook', webhookUrl: loopback });
+      expect(config.mail).toEqual({ mode: 'webhook', webhookUrl: loopback, webhookAllowPrivateAddress: false });
     }
 
     const accepted = await loadConfig(baseEnv({ ...production, ...PRODUCTION_MAIL }));
-    expect(accepted.mail).toEqual({ mode: 'webhook', webhookUrl: 'https://relay.example/hooks/mail' });
+    expect(accepted.mail).toEqual({
+      mode: 'webhook',
+      webhookUrl: 'https://relay.example/hooks/mail',
+      webhookAllowPrivateAddress: false,
+    });
   });
 
   it('rejects an unusable grading model, drain budget, or client version pin', async () => {

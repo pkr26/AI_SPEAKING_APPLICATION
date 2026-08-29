@@ -64,8 +64,21 @@ async function removeExpectedReports(reportDir, laneNames) {
     'app.html',
     'app-summary.json',
   ];
+  // Archive instead of unlink: a lane that crashes early still leaves the
+  // previous run's reports inspectable (and inside the CI artifact upload)
+  // while the canonical paths stay absent, so strict merging still fails
+  // closed on incompleteness. `.stale-*` is never read by tooling.
+  const archiveDirectory = path.join(reportDir, `.stale-${new Date().toISOString()}`);
+  await fs.mkdir(archiveDirectory, { recursive: true });
   await Promise.all(
-    fileNames.map((fileName) => fs.rm(path.join(reportDir, fileName), { force: true })),
+    fileNames.map(async (fileName) => {
+      const filePath = path.join(reportDir, fileName);
+      try {
+        await fs.rename(filePath, path.join(archiveDirectory, fileName));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }),
   );
 }
 
@@ -127,15 +140,30 @@ async function acquireMutationCampaignLock(appDir, reportDir, laneNames) {
   }
 
   let released = false;
-  return async () => {
+  return async (options = {}) => {
     if (released) return;
     released = true;
     await handle.close();
+    if (options.preserve === true) {
+      // A signal-ended campaign may leave orphaned Stryker/Jest children
+      // mutating the workspace. Keep the lock so a new campaign cannot start
+      // until a human verifies no child is alive and removes it manually —
+      // the same invariant the server runner enforces.
+      console.error(
+        `Mutation campaign stopped by signal: preserving ${mutationCampaignLockFileName} ` +
+          '(verify neither the recorded parent pid nor an orphaned Stryker/Jest child is alive, ' +
+          'then remove it manually).',
+      );
+      return;
+    }
     let owner;
     try {
       owner = await readMutationCampaignLock(lockPath);
-    } catch {
-      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      // An invalid lock must fail loudly: silently reporting successful cleanup
+      // would hide a wedged/foreign lock file.
+      throw error;
     }
     if (owner.token === token) await fs.rm(lockPath, { force: true });
   };
@@ -193,12 +221,13 @@ export async function runMutation({
     }
   }
   const releaseCampaignLock = await acquireMutationCampaignLock(appDir, reportDir, laneNames);
+  // Hoisted so the signal-preservation decision in finally can read it.
+  let stopRequested = false;
   try {
     await removeExpectedReports(reportDir, laneNames);
 
     const startedAt = Date.now();
     const failedLanes = [];
-    let stopRequested = false;
 
     async function executeLane(laneName) {
       console.log(`\n=== App mutation lane: ${laneName} ===`);
@@ -319,7 +348,7 @@ export async function runMutation({
       summary,
     };
   } finally {
-    await releaseCampaignLock();
+    await releaseCampaignLock({ preserve: stopRequested });
   }
 }
 

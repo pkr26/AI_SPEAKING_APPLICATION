@@ -686,6 +686,9 @@ export function audioFileDescriptor(
   if (Platform.OS === 'web' || path.endsWith('.webm')) {
     return { name: 'audio.webm', type: 'audio/webm' };
   }
+  if (path.endsWith('.m4a') || path.endsWith('.mp4')) {
+    return { name: 'audio.m4a', type: 'audio/mp4' };
+  }
   if (path.endsWith('.wav')) {
     return { name: 'audio.wav', type: 'audio/wav' };
   }
@@ -695,7 +698,16 @@ export function audioFileDescriptor(
     // device ever returns either format instead.
     throw new ApiError(415, 'Unsupported recording format');
   }
-  return { name: 'audio.m4a', type: 'audio/mp4' };
+  if (!/\.[a-z0-9]+$/.test(path)) {
+    // A native recorder URI without any extension is still the configured
+    // M4A recorder's output (content URIs may strip it). But an extension
+    // this function does not know must fail closed with the local 415
+    // instead of being silently declared MP4 — a container mismatch would
+    // otherwise surface later as a misleading server-side rejection telling
+    // the learner to record again.
+    return { name: 'audio.m4a', type: 'audio/mp4' };
+  }
+  throw new ApiError(415, 'Unsupported recording format');
 }
 
 /**

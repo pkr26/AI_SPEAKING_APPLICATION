@@ -552,6 +552,8 @@ export async function runJsxAttributeMutationCampaign({
     reportDir: resolvedReportDir,
     campaign,
   });
+  // Hoisted so the signal-preservation decision in finally can read it.
+  let stopSignalSeen = false;
   try {
     await removeCampaignReports(resolvedReportDir, normalizedMode);
     await validateManifest({ appDir });
@@ -622,6 +624,7 @@ export async function runJsxAttributeMutationCampaign({
             : { stdoutTail: baselineRun.stdoutTail, stderrTail: baselineRun.stderrTail },
       };
 
+      if (baseline?.process?.signal) stopSignalSeen = true;
       if (baseline.status === 'Passed') {
         results = await runBoundedMutationJobs({
           jobs: sites,
@@ -651,6 +654,7 @@ export async function runJsxAttributeMutationCampaign({
       }
       await fs.rm(temporaryDirectory, { recursive: true, force: true });
     }
+    if (results.some((result) => result.process?.signal)) stopSignalSeen = true;
 
     const inputsUnchanged = after !== null && before.fingerprint === after.fingerprint;
     const statuses = countMutationStatuses(results);
@@ -687,7 +691,7 @@ export async function runJsxAttributeMutationCampaign({
     const reportPaths = await writeCampaignReports({ reportDir: resolvedReportDir, report });
     return { report, reportPaths };
   } finally {
-    await releaseLock();
+    await releaseLock({ preserve: stopSignalSeen });
   }
 }
 

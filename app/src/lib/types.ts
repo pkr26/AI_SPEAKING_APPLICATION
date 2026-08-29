@@ -1,4 +1,5 @@
 import type { AssessmentEndpoint } from './pending-assessment';
+import { isUuid as isRouterParamUuid } from './params';
 
 export type NativeLanguage = 'te' | 'hi' | 'es' | 'zh';
 export type UiLanguage = 'en' | NativeLanguage;
@@ -288,10 +289,8 @@ function isCefrLevel(value: unknown): value is CefrLevel {
 }
 
 function isUuid(value: unknown): value is string {
-  return (
-    isString(value) &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value)
-  );
+  // Single regex source of truth: the router-param twin in params.ts.
+  return isString(value) && isRouterParamUuid(value);
 }
 
 function isScore(value: unknown): value is number {

@@ -504,15 +504,28 @@ export async function acquireMutationCampaignLock({ appDir, reportDir, campaign 
   }
 
   let released = false;
-  return async () => {
+  return async (options = {}) => {
     if (released) return;
     released = true;
     await handle.close();
+    if (options.preserve === true) {
+      // A signal-ended campaign may leave orphaned Jest/Stryker children
+      // mutating the workspace. Keep the lock so a new campaign cannot start
+      // until a human verifies no child is alive and removes it manually.
+      console.error(
+        `Mutation campaign stopped by signal: preserving ${mutationCampaignLockFileName} ` +
+          '(verify no orphaned Jest/Stryker child is alive, then remove it manually).',
+      );
+      return;
+    }
     let owner;
     try {
       owner = await readCampaignLock(lockPath);
-    } catch {
-      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      // An invalid lock must fail loudly: silently reporting successful cleanup
+      // would hide a wedged/foreign lock file.
+      throw error;
     }
     if (owner.token === token) await fs.rm(lockPath, { force: true });
   };

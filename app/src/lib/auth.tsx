@@ -212,7 +212,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const waitForPendingCleanup = useCallback(async () => {
     // Include cleanup appended while an earlier operation is settling. If the
     // last OS-storage cleanup failed, append and await one real retry before a
-    // new bearer token can be persisted.
+    // new bearer token can be persisted. This loop is bounded in practice,
+    // not unbounded: a failing retry rethrows (schedulePendingCleanup
+    // propagates the cleanup error), which exits the loop and surfaces to
+    // establishSession's caller, and a succeeding retry clears the failure
+    // flag. Only the "appended while settling" tail-chase can iterate twice.
     for (;;) {
       const pending = pendingCleanupTailRef.current;
       await pending;

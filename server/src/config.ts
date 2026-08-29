@@ -88,6 +88,17 @@ const envSchema = z
     JWT_SECRET: z
       .string({ required_error: 'JWT_SECRET is required (no default — set a real secret)' })
       .min(32, 'JWT_SECRET must be at least 32 characters'),
+    // Dedicated HMAC key for the persisted rate-limit counters. Optional: when
+    // empty the store derives a domain-separated subkey from JWT_SECRET, so a
+    // JWT rotation alone still resets every counter window once. Setting this
+    // to its own secret makes counter lifetimes independent of token signing.
+    RATE_LIMIT_HASH_SECRET: z
+      .string()
+      .trim()
+      .default('')
+      .refine((value) => value === '' || value.length >= 32, {
+        message: 'RATE_LIMIT_HASH_SECRET must be at least 32 characters (or empty to derive from JWT_SECRET)',
+      }),
     PORT: z.coerce.number().int().min(1).max(65535).default(4000),
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).optional(),
@@ -153,6 +164,12 @@ const envSchema = z
         const url = new URL(value);
         return url.protocol === 'http:' || url.protocol === 'https:';
       }, 'must be an http(s) URL (or empty when MAIL_MODE=log)'),
+    // The webhook URL is operator configuration, never user input, so it is
+    // not a live SSRF surface today. Still refuse to POST account-takeover
+    // reset codes at link-local/RFC1918/ULA targets unless the operator
+    // explicitly runs a co-located private relay and opts in. Loopback stays
+    // allowed unconditionally (it is a documented production deployment shape).
+    MAIL_WEBHOOK_ALLOW_PRIVATE_ADDRESS: bool,
     RATE_LIMIT_GLOBAL_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -210,6 +227,19 @@ const envSchema = z
       .max(86_400_000)
       .default(60 * 60 * 1000),
     RATE_LIMIT_FORGOT_EMAIL_MAX: z.coerce.number().int().min(1).max(100_000).default(5),
+    // Per-target-email budget for registration attempts: the 409 EMAIL_TAKEN
+    // response is an accepted enumeration oracle for a single probe, and this
+    // shared budget bounds distributed enumeration of one address across IPs.
+    // Over-budget requests get a uniform 429 regardless of whether the address
+    // exists, and a successful registration refunds its hit so the legitimate
+    // registrant keeps their budget.
+    RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS: z.coerce
+      .number()
+      .int()
+      .min(1000)
+      .max(86_400_000)
+      .default(60 * 60 * 1000),
+    RATE_LIMIT_REGISTER_EMAIL_MAX: z.coerce.number().int().min(1).max(100_000).default(20),
     RATE_LIMIT_ASSESS_WINDOW_MS: z.coerce
       .number()
       .int()
@@ -437,6 +467,7 @@ export const config = {
   port: env.PORT,
   databaseUrl: env.DATABASE_URL,
   jwtSecret: env.JWT_SECRET,
+  rateLimitHashSecret: env.RATE_LIMIT_HASH_SECRET,
   corsOrigins: env.CORS_ORIGINS,
   trustProxy: env.TRUST_PROXY,
   dbPoolMax: env.DB_POOL_MAX,
@@ -480,6 +511,8 @@ export const config = {
     passwordMax: env.RATE_LIMIT_PASSWORD_MAX,
     registerWindowMs: env.RATE_LIMIT_REGISTER_WINDOW_MS,
     registerMax: env.RATE_LIMIT_REGISTER_MAX,
+    registerEmailWindowMs: env.RATE_LIMIT_REGISTER_EMAIL_WINDOW_MS,
+    registerEmailMax: env.RATE_LIMIT_REGISTER_EMAIL_MAX,
     forgotEmailWindowMs: env.RATE_LIMIT_FORGOT_EMAIL_WINDOW_MS,
     forgotEmailMax: env.RATE_LIMIT_FORGOT_EMAIL_MAX,
     assessWindowMs: env.RATE_LIMIT_ASSESS_WINDOW_MS,
@@ -492,6 +525,7 @@ export const config = {
   mail: {
     mode: env.MAIL_MODE,
     webhookUrl: env.MAIL_WEBHOOK_URL,
+    webhookAllowPrivateAddress: env.MAIL_WEBHOOK_ALLOW_PRIVATE_ADDRESS,
   },
   mockAi: env.MOCK_AI,
   openaiApiKey: env.OPENAI_API_KEY,

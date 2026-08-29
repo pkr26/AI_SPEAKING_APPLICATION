@@ -322,6 +322,70 @@ describe('rate limiters', () => {
     });
   });
 
+  it('advertising Retry-After on every rejecting limiter 429 (express-rate-limit 8 pin)', async () => {
+    // The mobile retry contract reads the Retry-After header. express-rate-
+    // limit emits it on blocked requests when EITHER header family is enabled;
+    // with standardHeaders on and legacyHeaders off (the project's rejecting
+    // shape) it must still be present. Pin that so a future major upgrade that
+    // moves Retry-After back into the legacy family fails here, not in the app.
+    config.rateLimit.registerWindowMs = 60_000;
+    config.rateLimit.registerMax = 1;
+    const a = okApp(buildLimiters().register);
+
+    expect((await request(a).get('/x')).status).toBe(200);
+    const limited = await request(a).get('/x');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many accounts created from this network, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    const retryAfter = Number(limited.headers['retry-after']);
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThan(0);
+    expect(limited.headers['ratelimit-remaining']).toBe('0');
+    expect(limited.headers['ratelimit-reset']).toBeDefined();
+  });
+
+  it('throttles registration per target email without publishing that email counter state', async () => {
+    config.rateLimit.registerEmailWindowMs = 60_000;
+    config.rateLimit.registerEmailMax = 1;
+    const limiters = buildLimiters();
+    const a = express();
+    a.use(express.json());
+    a.post('/register', limiters.registerEmail, (req, res) => {
+      // The route answers the enumeration oracle this budget exists to bound.
+      res.status(req.body.email === 'taken@example.com' ? 409 : 201).end();
+    });
+    const register = (email: unknown) => request(a).post('/register').send({ email });
+
+    // A successful registration refunds its hit: the legitimate registrant
+    // keeps their budget for retries.
+    expect((await register('fresh@example.com')).status).toBe(201);
+    await expectRefunded('register-email:60000:1');
+
+    // Probing one existing address now saturates its shared budget...
+    expect((await register('taken@example.com')).status).toBe(409);
+    const limited = await register('taken@example.com');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many registration attempts, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    // ...and the 429 is uniform for existing and non-existing addresses, so it
+    // is not a new oracle. Like the other email-keyed budgets, no counter
+    // state for a third party's address may leak through headers.
+    const otherAddress = await register('taken@example.com');
+    expect(otherAddress.status).toBe(429);
+    expect(Object.keys(limited.headers).filter((name) => name.includes('ratelimit') || name === 'retry-after')).toEqual(
+      [],
+    );
+
+    // A different address keeps its own budget, and unusable identifiers are
+    // skipped (the route's own validation will reject them).
+    expect((await register('other-fresh@example.com')).status).toBe(201);
+    expect((await register('not-an-email')).status).toBe(201);
+  });
+
   it('throttles diagnostic restarts per user without coupling authenticated learners', async () => {
     config.rateLimit.passwordWindowMs = 60_000;
     config.rateLimit.passwordMax = 1;
@@ -356,6 +420,28 @@ describe('rate limiters', () => {
     // counter: consuming this budget must not throttle a diagnostic restart.
     const restart = userApp('recording-owner-1', limiters.diagnosticRestart);
     expect((await request(restart).get('/x')).status).toBe(200);
+  });
+
+  it('throttles single recording deletion per user in its own shared namespace', async () => {
+    config.rateLimit.passwordWindowMs = 60_000;
+    config.rateLimit.passwordMax = 1;
+    const limiters = buildLimiters();
+    const first = userApp('recording-owner-3', limiters.recordingDelete);
+    const second = userApp('recording-owner-4', limiters.recordingDelete);
+
+    expect((await request(first).get('/x')).status).toBe(200);
+    const limited = await request(first).get('/x');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many recording deletion requests, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    expect((await request(second).get('/x')).status).toBe(200);
+
+    // Independent counter from the bulk-delete budget: exhausting one must
+    // leave the other usable for its own operation.
+    const bulk = userApp('recording-owner-3', limiters.recordingBulkDelete);
+    expect((await request(bulk).get('/x')).status).toBe(200);
   });
 
   it('keys the assess limiter per user, not per IP', async () => {

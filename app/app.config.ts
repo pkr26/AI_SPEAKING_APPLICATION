@@ -140,6 +140,31 @@ export default (
   environment: NodeJS.ProcessEnv = process.env,
 ): ExpoConfig => {
   const production = environment.NODE_ENV === 'production';
+  // The API client resolves its base URL at module load and throws before any
+  // error UI can mount, so a missing/typo'd EXPO_PUBLIC_API_URL would only
+  // surface as a release white-screen. Fail the production bundle build here,
+  // where the mistake is actionable, instead. Non-HTTPS URLs are equally
+  // rejected: a plaintext API URL would broadcast bearer tokens.
+  if (production) {
+    const apiUrl = environment.EXPO_PUBLIC_API_URL;
+    let apiUrlProblem: string | null = null;
+    if (!apiUrl) apiUrlProblem = 'EXPO_PUBLIC_API_URL is required in production';
+    else {
+      try {
+        const url = new URL(apiUrl);
+        // Mirror the client's own resolveBaseUrl contract: https only, and no
+        // credentials/query/fragment (a base path itself is allowed).
+        if (url.protocol !== 'https:') {
+          apiUrlProblem = 'EXPO_PUBLIC_API_URL must be an https URL in production';
+        } else if (apiUrl.includes('?') || apiUrl.includes('#') || url.username || url.password) {
+          apiUrlProblem = 'EXPO_PUBLIC_API_URL cannot contain credentials, a query, or a fragment';
+        }
+      } catch {
+        apiUrlProblem = 'EXPO_PUBLIC_API_URL must be a valid https URL in production';
+      }
+    }
+    if (apiUrlProblem) throw new Error(apiUrlProblem);
+  }
   const androidAppId = production
     ? productionAppId(
         'ADMOB_ANDROID_APP_ID',

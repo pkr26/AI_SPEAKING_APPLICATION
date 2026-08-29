@@ -990,6 +990,41 @@ describe('(auth) layout', () => {
 });
 
 describe('index gate', () => {
+  it('refetches its own profile after a bounded wait when no bridge observer populates the cache', async () => {
+    jest.useFakeTimers();
+    try {
+      mockAuthValue = makeAuth({ token: 'stored-bearer', user: null });
+      const client = makeQueryClient();
+      mockApiFetch.mockResolvedValueOnce({ user: USER });
+      // Gate alone: no ProfileRefreshBridge shares the ['me'] cache entry,
+      // modeling a bridge regression that leaves the disabled observer alone.
+      const rendered = await render(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 0, left: 0, right: 0, bottom: 0 },
+          }}
+        >
+          <QueryClientProvider client={client}>
+            <Gate />
+          </QueryClientProvider>
+        </SafeAreaProvider>,
+      );
+      expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
+      expect(mockApiFetch).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(10_000);
+      });
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+      await waitFor(() => expect(asMock(mockAuthValue.setUser)).toHaveBeenCalledWith(USER));
+      expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
+      rendered.unmount();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('keeps the current route visible while the persistent profile refresh is in flight', async () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderGate();

@@ -188,7 +188,12 @@ describe('diagnostic transaction rollback precedence', () => {
       release: vi.fn(),
     };
     vi.spyOn(pool, 'query').mockImplementation(async (text: string) => {
-      if (text === 'SELECT * FROM users WHERE id = $1') return { rows: [user], rowCount: 1 } as never;
+      if (
+        text.startsWith('SELECT id, name, email, native_language, ui_language, cefr_level') &&
+        text.includes('FROM users WHERE id = $1')
+      ) {
+        return { rows: [user], rowCount: 1 } as never;
+      }
       // The shared submission pipeline snapshots this exact row into the
       // durable request before the diagnostic-state claim is attempted.
       if (text === 'SELECT id, cefr_level, prompt_word, question_text, translations FROM questions WHERE id = $1') {

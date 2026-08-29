@@ -12,6 +12,14 @@ import { useNetworkStatus } from '../lib/network-status';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import { parseUserResponse } from '../lib/types';
 
+/**
+ * Bounded wait before the Gate's disabled profile observer refetches on its
+ * own. The root ProfileRefreshBridge normally populates the shared cache long
+ * before this fires; it exists so a bridge regression degrades to one direct
+ * request instead of an unbounded loading spinner.
+ */
+const GATE_PROFILE_FALLBACK_MS = 10_000;
+
 function FallbackScreen({ children }: PropsWithChildren) {
   const styles = themedStyles(useTheme());
   return (
@@ -89,6 +97,20 @@ export default function Gate() {
       setUser(meQuery.data);
     }
   }, [isSessionLeaseCurrent, meQuery.data, sessionLease, setUser]);
+
+  // meQuery is disabled and relies on the root ProfileRefreshBridge to share
+  // the ['me', sessionVersion] cache entry. If that bridge is ever refactored
+  // away from its eager fetch, this observer would otherwise show an unbounded
+  // spinner; after a bounded wait, refetch through this observer once so the
+  // Gate degrades to its own request instead of hanging silently.
+  useEffect(() => {
+    if (!token || user || meQuery.data || meQuery.fetchStatus !== 'idle') return;
+    const fallback = setTimeout(() => {
+      void meQuery.refetch();
+    }, GATE_PROFILE_FALLBACK_MS);
+    return () => clearTimeout(fallback);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, user, meQuery.data, meQuery.fetchStatus, sessionVersion]);
 
   if (isRestoring) {
     return <LoadingView label={t('gate.restoring')} />;

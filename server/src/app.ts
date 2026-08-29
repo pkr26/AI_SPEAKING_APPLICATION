@@ -35,6 +35,12 @@ export function createApp({
   // would trust an attacker-supplied forwarding chain and bypass IP limits.
   app.set('trust proxy', config.trustProxy);
 
+  // No route uses nested/bracketed query syntax, and every query schema is a
+  // flat object: the 'simple' parser (key=value pairs only) removes the
+  // extended 'qs' prototype-pollution surface entirely rather than relying on
+  // the qs version pin to keep defending it.
+  app.set('query parser', 'simple');
+
   app.use(helmet());
   app.use(httpLogger);
   // Time every request (including limiter/gate rejections) with bounded route
@@ -127,6 +133,12 @@ export function createApp({
   // The independent IP limiter above still rejects abusive bodies before JSON
   // parsing, while this shared budget prevents distributed credential attacks.
   app.use('/auth/login', limiters.loginAccount);
+
+  // Same parsed-body requirement: the per-target-email register budget bounds
+  // distributed EMAIL_TAKEN enumeration of one address across IPs. Malformed
+  // bodies (no parseable email) are skipped here and rejected by the route's
+  // own zod validation.
+  app.use('/auth/register', limiters.registerEmail);
 
   app.use('/auth', createAuthRouter(limiters));
   app.get(

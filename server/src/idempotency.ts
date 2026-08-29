@@ -528,6 +528,11 @@ export async function claimAssessmentRequest(
     if (
       row.context !== context ||
       row.question_id !== questionId ||
+      // v1 rows predate migration 024's practice_cycle_id column and always
+      // read NULL here. A current client retrying one of those request ids
+      // sends a cycleId, so applying the cycle check to them would answer
+      // REQUEST_ID_REUSED and hide the legacy-result retirement contract
+      // below — the replay tombstone must win for pre-024 rows.
       (row.response_version === 2 && row.practice_cycle_id !== (practiceCycleId ?? null)) ||
       row.retain_recording !== retainRecording
     ) {
@@ -629,14 +634,18 @@ export async function completeAssessmentRequest(
     throw new HttpError(409, 'Assessment request ownership changed; please retry', 'STATE_CHANGED');
   }
   const owner = completed.rows[0];
-  if (recording && !owner) {
+  // Unreachable against a real PostgreSQL UPDATE ... RETURNING (rowCount 1
+  // implies the row), but this function's query client is injectable and unit
+  // tests exercise malformed-driver shapes; fail closed instead of crashing on
+  // property access.
+  if (!owner) {
     throw new Error('recording completion has no authoritative S3 audio key');
   }
   if (recording && owner.recording_retained) {
-    if (!owner?.audio_key) throw new Error('recording completion has no authoritative S3 audio key');
+    if (!owner.audio_key) throw new Error('recording completion has no authoritative S3 audio key');
     await insertRetainedRecording(client, userId, requestId, owner.question_id, context, owner.audio_key, recording);
   }
-  return recording && owner?.recording_retained ? responseWithRecording : validatedResponseWithoutRecording;
+  return recording && owner.recording_retained ? responseWithRecording : validatedResponseWithoutRecording;
 }
 
 export async function abandonAssessmentRequest(userId: string, requestId: string, claimId: string): Promise<void> {

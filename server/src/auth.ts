@@ -9,6 +9,7 @@ import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
 import { sendMail } from './mailer';
 import {
   AuthedRequest,
+  AuthUser,
   h,
   HttpError,
   JWT_AUDIENCE,
@@ -41,7 +42,7 @@ const RESET_INVALID_MESSAGE = 'Reset code is invalid or expired';
 const authenticationStateChanged = () =>
   new HttpError(409, 'Authentication state changed; please try again', 'STATE_CHANGED');
 
-function toUserJson(row: UserRow) {
+function toUserJson(row: AuthUser) {
   return {
     id: row.id,
     name: row.name,
@@ -451,7 +452,17 @@ export function createAuthRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       const { currentPassword, newPassword } = validated(req, changePasswordSchema);
-      if (!(await bcrypt.compare(currentPassword, user.password_hash))) {
+      // requireAuth deliberately does not pin the bcrypt hash onto the request
+      // object; fetch the exact credential snapshot at the moment of
+      // verification instead. A self-delete between the two reads leaves no
+      // row and gets the same state-change error as the guarded write below.
+      const credentialRows = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [user.id],
+      );
+      const credential = credentialRows.rows[0];
+      if (!credential) throw authenticationStateChanged();
+      if (!(await bcrypt.compare(currentPassword, credential.password_hash))) {
         if (res.locals.passwordAccountThrottled) {
           throw new HttpError(429, 'Too many attempts, please try again later');
         }
@@ -475,7 +486,7 @@ export function createAuthRouter(limiters: Limiters) {
            DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM updated)
          )
          SELECT * FROM updated`,
-        [passwordHash, user.id, user.password_hash, user.token_version],
+        [passwordHash, user.id, credential.password_hash, credential.token_version],
       );
       if (updatedResult.rowCount !== 1) throw authenticationStateChanged();
       const updated = updatedResult.rows[0];
@@ -491,7 +502,16 @@ export function createAuthRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
       const { password } = validated(req, deleteAccountSchema);
-      if (!(await bcrypt.compare(password, user.password_hash))) {
+      // Same in-route credential snapshot as change-password: the hash never
+      // rides on the request object, and a vanished row is the same
+      // state-change error as the guarded DELETE below.
+      const credentialRows = await pool.query<{ password_hash: string; token_version: number }>(
+        'SELECT password_hash, token_version FROM users WHERE id = $1',
+        [user.id],
+      );
+      const credential = credentialRows.rows[0];
+      if (!credential) throw authenticationStateChanged();
+      if (!(await bcrypt.compare(password, credential.password_hash))) {
         if (res.locals.passwordAccountThrottled) {
           throw new HttpError(429, 'Too many attempts, please try again later');
         }
@@ -503,7 +523,7 @@ export function createAuthRouter(limiters: Limiters) {
       // already changed or revoked that authentication state.
       const deleted = await pool.query(
         'DELETE FROM users WHERE id = $1 AND password_hash = $2 AND token_version = $3',
-        [user.id, user.password_hash, user.token_version],
+        [user.id, credential.password_hash, credential.token_version],
       );
       if (deleted.rowCount !== 1) throw authenticationStateChanged();
       res.status(204).end();

@@ -44,6 +44,14 @@ function canonicalEnvironment(environment) {
     const candidate = environment[name];
     return candidate === undefined ? null : String(candidate);
   };
+  // The named variables below are the reviewed, behavior-affecting set. Any
+  // EXPO_PUBLIC_* variable also reaches the bundle/tests by construction, so
+  // include every present one by name: a future flag must never let two runs
+  // fingerprint identically while behaving differently.
+  const expoPublic = Object.keys(environment)
+    .filter((name) => name.startsWith('EXPO_PUBLIC_'))
+    .toSorted()
+    .map((name) => [name, value(name)]);
   return {
     CI: value('CI'),
     EXPO_PUBLIC_API_URL: value('EXPO_PUBLIC_API_URL'),
@@ -59,6 +67,7 @@ function canonicalEnvironment(environment) {
     NODE_ENV: value('NODE_ENV'),
     NODE_OPTIONS: value('NODE_OPTIONS'),
     TZ: value('TZ'),
+    ...Object.fromEntries(expoPublic),
   };
 }
 

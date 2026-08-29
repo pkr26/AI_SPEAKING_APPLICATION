@@ -213,7 +213,7 @@ test('checked-in discovery is exhaustive and lane-owned for both JSX modes', asy
     mode: 'accessibility',
   });
   assert.equal(eventSites.length, 221);
-  assert.equal(accessibilitySites.length, 332);
+  assert.equal(accessibilitySites.length, 334);
   for (const sites of [eventSites, accessibilitySites]) {
     assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
     assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));

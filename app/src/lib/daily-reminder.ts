@@ -240,7 +240,16 @@ export function refreshDailyReminderLanguage(language: UiLanguage): Promise<Dail
     }
     if (stored.uiLanguage === language) return stored;
     const outcome = await enableDailyReminderUnsafe(stored.hour, language);
-    return outcome === 'enabled' ? { hour: stored.hour, uiLanguage: language } : null;
+    if (outcome !== 'enabled') return null;
+    // Re-read the persisted preference instead of hand-building the result so
+    // this return value can never drift from what parseDailyReminder validates
+    // if fields are ever added. A storage read failure falls back to the
+    // values that were just durably written.
+    try {
+      return (await getDailyReminderUnsafe()) ?? { hour: stored.hour, uiLanguage: language };
+    } catch {
+      return { hour: stored.hour, uiLanguage: language };
+    }
   });
 }
 

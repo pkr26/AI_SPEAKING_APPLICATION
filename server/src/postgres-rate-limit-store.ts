@@ -12,6 +12,20 @@ interface CounterRow {
   reset_at: Date | string;
 }
 
+const HASH_KEY_INFO = 'postgres-rate-limit-store/v1';
+
+// `config` is frozen at boot, so the derived key is computed once and reused.
+let cachedHashKeySecret: Buffer | undefined;
+
+function hashKeySecret(): Buffer {
+  if (!cachedHashKeySecret) {
+    cachedHashKeySecret = createHmac('sha256', config.rateLimitHashSecret || config.jwtSecret)
+      .update(HASH_KEY_INFO)
+      .digest();
+  }
+  return cachedHashKeySecret;
+}
+
 // Refund/reset/re-spend callbacks are deliberately fire-and-forget. A broken
 // logging transport must not turn the catch path itself into an unhandled
 // rejection (or replace increment's contracted retryable 503).
@@ -39,8 +53,14 @@ export class PostgresRateLimitStore implements Store {
     this.prefix = `${namespace}:`;
   }
 
+  // Counter keys are HMACed with a dedicated subkey, not the raw JWT secret:
+  // domain separation means the signing key never appears as a MAC key
+  // anywhere else, and RATE_LIMIT_HASH_SECRET lets operators give the counter
+  // store its own rotation lifecycle. With the derived default, rotating
+  // JWT_SECRET still invalidates every persisted window once — set the
+  // dedicated secret to decouple the two.
   private hash(key: string): string {
-    return createHmac('sha256', config.jwtSecret).update(this.namespace).update('\0').update(key).digest('hex');
+    return createHmac('sha256', hashKeySecret()).update(this.namespace).update('\0').update(key).digest('hex');
   }
 
   async increment(key: string): Promise<ClientRateLimitInfo> {

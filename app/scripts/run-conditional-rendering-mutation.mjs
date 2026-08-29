@@ -991,15 +991,27 @@ export async function acquireCampaignLock(appDir, reportDir) {
   }
 
   let released = false;
-  return async () => {
+  return async (options = {}) => {
     if (released) return;
     released = true;
     await handle.close();
+    if (options.preserve === true) {
+      // A signal-ended campaign may leave orphaned Jest children mutating the
+      // workspace. Keep the lock for manual verification before removal.
+      console.error(
+        `Mutation campaign stopped by signal: preserving ${campaignLockFileName} ` +
+          '(verify no orphaned Jest child is alive, then remove it manually).',
+      );
+      return;
+    }
     let owner;
     try {
       owner = await readCampaignLock(lockPath);
-    } catch {
-      return;
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      // An invalid lock must fail loudly: silently reporting successful cleanup
+      // would hide a wedged/foreign lock file.
+      throw error;
     }
     if (owner.token === token) await fs.rm(lockPath, { force: true });
   };
@@ -1053,6 +1065,8 @@ export async function runConditionalRenderingCampaign({
 } = {}) {
   const startedAt = Date.now();
   const releaseCampaignLock = await acquireCampaignLock(appDir, reportDir);
+  // Hoisted so the signal-preservation decision in finally can read it.
+  let stopSignalSeen = false;
   try {
     await removeCampaignReports(reportDir);
     await validateManifest({ appDir });
@@ -1095,6 +1109,7 @@ export async function runConditionalRenderingCampaign({
         expectedTestFiles: before.testFiles,
         appDir,
       });
+      if (baselineRun.signal) stopSignalSeen = true;
       baseline = {
         status:
           baselineClassification.status === 'Survived'
@@ -1131,6 +1146,7 @@ export async function runConditionalRenderingCampaign({
           executeJest,
           log,
         });
+        if (results.some((result) => result.process?.signal)) stopSignalSeen = true;
       } else {
         log(`Baseline ${baseline.status.toLowerCase()}: ${baseline.reason}`);
       }
@@ -1188,7 +1204,7 @@ export async function runConditionalRenderingCampaign({
     const reportPaths = await writeCampaignReports({ reportDir, report });
     return { report, reportPaths };
   } finally {
-    await releaseCampaignLock();
+    await releaseCampaignLock({ preserve: stopSignalSeen });
   }
 }
 

@@ -96,6 +96,12 @@ describe('metrics initialization', () => {
         registers: [registry],
       },
       {
+        name: 'janitor_skipped_total',
+        help: 'Janitor ticks skipped because another replica held the advisory lock, by janitor',
+        labelNames: ['janitor'],
+        registers: [registry],
+      },
+      {
         name: 'recording_maintenance_total',
         help: 'Durable recording retention/deletion maintenance outcomes',
         labelNames: ['operation', 'outcome'],

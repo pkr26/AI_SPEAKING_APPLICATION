@@ -24,6 +24,9 @@ function plugin(
 
 function configureValidProductionEnvironment(): void {
   process.env.NODE_ENV = 'production';
+  process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
+  // The production config also gates on a valid HTTPS API base URL.
+  process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
   process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
   process.env.ADMOB_IOS_APP_ID = 'ca-app-pub-2222222222222222~2222222222';
   process.env.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID = 'ca-app-pub-1111111111111111/1111111111';
@@ -67,6 +70,7 @@ describe('dynamic AdMob Expo configuration', () => {
     ['sample IDs', SAMPLE_ADMOB_ANDROID_APP_ID, SAMPLE_ADMOB_IOS_APP_ID],
   ])('fails production for %s', (_label, android, ios) => {
     process.env.NODE_ENV = 'production';
+    process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
     if (android === undefined) delete process.env.ADMOB_ANDROID_APP_ID;
     else process.env.ADMOB_ANDROID_APP_ID = android;
     if (ios === undefined) delete process.env.ADMOB_IOS_APP_ID;
@@ -138,6 +142,7 @@ describe('dynamic AdMob Expo configuration', () => {
 
   it('fails production when any real placement unit ID is missing', () => {
     process.env.NODE_ENV = 'production';
+    process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
     process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
     process.env.ADMOB_IOS_APP_ID = 'ca-app-pub-2222222222222222~2222222222';
     delete process.env.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID;
@@ -146,6 +151,7 @@ describe('dynamic AdMob Expo configuration', () => {
 
   it('rejects one production unit ID reused across a platform or placement', () => {
     process.env.NODE_ENV = 'production';
+    process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
     process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
     process.env.ADMOB_IOS_APP_ID = 'ca-app-pub-2222222222222222~2222222222';
     const duplicate = 'ca-app-pub-1111111111111111/1111111111';
@@ -160,6 +166,7 @@ describe('dynamic AdMob Expo configuration', () => {
 
   it('rejects one production app ID reused across platforms', () => {
     process.env.NODE_ENV = 'production';
+    process.env.EXPO_PUBLIC_API_URL = 'https://api.example.invalid';
     process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
     process.env.ADMOB_IOS_APP_ID = process.env.ADMOB_ANDROID_APP_ID;
     process.env.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID = 'ca-app-pub-1111111111111111/1111111111';

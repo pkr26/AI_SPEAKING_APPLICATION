@@ -1909,8 +1909,9 @@ describe('audioFileDescriptor', () => {
     ['file:///rec/a.webm', { name: 'audio.webm', type: 'audio/webm' }],
     ['file:///rec/a.wav', { name: 'audio.wav', type: 'audio/wav' }],
     ['file:///rec/a.m4a', { name: 'audio.m4a', type: 'audio/mp4' }],
-    ['file:///rec/a.bin', { name: 'audio.m4a', type: 'audio/mp4' }],
+    ['file:///rec/a.mp4', { name: 'audio.m4a', type: 'audio/mp4' }],
     ['file:///rec/no-extension', { name: 'audio.m4a', type: 'audio/mp4' }],
+    ['file:///content/primary-recording', { name: 'audio.m4a', type: 'audio/mp4' }],
     ['file:///REC/A.WEBM', { name: 'audio.webm', type: 'audio/webm' }],
     ['file:///REC/A.WAV', { name: 'audio.wav', type: 'audio/wav' }],
     ['file:///rec/a.wav?duration=10', { name: 'audio.wav', type: 'audio/wav' }],
@@ -1925,6 +1926,11 @@ describe('audioFileDescriptor', () => {
       'file:///REC/A.3GP?x=1',
       'file:///rec/a.aac',
       'file:///REC/A.AAC#clip',
+      // An extension this module does not know must fail closed instead of
+      // being silently declared MP4 and rejected server-side later.
+      'file:///rec/a.bin',
+      'file:///REC/A.OGG',
+      'file:///rec/take.mp3',
     ]) {
       const error = catchSync(() => api.audioFileDescriptor(uri));
       expect(error).toBeInstanceOf(api.ApiError);

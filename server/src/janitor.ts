@@ -1,5 +1,6 @@
 import { pool } from './db';
 import { logger } from './logger';
+import { janitorSkippedTotal } from './metrics';
 
 /**
  * Database janitors delete in bounded ctid batches so a large backlog can
@@ -30,7 +31,15 @@ export async function runExclusiveBatchedDelete(lockName: string, batchDeleteSql
     const { rows } = await client.query<{ locked: boolean }>('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', [
       lockName,
     ]);
-    if (rows[0]?.locked !== true) return 0;
+    if (rows[0]?.locked !== true) {
+      // Observability only: a metric failure must not fail the tick.
+      try {
+        janitorSkippedTotal.inc({ janitor: lockName });
+      } catch {
+        // The skip itself is normal cross-replica behavior.
+      }
+      return 0;
+    }
     try {
       let removed = 0;
       for (let batchNumber = 0; batchNumber < JANITOR_MAX_BATCHES_PER_TICK; batchNumber += 1) {

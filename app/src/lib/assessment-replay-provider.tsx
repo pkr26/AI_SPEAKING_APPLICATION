@@ -91,6 +91,12 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
     getPendingAssessmentReplayRevision,
   );
   const identity = `${sessionVersion}:${user?.id ?? 'anonymous'}`;
+  // Key the effect on the identity scalar, not the user object: every /auth/me
+  // refetch produces a new object reference, and re-running this check while
+  // `phase === 'checking'` replaces children with the full-screen "Checking
+  // your saved answer" spinner for no reason. sessionVersion in `identity`
+  // still rotates the check on real account transitions.
+  const userId = user?.id;
   const shouldCheck = !!token && !!user && !isRestoring && !restoreError;
   const checkKey = `${identity}:${shouldCheck ? 'check' : 'skip'}:${retryVersion}:${pendingReplayRevision}`;
   const [state, setState] = useState<ReplayState>(() =>
@@ -108,7 +114,7 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
     const controller = new AbortController();
     let active = true;
     let queriedPointer: Pick<PendingAssessment, 'requestId' | 'stage'> | null = null;
-    if (!shouldCheck || !user) return () => controller.abort();
+    if (!shouldCheck || userId === undefined) return () => controller.abort();
 
     const stillCurrent = () =>
       active && !controller.signal.aborted && isSessionLeaseCurrent(sessionLease);
@@ -141,7 +147,7 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
           setState({ ...initialState(identity, checkKey, false), phase: 'ready' });
           return;
         }
-        if (pending.ownerId !== user.id) {
+        if (pending.ownerId !== userId) {
           await retireReplayPointer(pending.requestId, false);
           return;
         }
@@ -269,7 +275,7 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
     restoreFeedback,
     sessionLease,
     shouldCheck,
-    user,
+    userId,
   ]);
 
   useEffect(() => {

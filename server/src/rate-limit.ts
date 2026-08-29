@@ -328,6 +328,38 @@ export function buildLimiters() {
     message: { error: 'Too many accounts created from this network, please try again later', code: 'RATE_LIMITED' },
   });
 
+  // The per-IP register budget above cannot bound enumeration of ONE address
+  // from distributed IPs, and POST /auth/register answers 409 EMAIL_TAKEN —
+  // an accepted per-probe oracle. This second budget keys the TARGET email
+  // across every source IP: after it saturates, both an existing and a
+  // non-existing address get the same 429, closing the oracle for the rest of
+  // the window. Like the other email-keyed budgets it keeps silent headers so
+  // a prober cannot read a third party's counter state, and a successful
+  // registration refunds its hit so the legitimate registrant is not the one
+  // who exhausts it.
+  const registerEmailStore = new PostgresRateLimitStore(
+    `register-email:${config.rateLimit.registerEmailWindowMs}:${config.rateLimit.registerEmailMax}`,
+    config.rateLimit.registerEmailWindowMs,
+  );
+  const registerEmailRequestProperty = 'registerEmailRateLimit';
+  const registerEmailLimiter = rateLimit({
+    ...common,
+    ...silentBudgetHeaders,
+    windowMs: config.rateLimit.registerEmailWindowMs,
+    limit: config.rateLimit.registerEmailMax,
+    store: registerEmailStore,
+    skip: skipInvalidEmail,
+    keyGenerator: validEmailRateLimitKey,
+    requestPropertyName: registerEmailRequestProperty,
+    message: { error: 'Too many registration attempts, please try again later', code: 'RATE_LIMITED' },
+  });
+  const registerEmail = withExactWindowFinishRefund({
+    limiter: registerEmailLimiter,
+    store: registerEmailStore,
+    requestPropertyName: registerEmailRequestProperty,
+    refundFinished: (_req, res) => res.statusCode < 400,
+  });
+
   // Restarting the placement test resets the learner's level, so it shares
   // the passwordAccount budget shape (PG-backed, per authenticated user).
   // Unlike the credential budgets it rejects outright: the operation is
@@ -359,6 +391,24 @@ export function buildLimiters() {
     limit: config.rateLimit.passwordMax,
     store: new PostgresRateLimitStore(
       `recording-bulk-delete:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
+      config.rateLimit.passwordWindowMs,
+    ),
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
+    message: { error: 'Too many recording deletion requests, please try again later', code: 'RATE_LIMITED' },
+  });
+
+  // Single-item deletion shares the bulk budget's shape for the same reason:
+  // every accepted request takes the user-row lock and enqueues a durable S3
+  // deletion job with unbounded retries (via the migration-017 trigger), so an
+  // authenticated learner cycling recording IDs must not mint an unbounded
+  // queue of maintenance jobs. The budget only rejects once the learner has
+  // genuinely deleted passwordMax recordings in one window.
+  const recordingDelete = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.passwordWindowMs,
+    limit: config.rateLimit.passwordMax,
+    store: new PostgresRateLimitStore(
+      `recording-delete:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
       config.rateLimit.passwordWindowMs,
     ),
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
@@ -528,8 +578,10 @@ export function buildLimiters() {
     forgotPasswordEmail,
     diagnosticRestart,
     recordingBulkDelete,
+    recordingDelete,
     readiness,
     register,
+    registerEmail,
     assess,
     assessIpDaily,
     assessAbortGuard,

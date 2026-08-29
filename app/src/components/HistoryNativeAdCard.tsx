@@ -26,6 +26,17 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   const [nativeAd, setNativeAd] = useState<NativeAd | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const nativeAdRef = useRef<NativeAd | null>(null);
+  // Declared before the effects below so its unmount cleanup runs first: the
+  // deferred/cleanup setState calls then skip cleanly once unmounted instead
+  // of writing state on a gone component (harmless in RN, but inconsistent
+  // with the `active` flag discipline the rest of this file follows).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const playbackActive = useSyncExternalStore(
     subscribeSubmittedRecordingPlaybackActive,
     getSubmittedRecordingPlaybackActive,
@@ -36,7 +47,9 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
     if (ads.statuses.historyNative !== 'blocked' && !playbackActive) return;
     nativeAdRef.current?.destroy();
     nativeAdRef.current = null;
-    void Promise.resolve().then(() => setNativeAd(null));
+    void Promise.resolve().then(() => {
+      if (mountedRef.current) setNativeAd(null);
+    });
   }, [ads.statuses.historyNative, playbackActive]);
 
   useEffect(() => {
@@ -78,7 +91,7 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
         loaded.destroy();
         nativeAdRef.current = null;
       }
-      setNativeAd(null);
+      if (mountedRef.current) setNativeAd(null);
     };
   }, [
     activatePlacement,

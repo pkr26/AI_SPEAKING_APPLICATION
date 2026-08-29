@@ -482,6 +482,12 @@ export default function RecordingPlayback({
       player.muted = false;
       player.volume = 1;
       let playRequested = false;
+      // Highest playback position observed after play was requested. Some
+      // Android decoders deliver audible playback while reporting
+      // playing=false irregularly; a position that advances past this mark is
+      // proof decode is progressing and must clear the prepare deadline even
+      // without a playing=true status.
+      let observedProgressSeconds = 0;
       const handlePlaybackStatus = (status: AudioStatus) => {
         if (playerRef.current !== player || !contextIsCurrent(lifecycle)) return;
         if (status.error) {
@@ -516,7 +522,11 @@ export default function RecordingPlayback({
               setPhase('error');
             }
           });
-        } else if (playRequested && status.playing) {
+        } else if (
+          playRequested &&
+          (status.playing || (status.isLoaded && status.currentTime > observedProgressSeconds))
+        ) {
+          observedProgressSeconds = Math.max(observedProgressSeconds, status.currentTime);
           clearPlaybackPrepareTimer();
           if (preparingPlayerRef.current === player) preparingPlayerRef.current = null;
           setPhase('playing');

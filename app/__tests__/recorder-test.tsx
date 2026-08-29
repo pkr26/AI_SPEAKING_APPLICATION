@@ -88,6 +88,7 @@ import Recorder, {
   shouldRetryCapacityFailure,
   shouldRunRecordingCacheJanitor,
   shouldPublishRecordingStatus,
+  awaitAudioSessionSettled,
   sleepAbortable,
   scrollToExpandedRecorderControls,
   terminalEventQuarantineIndex,
@@ -1885,6 +1886,79 @@ describe('Recorder pure behavior contracts', () => {
     await flushMicrotasks();
     expect(resolved).toBe(true);
     expect(appStateSubscriptionRemove).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('awaitAudioSessionSettled', () => {
+  it('resolves immediately for an absent release promise', async () => {
+    await expect(awaitAudioSessionSettled(null, 10_000)).resolves.toBeUndefined();
+  });
+
+  it('resolves when the release promise settles and clears the deadline timer', async () => {
+    jest.useFakeTimers();
+    try {
+      let release!: () => void;
+      const pending = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let outcome: unknown = 'pending';
+      void Promise.resolve(awaitAudioSessionSettled(pending, 10_000)).then(
+        () => {
+          outcome = 'resolved';
+        },
+        (error: unknown) => {
+          outcome = error;
+        },
+      );
+      await flushMicrotasks();
+      expect(outcome).toBe('pending');
+      release();
+      await flushMicrotasks();
+      expect(outcome).toBe('resolved');
+      // The deadline must be gone with the settled wait: advancing past it
+      // cannot turn the already-resolved outcome into a rejection.
+      jest.advanceTimersByTime(20_000);
+      await flushMicrotasks();
+      expect(outcome).toBe('resolved');
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('propagates an underlying rejection and wraps non-Error failures', async () => {
+    await expect(
+      awaitAudioSessionSettled(Promise.reject(new Error('restore failed')), 10_000),
+    ).rejects.toThrow('restore failed');
+    await expect(
+      awaitAudioSessionSettled(Promise.reject('string failure'), 10_000),
+    ).rejects.toThrow('audio session release failed');
+  });
+
+  it('rejects at the deadline when the owning instance never releases', async () => {
+    jest.useFakeTimers();
+    try {
+      const hung = new Promise<void>(() => undefined);
+      let outcome: unknown = 'pending';
+      void Promise.resolve(awaitAudioSessionSettled(hung, 10_000)).then(
+        () => {
+          outcome = 'resolved';
+        },
+        (error: unknown) => {
+          outcome = error;
+        },
+      );
+      await flushMicrotasks();
+      expect(outcome).toBe('pending');
+      jest.advanceTimersByTime(10_000);
+      await flushMicrotasks();
+      // A queued startRecording turns this rejection into the localized
+      // start-failure copy instead of locking the controls forever.
+      expect(outcome).toMatchObject({
+        message: 'audio session release did not settle in time',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });
 
@@ -4257,6 +4331,55 @@ describe('Recorder', () => {
       ]);
     });
 
+    it('fails a queued start closed when the owning instance never releases the audio session', async () => {
+      jest.useFakeTimers();
+      const firstError = jest.fn();
+      const secondError = jest.fn();
+      const first = recorderTestProps({ onError: firstError });
+      const second = recorderTestProps({ onError: secondError });
+      await render(
+        <>
+          <Recorder {...first} />
+          <Recorder {...second} />
+        </>,
+      );
+      await flushAct();
+      // The first instance acquires the module-level audio session; its
+      // release promise stays pending while it holds it.
+      const startButtons = screen.getAllByLabelText(START_LABEL);
+      const firstStart = compositePressablePropsForNode(startButtons[0]).onPress as () => unknown;
+      await act(async () => {
+        await firstStart();
+        await flushMicrotasks();
+      });
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+
+      // The second instance's start queues on that release promise. A hung
+      // native restore must fail this start closed after the bounded wait —
+      // never lock the controls on an unresolved promise forever.
+      const secondStart = compositePressablePropsForNode(startButtons[1]).onPress as () => unknown;
+      await act(async () => {
+        const queued = Promise.resolve(secondStart());
+        await flushMicrotasks();
+        await jest.advanceTimersByTimeAsync(10_000);
+        await queued;
+      });
+      expect(secondError).toHaveBeenCalledWith(t('recorder.errStartFailed'));
+      expect(mockRecorder.record).toHaveBeenCalledTimes(1);
+
+      // Real timers for cleanup so the first instance's stop/restore pipeline
+      // settles naturally and the module-level session owner is released for
+      // the tests that follow.
+      jest.useRealTimers();
+      const stopButtons = screen.getAllByLabelText(STOP_LABEL);
+      const firstStop = compositePressablePropsForNode(stopButtons[0]).onPress as () => unknown;
+      await act(async () => {
+        await firstStop();
+      });
+      await waitFor(() => expect(screen.getAllByText(SUBMIT_TEXT).length).toBeGreaterThan(0));
+      expect(firstError).not.toHaveBeenCalled();
+    });
+
     it('serializes overlapping stop handlers and rejects a stale stop handler', async () => {
       const nativeStop = deferred<void>();
       mockRecorder.stop.mockImplementation(async () => {
@@ -4490,6 +4613,57 @@ describe('Recorder', () => {
         jest.advanceTimersByTime(500);
         await flushMicrotasks();
       });
+    });
+
+    it('adopts the take-scoped status URL when neither the event nor the recorder reports one', async () => {
+      jest.useFakeTimers();
+      const statusUri = 'file:///recordings/take-scoped-status-url.m4a';
+      mockRecorder.stop.mockImplementationOnce(async () => {
+        mockRecorder.isRecording = false;
+        mockRecorderState = {
+          ...mockRecorderState,
+          canRecord: false,
+          isRecording: false,
+        };
+      });
+      const { props } = await renderRecorder();
+      await startRecording();
+      // The 200ms status poll must publish this take's URL for the scoped
+      // fallback: neither the terminal event nor the stopped recorder will
+      // report one.
+      mockRecorderState = {
+        ...mockRecorderState,
+        url: statusUri,
+        durationMillis: 5_000,
+      };
+      await act(async () => {
+        jest.advanceTimersByTime(250);
+        await flushMicrotasks();
+      });
+      Object.defineProperty(mockRecorder, 'uri', {
+        configurable: true,
+        get: () => null,
+        set: (_uri: string | null) => undefined,
+      });
+
+      // Auto-stop shape: no operation is in flight, the recorder reports it
+      // stopped, and the terminal event carries no URL — only the scoped
+      // status snapshot can resolve the take.
+      mockRecorder.isRecording = false;
+      mockRecorderState = {
+        ...mockRecorderState,
+        canRecord: false,
+        isRecording: false,
+      };
+      await act(async () => {
+        emitRecordingStatus({ isFinished: true, url: null });
+        await flushMicrotasks();
+      });
+
+      // The completion-adoption fallback resolved the take through the
+      // generation-scoped status URL instead of losing the recording.
+      expect(screen.getByText(recordedStatusText('0:05'))).toBeTruthy();
+      expect(props.onError).not.toHaveBeenCalled();
     });
 
     it('accepts a current missing-URL terminal event when the older quarantined event never arrives', async () => {
@@ -10505,6 +10679,10 @@ describe('Recorder', () => {
         expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
         expect(props.onResult).not.toHaveBeenCalled();
         expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        // Refund-first contract: the server proved the resubmission committed
+        // nothing, so the durable recovery-POST claim is refunded even though
+        // no surviving local take can spend it on a fresh-key re-upload.
+        expect(refundPendingAssessmentRecoveryPost).toHaveBeenCalledWith(REQUEST_ID);
       });
 
       it('treats a local-file inspection throw as a terminal missing-object result', async () => {

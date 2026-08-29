@@ -1,3 +1,5 @@
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import { config } from './config';
 import { logger } from './logger';
 
@@ -28,6 +30,69 @@ function logDeliveryFailure(payload: Record<string, unknown>, message: string): 
 }
 
 /**
+ * True when `address` is safe to POST a password-reset code to without the
+ * private-address opt-in: a public unicast address or loopback (loopback is a
+ * documented, allowed production webhook shape for co-located relays). Pure
+ * string analysis so it is unit-testable without DNS.
+ */
+export function addressIsPublicOrLoopback(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    const [a, b] = address.split('.').map(Number);
+    // 127/8 loopback is allowed; refuse unspecified, private, CGNAT, and
+    // link-local ranges.
+    if (a === 127) return true;
+    return !(
+      a === 0 ||
+      a === 10 ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) ||
+      (a === 169 && b === 254) ||
+      (a === 100 && b >= 64 && b <= 127)
+    );
+  }
+  if (family === 6) {
+    const normalized = address.toLowerCase();
+    if (normalized === '::1') return true;
+    // IPv4-mapped (::ffff:a.b.c.d) and well-known NAT64 (64:ff9b::a.b.c.d)
+    // embed an IPv4 target: decide by the embedded address.
+    const embedded =
+      /^::ffff:((?:\d{1,3}\.){3}\d{1,3})$/.exec(normalized)?.[1] ??
+      /^64:ff9b::((?:\d{1,3}\.){3}\d{1,3})$/.exec(normalized)?.[1];
+    if (embedded) return addressIsPublicOrLoopback(embedded);
+    // Refuse unspecified, unique-local, link-local, and multicast; global
+    // unicast addresses are allowed. A NaN prefix ('::', '::x' forms that are
+    // not plain hex up front) cannot be a global unicast address either.
+    const first = Number.parseInt(normalized.slice(0, 4), 16);
+    if (Number.isNaN(first)) return false;
+    return !(
+      first === 0 ||
+      (first >= 0xfc00 && first <= 0xfdff) ||
+      (first >= 0xfe80 && first <= 0xfebf) ||
+      first >= 0xff00
+    );
+  }
+  return false;
+}
+
+// The webhook host is resolved and checked per send (not cached): fetch
+// re-resolves on its own, so a cached verdict could not pin the connection it
+// guards anyway. The check exists to refuse misconfigured/attacker-influenced
+// private targets loudly, not to fully defeat DNS rebinding — that residual
+// window is documented and accepted because the URL is operator config.
+async function webhookHostAllowed(hostname: string): Promise<boolean> {
+  const bareHost = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1) : hostname;
+  try {
+    const { address } = await lookup(bareHost);
+    return addressIsPublicOrLoopback(address);
+  } catch {
+    // Unresolvable host: let the fetch itself fail (and be logged) rather
+    // than duplicating DNS error reporting here.
+    return true;
+  }
+}
+
+/**
  * Deliver one mail per the configured MAIL_MODE. 'log' writes the whole
  * message (including any embedded code) to the info log — dev/manual delivery.
  * 'webhook' POSTs {to, subject, text} as JSON to MAIL_WEBHOOK_URL; failures
@@ -37,7 +102,19 @@ export async function sendMail(message: MailMessage): Promise<void> {
   try {
     if (config.mail.mode === 'webhook') {
       try {
-        const response = await fetch(config.mail.webhookUrl, {
+        const webhookUrl = new URL(config.mail.webhookUrl);
+        // Unless the operator explicitly runs a co-located private relay, never
+        // deliver reset codes to a resolved private/link-local target: this
+        // turns a future attacker-influenced webhook URL into a loud refusal
+        // instead of silent exfiltration into an internal network.
+        if (!config.mail.webhookAllowPrivateAddress && !(await webhookHostAllowed(webhookUrl.hostname))) {
+          logDeliveryFailure(
+            { to: message.to, subject: message.subject, host: webhookUrl.hostname },
+            'mail webhook host resolves to a private address; refusing delivery',
+          );
+          return;
+        }
+        const response = await fetch(webhookUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ to: message.to, subject: message.subject, text: message.text }),

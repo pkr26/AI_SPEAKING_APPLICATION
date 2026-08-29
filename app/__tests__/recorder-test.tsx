@@ -22,6 +22,7 @@ import React from 'react';
 import type { TestInstance } from 'test-renderer';
 import {
   AccessibilityInfo,
+  Alert,
   Animated,
   AppState,
   Linking,
@@ -110,13 +111,14 @@ import {
   ensurePendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
+  markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   refundPendingAssessmentRecoveryPost,
   savePendingAssessment,
   type PendingAssessment,
 } from '../src/lib/pending-assessment';
-import { colors, darkColors, radii, spacing } from '../src/lib/theme';
+import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import { ContractError } from '../src/lib/types';
 
 // The recorder renders in the light palette unless a test flips the OS scheme.
@@ -233,6 +235,7 @@ jest.mock('../src/lib/pending-assessment', () => ({
   ensurePendingAssessment: jest.fn(),
   loadPendingAssessment: jest.fn(),
   markPendingAssessmentCancelled: jest.fn(),
+  markPendingAssessmentFeedbackPending: jest.fn(),
   markPendingAssessmentForReconciliation: jest.fn(),
   markPendingAssessmentStage: jest.fn(),
   refundPendingAssessmentRecoveryPost: jest.fn(),
@@ -241,6 +244,7 @@ jest.mock('../src/lib/pending-assessment', () => ({
 
 const OWNER_ID = '550e8400-e29b-41d4-a716-446655440000';
 const QUESTION_ID = '550e8400-e29b-41d4-a716-446655440001';
+const CYCLE_ID = '550e8400-e29b-41d4-a716-446655440020';
 const REQUEST_ID = '550e8400-e29b-41d4-a716-446655440002';
 const OTHER_QUESTION_ID = '550e8400-e29b-41d4-a716-446655440003';
 const OTHER_REQUEST_ID = '550e8400-e29b-41d4-a716-446655440004';
@@ -258,7 +262,8 @@ const START_LABEL = t('recorder.startLabel');
 const STOP_LABEL = t('recorder.stopLabel');
 const SUBMIT_TEXT = t('recorder.submit');
 const RERECORD_TEXT = t('recorder.rerecord');
-const CANCEL_TEXT = t('common.cancel');
+const DISCARD_TEXT = t('recorder.discard');
+const CANCEL_TEXT = /^(Cancel Sending|Stop Waiting)$/;
 const RECOVERING_TEXT = t('recorder.statusRecovering');
 const IDLE_TEXT = t('recorder.statusIdle');
 const RECORD_BUTTON_LABEL = new RegExp(`^(${START_LABEL}|${STOP_LABEL})$`);
@@ -486,12 +491,15 @@ function focusScreen(): void {
 }
 
 function pendingRecord(overrides: Partial<PendingAssessment> = {}): PendingAssessment {
+  const endpoint = overrides.endpoint ?? ENDPOINT;
   return {
     ownerId: OWNER_ID,
-    endpoint: ENDPOINT,
+    endpoint,
     questionId: QUESTION_ID,
+    ...(endpoint === '/diagnostic/answer' ? {} : { cycleId: CYCLE_ID }),
     requestId: REQUEST_ID,
     createdAt: Date.now(),
+    retainRecording: false,
     stage: 'direct-posting',
     ...overrides,
   };
@@ -622,12 +630,14 @@ function AfterRecorderLayout({ onLayout }: { onLayout?: () => void }) {
 type IdentityHarnessRecorderProps<T> = {
   ownerId: string;
   questionId: string;
+  cycleId?: string;
   endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
   parseResult: (data: unknown) => T;
   onResult: (data: T) => void;
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExitLockChange?: (locked: boolean) => void;
   onExpandedControlsLayout?: () => void;
   onRecoveryEndpointMismatch?: (
     endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
@@ -653,6 +663,7 @@ function IdentityLayoutHarness<T>({
 type RecorderTestOverrides = {
   ownerId?: string;
   questionId?: string;
+  cycleId?: string;
   disabled?: boolean;
   isStartBlocked?: () => boolean;
   endpoint?: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
@@ -660,6 +671,7 @@ type RecorderTestOverrides = {
   onError?: (message: string) => void;
   onRecoveryUnresolved?: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExitLockChange?: (locked: boolean) => void;
   onExpandedControlsLayout?: () => void;
   onRecoveryEndpointMismatch?: (
     endpoint: '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
@@ -668,10 +680,12 @@ type RecorderTestOverrides = {
 };
 
 function recorderTestProps(overrides: RecorderTestOverrides = {}) {
+  const endpoint = overrides.endpoint ?? ENDPOINT;
   return {
     ownerId: OWNER_ID,
     questionId: QUESTION_ID,
-    endpoint: ENDPOINT as '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native',
+    ...(endpoint === '/diagnostic/answer' ? {} : { cycleId: CYCLE_ID }),
+    endpoint,
     parseResult: jest.fn((data: unknown) => ({ parsed: data })),
     onResult: jest.fn(),
     onError: jest.fn(),
@@ -739,6 +753,7 @@ function RecoveryModeHarness({
         key={mode}
         ownerId={OWNER_ID}
         questionId={QUESTION_ID}
+        cycleId={CYCLE_ID}
         endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
         parseResult={nativeMode ? parseNative : parseEnglish}
         onResult={onResult}
@@ -1017,7 +1032,8 @@ beforeEach(() => {
           existing.requestId === candidate.requestId &&
           existing.ownerId === candidate.ownerId &&
           existing.endpoint === candidate.endpoint &&
-          existing.questionId === candidate.questionId;
+          existing.questionId === candidate.questionId &&
+          existing.cycleId === candidate.cycleId;
         // Most Recorder tests stage their recovery record in loadPendingAssessment
         // before the initial submission. Preserve that test harness choreography;
         // authoritative non-prepared states are covered by explicit ensure mocks.
@@ -1030,6 +1046,8 @@ beforeEach(() => {
   );
   asMock(clearPendingAssessment).mockReset();
   asMock(clearPendingAssessment).mockResolvedValue(undefined);
+  asMock(markPendingAssessmentFeedbackPending).mockReset();
+  asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(true);
   asMock(markPendingAssessmentForReconciliation).mockReset();
   asMock(markPendingAssessmentForReconciliation).mockResolvedValue(true);
   asMock(markPendingAssessmentCancelled).mockReset();
@@ -1228,6 +1246,7 @@ describe('Recorder pure behavior contracts', () => {
     ['recording', false, false, 'recording', true],
     ['uploading', false, false, 'uploading', true],
     ['recovering', false, false, 'recovering', true],
+    ['parked recovery', false, false, 'parked', true],
     ['recorded review', false, false, 'recorded', false],
   ] as const)('blocks recording start for %s', (_case, external, recovering, phase, expected) => {
     expect(recordingStartIsBlocked(external, recovering, phase)).toBe(expected);
@@ -1572,6 +1591,7 @@ describe('Recorder pure behavior contracts', () => {
     ['owner', { ownerId: OTHER_OWNER_ID }, false],
     ['endpoint', { endpoint: '/diagnostic/answer' as const }, false],
     ['question', { questionId: OTHER_QUESTION_ID }, false],
+    ['retention choice', { retainRecording: true }, false],
     ['stage', { stage: 's3-granted' as const }, false],
     ['cancelled', { cancelRequested: true }, false],
     ['recovery POST spent', { recoveryPostAttempts: 1 }, false],
@@ -1583,6 +1603,8 @@ describe('Recorder pure behavior contracts', () => {
         ENDPOINT,
         QUESTION_ID,
         REQUEST_ID,
+        false,
+        CYCLE_ID,
       ),
     ).toBe(expected);
   });
@@ -1934,6 +1956,8 @@ let recorderWebStopWaitSentinelAttempted = false;
 let recorderWebStopWaitSentinelPassed = false;
 let recorderWebLifecycleWaitSentinelAttempted = false;
 let recorderWebLifecycleWaitSentinelPassed = false;
+let recorderSubmitEventSentinelAttempted = false;
+let recorderSubmitEventSentinelPassed = false;
 
 describe('Recorder', () => {
   beforeEach(() => {
@@ -1949,6 +1973,9 @@ describe('Recorder', () => {
     }
     if (recorderWebLifecycleWaitSentinelAttempted) {
       expect(recorderWebLifecycleWaitSentinelPassed).toBe(true);
+    }
+    if (recorderSubmitEventSentinelAttempted) {
+      expect(recorderSubmitEventSentinelPassed).toBe(true);
     }
   });
 
@@ -1998,6 +2025,11 @@ describe('Recorder', () => {
     // Critical privacy copy pinned literally on purpose: this must match
     // t('recorder.privacyNote') exactly, so a silent copy edit fails here.
     expect(screen.getByText('We send your recording only after you tap Send Answer.')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on Save this recording.',
+      ),
+    ).toBeTruthy();
     expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
     expect(Directory).toHaveBeenCalledWith(Paths.cache, 'Audio');
     expect(Directory).toHaveBeenCalledWith(Paths.cache, 'ExpoAudio');
@@ -2039,6 +2071,78 @@ describe('Recorder', () => {
         await fireEvent.press(recordButton);
       }
     }
+  });
+
+  it('dispatches reviewed Submit before longer submission cases run', async () => {
+    const { props } = await renderRecorder();
+    await recordAndStop();
+    asMock(capturePendingAssessmentGeneration).mockClear();
+    recorderSubmitEventSentinelAttempted = true;
+
+    await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+    recorderSubmitEventSentinelPassed =
+      asMock(capturePendingAssessmentGeneration).mock.calls.length === 1;
+    expect(recorderSubmitEventSentinelPassed).toBe(true);
+
+    await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+  });
+
+  it('confirms and discards an unsent reviewed take without any network request', async () => {
+    const onInteractionLockChange = jest.fn();
+    const onExitLockChange = jest.fn();
+    const alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
+    await renderRecorder({ onInteractionLockChange, onExitLockChange });
+    await recordAndStop();
+
+    const discardButton = screen.getByRole('button', { name: DISCARD_TEXT });
+    expect(discardButton.props.accessibilityHint).toBe(t('recorder.discardHint'));
+    expect(onExitLockChange).toHaveBeenLastCalledWith(true);
+    await fireEvent.press(discardButton);
+
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('recorder.discardTitle'),
+      t('recorder.discardBody'),
+      expect.arrayContaining([
+        expect.objectContaining({ text: t('common.cancel'), style: 'cancel' }),
+        expect.objectContaining({ text: DISCARD_TEXT, style: 'destructive' }),
+      ]),
+    );
+    const buttons = alertSpy.mock.calls[0][2] as {
+      text?: string;
+      onPress?: () => void;
+    }[];
+    const destructive = buttons.find((button) => button.text === DISCARD_TEXT);
+    await act(async () => {
+      destructive?.onPress?.();
+      await flushMicrotasks();
+    });
+
+    expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: SUBMIT_TEXT })).toBeNull();
+    expect(deletedRecordingUris()).toContain(RECORDING_URI);
+    expect(onInteractionLockChange).toHaveBeenLastCalledWith(false);
+    expect(onExitLockChange).toHaveBeenLastCalledWith(false);
+    expect(AccessibilityInfo.announceForAccessibility).toHaveBeenCalledWith(
+      t('recorder.discarded'),
+    );
+    expect(clearPendingAssessment).not.toHaveBeenCalled();
+    expect(apiRequestAudioUpload).not.toHaveBeenCalled();
+    expect(apiUploadAudio).not.toHaveBeenCalled();
+    expect(apiPostPresignedAudio).not.toHaveBeenCalled();
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('hands the current unlocked state to a replacement exit-lock observer', async () => {
+    const firstObserver = jest.fn();
+    const secondObserver = jest.fn();
+    const { view, props } = await renderRecorder({ onExitLockChange: firstObserver });
+    firstObserver.mockClear();
+
+    await view.rerender(<Recorder {...props} onExitLockChange={secondObserver} />);
+    await flushAct();
+
+    expect(firstObserver).toHaveBeenCalledWith(false);
+    expect(secondObserver).toHaveBeenCalledWith(false);
   });
 
   describe('deterministic mutation boundaries 1001-1500', () => {
@@ -3502,7 +3606,7 @@ describe('Recorder', () => {
       await renderRecorder();
 
       await fireEvent.press(screen.getByLabelText(START_LABEL));
-      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy());
 
       expect(mockRecorder.record).not.toHaveBeenCalled();
       expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
@@ -3562,6 +3666,29 @@ describe('Recorder', () => {
       expect(mockRecorder.record).not.toHaveBeenCalled();
     });
 
+    it('rechecks permission after Settings and announces a grant without auto-recording', async () => {
+      asMock(AudioModule.getRecordingPermissionsAsync)
+        .mockResolvedValueOnce({ granted: false, canAskAgain: false })
+        .mockResolvedValueOnce({ granted: true });
+      const announce = jest
+        .spyOn(AccessibilityInfo, 'announceForAccessibility')
+        .mockImplementation(() => undefined);
+      await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      expect(await screen.findByText(t('recorder.permissionBody'))).toBeTruthy();
+
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.openSettings'))).toBeNull();
+      expect(announce).toHaveBeenCalledWith(t('recorder.permissionGranted'));
+      expect(mockRecorder.record).not.toHaveBeenCalled();
+      announce.mockRestore();
+    });
+
     it('renders a minimum-sized settings action with cancellable pressed feedback', async () => {
       asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({
         granted: false,
@@ -3577,22 +3704,25 @@ describe('Recorder', () => {
       expect(openSettings).not.toHaveBeenCalled();
 
       expect(flattenedStyle(getSettingsButton())).toMatchObject({
-        minHeight: 44,
+        minHeight: layout.minimumTarget,
         marginTop: 10,
         alignSelf: 'center',
         justifyContent: 'center',
         borderRadius: radii.button,
         paddingHorizontal: spacing.ml,
-        backgroundColor: colors.danger,
+        borderWidth: 1,
+        borderColor: colors.primary,
       });
       expect(flattenedStyle(getSettingsButton()).opacity).toBeUndefined();
 
       await fireEvent(getSettingsButton(), 'responderGrant', responderEvent());
       expect(openSettings).not.toHaveBeenCalled();
-      expect(flattenedStyle(getSettingsButton()).opacity).toBe(0.85);
+      expect(flattenedStyle(getSettingsButton()).backgroundColor).toBe(colors.primaryLight);
       await fireEvent(getSettingsButton(), 'responderTerminate', responderEvent());
       expect(openSettings).not.toHaveBeenCalled();
-      await waitFor(() => expect(flattenedStyle(getSettingsButton()).opacity).toBeUndefined());
+      await waitFor(() =>
+        expect(flattenedStyle(getSettingsButton()).backgroundColor).toBeUndefined(),
+      );
 
       expect(openSettings).not.toHaveBeenCalled();
       expect(mockRecorder.record).not.toHaveBeenCalled();
@@ -3695,8 +3825,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
@@ -3722,8 +3854,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
       mockRecorder.stop.mockImplementation(async () => {
         mockRecorder.isRecording = false;
@@ -3941,8 +4075,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
     });
 
@@ -4148,8 +4284,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
 
       await act(async () => {
@@ -4249,7 +4387,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         secondUri,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -4294,7 +4437,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         secondUri,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -4699,7 +4847,12 @@ describe('Recorder', () => {
         expect(apiUploadAudio).toHaveBeenCalledWith(
           ENDPOINT,
           fallbackUri,
-          { questionId: QUESTION_ID, requestId: REQUEST_ID },
+          {
+            questionId: QUESTION_ID,
+            requestId: REQUEST_ID,
+            cycleId: CYCLE_ID,
+            retainRecording: 'false',
+          },
           expect.objectContaining({ signal: expect.any(AbortSignal) }),
         );
         expect(revoke).toHaveBeenCalledWith(fallbackUri);
@@ -5292,7 +5445,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -5429,12 +5587,12 @@ describe('Recorder', () => {
       const { view, props } = await renderRecorder();
 
       await fireEvent.press(screen.getByLabelText(START_LABEL));
-      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy());
 
       await view.rerender(<Recorder {...props} questionId={OTHER_QUESTION_ID} />);
       await flushAct();
 
-      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.permissionRetryBody'))).toBeNull();
       expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
     });
 
@@ -5545,8 +5703,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
@@ -5574,8 +5734,10 @@ describe('Recorder', () => {
       expect(setAudioModeAsync).toHaveBeenLastCalledWith({
         allowsRecording: false,
         allowsBackgroundRecording: false,
+        interruptionMode: 'doNotMix',
         playsInSilentMode: true,
         shouldPlayInBackground: false,
+        shouldRouteThroughEarpiece: false,
       });
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
 
@@ -5779,6 +5941,79 @@ describe('Recorder', () => {
   });
 
   describe('submission', () => {
+    it('shows an accessible default-off retention choice only during review and submits an explicit opt-in', async () => {
+      await renderRecorder();
+      expect(screen.queryByRole('switch', { name: t('recorder.saveRecordingLabel') })).toBeNull();
+
+      await recordAndStop();
+      const retentionSwitch = screen.getByRole('switch', {
+        name: t('recorder.saveRecordingLabel'),
+      });
+      expect(retentionSwitch.props.value).toBe(false);
+      expect(retentionSwitch.props.disabled).toBe(false);
+      expect(retentionSwitch.props.accessibilityState).toEqual({ disabled: false });
+      expect(retentionSwitch.props.accessibilityHint).toBe(t('recorder.saveRecordingHint'));
+      expect(screen.getByText(t('recorder.saveRecordingHint'))).toBeTruthy();
+
+      await fireEvent(retentionSwitch, 'valueChange', true);
+      expect(
+        screen.getByRole('switch', { name: t('recorder.saveRecordingLabel') }).props.value,
+      ).toBe(true);
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+
+      await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
+      expect(savePendingAssessment).toHaveBeenCalledWith(
+        expect.objectContaining({ retainRecording: true }),
+      );
+      expect(apiUploadAudio).toHaveBeenCalledWith(
+        ENDPOINT,
+        RECORDING_URI,
+        expect.objectContaining({ retainRecording: 'true' }),
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      );
+    });
+
+    it('locks the retention choice during a re-record operation and resets it for the new take', async () => {
+      const permission = deferred<{ granted: boolean }>();
+      const { view } = await renderRecorder();
+      await recordAndStop();
+      await fireEvent(
+        screen.getByRole('switch', { name: t('recorder.saveRecordingLabel') }),
+        'valueChange',
+        true,
+      );
+      asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValueOnce(permission.promise);
+
+      let rerecord!: Promise<void>;
+      await act(() => {
+        rerecord = invokeRolePressHandler(RERECORD_TEXT);
+      });
+      await flushAct();
+      const lockedSwitch = screen.getByRole('switch', {
+        name: t('recorder.saveRecordingLabel'),
+      });
+      expect(lockedSwitch.props.value).toBe(true);
+      expect(lockedSwitch.props.disabled).toBe(true);
+      expect(lockedSwitch.props.accessibilityState).toEqual({ disabled: true });
+      await fireEvent(lockedSwitch, 'valueChange', false);
+      expect(
+        screen.getByRole('switch', { name: t('recorder.saveRecordingLabel') }).props.value,
+      ).toBe(true);
+
+      permission.resolve({ granted: true });
+      await act(async () => {
+        await rerecord;
+        await flushMicrotasks();
+      });
+      expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+      mockRecorderState.durationMillis = 5_000;
+      await fireEvent.press(screen.getByLabelText(STOP_LABEL));
+      expect(
+        screen.getByRole('switch', { name: t('recorder.saveRecordingLabel') }).props.value,
+      ).toBe(false);
+      expect(view.getByText(SUBMIT_TEXT)).toBeTruthy();
+    });
+
     it('asks the host to reveal recorded review actions only after their layout commits', async () => {
       const onExpandedControlsLayout = jest.fn();
       await renderRecorder({ onExpandedControlsLayout });
@@ -5789,6 +6024,15 @@ describe('Recorder', () => {
         nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 180 } },
       });
       expect(onExpandedControlsLayout).toHaveBeenCalledTimes(1);
+    });
+
+    it('accepts expanded-control layout events without a host callback', async () => {
+      await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
+        nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 180 } },
+      });
     });
 
     it('publishes expanded-control layout only to the latest callback prop', async () => {
@@ -5813,11 +6057,78 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
 
+      expect(
+        StyleSheet.flatten(screen.getByTestId('recorder-expanded-controls').props.style),
+      ).toEqual({
+        alignSelf: 'stretch',
+        alignItems: 'center',
+      });
+
       onExpandedControlsLayout.mockClear();
       await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
         nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 120 } },
       });
       expect(onExpandedControlsLayout).toHaveBeenCalledTimes(1);
+    });
+
+    it('labels a started assessment as Stop Waiting with its committed-request hint', async () => {
+      const assessment = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockImplementation(
+        (
+          _endpoint: string,
+          _uri: string,
+          _fields: unknown,
+          options?: { onRequestStarted?: () => void },
+        ) => {
+          options?.onRequestStarted?.();
+          return assessment.promise;
+        },
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      const stopWaiting = await screen.findByRole('button', {
+        name: t('recorder.stopWaiting'),
+      });
+      expect(stopWaiting.props.accessibilityHint).toBe(t('recorder.stopWaitingHint'));
+      expect(screen.queryByRole('button', { name: t('recorder.cancelSending') })).toBeNull();
+
+      await act(async () => {
+        assessment.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+    });
+
+    it('labels an in-flight S3 transfer as Cancel Sending with its post-transfer hint', async () => {
+      const objectUpload = deferred<void>();
+      asMock(apiRequestAudioUpload).mockResolvedValue({
+        mode: 's3',
+        assessmentEndpoint: ENDPOINT,
+        uploadUrl: 'https://s3.example.com/upload',
+        uploadFields: { key: S3_AUDIO_KEY },
+        audioKey: S3_AUDIO_KEY,
+        contentType: 'audio/mp4',
+        expiresIn: 300,
+        maxBytes: 25 * 1024 * 1024,
+      });
+      asMock(apiPostPresignedAudio).mockReturnValue(objectUpload.promise);
+      asMock(apiFetch).mockResolvedValue({ ok: true });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiPostPresignedAudio).toHaveBeenCalledTimes(1));
+      const cancel = screen.getByRole('button', { name: t('recorder.cancelSending') });
+      expect(cancel.props.accessibilityHint).toBe(t('recorder.cancelAfterTransferHint'));
+      expect(screen.queryByRole('button', { name: t('recorder.stopWaiting') })).toBeNull();
+
+      await act(async () => {
+        objectUpload.resolve(undefined);
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
     });
 
     it('renders the submit action with cancellable pressed feedback without submitting', async () => {
@@ -5861,8 +6172,10 @@ describe('Recorder', () => {
           ownerId: OWNER_ID,
           endpoint: assessmentEndpoint,
           questionId: QUESTION_ID,
+          ...(assessmentEndpoint === '/diagnostic/answer' ? {} : { cycleId: CYCLE_ID }),
           requestId: REQUEST_ID,
           createdAt: expect.any(Number),
+          retainRecording: false,
           stage: 'prepared',
         });
         expect(markPendingAssessmentStage).toHaveBeenCalledWith(REQUEST_ID, 'direct-posting');
@@ -5876,7 +6189,12 @@ describe('Recorder', () => {
         expect(apiUploadAudio).toHaveBeenCalledWith(
           assessmentEndpoint,
           RECORDING_URI,
-          { questionId: QUESTION_ID, requestId: REQUEST_ID },
+          {
+            questionId: QUESTION_ID,
+            requestId: REQUEST_ID,
+            ...(assessmentEndpoint === '/diagnostic/answer' ? {} : { cycleId: CYCLE_ID }),
+            retainRecording: 'false',
+          },
           expect.objectContaining({ signal: expect.any(AbortSignal) }),
         );
         expect(props.parseResult).toHaveBeenCalledWith({ ok: true });
@@ -5884,8 +6202,11 @@ describe('Recorder', () => {
           { parsed: { ok: true } },
           { requestId: REQUEST_ID },
         );
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        );
+        expect(clearPendingAssessment).not.toHaveBeenCalled();
         expect(deletedRecordingUris()).toContain(RECORDING_URI);
         expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
       },
@@ -5933,7 +6254,12 @@ describe('Recorder', () => {
       expect(Date.now() - submittedAt).toBeGreaterThanOrEqual(999);
       expect(apiUploadAudio).toHaveBeenCalledTimes(2);
       for (const call of asMock(apiUploadAudio).mock.calls) {
-        expect(call[2]).toEqual({ questionId: QUESTION_ID, requestId: REQUEST_ID });
+        expect(call[2]).toEqual({
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        });
       }
       expect(props.onError).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
@@ -5959,7 +6285,12 @@ describe('Recorder', () => {
 
       expect(apiUploadAudio).toHaveBeenCalledTimes(4);
       for (const call of asMock(apiUploadAudio).mock.calls) {
-        expect(call[2]).toEqual({ questionId: QUESTION_ID, requestId: REQUEST_ID });
+        expect(call[2]).toEqual({
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        });
       }
       await waitFor(() =>
         expect(props.onError).toHaveBeenCalledWith(`${t('error.busy')} ${t('wait.second')}`),
@@ -6070,7 +6401,13 @@ describe('Recorder', () => {
       await recordAndStop();
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'first' } }));
-      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
+      await waitFor(() =>
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
       await flushAct();
 
       await recordAndStop();
@@ -6078,17 +6415,30 @@ describe('Recorder', () => {
       await waitFor(() =>
         expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'second' } }),
       );
-      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(OTHER_REQUEST_ID));
+      await waitFor(() =>
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          OTHER_REQUEST_ID,
+          expect.any(Number),
+        ),
+      );
 
       expect(apiUploadAudio).toHaveBeenNthCalledWith(
         2,
         ENDPOINT,
         RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: OTHER_REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: OTHER_REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
       expect(Crypto.randomUUID).toHaveBeenCalledTimes(2);
-      expect(asMock(clearPendingAssessment).mock.calls).toEqual([[REQUEST_ID], [OTHER_REQUEST_ID]]);
+      // Starting a genuinely new take after the feedback owner has returned
+      // clears only the Recorder's stale in-memory request id. Delivery itself
+      // did not clear the durable feedback pointer.
+      expect(asMock(clearPendingAssessment).mock.calls).toEqual([[REQUEST_ID]]);
       expect(props.onResult).toHaveBeenCalledTimes(2);
       expect(props.onError).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
@@ -6201,7 +6551,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -6249,6 +6604,8 @@ describe('Recorder', () => {
           body: {
             questionId: QUESTION_ID,
             requestId: REQUEST_ID,
+            cycleId: CYCLE_ID,
+            retainRecording: false,
             audioKey: S3_AUDIO_KEY,
           },
           timeoutMs: AUDIO_TIMEOUT_MS,
@@ -6302,7 +6659,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -6801,6 +7163,31 @@ describe('Recorder', () => {
       expect(onRateLimited).not.toHaveBeenCalled();
     });
 
+    it('retires an incompatible POST replay without entering recovery or reusing its request id', async () => {
+      asMock(apiUploadAudio).mockRejectedValue(
+        new ApiError(409, 'old result version', undefined, {
+          code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+        }),
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('error.assessmentResultIncompatible')),
+      );
+
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(
+        asMock(clearPendingAssessment).mock.calls.filter(([requestId]) => requestId === REQUEST_ID),
+      ).toHaveLength(1);
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(apiFetch).not.toHaveBeenCalled();
+      expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
+      expect(deletedRecordingUris()).toContain(RECORDING_URI);
+      expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
+    });
+
     it('recovers the durable result after a network failure mid-upload', async () => {
       mockStartedUploadFailure(new ApiError(0, 'Could not connect to the server.'));
       const { props } = await renderRecorder();
@@ -6824,8 +7211,8 @@ describe('Recorder', () => {
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
 
-    it('reports an unrecoverable handoff when reconciliation marking fails after success', async () => {
-      asMock(markPendingAssessmentForReconciliation).mockResolvedValue(false);
+    it('reports an unrecoverable handoff when feedback-pointer marking fails after success', async () => {
+      asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
       const { props } = await renderRecorder();
       await recordAndStop();
 
@@ -7001,7 +7388,11 @@ describe('Recorder', () => {
       'suppresses callbacks when %s resolves after the app becomes inactive',
       async (_case, resultKind, markerValue) => {
         const marker = deferred<boolean>();
-        asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+        const markerFunction =
+          resultKind === 'contract'
+            ? markPendingAssessmentForReconciliation
+            : markPendingAssessmentFeedbackPending;
+        asMock(markerFunction).mockReturnValue(marker.promise);
         const { props } = await renderRecorder(
           resultKind === 'contract'
             ? {
@@ -7018,7 +7409,10 @@ describe('Recorder', () => {
           await flushMicrotasks();
         });
         await waitFor(() =>
-          expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+          expect(markerFunction).toHaveBeenCalledWith(
+            REQUEST_ID,
+            ...(resultKind === 'contract' ? [] : [expect.any(Number)]),
+          ),
         );
         Object.defineProperty(AppState, 'currentState', {
           configurable: true,
@@ -7536,7 +7930,12 @@ describe('Recorder', () => {
       expect(apiUploadAudio).toHaveBeenCalledWith(
         ENDPOINT,
         RECORDING_URI,
-        { questionId: QUESTION_ID, requestId: REQUEST_ID },
+        {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: 'false',
+        },
         expect.objectContaining({ signal: expect.any(AbortSignal) }),
       );
     });
@@ -7732,7 +8131,12 @@ describe('Recorder', () => {
       });
 
       await view.rerender(
-        <Recorder {...props} endpoint="/diagnostic/answer" questionId={OTHER_QUESTION_ID} />,
+        <Recorder
+          {...props}
+          endpoint="/diagnostic/answer"
+          questionId={OTHER_QUESTION_ID}
+          cycleId={undefined}
+        />,
       );
       await flushAct();
 
@@ -7863,7 +8267,62 @@ describe('Recorder', () => {
       expect(props.parseResult).toHaveBeenCalledWith({ level: 'B1' });
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { level: 'B1' } });
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+    });
+
+    it('retires an incompatible legacy diagnostic recovery and returns to a fresh answer', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/diagnostic/answer' }),
+      );
+      asMock(apiFetch).mockRejectedValue(
+        new ApiError(409, 'old result version', undefined, {
+          code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+        }),
+      );
+      const { props } = await renderRecorder({ endpoint: '/diagnostic/answer' });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('error.assessmentResultIncompatible')),
+      );
+      expect(apiFetch).toHaveBeenCalledTimes(1);
+      expect(apiFetch).toHaveBeenCalledWith(`/assessments/${REQUEST_ID}`, {
+        timeoutMs: 5000,
+        signal: expect.any(AbortSignal),
+      });
+      expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
       expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
+      expect(apiUploadAudio).not.toHaveBeenCalled();
+      expect(apiPostPresignedAudio).not.toHaveBeenCalled();
+      expect(props.parseResult).not.toHaveBeenCalled();
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('keeps an incompatible legacy recovery locked when its tombstone cannot be cleared', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ endpoint: '/diagnostic/answer' }),
+      );
+      asMock(clearPendingAssessment).mockRejectedValue(new Error('keychain write failed'));
+      asMock(apiFetch).mockRejectedValue(
+        new ApiError(409, 'old result version', undefined, {
+          code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+        }),
+      );
+      const { props } = await renderRecorder({ endpoint: '/diagnostic/answer' });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoClear')),
+      );
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalledWith(t('error.assessmentResultIncompatible'));
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
     });
 
     it('delivers a completed native-practice recovery only with its isolated context', async () => {
@@ -7883,7 +8342,11 @@ describe('Recorder', () => {
         parsed: { mode: 'native', understood: true },
       });
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
     it('restores a saved native endpoint before polling it with the English parser', async () => {
@@ -7996,10 +8459,12 @@ describe('Recorder', () => {
         expect(matchingParser).toHaveBeenCalledWith(response);
         expect(wrongParser).not.toHaveBeenCalled();
         expect(onResult).toHaveBeenCalledWith({ parser: savedMode, response });
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledTimes(1);
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-        expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
-        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledTimes(1);
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        );
+        expect(clearPendingAssessment).not.toHaveBeenCalled();
         expect(onError).not.toHaveBeenCalled();
         expect(onRecoveryUnresolved).not.toHaveBeenCalled();
       },
@@ -8026,7 +8491,10 @@ describe('Recorder', () => {
       expect(props.parseResult).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
       expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
     });
 
     it('rejects an English-practice replay for a native-practice handoff', async () => {
@@ -8050,7 +8518,7 @@ describe('Recorder', () => {
     });
 
     it.each(['returns false', 'rejects'] as const)(
-      'keeps a completed recovery for another route locked when reconciliation persistence %s',
+      'keeps a completed recovery for another route locked when feedback-pointer persistence %s',
       async (failureMode) => {
         asMock(loadPendingAssessment).mockResolvedValue(
           pendingRecord({ questionId: OTHER_QUESTION_ID }),
@@ -8062,9 +8530,9 @@ describe('Recorder', () => {
           response: { score: 99 },
         });
         if (failureMode === 'returns false') {
-          asMock(markPendingAssessmentForReconciliation).mockResolvedValue(false);
+          asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
         } else {
-          asMock(markPendingAssessmentForReconciliation).mockRejectedValue(
+          asMock(markPendingAssessmentFeedbackPending).mockRejectedValue(
             new Error('keychain unavailable'),
           );
         }
@@ -8076,8 +8544,11 @@ describe('Recorder', () => {
         );
 
         expect(apiFetch).toHaveBeenCalledTimes(1);
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledTimes(1);
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledTimes(1);
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        );
         expect(apiRequestAudioUpload).not.toHaveBeenCalled();
         expect(apiUploadAudio).not.toHaveBeenCalled();
         expect(props.parseResult).not.toHaveBeenCalled();
@@ -8099,7 +8570,7 @@ describe('Recorder', () => {
     );
 
     it.each(['returns false', 'rejects'] as const)(
-      'suppresses an old-route reconciliation marker failure after the identity changes when it %s',
+      'suppresses an old-route feedback marker failure after the identity changes when it %s',
       async (failureMode) => {
         const marker = deferred<boolean>();
         asMock(loadPendingAssessment)
@@ -8111,10 +8582,13 @@ describe('Recorder', () => {
           questionId: OTHER_QUESTION_ID,
           response: { score: 99 },
         });
-        asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+        asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
         const { view, props } = await renderRecorder();
         await waitFor(() =>
-          expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+          expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+            REQUEST_ID,
+            expect.any(Number),
+          ),
         );
         const nextError = jest.fn();
         const nextResult = jest.fn();
@@ -8150,7 +8624,7 @@ describe('Recorder', () => {
     );
 
     it.each(['returns false', 'rejects'] as const)(
-      'keeps a completed recovery locked when reconciliation persistence %s',
+      'keeps a completed recovery locked when feedback-pointer persistence %s',
       async (failureMode) => {
         asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
         asMock(apiFetch).mockResolvedValue({
@@ -8160,9 +8634,9 @@ describe('Recorder', () => {
           response: { score: 99 },
         });
         if (failureMode === 'returns false') {
-          asMock(markPendingAssessmentForReconciliation).mockResolvedValue(false);
+          asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
         } else {
-          asMock(markPendingAssessmentForReconciliation).mockRejectedValue(
+          asMock(markPendingAssessmentFeedbackPending).mockRejectedValue(
             new Error('keychain unavailable'),
           );
         }
@@ -8242,6 +8716,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onError: jest.fn(),
@@ -8270,8 +8745,8 @@ describe('Recorder', () => {
       });
 
       expect(firstResult.mock.calls.length + secondResult.mock.calls.length).toBe(1);
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledTimes(1);
-      expect(clearPendingAssessment).toHaveBeenCalledTimes(1);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledTimes(1);
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
     it('releases the global recovery lease after normal completion', async () => {
@@ -8294,6 +8769,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onError: jest.fn(),
@@ -8302,7 +8778,12 @@ describe('Recorder', () => {
       const view = await render(<Recorder key="first" {...sharedProps} onResult={firstResult} />);
       await flushAct();
       await waitFor(() => expect(firstResult).toHaveBeenCalledWith({ parsed: { score: 91 } }));
-      await waitFor(() => expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID));
+      await waitFor(() =>
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
+      );
       await flushAct();
 
       await view.rerender(
@@ -8328,6 +8809,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onError: jest.fn(),
@@ -8383,6 +8865,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onError: jest.fn(),
@@ -8499,6 +8982,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onError: jest.fn(),
@@ -8549,6 +9033,7 @@ describe('Recorder', () => {
       const sharedProps = {
         ownerId: OWNER_ID,
         questionId: QUESTION_ID,
+        cycleId: CYCLE_ID,
         endpoint: ENDPOINT,
         parseResult: (data: unknown) => ({ parsed: data }),
         onRecoveryUnresolved: jest.fn(),
@@ -8944,6 +9429,7 @@ describe('Recorder', () => {
           body: {
             questionId: QUESTION_ID,
             requestId: REQUEST_ID,
+            cycleId: CYCLE_ID,
             audioKey: S3_AUDIO_KEY,
           },
           timeoutMs: AUDIO_TIMEOUT_MS,
@@ -9044,7 +9530,11 @@ describe('Recorder', () => {
     it('resubmits the same S3 key and request id after a crash before assessment POST', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(
-        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+        pendingRecord({
+          stage: 's3-granted',
+          audioKey: S3_AUDIO_KEY,
+          retainRecording: true,
+        }),
       );
       for (let i = 0; i < 6; i++) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
@@ -9069,18 +9559,23 @@ describe('Recorder', () => {
         body: {
           questionId: QUESTION_ID,
           requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: true,
           audioKey: S3_AUDIO_KEY,
         },
         signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
         onRequestStarted: expect.any(Function),
       });
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
     it.each(['returns false', 'rejects'] as const)(
-      'does not replay a successful S3 resubmission when reconciliation persistence %s',
+      'does not replay a successful S3 resubmission when feedback-pointer persistence %s',
       async (failureMode) => {
         jest.useFakeTimers();
         asMock(loadPendingAssessment).mockResolvedValue(
@@ -9091,9 +9586,9 @@ describe('Recorder', () => {
         }
         mockStartedApiFetchResultOnce({ score: 84 });
         if (failureMode === 'returns false') {
-          asMock(markPendingAssessmentForReconciliation).mockResolvedValue(false);
+          asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
         } else {
-          asMock(markPendingAssessmentForReconciliation).mockRejectedValue(
+          asMock(markPendingAssessmentFeedbackPending).mockRejectedValue(
             new Error('keychain unavailable'),
           );
         }
@@ -9162,6 +9657,7 @@ describe('Recorder', () => {
         body: {
           questionId: OTHER_QUESTION_ID,
           requestId: REQUEST_ID,
+          retainRecording: false,
           audioKey: S3_AUDIO_KEY,
         },
         signal: expect.any(AbortSignal),
@@ -9204,6 +9700,8 @@ describe('Recorder', () => {
           body: {
             questionId: QUESTION_ID,
             requestId: REQUEST_ID,
+            cycleId: CYCLE_ID,
+            retainRecording: false,
             audioKey: S3_AUDIO_KEY,
           },
           timeoutMs: AUDIO_TIMEOUT_MS,
@@ -9237,6 +9735,8 @@ describe('Recorder', () => {
         body: {
           questionId: QUESTION_ID,
           requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: false,
           audioKey: S3_AUDIO_KEY,
         },
         signal: expect.any(AbortSignal),
@@ -9305,6 +9805,8 @@ describe('Recorder', () => {
         expect(options.body).toEqual({
           questionId: QUESTION_ID,
           requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: false,
           audioKey: S3_AUDIO_KEY,
         });
         expect(options.signal).toBeInstanceOf(AbortSignal);
@@ -9450,6 +9952,35 @@ describe('Recorder', () => {
         expect(onRateLimited).not.toHaveBeenCalled();
       },
     );
+
+    it('retires an incompatible S3 recovery POST without polling or posting again', async () => {
+      jest.useFakeTimers();
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      mockStartedApiFetchFailureOnce(
+        new ApiError(409, 'old result version', undefined, {
+          code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+        }),
+      );
+      const { props } = await submitLiveRecordingIntoRecovery(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+      );
+
+      await advancePolls(6);
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('error.assessmentResultIncompatible')),
+      );
+
+      expect(asMock(apiFetch).mock.calls.filter(([path]) => path === ENDPOINT)).toHaveLength(1);
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(deletedRecordingUris()).toContain(RECORDING_URI);
+      expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
+
+      await advancePolls(3);
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+    });
 
     it('stops S3 resubmission immediately when authentication expires', async () => {
       jest.useFakeTimers();
@@ -10119,7 +10650,11 @@ describe('Recorder', () => {
       await fireEvent.press(tryAgain);
 
       await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 7 } }));
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
       expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
       expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toMatchObject({
@@ -10191,9 +10726,59 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(2);
       expect(props.parseResult).toHaveBeenCalledWith({ score: 7 });
       expect(props.onResult).toHaveBeenCalledWith({ parsed: { score: 7 } });
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+    });
+
+    it('parks a long recovery without cancelling it, releases exits, and resumes on demand', async () => {
+      jest.useFakeTimers();
+      const onInteractionLockChange = jest.fn();
+      const onExitLockChange = jest.fn();
+      const onExpandedControlsLayout = jest.fn();
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({
+        status: 'processing',
+        context: 'practice',
+        questionId: QUESTION_ID,
+      });
+      await renderRecorder({
+        onInteractionLockChange,
+        onExitLockChange,
+        onExpandedControlsLayout,
+      });
+
+      await advancePolls(8);
+      const checkLater = screen.getByRole('button', { name: t('replay.checkLater') });
+      const callsBeforePark = asMock(apiFetch).mock.calls.length;
+      await fireEvent.press(checkLater);
+
+      expect(screen.getByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      const parkedStatus = screen.getByLabelText(t('replay.failedBody'));
+      expect(parkedStatus).toHaveTextContent(t('replay.failedBody'));
+      onExpandedControlsLayout.mockClear();
+      await fireEvent(screen.getByTestId('recorder-expanded-controls'), 'layout', {
+        nativeEvent: { layout: { x: 0, y: 0, width: 280, height: 120 } },
+      });
+      expect(onExpandedControlsLayout).toHaveBeenCalledTimes(1);
+      expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toMatchObject({
+        disabled: true,
+      });
+      expect(onInteractionLockChange).toHaveBeenLastCalledWith(true);
+      expect(onExitLockChange).toHaveBeenLastCalledWith(false);
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(markPendingAssessmentCancelled).not.toHaveBeenCalled();
+
+      await advancePolls(3);
+      expect(apiFetch).toHaveBeenCalledTimes(callsBeforePark);
+
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+      await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(callsBeforePark + 1));
+      expect(onExitLockChange).toHaveBeenLastCalledWith(true);
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
     });
 
     it('does not deliver a late recovered result after the app is no longer active', async () => {
@@ -10271,7 +10856,7 @@ describe('Recorder', () => {
       expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
     });
 
-    it('does not deliver a recovered result after its reconciliation marker resolves stale', async () => {
+    it('does not deliver a recovered result after its feedback marker resolves stale', async () => {
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValueOnce(pendingRecord()).mockResolvedValue(null);
       asMock(apiFetch).mockResolvedValue({
@@ -10280,10 +10865,13 @@ describe('Recorder', () => {
         questionId: QUESTION_ID,
         response: { score: 97 },
       });
-      asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+      asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
       const { view, props } = await renderRecorder();
       await waitFor(() =>
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
       );
       const nextResult = jest.fn();
       const nextError = jest.fn();
@@ -10746,14 +11334,20 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(1);
       expect(apiFetch).toHaveBeenCalledWith(ENDPOINT, {
         method: 'POST',
-        body: { questionId: QUESTION_ID, requestId: REQUEST_ID, audioKey: S3_AUDIO_KEY },
+        body: {
+          questionId: QUESTION_ID,
+          requestId: REQUEST_ID,
+          cycleId: CYCLE_ID,
+          retainRecording: false,
+          audioKey: S3_AUDIO_KEY,
+        },
         signal: expect.any(AbortSignal),
         timeoutMs: AUDIO_TIMEOUT_MS,
         onRequestStarted: expect.any(Function),
       });
     });
 
-    it('cancel after the assessment POST is in flight defers to recovery without re-posting', async () => {
+    it('Stop Waiting parks an in-flight assessment and Check Now resolves it without re-posting', async () => {
       asMock(apiUploadAudio).mockImplementation(abortRejectingUpload());
       asMock(loadPendingAssessment)
         .mockResolvedValueOnce(null)
@@ -10772,6 +11366,9 @@ describe('Recorder', () => {
       await waitFor(() => expect(apiUploadAudio).toHaveBeenCalledTimes(1));
 
       await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      expect(apiFetch).not.toHaveBeenCalled();
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
       await waitFor(() =>
         expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'recovered' } }),
       );
@@ -10865,6 +11462,8 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
 
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
       await waitFor(() =>
         expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: 'recovered' } }),
       );
@@ -10926,6 +11525,8 @@ describe('Recorder', () => {
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
       await waitFor(() => expect(apiFetch).toHaveBeenCalledWith(ENDPOINT, expect.anything()));
       await fireEvent.press(screen.getByRole('button', { name: CANCEL_TEXT }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('replay.failedBody'));
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
       await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
 
       // A lone 404 still races the cancelled POST, so the cancel is only
@@ -13109,7 +13710,7 @@ describe('Recorder', () => {
       expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
     });
 
-    it('suppresses an other-route reconciliation refresh that lands after backgrounding', async () => {
+    it('suppresses an other-route feedback refresh that lands after backgrounding', async () => {
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ questionId: OTHER_QUESTION_ID }),
@@ -13120,10 +13721,13 @@ describe('Recorder', () => {
         questionId: OTHER_QUESTION_ID,
         response: { ok: 'other' },
       });
-      asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+      asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await waitFor(() =>
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
       );
 
       backgroundApp();
@@ -13258,7 +13862,7 @@ describe('Recorder', () => {
       expect(clearPendingAssessment).not.toHaveBeenCalled();
     });
 
-    it('suppresses a result marker rejection that lands after backgrounding', async () => {
+    it('suppresses a feedback marker rejection that lands after backgrounding', async () => {
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
       asMock(apiFetch).mockResolvedValue({
@@ -13267,10 +13871,13 @@ describe('Recorder', () => {
         questionId: QUESTION_ID,
         response: { score: 9 },
       });
-      asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+      asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await waitFor(() =>
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
       );
 
       backgroundApp();
@@ -13373,17 +13980,20 @@ describe('Recorder', () => {
       expect(props.onResult).not.toHaveBeenCalled();
     });
 
-    it('suppresses a resubmission marker rejection that lands after backgrounding', async () => {
+    it('suppresses a resubmission feedback marker rejection that lands after backgrounding', async () => {
       jest.useFakeTimers();
       const marker = deferred<boolean>();
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
       mockStartedApiFetchResultOnce({ score: 12 });
-      asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+      asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await advancePolls(5);
       await waitFor(() =>
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
       );
 
       backgroundApp();
@@ -13402,11 +14012,14 @@ describe('Recorder', () => {
       asMock(loadPendingAssessment).mockResolvedValue(S3_HANDOFF);
       mockAbsentStatusReads();
       mockStartedApiFetchResultOnce({ score: 12 });
-      asMock(markPendingAssessmentForReconciliation).mockReturnValue(marker.promise);
+      asMock(markPendingAssessmentFeedbackPending).mockReturnValue(marker.promise);
       const { props } = await renderRecorder();
       await advancePolls(5);
       await waitFor(() =>
-        expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID),
+        expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+          REQUEST_ID,
+          expect.any(Number),
+        ),
       );
 
       backgroundApp();
@@ -14522,7 +15135,7 @@ describe('Recorder', () => {
         await flushMicrotasks();
       });
 
-      expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy();
+      expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy();
       expect(screen.queryByText(t('recorder.openSettings'))).toBeNull();
       expect(mockRecorder.record).not.toHaveBeenCalled();
       expect(AudioModule.getRecordingPermissionsAsync).toHaveBeenCalledTimes(1);
@@ -16023,9 +16636,9 @@ describe('Recorder', () => {
       await renderRecorder();
 
       await fireEvent.press(screen.getByLabelText(START_LABEL));
-      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy());
 
-      const banner = screen.getByText(t('recorder.permissionBody')).parent;
+      const banner = screen.getByText(t('recorder.permissionRetryBody')).parent;
       if (!banner) throw new Error('Permission banner not found');
       expect(banner.props.accessibilityRole).toBe('alert');
       expect(flattenedStyle(banner)).toEqual({
@@ -16036,7 +16649,7 @@ describe('Recorder', () => {
         padding: spacing.md,
         marginBottom: spacing.lg,
       });
-      expect(flattenedStyle(screen.getByText(t('recorder.permissionBody')))).toEqual({
+      expect(flattenedStyle(screen.getByText(t('recorder.permissionRetryBody')))).toEqual({
         color: colors.danger,
         fontSize: 14,
         lineHeight: 20,
@@ -16114,11 +16727,13 @@ describe('Recorder', () => {
         textAlign: 'center',
       });
       const cancel = screen.getByRole('button', { name: CANCEL_TEXT });
+      expect(cancel).toHaveTextContent(t('recorder.cancelSending'));
+      expect(screen.queryByRole('button', { name: t('recorder.stopWaiting') })).toBeNull();
       expect(flattenedStyle(cancel)).toMatchObject({
         marginTop: spacing.md,
         alignSelf: 'center',
       });
-      expect(cancel.props.accessibilityHint).toBe(t('recorder.cancelHint'));
+      expect(cancel.props.accessibilityHint).toBe(t('recorder.cancelBeforeTransferHint'));
       // The longer-than-usual note belongs to recovery, not to a fresh upload.
       expect(screen.queryByText(t('recorder.waitHint'))).toBeNull();
 

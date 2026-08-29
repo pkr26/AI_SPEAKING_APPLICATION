@@ -9,6 +9,7 @@ import Button from '../../components/Button';
 import RecordingPlayback from '../../components/RecordingPlayback';
 import { useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
+import { acknowledgePendingAssessmentFeedback } from '../../lib/pending-assessment';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import {
@@ -18,15 +19,26 @@ import {
   PRACTICE_PASS_SCORE,
   type NativeLanguage,
   type PracticeOutcome,
+  type Question,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
 type Variant =
-  'native' | 'native-nospeech' | 'nospeech' | 'levelup' | 'mastered' | 'passed' | 'retry' | 'final';
+  | 'native'
+  | 'native-final'
+  | 'native-nospeech'
+  | 'nospeech'
+  | 'levelup'
+  | 'mastered'
+  | 'passed'
+  | 'retry'
+  | 'final';
 
 interface FeedbackCard {
   questionId: string;
   result: PracticeOutcome;
+  question?: Question;
+  requestId?: string;
 }
 
 const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
@@ -63,17 +75,33 @@ export default function FeedbackScreen() {
   const styles = themedStyles(theme);
   const { colors } = theme;
   const queryClient = useQueryClient();
-  const { feedback, clearFeedback, setAnswerMode } = usePracticeFlow();
+  const { feedback, clearFeedback, restoreFeedback, setAnswerMode } = usePracticeFlow();
   // Every exit clears the flow state before the router finishes popping this
   // screen. Latch the outcome so the card slides away as itself instead of
   // flipping to the no-result state for the whole transition; a freshly
   // submitted outcome replaces the latched one.
   const [card, setCard] = useState<FeedbackCard | null>(() => {
     if (!feedback) return null;
-    return { questionId: feedback.questionId, result: feedback.result };
+    return {
+      questionId: feedback.questionId,
+      result: feedback.result,
+      ...(feedback.question === undefined ? {} : { question: feedback.question }),
+      ...(feedback.requestId === undefined ? {} : { requestId: feedback.requestId }),
+    };
   });
-  if (feedback && (feedback.questionId !== card?.questionId || feedback.result !== card?.result)) {
-    setCard({ questionId: feedback.questionId, result: feedback.result });
+  if (
+    feedback &&
+    (feedback.questionId !== card?.questionId ||
+      feedback.result !== card?.result ||
+      feedback.question !== card?.question ||
+      feedback.requestId !== card?.requestId)
+  ) {
+    setCard({
+      questionId: feedback.questionId,
+      result: feedback.result,
+      ...(feedback.question === undefined ? {} : { question: feedback.question }),
+      ...(feedback.requestId === undefined ? {} : { requestId: feedback.requestId }),
+    });
   }
   const result = card?.result ?? null;
   const questionId = card?.questionId ?? null;
@@ -86,6 +114,12 @@ export default function FeedbackScreen() {
   const focusedRef = useRef(false);
   const activeCardRef = useRef<FeedbackCard | null>(card);
   const actedCardRef = useRef<FeedbackCard | null>(null);
+  const acknowledgedRequestIdsRef = useRef(new Set<string>());
+  const [cardActionState, setCardActionState] = useState<{
+    card: FeedbackCard;
+    busy: boolean;
+    error: boolean;
+  } | null>(null);
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -114,7 +148,9 @@ export default function FeedbackScreen() {
     variant = isNativeOutcome(result)
       ? result.transcript === ''
         ? 'native-nospeech'
-        : 'native'
+        : result.attemptsLeft > 0
+          ? 'native'
+          : 'native-final'
       : result.noSpeech
         ? 'nospeech'
         : result.passed
@@ -135,18 +171,22 @@ export default function FeedbackScreen() {
     void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
   }, [result, variant]);
 
-  // Every scored English attempt changes the home stats and the history list.
+  // Every processed spoken attempt changes the home stats and history list.
   // Both queries stay mounted beneath this stack, so invalidating here means
   // they are fresh again by the time the learner returns to them.
-  const scoredAttempt = !!result && !isNativeOutcome(result) && !result.noSpeech;
+  const countedAttempt = !!result && !result.noSpeech;
   useEffect(() => {
-    if (!scoredAttempt) return;
+    if (!countedAttempt) return;
     void queryClient.invalidateQueries({ queryKey: ['practice-stats'] });
     void queryClient.invalidateQueries({ queryKey: ['practice-history'] });
-  }, [queryClient, result, scoredAttempt]);
+  }, [countedAttempt, queryClient, result]);
+
+  const cardActionBusy = cardActionState?.card === card && cardActionState.busy;
+  const cardActionError = cardActionState?.card === card && cardActionState.error;
 
   /** One navigation per feedback card: a double-tap on Try Again or Next
-   * Question must not pop or advance the practice stack twice. */
+   * Question must not pop or advance the practice stack twice. Durable cards
+   * clear their exact local replay pointer before any cache or route mutation. */
   const runOnce = (expectedCard: FeedbackCard | null, action: () => void) => {
     if (
       !expectedCard ||
@@ -159,7 +199,51 @@ export default function FeedbackScreen() {
       return;
     }
     actedCardRef.current = expectedCard;
-    action();
+    const requestId = expectedCard.requestId;
+    if (!requestId || acknowledgedRequestIdsRef.current.has(requestId)) {
+      action();
+      return;
+    }
+
+    setCardActionState({ card: expectedCard, busy: true, error: false });
+    const ownerId = user?.id;
+    void (async () => {
+      let acknowledged = false;
+      try {
+        acknowledged =
+          !!ownerId && (await acknowledgePendingAssessmentFeedback(ownerId, requestId));
+      } catch {
+        // The card remains the only safe source of feedback. The inline retry
+        // state below deliberately avoids exposing SecureStore internals.
+      }
+      const cardStillBelongsToSession =
+        mountedRef.current &&
+        activeCardRef.current === expectedCard &&
+        isSessionLeaseCurrent(sessionLease);
+      if (!cardStillBelongsToSession) return;
+      if (!acknowledged) {
+        actedCardRef.current = null;
+        setCardActionState({ card: expectedCard, busy: false, error: true });
+        return;
+      }
+
+      acknowledgedRequestIdsRef.current.add(requestId);
+      if (!focusedRef.current) {
+        // The secure pointer is gone, but focus ownership was lost before the
+        // route action could run. Keep the same card as an acknowledged legacy
+        // card so a later refocus can finish without a false second delete.
+        restoreFeedback(
+          expectedCard.questionId,
+          expectedCard.result,
+          expectedCard.question,
+          undefined,
+        );
+        actedCardRef.current = null;
+        setCardActionState({ card: expectedCard, busy: false, error: false });
+        return;
+      }
+      action();
+    })();
   };
 
   const backToPractice = () =>
@@ -178,7 +262,10 @@ export default function FeedbackScreen() {
   const retry = () =>
     runOnce(card, () => {
       clearFeedback();
-      router.back();
+      // A cold-start replay opens this screen with replace(), so there may be
+      // no Practice route underneath to pop. dismissTo returns to an existing
+      // Practice screen when present and replaces safely when it is absent.
+      router.dismissTo('/practice');
     });
 
   const goToNextQuestion = () => {
@@ -186,18 +273,25 @@ export default function FeedbackScreen() {
     runOnce(card, () => {
       const currentQuestionKey = ['practice-question', user.id, user.cefrLevel] as const;
       void queryClient.cancelQueries({ queryKey: currentQuestionKey, exact: true });
-      if (!isNativeOutcome(result) && result.levelUp && result.next) {
-        const nextLevel = result.levelUp.to;
-        // The promotion response already carries the next question and
-        // progress from the NEW level: adopt the level locally first so the
-        // practice screen's cache key and level badge match what it renders.
-        queryClient.setQueryData(['practice-question', user.id, nextLevel], result.next);
-        setUser((current) =>
-          current?.id === user.id ? { ...current, cefrLevel: nextLevel } : current,
-        );
-        void queryClient.invalidateQueries({ queryKey: ['me'] });
-      } else if (!isNativeOutcome(result) && result.next) {
-        queryClient.setQueryData(currentQuestionKey, result.next);
+      if (result.next) {
+        const nextLevel = result.next.question.cefrLevel;
+        const levelChanged = nextLevel !== user.cefrLevel;
+        const nextQuestionKey = ['practice-question', user.id, nextLevel] as const;
+        queryClient.setQueryData(nextQuestionKey, result.next);
+
+        if (levelChanged) {
+          // A rival request/device can promote the learner while this English
+          // or native answer is in flight. In that case the terminal response
+          // correctly carries a question from the authoritative new level but
+          // no levelUp celebration (this answer did not earn it). Trust the
+          // served question's level for both answer modes so Practice reads the
+          // matching cache key instead of returning to a stale-level loop.
+          queryClient.removeQueries({ queryKey: currentQuestionKey, exact: true });
+          setUser((current) =>
+            current?.id === user.id ? { ...current, cefrLevel: nextLevel } : current,
+          );
+          void queryClient.invalidateQueries({ queryKey: ['me'] });
+        }
       } else {
         void queryClient.invalidateQueries({
           queryKey: currentQuestionKey,
@@ -209,11 +303,18 @@ export default function FeedbackScreen() {
   };
 
   const openHelp = () => {
-    if (!questionId) return;
+    if (!questionId || !result) return;
     runOnce(card, () => {
       clearFeedback();
       router.dismissTo('/practice');
-      router.push({ pathname: '/practice/help', params: { questionId } });
+      router.push({
+        pathname: '/practice/help',
+        params: {
+          questionId,
+          cycleId: result.cycleId,
+          attemptsUsed: String(result.noSpeech ? result.attemptNo - 1 : result.attemptNo),
+        },
+      });
     });
   };
 
@@ -245,6 +346,7 @@ export default function FeedbackScreen() {
         <Button
           title={t('common.backToPractice')}
           fullWidth
+          size="md"
           onPress={() => router.replace('/practice')}
           style={styles.noResultButton}
         />
@@ -289,6 +391,16 @@ export default function FeedbackScreen() {
                 {t('feedback.noSpeechTitle')}
               </Text>
               <Text style={styles.subtitle}>{t('feedback.nativeNoSpeechBody')}</Text>
+            </>
+          )}
+
+          {variant === 'native-final' && (
+            <>
+              <DecorativeEmoji style={styles.emoji}>📘</DecorativeEmoji>
+              <Text accessibilityRole="header" style={[styles.title, { color: colors.danger }]}>
+                {t('feedback.nativeFinalTitle')}
+              </Text>
+              <Text style={styles.subtitle}>{t('feedback.nativeFinalBody')}</Text>
             </>
           )}
 
@@ -376,6 +488,13 @@ export default function FeedbackScreen() {
             </>
           )}
 
+          <Text style={styles.attemptLine}>
+            {t(result.noSpeech ? 'feedback.attemptStillAvailable' : 'feedback.attemptLine', {
+              current: result.attemptNo,
+              max: PRACTICE_MAX_ATTEMPTS,
+            })}
+          </Text>
+
           {!isNativeOutcome(result) && variant !== 'nospeech' && (
             <>
               <Text style={styles.scoreLine}>
@@ -392,37 +511,75 @@ export default function FeedbackScreen() {
         </View>
 
         <View style={styles.card}>
+          {card?.question && (
+            <View style={styles.questionSummary}>
+              <Text style={styles.cardLabel}>{t('label.word')}</Text>
+              <Text
+                accessibilityLanguage="en-US"
+                accessibilityRole="header"
+                style={styles.feedbackWord}
+                selectable
+              >
+                {card.question.promptWord}
+              </Text>
+              <Text style={styles.cardLabel}>{t('label.question')}</Text>
+              <Text accessibilityLanguage="en-US" style={styles.feedbackQuestion} selectable>
+                {card.question.questionText}
+              </Text>
+            </View>
+          )}
+
           {!!result.transcript && (
-            <>
-              <Text style={styles.cardLabel}>{t('feedback.weHeard')}</Text>
+            <View style={styles.transcriptSection}>
+              <Text style={styles.transcriptLabel}>
+                {isNativeOutcome(result) && user
+                  ? t('feedback.originalTranscript', {
+                      language: t(`language.${user.nativeLanguage}`),
+                    })
+                  : t('feedback.weHeard')}
+              </Text>
               <Text
                 accessibilityLanguage={
                   isNativeOutcome(result) && user
                     ? NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage]
                     : 'en-US'
                 }
+                selectable
                 style={styles.transcript}
               >
                 “{result.transcript}”
               </Text>
-            </>
+            </View>
+          )}
+
+          {isNativeOutcome(result) && !!result.translatedTranscript && (
+            <View style={styles.translationSection}>
+              <Text style={styles.transcriptLabel}>{t('feedback.englishTranslation')}</Text>
+              <Text accessibilityLanguage="en-US" selectable style={styles.translation}>
+                {result.translatedTranscript}
+              </Text>
+            </View>
           )}
 
           <Text style={styles.cardLabel}>
             {variant === 'final' ? t('feedback.finalFeedbackLabel') : t('feedback.feedbackLabel')}
           </Text>
-          <Text style={styles.body}>
+          <Text accessibilityLanguage="en-US" style={styles.body}>
             {variant === 'final' && !isNativeOutcome(result) && result.finalFeedback
               ? result.finalFeedback
               : result.feedback}
           </Text>
 
-          {variant === 'native' && isNativeOutcome(result) && !!result.modelAnswer && (
-            <>
-              <Text style={styles.cardLabel}>{t('feedback.sayInEnglish')}</Text>
-              <Text style={styles.modelAnswer}>{result.modelAnswer}</Text>
-            </>
-          )}
+          {(variant === 'native' || variant === 'native-final') &&
+            isNativeOutcome(result) &&
+            !!result.modelAnswer && (
+              <>
+                <Text style={styles.cardLabel}>{t('feedback.exampleEnglishAnswer')}</Text>
+                <Text accessibilityLanguage="en-US" selectable style={styles.modelAnswer}>
+                  {result.modelAnswer}
+                </Text>
+              </>
+            )}
 
           {user && result.recordingId && (
             <>
@@ -435,27 +592,82 @@ export default function FeedbackScreen() {
 
       <View style={[styles.bottomBar, { paddingBottom: Math.max(insets.bottom, 16) }]}>
         <View style={styles.bottomBarContent}>
-          {variant === 'retry' && <Button title={t('common.tryAgain')} onPress={retry} />}
+          {cardActionError && (
+            <Text accessibilityRole="alert" style={styles.cardActionError}>
+              {t('boundary.body')}
+            </Text>
+          )}
+          {variant === 'retry' && (
+            <Button
+              title={t('common.tryAgain')}
+              fullWidth
+              size="md"
+              disabled={cardActionBusy}
+              onPress={retry}
+            />
+          )}
 
           {(variant === 'levelup' ||
             variant === 'mastered' ||
             variant === 'passed' ||
-            variant === 'final') && (
-            <Button title={t('feedback.nextQuestion')} onPress={goToNextQuestion} />
+            variant === 'final' ||
+            variant === 'native-final') && (
+            <Button
+              title={t('feedback.nextQuestion')}
+              fullWidth
+              size="md"
+              disabled={cardActionBusy}
+              onPress={goToNextQuestion}
+            />
           )}
 
           {variant === 'native' && (
-            <Button title={t('feedback.tryInEnglish')} onPress={tryInEnglish} />
+            <View style={styles.buttonColumn}>
+              <Button
+                title={t('feedback.tryInEnglish')}
+                fullWidth
+                size="md"
+                disabled={cardActionBusy}
+                onPress={tryInEnglish}
+              />
+              <Button
+                title={t('feedback.tryAgainNative')}
+                variant="secondary"
+                fullWidth
+                size="md"
+                disabled={cardActionBusy}
+                onPress={backToPractice}
+              />
+            </View>
           )}
 
           {variant === 'native-nospeech' && (
-            <Button title={t('feedback.tryAgainNative')} onPress={backToPractice} />
+            <Button
+              title={t('feedback.tryAgainNative')}
+              fullWidth
+              size="md"
+              disabled={cardActionBusy}
+              onPress={backToPractice}
+            />
           )}
 
           {variant === 'nospeech' && (
             <View style={styles.buttonColumn}>
-              <Button title={t('common.tryAgain')} onPress={retry} />
-              <Button title={t('feedback.seeHelp')} variant="secondary" onPress={openHelp} />
+              <Button
+                title={t('common.tryAgain')}
+                fullWidth
+                size="md"
+                disabled={cardActionBusy}
+                onPress={retry}
+              />
+              <Button
+                title={t('feedback.seeHelp')}
+                variant="secondary"
+                fullWidth
+                size="md"
+                disabled={cardActionBusy}
+                onPress={openHelp}
+              />
             </View>
           )}
         </View>
@@ -525,6 +737,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.muted,
     textAlign: 'center',
   },
+  attemptLine: {
+    marginTop: spacing.md,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
+    borderRadius: radii.badge,
+    backgroundColor: colors.primaryLight,
+    color: colors.primary,
+    fontSize: 14,
+    fontWeight: '800',
+  },
   card: {
     marginTop: spacing.xl,
     alignSelf: 'stretch',
@@ -542,11 +764,57 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     letterSpacing: 0.8,
     marginTop: 14,
   },
-  transcript: {
+  questionSummary: {
+    paddingBottom: spacing.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+  },
+  feedbackWord: {
     marginTop: spacing.xs,
-    fontSize: 16,
-    fontStyle: 'italic',
-    lineHeight: 23,
+    color: colors.primary,
+    fontSize: 24,
+    fontWeight: '800',
+  },
+  feedbackQuestion: {
+    marginTop: spacing.xs,
+    color: colors.text,
+    fontSize: 17,
+    lineHeight: 25,
+  },
+  transcriptSection: {
+    marginTop: spacing.lg,
+    padding: spacing.md,
+    borderRadius: radii.input,
+    backgroundColor: colors.primaryLight,
+    borderWidth: 1,
+    borderColor: colors.primary,
+  },
+  translationSection: {
+    marginTop: spacing.md,
+    padding: spacing.md,
+    borderRadius: radii.input,
+    backgroundColor: colors.background,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  transcriptLabel: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: colors.text,
+    textTransform: 'uppercase',
+    letterSpacing: 0.6,
+  },
+  transcript: {
+    marginTop: spacing.sm,
+    fontSize: 18,
+    fontWeight: '600',
+    lineHeight: 27,
+    color: colors.text,
+  },
+  translation: {
+    marginTop: spacing.sm,
+    fontSize: 18,
+    lineHeight: 27,
     color: colors.text,
   },
   modelAnswer: {
@@ -577,6 +845,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'center',
   },
   buttonColumn: {
-    gap: 10,
+    alignSelf: 'stretch',
+    gap: spacing.sm,
+  },
+  cardActionError: {
+    marginBottom: spacing.md,
+    color: colors.danger,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: 'center',
   },
 }));

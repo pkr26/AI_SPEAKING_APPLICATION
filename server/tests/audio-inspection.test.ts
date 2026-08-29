@@ -4,8 +4,13 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  accumulatePcmS16LeSignal,
   assertAudioInspectorAvailable,
+  createPcmS16LeSignalAccumulator,
+  hasAssessableAudioSignal,
   MAX_AUDIO_DURATION_SECONDS,
+  MIN_AUDIO_PEAK_AMPLITUDE,
+  summarizePcmS16LeSignal,
   verifyAudioDuration,
 } from '../src/audio-inspection';
 import { config } from '../src/config';
@@ -26,9 +31,10 @@ const supportedAudioFixtures = [
   ['FLAC', 'supported.flac', 'flac', undefined],
 ] as const;
 
-function pcmWav(durationSeconds: number, sampleRate = 8_000): Buffer {
-  const dataBytes = Math.round(durationSeconds * sampleRate);
-  const buffer = Buffer.alloc(44 + dataBytes, 128);
+function pcmWav(durationSeconds: number, sampleRate = 8_000, peakAmplitude = 4_096): Buffer {
+  const sampleCount = Math.round(durationSeconds * sampleRate);
+  const dataBytes = sampleCount * 2;
+  const buffer = Buffer.alloc(44 + dataBytes);
   buffer.write('RIFF', 0, 'ascii');
   buffer.writeUInt32LE(buffer.length - 8, 4);
   buffer.write('WAVE', 8, 'ascii');
@@ -37,11 +43,15 @@ function pcmWav(durationSeconds: number, sampleRate = 8_000): Buffer {
   buffer.writeUInt16LE(1, 20); // PCM
   buffer.writeUInt16LE(1, 22); // mono
   buffer.writeUInt32LE(sampleRate, 24);
-  buffer.writeUInt32LE(sampleRate, 28); // 8-bit mono byte rate
-  buffer.writeUInt16LE(1, 32);
-  buffer.writeUInt16LE(8, 34);
+  buffer.writeUInt32LE(sampleRate * 2, 28); // 16-bit mono byte rate
+  buffer.writeUInt16LE(2, 32);
+  buffer.writeUInt16LE(16, 34);
   buffer.write('data', 36, 'ascii');
   buffer.writeUInt32LE(dataBytes, 40);
+  for (let sampleIndex = 0; sampleIndex < sampleCount; sampleIndex++) {
+    const sample = Math.round(peakAmplitude * Math.sin((2 * Math.PI * 440 * sampleIndex) / sampleRate));
+    buffer.writeInt16LE(sample, 44 + sampleIndex * 2);
+  }
   return buffer;
 }
 
@@ -83,7 +93,7 @@ async function generatedAudio(
     codec,
     durationSeconds = 1,
     format,
-    source = 'anullsrc=r=48000:cl=mono',
+    source = 'sine=frequency=440:sample_rate=48000',
   }: { bitrate?: string; codec: string; durationSeconds?: number; format?: string; source?: string },
 ): Promise<string> {
   const filePath = path.join(uploadsDir, `${process.pid}-${name}`);
@@ -116,8 +126,48 @@ afterEach(async () => {
 });
 
 describe('verifyAudioDuration', () => {
+  it('measures signed PCM energy across arbitrary odd stream boundaries', () => {
+    const samples = [0, -32_768, 123, -456, 16];
+    const pcm = Buffer.alloc(samples.length * 2);
+    samples.forEach((sample, index) => pcm.writeInt16LE(sample, index * 2));
+
+    let accumulator = createPcmS16LeSignalAccumulator();
+    for (const chunk of [pcm.subarray(0, 1), pcm.subarray(1, 4), pcm.subarray(4, 7), pcm.subarray(7)]) {
+      accumulator = accumulatePcmS16LeSignal(accumulator, chunk);
+    }
+    const summary = summarizePcmS16LeSignal(accumulator);
+
+    expect(summary).toEqual({
+      sampleCount: samples.length,
+      peakAmplitude: 32_768,
+      rmsAmplitude: Math.sqrt(samples.reduce((total, sample) => total + sample * sample, 0) / samples.length),
+      hasPartialSample: false,
+    });
+    expect(hasAssessableAudioSignal(summary)).toBe(true);
+
+    const incomplete = summarizePcmS16LeSignal(
+      accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), Buffer.from([0x7f])),
+    );
+    expect(incomplete).toMatchObject({ sampleCount: 0, hasPartialSample: true });
+    expect(hasAssessableAudioSignal(incomplete)).toBe(false);
+  });
+
   it('accepts a decodable recording within the product duration limit', async () => {
     await expect(verifyAudioDuration(await fixture('valid.wav', pcmWav(1)))).resolves.toBe(true);
+  });
+
+  it('rejects digital silence and near-zero residue but accepts an extremely quiet real tone', async () => {
+    await expect(verifyAudioDuration(await fixture('silent.wav', pcmWav(1, 8_000, 0)))).rejects.toMatchObject({
+      status: 422,
+      message: 'No audible signal was detected in the recording',
+      code: 'AUDIO_SILENT',
+    });
+    await expect(
+      verifyAudioDuration(await fixture('near-zero.wav', pcmWav(1, 8_000, MIN_AUDIO_PEAK_AMPLITUDE - 1))),
+    ).rejects.toMatchObject({ status: 422, code: 'AUDIO_SILENT' });
+    await expect(
+      verifyAudioDuration(await fixture('quiet-tone.wav', pcmWav(1, 8_000, MIN_AUDIO_PEAK_AMPLITUDE * 2))),
+    ).resolves.toBe(true);
   });
 
   it('accepts the exact minimum and maximum decoded-duration boundaries', async () => {

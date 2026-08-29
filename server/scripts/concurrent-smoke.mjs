@@ -167,7 +167,7 @@ function expectResponse(name, response, expectedStatus) {
   );
 }
 
-function audioForm(questionId, requestId = randomUUID()) {
+function audioForm(questionId, requestId = randomUUID(), cycleId) {
   const form = new FormData();
   // Valid ISO BMFF magic bytes, but intentionally not playable audio. MOCK_AI
   // skips native duration inspection. Real mode rejects this before OpenAI.
@@ -175,6 +175,7 @@ function audioForm(questionId, requestId = randomUUID()) {
   form.append('audio', fakeAudio, 'answer.m4a');
   form.append('questionId', questionId);
   form.append('requestId', requestId);
+  if (cycleId) form.append('cycleId', cycleId);
   return form;
 }
 
@@ -301,6 +302,7 @@ function validateNativeAssessment(name, response) {
     response.body?.mode === 'native' &&
       response.body.understood === true &&
       response.body.transcript === '(mock transcript)' &&
+      response.body.translatedTranscript === '(mock English translation)' &&
       typeof response.body.modelAnswer === 'string' &&
       response.body.modelAnswer.includes('MOCK_AI=true') &&
       typeof response.body.feedback === 'string' &&
@@ -504,7 +506,7 @@ async function main() {
     );
     check(
       `initial diagnostic progress for user ${user.index + 1}`,
-      nextResponse.body.progress?.asked === 0 && nextResponse.body.progress?.maxQuestions === 5,
+      nextResponse.body.progress?.asked === 0 && nextResponse.body.progress?.maxQuestions === 3,
       safeJson(nextResponse.body),
     );
     user.currentQuestion = nextResponse.body.question;
@@ -519,14 +521,14 @@ async function main() {
 
   let diagnosticWaveCount = 0;
   let diagnosticWaveAttemptCount = 0;
-  for (let wave = 1; wave <= 5; wave++) {
+  for (let wave = 1; wave <= 3; wave++) {
     const pending = createdUsers.filter((user) => user.currentQuestion);
     if (pending.length === 0) break;
     diagnosticWaveCount++;
     diagnosticWaveAttemptCount += pending.length;
     check(
-      `diagnostic wave ${wave} does not exceed five attempts per user`,
-      pending.every((user) => user.diagnosticAttempts < 5),
+      `diagnostic wave ${wave} does not exceed three attempts per user`,
+      pending.every((user) => user.diagnosticAttempts < 3),
     );
     await concurrentPhase(`diagnostic upload-grant wave ${wave}`, pending, (user) =>
       requestDirectUploadGrant(
@@ -545,8 +547,8 @@ async function main() {
     createdUsers.every((user) => !user.currentQuestion && LEVELS.includes(user.level)),
   );
   check(
-    'every diagnostic completed within five answers',
-    createdUsers.every((user) => user.diagnosticAttempts >= 2 && user.diagnosticAttempts <= 5),
+    'every diagnostic completed within three answers',
+    createdUsers.every((user) => user.diagnosticAttempts >= 2 && user.diagnosticAttempts <= 3),
   );
   check(
     'at least one diagnostic assessment phase overlapped all 10 client participant promises',
@@ -577,6 +579,7 @@ async function main() {
       (practiceResponse.headers.get('cache-control') || '').includes('no-store'),
     );
     user.practiceQuestion = practiceResponse.body.question;
+    user.practiceCycleId = practiceResponse.body.cycleId;
   });
 
   await concurrentPhase('load and revalidate 10 localized help payloads', createdUsers, async (user) => {
@@ -616,7 +619,7 @@ async function main() {
   await concurrentPhase('submit 10 English practice attempts', createdUsers, async (user) => {
     const attemptResponse = await req('POST', '/practice/attempt', {
       token: user.token,
-      form: audioForm(user.practiceQuestion.id),
+      form: audioForm(user.practiceQuestion.id, randomUUID(), user.practiceCycleId),
     });
     validateMockAssessment(`English practice attempt for user ${user.index + 1}`, attemptResponse);
     check(
@@ -636,6 +639,7 @@ async function main() {
         safeJson(attemptResponse.body),
       );
       user.practiceQuestion = attemptResponse.body.next.question;
+      user.practiceCycleId = attemptResponse.body.next.cycleId;
     } else {
       check(
         `failed English attempt keeps two retries for user ${user.index + 1}`,
@@ -662,6 +666,8 @@ async function main() {
       safeJson(progressResponse.body),
     );
     user.progressAfterEnglish = { ...progressResponse.body.progress };
+    user.practiceQuestion = progressResponse.body.question;
+    user.practiceCycleId = progressResponse.body.cycleId;
   });
 
   await concurrentPhase('issue 10 native-practice upload grants', createdUsers, (user) =>
@@ -674,7 +680,7 @@ async function main() {
   await concurrentPhase('submit 10 native-language practice attempts', createdUsers, async (user) => {
     const nativeResponse = await req('POST', '/practice/attempt/native', {
       token: user.token,
-      form: audioForm(user.nativeQuestionId, user.nativeRequestId),
+      form: audioForm(user.nativeQuestionId, user.nativeRequestId, user.practiceCycleId),
     });
     validateNativeAssessment(`native practice attempt for user ${user.index + 1}`, nativeResponse);
     user.nativeResponse = nativeResponse.body;
@@ -698,7 +704,7 @@ async function main() {
   await concurrentPhase('replay 10 completed native requests with the same UUIDs', createdUsers, async (user) => {
     const replayResponse = await req('POST', '/practice/attempt/native', {
       token: user.token,
-      form: audioForm(user.nativeQuestionId, user.nativeRequestId),
+      form: audioForm(user.nativeQuestionId, user.nativeRequestId, user.practiceCycleId),
     });
     validateNativeAssessment(`native same-request replay for user ${user.index + 1}`, replayResponse);
     check(
@@ -708,15 +714,32 @@ async function main() {
     );
   });
 
-  await concurrentPhase('prove native mode did not change 10 mastery states', createdUsers, async (user) => {
-    const afterNativeResponse = await req('GET', '/practice/question', { token: user.token });
-    expectResponse(`post-native progress for user ${user.index + 1}`, afterNativeResponse, 200);
-    check(
-      `native mode preserves progress for user ${user.index + 1}`,
-      isDeepStrictEqual(afterNativeResponse.body?.progress, user.progressAfterEnglish),
-      `before ${safeJson(user.progressAfterEnglish)}, after ${safeJson(afterNativeResponse.body?.progress)}`,
-    );
-  });
+  await concurrentPhase(
+    'prove native mode counted a try without changing 10 mastery states',
+    createdUsers,
+    async (user) => {
+      const afterNativeResponse = await req('GET', '/practice/question', { token: user.token });
+      expectResponse(`post-native progress for user ${user.index + 1}`, afterNativeResponse, 200);
+      const expectedNewLearningWord = user.englishResult.passed ? 1 : 0;
+      const expectedProgress = {
+        ...user.progressAfterEnglish,
+        learningCount: user.progressAfterEnglish.learningCount + expectedNewLearningWord,
+        dueCount: user.progressAfterEnglish.dueCount + expectedNewLearningWord,
+      };
+      check(
+        `native mode preserves mastery counts for user ${user.index + 1}`,
+        isDeepStrictEqual(afterNativeResponse.body?.progress, expectedProgress),
+        `expected ${safeJson(expectedProgress)}, after ${safeJson(afterNativeResponse.body?.progress)}`,
+      );
+      check(
+        `native mode advances the shared cycle budget for user ${user.index + 1}`,
+        afterNativeResponse.body?.cycleId === user.practiceCycleId &&
+          afterNativeResponse.body.attemptsUsed === user.nativeResponse.attemptNo &&
+          afterNativeResponse.body.attemptsLeft === user.nativeResponse.attemptsLeft,
+        safeJson(afterNativeResponse.body),
+      );
+    },
+  );
 
   await concurrentPhase('verify 10 isolated data exports', createdUsers, async (user) => {
     const exportResponse = await req('GET', '/auth/me/data?limit=100', { token: user.token });
@@ -727,17 +750,27 @@ async function main() {
       safeJson(exportResponse.body),
     );
     check(
-      `native mode writes no attempt for user ${user.index + 1}`,
+      `native mode writes one counted attempt for user ${user.index + 1}`,
       Array.isArray(exportResponse.body?.attempts) &&
-        exportResponse.body.attempts.length === user.diagnosticAttempts + 1,
+        exportResponse.body.attempts.length === user.diagnosticAttempts + 2,
       safeJson(exportResponse.body),
     );
     check(
       `attempt contexts are isolated for user ${user.index + 1}`,
       exportResponse.body.attempts.filter((attempt) => attempt.context === 'diagnostic').length ===
         user.diagnosticAttempts &&
-        exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice').length === 1,
+        exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice').length === 1 &&
+        exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice-native').length === 1,
       safeJson(exportResponse.body),
+    );
+    const nativeProgress = exportResponse.body.practiceProgress?.find(
+      (progress) => progress.questionId === user.nativeQuestionId,
+    );
+    check(
+      `native mode increments durable progress without changing best English score for user ${user.index + 1}`,
+      nativeProgress?.attemptCount === (user.englishResult.passed ? 1 : 2) &&
+        nativeProgress.bestScore === (user.englishResult.passed ? 0 : user.englishResult.score),
+      safeJson(nativeProgress),
     );
     check(
       `data export omits password hash for user ${user.index + 1}`,

@@ -80,6 +80,7 @@ function pendingRecord(overrides: Partial<Pending> = {}): Pending {
     questionId: QUESTION_ID,
     requestId: REQUEST_ID,
     createdAt: 1,
+    retainRecording: false,
     stage: 'prepared',
     ...overrides,
   };
@@ -249,6 +250,7 @@ describe('Recorder mutation-first pure contracts', () => {
     ['owner', { ownerId: OTHER_OWNER_ID }, false],
     ['endpoint', { endpoint: '/diagnostic/answer' as const }, false],
     ['question', { questionId: OTHER_QUESTION_ID }, false],
+    ['retention choice', { retainRecording: true }, false],
     ['stage', { stage: 's3-granted' as const }, false],
     ['cancelled', { cancelRequested: true }, false],
     ['spent recovery POST', { recoveryPostAttempts: 1 }, false],
@@ -260,6 +262,7 @@ describe('Recorder mutation-first pure contracts', () => {
         ENDPOINT,
         QUESTION_ID,
         REQUEST_ID,
+        false,
       ),
     ).toBe(expected);
   });

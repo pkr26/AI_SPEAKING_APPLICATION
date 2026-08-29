@@ -805,7 +805,7 @@ async function main() {
         'diagnostic asked-count oracle is bounded',
         Number.isSafeInteger(expectedFinal.diagnosticQuestionsAsked) &&
           expectedFinal.diagnosticQuestionsAsked >= 0 &&
-          expectedFinal.diagnosticQuestionsAsked <= 5,
+          expectedFinal.diagnosticQuestionsAsked <= 3,
       );
     }
     check(scope, 'attempt expectations are present', Array.isArray(user.expectedAttempts));
@@ -816,12 +816,13 @@ async function main() {
       'attempt expectations include exact row fields and digests',
       expectedAttemptsFor(user).every(
         (attempt) =>
-          ['diagnostic', 'practice'].includes(attempt.context) &&
+          ['diagnostic', 'practice', 'practice-native'].includes(attempt.context) &&
           typeof attempt.questionId === 'string' &&
           Number.isSafeInteger(attempt.seq) &&
           Number.isSafeInteger(attempt.attemptNo) &&
-          Number.isSafeInteger(attempt.score) &&
-          typeof attempt.passed === 'boolean' &&
+          (attempt.context === 'practice-native'
+            ? attempt.score === null && attempt.passed === null
+            : Number.isSafeInteger(attempt.score) && typeof attempt.passed === 'boolean') &&
           typeof attempt.recordingId === 'string' &&
           !!normalizeDigest(attempt.transcriptDigest) &&
           !!normalizeDigest(attempt.feedbackDigest),
@@ -902,7 +903,7 @@ async function main() {
     const actions = Array.isArray(user.actions) ? user.actions : [];
     check(scope, 'user has recorded API actions', actions.length > 0);
     if (actions.some((action) => action.logicalAction === 'assessment:practice-native')) {
-      check(scope, 'native assessment declares progress invariance', user.nativeInvariantExpected === true);
+      check(scope, 'native assessment declares mastery invariance', user.nativeInvariantExpected === true);
     }
     const actualActionCounts = new Map();
     for (const action of actions) {
@@ -1514,10 +1515,12 @@ async function main() {
       for (const expected of expectedProgress) {
         const progressScope = `${scope}:progress:${expected.questionId}`;
         const relatedAttempts = expectedAttempts.filter(
-          (attempt) => attempt.context === 'practice' && attempt.questionId === expected.questionId,
+          (attempt) =>
+            ['practice', 'practice-native'].includes(attempt.context) && attempt.questionId === expected.questionId,
         );
+        const relatedEnglishAttempts = relatedAttempts.filter((attempt) => attempt.context === 'practice');
         const expectedBestScore =
-          relatedAttempts.length > 0 ? Math.max(...relatedAttempts.map((attempt) => attempt.score)) : 0;
+          relatedEnglishAttempts.length > 0 ? Math.max(...relatedEnglishAttempts.map((attempt) => attempt.score)) : 0;
         check(
           progressScope,
           'progress count and best score agree with the exact attempt ledger',
@@ -1559,7 +1562,8 @@ async function main() {
             return action.logicalAction === 'practice-skip' && action.essentials?.questionId === expected.questionId;
           }
           return (
-            action.logicalAction === 'assessment:practice' && action.assessment?.questionId === expected.questionId
+            ['assessment:practice', 'assessment:practice-native'].includes(action.logicalAction) &&
+            action.assessment?.questionId === expected.questionId
           );
         });
         sourceActions.sort((left, right) => Date.parse(left.finishedAt) - Date.parse(right.finishedAt));
@@ -1568,7 +1572,7 @@ async function main() {
           progressScope,
           expected.attemptCount === 0
             ? 'zero-attempt last_attempt_at is sourced by the skip action'
-            : 'scored last_attempt_at is sourced by the latest English assessment',
+            : 'spoken last_attempt_at is sourced by the latest practice assessment',
           !!sourceAction,
         );
         if (sourceAction) {
@@ -1592,7 +1596,8 @@ async function main() {
           );
           if (expected.attemptCount > 0) {
             const matchingDatabaseAttempts = actualAttempts.filter(
-              (attempt) => attempt.context === 'practice' && attempt.questionId === expected.questionId,
+              (attempt) =>
+                ['practice', 'practice-native'].includes(attempt.context) && attempt.questionId === expected.questionId,
             );
             const latestDatabaseAttempt = matchingDatabaseAttempts.at(-1);
             const latestCreatedAt =
@@ -2249,6 +2254,7 @@ async function main() {
         },
         diagnosticAttempts: attempts.filter((attempt) => attempt.context === 'diagnostic').length,
         englishPracticeAttempts: attempts.filter((attempt) => attempt.context === 'practice').length,
+        nativePracticeAttempts: attempts.filter((attempt) => attempt.context === 'practice-native').length,
         diagnosticRequests: requests.filter((request) => request.context === 'diagnostic').length,
         englishPracticeRequests: requests.filter((request) => request.context === 'practice').length,
         nativeRequests: requests.filter((request) => request.context === 'practice-native').length,

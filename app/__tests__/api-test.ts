@@ -2,6 +2,7 @@ import { File } from 'expo-file-system';
 import * as SecureStore from 'expo-secure-store';
 
 import type { ApiErrorCode } from '../src/lib/api';
+import { latchClientUpgradeRequired } from '../src/lib/client-upgrade-store';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { ContractError } from '../src/lib/types';
 
@@ -65,6 +66,10 @@ jest.mock('expo-file-system', () => ({
     upload: mockFileUpload,
   })),
   UploadType: { MULTIPART: 'multipart' },
+}));
+
+jest.mock('../src/lib/client-upgrade-store', () => ({
+  latchClientUpgradeRequired: jest.fn(),
 }));
 
 jest.mock('react-native', () => ({
@@ -322,7 +327,12 @@ async function assertMutationLiveness(): Promise<void> {
   const cursor = '550e8400-e29b-41d4-a716-446655440041';
   fetchMock.mockResolvedValue(
     fakeResponse({
-      json: async () => ({ user: PROFILE_USER, attempts: [{ id: 'a1' }], nextCursor: cursor }),
+      json: async () =>
+        userExportPage({
+          attempts: [{ id: 'a1' }],
+          nextCursor: cursor,
+          attemptsDone: false,
+        }),
     }),
   );
   let emittedPages = 0;
@@ -380,6 +390,7 @@ afterEach(async () => {
     body: '',
   }));
   api.setUnauthorizedHandler(null);
+  jest.mocked(latchClientUpgradeRequired).mockClear();
 });
 
 afterAll(() => {
@@ -692,6 +703,8 @@ describe('userMessageForError', () => {
       ['REQUEST_IN_FLIGHT', 'error.stillChecking'],
       ['REQUEST_ID_REUSED', 'error.alreadySent'],
       ['ASSESSMENT_IN_PROGRESS', 'error.stillChecking'],
+      ['ASSESSMENT_RESULT_INCOMPATIBLE', 'error.assessmentResultIncompatible'],
+      ['PRACTICE_CYCLE_CLOSED', 'error.stateChanged'],
       ['STATE_CHANGED', 'error.stateChanged'],
       ['RATE_LIMITED', 'error.tooMany'],
       ['DAILY_LIMIT', 'error.dailyLimit'],
@@ -699,6 +712,7 @@ describe('userMessageForError', () => {
       ['CAPACITY_BUSY', 'error.busy'],
       ['POOL_SATURATED', 'error.busy'],
       ['AUDIO_INVALID', 'error.audioInvalid'],
+      ['AUDIO_SILENT', 'error.audioSilent'],
       ['AUDIO_UPLOAD_MISSING', 'error.audioInvalid'],
       ['AUDIO_TOO_LARGE', 'error.tooLarge'],
       ['AUDIO_TOO_LONG', 'error.audioTooLong'],
@@ -842,6 +856,41 @@ describe('apiFetch', () => {
     expect(fetchMock.mock.calls[0][1].headers).toStrictEqual({
       'Content-Type': 'application/json',
     });
+  });
+
+  it.each([
+    ['the status is not 426', 400, 'CLIENT_UPGRADE_REQUIRED'],
+    ['the error code is not exact', 426, 'INTERNAL'],
+    ['the error body has no code', 426, undefined],
+  ])('does not latch a forced update when %s', async (_label, status, code: string | undefined) => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status,
+        json: async () => (code === undefined ? {} : { code }),
+      }),
+    );
+
+    await expect(api.apiFetch('/client-version-check')).rejects.toMatchObject({ status });
+
+    expect(latchClientUpgradeRequired).not.toHaveBeenCalled();
+  });
+
+  it('latches only the exact first-party 426 client-upgrade contract', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status: 426,
+        json: async () => ({ code: 'CLIENT_UPGRADE_REQUIRED' }),
+      }),
+    );
+
+    await expect(api.apiFetch('/client-version-check')).rejects.toMatchObject({
+      status: 426,
+      code: 'CLIENT_UPGRADE_REQUIRED',
+    });
+
+    expect(latchClientUpgradeRequired).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -2011,7 +2060,7 @@ describe('apiUploadAudio', () => {
     const result = await api.apiUploadAudio<{ result: string }>(
       '/practice/attempt',
       'file:///recordings/answer.m4a',
-      { questionId: 'q-1', requestId: 'r-1' },
+      { questionId: 'q-1', requestId: 'r-1', retainRecording: 'false' },
     );
 
     expect(result).toEqual({ result: 'ok' });
@@ -2032,6 +2081,7 @@ describe('apiUploadAudio', () => {
       },
       { name: 'questionId', value: 'q-1' },
       { name: 'requestId', value: 'r-1' },
+      { name: 'retainRecording', value: 'false' },
     ]);
   });
 
@@ -2050,6 +2100,21 @@ describe('apiUploadAudio', () => {
     await api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {});
 
     expect(fetchMock.mock.calls[0][1].headers).toEqual({ 'X-Client-Version': '1.0.0' });
+  });
+
+  it('latches the exact upgrade contract from a direct first-party audio submission', async () => {
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        ok: false,
+        status: 426,
+        json: async () => ({ code: 'CLIENT_UPGRADE_REQUIRED' }),
+      }),
+    );
+
+    await expect(
+      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}),
+    ).rejects.toMatchObject({ status: 426, code: 'CLIENT_UPGRADE_REQUIRED' });
+    expect(latchClientUpgradeRequired).toHaveBeenCalledTimes(1);
   });
 
   it('uploads a fetched blob on web', async () => {
@@ -2127,6 +2192,23 @@ describe('apiUploadAudio', () => {
     await expect(
       api.apiUploadAudio('/practice/attempt', 'blob:https://app/missing', {}),
     ).rejects.toMatchObject({ status: 404 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('never latches from a look-alike 426 returned by a local browser blob URL', async () => {
+    mockPlatform.OS = 'web';
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 426,
+        json: async () => ({ code: 'CLIENT_UPGRADE_REQUIRED' }),
+      }),
+    );
+
+    await expect(
+      api.apiUploadAudio('/practice/attempt', 'blob:https://app/missing', {}),
+    ).rejects.toMatchObject({ status: 426, code: 'CLIENT_UPGRADE_REQUIRED' });
+    expect(latchClientUpgradeRequired).not.toHaveBeenCalled();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
@@ -2633,6 +2715,35 @@ describe('apiPostPresignedAudio', () => {
       { name: 'Policy', value: 'signed-policy' },
       { name: 'file', value: blob, filename: 'audio.webm' },
     ]);
+  });
+
+  it('never latches from a look-alike 426 returned by S3', async () => {
+    mockPlatform.OS = 'web';
+    const blob = new Blob(['web-audio'], { type: 'audio/webm' });
+    fetchMock
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        blob: async () => blob,
+      } as unknown as Response)
+      .mockResolvedValueOnce(
+        fakeResponse({
+          ok: false,
+          status: 426,
+          json: async () => ({ code: 'CLIENT_UPGRADE_REQUIRED' }),
+        }),
+      );
+
+    await expect(
+      api.apiPostPresignedAudio(
+        uploadUrl,
+        { ...uploadFields, 'Content-Type': 'audio/webm' },
+        'blob:https://app/audio-1',
+        'audio/webm',
+        maxBytes,
+      ),
+    ).rejects.toMatchObject({ status: 426, code: 'CLIENT_UPGRADE_REQUIRED' });
+    expect(latchClientUpgradeRequired).not.toHaveBeenCalled();
   });
 
   it('throws an ApiError when S3 rejects the upload', async () => {
@@ -3357,10 +3468,14 @@ const HISTORY_ITEM = {
   questionText: 'Describe a time you showed courage.',
   cefrLevel: 'B1',
   context: 'practice',
+  cycleId: '550e8400-e29b-41d4-a716-446655440020',
   attemptNo: 1,
   score: 82,
   passed: true,
+  understood: null,
   transcript: 'I was brave.',
+  translatedTranscript: null,
+  modelAnswer: null,
   feedback: 'Nice work.',
   createdAt: '2026-08-15T10:00:00.000Z',
 };
@@ -3374,6 +3489,21 @@ const PROFILE_USER = {
   cefrLevel: 'B1',
   diagnosticCompleted: true,
 };
+
+function userExportPage(overrides: Record<string, unknown> = {}) {
+  return {
+    user: PROFILE_USER,
+    attempts: [],
+    practiceProgress: [],
+    practiceCycles: [],
+    diagnosticState: null,
+    nextCursor: null,
+    nextPracticeCycleCursor: null,
+    attemptsDone: true,
+    practiceCyclesDone: true,
+    ...overrides,
+  };
+}
 
 describe('typed endpoint helpers', () => {
   const recordingId = '550e8400-e29b-41d4-a716-446655440090';
@@ -3398,8 +3528,9 @@ describe('typed endpoint helpers', () => {
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
 
     await expect(api.apiGetPracticeStats()).resolves.toEqual(STATS_BODY);
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://localhost:4000/practice/stats',
+      `http://localhost:4000/practice/stats?timeZone=${encodeURIComponent(timeZone)}`,
       expect.objectContaining({ method: 'GET' }),
     );
   });
@@ -3439,7 +3570,7 @@ describe('typed endpoint helpers', () => {
     );
   });
 
-  it('loads recordings, lazily requests a playback URL, and deletes by owner recording id', async () => {
+  it('loads recordings, lazily requests a playback URL, and supports owner-scoped deletion', async () => {
     fetchMock
       .mockResolvedValueOnce(
         fakeResponse({ json: async () => ({ items: [recordingBody], nextCursor: null }) }),
@@ -3454,6 +3585,7 @@ describe('typed endpoint helpers', () => {
           }),
         }),
       )
+      .mockResolvedValueOnce(fakeResponse({ status: 204 }))
       .mockResolvedValueOnce(fakeResponse({ status: 204 }));
 
     await expect(api.apiGetRecordings()).resolves.toEqual({
@@ -3467,13 +3599,16 @@ describe('typed endpoint helpers', () => {
       contentType: 'audio/mp4',
     });
     await expect(api.apiDeleteRecording(recordingId)).resolves.toBeUndefined();
+    await expect(api.apiDeleteAllRecordings()).resolves.toBeUndefined();
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
       'http://localhost:4000/recordings?limit=20',
       `http://localhost:4000/recordings/${recordingId}/playback-url`,
       `http://localhost:4000/recordings/${recordingId}`,
+      'http://localhost:4000/recordings',
     ]);
     expect(fetchMock.mock.calls[1][1]).toEqual(expect.objectContaining({ method: 'POST' }));
     expect(fetchMock.mock.calls[2][1]).toEqual(expect.objectContaining({ method: 'DELETE' }));
+    expect(fetchMock.mock.calls[3][1]).toEqual(expect.objectContaining({ method: 'DELETE' }));
   });
 
   it('URL-encodes the recordings cursor', async () => {
@@ -3514,9 +3649,10 @@ describe('typed endpoint helpers', () => {
       .mockImplementationOnce(async () => {
         await api.saveToken('replacement-token');
         return fakeResponse({
-          json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }),
+          json: async () => userExportPage(),
         });
       })
+      .mockResolvedValueOnce(fakeResponse({ json: async () => userExportPage() }))
       .mockResolvedValueOnce(
         fakeResponse({
           json: async () => ({
@@ -3533,10 +3669,8 @@ describe('typed endpoint helpers', () => {
       );
 
     await api.apiConsumeAccountExportPages(consumeUser, consumeRecordings);
-    expect(consumeUser).toHaveBeenCalledWith(
-      { user: PROFILE_USER, attempts: [], nextCursor: null },
-      0,
-    );
+    expect(consumeUser).toHaveBeenNthCalledWith(1, userExportPage(), 0);
+    expect(consumeUser).toHaveBeenNthCalledWith(2, userExportPage(), 1);
     expect(consumeRecordings).toHaveBeenCalledWith(
       {
         recordings: [
@@ -3554,7 +3688,8 @@ describe('typed endpoint helpers', () => {
       expect(init.headers.Authorization).toBe('Bearer pinned-export-token');
     }
     expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
-      'http://localhost:4000/auth/me/data?limit=500',
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true',
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=true&practiceCyclesDone=false',
       'http://localhost:4000/recordings/export?limit=500',
     ]);
   });
@@ -3681,9 +3816,7 @@ describe('typed endpoint helpers', () => {
     const controller = new AbortController();
     const consumeUser = jest.fn(() => controller.abort(reason));
     const consumeRecordings = jest.fn();
-    fetchMock.mockResolvedValue(
-      fakeResponse({ json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }) }),
-    );
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => userExportPage() }));
 
     const outcome = api.apiConsumeAccountExportPages(
       consumeUser,
@@ -3702,12 +3835,15 @@ describe('typed endpoint helpers', () => {
   it('apiSkipPracticeWord POSTs the question id to /practice/skip', async () => {
     fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
 
-    await api.apiSkipPracticeWord(HISTORY_ITEM.questionId);
+    await api.apiSkipPracticeWord(HISTORY_ITEM.questionId, '550e8400-e29b-41d4-a716-446655440020');
     expect(fetchMock).toHaveBeenCalledWith(
       'http://localhost:4000/practice/skip',
       expect.objectContaining({
         method: 'POST',
-        body: JSON.stringify({ questionId: HISTORY_ITEM.questionId }),
+        body: JSON.stringify({
+          questionId: HISTORY_ITEM.questionId,
+          cycleId: '550e8400-e29b-41d4-a716-446655440020',
+        }),
       }),
     );
   });
@@ -3811,8 +3947,22 @@ describe('typed endpoint helpers', () => {
     );
   });
 
+  it('apiAcknowledgeDiagnostic POSTs the durable reveal acknowledgement', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ status: 204 }));
+
+    await api.apiAcknowledgeDiagnostic();
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://localhost:4000/diagnostic/acknowledge',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
   it.each([
-    ['apiSkipPracticeWord', () => api.apiSkipPracticeWord(HISTORY_ITEM.questionId)],
+    [
+      'apiSkipPracticeWord',
+      () =>
+        api.apiSkipPracticeWord(HISTORY_ITEM.questionId, '550e8400-e29b-41d4-a716-446655440020'),
+    ],
     ['apiForgotPassword', () => api.apiForgotPassword('ada@example.com')],
     [
       'apiResetPassword',
@@ -3826,65 +3976,104 @@ describe('typed endpoint helpers', () => {
   });
 
   it('apiConsumeUserDataPages emits each validated page without combining them', async () => {
-    const cursor = '550e8400-e29b-41d4-a716-446655440041';
+    const attemptCursor = '550e8400-e29b-41d4-a716-446655440041';
+    const cycleCursor = '550e8400-e29b-41d4-a716-446655440042';
     const consumePage = jest.fn();
     fetchMock
       .mockResolvedValueOnce(
         fakeResponse({
-          json: async () => ({
-            user: PROFILE_USER,
-            attempts: [{ id: 'a1' }],
-            nextCursor: cursor,
-          }),
+          json: async () =>
+            userExportPage({
+              attempts: [{ id: 'a1' }],
+              nextCursor: attemptCursor,
+              attemptsDone: false,
+            }),
         }),
       )
       .mockResolvedValueOnce(
         fakeResponse({
-          json: async () => ({
-            user: PROFILE_USER,
-            attempts: [{ id: 'a2' }],
-            nextCursor: null,
-          }),
+          json: async () => userExportPage({ attempts: [{ id: 'a2' }] }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              practiceCycles: [{ id: 'c1' }],
+              nextPracticeCycleCursor: cycleCursor,
+              practiceCyclesDone: false,
+            }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => userExportPage({ practiceCycles: [{ id: 'c2' }] }),
         }),
       );
 
     await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
-    expect(consumePage).toHaveBeenNthCalledWith(
-      1,
-      { user: PROFILE_USER, attempts: [{ id: 'a1' }], nextCursor: cursor },
-      0,
-    );
-    expect(consumePage).toHaveBeenNthCalledWith(
-      2,
-      { user: PROFILE_USER, attempts: [{ id: 'a2' }], nextCursor: null },
-      1,
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      'http://localhost:4000/auth/me/data?limit=500',
-      expect.anything(),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      `http://localhost:4000/auth/me/data?limit=500&cursor=${cursor}`,
-      expect.anything(),
-    );
+    expect(
+      consumePage.mock.calls.map(([page, index]) => [page.attempts, page.practiceCycles, index]),
+    ).toEqual([
+      [[{ id: 'a1' }], [], 0],
+      [[{ id: 'a2' }], [], 1],
+      [[], [{ id: 'c1' }], 2],
+      [[], [{ id: 'c2' }], 3],
+    ]);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true',
+      `http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true&cursor=${attemptCursor}`,
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=true&practiceCyclesDone=false',
+      `http://localhost:4000/auth/me/data?limit=500&attemptsDone=true&practiceCyclesDone=false&practiceCycleCursor=${cycleCursor}`,
+    ]);
   });
 
-  it('apiConsumeUserDataPages emits an empty terminal page', async () => {
+  it('apiConsumeUserDataPages emits one empty terminal page for each independent stream', async () => {
     const consumePage = jest.fn();
-    fetchMock.mockResolvedValue(
-      fakeResponse({
-        json: async () => ({ user: PROFILE_USER, attempts: [], nextCursor: null }),
-      }),
-    );
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => userExportPage() }));
 
     await api.apiConsumeUserDataPages(consumePage);
 
-    expect(consumePage).toHaveBeenCalledWith(
-      { user: PROFILE_USER, attempts: [], nextCursor: null },
-      0,
-    );
+    expect(consumePage).toHaveBeenNthCalledWith(1, userExportPage(), 0);
+    expect(consumePage).toHaveBeenNthCalledWith(2, userExportPage(), 1);
+  });
+
+  it.each([0, 1.5, 10_001])(
+    'apiConsumeUserDataPages rejects invalid page bound %s before network work',
+    async (maxPages) => {
+      await expect(
+        api.apiConsumeUserDataPages(jest.fn(), undefined, maxPages),
+      ).rejects.toBeInstanceOf(ContractError);
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it('rejects attempts leaked into the practice-cycle export stream', async () => {
+    const consumePage = jest.fn();
+    fetchMock
+      .mockResolvedValueOnce(fakeResponse({ json: async () => userExportPage() }))
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => userExportPage({ attempts: [{ id: 'unexpected-attempt' }] }),
+        }),
+      );
+
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumePage).toHaveBeenCalledTimes(1);
+  });
+
+  it('honors an abort raised by the consumer of a practice-cycle page', async () => {
+    const controller = new AbortController();
+    const reason = new Error('export screen left');
+    const consumePage = jest.fn((_page, pageIndex: number) => {
+      if (pageIndex === 1) controller.abort(reason);
+    });
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => userExportPage() }));
+
+    await expect(api.apiConsumeUserDataPages(consumePage, controller.signal)).rejects.toBe(reason);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumePage).toHaveBeenCalledTimes(2);
   });
 
   it('apiConsumeUserDataPages stops before another request when its consumer fails', async () => {
@@ -3892,11 +4081,8 @@ describe('typed endpoint helpers', () => {
     const failure = new Error('file write failed');
     fetchMock.mockResolvedValue(
       fakeResponse({
-        json: async () => ({
-          user: PROFILE_USER,
-          attempts: [{ id: 'a1' }],
-          nextCursor: cursor,
-        }),
+        json: async () =>
+          userExportPage({ attempts: [{ id: 'a1' }], nextCursor: cursor, attemptsDone: false }),
       }),
     );
 
@@ -3917,27 +4103,25 @@ describe('typed endpoint helpers', () => {
         fakeResponse({
           json: async () => {
             await api.saveToken('jwt-new-session');
-            return {
-              user: PROFILE_USER,
+            return userExportPage({
               attempts: [{ id: 'a1' }],
               nextCursor: cursor,
-            };
+              attemptsDone: false,
+            });
           },
         }),
       )
       .mockResolvedValueOnce(
         fakeResponse({
-          json: async () => ({
-            user: PROFILE_USER,
-            attempts: [{ id: 'a2' }],
-            nextCursor: null,
-          }),
+          json: async () => userExportPage({ attempts: [{ id: 'a2' }] }),
         }),
-      );
+      )
+      .mockResolvedValueOnce(fakeResponse({ json: async () => userExportPage() }));
 
     await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
-    expect(consumePage).toHaveBeenCalledTimes(2);
+    expect(consumePage).toHaveBeenCalledTimes(3);
     expect(fetchMock.mock.calls.map(([, init]) => init.headers.Authorization)).toEqual([
+      'Bearer jwt-export-owner',
       'Bearer jwt-export-owner',
       'Bearer jwt-export-owner',
     ]);
@@ -3950,20 +4134,17 @@ describe('typed endpoint helpers', () => {
     fetchMock
       .mockResolvedValueOnce(
         fakeResponse({
-          json: async () => ({
-            user: PROFILE_USER,
-            attempts: [{ id: 'a1' }],
-            nextCursor: cursor,
-          }),
+          json: async () =>
+            userExportPage({ attempts: [{ id: 'a1' }], nextCursor: cursor, attemptsDone: false }),
         }),
       )
       .mockResolvedValueOnce(
         fakeResponse({
-          json: async () => ({
-            user: { ...PROFILE_USER, id: '650e8400-e29b-41d4-a716-446655440111' },
-            attempts: [{ id: 'foreign' }],
-            nextCursor: null,
-          }),
+          json: async () =>
+            userExportPage({
+              user: { ...PROFILE_USER, id: '650e8400-e29b-41d4-a716-446655440111' },
+              attempts: [{ id: 'foreign' }],
+            }),
         }),
       );
 
@@ -3986,6 +4167,7 @@ describe('typed endpoint helpers', () => {
       (signal: AbortSignal) => api.apiGetRecordingPlaybackGrant(recordingId, signal),
     ],
     ['apiDeleteRecording', (signal: AbortSignal) => api.apiDeleteRecording(recordingId, signal)],
+    ['apiDeleteAllRecordings', (signal: AbortSignal) => api.apiDeleteAllRecordings(signal)],
     [
       'apiConsumeUserDataPages',
       (signal: AbortSignal) => api.apiConsumeUserDataPages(jest.fn(), signal),
@@ -4005,57 +4187,62 @@ describe('typed endpoint helpers', () => {
     expect(fetchMock.mock.calls[0][1].signal.reason).toBe(reason);
   });
 
-  it('apiConsumeUserDataPages rejects an excessive cursor before emitting page 10,000', async () => {
-    // Distinct cursors forever: only the page bound can end this walk.
+  it('apiConsumeUserDataPages rejects a nonterminal page at its injected resource bound', async () => {
     const exportCursor = (page: number) =>
       `550e8400-e29b-41d4-a716-${String(page).padStart(12, '0')}`;
     let calls = 0;
     const consumePage = jest.fn();
     fetchMock.mockImplementation(async () => {
       calls += 1;
-      if (calls > 10_100) throw new Error('the export walk never stopped');
       return fakeResponse({
-        json: async () => ({
-          user: PROFILE_USER,
-          attempts: [{ id: `a${calls}` }],
-          nextCursor: exportCursor(calls),
-        }),
+        json: async () =>
+          userExportPage({
+            attempts: [{ id: `a${calls}` }],
+            nextCursor: exportCursor(calls),
+            attemptsDone: false,
+          }),
       });
     });
 
-    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
-    // EXPORT_MAX_PAGES pages are fetched, and not one page more.
-    expect(fetchMock).toHaveBeenCalledTimes(10_000);
-    expect(fetchMock.mock.calls[9_999][0]).toBe(
-      `http://localhost:4000/auth/me/data?limit=500&cursor=${exportCursor(9_999)}`,
+    await expect(api.apiConsumeUserDataPages(consumePage, undefined, 3)).rejects.toBeInstanceOf(
+      ContractError,
     );
-    expect(consumePage).toHaveBeenCalledTimes(9_999);
-  }, 30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[2][0]).toBe(
+      `http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true&cursor=${exportCursor(2)}`,
+    );
+    expect(consumePage).toHaveBeenCalledTimes(2);
+  });
 
-  it('apiConsumeUserDataPages accepts an exactly 10,000-page terminal walk', async () => {
+  it('apiConsumeUserDataPages accepts a stream that terminates exactly at its injected bound', async () => {
     const exportCursor = (page: number) =>
       `550e8400-e29b-41d4-a716-${String(page).padStart(12, '0')}`;
     let calls = 0;
-    fetchMock.mockImplementation(async () => {
+    fetchMock.mockImplementation(async (url: string) => {
       calls += 1;
+      if (url.includes('attemptsDone=true')) {
+        return fakeResponse({ json: async () => userExportPage() });
+      }
       return fakeResponse({
-        json: async () => ({
-          user: PROFILE_USER,
-          attempts: calls === 10_000 ? [] : [{ id: `a${calls}` }],
-          nextCursor: calls === 10_000 ? null : exportCursor(calls),
-        }),
+        json: async () =>
+          userExportPage(
+            calls === 3
+              ? { attempts: [{ id: `a${calls}` }] }
+              : {
+                  attempts: [{ id: `a${calls}` }],
+                  nextCursor: exportCursor(calls),
+                  attemptsDone: false,
+                },
+          ),
       });
     });
     const consumePage = jest.fn();
 
-    await expect(api.apiConsumeUserDataPages(consumePage)).resolves.toBeUndefined();
-    expect(fetchMock).toHaveBeenCalledTimes(10_000);
-    expect(consumePage).toHaveBeenCalledTimes(10_000);
-    expect(consumePage).toHaveBeenLastCalledWith(
-      { user: PROFILE_USER, attempts: [], nextCursor: null },
-      9_999,
-    );
-  }, 30_000);
+    await expect(api.apiConsumeUserDataPages(consumePage, undefined, 3)).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(consumePage).toHaveBeenCalledTimes(4);
+    expect(consumePage).toHaveBeenLastCalledWith(userExportPage(), 3);
+  });
 
   it('apiConsumeUserDataPages rejects a repeated cursor before emitting the cyclic page', async () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440042';
@@ -4066,11 +4253,8 @@ describe('typed endpoint helpers', () => {
     });
     fetchMock.mockResolvedValue(
       fakeResponse({
-        json: async () => ({
-          user: PROFILE_USER,
-          attempts: [{ id: 'a1' }],
-          nextCursor: cursor,
-        }),
+        json: async () =>
+          userExportPage({ attempts: [{ id: 'a1' }], nextCursor: cursor, attemptsDone: false }),
       }),
     );
 
@@ -4078,5 +4262,38 @@ describe('typed endpoint helpers', () => {
     // First page + the page fetched with the repeated cursor.
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(consumePage).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a repeated practice-cycle cursor before duplicate emission', async () => {
+    const cursor = '550e8400-e29b-41d4-a716-446655440043';
+    const consumePage = jest.fn();
+    fetchMock
+      .mockResolvedValueOnce(fakeResponse({ json: async () => userExportPage() }))
+      .mockResolvedValue(
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              practiceCycles: [{ id: 'c1' }],
+              nextPracticeCycleCursor: cursor,
+              practiceCyclesDone: false,
+            }),
+        }),
+      );
+
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(consumePage).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a contradictory non-target stream before emitting it', async () => {
+    const consumePage = jest.fn();
+    fetchMock.mockResolvedValue(
+      fakeResponse({
+        json: async () => userExportPage({ practiceCycles: [{ id: 'unexpected' }] }),
+      }),
+    );
+
+    await expect(api.apiConsumeUserDataPages(consumePage)).rejects.toBeInstanceOf(ContractError);
+    expect(consumePage).not.toHaveBeenCalled();
   });
 });

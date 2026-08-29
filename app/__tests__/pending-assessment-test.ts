@@ -1,13 +1,17 @@
 import * as SecureStore from 'expo-secure-store';
 
 import {
+  acknowledgePendingAssessmentFeedback,
   claimPendingAssessmentRecoveryPost,
   clearPendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
+  markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   parsePendingAssessment,
+  pendingAssessmentFeedbackIsExpired,
+  PENDING_FEEDBACK_RETENTION_MS,
   savePendingAssessment,
   type PendingAssessment,
 } from '../src/lib/pending-assessment';
@@ -59,12 +63,20 @@ const pending: PendingAssessment = {
   ownerId: '550e8400-e29b-41d4-a716-446655440000',
   endpoint: '/practice/attempt',
   questionId: '550e8400-e29b-41d4-a716-446655440001',
+  cycleId: '550e8400-e29b-41d4-a716-446655440020',
   requestId: '550e8400-e29b-41d4-a716-446655440002',
   createdAt: 1_700_000_000_000,
+  retainRecording: false,
   stage: 'direct-posting',
 };
 const audioKey =
   'audio-uploads/practice/550e8400-e29b-41d4-a716-446655440000/550e8400-e29b-41d4-a716-446655440003.m4a';
+
+function pendingForEndpoint(endpoint: PendingAssessment['endpoint']): PendingAssessment {
+  if (endpoint !== '/diagnostic/answer') return { ...pending, endpoint };
+  const { cycleId: _cycleId, ...diagnostic } = pending;
+  return { ...diagnostic, endpoint };
+}
 
 describe('durable assessment handoff', () => {
   // The module keeps an in-memory copy, so reset through the public API:
@@ -86,6 +98,80 @@ describe('durable assessment handoff', () => {
 
     await clearPendingAssessment(pending.requestId);
     expect(await loadPendingAssessment()).toBeNull();
+  });
+
+  it('keeps a server-replay pointer until the exact learner acknowledges feedback', async () => {
+    const readyAt = pending.createdAt + 5_000;
+    await savePendingAssessment({
+      ...pending,
+      stage: 's3-granted',
+      audioKey,
+      cancelRequested: true,
+      recoveryPostAttempts: 1,
+    });
+
+    await expect(markPendingAssessmentFeedbackPending(pending.requestId, readyAt)).resolves.toBe(
+      true,
+    );
+    expect(await loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: readyAt,
+      cancelRequested: true,
+      recoveryPostAttempts: 1,
+    });
+
+    await expect(
+      acknowledgePendingAssessmentFeedback(
+        '550e8400-e29b-41d4-a716-446655440099',
+        pending.requestId,
+      ),
+    ).resolves.toBe(false);
+    await expect(
+      acknowledgePendingAssessmentFeedback(pending.ownerId, pending.requestId),
+    ).resolves.toBe(true);
+    expect(await loadPendingAssessment()).toBeNull();
+  });
+
+  it('keeps feedback pending when its secure acknowledgement delete fails', async () => {
+    const readyAt = pending.createdAt + 1;
+    await savePendingAssessment({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: readyAt,
+    });
+    jest.mocked(SecureStore.deleteItemAsync).mockRejectedValueOnce(new Error('keychain locked'));
+
+    await expect(
+      acknowledgePendingAssessmentFeedback(pending.ownerId, pending.requestId),
+    ).rejects.toThrow('keychain locked');
+    expect(await loadPendingAssessment()).toEqual({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: readyAt,
+    });
+
+    await clearPendingAssessment();
+  });
+
+  it('expires feedback only at the 48-hour server replay boundary', () => {
+    const readyAt = pending.createdAt + 1;
+    const feedbackPending: PendingAssessment = {
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: readyAt,
+    };
+
+    expect(
+      pendingAssessmentFeedbackIsExpired(
+        feedbackPending,
+        readyAt + PENDING_FEEDBACK_RETENTION_MS - 1,
+      ),
+    ).toBe(false);
+    expect(
+      pendingAssessmentFeedbackIsExpired(feedbackPending, readyAt + PENDING_FEEDBACK_RETENTION_MS),
+    ).toBe(true);
+    expect(pendingAssessmentFeedbackIsExpired(pending, Number.MAX_SAFE_INTEGER)).toBe(false);
   });
 
   it('preserves durable cancellation and recovery claims through stage and reconciliation updates', async () => {
@@ -235,6 +321,11 @@ describe('pending assessment edge cases', () => {
     { ...pending, createdAt: Number.POSITIVE_INFINITY },
     { ...pending, createdAt: 'yesterday' },
     { ...pending, stage: 'bogus' },
+    { ...pending, stage: 'feedback-pending' },
+    { ...pending, stage: 'feedback-pending', feedbackReadyAt: 0 },
+    { ...pending, stage: 'feedback-pending', feedbackReadyAt: pending.createdAt - 1 },
+    { ...pending, stage: 'feedback-pending', feedbackReadyAt: pending.createdAt + 0.5 },
+    { ...pending, stage: 'direct-posting', feedbackReadyAt: pending.createdAt + 1 },
     { ...pending, stage: 's3-granted' },
     { ...pending, stage: 's3-granted', audioKey: '' },
     { ...pending, stage: 's3-granted', audioKey: [audioKey] },
@@ -265,6 +356,9 @@ describe('pending assessment edge cases', () => {
     { ...pending, cancelRequested: 1 },
     { ...pending, cancelRequested: 'true' },
     { ...pending, cancelRequested: {} },
+    { ...pending, retainRecording: null },
+    { ...pending, retainRecording: 0 },
+    { ...pending, retainRecording: 'false' },
     { ...pending, recoveryPostAttempts: null },
     { ...pending, recoveryPostAttempts: -1 },
     { ...pending, recoveryPostAttempts: 1.5 },
@@ -276,10 +370,17 @@ describe('pending assessment edge cases', () => {
     expect(parsePendingAssessment(value)).toBeNull();
   });
 
+  it('normalizes a pre-choice handoff to the legacy retain-audio identity', () => {
+    const { retainRecording: _retainRecording, ...legacy } = pending;
+
+    expect(parsePendingAssessment(legacy)).toEqual({ ...pending, retainRecording: true });
+  });
+
   it.each(['/diagnostic/answer', '/practice/attempt', '/practice/attempt/native'] as const)(
     'accepts the server assessment endpoint %s',
     (endpoint) => {
-      expect(parsePendingAssessment({ ...pending, endpoint })).toEqual({ ...pending, endpoint });
+      const value = pendingForEndpoint(endpoint);
+      expect(parsePendingAssessment(value)).toEqual(value);
     },
   );
 
@@ -334,6 +435,22 @@ describe('pending assessment edge cases', () => {
     },
   );
 
+  it('accepts a feedback pointer without audio metadata', () => {
+    const feedbackReadyAt = pending.createdAt + 1;
+    expect(
+      parsePendingAssessment({
+        ...pending,
+        stage: 'feedback-pending',
+        feedbackReadyAt,
+        audioKey,
+      }),
+    ).toEqual({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt,
+    });
+  });
+
   it('accepts an owned S3 key case-insensitively', () => {
     const uppercaseFilenameKey = `${audioKey.slice(0, audioKey.lastIndexOf('/') + 1)}${audioKey
       .slice(audioKey.lastIndexOf('/') + 1)
@@ -352,22 +469,21 @@ describe('pending assessment edge cases', () => {
     ['/practice/attempt', 'practice'],
     ['/practice/attempt/native', 'practice'],
   ] as const)('requires endpoint %s to match the durable %s key scope', (endpoint, scope) => {
+    const endpointPending = pendingForEndpoint(endpoint);
     const matchingKey = `audio-uploads/${scope}/${pending.ownerId}/550e8400-e29b-41d4-a716-446655440003.m4a`;
     const otherScope = scope === 'diagnostic' ? 'practice' : 'diagnostic';
     const mismatchedKey = `audio-uploads/${otherScope}/${pending.ownerId}/550e8400-e29b-41d4-a716-446655440003.m4a`;
 
     expect(
       parsePendingAssessment({
-        ...pending,
-        endpoint,
+        ...endpointPending,
         stage: 's3-granted',
         audioKey: matchingKey,
       }),
-    ).toEqual({ ...pending, endpoint, stage: 's3-granted', audioKey: matchingKey });
+    ).toEqual({ ...endpointPending, stage: 's3-granted', audioKey: matchingKey });
     expect(
       parsePendingAssessment({
-        ...pending,
-        endpoint,
+        ...endpointPending,
         stage: 's3-granted',
         audioKey: mismatchedKey,
       }),
@@ -540,6 +656,90 @@ describe('pending assessment edge cases', () => {
     expect(secureStore.setItemAsync).not.toHaveBeenCalled();
     expect(await mod.loadPendingAssessment()).toEqual(pending);
   });
+
+  it('never downgrades delivered feedback into reconciliation or upload recovery', async () => {
+    const { secureStore, mod } = loadFresh();
+    const feedbackPending = {
+      ...pending,
+      stage: 'feedback-pending' as const,
+      feedbackReadyAt: pending.createdAt + 1,
+    };
+    await mod.savePendingAssessment(feedbackPending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+
+    await expect(mod.markPendingAssessmentForReconciliation(pending.requestId)).resolves.toBe(
+      false,
+    );
+    await expect(mod.claimPendingAssessmentRecoveryPost(pending.requestId)).resolves.toBe(false);
+    await expect(mod.markPendingAssessmentStage(pending.requestId, 'direct-posting')).resolves.toBe(
+      false,
+    );
+
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual(feedbackPending);
+  });
+
+  it('validates feedback timestamps before any secure-store access', async () => {
+    const { secureStore, mod } = loadFresh();
+
+    await expect(mod.markPendingAssessmentFeedbackPending(pending.requestId, 0)).rejects.toThrow(
+      'feedbackReadyAt must be a positive safe integer',
+    );
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(
+      mod.markPendingAssessmentFeedbackPending(pending.requestId, pending.createdAt - 1),
+    ).rejects.toThrow('feedbackReadyAt cannot predate the assessment');
+
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual(pending);
+  });
+
+  it('conditionally acknowledges only a feedback-pending request', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+    await expect(
+      mod.acknowledgePendingAssessmentFeedback(pending.ownerId, pending.requestId),
+    ).resolves.toBe(false);
+    await expect(
+      mod.acknowledgePendingAssessmentFeedback('not-a-user', pending.requestId),
+    ).resolves.toBe(false);
+    expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('marks feedback only for the matching request and treats a repeat as idempotent', async () => {
+    const { secureStore, mod } = loadFresh();
+    const readyAt = pending.createdAt + 1;
+
+    await expect(
+      mod.markPendingAssessmentFeedbackPending(pending.requestId, readyAt),
+    ).resolves.toBe(false);
+    await mod.savePendingAssessment(pending);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(
+      mod.markPendingAssessmentFeedbackPending('different-request-id', readyAt),
+    ).resolves.toBe(false);
+    await expect(
+      mod.markPendingAssessmentFeedbackPending(pending.requestId, readyAt),
+    ).resolves.toBe(true);
+    expect(secureStore.setItemAsync).toHaveBeenCalledTimes(1);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+    await expect(
+      mod.markPendingAssessmentFeedbackPending(pending.requestId, readyAt + 1),
+    ).resolves.toBe(true);
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+  });
+
+  it.each([0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    'rejects invalid feedback expiry time %p',
+    (now) => {
+      expect(() => pendingAssessmentFeedbackIsExpired(pending, now)).toThrow(
+        'now must be a positive safe integer',
+      );
+    },
+  );
 
   it('marks a matching record for reconciliation in storage', async () => {
     const { mod } = loadFresh();

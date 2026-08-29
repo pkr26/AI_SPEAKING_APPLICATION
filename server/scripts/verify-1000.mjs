@@ -61,6 +61,23 @@ const deletedIds = new Set(deleted.map((u) => u.id));
 const aliveIds = alive.map((u) => u.id);
 
 const sum = (list, fn) => list.reduce((total, item) => total + fn(item), 0);
+const expectedProgressForUser = (user) => {
+  const byQuestion = new Map();
+  for (const attempt of user.englishAttempts) {
+    const prior = byQuestion.get(attempt.questionId) || { bestScore: 0, attemptCount: 0, mastered: false };
+    prior.bestScore = Math.max(prior.bestScore, attempt.score);
+    prior.attemptCount += 1;
+    prior.mastered ||= attempt.score >= 75;
+    byQuestion.set(attempt.questionId, prior);
+  }
+  if (user.nativeAttempt) {
+    const prior = byQuestion.get(user.nativeAttempt.questionId) || { bestScore: 0, attemptCount: 0, mastered: false };
+    prior.attemptCount += 1;
+    byQuestion.set(user.nativeAttempt.questionId, prior);
+  }
+  return byQuestion;
+};
+const aliveProgress = alive.flatMap((user) => [...expectedProgressForUser(user).values()]);
 const expected = {
   aliveUsers: alive.length,
   deletedUsers: deleted.length,
@@ -71,10 +88,9 @@ const expected = {
   diagAnswersIncludingDeleted: sum(registered, (u) => u.diagnosticAnswers.length),
   englishAttempts: sum(registered, (u) => u.englishAttempts.length),
   nativeAttempts: registered.filter((u) => u.nativeAttempt).length,
-  progressUsers: alive.filter((u) => u.englishAttempts.length > 0).length,
-  masteredUsers: alive.filter((u) => u.englishAttempts.some((a) => a.score >= 75)).length,
-  learningUsers: alive.filter((u) => u.englishAttempts.length > 0 && !u.englishAttempts.some((a) => a.score >= 75))
-    .length,
+  progressRows: aliveProgress.length,
+  masteredRows: aliveProgress.filter((row) => row.mastered).length,
+  learningRows: aliveProgress.filter((row) => !row.mastered).length,
   changedPassword: alive.filter((u) => u.changedPassword).length,
 };
 expected.assessments = expected.diagAnswers + expected.englishAttempts + expected.nativeAttempts;
@@ -128,9 +144,9 @@ try {
   // --- B. attempts ----------------------------------------------------------
   const attemptsTotal = await scalar('SELECT count(*)::int AS n FROM attempts');
   check(
-    'attempts: total equals diagnostic + English answers',
-    attemptsTotal.n === expected.diagAnswers + expected.englishAttempts,
-    `db=${attemptsTotal.n} expected=${expected.diagAnswers + expected.englishAttempts}`,
+    'attempts: total equals diagnostic + English + native answers',
+    attemptsTotal.n === expected.assessments,
+    `db=${attemptsTotal.n} expected=${expected.assessments}`,
   );
 
   const byContext = await client.query(
@@ -148,9 +164,9 @@ try {
     `db=${contextMap.practice} expected=${expected.englishAttempts}`,
   );
   check(
-    'attempts: no other contexts (native mode writes none)',
-    Object.keys(contextMap).every((c) => c === 'diagnostic' || c === 'practice'),
-    JSON.stringify(contextMap),
+    'attempts: native context count',
+    contextMap['practice-native'] === expected.nativeAttempts,
+    `db=${contextMap['practice-native']} expected=${expected.nativeAttempts}`,
   );
 
   const orphanAttempts = await scalar('SELECT count(*)::int AS n FROM attempts WHERE user_id <> ALL($1::uuid[])', [
@@ -162,12 +178,15 @@ try {
     `db=${orphanAttempts.n}`,
   );
 
-  const passConsistency = await scalar('SELECT count(*)::int AS n FROM attempts WHERE passed <> (score >= 60)');
+  const passConsistency = await scalar(
+    "SELECT count(*)::int AS n FROM attempts WHERE context <> 'practice-native' AND passed <> (score >= 60)",
+  );
   check('attempts: passed flag consistent with score >= 60', passConsistency.n === 0, `db=${passConsistency.n}`);
 
   const attemptNoRange = await scalar(
     `SELECT count(*)::int AS n FROM attempts
      WHERE (context = 'practice' AND (attempt_no < 1 OR attempt_no > 3))
+        OR (context = 'practice-native' AND (attempt_no < 1 OR attempt_no > 3))
         OR (context = 'diagnostic' AND (attempt_no < 1 OR attempt_no > 5))`,
   );
   check(
@@ -202,9 +221,9 @@ try {
   // --- D. practice_progress ---------------------------------------------------
   const progressTotal = await scalar('SELECT count(*)::int AS n FROM practice_progress');
   check(
-    'practice_progress: one row per user that attempted English practice',
-    progressTotal.n === expected.progressUsers,
-    `db=${progressTotal.n} expected=${expected.progressUsers}`,
+    'practice_progress: one row per user that made a spoken practice attempt',
+    progressTotal.n === expected.progressRows,
+    `db=${progressTotal.n} expected=${expected.progressRows}`,
   );
 
   const progressByStatus = await client.query(
@@ -213,15 +232,15 @@ try {
   const progressMap = Object.fromEntries(progressByStatus.rows.map((r) => [r.status, r]));
   check(
     'practice_progress: mastered/learning split matches ledger scores (>=75 masters)',
-    (progressMap.mastered?.n ?? 0) === expected.masteredUsers &&
-      (progressMap.learning?.n ?? 0) === expected.learningUsers,
-    `db=${JSON.stringify(progressByStatus.rows)} expected mastered=${expected.masteredUsers} learning=${expected.learningUsers}`,
+    (progressMap.mastered?.n ?? 0) === expected.masteredRows &&
+      (progressMap.learning?.n ?? 0) === expected.learningRows,
+    `db=${JSON.stringify(progressByStatus.rows)} expected mastered=${expected.masteredRows} learning=${expected.learningRows}`,
   );
   const progressAttempts = progressByStatus.rows.reduce((total, r) => total + r.attempts, 0);
   check(
-    'practice_progress: attempt_count sums to all English attempts',
-    progressAttempts === expected.englishAttempts,
-    `db=${progressAttempts} expected=${expected.englishAttempts}`,
+    'practice_progress: attempt_count sums to all English and native attempts',
+    progressAttempts === expected.englishAttempts + expected.nativeAttempts,
+    `db=${progressAttempts} expected=${expected.englishAttempts + expected.nativeAttempts}`,
   );
 
   const orphanProgress = await scalar(
@@ -242,7 +261,10 @@ try {
   );
 
   const usageAnonymized = await scalar('SELECT count(*)::int AS n FROM assessment_usage WHERE user_id IS NULL');
-  const deletedAssessments = sum(deleted, (u) => u.diagnosticAnswers.length + u.englishAttempts.length);
+  const deletedAssessments = sum(
+    deleted,
+    (u) => u.diagnosticAnswers.length + u.englishAttempts.length + (u.nativeAttempt ? 1 : 0),
+  );
   check(
     'assessment_usage: deleted users anonymized to NULL (SET NULL), not removed',
     usageAnonymized.n === deletedAssessments,
@@ -379,6 +401,17 @@ try {
         score: a.score,
         passed: a.passed,
       })),
+      ...(user.nativeAttempt
+        ? [
+            {
+              context: 'practice-native',
+              qid: user.nativeAttempt.questionId,
+              score: null,
+              passed: null,
+              attemptNo: user.nativeAttempt.attemptNo,
+            },
+          ]
+        : []),
     ];
     let attemptsOk = attemptRows.rows.length === ledgerAttempts.length;
     if (attemptsOk) {
@@ -397,20 +430,23 @@ try {
         }
         if (row.context === 'diagnostic') {
           // Diagnostic attempt_no is the 1-based position in the user's
-          // diagnostic sequence (one attempt per question, up to 5).
+          // diagnostic sequence (one attempt per question, up to 3).
           const diagNo = (sequenceSeen.get('__diag__') || 0) + 1;
           sequenceSeen.set('__diag__', diagNo);
           if (row.attemptNo !== diagNo) {
             attemptsOk = false;
             break;
           }
-        } else {
+        } else if (row.context === 'practice') {
           const no = (sequenceSeen.get(row.qid) || 0) + 1;
           sequenceSeen.set(row.qid, no);
           if (row.attemptNo !== no) {
             attemptsOk = false;
             break;
           }
+        } else if (row.attemptNo !== want.attemptNo) {
+          attemptsOk = false;
+          break;
         }
       }
     }
@@ -421,26 +457,28 @@ try {
       );
     }
 
-    const progressRow = await scalar('SELECT * FROM practice_progress WHERE user_id = $1', [user.id]);
-    if (user.englishAttempts.length === 0) {
-      if (progressRow) {
-        deepFailures++;
-        console.log(`FAIL: ${label} unexpected practice_progress row`);
-      }
-    } else {
-      const best = Math.max(...user.englishAttempts.map((a) => a.score));
-      const mastered = user.englishAttempts.some((a) => a.score >= 75);
-      const progressOk =
-        progressRow &&
-        progressRow.best_score === best &&
-        progressRow.attempt_count === user.englishAttempts.length &&
-        progressRow.status === (mastered ? 'mastered' : 'learning');
-      if (!progressOk) {
-        deepFailures++;
-        console.log(
-          `FAIL: ${label} progress mismatch db=${JSON.stringify(progressRow)} ledger best=${best} n=${user.englishAttempts.length} mastered=${mastered}`,
+    const progressRows = await client.query(
+      `SELECT question_id::text AS qid, best_score, attempt_count, status
+       FROM practice_progress WHERE user_id = $1 ORDER BY question_id`,
+      [user.id],
+    );
+    const expectedProgress = expectedProgressForUser(user);
+    const progressOk =
+      progressRows.rows.length === expectedProgress.size &&
+      progressRows.rows.every((row) => {
+        const wanted = expectedProgress.get(row.qid);
+        return (
+          wanted &&
+          row.best_score === wanted.bestScore &&
+          row.attempt_count === wanted.attemptCount &&
+          row.status === (wanted.mastered ? 'mastered' : 'learning')
         );
-      }
+      });
+    if (!progressOk) {
+      deepFailures++;
+      console.log(
+        `FAIL: ${label} progress mismatch db=${JSON.stringify(progressRows.rows)} ledger=${JSON.stringify([...expectedProgress])}`,
+      );
     }
 
     const ledgerRequests = [

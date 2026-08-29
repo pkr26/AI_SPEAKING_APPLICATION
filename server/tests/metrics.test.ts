@@ -293,7 +293,9 @@ describe('capacity slot gauges', () => {
       expect(await gaugeValue('audio_inspection_slots_in_use')).toBe(1);
 
       // One second of mono 8 kHz signed 16-bit PCM completes the decode.
-      decoder.stdout.emit('data', Buffer.alloc(8_000 * 2));
+      // Non-zero PCM: the inspection gauge test is about slot lifetime, not
+      // the independent digital-silence rejection branch.
+      decoder.stdout.emit('data', Buffer.alloc(8_000 * 2, 32));
       decoder.emit('close', 0);
       await expect(result).resolves.toEqual({ status: 'fulfilled', value: true });
       expect(await gaugeValue('audio_inspection_slots_in_use')).toBe(0);

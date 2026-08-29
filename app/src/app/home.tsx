@@ -4,6 +4,7 @@ import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
   Pressable,
+  RefreshControl,
   ScrollView,
   Text,
   View,
@@ -12,7 +13,9 @@ import {
 } from 'react-native';
 
 import Button from '../components/Button';
+import DataRefreshNotice from '../components/DataRefreshNotice';
 import HomeBannerAd from '../components/HomeBannerAd';
+import OfflineState from '../components/OfflineState';
 import { apiGetPracticeStats, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
@@ -147,7 +150,21 @@ export default function HomeScreen() {
         : t('home.streakMany', { count: stats.streakDays });
 
   return (
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.container}>
+    <ScrollView
+      contentInsetAdjustmentBehavior="automatic"
+      contentContainerStyle={styles.container}
+      refreshControl={
+        <RefreshControl
+          refreshing={statsQuery.isRefetching}
+          onRefresh={() => {
+            if (isSessionLeaseCurrent(sessionLease)) {
+              void statsQuery.refetch({ cancelRefetch: false });
+            }
+          }}
+          tintColor={theme.colors.primary}
+        />
+      }
+    >
       <Text style={styles.greeting}>{t('practice.greeting', { name: user.name })}</Text>
 
       {sessionTally.attempts > 0 && (
@@ -179,18 +196,22 @@ export default function HomeScreen() {
         </View>
       )}
 
-      {!stats && statsQuery.isPending && (
-        <View style={styles.center}>
-          <ActivityIndicator
-            accessibilityLabel={t('home.loading')}
-            size="large"
-            color={theme.colors.primary}
-          />
-          <Text accessibilityLiveRegion="polite" style={styles.muted}>
-            {t('home.loading')}
-          </Text>
-        </View>
-      )}
+      {!stats &&
+        statsQuery.isPending &&
+        (statsQuery.fetchStatus === 'paused' ? (
+          <OfflineState />
+        ) : (
+          <View style={styles.center}>
+            <ActivityIndicator
+              accessibilityLabel={t('home.loading')}
+              size="large"
+              color={theme.colors.primary}
+            />
+            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+              {t('home.loading')}
+            </Text>
+          </View>
+        ))}
 
       {!stats && statsQuery.isError && (
         <View style={styles.center}>
@@ -207,6 +228,14 @@ export default function HomeScreen() {
             style={styles.primaryAction}
           />
         </View>
+      )}
+
+      {stats && (
+        <DataRefreshNotice
+          updating={statsQuery.isRefetching && !statsQuery.isRefetchError}
+          failed={statsQuery.isRefetchError}
+          onRetry={() => void statsQuery.refetch({ cancelRefetch: false })}
+        />
       )}
 
       {stats && (
@@ -293,21 +322,24 @@ export default function HomeScreen() {
       <View style={styles.linkRow}>
         <Button
           title={t('header.history')}
-          variant="quiet"
+          variant="secondary"
           size="sm"
           onPress={() => navigateOnce('/history')}
+          style={styles.secondaryAction}
         />
         <Button
           title={t('header.recordings')}
-          variant="quiet"
+          variant="secondary"
           size="sm"
           onPress={() => navigateOnce('/recordings')}
+          style={styles.secondaryAction}
         />
         <Button
           title={t('header.settings')}
-          variant="quiet"
+          variant="secondary"
           size="sm"
           onPress={() => navigateOnce('/settings')}
+          style={styles.secondaryAction}
         />
       </View>
       <HomeBannerAd focused={focused} />
@@ -489,8 +521,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   linkRow: {
     marginTop: spacing.lg,
     flexDirection: 'row',
-    justifyContent: 'center',
     flexWrap: 'wrap',
-    gap: spacing.xl,
+    gap: spacing.md,
+  },
+  secondaryAction: {
+    flexBasis: 140,
+    flexGrow: 1,
   },
 }));

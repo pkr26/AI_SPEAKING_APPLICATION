@@ -34,10 +34,28 @@ import { ownSubmittedAudioFile, uploadAudio, verifyAudioMagicBytes } from './upl
  */
 
 function createSubmissionBodySchema(storageScope: AudioStorageScope) {
-  const submissionBodySchema = z.object({
-    questionId: z.string().uuid('questionId must be a valid UUID'),
-    requestId: z.string().uuid('requestId must be a valid UUID'),
-  });
+  const retainRecording = z.preprocess((value) => {
+    // Multipart fields arrive as strings, while S3-mode JSON carries a real
+    // boolean. Missing means true for clients released before retention became
+    // an explicit per-submission choice.
+    if (value === undefined) return true;
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+    return value;
+  }, z.boolean());
+  const commonSubmissionBodySchema = z
+    .object({
+      questionId: z.string().uuid('questionId must be a valid UUID'),
+      requestId: z.string().uuid('requestId must be a valid UUID'),
+      retainRecording,
+    })
+    .strict();
+  // Practice submissions are bound to the durable serving cycle returned by
+  // GET /practice/question. Diagnostic retains its existing body contract.
+  const submissionBodySchema =
+    storageScope === 'practice'
+      ? commonSubmissionBodySchema.extend({ cycleId: z.string().uuid('cycleId must be a valid UUID') })
+      : commonSubmissionBodySchema;
 
   // S3 mode receives JSON with the presigned object key; local mode receives
   // multipart audio (see audio-upload.ts / upload.ts).
@@ -170,7 +188,8 @@ export async function runAssessmentSubmission<Claim, Result>(
   // upload middleware must not unlink it from a response `close` listener.
   ownSubmittedAudioFile(res);
   try {
-    const { questionId, requestId } = validated(req, hooks.bodySchema);
+    const { questionId, requestId, retainRecording } = validated(req, hooks.bodySchema);
+    const practiceCycleId = hooks.storageScope === 'practice' ? (req.body as { cycleId: string }).cycleId : undefined;
     // The dual-mode schema carries audioKey only in S3 ingress mode (the zod
     // union collapses it out of the inferred type, so read it the same
     // defensive way resolvePresignedAudio does). Recording it with the
@@ -188,7 +207,32 @@ export async function runAssessmentSubmission<Claim, Result>(
     );
     const question = qRows[0];
     if (!question) throw hooks.questionMissingError();
-    const requestClaim = await claimAssessmentRequest(user.id, requestId, hooks.context, questionId, audioKey);
+    if (hooks.requireQuestionAtUserLevel && practiceCycleId) {
+      // A composite database FK is the final ownership backstop, but hostile
+      // question/cycle pairs must remain a stable public 403/409 instead of
+      // surfacing a constraint violation. Match closed cycles too so an exact
+      // completed replay still wins after a pass promoted the learner.
+      const matchingCycle = await pool.query(
+        `SELECT 1 FROM practice_cycles
+         WHERE id = $1 AND user_id = $2 AND question_id = $3`,
+        [practiceCycleId, user.id, questionId],
+      );
+      if (matchingCycle.rowCount !== 1) {
+        if (question.cefr_level !== user.cefr_level) {
+          throw new HttpError(403, 'Question is not available at your level', 'FORBIDDEN');
+        }
+        throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+      }
+    }
+    const requestClaim = await claimAssessmentRequest(
+      user.id,
+      requestId,
+      hooks.context,
+      questionId,
+      audioKey,
+      practiceCycleId,
+      retainRecording,
+    );
     if (requestClaim.kind === 'completed') {
       // Completed replays retain their object for the bucket lifecycle: an
       // active delete near tombstone expiry could race a newly rebound owner.
@@ -237,23 +281,25 @@ export async function runAssessmentSubmission<Claim, Result>(
           }
         },
       });
-      const recording: RecordingCapture | undefined = audioFile.retainedSource
-        ? {
-            id: randomUUID(),
-            storageScope: audioFile.retainedSource.scope,
-            audioKey: audioFile.retainedSource.audioKey,
-            s3VersionId: audioFile.retainedSource.s3VersionId,
-            contentType: audioFile.retainedSource.contentType,
-            sizeBytes: audioFile.retainedSource.sizeBytes,
-            // Downstream persistence deliberately normalizes undefined to SQL
-            // NULL. Keeping the stable capture shape avoids a semantically
-            // redundant presence/absence branch in mock mode.
-            durationMs,
-            ...(audioFile.retainedSource.etag ? { etag: audioFile.retainedSource.etag } : {}),
-          }
-        : undefined;
+      const recording: RecordingCapture | undefined =
+        retainRecording && audioFile.retainedSource
+          ? {
+              id: randomUUID(),
+              storageScope: audioFile.retainedSource.scope,
+              audioKey: audioFile.retainedSource.audioKey,
+              s3VersionId: audioFile.retainedSource.s3VersionId,
+              contentType: audioFile.retainedSource.contentType,
+              sizeBytes: audioFile.retainedSource.sizeBytes,
+              // Downstream persistence deliberately normalizes undefined to SQL
+              // NULL. Keeping the stable capture shape avoids a semantically
+              // redundant presence/absence branch in mock mode.
+              durationMs,
+              ...(audioFile.retainedSource.etag ? { etag: audioFile.retainedSource.etag } : {}),
+            }
+          : undefined;
       const response = await hooks.persist(user, question, claim, result, requestId, requestClaim.claimId, recording);
-      if (recording) {
+      const recordingWasRetained = recording !== undefined && response.recordingId === recording.id;
+      if (recordingWasRetained) {
         // The metadata and idempotent response committed together. Suppress the
         // old success DeleteObject and promote the exact version; a durable
         // worker retries if this immediate best-effort tag fails.
@@ -262,8 +308,9 @@ export async function runAssessmentSubmission<Claim, Result>(
       }
       completed = true;
       // The response middleware owns finish/close finalization. At this point
-      // every successful retained recording is already marked preserve=true,
-      // so an additional synchronous finalizer would only repeat that no-op.
+      // every successful retained recording is already marked preserve=true.
+      // A delete-all epoch mismatch intentionally leaves preserve=false so the
+      // successful opt-out cleanup removes that now-transient object.
       return res.json(response);
     } finally {
       if (claim) await hooks.clearClaim(user, question, claim);

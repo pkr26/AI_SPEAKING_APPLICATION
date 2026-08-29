@@ -347,6 +347,24 @@ export function buildLimiters() {
     message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
   });
 
+  // Deleting every retained recording is intentionally separate from single-
+  // item deletion and from the diagnostic restart budget. The endpoint is
+  // idempotent, but each accepted request still takes the user-row lock and
+  // can enqueue many durable S3 deletion jobs, so bound it per authenticated
+  // learner across replicas. Reuse the reviewed destructive-action window
+  // knobs while keeping a stable, independent counter namespace.
+  const recordingBulkDelete = rateLimit({
+    ...common,
+    windowMs: config.rateLimit.passwordWindowMs,
+    limit: config.rateLimit.passwordMax,
+    store: new PostgresRateLimitStore(
+      `recording-bulk-delete:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
+      config.rateLimit.passwordWindowMs,
+    ),
+    keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
+    message: { error: 'Too many recording deletion requests, please try again later', code: 'RATE_LIMITED' },
+  });
+
   // Readiness performs a database query and may be reachable outside the
   // orchestrator network, so keep it independently bounded.
   const readiness = rateLimit({
@@ -509,6 +527,7 @@ export function buildLimiters() {
     passwordAccount,
     forgotPasswordEmail,
     diagnosticRestart,
+    recordingBulkDelete,
     readiness,
     register,
     assess,

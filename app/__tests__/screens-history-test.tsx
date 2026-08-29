@@ -1,4 +1,9 @@
-import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  InfiniteQueryObserver,
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { SectionList, StyleSheet, useColorScheme } from 'react-native';
@@ -53,12 +58,39 @@ jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
 }));
 
 let mockHistoryIsFocused = true;
+let mockHistoryAutoFocus = true;
+interface MockHistoryFocusRegistration {
+  callback: () => void | (() => void);
+  cleanup: (() => void) | null;
+}
+const mockHistoryFocusRegistrations: MockHistoryFocusRegistration[] = [];
 
-jest.mock('expo-router', () => ({
-  router: { push: jest.fn(), replace: jest.fn(), back: jest.fn(), dismissTo: jest.fn() },
-  useFocusEffect: jest.fn(),
-  useIsFocused: () => mockHistoryIsFocused,
-}));
+jest.mock('expo-router', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  return {
+    router: {
+      push: jest.fn(),
+      navigate: jest.fn(),
+      replace: jest.fn(),
+      back: jest.fn(),
+      dismissTo: jest.fn(),
+    },
+    useFocusEffect: (callback: () => void | (() => void)) => {
+      ReactActual.useEffect(() => {
+        const registration = { callback, cleanup: null as (() => void) | null };
+        mockHistoryFocusRegistrations.push(registration);
+        const cleanup = mockHistoryAutoFocus ? callback() : undefined;
+        registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+        return () => {
+          registration.cleanup?.();
+          const index = mockHistoryFocusRegistrations.indexOf(registration);
+          if (index >= 0) mockHistoryFocusRegistrations.splice(index, 1);
+        };
+      }, [callback]);
+    },
+    useIsFocused: () => mockHistoryIsFocused,
+  };
+});
 
 type AuthValue = ReturnType<typeof useAuth>;
 
@@ -145,6 +177,9 @@ jest.mock('../src/components/HistoryNativeAdCard', () => ({
 }));
 
 const mockGetHistory = apiGetPracticeHistory as jest.Mock;
+const mockHistoryRouter = jest.requireMock('expo-router').router as {
+  navigate: jest.Mock;
+};
 
 function historyItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
   return {
@@ -154,10 +189,14 @@ function historyItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
     questionText: 'Describe a time you showed courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    cycleId: '550e8400-e29b-41d4-a716-446655440020',
     attemptNo: 2,
     score: 82,
     passed: true,
+    understood: null,
     transcript: 'I was brave at work.',
+    translatedTranscript: null,
+    modelAnswer: null,
     feedback: 'Nice detail.',
     createdAt: '2026-08-15T10:00:00.000Z',
     ...overrides,
@@ -259,6 +298,25 @@ function committedPressHandler(node: TestInstance): () => void {
   throw new Error('No committed press handler found');
 }
 
+async function blurHistory(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockHistoryFocusRegistrations) {
+      const cleanup = registration.cleanup;
+      registration.cleanup = null;
+      cleanup?.();
+    }
+  });
+}
+
+async function focusHistory(): Promise<void> {
+  await act(async () => {
+    for (const registration of mockHistoryFocusRegistrations) {
+      const cleanup = registration.callback();
+      registration.cleanup = typeof cleanup === 'function' ? cleanup : null;
+    }
+  });
+}
+
 /**
  * SectionList renders as the host `RCTScrollView`, which keeps
  * `contentContainerStyle` as a prop instead of applying it to a child view.
@@ -267,6 +325,15 @@ function listView(): TestInstance {
   const [node] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
   if (!node) throw new Error('No SectionList rendered');
   return node;
+}
+
+function refreshHandler(): () => void {
+  const [scroll] = screen.container.queryAll(
+    (candidate) => typeof candidate.props.refreshControl?.props?.onRefresh === 'function',
+  );
+  const onRefresh = scroll?.props.refreshControl?.props?.onRefresh;
+  if (typeof onRefresh !== 'function') throw new Error('No RefreshControl rendered');
+  return onRefresh as () => void;
 }
 
 function sectionListProps(): Record<string, unknown> {
@@ -278,7 +345,9 @@ function sectionListProps(): Record<string, unknown> {
 /** The row header, addressed the way a screen reader announces it. */
 function rowHeader(promptWord: string, score: number): TestInstance {
   return screen.getByRole('button', {
-    name: `${promptWord}. ${t('feedback.scoreLine', { score })}`,
+    name: `${promptWord}. ${t('feedback.scoreLine', { score })}. ${t(
+      'history.contextPractice',
+    )}. ${t('history.attemptNo', { number: 2 })}. ${t('history.showDetails')}`,
   });
 }
 
@@ -364,6 +433,7 @@ const CONTEXT_BADGE_TEXT: SemanticStyle = {
 };
 
 beforeEach(() => {
+  onlineManager.setOnline(true);
   jest.clearAllMocks();
   // Module factory mocks outlive clearAllMocks; re-arm the light default.
   asMock(useColorScheme).mockReset();
@@ -374,14 +444,22 @@ beforeEach(() => {
   mockGetHistory.mockReset();
   mockAuthValue = makeAuth();
   mockHistoryIsFocused = true;
+  mockHistoryAutoFocus = true;
+  mockHistoryFocusRegistrations.length = 0;
   asMock(SectionList).mockClear();
   asMock(RecordingPlayback).mockClear();
   asMock(HistoryNativeAdCard).mockClear();
 });
 
 afterEach(async () => {
-  await cleanup();
   await act(async () => {
+    // Let any query completion already queued by the test publish while the
+    // mounted observer is still inside React's act boundary. Cleaning up first
+    // leaves that publication racing the next test and produces a false
+    // "not wrapped in act" warning in the full-suite order.
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    cleanup();
     for (const client of queryClients) client.clear();
     // TanStack Query batches observer notifications onto timers. Drain both
     // the clear publication and any timer it schedules before Jest tears down
@@ -420,6 +498,15 @@ describe('groupHistoryByDay', () => {
 });
 
 describe('history screen', () => {
+  it('shows the offline first-load state and waits for automatic reconnect', async () => {
+    onlineManager.setOnline(false);
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    await renderHistory();
+
+    expect(await screen.findByRole('header', { name: t('network.offlineTitle') })).toBeTruthy();
+    expect(mockGetHistory).not.toHaveBeenCalled();
+  });
+
   it('shows a loading state while the first page loads', async () => {
     mockGetHistory.mockReturnValue(new Promise(() => undefined));
     await renderHistory();
@@ -453,7 +540,7 @@ describe('history screen', () => {
       await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
-    expect(await screen.findByText('courage')).toBeTruthy();
+    expect((await screen.findByText('courage')).props.accessibilityLanguage).toBe('en-US');
   });
 
   it('falls back to the screen copy when the failure carries no API status', async () => {
@@ -569,7 +656,9 @@ describe('history screen', () => {
   });
 
   it('shows the empty state for a learner with no attempts', async () => {
-    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    mockGetHistory
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockResolvedValueOnce({ items: [], nextCursor: null });
     await renderHistory();
 
     expect((await screen.findByText(t('history.emptyTitle'))).props.accessibilityRole).toBe(
@@ -580,6 +669,98 @@ describe('history screen', () => {
     expect(flattenedStyle(screen.getByText(t('history.emptyTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('history.emptyBody')))).toEqual(MUTED_TEXT);
     expect(centeredStateStyle(screen.getByText(t('history.emptyBody')))).toEqual(CENTER_STATE);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
+    ).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      marginTop: spacing.lg,
+      backgroundColor: colors.primary,
+    });
+
+    await act(async () => {
+      refreshHandler()();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockGetHistory).toHaveBeenCalledTimes(2));
+  });
+
+  it('pulls a loaded answer list only while its rendered session lease is current', async () => {
+    mockGetHistory.mockResolvedValue({ items: [historyItem()], nextCursor: null });
+    await renderHistory();
+    await screen.findByText('courage');
+    const onRefresh = sectionListProps().onRefresh as () => void;
+
+    await act(async () => {
+      onRefresh();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockGetHistory).toHaveBeenCalledTimes(2));
+
+    jest.mocked(mockAuthValue.isSessionLeaseCurrent).mockReturnValue(false);
+    onRefresh();
+    expect(mockGetHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it('retries a failed refresh without replacing a cached answer list', async () => {
+    const client = makeQueryClient();
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [{ items: [historyItem()], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    mockGetHistory
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockResolvedValueOnce({ items: [historyItem()], nextCursor: null });
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved'));
+    expect(screen.getByText('courage')).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    await waitFor(() => expect(mockGetHistory).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('courage')).toBeTruthy();
+  });
+
+  it('navigates to Practice only once after a rapid empty-state double tap', async () => {
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    await renderHistory();
+    const startPractice = committedPressHandler(
+      await screen.findByRole('button', { name: t('home.startPractice') }),
+    );
+
+    await act(async () => {
+      startPractice();
+      startPractice();
+    });
+
+    expect(mockHistoryRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockHistoryRouter.navigate).toHaveBeenCalledWith('/practice');
+  });
+
+  it('rejects empty-state navigation before focus and after blur, then accepts refocus', async () => {
+    mockHistoryAutoFocus = false;
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
+    await renderHistory();
+    const startPracticeButton = await screen.findByRole('button', {
+      name: t('home.startPractice'),
+    });
+    const retainedStartPractice = committedPressHandler(startPracticeButton);
+
+    retainedStartPractice();
+    expect(mockHistoryRouter.navigate).not.toHaveBeenCalled();
+
+    await focusHistory();
+    await blurHistory();
+    retainedStartPractice();
+    expect(mockHistoryRouter.navigate).not.toHaveBeenCalled();
+
+    await focusHistory();
+    await fireEvent.press(startPracticeButton);
+    expect(mockHistoryRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockHistoryRouter.navigate).toHaveBeenCalledWith('/practice');
   });
 
   it('renders rows grouped by day with score chips and context badges', async () => {
@@ -915,8 +1096,8 @@ describe('history screen', () => {
     const row = screen.getByRole('button', { expanded: false });
     await fireEvent.press(row);
 
-    expect(screen.getByText('“I was brave at work.”')).toBeTruthy();
-    expect(screen.getByText('Nice detail.')).toBeTruthy();
+    expect(screen.getByText('“I was brave at work.”').props.accessibilityLanguage).toBe('en-US');
+    expect(screen.getByText('Nice detail.').props.accessibilityLanguage).toBe('en-US');
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText(t('history.hideDetails'))).toBeTruthy();
     expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
@@ -931,6 +1112,54 @@ describe('history screen', () => {
     expect(screen.queryByText(t('feedback.weHeard'))).toBeNull();
     expect(screen.getByText(t('history.showDetails'))).toBeTruthy();
   });
+
+  it.each(DATE_TAGS)(
+    'shows %s native history with a named transcript language and semantic speech tags',
+    async (nativeLanguage, accessibilityLanguage) => {
+      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage } });
+      const native = historyItem({
+        context: 'practice-native',
+        attemptNo: 2,
+        score: null,
+        passed: null,
+        understood: true,
+        transcript: 'ఆమె ధైర్యంగా ఉంది.',
+        translatedTranscript: 'She was brave.',
+        modelAnswer: 'She showed courage when she spoke up.',
+        feedback: 'You understood the question.',
+      });
+      mockGetHistory.mockResolvedValue({ items: [native], nextCursor: null });
+      await renderHistory();
+      await screen.findByText('courage');
+
+      expect(screen.getByText(t('history.contextNative'))).toBeTruthy();
+      expect(screen.getByText(t('feedback.nativeUnderstoodTitle'))).toBeTruthy();
+      expect(screen.queryByText(/\/ 100/)).toBeNull();
+      expect(screen.getByText(t('history.attemptNo', { number: 2 }))).toBeTruthy();
+
+      await fireEvent.press(screen.getByRole('button', { expanded: false }));
+      expect(screen.getByText(native.questionText).props.accessibilityLanguage).toBe('en-US');
+      expect(
+        screen.getByText(
+          t('feedback.originalTranscript', { language: t(`language.${nativeLanguage}`) }),
+        ),
+      ).toBeTruthy();
+      expect(screen.getByText(`“${native.transcript}”`).props).toMatchObject({
+        selectable: true,
+        accessibilityLanguage,
+      });
+      expect(screen.getByText(t('feedback.englishTranslation'))).toBeTruthy();
+      expect(screen.getByText(native.translatedTranscript!).props).toMatchObject({
+        selectable: true,
+        accessibilityLanguage: 'en-US',
+      });
+      expect(screen.getByText(t('feedback.exampleEnglishAnswer'))).toBeTruthy();
+      expect(screen.getByText(native.modelAnswer!).props).toMatchObject({
+        selectable: true,
+        accessibilityLanguage: 'en-US',
+      });
+    },
+  );
 
   it('inserts one native ad only after the eighth real history item', async () => {
     const items = Array.from({ length: 8 }, (_, index) =>
@@ -1154,8 +1383,9 @@ describe('history screen', () => {
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
   });
 
-  it('enforces the explicit 500-page walk bound even when another cursor is present', async () => {
+  it('keeps paging beyond 500 pages when the cursor remains distinct', async () => {
     const client = makeQueryClient(Infinity);
+    mockGetHistory.mockResolvedValue({ items: [], nextCursor: null });
     const pages = Array.from({ length: 500 }, (_, index) => ({
       items: index === 0 ? [historyItem()] : [],
       nextCursor: `cursor-${index + 1}`,
@@ -1173,9 +1403,9 @@ describe('history screen', () => {
     );
 
     expect(screen.getByText('courage')).toBeTruthy();
-    expect(screen.queryByText(t('history.loadMore'))).toBeNull();
+    expect(screen.getByText(t('history.loadMore'))).toBeTruthy();
     await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
-    expect(mockGetHistory).not.toHaveBeenCalled();
+    expect(mockGetHistory).toHaveBeenCalledWith('cursor-500', expect.anything());
   });
 
   it('pages older answers when the list is scrolled to its end', async () => {
@@ -1686,8 +1916,12 @@ describe('history screen', () => {
     });
 
     expect(screen.getAllByRole('button').map((node) => node.props.accessibilityLabel)).toEqual([
-      `journey. ${t('feedback.scoreLine', { score: 82 })}`,
-      `courage. ${t('feedback.scoreLine', { score: 82 })}`,
+      `journey. ${t('feedback.scoreLine', { score: 82 })}. ${t(
+        'history.contextPractice',
+      )}. ${t('history.attemptNo', { number: 2 })}. ${t('history.showDetails')}`,
+      `courage. ${t('feedback.scoreLine', { score: 82 })}. ${t(
+        'history.contextPractice',
+      )}. ${t('history.attemptNo', { number: 2 })}. ${t('history.hideDetails')}`,
     ]);
     expect(screen.getByText('“I was brave at work.”')).toBeTruthy();
     expect(screen.queryByText('“I travelled alone.”')).toBeNull();

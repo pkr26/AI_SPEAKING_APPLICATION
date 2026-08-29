@@ -9,7 +9,7 @@ import { renderSeedSql } from '../db/generate-seed';
 import { questions, type QuestionSeed } from '../db/seed-data';
 import { assertDatabaseSchemaCurrent, resetQuestionInventoryReadinessCacheForTests } from '../src/schema-readiness';
 import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
-import { pool } from './helpers';
+import { createClosedPracticeCycle, pool } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -56,7 +56,7 @@ describe('database content seeding', () => {
   it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
     resetQuestionInventoryReadinessCacheForTests();
     await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-      latestMigration: '017_retained_recordings.sql',
+      latestMigration: '021_recording_retention_epoch.sql',
     });
     const expectInventoryRejected = async () => {
       resetQuestionInventoryReadinessCacheForTests();
@@ -181,10 +181,12 @@ describe('migration 010/011 invariants', () => {
     const question = await pool.query<{ id: string }>(
       `SELECT id FROM questions WHERE cefr_level = 'A1' AND prompt_word = 'family'`,
     );
+    const cycleId = await createClosedPracticeCycle(user.rows[0].id, question.rows[0].id);
     await pool.query(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 1, 'hello', 80, true, 'good')`,
-      [user.rows[0].id, question.rows[0].id],
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'hello', 80, true, 'good', $3)`,
+      [user.rows[0].id, question.rows[0].id, cycleId],
     );
 
     await expect(pool.query('DELETE FROM questions WHERE id = $1', [question.rows[0].id])).rejects.toMatchObject({
@@ -286,12 +288,23 @@ describe('migration 014 attempt-result invariants', () => {
     const question = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 1');
     const userId = user.rows[0].id;
     const questionId = question.rows[0].id;
-    const insertAttempt = (context: 'diagnostic' | 'practice', attemptNo: number, score: number, passed: boolean) =>
-      pool.query(
-        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-         VALUES ($1, $2, $3, $4, 'bounded answer', $5, $6, 'bounded feedback')`,
-        [userId, questionId, context, attemptNo, score, passed],
+    const insertAttempt = async (
+      context: 'diagnostic' | 'practice',
+      attemptNo: number,
+      score: number,
+      passed: boolean,
+    ) => {
+      const cycleId =
+        context === 'practice'
+          ? await createClosedPracticeCycle(userId, questionId, Math.max(0, Math.min(3, attemptNo)))
+          : null;
+      return pool.query(
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+         VALUES ($1, $2, $3, $4, 'bounded answer', $5, $6, 'bounded feedback', $7)`,
+        [userId, questionId, context, attemptNo, score, passed, cycleId],
       );
+    };
 
     try {
       await expect(insertAttempt('diagnostic', 1, 59, false)).resolves.toMatchObject({ rowCount: 1 });
@@ -403,11 +416,13 @@ describe('migration 015 public-string invariants', () => {
     );
     const userId = user.rows[0].id;
     try {
+      const cycleId = await createClosedPracticeCycle(userId, question.rows[0].id);
       await expect(
         pool.query(
-          `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-           VALUES ($1, $2, 'practice', 1, 'bounded answer', 60, true, $3)`,
-          [userId, question.rows[0].id, blank],
+          `INSERT INTO attempts
+             (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+           VALUES ($1, $2, 'practice', 1, 'bounded answer', 60, true, $3, $4)`,
+          [userId, question.rows[0].id, blank, cycleId],
         ),
       ).rejects.toMatchObject({ code: '23514' });
 
@@ -504,6 +519,365 @@ describe('migration 016 user UI language', () => {
       await expect(client.query("INSERT INTO users (id, ui_language) VALUES (3, 'fr')")).rejects.toMatchObject({
         code: '23514',
       });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 019 diagnostic acknowledgement', () => {
+  it('repairs impossible legacy in-progress states, preserves completed state, and backfills acknowledgement', async () => {
+    const client = await pool.connect();
+    const schema = `diagnostic_ack_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE users (id INTEGER PRIMARY KEY, diagnostic_completed BOOLEAN NOT NULL)');
+      await client.query(`CREATE TABLE diagnostic_state (
+        user_id INTEGER PRIMARY KEY,
+        low_idx INTEGER NOT NULL,
+        high_idx INTEGER NOT NULL,
+        questions_asked INTEGER NOT NULL,
+        current_question_id INTEGER,
+        processing_question_id INTEGER,
+        processing_started_at TIMESTAMPTZ,
+        processing_claim_id UUID
+      )`);
+      await client.query('INSERT INTO users (id, diagnostic_completed) VALUES (1, false), (2, true), (3, false)');
+      await client.query(
+        `INSERT INTO diagnostic_state
+           (user_id, low_idx, high_idx, questions_asked, current_question_id,
+            processing_question_id, processing_started_at, processing_claim_id)
+         VALUES
+           (1, 2, 5, 3, 10, 10, now(), gen_random_uuid()),
+           (2, 4, 3, 4, NULL, NULL, NULL, NULL),
+           (3, 1, 4, 2, 11, NULL, NULL, NULL)`,
+      );
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/019_diagnostic_acknowledgement.sql'), 'utf8');
+      await client.query(sql);
+      await client.query('INSERT INTO users (id, diagnostic_completed) VALUES (4, false)');
+
+      const rows = await client.query<{ id: number; diagnostic_acknowledged: boolean }>(
+        'SELECT id, diagnostic_acknowledged FROM users ORDER BY id',
+      );
+      expect(rows.rows).toEqual([
+        { id: 1, diagnostic_acknowledged: false },
+        { id: 2, diagnostic_acknowledged: true },
+        { id: 3, diagnostic_acknowledged: false },
+        { id: 4, diagnostic_acknowledged: false },
+      ]);
+      const states = await client.query(
+        `SELECT user_id, low_idx, high_idx, questions_asked, current_question_id,
+                processing_question_id, processing_started_at, processing_claim_id
+         FROM diagnostic_state ORDER BY user_id`,
+      );
+      expect(states.rows).toEqual([
+        {
+          user_id: 1,
+          low_idx: 0,
+          high_idx: 5,
+          questions_asked: 0,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 2,
+          low_idx: 4,
+          high_idx: 3,
+          questions_asked: 4,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 3,
+          low_idx: 1,
+          high_idx: 4,
+          questions_asked: 2,
+          current_question_id: 11,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+      ]);
+      await expect(client.query('UPDATE users SET diagnostic_acknowledged = true WHERE id = 1')).rejects.toMatchObject({
+        code: '23514',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 020 assessment recording retention choice', () => {
+  it('backfills old request identities to retain and stores explicit opt-out choices', async () => {
+    const client = await pool.connect();
+    const schema = `retention_choice_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE assessment_requests (request_id INTEGER PRIMARY KEY)');
+      await client.query('INSERT INTO assessment_requests (request_id) VALUES (1)');
+
+      const sql = fs.readFileSync(
+        path.join(__dirname, '../db/migrations/020_assessment_recording_retention_choice.sql'),
+        'utf8',
+      );
+      await client.query(sql);
+      await client.query('INSERT INTO assessment_requests (request_id) VALUES (2)');
+      await client.query('INSERT INTO assessment_requests (request_id, retain_recording) VALUES (3, false)');
+
+      const rows = await client.query<{ request_id: number; retain_recording: boolean }>(
+        'SELECT request_id, retain_recording FROM assessment_requests ORDER BY request_id',
+      );
+      expect(rows.rows).toEqual([
+        { request_id: 1, retain_recording: true },
+        { request_id: 2, retain_recording: true },
+        { request_id: 3, retain_recording: false },
+      ]);
+      const column = await client.query<{ is_nullable: string }>(
+        `SELECT is_nullable
+         FROM information_schema.columns
+         WHERE table_schema = $1
+           AND table_name = 'assessment_requests'
+           AND column_name = 'retain_recording'`,
+        [schema],
+      );
+      expect(column.rows).toEqual([{ is_nullable: 'NO' }]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 021 recording retention epoch', () => {
+  it('backfills monotonic zero epochs for users and assessment request claims', async () => {
+    const client = await pool.connect();
+    const schema = `recording_epoch_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE users (id INTEGER PRIMARY KEY)');
+      await client.query('CREATE TABLE assessment_requests (request_id INTEGER PRIMARY KEY)');
+      await client.query('INSERT INTO users (id) VALUES (1)');
+      await client.query('INSERT INTO assessment_requests (request_id) VALUES (1)');
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/021_recording_retention_epoch.sql'), 'utf8');
+      await client.query(sql);
+      await client.query('INSERT INTO users (id) VALUES (2)');
+      await client.query('INSERT INTO assessment_requests (request_id) VALUES (2)');
+
+      const users = await client.query<{ id: number; recording_retention_epoch: string }>(
+        'SELECT id, recording_retention_epoch FROM users ORDER BY id',
+      );
+      const requests = await client.query<{
+        request_id: number;
+        recording_retention_epoch: string;
+      }>('SELECT request_id, recording_retention_epoch FROM assessment_requests ORDER BY request_id');
+      expect(users.rows).toEqual([
+        { id: 1, recording_retention_epoch: '0' },
+        { id: 2, recording_retention_epoch: '0' },
+      ]);
+      expect(requests.rows).toEqual([
+        { request_id: 1, recording_retention_epoch: '0' },
+        { request_id: 2, recording_retention_epoch: '0' },
+      ]);
+      await client.query('SAVEPOINT before_invalid_user_epoch');
+      await expect(client.query('UPDATE users SET recording_retention_epoch = -1 WHERE id = 1')).rejects.toMatchObject({
+        code: '23514',
+      });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_user_epoch');
+      await expect(
+        client.query('UPDATE assessment_requests SET recording_retention_epoch = -1 WHERE request_id = 1'),
+      ).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 018 practice cycle upgrade', () => {
+  it('upgrades a populated genuine 017 schema without weakening legacy history or replay ownership', async () => {
+    const client = await pool.connect();
+    const schema = `practice_cycle_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      const migrationsDirectory = path.join(__dirname, '../db/migrations');
+      const legacyMigrations = fs
+        .readdirSync(migrationsDirectory)
+        .filter((name) => /^0(0[1-9]|1[0-7])_.*\.sql$/.test(name))
+        .sort();
+      expect(legacyMigrations.at(-1)).toBe('017_retained_recordings.sql');
+      for (const name of legacyMigrations) {
+        await client.query(fs.readFileSync(path.join(migrationsDirectory, name), 'utf8'));
+      }
+
+      const userId = randomUUID();
+      const questionId = randomUUID();
+      const otherQuestionId = randomUUID();
+      const translations = Object.fromEntries(
+        ['te', 'hi', 'es', 'zh'].map((language) => [
+          language,
+          {
+            word: `${language} word`,
+            question: `${language} question`,
+            examples: Array.from({ length: 3 }, (_, index) => ({
+              en: `English example ${index + 1}`,
+              native: `${language} example ${index + 1}`,
+            })),
+          },
+        ]),
+      );
+      await client.query(
+        `INSERT INTO users (id, name, email, password_hash, native_language)
+         VALUES ($1, 'Legacy Learner', 'legacy@example.com', 'not-used', 'te')`,
+        [userId],
+      );
+      await client.query(
+        `INSERT INTO questions (id, cefr_level, prompt_word, question_text, translations)
+         VALUES
+           ($1, 'A1', 'legacy', 'Describe a legacy answer.', $3::jsonb),
+           ($2, 'A1', 'other', 'Describe another answer.', $3::jsonb)`,
+        [questionId, otherQuestionId, JSON.stringify(translations)],
+      );
+      await client.query(
+        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
+         VALUES
+           ($1, $2, 'practice', 1, 'first old cycle', 50, false, 'Try again.'),
+           ($1, $2, 'practice', 1, 'second old cycle', 80, true, 'Well done.'),
+           ($1, $2, 'diagnostic', 1, 'diagnostic speech', 60, true, 'Placed.')`,
+        [userId, questionId],
+      );
+
+      const legacyPracticeRequest = randomUUID();
+      const legacyNativeRequest = randomUUID();
+      const legacySilentDiagnosticRequest = randomUUID();
+      const compatibleDiagnosticRequest = randomUUID();
+      const diagnosticQuestion = {
+        id: questionId,
+        cefrLevel: 'A1',
+        promptWord: 'legacy',
+        questionText: 'Describe a legacy answer.',
+      };
+      const insertCompletedRequest = (requestId: string, context: string, response: Record<string, unknown>) =>
+        client.query(
+          `INSERT INTO assessment_requests
+             (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at)
+           VALUES ($1, $2, gen_random_uuid(), $3, $4, 'completed', $5::jsonb, now())`,
+          [userId, requestId, context, questionId, JSON.stringify(response)],
+        );
+      await insertCompletedRequest(legacyPracticeRequest, 'practice', {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 50,
+        transcript: 'legacy practice speech',
+        feedback: 'Try again.',
+      });
+      await insertCompletedRequest(legacyNativeRequest, 'practice-native', {
+        mode: 'native',
+        understood: true,
+        transcript: 'legacy native speech',
+        modelAnswer: 'A model answer.',
+        feedback: 'Understood.',
+      });
+      await insertCompletedRequest(legacySilentDiagnosticRequest, 'diagnostic', {
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: 'No speech detected.',
+        done: false,
+        nextQuestion: diagnosticQuestion,
+      });
+      await insertCompletedRequest(compatibleDiagnosticRequest, 'diagnostic', {
+        passed: true,
+        score: 60,
+        transcript: 'legacy diagnostic speech',
+        feedback: 'Placed.',
+        done: true,
+        level: 'A1',
+      });
+
+      const migration = fs.readFileSync(path.join(migrationsDirectory, '018_practice_serving_cycles.sql'), 'utf8');
+      await client.query(migration);
+
+      const upgradedAttempts = await client.query<{
+        id: string;
+        context: string;
+        practice_cycle_id: string | null;
+      }>('SELECT id, context, practice_cycle_id FROM attempts ORDER BY created_at, id');
+      const practiceAttempts = upgradedAttempts.rows.filter((row) => row.context === 'practice');
+      expect(practiceAttempts).toHaveLength(2);
+      expect(practiceAttempts.every((row) => row.practice_cycle_id === row.id)).toBe(true);
+      expect(upgradedAttempts.rows.find((row) => row.context === 'diagnostic')?.practice_cycle_id).toBeNull();
+
+      const replayVersions = await client.query<{
+        request_id: string;
+        response_version: number;
+        practice_cycle_id: string | null;
+      }>(
+        `SELECT request_id, response_version, practice_cycle_id
+         FROM assessment_requests ORDER BY request_id`,
+      );
+      const byRequest = new Map(replayVersions.rows.map((row) => [row.request_id, row]));
+      expect(byRequest.get(legacyPracticeRequest)).toMatchObject({ response_version: 1, practice_cycle_id: null });
+      expect(byRequest.get(legacyNativeRequest)).toMatchObject({ response_version: 1, practice_cycle_id: null });
+      expect(byRequest.get(legacySilentDiagnosticRequest)).toMatchObject({
+        response_version: 1,
+        practice_cycle_id: null,
+      });
+      expect(byRequest.get(compatibleDiagnosticRequest)).toMatchObject({
+        response_version: 2,
+        practice_cycle_id: null,
+      });
+
+      const cycleId = practiceAttempts[0].practice_cycle_id!;
+      await client.query('SAVEPOINT before_duplicate_attempt');
+      await expect(
+        client.query(
+          `INSERT INTO attempts
+             (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+           VALUES ($1, $2, 'practice', 1, 'duplicate', 50, false, 'Try again.', $3)`,
+          [userId, questionId, cycleId],
+        ),
+      ).rejects.toMatchObject({ code: '23505' });
+      await client.query('ROLLBACK TO SAVEPOINT before_duplicate_attempt');
+
+      await client.query('SAVEPOINT before_missing_request_cycle');
+      await expect(
+        client.query(
+          `INSERT INTO assessment_requests
+             (user_id, request_id, claim_id, context, question_id, status)
+           VALUES ($1, gen_random_uuid(), gen_random_uuid(), 'practice', $2, 'processing')`,
+          [userId, questionId],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_missing_request_cycle');
+
+      await client.query('SAVEPOINT before_diagnostic_request_cycle');
+      await expect(
+        client.query(
+          `INSERT INTO assessment_requests
+             (user_id, request_id, claim_id, context, question_id, status, practice_cycle_id)
+           VALUES ($1, gen_random_uuid(), gen_random_uuid(), 'diagnostic', $2, 'processing', $3)`,
+          [userId, questionId, cycleId],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_diagnostic_request_cycle');
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();

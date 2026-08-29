@@ -76,7 +76,7 @@ describe('assessment route transaction lifecycles', () => {
     );
 
     expect(result.status).toBe(200);
-    expect(result.body.progress).toEqual({ asked: 0, maxQuestions: 5 });
+    expect(result.body.progress).toEqual({ asked: 0, maxQuestions: 3 });
     expectCommittedLease(leases.find(({ statements }) => statements.some((text) => text.includes('diagnostic_state'))));
   });
 
@@ -103,13 +103,16 @@ describe('assessment route transaction lifecycles', () => {
   it('commits and releases both practice claim and result transactions', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
     const { result, leases } = await observePoolLeases(() =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), question.rows[0].id),
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        question.body.question.id,
+        undefined,
+        question.body.cycleId,
+      ),
     );
 
     expect(result.status).toBe(200);
@@ -126,7 +129,7 @@ describe('assessment route transaction lifecycles', () => {
     const exactClaimDelete = 'DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3';
     const deleteIndex = resultLease!.statements.indexOf(exactClaimDelete);
     const requestCompletionIndex = resultLease!.statements.findIndex((text) =>
-      text.includes("SET status = 'completed', response_body = $1::jsonb"),
+      text.includes('UPDATE assessment_requests AS requests'),
     );
     const commitIndex = resultLease!.statements.indexOf('COMMIT');
     expect(deleteIndex).toBeGreaterThan(0);
@@ -137,16 +140,14 @@ describe('assessment route transaction lifecycles', () => {
   it('locks the current user before parking a skipped word', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
     const { result, leases } = await observePoolLeases(() =>
       request(a)
         .post('/practice/skip')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: question.rows[0].id }),
+        .send({ questionId: question.body.question.id, cycleId: question.body.cycleId }),
     );
 
     expect(result.status).toBe(204);
@@ -166,19 +167,22 @@ describe('assessment route transaction lifecycles', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
       userId,
-      question.rows[0].id,
+      question.body.question.id,
       randomUUID(),
     ]);
 
     try {
       const { result, leases } = await observePoolLeases(() =>
-        answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), question.rows[0].id),
+        answerForm(
+          request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+          question.body.question.id,
+          undefined,
+          question.body.cycleId,
+        ),
       );
       expect(result.status).toBe(409);
       expect(result.body).toEqual({
@@ -194,7 +198,7 @@ describe('assessment route transaction lifecycles', () => {
     } finally {
       await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [
         userId,
-        question.rows[0].id,
+        question.body.question.id,
       ]);
     }
   });
@@ -202,13 +206,16 @@ describe('assessment route transaction lifecycles', () => {
   it('locks the users parent row before the practice_inflight child row when claiming an attempt', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
 
     const { result, leases } = await observePoolLeases(() =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), question.rows[0].id),
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        question.body.question.id,
+        undefined,
+        question.body.cycleId,
+      ),
     );
 
     expect(result.status).toBe(200);

@@ -47,6 +47,9 @@ const deleteItemAsync = SecureStore.deleteItemAsync as jest.Mock;
 const STORAGE_OPTIONS = expect.objectContaining({
   keychainService: 'ai-english-coach.daily-reminder',
 });
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+const MUTATION_WATCHDOG_MS = 500;
 
 /**
  * Model SecureStore as a durable keychain already holding `initial`, so a test
@@ -72,6 +75,31 @@ function deferred<T>() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function settleWithin<T>(promise: Promise<T>, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = nativeSetTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} did not settle within the mutation watchdog`));
+    }, MUTATION_WATCHDOG_MS);
+    void Promise.resolve(promise).then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        nativeClearTimeout(timer);
+        resolve(value);
+      },
+      (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        nativeClearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function withPlatformOS(os: 'ios' | 'android', run: () => Promise<void>): Promise<void> {
@@ -139,6 +167,36 @@ describe('getDailyReminder', () => {
   it('returns the stored hour', async () => {
     getItemAsync.mockImplementation(async () => JSON.stringify({ hour: 8 }));
     await expect(getDailyReminder()).resolves.toEqual({ hour: 8 });
+    expect(mockGetPermissionsAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('turns a stored reminder off after permission is revoked in system settings', async () => {
+    withPersistedReminder({ hour: 8, uiLanguage: 'en' });
+    mockGetPermissionsAsync.mockResolvedValueOnce({ granted: false });
+
+    await expect(getDailyReminder()).resolves.toBeNull();
+    await expect(getDailyReminder()).resolves.toBeNull();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(deleteItemAsync).toHaveBeenCalledWith('daily_reminder_v1', STORAGE_OPTIONS);
+  });
+
+  it('still reports a revoked reminder as off when cleanup services fail', async () => {
+    withPersistedReminder({ hour: 8, uiLanguage: 'en' });
+    mockGetPermissionsAsync.mockResolvedValueOnce({ granted: false });
+    mockCancelAllScheduledNotificationsAsync.mockRejectedValueOnce(new Error('os unavailable'));
+    deleteItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(getDailyReminder()).resolves.toBeNull();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(deleteItemAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a stored reminder when permission status is temporarily unreadable', async () => {
+    withPersistedReminder({ hour: 8, uiLanguage: 'en' });
+    mockGetPermissionsAsync.mockRejectedValueOnce(new Error('native module unavailable'));
+
+    await expect(getDailyReminder()).resolves.toEqual({ hour: 8, uiLanguage: 'en' });
+    expect(deleteItemAsync).not.toHaveBeenCalled();
   });
 
   it('waits for an earlier in-flight enable before reading storage', async () => {
@@ -155,7 +213,7 @@ describe('getDailyReminder', () => {
     });
 
     const enabling = enableDailyReminder(19);
-    await scheduleStarted.promise;
+    await settleWithin(scheduleStarted.promise, 'enable schedule start');
     const reading = getDailyReminder();
     await Promise.resolve();
     const readsBeforeRelease = getItemAsync.mock.calls.length;
@@ -460,7 +518,7 @@ describe('cancelDailyReminderQuietly', () => {
     });
 
     const enabling = enableDailyReminder(19);
-    await scheduleStarted.promise;
+    await settleWithin(scheduleStarted.promise, 'logout serialization schedule start');
     const loggingOut = cancelDailyReminderQuietly();
     try {
       // The queued cancellation must not even begin its storage read midway
@@ -530,7 +588,7 @@ describe('refreshDailyReminderLanguage', () => {
     });
 
     const refreshing = refreshDailyReminderLanguage('hi');
-    await scheduleStarted.promise;
+    await settleWithin(scheduleStarted.promise, 'language refresh schedule start');
     const loggingOut = cancelDailyReminderQuietly();
     await Promise.resolve();
     await Promise.resolve();
@@ -553,5 +611,29 @@ describe('refreshDailyReminderLanguage', () => {
     await expect(refreshDailyReminderLanguage('hi')).resolves.toBeNull();
     await expect(getDailyReminder()).resolves.toBeNull();
     expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+  });
+
+  it('preserves the stored preference when permission status is temporarily unreadable', async () => {
+    withPersistedReminder({ hour: 19, uiLanguage: 'en' });
+    mockGetPermissionsAsync.mockRejectedValueOnce(new Error('native module unavailable'));
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({
+      hour: 19,
+      uiLanguage: 'en',
+    });
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+    expect(deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('still reports revoked permission as off when refresh cleanup fails', async () => {
+    withPersistedReminder({ hour: 19, uiLanguage: 'en' });
+    mockGetPermissionsAsync.mockResolvedValueOnce({ granted: false });
+    mockCancelAllScheduledNotificationsAsync.mockRejectedValueOnce(new Error('os unavailable'));
+    deleteItemAsync.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toBeNull();
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+    expect(mockCancelAllScheduledNotificationsAsync).toHaveBeenCalledTimes(1);
+    expect(deleteItemAsync).toHaveBeenCalledTimes(1);
   });
 });

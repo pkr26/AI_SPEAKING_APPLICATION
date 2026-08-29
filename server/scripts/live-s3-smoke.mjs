@@ -396,10 +396,10 @@ async function adminDelete(scope, key, includeRunSignal = true) {
   if ((deleted.Errors?.length || 0) > 0) throw new SmokeFailure(`${scope} version cleanup returned errors`);
 }
 
-async function submitAssessment(endpoint, questionId, audioKey, label) {
+async function submitAssessment(endpoint, questionId, audioKey, label, cycleId) {
   const response = await apiRequest('POST', endpoint, {
     token: account.token,
-    json: { questionId, requestId: randomUUID(), audioKey },
+    json: { questionId, requestId: randomUUID(), audioKey, ...(cycleId ? { cycleId } : {}) },
   });
   checkStatus(label, response, 200);
   check(`${label} returns a JSON object`, isRecord(response.body));
@@ -419,14 +419,14 @@ async function requestPlayback(recordingId, label) {
   throw new SmokeFailure(`${label} playback did not become ready`);
 }
 
-async function exerciseSuccessfulAssessment(endpoint, scope, questionId, audioBytes, label) {
+async function exerciseSuccessfulAssessment(endpoint, scope, questionId, audioBytes, label, cycleId) {
   const grant = await requestGrant(endpoint, scope, account.userId);
   const upload = await uploadSignedObject(grant, audioBytes);
   check(
     `${label} signed upload returns 2xx (observed HTTP ${upload.status}${upload.errorCode ? ` ${upload.errorCode}` : ''})`,
     upload.status >= 200 && upload.status < 300,
   );
-  const assessment = await submitAssessment(endpoint, questionId, grant.audioKey, label);
+  const assessment = await submitAssessment(endpoint, questionId, grant.audioKey, label, cycleId);
   check(`${label} object remains private after assessment`, await objectExists(scope, grant.audioKey));
   const retainedVersions = await listExactVersions(scope, grant.audioKey);
   let retainedTagFound = false;
@@ -608,6 +608,7 @@ try {
     practiceQuestion.id,
     audioBytes,
     'English practice assessment',
+    practiceNext.body.cycleId,
   );
 
   const nativeNext = await apiRequest('GET', '/practice/question', { token: account.token });
@@ -618,6 +619,7 @@ try {
     nativeQuestion.id,
     audioBytes,
     'native practice assessment',
+    nativeNext.body.cycleId,
   );
 
   const crossScopeQuestionResponse = await apiRequest('GET', '/practice/question', {
@@ -639,6 +641,7 @@ try {
     json: {
       questionId: crossScopeQuestion.id,
       requestId: randomUUID(),
+      cycleId: crossScopeQuestionResponse.body.cycleId,
       audioKey: crossScopeGrant.audioKey,
     },
   });

@@ -4,6 +4,7 @@ import * as SecureStore from 'expo-secure-store';
 import { Platform } from 'react-native';
 
 import { translate, type MessageKey } from './i18n';
+import { latchClientUpgradeRequired } from './client-upgrade-store';
 import {
   audioKeyBelongsToOwner,
   audioKeyMatchesAssessmentEndpoint,
@@ -110,6 +111,8 @@ export const API_ERROR_CODES = [
   'REQUEST_IN_FLIGHT',
   'REQUEST_ID_REUSED',
   'ASSESSMENT_IN_PROGRESS',
+  'ASSESSMENT_RESULT_INCOMPATIBLE',
+  'PRACTICE_CYCLE_CLOSED',
   'STATE_CHANGED',
   'RATE_LIMITED',
   'DAILY_LIMIT',
@@ -117,6 +120,7 @@ export const API_ERROR_CODES = [
   'CAPACITY_BUSY',
   'POOL_SATURATED',
   'AUDIO_INVALID',
+  'AUDIO_SILENT',
   'AUDIO_UPLOAD_MISSING',
   'AUDIO_TOO_LARGE',
   'AUDIO_TOO_LONG',
@@ -174,6 +178,8 @@ const CODE_MESSAGE_KEYS: Readonly<Record<ApiErrorCode, MessageKey>> = {
   REQUEST_IN_FLIGHT: 'error.stillChecking',
   REQUEST_ID_REUSED: 'error.alreadySent',
   ASSESSMENT_IN_PROGRESS: 'error.stillChecking',
+  ASSESSMENT_RESULT_INCOMPATIBLE: 'error.assessmentResultIncompatible',
+  PRACTICE_CYCLE_CLOSED: 'error.stateChanged',
   STATE_CHANGED: 'error.stateChanged',
   RATE_LIMITED: 'error.tooMany',
   DAILY_LIMIT: 'error.dailyLimit',
@@ -181,6 +187,7 @@ const CODE_MESSAGE_KEYS: Readonly<Record<ApiErrorCode, MessageKey>> = {
   CAPACITY_BUSY: 'error.busy',
   POOL_SATURATED: 'error.busy',
   AUDIO_INVALID: 'error.audioInvalid',
+  AUDIO_SILENT: 'error.audioSilent',
   AUDIO_UPLOAD_MISSING: 'error.audioInvalid',
   AUDIO_TOO_LARGE: 'error.tooLarge',
   AUDIO_TOO_LONG: 'error.audioTooLong',
@@ -443,6 +450,7 @@ async function throwForStatus(
   res: Response,
   timeoutMs = JSON_TIMEOUT_MS,
   externalSignal?: AbortSignal,
+  source: 'external' | 'first-party-api' = 'external',
 ): Promise<never> {
   // Do not forward server or upstream-provider error bodies into the UI. The
   // only fields read are the machine-readable `code` (mapped to localized
@@ -460,6 +468,13 @@ async function throwForStatus(
   }
   const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : undefined;
   const code = isApiErrorCode(record?.code) ? record.code : undefined;
+
+  // Only our own API contract can retire this build. A blob URL, signed S3
+  // upload, captive portal, or other external response must never be able to
+  // display the non-dismissible update UI, even if it returns look-alike JSON.
+  if (source === 'first-party-api' && res.status === 426 && code === 'CLIENT_UPGRADE_REQUIRED') {
+    latchClientUpgradeRequired();
+  }
 
   let retryAfterSeconds: number | undefined;
   let retryAfterHours: number | undefined;
@@ -623,7 +638,12 @@ async function apiFetchWithToken<T>(
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, options.expireSessionOn401 !== false);
-    await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+    await throwForStatus(
+      res,
+      remainingTimeoutMs(startedAt, timeoutMs),
+      options.signal,
+      'first-party-api',
+    );
   }
   if (options.expectedStatus !== undefined && res.status !== options.expectedStatus) {
     throw new ApiError(502, 'The server returned an invalid response');
@@ -781,7 +801,12 @@ export async function apiUploadAudio<T>(
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, true);
-    await throwForStatus(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal);
+    await throwForStatus(
+      res,
+      remainingTimeoutMs(startedAt, timeoutMs),
+      options.signal,
+      'first-party-api',
+    );
   }
   try {
     return (await readJsonBody(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal)) as T;
@@ -950,7 +975,18 @@ export async function apiPostPresignedAudio(
 
 /** Home-screen mastery/streak/due statistics. */
 export async function apiGetPracticeStats(signal?: AbortSignal): Promise<PracticeStats> {
-  return parsePracticeStats(await apiFetch<unknown>('/practice/stats', { signal }));
+  let timeZone = 'UTC';
+  try {
+    const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (typeof resolved === 'string' && resolved.trim().length > 0 && resolved.length <= 100) {
+      timeZone = resolved;
+    }
+  } catch {
+    // Older runtimes can lack full Intl timezone data; UTC remains explicit.
+  }
+  return parsePracticeStats(
+    await apiFetch<unknown>(`/practice/stats?timeZone=${encodeURIComponent(timeZone)}`, { signal }),
+  );
 }
 
 /** One newest-first page of attempt history; pass the previous nextCursor to page older. */
@@ -1000,11 +1036,20 @@ export async function apiDeleteRecording(recordingId: string, signal?: AbortSign
   });
 }
 
+/** Idempotently removes every retained recording owned by the current account. */
+export async function apiDeleteAllRecordings(signal?: AbortSignal): Promise<void> {
+  await apiFetch<void>('/recordings', {
+    method: 'DELETE',
+    signal,
+    expectedStatus: 204,
+  });
+}
+
 /** Defers the current word for a week and frees the queue for the next one. */
-export async function apiSkipPracticeWord(questionId: string): Promise<void> {
+export async function apiSkipPracticeWord(questionId: string, cycleId: string): Promise<void> {
   await apiFetch<void>('/practice/skip', {
     method: 'POST',
-    body: { questionId },
+    body: { questionId, cycleId },
     expectedStatus: 204,
   });
 }
@@ -1055,9 +1100,17 @@ export async function apiRestartDiagnostic(): Promise<void> {
   });
 }
 
-// The export walker refuses to loop forever on a server that keeps handing
-// out cursors. Requesting the server maximum of 500 rows and allowing 10,000
-// pages bounds one export at 5,000,000 attempt rows and 10,000 requests.
+/** Durably acknowledges the completed placement reveal before Home unlocks. */
+export async function apiAcknowledgeDiagnostic(): Promise<void> {
+  await apiFetch<void>('/diagnostic/acknowledge', {
+    method: 'POST',
+    expectedStatus: 204,
+  });
+}
+
+// Each independent export stream refuses to loop forever on a server that
+// keeps handing out cursors. Requesting the server maximum of 500 rows and
+// allowing 10,000 pages bounds each stream at 5,000,000 rows.
 const EXPORT_PAGE_LIMIT = 500;
 const EXPORT_MAX_PAGES = 10_000;
 
@@ -1071,30 +1124,92 @@ async function consumeUserDataPagesWithToken(
   token: string | null,
   consumePage: UserDataPageConsumer,
   signal?: AbortSignal,
+  maxPages = EXPORT_MAX_PAGES,
 ): Promise<void> {
+  if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > EXPORT_MAX_PAGES) {
+    throw new ContractError();
+  }
   let userId: string | null = null;
-  let cursor: string | null = null;
-  const seenCursors = new Set<string>();
-  for (let page = 0; page < EXPORT_MAX_PAGES; page += 1) {
-    const cursorParam = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+  let emittedPage = 0;
+
+  const assertOwner = (data: UserDataPage) => {
+    if (userId !== null && data.user.id !== userId) throw new ContractError();
+    userId ??= data.user.id;
+  };
+
+  // Walk attempts first while explicitly telling the server not to resend any
+  // cycles. This ordering lets callers stream attempts and then cycles into
+  // one JSON document without buffering either lifetime-sized collection.
+  let attemptCursor: string | null = null;
+  const seenAttemptCursors = new Set<string>();
+  for (let page = 0; page < maxPages; page += 1) {
+    const cursorParam = attemptCursor ? `&cursor=${encodeURIComponent(attemptCursor)}` : '';
     const data = parseUserDataPage(
       await apiFetchWithToken<unknown>(
-        `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}${cursorParam}`,
+        `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&attemptsDone=false&practiceCyclesDone=true${cursorParam}`,
         { signal },
         token,
       ),
     );
-    if (userId !== null && data.user.id !== userId) throw new ContractError();
-    userId ??= data.user.id;
+    assertOwner(data);
+    if (
+      data.practiceCyclesDone !== true ||
+      data.practiceCycles.length !== 0 ||
+      data.nextPracticeCycleCursor !== null
+    ) {
+      throw new ContractError();
+    }
     const nextCursor = data.nextCursor;
     if (nextCursor !== null) {
-      if (page === EXPORT_MAX_PAGES - 1 || seenCursors.has(nextCursor)) throw new ContractError();
-      seenCursors.add(nextCursor);
+      if (page === maxPages - 1 || seenAttemptCursors.has(nextCursor)) {
+        throw new ContractError();
+      }
+      seenAttemptCursors.add(nextCursor);
     }
-    await consumePage(data, page);
-    if (nextCursor === null) return;
-    cursor = nextCursor;
+    await consumePage(data, emittedPage++);
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+    }
+    if (data.attemptsDone) break;
+    attemptCursor = nextCursor;
   }
+
+  // Then walk serving cycles independently. The done flag prevents the server
+  // from re-reading attempts while their cursor intentionally stays absent.
+  let practiceCycleCursor: string | null = null;
+  const seenPracticeCycleCursors = new Set<string>();
+  for (let page = 0; page < maxPages; page += 1) {
+    const cursorParam = practiceCycleCursor
+      ? `&practiceCycleCursor=${encodeURIComponent(practiceCycleCursor)}`
+      : '';
+    const data = parseUserDataPage(
+      await apiFetchWithToken<unknown>(
+        `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&attemptsDone=true&practiceCyclesDone=false${cursorParam}`,
+        { signal },
+        token,
+      ),
+    );
+    assertOwner(data);
+    if (data.attemptsDone !== true || data.attempts.length !== 0 || data.nextCursor !== null) {
+      throw new ContractError();
+    }
+    const nextCursor = data.nextPracticeCycleCursor;
+    if (nextCursor !== null) {
+      if (page === maxPages - 1 || seenPracticeCycleCursors.has(nextCursor)) {
+        throw new ContractError();
+      }
+      seenPracticeCycleCursors.add(nextCursor);
+    }
+    await consumePage(data, emittedPage++);
+    if (signal?.aborted) {
+      throw signal.reason ?? new DOMException('Aborted', 'AbortError');
+    }
+    if (data.practiceCyclesDone) return;
+    practiceCycleCursor = nextCursor;
+  }
+  // A nonterminal final page is rejected inside the loop before emission;
+  // a terminal page returns above. This is a defensive exhaustiveness guard.
+  /* istanbul ignore next */
   throw new ContractError();
 }
 
@@ -1123,6 +1238,9 @@ async function consumeRecordingExportPagesWithToken(
     if (nextCursor === null) return;
     cursor = nextCursor;
   }
+  // The final nonterminal cursor is rejected inside the loop, while a null
+  // cursor returns above. Retain the guard for future loop changes.
+  /* istanbul ignore next */
   throw new ContractError();
 }
 
@@ -1135,12 +1253,14 @@ async function consumeRecordingExportPagesWithToken(
 export async function apiConsumeUserDataPages(
   consumePage: UserDataPageConsumer,
   signal?: AbortSignal,
+  /** Optional lower resource bound for constrained callers and deterministic tests. */
+  maxPages = EXPORT_MAX_PAGES,
 ): Promise<void> {
   // An export is one logical read even though it spans many HTTP requests.
   // Pin the initiating session so a logout/new login cannot silently switch
   // accounts between pages.
   const token = await tokenForRequest();
-  await consumeUserDataPagesWithToken(token, consumePage, signal);
+  await consumeUserDataPagesWithToken(token, consumePage, signal, maxPages);
 }
 
 export async function apiConsumeRecordingExportPages(

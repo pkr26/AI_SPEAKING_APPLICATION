@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs/promises';
 import path from 'path';
 import request from 'supertest';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, createClosedPracticeCycle, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -51,6 +51,8 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     const r = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
+      undefined,
+      q.body.cycleId,
     );
 
     expect(r.status).toBe(200);
@@ -73,6 +75,8 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     const r = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
+      undefined,
+      q.body.cycleId,
     );
 
     expect(r.status).toBe(200);
@@ -88,14 +92,34 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     const { token, userId } = await freshUser();
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const questionId = q.body.question.id as string;
+    let cycleId = q.body.cycleId as string;
     const attempt = () =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        questionId,
+        undefined,
+        cycleId,
+      );
+    const reassign = async () => {
+      await pool.query(
+        `UPDATE practice_cycles SET status = 'closed', closed_at = now(), updated_at = now()
+         WHERE user_id = $1 AND status = 'active'`,
+        [userId],
+      );
+      const cycle = await pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles (user_id, question_id, kind)
+         VALUES ($1, $2, 'revision') RETURNING id`,
+        [userId, questionId],
+      );
+      cycleId = cycle.rows[0].id;
+    };
 
     const random = vi.spyOn(Math, 'random');
     random.mockReturnValue(SCORE_HIGH);
     expect((await attempt()).body).toMatchObject({ mastered: true, score: 95 });
 
     // A mediocre retention pass (60-74) never downgrades mastery.
+    await reassign();
     random.mockReturnValue(SCORE_74);
     const retained = await attempt();
     expect(retained.body).toMatchObject({ passed: true, mastered: false, score: 74, attemptNo: 1 });
@@ -107,6 +131,7 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
 
     // A failed retention attempt (<60) is the one downgrade path: back to
     // learning while the historical best score is kept.
+    await reassign();
     random.mockReturnValue(SCORE_LOW);
     const failed = await attempt();
     expect(failed.body).toMatchObject({ passed: false, mastered: false, score: 40, attemptNo: 1 });
@@ -117,7 +142,7 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     });
   });
 
-  it('opens on revision after a failure, then alternates to a new word', async () => {
+  it('durably resumes a failed serving cycle, then advances after its third try', async () => {
     const { token } = await freshUser();
     const first = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(first.body.kind).toBe('new');
@@ -126,20 +151,31 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
 
     vi.spyOn(Math, 'random').mockReturnValue(SCORE_LOW);
     const attempt = () =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        questionId,
+        undefined,
+        first.body.cycleId,
+      );
     expect((await attempt()).body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
 
-    // The failed word is learning, so the next pick is that word as revision.
+    // A remount resumes the exact assignment and its remaining budget.
     const revision = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(revision.body.kind).toBe('revision');
     expect(revision.body.question.id).toBe(questionId);
+    expect(revision.body).toMatchObject({ attemptsUsed: 1, attemptsLeft: 2 });
     expect(revision.body.progress).toMatchObject({ masteredCount: 0, learningCount: 1 });
 
-    // Revising (a word with earlier attempts) flips the interleave back to new.
+    // The second failure is still the same serving cycle.
     expect((await attempt()).body).toMatchObject({ passed: false, attemptNo: 2, attemptsLeft: 1 });
-    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
-    expect(next.body.kind).toBe('new');
-    expect(next.body.question.id).not.toBe(questionId);
+    expect((await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`)).body).toMatchObject({
+      cycleId: first.body.cycleId,
+      attemptsUsed: 2,
+      attemptsLeft: 1,
+    });
+    const final = await attempt();
+    expect(final.body).toMatchObject({ attemptNo: 3, attemptsLeft: 0 });
+    expect(final.body.next.question.id).not.toBe(questionId);
   });
 
   it('serves the most overdue mastered word as retention revision when the level is exhausted', async () => {
@@ -212,19 +248,23 @@ describe('practice mastery and interleave (deterministic mock scores)', () => {
     const userId = res.body.user.id as string;
     const questions = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 3');
     const [masteredQ, learningQ, diagnosticQ] = questions.rows;
+    const masteredCycleId = await createClosedPracticeCycle(userId, masteredQ.id);
     await pool.query(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 1, 'strong answer', 80, true, 'Great')`,
-      [userId, masteredQ.id],
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'strong answer', 80, true, 'Great', $3)`,
+      [userId, masteredQ.id, masteredCycleId],
     );
+    const learningCycleId = await createClosedPracticeCycle(userId, learningQ.id, 2);
     for (const [attemptNo, score] of [
       [1, 50],
       [2, 55],
     ] as const) {
       await pool.query(
-        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-         VALUES ($1, $2, 'practice', $3, 'weak answer', $4, false, 'Keep going')`,
-        [userId, learningQ.id, attemptNo, score],
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+         VALUES ($1, $2, 'practice', $3, 'weak answer', $4, false, 'Keep going', $5)`,
+        [userId, learningQ.id, attemptNo, score, learningCycleId],
       );
     }
     await pool.query(

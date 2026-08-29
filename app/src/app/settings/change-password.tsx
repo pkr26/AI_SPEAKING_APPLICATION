@@ -71,11 +71,14 @@ export default function ChangePasswordScreen() {
   const currentPasswordError = comparablePasswordError(currentPassword, t);
   const confirmError =
     confirmPassword.length > 0 && confirmPassword !== newPassword ? t('cp.mismatch') : null;
+  const samePasswordError =
+    newPassword.length > 0 && newPassword === currentPassword ? t('cp.sameAsCurrent') : null;
 
   const canSubmit =
     currentPassword.length > 0 &&
     currentPasswordError === null &&
     passwordPolicyError(newPassword) === null &&
+    samePasswordError === null &&
     confirmPassword === newPassword &&
     !busy;
 
@@ -120,16 +123,25 @@ export default function ChangePasswordScreen() {
     }
   };
 
-  const visibilityToggle = (field: FieldName, visible: boolean) => (
-    <Pressable
-      accessibilityRole="button"
-      accessibilityLabel={visible ? t('common.hidePassword') : t('common.showPassword')}
-      onPress={() => toggleVisibility(field)}
-      style={styles.inputAction}
-    >
-      <Text style={styles.inputActionText}>{visible ? t('common.hide') : t('common.show')}</Text>
-    </Pressable>
-  );
+  const visibilityToggle = (field: FieldName, visible: boolean) => {
+    const fieldLabel =
+      field === 'current'
+        ? t('cp.currentLabel')
+        : field === 'next'
+          ? t('cp.newLabel')
+          : t('cp.confirmLabel');
+    const actionLabel = visible ? t('common.hidePassword') : t('common.showPassword');
+    return (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${fieldLabel}: ${actionLabel}`}
+        onPress={() => toggleVisibility(field)}
+        style={styles.inputAction}
+      >
+        <Text style={styles.inputActionText}>{visible ? t('common.hide') : t('common.show')}</Text>
+      </Pressable>
+    );
+  };
 
   return (
     <KeyboardAvoidingView
@@ -209,6 +221,11 @@ export default function ChangePasswordScreen() {
           {newPasswordError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {newPasswordError}
+            </Text>
+          )}
+          {samePasswordError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {samePasswordError}
             </Text>
           )}
 

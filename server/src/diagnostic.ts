@@ -13,7 +13,11 @@ import { RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
-const MAX_QUESTIONS = 5;
+// A binary search over six CEFR levels always converges in at most three
+// scored answers. Keep the learner-facing progress contract aligned with the
+// actual algorithm instead of advertising the old defensive database cap of
+// five.
+const MAX_QUESTIONS = 3;
 
 interface DiagnosticStateRow {
   user_id: string;
@@ -30,6 +34,50 @@ interface QuestionJson {
   cefrLevel: string;
   promptWord: string;
   questionText: string;
+}
+
+interface DiagnosticAnswerSummary {
+  attemptNo: number;
+  promptWord: string;
+  questionText: string;
+  transcript: string;
+  score: number;
+  passed: boolean;
+  feedback: string;
+}
+
+function questionJson(question: QuestionRow): QuestionJson {
+  return {
+    id: question.id,
+    cefrLevel: question.cefr_level,
+    promptWord: question.prompt_word,
+    questionText: question.question_text,
+  };
+}
+
+/**
+ * Return only the current placement run. Retakes deliberately preserve older
+ * diagnostic history, while diagnostic_state.questions_asked restarts at
+ * zero; taking the newest N rows therefore identifies the active/latest run
+ * without a schema migration and makes resume/completion screens durable.
+ */
+async function diagnosticAnswerSummaries(
+  client: PoolClient,
+  userId: string,
+  questionsAsked: number,
+): Promise<DiagnosticAnswerSummary[]> {
+  if (questionsAsked === 0) return [];
+  const { rows } = await client.query<DiagnosticAnswerSummary>(
+    `SELECT a.attempt_no AS "attemptNo", q.prompt_word AS "promptWord",
+            q.question_text AS "questionText", a.transcript, a.score, a.passed, a.feedback
+     FROM attempts a
+     JOIN questions q ON q.id = a.question_id
+     WHERE a.user_id = $1 AND a.context = 'diagnostic'
+     ORDER BY a.created_at DESC, a.id DESC
+     LIMIT $2`,
+    [userId, questionsAsked],
+  );
+  return rows.reverse();
 }
 
 /** Lock and read the user's diagnostic state, creating it on first use. */
@@ -178,6 +226,43 @@ async function finalizeDiagnosticAnswer(
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
 
+    // Silence is a free retry, just as it is in practice. Complete the durable
+    // request for exact replay and release the processing claim, but do not
+    // write an attempt, advance the binary search, or change placement.
+    if (result.transcript === '') {
+      const cleared = await client.query(
+        `UPDATE diagnostic_state
+         SET processing_question_id = NULL, processing_started_at = NULL, processing_claim_id = NULL
+         WHERE user_id = $1 AND processing_claim_id = $2`,
+        [userId, claimId],
+      );
+      if (cleared.rowCount !== 1) {
+        throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+      }
+      let silenceBody: Record<string, unknown> = {
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: result.feedback,
+        noSpeech: true,
+        done: false,
+        // Preserve the additive response shape older clients understand. New
+        // clients use noSpeech to keep progress fixed and record again.
+        nextQuestion: questionJson(question),
+      };
+      silenceBody = await completeAssessmentRequest(
+        client,
+        userId,
+        requestId,
+        requestClaimId,
+        silenceBody,
+        'diagnostic',
+        recording,
+      );
+      await client.query('COMMIT');
+      return silenceBody;
+    }
+
     const attemptNo = state.questions_asked + 1;
     const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
@@ -213,10 +298,12 @@ async function finalizeDiagnosticAnswer(
          WHERE user_id = $4 AND processing_claim_id = $5`,
         [low, high, attemptNo, userId, claimId],
       );
-      await client.query('UPDATE users SET cefr_level = $1, diagnostic_completed = true WHERE id = $2', [
-        level,
-        userId,
-      ]);
+      await client.query(
+        `UPDATE users
+         SET cefr_level = $1, diagnostic_completed = true, diagnostic_acknowledged = false
+         WHERE id = $2`,
+        [level, userId],
+      );
       body = { ...body, done: true, level };
     } else {
       const nextMid = Math.floor((low + high) / 2);
@@ -287,11 +374,12 @@ export function createDiagnosticRouter(limiters: Limiters) {
         if (!lockedUserRow) {
           throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
         }
+        const state = await lockState(client, user.id);
+        const answers = await diagnosticAnswerSummaries(client, user.id, state.questions_asked);
         if (lockedUserRow.diagnostic_completed) {
           await client.query('COMMIT');
-          return res.json({ done: true, level: lockedUserRow.cefr_level });
+          return res.json({ done: true, level: lockedUserRow.cefr_level, answers });
         }
-        const state = await lockState(client, user.id);
         let question: QuestionJson | undefined;
         if (state.current_question_id) {
           question = await questionById(client, state.current_question_id);
@@ -307,7 +395,12 @@ export function createDiagnosticRouter(limiters: Limiters) {
           ]);
         }
         await client.query('COMMIT');
-        res.json({ done: false, question, progress: { asked: state.questions_asked, maxQuestions: MAX_QUESTIONS } });
+        res.json({
+          done: false,
+          question,
+          progress: { asked: state.questions_asked, maxQuestions: MAX_QUESTIONS },
+          answers,
+        });
       } catch (err) {
         return await rollbackTransaction(client, { value: err });
       } finally {
@@ -350,12 +443,43 @@ export function createDiagnosticRouter(limiters: Limiters) {
            WHERE user_id = $1`,
           [user.id],
         );
-        await client.query('UPDATE users SET diagnostic_completed = false, cefr_level = NULL WHERE id = $1', [user.id]);
+        await client.query(
+          `UPDATE practice_cycles
+           SET status = 'closed', closed_at = now(), updated_at = now()
+           WHERE user_id = $1 AND status = 'active'`,
+          [user.id],
+        );
+        await client.query(
+          `UPDATE users
+           SET diagnostic_completed = false, diagnostic_acknowledged = false, cefr_level = NULL
+           WHERE id = $1`,
+          [user.id],
+        );
         await client.query('COMMIT');
       } catch (err) {
         return await rollbackTransaction(client, { value: err });
       } finally {
         releaseTransactionClient(client);
+      }
+      res.status(204).end();
+    }),
+  );
+
+  // The placement itself commits with the final scored answer, but the app
+  // does not unlock Home until the learner explicitly acknowledges the durable
+  // result screen. This makes a kill/relaunch between those events resume the
+  // reveal instead of silently skipping it.
+  router.post(
+    '/acknowledge',
+    h(async (req: AuthedRequest, res) => {
+      const acknowledged = await pool.query(
+        `UPDATE users
+         SET diagnostic_acknowledged = true
+         WHERE id = $1 AND diagnostic_completed = true`,
+        [req.user!.id],
+      );
+      if (acknowledged.rowCount !== 1) {
+        throw new HttpError(409, 'Diagnostic is not ready to acknowledge', 'STATE_CHANGED');
       }
       res.status(204).end();
     }),

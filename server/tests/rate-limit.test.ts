@@ -336,6 +336,28 @@ describe('rate limiters', () => {
     expect((await request(second).get('/x')).status).toBe(200);
   });
 
+  it('throttles bulk recording deletion per user in its own shared namespace', async () => {
+    config.rateLimit.passwordWindowMs = 60_000;
+    config.rateLimit.passwordMax = 1;
+    const limiters = buildLimiters();
+    const first = userApp('recording-owner-1', limiters.recordingBulkDelete);
+    const second = userApp('recording-owner-2', limiters.recordingBulkDelete);
+
+    expect((await request(first).get('/x')).status).toBe(200);
+    const limited = await request(first).get('/x');
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many recording deletion requests, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    expect((await request(second).get('/x')).status).toBe(200);
+
+    // The destructive actions reuse one reviewed window shape, not one
+    // counter: consuming this budget must not throttle a diagnostic restart.
+    const restart = userApp('recording-owner-1', limiters.diagnosticRestart);
+    expect((await request(restart).get('/x')).status).toBe(200);
+  });
+
   it('keys the assess limiter per user, not per IP', async () => {
     config.rateLimit.assessWindowMs = 60_000;
     config.rateLimit.assessMax = 1;
@@ -1592,13 +1614,20 @@ describe('assessment reservation after client disconnect', () => {
     );
     const user = userRows[0];
     const { rows: questionRows } = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    const cycleId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles (user_id, question_id, kind)
+         VALUES ($1, $2, 'revision') RETURNING id`,
+        [user.id, questionRows[0].id],
+      )
+    ).rows[0].id;
     const audioPath = path.join(os.tmpdir(), `respend-${process.pid}-${randomUUID()}.m4a`);
     await fs.writeFile(audioPath, fakeM4aBuffer());
 
     const req = {
       user,
       ip: '127.0.0.1',
-      body: { questionId: questionRows[0].id, requestId: randomUUID() },
+      body: { questionId: questionRows[0].id, requestId: randomUUID(), cycleId },
       file: { path: audioPath },
       socket: { destroyed: socketDestroyed },
     } as unknown as AuthedRequest;

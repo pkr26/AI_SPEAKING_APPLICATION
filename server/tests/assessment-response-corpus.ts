@@ -8,6 +8,8 @@ export interface AssessmentResponseCase {
 }
 
 const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
+const CYCLE_ID = '22222222-2222-4222-8222-222222222222';
+const NEXT_CYCLE_ID = '33333333-3333-4333-8333-333333333333';
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
 const PROMOTIONS = [
   ['A1', 'A2'],
@@ -38,6 +40,9 @@ function progress(overrides: Record<string, unknown> = {}) {
 
 function nextPayload(cefrLevel: (typeof LEVELS)[number] = 'A1', overrides: Record<string, unknown> = {}) {
   return {
+    cycleId: NEXT_CYCLE_ID,
+    attemptsUsed: 0,
+    attemptsLeft: 3,
     question: question(cefrLevel),
     kind: 'new',
     progress: progress(),
@@ -73,6 +78,7 @@ export function practiceRetry(overrides: Record<string, unknown> = {}) {
   return {
     passed: false,
     mastered: false,
+    cycleId: CYCLE_ID,
     attemptNo: 1,
     attemptsLeft: 2,
     score: 50,
@@ -86,6 +92,7 @@ export function practiceSilence(overrides: Record<string, unknown> = {}) {
   return {
     passed: false,
     mastered: false,
+    cycleId: CYCLE_ID,
     attemptNo: 1,
     attemptsLeft: 3,
     noSpeech: true,
@@ -100,6 +107,7 @@ export function practiceTerminal(overrides: Record<string, unknown> = {}) {
   return {
     passed: false,
     mastered: false,
+    cycleId: CYCLE_ID,
     attemptNo: 3,
     attemptsLeft: 0,
     score: 50,
@@ -115,7 +123,9 @@ export function practiceLearningPass(overrides: Record<string, unknown> = {}) {
   return {
     passed: true,
     mastered: false,
+    cycleId: CYCLE_ID,
     attemptNo: 1,
+    attemptsLeft: 0,
     score: 60,
     transcript: 'A passing answer.',
     feedback: 'Good answer.',
@@ -128,7 +138,9 @@ export function practiceMastery(overrides: Record<string, unknown> = {}) {
   return {
     passed: true,
     mastered: true,
+    cycleId: CYCLE_ID,
     attemptNo: 1,
+    attemptsLeft: 0,
     score: 75,
     transcript: 'A mastered answer.',
     feedback: 'Clear and relevant.',
@@ -152,8 +164,12 @@ export function practicePromotion(
 export function nativeSpoken(overrides: Record<string, unknown> = {}) {
   return {
     mode: 'native',
+    cycleId: CYCLE_ID,
+    attemptNo: 1,
+    attemptsLeft: 2,
     understood: true,
     transcript: 'A native-language answer.',
+    translatedTranscript: 'An English translation of the answer.',
     modelAnswer: 'This is a model English answer.',
     feedback: 'The answer shows understanding.',
     ...overrides,
@@ -163,10 +179,15 @@ export function nativeSpoken(overrides: Record<string, unknown> = {}) {
 export function nativeSilence(overrides: Record<string, unknown> = {}) {
   return {
     mode: 'native',
+    cycleId: CYCLE_ID,
+    attemptNo: 1,
+    attemptsLeft: 3,
     understood: false,
     transcript: '',
+    translatedTranscript: '',
     modelAnswer: '',
     feedback: 'Please speak clearly and try again.',
+    noSpeech: true,
     ...overrides,
   };
 }
@@ -191,7 +212,11 @@ const invalid = (name: string, context: ResponseContext, value: unknown) =>
 valid('diagnostic pass threshold', 'diagnostic', diagnosticDone());
 valid('diagnostic maximum score', 'diagnostic', diagnosticDone({ score: 100 }));
 valid('diagnostic fail threshold', 'diagnostic', diagnosticActive());
-valid('diagnostic minimum score and empty transcript', 'diagnostic', diagnosticActive({ score: 0, transcript: '' }));
+valid(
+  'diagnostic minimum score and empty transcript',
+  'diagnostic',
+  diagnosticActive({ score: 0, transcript: '', noSpeech: true }),
+);
 valid('diagnostic maximum transcript', 'diagnostic', diagnosticActive({ transcript: 'x'.repeat(12_000) }));
 valid('diagnostic maximum feedback', 'diagnostic', diagnosticActive({ feedback: 'x'.repeat(800) }));
 valid('diagnostic additive field', 'diagnostic', diagnosticDone({ additiveFutureField: { enabled: true } }));
@@ -203,6 +228,7 @@ for (const [name, value] of [
   ['missing transcript', without(diagnosticDone(), 'transcript')],
   ['missing feedback', without(diagnosticDone(), 'feedback')],
   ['missing done', without(diagnosticDone(), 'done')],
+  ['empty transcript without noSpeech', diagnosticActive({ score: 0, transcript: '' })],
   ['negative score', diagnosticActive({ score: -1 })],
   ['score above maximum', diagnosticDone({ score: 101 })],
   ['fractional score', diagnosticDone({ score: 60.5 })],
@@ -312,6 +338,10 @@ for (const [name, progressValue] of [
 }
 for (const [name, next] of [
   ['invalid kind', nextPayload('A1', { kind: 'other' })],
+  ['missing cycle id', without(nextPayload(), 'cycleId')],
+  ['invalid cycle id', nextPayload('A1', { cycleId: 'not-a-uuid' })],
+  ['missing attempts used', without(nextPayload(), 'attemptsUsed')],
+  ['wrong next attempts left', nextPayload('A1', { attemptsUsed: 1, attemptsLeft: 3 })],
   ['missing question', without(nextPayload(), 'question')],
   ['missing progress', without(nextPayload(), 'progress')],
 ] as const) {
@@ -346,7 +376,10 @@ for (const [from, to] of PROMOTIONS) {
 for (const [name, value] of [
   ['missing passed', without(practiceLearningPass(), 'passed')],
   ['missing mastered', without(practiceLearningPass(), 'mastered')],
+  ['missing cycle id', without(practiceLearningPass(), 'cycleId')],
+  ['invalid cycle id', practiceLearningPass({ cycleId: 'not-a-uuid' })],
   ['missing attempt number', without(practiceLearningPass(), 'attemptNo')],
+  ['missing attempts left', without(practiceLearningPass(), 'attemptsLeft')],
   ['missing score', without(practiceLearningPass(), 'score')],
   ['missing transcript', without(practiceLearningPass(), 'transcript')],
   ['missing feedback', without(practiceLearningPass(), 'feedback')],
@@ -408,7 +441,7 @@ for (const [name, value] of [
 }
 
 for (const [name, value] of [
-  ['pass with attemptsLeft', practiceLearningPass({ attemptsLeft: 0 })],
+  ['pass with nonzero attemptsLeft', practiceLearningPass({ attemptsLeft: 1 })],
   ['pass with final feedback', practiceLearningPass({ finalFeedback: 'Unexpected.' })],
   ['pass with noSpeech', practiceLearningPass({ noSpeech: false })],
   ['pass without next', without(practiceLearningPass(), 'next')],
@@ -426,17 +459,31 @@ for (const [name, value] of [
 // Native spoken/silence variants and exact string boundaries.
 valid('native spoken understood', 'practice-native', nativeSpoken());
 valid('native spoken not understood', 'practice-native', nativeSpoken({ understood: false }));
+valid(
+  'native terminal spoken',
+  'practice-native',
+  nativeSpoken({ attemptNo: 3, attemptsLeft: 0, next: nextPayload() }),
+);
 valid('native silence', 'practice-native', nativeSilence());
 valid(
   'native maximum strings',
   'practice-native',
-  nativeSpoken({ transcript: 'x'.repeat(12_000), modelAnswer: 'x'.repeat(800), feedback: 'x'.repeat(800) }),
+  nativeSpoken({
+    transcript: 'x'.repeat(12_000),
+    translatedTranscript: 'x'.repeat(12_000),
+    modelAnswer: 'x'.repeat(800),
+    feedback: 'x'.repeat(800),
+  }),
 );
 valid('native additive field', 'practice-native', nativeSpoken({ additiveFutureField: true }));
 
 for (const [name, value] of [
   ['missing understood', without(nativeSpoken(), 'understood')],
+  ['missing cycle id', without(nativeSpoken(), 'cycleId')],
+  ['missing attempt number', without(nativeSpoken(), 'attemptNo')],
+  ['missing attempts left', without(nativeSpoken(), 'attemptsLeft')],
   ['missing transcript', without(nativeSpoken(), 'transcript')],
+  ['missing translation', without(nativeSpoken(), 'translatedTranscript')],
   ['missing model answer', without(nativeSpoken(), 'modelAnswer')],
   ['missing feedback', without(nativeSpoken(), 'feedback')],
   ['wrong mode', nativeSpoken({ mode: 'english' })],
@@ -445,6 +492,8 @@ for (const [name, value] of [
   ['overlong transcript', nativeSpoken({ transcript: 'x'.repeat(12_001) })],
   ['non-string transcript', nativeSpoken({ transcript: 1 })],
   ['whitespace spoken transcript', nativeSpoken({ transcript: '   ' })],
+  ['overlong translation', nativeSpoken({ translatedTranscript: 'x'.repeat(12_001) })],
+  ['whitespace translation', nativeSpoken({ translatedTranscript: '   ' })],
   ['overlong model answer', nativeSpoken({ modelAnswer: 'x'.repeat(801) })],
   ['non-string model answer', nativeSpoken({ modelAnswer: 1 })],
   ['whitespace model answer', nativeSpoken({ modelAnswer: '   ' })],
@@ -452,7 +501,12 @@ for (const [name, value] of [
   ['overlong feedback', nativeSpoken({ feedback: 'x'.repeat(801) })],
   ['non-string feedback', nativeSpoken({ feedback: 1 })],
   ['understood silence', nativeSilence({ understood: true })],
+  ['silence without noSpeech', without(nativeSilence(), 'noSpeech')],
+  ['silence with translation', nativeSilence({ translatedTranscript: 'Unexpected.' })],
   ['silence with model answer', nativeSilence({ modelAnswer: 'Unexpected.' })],
+  ['retry with wrong attempts left', nativeSpoken({ attemptsLeft: 1 })],
+  ['retry with next', nativeSpoken({ next: nextPayload() })],
+  ['terminal without next', nativeSpoken({ attemptNo: 3, attemptsLeft: 0 })],
 ] as const) {
   invalid(`native ${name}`, 'practice-native', value);
 }

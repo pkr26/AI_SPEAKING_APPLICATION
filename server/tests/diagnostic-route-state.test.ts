@@ -505,10 +505,16 @@ describe('diagnostic completion race', () => {
       });
 
       expect(response.status).toBe(200);
-      expect(response.body).toEqual({ done: true, level });
-      // The terminal state is never read or written: the locked users row
-      // answers, and the transaction commits its lock release straight away.
-      expect(statements).toEqual(['BEGIN', NEXT_PARENT_LOCK, 'COMMIT']);
+      expect(response.body).toEqual({ done: true, level, answers: [] });
+      // The terminal state is read only to recover the latest run's durable
+      // answer summaries; no question is selected or written after completion.
+      expect(statements).toEqual([
+        'BEGIN',
+        NEXT_PARENT_LOCK,
+        'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE',
+        expect.stringContaining('FROM attempts a'),
+        'COMMIT',
+      ]);
       // No phantom question may be parked on the finished diagnostic: /answer
       // could only ever reject it with 400 DIAGNOSTIC_DONE.
       const state = await pool.query<{ current_question_id: string | null }>(
@@ -550,7 +556,7 @@ describe('diagnostic completion race', () => {
     expect(response.body).toMatchObject({
       done: false,
       question: { id: expect.any(String), cefrLevel: 'B1' },
-      progress: { asked: 0, maxQuestions: 5 },
+      progress: { asked: 0, maxQuestions: 3 },
     });
     expect(statements).toEqual([
       'BEGIN',

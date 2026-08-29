@@ -24,6 +24,8 @@ const CHECK_NAMES = [
   'duplicate question natural keys',
   'invalid question metadata',
   'invalid attempts',
+  'duplicate practice cycle attempt numbers',
+  'invalid assessment request cycle versions',
   'invalid diagnostic states',
 ] as const;
 
@@ -73,9 +75,9 @@ describe('database integrity preflight', () => {
     });
     expect(connect).toHaveBeenCalledOnce();
     expect(query.mock.calls[0]).toEqual(["SET statement_timeout = '60s'"]);
-    expect(query).toHaveBeenCalledTimes(7);
-    const integritySql = query.mock.calls.slice(1, 6).map(([sql]) => String(sql));
-    expect(integritySql).toHaveLength(5);
+    expect(query).toHaveBeenCalledTimes(9);
+    const integritySql = query.mock.calls.slice(1, 8).map(([sql]) => String(sql));
+    expect(integritySql).toHaveLength(7);
     expect(integritySql[0]).toContain('token_version <= 0');
     expect(integritySql[0]).toContain('diagnostic_completed AND cefr_level IS NULL');
     expect(integritySql[0]).toContain("btrim(name, U&'\\0009");
@@ -90,8 +92,11 @@ describe('database integrity preflight', () => {
     expect(integritySql[3]).toContain('passed IS DISTINCT FROM (score >= 60)');
     expect(integritySql[3]).toContain('char_length(transcript) > 12000');
     expect(integritySql[3]).toContain("btrim(feedback, U&'\\0009");
-    expect(integritySql[4]).toContain('low_idx > high_idx + 1');
-    expect(query.mock.calls[6]).toEqual([
+    expect(integritySql[3]).toContain("to_jsonb(attempts) ? 'practice_cycle_id'");
+    expect(integritySql[4]).toContain("GROUP BY to_jsonb(attempts)->>'practice_cycle_id', attempt_no");
+    expect(integritySql[5]).toContain("to_jsonb(assessment_requests) ? 'response_version'");
+    expect(integritySql[6]).toContain('low_idx > high_idx + 1');
+    expect(query.mock.calls[8]).toEqual([
       expect.stringContaining('SELECT id, cefr_level, prompt_word, question_text, translations'),
       [601],
     ]);
@@ -109,7 +114,7 @@ describe('database integrity preflight', () => {
   );
 
   it('reports multiple integrity failures on separate operator-readable lines', async () => {
-    mockPreflightQueries([2, 0, 3, 0, 0]);
+    mockPreflightQueries([2, 0, 3, 0, 0, 0, 0]);
 
     await expect(preflight(DATABASE_URL)).rejects.toThrow(
       'database integrity preflight failed; repair or explicitly migrate these rows before deployment:\n  - invalid users: 2\n  - invalid question metadata: 3',

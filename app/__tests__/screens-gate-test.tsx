@@ -1,6 +1,7 @@
 import {
   focusManager,
   notifyManager,
+  onlineManager,
   QueryClient,
   QueryClientProvider,
   useQueryClient,
@@ -10,16 +11,23 @@ import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { AppState, type AppStateStatus, StyleSheet, Text, useColorScheme } from 'react-native';
 import { router } from 'expo-router';
+import * as SecureStore from 'expo-secure-store';
+import * as SplashScreen from 'expo-splash-screen';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import AuthLayout from '../src/app/(auth)/_layout';
 import NotFoundScreen from '../src/app/+not-found';
-import RootLayout, { ErrorBoundary } from '../src/app/_layout';
+import RootLayout, {
+  ErrorBoundary,
+  ProfileRefreshBridge,
+  unstable_settings,
+} from '../src/app/_layout';
 import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { SessionLease, useAuth } from '../src/lib/auth';
 import { refreshDailyReminderLanguage } from '../src/lib/daily-reminder';
 import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
+import { resetNetworkStatusModuleForTests } from '../src/lib/network-status';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
@@ -45,7 +53,7 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
 
 const capturedStackProps: { screenOptions?: unknown }[] = [];
 const capturedScreenProps: ({ name?: string; options?: unknown } | undefined)[] = [];
-const capturedProtectedProps: { guard: boolean }[] = [];
+const capturedProtectedProps: { guard: boolean; screenNames: string[] }[] = [];
 
 function MockStack(props: { children?: React.ReactNode; screenOptions?: unknown }) {
   capturedStackProps.push(props);
@@ -56,7 +64,11 @@ function MockStackScreen(props: { name?: string; options?: unknown }) {
   return null;
 }
 function MockStackProtected(props: { guard: boolean; children?: React.ReactNode }) {
-  capturedProtectedProps.push(props);
+  const screenNames = React.Children.toArray(props.children).flatMap((child) => {
+    if (!React.isValidElement<{ name?: string }>(child) || !child.props.name) return [];
+    return [child.props.name];
+  });
+  capturedProtectedProps.push({ guard: props.guard, screenNames });
   return <>{props.children}</>;
 }
 
@@ -93,6 +105,49 @@ function MockStatusBar(props: { style?: string }) {
 
 jest.mock('expo-status-bar', () => ({ StatusBar: MockStatusBar }));
 
+jest.mock('../src/components/ClientUpgradeModal', () => {
+  const ReactActual = jest.requireActual<typeof import('react')>('react');
+  const { Text: NativeText } = jest.requireActual<typeof import('react-native')>('react-native');
+  return {
+    __esModule: true,
+    default: ({ onLocalSignOut }: { onLocalSignOut?: () => void }) =>
+      onLocalSignOut
+        ? ReactActual.createElement(
+            NativeText,
+            { testID: 'client-upgrade-local-sign-out', onPress: onLocalSignOut },
+            'local sign out',
+          )
+        : null,
+  };
+});
+
+// Connectivity behavior has its own focused test file. RootLayout still mounts
+// the real bridge here; keep its startup sample pending so it cannot race gate
+// assertions, while TanStack's online state remains under each test's control.
+jest.mock('expo-network', () => ({
+  NetworkStateType: { NONE: 'NONE' },
+  addNetworkStateListener: jest.fn(() => ({ remove: jest.fn() })),
+  getNetworkStateAsync: jest.fn(() => new Promise(() => undefined)),
+}));
+
+jest.mock('expo-secure-store', () => ({
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'device-only',
+  getItemAsync: jest.fn(async () => null),
+  setItemAsync: jest.fn(async () => undefined),
+  deleteItemAsync: jest.fn(async () => undefined),
+}));
+
+jest.mock('expo-splash-screen', () => ({
+  preventAutoHideAsync: jest.fn(async () => true),
+  hideAsync: jest.fn(async () => undefined),
+}));
+
+const mockSecureStoreGet = jest.mocked(SecureStore.getItemAsync);
+const mockSecureStoreSet = jest.mocked(SecureStore.setItemAsync);
+const mockHideSplash = jest.mocked(SplashScreen.hideAsync);
+const splashHoldCallCountAtImport = jest.mocked(SplashScreen.preventAutoHideAsync).mock.calls
+  .length;
+
 // The real SafeAreaProvider stays empty in jest until native insets arrive;
 // RootLayout mounts its own provider, so substitute a passthrough.
 jest.mock('react-native-safe-area-context', () => ({
@@ -115,6 +170,7 @@ const USER: User = {
   uiLanguage: 'hi',
   cefrLevel: 'B1',
   diagnosticCompleted: true,
+  diagnosticAcknowledged: true,
 };
 
 let mockAuthValue: AuthValue;
@@ -159,11 +215,14 @@ function MockPracticeFlowProvider({ children }: { children: React.ReactNode }) {
   return <>{children}</>;
 }
 
+const mockRestoreFeedback = jest.fn();
+
 jest.mock('../src/lib/practice-flow', () => ({
   PracticeFlowProvider: MockPracticeFlowProvider,
   usePracticeFlow: () => ({
     feedback: null,
     showFeedback: jest.fn(),
+    restoreFeedback: mockRestoreFeedback,
     clearFeedback: jest.fn(),
   }),
 }));
@@ -213,6 +272,7 @@ async function renderGate(queryClient = makeQueryClient()) {
       }}
     >
       <QueryClientProvider client={queryClient}>
+        <ProfileRefreshBridge />
         <Gate />
       </QueryClientProvider>
     </SafeAreaProvider>
@@ -277,6 +337,14 @@ function responderEvent() {
   };
 }
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 async function expectPressFeedback(
   getButton: () => TestInstance,
   resting: SemanticStyle,
@@ -302,21 +370,27 @@ afterEach(async () => {
   cleanup();
   await act(async () => {
     for (const client of queryClients) client.clear();
+    rootQueryClient?.clear();
     // TanStack can schedule a second notification from the first batch.
     await new Promise((resolve) => setTimeout(resolve, 0));
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
   queryClients.length = 0;
+  rootQueryClient = undefined;
 });
 
 beforeEach(() => {
   jest.clearAllMocks();
+  resetNetworkStatusModuleForTests();
   // RootLayout renders with a Hindi UI user and syncs the module-level language via the
   // real I18nProvider's effect; pin it back so every test starts in English.
   setActiveLanguage('en');
   asMock(useColorScheme).mockReturnValue('light');
-  mockApiFetch.mockReset();
+  mockApiFetch.mockReset().mockResolvedValue({ user: USER });
   mockRefreshDailyReminderLanguage.mockReset().mockResolvedValue(undefined);
+  mockSecureStoreGet.mockReset().mockResolvedValue(null);
+  mockSecureStoreSet.mockReset().mockResolvedValue(undefined);
+  mockHideSplash.mockReset().mockResolvedValue(undefined);
   capturedStackProps.length = 0;
   capturedScreenProps.length = 0;
   capturedProtectedProps.length = 0;
@@ -329,6 +403,27 @@ describe('root layout route guards', () => {
   function guards(): boolean[] {
     return capturedProtectedProps.map((props) => props.guard);
   }
+
+  it('anchors cold deep links behind the index route gate', () => {
+    expect(unstable_settings).toEqual({ initialRouteName: 'index' });
+  });
+
+  it('bridges the signed-in upgrade escape to secure local-session cleanup', async () => {
+    const resetStoredSession = jest.fn();
+    mockAuthValue = makeAuth({ resetStoredSession });
+    await render(<RootLayout />);
+
+    await fireEvent.press(screen.getByTestId('client-upgrade-local-sign-out'));
+
+    expect(resetStoredSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose a local sign-out callback without a stored signed-in session', async () => {
+    mockAuthValue = makeAuth({ token: null, user: null });
+    await render(<RootLayout />);
+
+    expect(screen.queryByTestId('client-upgrade-local-sign-out')).toBeNull();
+  });
 
   it('declares every route screen in order', async () => {
     mockAuthValue = makeAuth();
@@ -350,6 +445,26 @@ describe('root layout route guards', () => {
       'settings/privacy',
       'settings/terms',
     ]);
+  });
+
+  it('holds the native splash until the persisted public language is ready', async () => {
+    expect(splashHoldCallCountAtImport).toBe(1);
+    const languageRestore = deferred<string | null>();
+    mockSecureStoreGet.mockReturnValueOnce(languageRestore.promise);
+    mockAuthValue = makeAuth({ token: null, user: null });
+
+    await render(<RootLayout />);
+    expect(capturedScreenProps).toHaveLength(0);
+    expect(mockHideSplash).not.toHaveBeenCalled();
+
+    await act(async () => languageRestore.resolve('es'));
+    await waitFor(() => expect(capturedScreenProps.length).toBeGreaterThan(0));
+    await waitFor(() => expect(mockHideSplash).toHaveBeenCalledTimes(1));
+    const privacyTitle = (
+      capturedScreenProps.filter((props) => props?.name === 'settings/privacy').at(-1)?.options as
+        { title?: unknown } | undefined
+    )?.title;
+    expect(privacyTitle).toBe(translateFor('es', 'header.privacy'));
   });
 
   it('configures the exact header title for every visible nested route', async () => {
@@ -391,6 +506,9 @@ describe('root layout route guards', () => {
       translateFor('hi', 'header.privacy'),
       translateFor('hi', 'header.terms'),
     ]);
+    expect(
+      screen.container.queryAll((node) => node.props.accessibilityLanguage === 'hi-IN'),
+    ).not.toHaveLength(0);
   });
 
   it('relocalizes and refreshes reminder copy only from UI-language and account changes', async () => {
@@ -504,6 +622,30 @@ describe('root layout route guards', () => {
     expect(guards()).toEqual([true, false, false, false]);
   });
 
+  it('keeps Privacy and Terms public without exposing account routes signed out', async () => {
+    mockAuthValue = makeAuth({ token: null, user: null });
+    await render(<RootLayout />);
+
+    const accountGroup = capturedProtectedProps.find((props) =>
+      props.screenNames.includes('settings/index'),
+    );
+    expect(accountGroup).toEqual({
+      guard: false,
+      screenNames: [
+        'recordings',
+        'settings/index',
+        'settings/change-password',
+        'settings/delete-account',
+      ],
+    });
+    const protectedNames = capturedProtectedProps.flatMap((props) => props.screenNames);
+    expect(protectedNames).not.toContain('settings/privacy');
+    expect(protectedNames).not.toContain('settings/terms');
+    expect(capturedScreenProps.map((props) => props?.name)).toEqual(
+      expect.arrayContaining(['settings/privacy', 'settings/terms']),
+    );
+  });
+
   it('keeps every protected group closed after a secure-store restore error', async () => {
     mockAuthValue = makeAuth({
       token: null,
@@ -538,6 +680,14 @@ describe('root layout route guards', () => {
     mockAuthValue = makeAuth();
     await render(<RootLayout />);
     expect(guards()).toEqual([false, false, true, true]);
+  });
+
+  it('keeps a completed but unacknowledged placement inside diagnostic', async () => {
+    mockAuthValue = makeAuth({
+      user: { ...USER, diagnosticAcknowledged: false },
+    });
+    await render(<RootLayout />);
+    expect(guards()).toEqual([false, true, false, true]);
   });
 
   it('locks assessment routes against header-back and swipe-back bypasses', async () => {
@@ -839,6 +989,51 @@ describe('(auth) layout', () => {
 });
 
 describe('index gate', () => {
+  it('keeps the current route visible while the persistent profile refresh is in flight', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderGate();
+
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
+    expect(screen.queryByText(t('gate.loadingProfile'))).toBeNull();
+  });
+
+  it('applies cross-device language and placement changes and expires dependent caches', async () => {
+    const client = makeQueryClient();
+    mockApiFetch.mockResolvedValueOnce({ user: USER });
+    await renderGate(client);
+    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+    asMock(mockAuthValue.setUser).mockClear();
+
+    client.setQueryData(['question-help', USER.id, USER.nativeLanguage, 'question'], {
+      translated: 'old',
+    });
+    client.setQueryData(['diagnostic-next', 1, USER.id], { done: true });
+    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], { stale: true });
+    client.setQueryData(['practice-stats', USER.id], { stale: true });
+    const refreshed = {
+      ...USER,
+      nativeLanguage: 'es' as const,
+      cefrLevel: null,
+      diagnosticCompleted: false,
+      diagnosticAcknowledged: false,
+    };
+    mockApiFetch.mockResolvedValueOnce({ user: refreshed });
+
+    await act(async () => {
+      focusManager.setFocused(false);
+      focusManager.setFocused(true);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(refreshed));
+    expect(
+      client.getQueryData(['question-help', USER.id, USER.nativeLanguage, 'question']),
+    ).toBeUndefined();
+    expect(client.getQueryData(['diagnostic-next', 1, USER.id])).toBeUndefined();
+    expect(client.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toBeUndefined();
+    expect(client.getQueryState(['practice-stats', USER.id])?.isInvalidated).toBe(true);
+  });
+
   it('shows a restoring message while the session is being read', async () => {
     mockAuthValue = makeAuth({ isRestoring: true });
     await renderGate();
@@ -979,18 +1174,32 @@ describe('index gate', () => {
 
   it('redirects to the home progress screen when the diagnostic is complete', async () => {
     mockAuthValue = makeAuth();
+    mockApiFetch.mockResolvedValue({ user: USER });
     await renderGate();
     expect(screen.getByTestId('redirect')).toHaveTextContent('/home');
-    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledWith('/auth/me', { signal: expect.any(AbortSignal) });
   });
 
   it('redirects to the diagnostic when it is not complete', async () => {
     mockAuthValue = makeAuth({
       user: { ...USER, diagnosticCompleted: false, cefrLevel: null },
     });
+    mockApiFetch.mockResolvedValue({
+      user: { ...USER, diagnosticCompleted: false, cefrLevel: null },
+    });
     await renderGate();
     expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
-    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockApiFetch).toHaveBeenCalledWith('/auth/me', { signal: expect.any(AbortSignal) });
+  });
+
+  it('resumes the durable result reveal after a final-answer kill/relaunch', async () => {
+    const pendingReveal = { ...USER, diagnosticAcknowledged: false };
+    mockAuthValue = makeAuth({ user: pendingReveal });
+    mockApiFetch.mockResolvedValue({ user: pendingReveal });
+    await renderGate();
+
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
+    expect(mockApiFetch).toHaveBeenCalledWith('/auth/me', { signal: expect.any(AbortSignal) });
   });
 
   it('loads the profile when a token exists without a user', async () => {
@@ -1004,6 +1213,29 @@ describe('index gate', () => {
       expect.objectContaining({ signal: expect.anything() }),
     );
     expect(queryClient.getQueryCache().find({ queryKey: ['me', 1], exact: true })).toBeDefined();
+  });
+
+  it('keeps the restored token and waits for an automatic reconnect when profile loading is paused', async () => {
+    const fetched = { ...USER, diagnosticCompleted: false, cefrLevel: null };
+    mockAuthValue = makeAuth({ user: null });
+    mockApiFetch.mockResolvedValue({ user: fetched });
+    onlineManager.setOnline(false);
+
+    await renderGate();
+
+    expect(screen.getByRole('header', { name: t('gate.offlineTitle') })).toBeTruthy();
+    expect(screen.getByText(t('gate.offlineBody')).props.accessibilityLiveRegion).toBe('polite');
+    expect(mockAuthValue.token).toBe('token-abc');
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockAuthValue.resetStoredSession).not.toHaveBeenCalled();
+
+    await act(async () => {
+      onlineManager.setOnline(true);
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(mockAuthValue.setUser).toHaveBeenCalledWith(fetched));
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/diagnostic');
   });
 
   it('stores the fetched profile and redirects based on it', async () => {
@@ -1067,7 +1299,9 @@ describe('index gate', () => {
     mockApiFetch.mockReturnValue(profileRequest);
     const rendered = await renderGate();
     expect(mockApiFetch).toHaveBeenCalledTimes(1);
-    expect(captureA).toHaveBeenCalledTimes(1);
+    // The persistent bridge and Gate's passive observer each capture the same
+    // render identity, while only the bridge issues the request.
+    expect(captureA).toHaveBeenCalledTimes(2);
 
     const replacementSetUser = jest.fn();
     currentLease = leaseB;
@@ -1079,7 +1313,7 @@ describe('index gate', () => {
     });
     await rendered.rerenderGate();
     expect(mockApiFetch).toHaveBeenCalledTimes(1);
-    expect(captureB).toHaveBeenCalledTimes(1);
+    expect(captureB).toHaveBeenCalledTimes(2);
 
     const currentProfile = { ...USER, name: 'Current Lease' };
     await act(async () => {
@@ -1110,7 +1344,7 @@ describe('index gate', () => {
     await renderGate();
     expect(screen.getByText(t('gate.loadingProfile'))).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledTimes(1);
-    expect(mockAuthValue.captureSessionLease).toHaveBeenCalledTimes(1);
+    expect(mockAuthValue.captureSessionLease).toHaveBeenCalledTimes(2);
 
     // Invalidate Auth synchronously without granting React a rerender first.
     // A query-key/sessionVersion guard alone cannot cover this interval.

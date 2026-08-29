@@ -11,6 +11,9 @@ export const SAMPLE_HISTORY_NATIVE_IOS_UNIT_ID = 'ca-app-pub-3940256099942544/39
 
 const ADMOB_APP_ID = /^ca-app-pub-\d{16}~\d{10}$/;
 const ADMOB_UNIT_ID = /^ca-app-pub-\d{16}\/\d{10}$/;
+const IOS_STORE_SEARCH_FALLBACK = 'https://apps.apple.com/us/search?term=AI%20English%20Coach';
+const ANDROID_PLAY_STORE_FALLBACK =
+  'https://play.google.com/store/apps/details?id=com.aienglish.coach';
 
 /** Current Google/participating-buyer list from the AdMob iOS privacy guide. */
 export const GOOGLE_SKADNETWORK_IDENTIFIERS = [
@@ -97,6 +100,41 @@ function productionUnitId(name: string, value: string | undefined, sample: strin
   return normalized;
 }
 
+function storeUrl(
+  name: string,
+  value: string | undefined,
+  platform: 'ios' | 'android',
+  production: boolean,
+): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    if (production) throw new Error(`${name} must be configured in production`);
+    return platform === 'ios' ? IOS_STORE_SEARCH_FALLBACK : ANDROID_PLAY_STORE_FALLBACK;
+  }
+
+  let url: URL;
+  try {
+    url = new URL(normalized);
+  } catch {
+    throw new Error(`${name} must be a valid absolute store URL`);
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.hash) {
+    throw new Error(`${name} must be a safe HTTPS store URL`);
+  }
+  if (platform === 'ios') {
+    if (url.hostname !== 'apps.apple.com' || !/\/id\d+\/?$/.test(url.pathname)) {
+      throw new Error(`${name} must be an apps.apple.com URL ending in a numeric app ID`);
+    }
+  } else if (
+    url.hostname !== 'play.google.com' ||
+    url.pathname !== '/store/apps/details' ||
+    url.searchParams.get('id') !== 'com.aienglish.coach'
+  ) {
+    throw new Error(`${name} must be the Google Play URL for com.aienglish.coach`);
+  }
+  return normalized;
+}
+
 export default (
   { config }: ConfigContext,
   environment: NodeJS.ProcessEnv = process.env,
@@ -154,6 +192,18 @@ export default (
   ) {
     throw new Error('AdMob production unit IDs must be unique per platform and placement');
   }
+  const iosStoreUrl = storeUrl(
+    'EXPO_PUBLIC_IOS_APP_STORE_URL',
+    environment.EXPO_PUBLIC_IOS_APP_STORE_URL,
+    'ios',
+    production,
+  );
+  const androidStoreUrl = storeUrl(
+    'EXPO_PUBLIC_ANDROID_PLAY_STORE_URL',
+    environment.EXPO_PUBLIC_ANDROID_PLAY_STORE_URL,
+    'android',
+    production,
+  );
   const base = appJson.expo as ExpoConfig;
   const plugins = (base.plugins ?? []).filter((plugin) => {
     const name = Array.isArray(plugin) ? plugin[0] : plugin;
@@ -170,6 +220,10 @@ export default (
         homeBannerIosUnitId,
         historyNativeAndroidUnitId,
         historyNativeIosUnitId,
+      },
+      storeUrls: {
+        ios: iosStoreUrl,
+        android: androidStoreUrl,
       },
     },
     plugins: [

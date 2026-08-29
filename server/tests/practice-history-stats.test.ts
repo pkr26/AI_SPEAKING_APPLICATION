@@ -1,6 +1,6 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { app, pool, registerUser } from './helpers';
+import { app, createClosedPracticeCycle, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -28,11 +28,15 @@ async function insertAttempt(
   minutesAgo: number,
   overrides: { context?: string; score?: number; passed?: boolean } = {},
 ): Promise<string> {
+  const context = overrides.context ?? 'practice';
+  const cycleId = context === 'diagnostic' ? null : await createClosedPracticeCycle(userId, questionId);
   const { rows } = await pool.query<{ id: string }>(
-    `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, created_at)
-     VALUES ($1, $2, $3, 1, 'transcribed answer', $4, $5, 'feedback text', now() - ($6 || ' minutes')::interval)
+    `INSERT INTO attempts
+       (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, created_at, practice_cycle_id)
+     VALUES ($1, $2, $3, 1, 'transcribed answer', $4, $5, 'feedback text',
+       now() - ($6 || ' minutes')::interval, $7)
      RETURNING id`,
-    [userId, questionId, overrides.context ?? 'practice', overrides.score ?? 70, overrides.passed ?? true, minutesAgo],
+    [userId, questionId, context, overrides.score ?? 70, overrides.passed ?? true, minutesAgo, cycleId],
   );
   return rows[0].id;
 }
@@ -77,6 +81,10 @@ describe('GET /practice/history', () => {
       passed: true,
       transcript: 'transcribed answer',
       feedback: 'feedback text',
+      cycleId: expect.any(String),
+      understood: null,
+      translatedTranscript: null,
+      modelAnswer: null,
       createdAt: expect.any(String),
       recordingId: null,
       recordingStatus: null,
@@ -176,6 +184,7 @@ describe('GET /practice/stats', () => {
       practicedToday: 0,
       totalAttempts: 0,
       lastPracticedAt: null,
+      timeZone: 'UTC',
     });
   });
 

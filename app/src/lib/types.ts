@@ -15,6 +15,8 @@ export interface User {
   uiLanguage: UiLanguage;
   cefrLevel: CefrLevel | null;
   diagnosticCompleted: boolean;
+  /** Additive compatibility field; absent older servers are treated as acknowledged. */
+  diagnosticAcknowledged?: boolean;
 }
 
 export interface Question {
@@ -24,13 +26,24 @@ export interface Question {
   questionText: string;
 }
 
+export interface DiagnosticAnswerSummary {
+  attemptNo: number;
+  promptWord: string;
+  questionText: string;
+  transcript: string;
+  score: number;
+  passed: boolean;
+  feedback: string;
+}
+
 export type DiagnosticNext =
   | {
       done: false;
       question: Question;
       progress: { asked: number; maxQuestions: number };
+      answers?: DiagnosticAnswerSummary[];
     }
-  | { done: true; level: CefrLevel };
+  | { done: true; level: CefrLevel; answers?: DiagnosticAnswerSummary[] };
 
 export interface DiagnosticAnswerResult {
   passed: boolean;
@@ -38,6 +51,7 @@ export interface DiagnosticAnswerResult {
   transcript: string;
   feedback: string;
   done: boolean;
+  noSpeech?: true;
   level?: CefrLevel;
   nextQuestion?: Question;
   recordingId?: string;
@@ -79,13 +93,18 @@ export interface PracticeQuestionPayload {
   question: Question;
   kind: PracticeKind;
   progress: PracticeProgress;
+  /** Durable server-owned serving cycle shared by English and native answers. */
+  cycleId: string;
+  attemptsUsed: number;
+  attemptsLeft: number;
 }
 
 export interface AttemptResult {
+  cycleId: string;
   passed: boolean;
   mastered: boolean;
   attemptNo: number;
-  attemptsLeft?: number;
+  attemptsLeft: number;
   noSpeech?: boolean;
   score: number;
   transcript: string;
@@ -111,8 +130,8 @@ export interface PracticeStats {
   lastPracticedAt: string | null;
 }
 
-export type HistoryContext = 'diagnostic' | 'practice';
-export type RecordingContext = HistoryContext | 'practice-native';
+export type HistoryContext = 'diagnostic' | 'practice' | 'practice-native';
+export type RecordingContext = HistoryContext;
 export type RecordingStatus = 'retention_pending' | 'available' | 'unavailable';
 
 export interface HistoryItem {
@@ -122,10 +141,14 @@ export interface HistoryItem {
   questionText: string;
   cefrLevel: CefrLevel;
   context: HistoryContext;
+  cycleId: string | null;
   attemptNo: number;
-  score: number;
-  passed: boolean;
+  score: number | null;
+  passed: boolean | null;
+  understood: boolean | null;
   transcript: string;
+  translatedTranscript: string | null;
+  modelAnswer: string | null;
   feedback: string;
   createdAt: string;
   recordingId?: string | null;
@@ -137,20 +160,33 @@ export interface HistoryPage {
   nextCursor: string | null;
 }
 
-/** One page of the GET /auth/me/data export. Attempt rows are passed through
- * verbatim so the exported file keeps full server fidelity. */
+/** One page of the GET /auth/me/data export. Export rows are passed through
+ * verbatim so the downloaded file keeps full server fidelity. Attempts and
+ * practice cycles have independent cursors/done flags. */
 export interface UserDataPage {
   user: User;
   attempts: Record<string, unknown>[];
+  practiceProgress: Record<string, unknown>[];
+  practiceCycles: Record<string, unknown>[];
+  diagnosticState: Record<string, unknown> | null;
   nextCursor: string | null;
+  nextPracticeCycleCursor: string | null;
+  attemptsDone: boolean;
+  practiceCyclesDone: boolean;
 }
 
 export interface NativeAttemptResult {
   mode: 'native';
+  cycleId: string;
   understood: boolean;
+  attemptNo: number;
+  attemptsLeft: number;
+  noSpeech?: boolean;
   transcript: string;
+  translatedTranscript: string;
   modelAnswer: string;
   feedback: string;
+  next?: PracticeQuestionPayload;
   recordingId?: string;
 }
 
@@ -273,6 +309,11 @@ function parseWith<T>(value: unknown, predicate: (value: unknown) => value is T)
   return value;
 }
 
+/** Strict public-question parser reused by durable assessment replay. */
+export function parseQuestion(value: unknown): Question {
+  return parseWith(value, isQuestion);
+}
+
 export function parseUser(value: unknown): User {
   return parseWith(value, (candidate): candidate is User => {
     if (!isRecord(candidate)) return false;
@@ -283,7 +324,9 @@ export function parseUser(value: unknown): User {
       isNativeLanguage(candidate.nativeLanguage) &&
       isUiLanguage(candidate.uiLanguage) &&
       (candidate.cefrLevel === null || isCefrLevel(candidate.cefrLevel)) &&
-      typeof candidate.diagnosticCompleted === 'boolean'
+      typeof candidate.diagnosticCompleted === 'boolean' &&
+      (candidate.diagnosticAcknowledged === undefined ||
+        typeof candidate.diagnosticAcknowledged === 'boolean')
     );
   });
 }
@@ -343,11 +386,19 @@ function isLevelUp(value: unknown): value is LevelUp {
 }
 
 function isPracticeQuestionPayload(value: unknown): value is PracticeQuestionPayload {
+  if (!isRecord(value)) return false;
+  const attemptsUsed = value.attemptsUsed;
+  const attemptsLeft = value.attemptsLeft;
   return (
-    isRecord(value) &&
     isPracticeKind(value.kind) &&
     isPracticeProgress(value.progress) &&
-    isQuestion(value.question)
+    isQuestion(value.question) &&
+    isUuid(value.cycleId) &&
+    isNumber(attemptsUsed) &&
+    Number.isInteger(attemptsUsed) &&
+    attemptsUsed >= 0 &&
+    attemptsUsed < PRACTICE_MAX_ATTEMPTS &&
+    attemptsLeft === PRACTICE_MAX_ATTEMPTS - attemptsUsed
   );
 }
 
@@ -364,11 +415,13 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
   const level = value.level;
   const question = value.question;
   const rawProgress = value.progress;
+  const rawAnswers = value.answers;
+  const answers = rawAnswers === undefined ? undefined : parseDiagnosticAnswerSummaries(rawAnswers);
   if (done) {
     if (!isCefrLevel(level) || question !== undefined || rawProgress !== undefined) {
       throw new ContractError();
     }
-    return { done: true, level };
+    return answers === undefined ? { done: true, level } : { done: true, level, answers };
   }
   if (!isRecord(rawProgress)) throw new ContractError();
   const asked = rawProgress.asked;
@@ -386,11 +439,43 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
   ) {
     throw new ContractError();
   }
-  return {
+  const result: DiagnosticNext = {
     done: false,
     question: parseWith(question, isQuestion),
     progress: { asked, maxQuestions },
   };
+  if (answers !== undefined) result.answers = answers;
+  return result;
+}
+
+function parseDiagnosticAnswerSummaries(value: unknown): DiagnosticAnswerSummary[] {
+  if (!Array.isArray(value) || value.length > 5) throw new ContractError();
+  return value.map((candidate, index) => {
+    if (
+      !isRecord(candidate) ||
+      !isNumber(candidate.attemptNo) ||
+      !Number.isInteger(candidate.attemptNo) ||
+      candidate.attemptNo !== index + 1 ||
+      !isBoundedNonEmptyString(candidate.promptWord, 100) ||
+      !isBoundedNonEmptyString(candidate.questionText, 1_000) ||
+      !isBoundedNonEmptyString(candidate.transcript, 12_000) ||
+      !isScore(candidate.score) ||
+      typeof candidate.passed !== 'boolean' ||
+      candidate.passed !== candidate.score >= PRACTICE_PASS_SCORE ||
+      !isBoundedNonEmptyString(candidate.feedback, 800)
+    ) {
+      throw new ContractError();
+    }
+    return {
+      attemptNo: candidate.attemptNo,
+      promptWord: candidate.promptWord,
+      questionText: candidate.questionText,
+      transcript: candidate.transcript,
+      score: candidate.score,
+      passed: candidate.passed,
+      feedback: candidate.feedback,
+    };
+  });
 }
 
 export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerResult {
@@ -400,6 +485,7 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
   const transcript = value.transcript;
   const feedback = value.feedback;
   const done = value.done;
+  const noSpeech = value.noSpeech;
   const recordingId = value.recordingId;
   if (
     typeof passed !== 'boolean' ||
@@ -422,6 +508,23 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
   if (recordingId !== undefined) result.recordingId = recordingId;
   const level = value.level;
   const nextQuestion = value.nextQuestion;
+  if (noSpeech !== undefined) {
+    if (
+      noSpeech !== true ||
+      passed ||
+      score !== 0 ||
+      transcript !== '' ||
+      done ||
+      level !== undefined ||
+      nextQuestion === undefined
+    ) {
+      throw new ContractError();
+    }
+    result.noSpeech = true;
+    result.nextQuestion = parseWith(nextQuestion, isQuestion);
+    return result;
+  }
+  if (!isBoundedNonEmptyString(transcript, 12_000)) throw new ContractError();
   if (done) {
     if (!isCefrLevel(level) || nextQuestion !== undefined) {
       throw new ContractError();
@@ -467,13 +570,14 @@ export function parseHelpContent(value: unknown): HelpContent {
   };
 }
 
-export function parseAttemptResult(value: unknown): AttemptResult {
+export function parseAttemptResult(value: unknown, expectedCycleId?: string): AttemptResult {
   if (!isRecord(value)) throw new ContractError();
   // Snapshot every response field once. JSON responses are plain records, but
   // callers and tests may still hand this public parser accessor-backed input;
   // validation and rendering must agree on the same observed values.
   const passed = value.passed;
   const mastered = value.mastered;
+  const cycleId = value.cycleId;
   const attemptNo = value.attemptNo;
   const score = value.score;
   const transcript = value.transcript;
@@ -485,6 +589,8 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   const next = value.next;
   const recordingId = value.recordingId;
   if (
+    !isUuid(cycleId) ||
+    (expectedCycleId !== undefined && cycleId !== expectedCycleId) ||
     typeof passed !== 'boolean' ||
     typeof mastered !== 'boolean' ||
     !isNumber(attemptNo) ||
@@ -492,6 +598,10 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     attemptNo < 1 ||
     attemptNo > PRACTICE_MAX_ATTEMPTS ||
     !isScore(score) ||
+    !isNumber(attemptsLeft) ||
+    !Number.isInteger(attemptsLeft) ||
+    attemptsLeft < 0 ||
+    attemptsLeft > PRACTICE_MAX_ATTEMPTS ||
     !isBoundedString(transcript, 12_000) ||
     !isBoundedNonEmptyString(feedback, 800) ||
     (recordingId !== undefined && !isUuid(recordingId))
@@ -499,9 +609,11 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     throw new ContractError();
   }
   const result: AttemptResult = {
+    cycleId,
     passed,
     mastered,
     attemptNo,
+    attemptsLeft,
     score,
     transcript,
     feedback,
@@ -534,7 +646,6 @@ export function parseAttemptResult(value: unknown): AttemptResult {
       throw new ContractError();
     }
     result.noSpeech = true;
-    result.attemptsLeft = attemptsLeft as number;
     return result;
   }
 
@@ -543,7 +654,7 @@ export function parseAttemptResult(value: unknown): AttemptResult {
   if (!isNonEmptyString(transcript)) throw new ContractError();
 
   if (passed) {
-    if (attemptsLeft !== undefined || finalFeedback !== undefined || next === undefined) {
+    if (attemptsLeft !== 0 || finalFeedback !== undefined || next === undefined) {
       throw new ContractError();
     }
     result.next = parseWith(next, isPracticeQuestionPayload);
@@ -572,48 +683,80 @@ export function parseAttemptResult(value: unknown): AttemptResult {
     ) {
       throw new ContractError();
     }
-    result.attemptsLeft = expectedAttemptsLeft;
     return result;
   }
 
   if (attemptsLeft !== 0 || !isBoundedNonEmptyString(finalFeedback, 4_000) || next === undefined) {
     throw new ContractError();
   }
-  result.attemptsLeft = 0;
   result.finalFeedback = finalFeedback;
   result.next = parseWith(next, isPracticeQuestionPayload);
   return result;
 }
 
-export function parseNativeAttemptResult(value: unknown): NativeAttemptResult {
+export function parseNativeAttemptResult(
+  value: unknown,
+  expectedCycleId?: string,
+): NativeAttemptResult {
   if (
     !isRecord(value) ||
     value.mode !== 'native' ||
+    !isUuid(value.cycleId) ||
+    (expectedCycleId !== undefined && value.cycleId !== expectedCycleId) ||
     typeof value.understood !== 'boolean' ||
+    !isNumber(value.attemptNo) ||
+    !Number.isInteger(value.attemptNo) ||
+    value.attemptNo < 1 ||
+    value.attemptNo > PRACTICE_MAX_ATTEMPTS ||
+    !isNumber(value.attemptsLeft) ||
+    !Number.isInteger(value.attemptsLeft) ||
+    value.attemptsLeft < 0 ||
+    value.attemptsLeft > PRACTICE_MAX_ATTEMPTS ||
     !isBoundedString(value.transcript, 12_000) ||
+    !isBoundedString(value.translatedTranscript, 12_000) ||
     !isBoundedString(value.modelAnswer, 800) ||
     !isBoundedNonEmptyString(value.feedback, 800) ||
     (value.recordingId !== undefined && !isUuid(value.recordingId))
   ) {
     throw new ContractError();
   }
-  const noSpeech = value.transcript === '';
-  if (
-    (noSpeech && (value.understood || value.modelAnswer !== '')) ||
-    (!noSpeech &&
-      (!isBoundedNonEmptyString(value.transcript, 12_000) ||
-        !isBoundedNonEmptyString(value.modelAnswer, 800)))
+  const noSpeech = value.noSpeech === true;
+  if (value.noSpeech !== undefined && value.noSpeech !== true) throw new ContractError();
+  if (noSpeech) {
+    if (
+      value.understood ||
+      value.transcript !== '' ||
+      value.translatedTranscript !== '' ||
+      value.modelAnswer !== '' ||
+      value.next !== undefined ||
+      value.attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (value.attemptNo - 1)
+    ) {
+      throw new ContractError();
+    }
+  } else if (
+    !isBoundedNonEmptyString(value.transcript, 12_000) ||
+    !isBoundedNonEmptyString(value.translatedTranscript, 12_000) ||
+    !isBoundedNonEmptyString(value.modelAnswer, 800) ||
+    value.attemptsLeft !== PRACTICE_MAX_ATTEMPTS - value.attemptNo ||
+    (value.attemptsLeft === 0) !== (value.next !== undefined)
   ) {
     throw new ContractError();
   }
-  return {
+  const result: NativeAttemptResult = {
     mode: 'native',
+    cycleId: value.cycleId,
     understood: value.understood,
+    attemptNo: value.attemptNo,
+    attemptsLeft: value.attemptsLeft,
     transcript: value.transcript,
+    translatedTranscript: value.translatedTranscript,
     modelAnswer: value.modelAnswer,
     feedback: value.feedback,
+    ...(noSpeech ? { noSpeech: true } : {}),
     ...(value.recordingId === undefined ? {} : { recordingId: value.recordingId }),
   };
+  if (value.next !== undefined) result.next = parseWith(value.next, isPracticeQuestionPayload);
+  return result;
 }
 
 /** Server timestamps are ISO-8601 strings; anything unparseable is contract drift. */
@@ -689,9 +832,13 @@ const DIAGNOSTIC_MAX_ATTEMPTS = 5;
 function parseHistoryItem(value: unknown): HistoryItem {
   if (!isRecord(value)) throw new ContractError();
   const context = value.context;
+  const cycleId = value.cycleId;
   const attemptNo = value.attemptNo;
   const score = value.score;
   const passed = value.passed;
+  const understood = value.understood;
+  const translatedTranscript = value.translatedTranscript;
+  const modelAnswer = value.modelAnswer;
   const recordingId = value.recordingId;
   const recordingStatus = value.recordingStatus;
   if (
@@ -700,13 +847,11 @@ function parseHistoryItem(value: unknown): HistoryItem {
     !isBoundedNonEmptyString(value.promptWord, 100) ||
     !isBoundedNonEmptyString(value.questionText, 1_000) ||
     !isCefrLevel(value.cefrLevel) ||
-    (context !== 'diagnostic' && context !== 'practice') ||
+    (context !== 'diagnostic' && context !== 'practice' && context !== 'practice-native') ||
     !isNumber(attemptNo) ||
     !Number.isSafeInteger(attemptNo) ||
     attemptNo < 1 ||
     attemptNo > (context === 'diagnostic' ? DIAGNOSTIC_MAX_ATTEMPTS : PRACTICE_MAX_ATTEMPTS) ||
-    !isScore(score) ||
-    typeof passed !== 'boolean' ||
     !isBoundedString(value.transcript, 12_000) ||
     !isBoundedNonEmptyString(value.feedback, 4_000) ||
     !isTimestamp(value.createdAt) ||
@@ -718,7 +863,31 @@ function parseHistoryItem(value: unknown): HistoryItem {
   ) {
     throw new ContractError();
   }
-  if (passed !== score >= PRACTICE_PASS_SCORE) throw new ContractError();
+  if (context === 'practice-native') {
+    if (
+      !isUuid(cycleId) ||
+      score !== null ||
+      passed !== null ||
+      typeof understood !== 'boolean' ||
+      !isBoundedNonEmptyString(value.transcript, 12_000) ||
+      !isBoundedNonEmptyString(translatedTranscript, 12_000) ||
+      !isBoundedNonEmptyString(modelAnswer, 800)
+    ) {
+      throw new ContractError();
+    }
+  } else {
+    if (
+      !isScore(score) ||
+      typeof passed !== 'boolean' ||
+      passed !== score >= PRACTICE_PASS_SCORE ||
+      understood !== null ||
+      translatedTranscript !== null ||
+      modelAnswer !== null ||
+      (context === 'practice' ? !isUuid(cycleId) : cycleId !== null)
+    ) {
+      throw new ContractError();
+    }
+  }
   return {
     id: value.id,
     questionId: value.questionId,
@@ -726,10 +895,14 @@ function parseHistoryItem(value: unknown): HistoryItem {
     questionText: value.questionText,
     cefrLevel: value.cefrLevel,
     context,
+    cycleId: cycleId as string | null,
     attemptNo: attemptNo as number,
-    score,
-    passed,
+    score: score as number | null,
+    passed: passed as boolean | null,
+    understood: understood as boolean | null,
     transcript: value.transcript,
+    translatedTranscript: translatedTranscript as string | null,
+    modelAnswer: modelAnswer as string | null,
     feedback: value.feedback,
     createdAt: value.createdAt,
     ...(recordingId === undefined ? {} : { recordingId, recordingStatus }),
@@ -843,21 +1016,38 @@ export function parseUserDataPage(value: unknown): UserDataPage {
   if (
     !isRecord(value) ||
     !Array.isArray(value.attempts) ||
+    !Array.isArray(value.practiceProgress) ||
+    !Array.isArray(value.practiceCycles) ||
     value.attempts.length > EXPORT_MAX_PAGE_ITEMS ||
+    value.practiceCycles.length > EXPORT_MAX_PAGE_ITEMS ||
+    (value.diagnosticState !== null && !isRecord(value.diagnosticState)) ||
     (value.nextCursor !== null && !isUuid(value.nextCursor)) ||
-    (value.attempts.length === 0 && value.nextCursor !== null)
+    (value.nextPracticeCycleCursor !== null && !isUuid(value.nextPracticeCycleCursor)) ||
+    typeof value.attemptsDone !== 'boolean' ||
+    typeof value.practiceCyclesDone !== 'boolean' ||
+    (value.attempts.length === 0 && value.nextCursor !== null) ||
+    (value.practiceCycles.length === 0 && value.nextPracticeCycleCursor !== null) ||
+    value.attemptsDone !== (value.nextCursor === null) ||
+    value.practiceCyclesDone !== (value.nextPracticeCycleCursor === null)
   ) {
     throw new ContractError();
   }
-  const attempts = value.attempts.map((attempt) => {
-    // Rows are exported verbatim, but they must at least be JSON objects.
-    if (!isRecord(attempt)) throw new ContractError();
-    return attempt;
-  });
+  const parseRows = (rows: unknown[]): Record<string, unknown>[] =>
+    rows.map((row) => {
+      // Rows are exported verbatim, but they must at least be JSON objects.
+      if (!isRecord(row)) throw new ContractError();
+      return row;
+    });
   return {
     user: parseUser(value.user),
-    attempts,
+    attempts: parseRows(value.attempts),
+    practiceProgress: parseRows(value.practiceProgress),
+    practiceCycles: parseRows(value.practiceCycles),
+    diagnosticState: value.diagnosticState,
     nextCursor: value.nextCursor,
+    nextPracticeCycleCursor: value.nextPracticeCycleCursor,
+    attemptsDone: value.attemptsDone,
+    practiceCyclesDone: value.practiceCyclesDone,
   };
 }
 

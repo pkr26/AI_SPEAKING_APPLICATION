@@ -43,6 +43,9 @@ const question = {
   questionText: 'Where would you like to travel?',
 } as const;
 
+const cycleId = '550e8400-e29b-41d4-a716-446655440020';
+const nextCycleId = '550e8400-e29b-41d4-a716-446655440021';
+
 const practiceProgress = {
   masteredCount: 2,
   learningCount: 1,
@@ -53,6 +56,9 @@ const practicePayload = {
   question,
   kind: 'new',
   progress: practiceProgress,
+  cycleId,
+  attemptsUsed: 0,
+  attemptsLeft: 3,
 } as const;
 
 function expectContractError(run: () => unknown): void {
@@ -135,9 +141,11 @@ describe('recording contracts', () => {
 
   it('accepts additive recording ids in assessment outcomes and rejects malformed ids', () => {
     const attempt = {
+      cycleId,
       passed: true,
       mastered: false,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 70,
       transcript: 'Answer',
       feedback: 'Good.',
@@ -148,10 +156,29 @@ describe('recording contracts', () => {
     expect(
       parseNativeAttemptResult({
         mode: 'native',
+        cycleId,
         understood: true,
+        attemptNo: 1,
+        attemptsLeft: 2,
         transcript: 'Respuesta',
+        translatedTranscript: 'Answer.',
         modelAnswer: 'Answer.',
         feedback: 'Good.',
+        recordingId,
+      }).recordingId,
+    ).toBe(recordingId);
+    expect(
+      parseNativeAttemptResult({
+        mode: 'native',
+        cycleId,
+        understood: false,
+        attemptNo: 1,
+        attemptsLeft: 3,
+        noSpeech: true,
+        transcript: '',
+        translatedTranscript: '',
+        modelAnswer: '',
+        feedback: 'We could not hear any speech.',
         recordingId,
       }).recordingId,
     ).toBe(recordingId);
@@ -465,6 +492,7 @@ describe('practice contract parsers', () => {
     expect(parseHelpContent(help)).toEqual(help);
 
     const attempt = {
+      cycleId,
       passed: false,
       mastered: false,
       attemptNo: 3,
@@ -476,6 +504,8 @@ describe('practice contract parsers', () => {
       next: practicePayload,
     };
     expect(parseAttemptResult(attempt)).toEqual(attempt);
+    expect(parseAttemptResult(attempt, cycleId)).toEqual(attempt);
+    expectContractError(() => parseAttemptResult(attempt, nextCycleId));
   });
 
   it.each([
@@ -505,9 +535,11 @@ describe('practice contract parsers', () => {
 
   it('rejects array and wrong-boolean attempt envelopes that otherwise satisfy the contract', () => {
     const passedAttempt = {
+      cycleId,
       passed: true,
       mastered: true,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
@@ -587,19 +619,19 @@ describe('practice question payload parser', () => {
   it('accepts new and revision payloads at the progress count boundaries', () => {
     expect(parsePracticeQuestion(practicePayload)).toEqual(practicePayload);
     const revision = {
-      question,
+      ...practicePayload,
       kind: 'revision',
       progress: { masteredCount: 0, learningCount: 5, totalAtLevel: 5 },
     } as const;
     expect(parsePracticeQuestion(revision)).toEqual(revision);
     const maxed = {
-      question,
+      ...practicePayload,
       kind: 'new',
       progress: { masteredCount: 100_000, learningCount: 0, totalAtLevel: 100_000 },
     } as const;
     expect(parsePracticeQuestion(maxed)).toEqual(maxed);
     const singleWordLevel = {
-      question,
+      ...practicePayload,
       kind: 'new',
       progress: { masteredCount: 1, learningCount: 0, totalAtLevel: 1 },
     } as const;
@@ -607,6 +639,11 @@ describe('practice question payload parser', () => {
   });
 
   it.each([
+    ['a missing serving cycle', { ...practicePayload, cycleId: undefined }],
+    ['a malformed serving cycle', { ...practicePayload, cycleId: 'not-a-uuid' }],
+    ['a negative attempts-used count', { ...practicePayload, attemptsUsed: -1, attemptsLeft: 4 }],
+    ['a closed attempts-used count', { ...practicePayload, attemptsUsed: 3, attemptsLeft: 0 }],
+    ['inconsistent attempts left', { ...practicePayload, attemptsUsed: 1, attemptsLeft: 1 }],
     ['a bogus kind', { ...practicePayload, kind: 'repeat' }],
     ['an uppercase kind', { ...practicePayload, kind: 'NEW' }],
     ['a missing kind', { question, progress: practiceProgress }],
@@ -644,8 +681,12 @@ describe('practice question payload parser', () => {
 describe('native attempt result parser', () => {
   const native = {
     mode: 'native',
+    cycleId,
     understood: true,
+    attemptNo: 1,
+    attemptsLeft: 2,
     transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    translatedTranscript: 'She showed courage at work.',
     modelAnswer: 'She showed courage at work.',
     feedback: 'You understood the question.',
   } as const;
@@ -653,27 +694,39 @@ describe('native attempt result parser', () => {
   it('accepts understood, missed, and silent native results', () => {
     expect(parseNativeAttemptResult(native)).toEqual(native);
     const missed = {
-      mode: 'native',
+      ...native,
       understood: false,
       transcript: 'నేను రైలులో ప్రయాణిస్తాను.',
+      translatedTranscript: 'I travel by train.',
       modelAnswer: 'She showed courage at work.',
       feedback: 'That answer was about something else.',
     } as const;
     expect(parseNativeAttemptResult(missed)).toEqual(missed);
     const silent = {
       mode: 'native',
+      cycleId,
       understood: false,
+      attemptNo: 1,
+      attemptsLeft: 3,
+      noSpeech: true,
       transcript: '',
+      translatedTranscript: '',
       modelAnswer: '',
       feedback: 'We could not hear any speech.',
     } as const;
     expect(parseNativeAttemptResult(silent)).toEqual(silent);
   });
 
+  it('rejects a valid native response from a different serving cycle', () => {
+    expectContractError(() => parseNativeAttemptResult(native, nextCycleId));
+    expect(parseNativeAttemptResult(native, cycleId)).toEqual(native);
+  });
+
   it('accepts the native string-length boundaries', () => {
     const bounded = {
       ...native,
       transcript: 'x'.repeat(12_000),
+      translatedTranscript: 'x'.repeat(12_000),
       modelAnswer: 'x'.repeat(800),
       feedback: 'x'.repeat(800),
     };
@@ -713,16 +766,22 @@ describe('native attempt result parser', () => {
 describe('practice outcome discriminant', () => {
   const nativeOutcome = {
     mode: 'native',
+    cycleId: '550e8400-e29b-41d4-a716-446655440020',
     understood: true,
+    attemptNo: 1,
+    attemptsLeft: 2,
     transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    translatedTranscript: 'She showed courage at work.',
     modelAnswer: 'She showed courage at work.',
     feedback: 'You understood the question.',
   } as const;
 
   const englishOutcome = {
+    cycleId: '550e8400-e29b-41d4-a716-446655440020',
     passed: true,
     mastered: true,
     attemptNo: 1,
+    attemptsLeft: 0,
     score: 90,
     transcript: 'An answer.',
     feedback: 'Great.',
@@ -750,6 +809,7 @@ describe('no-speech attempt variant', () => {
     'accepts silence on attempt %i as a free retry with %i attempts left',
     (attemptNo, attemptsLeft) => {
       const silent = {
+        cycleId,
         passed: false,
         mastered: false,
         noSpeech: true,
@@ -765,6 +825,7 @@ describe('no-speech attempt variant', () => {
 
   it('rejects silence that carries scored-attempt fields', () => {
     const silent = {
+      cycleId,
       passed: false,
       mastered: false,
       noSpeech: true,
@@ -839,7 +900,7 @@ describe('score and progress boundaries', () => {
   const doneAnswer = {
     passed: false,
     score: 0,
-    transcript: '',
+    transcript: 'Answer.',
     feedback: 'Good start.',
     done: true,
     level: 'A1',
@@ -981,6 +1042,7 @@ describe('help and attempt detail boundaries', () => {
 
   it('enforces attempt number and attempts-left bounds', () => {
     const final = {
+      cycleId,
       passed: false,
       mastered: false,
       attemptNo: 3,
@@ -992,6 +1054,7 @@ describe('help and attempt detail boundaries', () => {
       next: practicePayload,
     };
     const firstRetry = {
+      cycleId,
       passed: false,
       mastered: false,
       attemptNo: 1,
@@ -1016,6 +1079,7 @@ describe('help and attempt detail boundaries', () => {
     // no longer matches the question's level, so a miss before the last attempt
     // legitimately arrives in the terminal shape.
     const earlyClose = {
+      cycleId,
       passed: false,
       mastered: false,
       attemptNo: 1,
@@ -1035,9 +1099,11 @@ describe('help and attempt detail boundaries', () => {
 
   it('enforces passed, retry, and final response shapes', () => {
     const passed = {
+      cycleId,
       passed: true,
       mastered: true,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
@@ -1050,6 +1116,7 @@ describe('help and attempt detail boundaries', () => {
     expectContractError(() => parseAttemptResult({ ...passed, next: undefined }));
 
     const retry = {
+      cycleId,
       passed: false,
       mastered: false,
       attemptNo: 2,
@@ -1126,11 +1193,12 @@ describe('help and attempt detail boundaries', () => {
   });
 
   it.each([
-    ['passed', { passed: true, mastered: true, attemptNo: 1, score: 90 }],
+    ['passed', { passed: true, mastered: true, attemptNo: 1, attemptsLeft: 0, score: 90 }],
     ['final', { passed: false, mastered: false, attemptNo: 3, score: 50, attemptsLeft: 0 }],
   ] as const)('uses one stable next payload for a %s result', (_variant, fields) => {
     let reads = 0;
     const result = {
+      cycleId,
       transcript: 'A complete answer.',
       feedback: 'Feedback.',
       ...(fields.passed ? {} : { finalFeedback: 'Review the example and continue.' }),
@@ -1167,9 +1235,11 @@ describe('help and attempt detail boundaries', () => {
 
   it('accepts the exact pass and mastery score boundaries', () => {
     const passedAtPassScore = {
+      cycleId,
       passed: true,
       mastered: false,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: PRACTICE_PASS_SCORE,
       transcript: 'A complete answer.',
       feedback: 'Feedback.',
@@ -1340,9 +1410,11 @@ describe('help and attempt detail boundaries', () => {
     );
 
     const boundedAttempt = {
+      cycleId,
       passed: true,
       mastered: true,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 80,
       transcript: 'x'.repeat(12_000),
       feedback: 'x'.repeat(800),
@@ -1806,12 +1878,17 @@ describe('levelUp attempt variant', () => {
     question: b2Question,
     kind: 'new',
     progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 12 },
+    cycleId: nextCycleId,
+    attemptsUsed: 0,
+    attemptsLeft: 3,
   } as const;
 
   const promotedAttempt = {
+    cycleId,
     passed: true,
     mastered: true,
     attemptNo: 1,
+    attemptsLeft: 0,
     score: 90,
     transcript: 'A detailed answer.',
     feedback: 'Excellent.',
@@ -1889,9 +1966,11 @@ describe('levelUp attempt variant', () => {
 
   it('tolerates unknown additive fields on attempt responses', () => {
     const attempt = {
+      cycleId,
       passed: true,
       mastered: true,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
@@ -1899,9 +1978,11 @@ describe('levelUp attempt variant', () => {
       someFutureField: { anything: true },
     };
     expect(parseAttemptResult(attempt)).toEqual({
+      cycleId,
       passed: true,
       mastered: true,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 90,
       transcript: 'An answer.',
       feedback: 'Great.',
@@ -2157,10 +2238,14 @@ describe('practice history parser', () => {
     questionText: 'Describe a time you showed courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    cycleId,
     attemptNo: 2,
     score: 59,
     passed: false,
+    understood: null,
     transcript: 'I tried.',
+    translatedTranscript: null,
+    modelAnswer: null,
     feedback: 'Add more detail.',
     createdAt: '2026-08-15T10:00:00.000Z',
   } as const;
@@ -2168,7 +2253,10 @@ describe('practice history parser', () => {
   const cursor = '550e8400-e29b-41d4-a716-446655440033';
 
   it('accepts a page with items and a keyset cursor', () => {
-    const page = { items: [item, { ...item, context: 'diagnostic' }], nextCursor: cursor };
+    const page = {
+      items: [item, { ...item, context: 'diagnostic', cycleId: null }],
+      nextCursor: cursor,
+    };
     expect(parsePracticeHistory(page)).toEqual(page);
   });
 
@@ -2211,9 +2299,36 @@ describe('practice history parser', () => {
     },
   );
 
+  it('accepts native practice history without inventing an English score', () => {
+    const nativeItem = {
+      ...item,
+      context: 'practice-native',
+      score: null,
+      passed: null,
+      understood: true,
+      transcript: 'ఆమె ధైర్యంగా ఉంది.',
+      translatedTranscript: 'She was brave.',
+      modelAnswer: 'She showed courage at work.',
+    } as const;
+
+    expect(parsePracticeHistory({ items: [nativeItem], nextCursor: null })).toEqual({
+      items: [nativeItem],
+      nextCursor: null,
+    });
+    expectContractError(() =>
+      parsePracticeHistory({ items: [{ ...nativeItem, score: 80 }], nextCursor: null }),
+    );
+    expectContractError(() =>
+      parsePracticeHistory({
+        items: [{ ...nativeItem, translatedTranscript: null }],
+        nextCursor: null,
+      }),
+    );
+  });
+
   it('accepts diagnostic attempt numbers through the backend maximum of 5', () => {
     const page = {
-      items: [{ ...item, context: 'diagnostic', attemptNo: 5 }],
+      items: [{ ...item, context: 'diagnostic', cycleId: null, attemptNo: 5 }],
       nextCursor: null,
     } as const;
     expect(parsePracticeHistory(page)).toEqual(page);
@@ -2245,7 +2360,7 @@ describe('practice history parser', () => {
     );
     expectContractError(() =>
       parsePracticeHistory({
-        items: [{ ...item, context: 'diagnostic', attemptNo: 6 }],
+        items: [{ ...item, context: 'diagnostic', cycleId: null, attemptNo: 6 }],
         nextCursor: null,
       }),
     );
@@ -2282,50 +2397,128 @@ describe('practice history parser', () => {
 describe('user data export page parser', () => {
   const exportUser = { ...user } as const;
   const cursor = '550e8400-e29b-41d4-a716-446655440034';
+  const cycleCursor = '550e8400-e29b-41d4-a716-446655440035';
+  const exportPage = (overrides: Record<string, unknown> = {}) => ({
+    user: exportUser,
+    attempts: [],
+    practiceProgress: [],
+    practiceCycles: [],
+    diagnosticState: null,
+    nextCursor: null,
+    nextPracticeCycleCursor: null,
+    attemptsDone: true,
+    practiceCyclesDone: true,
+    ...overrides,
+  });
 
-  it('passes attempt rows through verbatim for export fidelity', () => {
-    const page = {
-      user: exportUser,
+  it('passes every export row and snapshot through verbatim for export fidelity', () => {
+    const page = exportPage({
       attempts: [{ id: 'a1', anything: { nested: true } }],
+      practiceProgress: [{ questionId: 'q1', status: 'learning' }],
+      practiceCycles: [{ id: 'c1', attemptsUsed: 2 }],
+      diagnosticState: { lowIndex: 1, highIndex: 3 },
       nextCursor: cursor,
-    };
+      nextPracticeCycleCursor: cycleCursor,
+      attemptsDone: false,
+      practiceCyclesDone: false,
+    });
     expect(parseUserDataPage(page)).toEqual(page);
   });
 
-  it('accepts the final page of an account with no attempts', () => {
-    expect(parseUserDataPage({ user: exportUser, attempts: [], nextCursor: null })).toEqual({
-      user: exportUser,
-      attempts: [],
-      nextCursor: null,
-    });
+  it('accepts the final page of an account with no attempts or cycles', () => {
+    expect(parseUserDataPage(exportPage())).toEqual(exportPage());
   });
 
-  it('accepts a full export page and rejects one row beyond the server maximum', () => {
+  it('accepts full independently paginated streams and rejects one row beyond either maximum', () => {
     const attempts = Array.from({ length: 500 }, (_value, index) => ({ id: index }));
-    expect(parseUserDataPage({ user: exportUser, attempts, nextCursor: cursor }).attempts).toEqual(
-      attempts,
+    const cycles = Array.from({ length: 500 }, (_value, index) => ({ id: index }));
+    expect(
+      parseUserDataPage(
+        exportPage({
+          attempts,
+          practiceCycles: cycles,
+          nextCursor: cursor,
+          nextPracticeCycleCursor: cycleCursor,
+          attemptsDone: false,
+          practiceCyclesDone: false,
+        }),
+      ),
+    ).toMatchObject({ attempts, practiceCycles: cycles });
+    expectContractError(() =>
+      parseUserDataPage(
+        exportPage({
+          attempts: [...attempts, { id: 500 }],
+          nextCursor: cursor,
+          attemptsDone: false,
+        }),
+      ),
     );
     expectContractError(() =>
-      parseUserDataPage({
-        user: exportUser,
-        attempts: [...attempts, { id: 500 }],
-        nextCursor: cursor,
-      }),
+      parseUserDataPage(
+        exportPage({
+          practiceCycles: [...cycles, { id: 500 }],
+          nextPracticeCycleCursor: cycleCursor,
+          practiceCyclesDone: false,
+        }),
+      ),
     );
   });
 
   it.each([
     ['a non-record envelope', 'page'],
-    ['a malformed user', { user: { ...exportUser, email: '' }, attempts: [], nextCursor: null }],
-    ['non-array attempts', { user: exportUser, attempts: 'rows', nextCursor: null }],
-    ['a non-record attempt row', { user: exportUser, attempts: ['row'], nextCursor: null }],
-    ['a non-uuid cursor', { user: exportUser, attempts: [{}], nextCursor: 'next' }],
+    ['a malformed user', exportPage({ user: { ...exportUser, email: '' } })],
+    ['non-array attempts', exportPage({ attempts: 'rows' })],
+    ['non-array progress', exportPage({ practiceProgress: 'rows' })],
+    ['non-array cycles', exportPage({ practiceCycles: 'rows' })],
+    ['a non-record attempt row', exportPage({ attempts: ['row'] })],
+    ['a non-record progress row', exportPage({ practiceProgress: ['row'] })],
+    ['a non-record cycle row', exportPage({ practiceCycles: ['row'] })],
+    ['an array diagnostic state', exportPage({ diagnosticState: [] })],
     [
-      'an empty page that advertises another page',
-      { user: exportUser, attempts: [], nextCursor: '550e8400-e29b-41d4-a716-446655440035' },
+      'a non-uuid attempt cursor',
+      exportPage({ attempts: [{}], nextCursor: 'next', attemptsDone: false }),
+    ],
+    [
+      'a non-uuid cycle cursor',
+      exportPage({
+        practiceCycles: [{}],
+        nextPracticeCycleCursor: 'next',
+        practiceCyclesDone: false,
+      }),
+    ],
+    [
+      'an empty attempt page that advertises another page',
+      exportPage({ nextCursor: cursor, attemptsDone: false }),
+    ],
+    [
+      'an empty cycle page that advertises another page',
+      exportPage({ nextPracticeCycleCursor: cycleCursor, practiceCyclesDone: false }),
+    ],
+    ['a false attempt done flag without a cursor', exportPage({ attemptsDone: false })],
+    ['a true attempt done flag with a cursor', exportPage({ attempts: [{}], nextCursor: cursor })],
+    ['a false cycle done flag without a cursor', exportPage({ practiceCyclesDone: false })],
+    [
+      'a true cycle done flag with a cursor',
+      exportPage({ practiceCycles: [{}], nextPracticeCycleCursor: cycleCursor }),
     ],
   ])('rejects %s', (_label, value) => {
     expectContractError(() => parseUserDataPage(value));
+  });
+
+  it('requires every additive export field', () => {
+    const complete = exportPage();
+    for (const field of [
+      'practiceProgress',
+      'practiceCycles',
+      'diagnosticState',
+      'nextPracticeCycleCursor',
+      'attemptsDone',
+      'practiceCyclesDone',
+    ]) {
+      const missing: Record<string, unknown> = { ...complete };
+      delete missing[field];
+      expectContractError(() => parseUserDataPage(missing));
+    }
   });
 });
 
@@ -2412,9 +2605,11 @@ describe('recording contract mutation boundaries', () => {
     );
 
     const english = {
+      cycleId,
       passed: true,
       mastered: false,
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 70,
       transcript: 'A complete answer.',
       feedback: 'Good.',
@@ -2425,8 +2620,12 @@ describe('recording contract mutation boundaries', () => {
 
     const native = {
       mode: 'native',
+      cycleId,
       understood: true,
+      attemptNo: 1,
+      attemptsLeft: 2,
       transcript: 'జవాబు.',
+      translatedTranscript: 'Answer.',
       modelAnswer: 'An answer.',
       feedback: 'Good.',
     } as const;
@@ -2607,10 +2806,14 @@ describe('history recording-field mutation boundaries', () => {
     questionText: question.questionText,
     cefrLevel: question.cefrLevel,
     context: 'practice' as const,
+    cycleId,
     attemptNo: 1,
     score: 70,
     passed: true,
+    understood: null,
     transcript: 'A complete answer.',
+    translatedTranscript: null,
+    modelAnswer: null,
     feedback: 'Good.',
     createdAt: '2026-08-25T00:00:00.000Z',
   };

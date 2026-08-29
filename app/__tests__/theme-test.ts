@@ -235,7 +235,7 @@ describe('theme palette', () => {
       screenPadding: 20,
       formMaxWidth: 560,
       contentMaxWidth: 760,
-      minimumTarget: 44,
+      minimumTarget: 48,
     });
     expect(radii).toEqual({ badge: 8, input: 12, button: 14, card: 16, pill: 999 });
     expect(spacing).toEqual({

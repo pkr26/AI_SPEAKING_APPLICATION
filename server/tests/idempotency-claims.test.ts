@@ -4,7 +4,7 @@ import {
   ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS,
   AssessmentRequestInFlightError,
   abandonAssessmentRequest,
-  claimAssessmentRequest,
+  claimAssessmentRequest as claimAssessmentRequestWithCycle,
   completeAssessmentRequest,
   getAssessmentRequestStatus,
   isAudioKeyClaimedForProcessing,
@@ -24,23 +24,79 @@ describe('claimAssessmentRequest ownership and replay', () => {
   let userId: string;
   let questionId: string;
   let otherQuestionId: string;
+  let question: { id: string; cefrLevel: string; promptWord: string; questionText: string };
+  const cycleIds = new Map<string, string>();
+
+  async function createClosedCycle(cycleUserId: string, cycleQuestionId: string): Promise<string> {
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO practice_cycles
+         (user_id, question_id, kind, attempts_used, status, closed_at)
+       VALUES ($1, $2, 'revision', 0, 'closed', now())
+       RETURNING id`,
+      [cycleUserId, cycleQuestionId],
+    );
+    const id = rows[0].id;
+    cycleIds.set(`${cycleUserId}:${cycleQuestionId}`, id);
+    return id;
+  }
+
+  function claimAssessmentRequest(
+    claimUserId: string,
+    requestId: string,
+    context: 'diagnostic' | 'practice' | 'practice-native',
+    claimQuestionId: string,
+    audioKey?: string,
+    retainRecording = true,
+  ) {
+    const cycleId =
+      context === 'diagnostic'
+        ? undefined
+        : (cycleIds.get(`${claimUserId}:${claimQuestionId}`) ?? cycleIds.get(`${userId}:${claimQuestionId}`));
+    if (context !== 'diagnostic' && !cycleId) throw new Error('test fixture omitted a practice cycle');
+    return claimAssessmentRequestWithCycle(
+      claimUserId,
+      requestId,
+      context,
+      claimQuestionId,
+      audioKey,
+      cycleId,
+      retainRecording,
+    );
+  }
 
   beforeAll(async () => {
     const { res } = await registerUser(a);
     userId = res.body.user.id;
-    const { rows } = await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 2');
+    const { rows } = await pool.query<{
+      id: string;
+      cefrLevel: string;
+      promptWord: string;
+      questionText: string;
+    }>(
+      `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
+       FROM questions ORDER BY id LIMIT 2`,
+    );
     [questionId, otherQuestionId] = [rows[0].id, rows[1].id];
+    question = rows[0];
+    await createClosedCycle(userId, questionId);
+    await createClosedCycle(userId, otherQuestionId);
   });
 
   function completedPracticeResponse(score = 86) {
+    const cycleId = '22222222-2222-4222-8222-222222222222';
     return {
       passed: true,
       mastered: score >= 75,
+      cycleId,
       attemptNo: 1,
+      attemptsLeft: 0,
       score,
       transcript: 'A complete stored answer.',
       feedback: 'Clear and relevant.',
       next: {
+        cycleId: '33333333-3333-4333-8333-333333333333',
+        attemptsUsed: 0,
+        attemptsLeft: 3,
         question: {
           id: questionId,
           cefrLevel: 'A1',
@@ -56,6 +112,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
   const retryPracticeResponse = {
     passed: false,
     mastered: false,
+    cycleId: '22222222-2222-4222-8222-222222222222',
     attemptNo: 1,
     attemptsLeft: 2,
     score: 50,
@@ -74,8 +131,12 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
   const nativeResponse = {
     mode: 'native',
+    cycleId: '22222222-2222-4222-8222-222222222222',
+    attemptNo: 1,
+    attemptsLeft: 2,
     understood: true,
     transcript: 'A native-language answer.',
+    translatedTranscript: 'An English translation of the answer.',
     modelAnswer: 'This is a model English answer.',
     feedback: 'The answer shows understanding.',
   } as const;
@@ -223,6 +284,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
     });
     // A different user can still use the same request UUID independently.
     const other = await registerUser(a);
+    await createClosedCycle(other.res.body.user.id, questionId);
     await expect(
       claimAssessmentRequest(other.res.body.user.id, requestId, 'practice', questionId),
     ).resolves.toMatchObject({ kind: 'claimed' });
@@ -242,6 +304,57 @@ describe('claimAssessmentRequest ownership and replay', () => {
       message: 'Assessment request identifier was already used',
       code: 'REQUEST_ID_REUSED',
     });
+  });
+
+  it('binds the recording-retention choice to processing and completed request identities', async () => {
+    const processingRequestId = randomUUID();
+    await claimAssessmentRequest(userId, processingRequestId, 'practice', questionId, undefined, false);
+
+    const processingMismatch = claimAssessmentRequest(
+      userId,
+      processingRequestId,
+      'practice',
+      questionId,
+      undefined,
+      true,
+    );
+    await expect(processingMismatch).rejects.toBeInstanceOf(AssessmentRequestInFlightError);
+    await expect(processingMismatch).rejects.toMatchObject({
+      status: 409,
+      code: 'REQUEST_ID_REUSED',
+    });
+
+    const completedRequestId = randomUUID();
+    const completedClaim = await claimAssessmentRequest(
+      userId,
+      completedRequestId,
+      'practice',
+      questionId,
+      undefined,
+      false,
+    );
+    if (completedClaim.kind !== 'claimed') throw new Error('expected a fresh claim');
+    await completeAssessmentRequest(
+      pool,
+      userId,
+      completedRequestId,
+      completedClaim.claimId,
+      retryPracticeResponse,
+      'practice',
+    );
+
+    await expect(
+      claimAssessmentRequest(userId, completedRequestId, 'practice', questionId, undefined, false),
+    ).resolves.toEqual({ kind: 'completed', response: retryPracticeResponse });
+    await expect(
+      claimAssessmentRequest(userId, completedRequestId, 'practice', questionId, undefined, true),
+    ).rejects.toMatchObject({ status: 409, code: 'REQUEST_ID_REUSED' });
+    const stored = await pool.query<{ retain_recording: boolean }>(
+      `SELECT retain_recording FROM assessment_requests
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, completedRequestId],
+    );
+    expect(stored.rows[0].retain_recording).toBe(false);
   });
 
   it('returns 409 while a matching request is still processing', async () => {
@@ -273,6 +386,8 @@ describe('claimAssessmentRequest ownership and replay', () => {
       status: 'completed',
       context: 'practice',
       questionId,
+      cycleId: cycleIds.get(`${userId}:${questionId}`)!,
+      question,
       response: storedResponse,
     });
   });
@@ -343,6 +458,9 @@ describe('claimAssessmentRequest ownership and replay', () => {
             {
               context: 'practice',
               question_id: questionId,
+              practice_cycle_id: cycleIds.get(`${userId}:${questionId}`),
+              retain_recording: true,
+              response_version: 2,
               status: 'completed',
               response_body: response,
             },
@@ -391,6 +509,9 @@ describe('claimAssessmentRequest ownership and replay', () => {
             {
               context: 'practice',
               question_id: questionId,
+              practice_cycle_id: cycleIds.get(`${userId}:${questionId}`),
+              retain_recording: true,
+              response_version: 2,
               status,
               response_body: responseBody,
             },
@@ -432,8 +553,13 @@ describe('claimAssessmentRequest ownership and replay', () => {
         {
           context: 'practice',
           question_id: questionId,
+          practice_cycle_id: cycleIds.get(`${userId}:${questionId}`),
+          response_version: 2,
           status,
           response_body: responseBody,
+          question_cefr_level: question.cefrLevel,
+          question_prompt_word: question.promptWord,
+          question_text: question.questionText,
         },
       ],
     } as never);
@@ -442,6 +568,8 @@ describe('claimAssessmentRequest ownership and replay', () => {
         status: 'processing',
         context: 'practice',
         questionId,
+        cycleId: cycleIds.get(`${userId}:${questionId}`),
+        question,
       });
     } finally {
       query.mockRestore();
@@ -455,7 +583,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
         if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
-        if (text.includes('SELECT context, question_id, status, response_body')) return { rows: [] };
+        if (text.includes('SELECT context, question_id, practice_cycle_id, retain_recording')) return { rows: [] };
         throw new Error(`unexpected query: ${text}`);
       }),
       release: vi.fn(),
@@ -487,7 +615,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
         if (text === 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE') return { rowCount: 1 };
         if (text.includes('DELETE FROM assessment_requests')) return { rowCount: 0 };
         if (text.includes('INSERT INTO assessment_requests')) return { rowCount: 0 };
-        if (text.includes('SELECT context, question_id, status, response_body')) return { rows: [] };
+        if (text.includes('SELECT context, question_id, practice_cycle_id, retain_recording')) return { rows: [] };
         if (text.includes('SELECT status') && text.includes('audio_key = $2')) return { rows: [] };
         throw new Error(`unexpected query: ${text}`);
       }),
@@ -509,7 +637,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
         'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
         expect.stringContaining('DELETE FROM assessment_requests'),
         expect.stringContaining('INSERT INTO assessment_requests'),
-        expect.stringContaining('SELECT context, question_id, status, response_body'),
+        expect.stringContaining('SELECT context, question_id, practice_cycle_id, retain_recording'),
         expect.stringContaining('SELECT status'),
         'ROLLBACK',
       ]);
@@ -545,9 +673,10 @@ describe('claimAssessmentRequest ownership and replay', () => {
     // An expired processing row no longer protects the object either.
     const staleKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
     await pool.query(
-      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
-       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
-      [userId, randomUUID(), randomUUID(), questionId, staleKey],
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key, practice_cycle_id)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5, $6)`,
+      [userId, randomUUID(), randomUUID(), questionId, staleKey, cycleIds.get(`${userId}:${questionId}`)],
     );
     await expect(isAudioKeyClaimedForProcessing(userId, staleKey)).resolves.toBe(false);
 
@@ -601,9 +730,9 @@ describe('claimAssessmentRequest ownership and replay', () => {
     const staleRequestId = randomUUID();
     await pool.query(
       `INSERT INTO assessment_requests
-         (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key)
-       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5)`,
-      [userId, staleRequestId, randomUUID(), questionId, staleKey],
+         (user_id, request_id, claim_id, context, question_id, status, started_at, audio_key, practice_cycle_id)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', now() - interval '6 minutes', $5, $6)`,
+      [userId, staleRequestId, randomUUID(), questionId, staleKey, cycleIds.get(`${userId}:${questionId}`)],
     );
     const replacementRequestId = randomUUID();
     await expect(

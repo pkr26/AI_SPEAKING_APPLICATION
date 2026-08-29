@@ -4,8 +4,10 @@ import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput } from 'rea
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { apiForgotPassword, userMessageForError } from '../../lib/api';
-import { MAX_EMAIL_LENGTH } from '../../lib/auth';
+import { emailAddressError, MAX_EMAIL_LENGTH } from '../../lib/auth';
+import { useGuestLanguage } from '../../lib/guest-language';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import { useHardwareBack } from '../../lib/use-hardware-back';
@@ -17,6 +19,7 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
  */
 export default function ForgotPasswordScreen() {
   const t = useT();
+  const { language: guestLanguage, persistenceError, setLanguage } = useGuestLanguage();
   const navigation = useNavigation();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -55,7 +58,12 @@ export default function ForgotPasswordScreen() {
   };
 
   const trimmedEmail = email.trim();
-  const canSubmit = trimmedEmail.length > 0 && trimmedEmail.length <= MAX_EMAIL_LENGTH && !busy;
+  const emailError = emailAddressError(email, t);
+  const canSubmit =
+    trimmedEmail.length > 0 &&
+    trimmedEmail.length <= MAX_EMAIL_LENGTH &&
+    emailError === null &&
+    !busy;
 
   const handleSubmit = async () => {
     if (!canSubmit || busyRef.current) return;
@@ -83,6 +91,31 @@ export default function ForgotPasswordScreen() {
     }
   };
 
+  const handleResend = async () => {
+    if (!sentEmail || busyRef.current) return;
+    busyRef.current = true;
+    publishNavigationLock();
+    setBusy(true);
+    setError(null);
+    try {
+      // Same uniform endpoint and pinned address as the first request: this
+      // remains non-enumerating while recovering from transient mail delivery.
+      await apiForgotPassword(sentEmail);
+    } catch (err) {
+      if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));
+    } finally {
+      busyRef.current = false;
+      if (mountedRef.current) {
+        publishNavigationLock();
+        setBusy(false);
+      }
+    }
+  };
+  const continueWithCode = () => {
+    if (!sentEmail || busyRef.current) return;
+    router.navigate({ pathname: '/reset-password', params: { email: sentEmail } });
+  };
+
   if (sentEmail) {
     return (
       <SafeAreaView style={styles.flex}>
@@ -93,17 +126,40 @@ export default function ForgotPasswordScreen() {
           <Text accessibilityLiveRegion="polite" style={styles.subtitle}>
             {t('reset.sentBody')}
           </Text>
+          <UiLanguagePicker
+            value={guestLanguage}
+            onChange={setLanguage}
+            disabled={busy}
+            error={persistenceError}
+          />
           {/* navigate, not push: a double-tap on this one unguarded target
               would otherwise stack a second, empty reset form behind the one
               the user fills in. navigate dedupes the identical route. */}
           <Button
             title={t('reset.continue')}
-            onPress={() =>
-              router.navigate({ pathname: '/reset-password', params: { email: sentEmail } })
-            }
+            disabled={busy}
+            onPress={continueWithCode}
             style={styles.submitButton}
           />
-          <Link href="/login" style={styles.footerLink}>
+          <Button
+            title={busy ? t('reset.resendBusy') : t('reset.resend')}
+            variant="secondary"
+            disabled={busy}
+            loading={busy}
+            onPress={() => void handleResend()}
+            style={styles.resendButton}
+          />
+          {error && (
+            <Text accessibilityRole="alert" style={styles.error}>
+              {error}
+            </Text>
+          )}
+          <Link
+            href="/login"
+            accessibilityState={{ disabled: busy }}
+            onPress={blockLinkWhileBusy}
+            style={styles.footerLink}
+          >
             {t('reset.backToLogin')}
           </Link>
         </ScrollView>
@@ -122,6 +178,12 @@ export default function ForgotPasswordScreen() {
             {t('reset.requestTitle')}
           </Text>
           <Text style={styles.subtitle}>{t('reset.requestBody')}</Text>
+          <UiLanguagePicker
+            value={guestLanguage}
+            onChange={setLanguage}
+            disabled={busy}
+            error={persistenceError}
+          />
 
           <Text style={styles.label}>{t('login.emailLabel')}</Text>
           <TextInput
@@ -142,6 +204,11 @@ export default function ForgotPasswordScreen() {
             onSubmitEditing={() => void handleSubmit()}
             maxLength={MAX_EMAIL_LENGTH}
           />
+          {emailError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {emailError}
+            </Text>
+          )}
 
           {error && (
             <Text accessibilityRole="alert" style={styles.error}>
@@ -223,8 +290,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     textAlign: 'center',
   },
+  fieldError: {
+    marginTop: 6,
+    color: colors.danger,
+    fontSize: 13,
+  },
   submitButton: {
     marginTop: spacing.lg,
+  },
+  resendButton: {
+    marginTop: spacing.sm,
   },
   footerLink: {
     marginTop: spacing.xl,

@@ -77,7 +77,7 @@ function expectCompletedPersistenceLease(leases: ObservedLease[]): void {
   expect(lease!.statements[0]).toBe('BEGIN');
   expect(lease!.statements[lease!.releasedAfterStatementCount[0] - 1]).toBe('COMMIT');
   expect(lease!.release).toHaveBeenCalledOnce();
-  const parentLockAt = lease!.statements.indexOf('SELECT 1 FROM users WHERE id = $1 FOR UPDATE');
+  const parentLockAt = lease!.statements.findIndex((text) => text.includes('FROM users WHERE id = $1 FOR UPDATE'));
   const claimLockAt = lease!.statements.findIndex((text) => text.includes(CLAIM_OWNERSHIP_FRAGMENT));
   expect(parentLockAt).toBeGreaterThan(0);
   expect(claimLockAt).toBeGreaterThan(parentLockAt);
@@ -102,6 +102,7 @@ beforeEach(() => {
   nativeMock.mockResolvedValue({
     understood: true,
     transcript: 'మీరు అర్థం చేసుకున్నారు.',
+    translatedTranscript: 'You understood.',
     modelAnswer: 'A simple model answer in English.',
     feedback: 'Your answer shows you understood the question.',
   });
@@ -136,11 +137,26 @@ describe('practice stuck cases', () => {
     return rows[0].id;
   }
 
+  async function assignCycle(userId: string, questionId: string): Promise<string> {
+    await pool.query(
+      `UPDATE practice_cycles SET status = 'closed', closed_at = now(), updated_at = now()
+       WHERE user_id = $1 AND status = 'active'`,
+      [userId],
+    );
+    const { rows } = await pool.query<{ id: string }>(
+      `INSERT INTO practice_cycles (user_id, question_id, kind)
+       VALUES ($1, $2, 'new') RETURNING id`,
+      [userId, questionId],
+    );
+    return rows[0].id;
+  }
+
   describe('silence (case 04)', () => {
     it('is a free retry: no attempt row, no progress, counter unmoved', async () => {
       const { token, userId, level } = await freshUser();
       speakMock.mockClear(); // discount the diagnostic answers
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       speakMock.mockResolvedValue(SILENCE);
       const requestId = randomUUID();
       const send = () =>
@@ -152,7 +168,8 @@ describe('practice stuck cases', () => {
             contentType: 'audio/mp4',
           })
           .field('questionId', questionId)
-          .field('requestId', requestId);
+          .field('requestId', requestId)
+          .field('cycleId', cycleId);
 
       const { result: first, leases } = await observePoolLeases(send);
       expect(first.status).toBe(200);
@@ -164,6 +181,7 @@ describe('practice stuck cases', () => {
         score: 0,
         transcript: '',
         feedback: SILENCE.feedback,
+        cycleId,
         attemptsLeft: 3,
       });
       expectCompletedPersistenceLease(leases);
@@ -193,6 +211,8 @@ describe('practice stuck cases', () => {
       const real = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        cycleId,
       );
       expect(real.status).toBe(200);
       expect(real.body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
@@ -201,6 +221,7 @@ describe('practice stuck cases', () => {
     it('after a real failure, silence reports the pending attempt number without consuming it', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       speakMock.mockResolvedValue({
         transcript: 'weak answer',
         score: 40,
@@ -210,6 +231,8 @@ describe('practice stuck cases', () => {
       const failed = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        cycleId,
       );
       expect(failed.body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
 
@@ -217,6 +240,8 @@ describe('practice stuck cases', () => {
       const silent = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        cycleId,
       );
       expect(silent.status).toBe(200);
       expect(silent.body).toMatchObject({ noSpeech: true, attemptNo: 2, attemptsLeft: 2 });
@@ -231,6 +256,7 @@ describe('practice stuck cases', () => {
     it('rolls back and returns the exact state-changed contract when silence no longer owns the claim', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       const rivalClaimId = randomUUID();
       speakMock.mockImplementationOnce(async () => {
         await pool.query('UPDATE practice_inflight SET claim_id = $1 WHERE user_id = $2 AND question_id = $3', [
@@ -243,7 +269,12 @@ describe('practice stuck cases', () => {
 
       try {
         const { result, leases } = await observePoolLeases(() =>
-          answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId),
+          answerForm(
+            request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+            questionId,
+            undefined,
+            cycleId,
+          ),
         );
 
         expect(result.status).toBe(409);
@@ -266,13 +297,19 @@ describe('practice stuck cases', () => {
     it('stops before the claim-row read when account deletion lands after the silence result', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       speakMock.mockImplementationOnce(async () => {
         await pool.query('DELETE FROM users WHERE id = $1', [userId]);
         return SILENCE;
       });
 
       const { result, leases } = await observePoolLeases(() =>
-        answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId),
+        answerForm(
+          request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+          questionId,
+          undefined,
+          cycleId,
+        ),
       );
 
       expect(result.status).toBe(409);
@@ -288,12 +325,18 @@ describe('practice stuck cases', () => {
   });
 
   describe('native-language answers (case 02)', () => {
-    it('returns comprehension feedback without touching attempts or mastery', async () => {
+    it('persists comprehension feedback without changing English mastery', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
 
       const { result: r, leases } = await observePoolLeases(() =>
-        answerForm(request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`), questionId),
+        answerForm(
+          request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+          questionId,
+          undefined,
+          cycleId,
+        ),
       );
 
       expect(r.status).toBe(200);
@@ -301,8 +344,12 @@ describe('practice stuck cases', () => {
         mode: 'native',
         understood: true,
         transcript: 'మీరు అర్థం చేసుకున్నారు.',
+        translatedTranscript: 'You understood.',
         modelAnswer: 'A simple model answer in English.',
         feedback: 'Your answer shows you understood the question.',
+        cycleId,
+        attemptNo: 1,
+        attemptsLeft: 2,
       });
       expect(nativeMock).toHaveBeenCalledOnce();
       expect(nativeMock).toHaveBeenCalledWith(
@@ -315,45 +362,58 @@ describe('practice stuck cases', () => {
 
       const counts = await pool.query<{ attempts: number; progress: number }>(
         `SELECT
-           (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS attempts,
+           (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice-native') AS attempts,
            (SELECT count(*)::int FROM practice_progress WHERE user_id = $1) AS progress`,
         [userId],
       );
-      expect(counts.rows[0]).toEqual({ attempts: 0, progress: 0 });
+      expect(counts.rows[0]).toEqual({ attempts: 1, progress: 1 });
       expectCompletedPersistenceLease(leases);
     });
 
     it('stops before the claim-row read when account deletion lands after the native result', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       nativeMock.mockImplementationOnce(async () => {
         await pool.query('DELETE FROM users WHERE id = $1', [userId]);
         return {
           understood: true,
           transcript: 'అర్థమైంది.',
+          translatedTranscript: 'Understood.',
           modelAnswer: 'A model answer.',
           feedback: 'Good comprehension.',
         };
       });
 
       const { result, leases } = await observePoolLeases(() =>
-        answerForm(request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`), questionId),
+        answerForm(
+          request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+          questionId,
+          undefined,
+          cycleId,
+        ),
       );
 
       expect(result.status).toBe(409);
       expect(result.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
       const persistence = leases.find(
         ({ statements }) =>
-          statements.includes('SELECT 1 FROM users WHERE id = $1 FOR UPDATE') && statements.at(-1) === 'ROLLBACK',
+          statements.includes('SELECT cefr_level FROM users WHERE id = $1 FOR UPDATE') &&
+          statements.at(-1) === 'ROLLBACK',
       );
       expect(persistence).toBeDefined();
-      expect(persistence!.statements).toEqual(['BEGIN', 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE', 'ROLLBACK']);
+      expect(persistence!.statements).toEqual([
+        'BEGIN',
+        'SELECT cefr_level FROM users WHERE id = $1 FOR UPDATE',
+        'ROLLBACK',
+      ]);
       expect(persistence!.release).toHaveBeenCalledOnce();
     });
 
     it('appends the authored native example when the answer misses the question', async () => {
-      const { token, level } = await freshUser();
+      const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       const { rows } = await pool.query<{ native: string }>(
         `SELECT translations->'te'->'examples'->0->>'native' AS native FROM questions WHERE id = $1`,
         [questionId],
@@ -361,6 +421,7 @@ describe('practice stuck cases', () => {
       nativeMock.mockResolvedValue({
         understood: false,
         transcript: 'something off topic',
+        translatedTranscript: 'Something off topic.',
         modelAnswer: 'A simple model answer in English.',
         feedback: 'That answer is about something else.',
       });
@@ -368,6 +429,8 @@ describe('practice stuck cases', () => {
       const r = await answerForm(
         request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        cycleId,
       );
 
       expect(r.status).toBe(200);
@@ -379,11 +442,13 @@ describe('practice stuck cases', () => {
     });
 
     it('keeps native silence feedback focused on recording again', async () => {
-      const { token, level } = await freshUser();
+      const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       nativeMock.mockResolvedValue({
         understood: false,
         transcript: '',
+        translatedTranscript: '',
         modelAnswer: '',
         feedback: 'I could not hear enough speech. Please try again.',
       });
@@ -391,6 +456,8 @@ describe('practice stuck cases', () => {
       const r = await answerForm(
         request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        cycleId,
       );
 
       expect(r.status).toBe(200);
@@ -398,15 +465,21 @@ describe('practice stuck cases', () => {
         mode: 'native',
         understood: false,
         transcript: '',
+        translatedTranscript: '',
         modelAnswer: '',
         feedback: 'I could not hear enough speech. Please try again.',
+        noSpeech: true,
+        cycleId,
+        attemptNo: 1,
+        attemptsLeft: 3,
       });
       expect(r.body.feedback).not.toContain('An on-topic answer could be:');
     });
 
     it('replays the same native request without a second assessment', async () => {
-      const { token, level } = await freshUser();
+      const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       const requestId = randomUUID();
       const send = () =>
         request(a)
@@ -417,7 +490,8 @@ describe('practice stuck cases', () => {
             contentType: 'audio/mp4',
           })
           .field('questionId', questionId)
-          .field('requestId', requestId);
+          .field('requestId', requestId)
+          .field('cycleId', cycleId);
 
       const first = await send();
       const replay = await send();
@@ -427,10 +501,17 @@ describe('practice stuck cases', () => {
     });
 
     it('keeps English and native request identifiers in separate replay namespaces', async () => {
-      const { token, level } = await freshUser();
+      const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       speakMock.mockClear();
       nativeMock.mockClear();
+      speakMock.mockResolvedValue({
+        transcript: 'A retryable English answer.',
+        score: 40,
+        passed: false,
+        feedback: 'Keep trying.',
+      });
       const englishRequestId = randomUUID();
       const nativeRequestId = randomUUID();
       const send = (endpoint: '/practice/attempt' | '/practice/attempt/native', requestId: string) =>
@@ -442,7 +523,8 @@ describe('practice stuck cases', () => {
             contentType: 'audio/mp4',
           })
           .field('questionId', questionId)
-          .field('requestId', requestId);
+          .field('requestId', requestId)
+          .field('cycleId', cycleId);
 
       expect((await send('/practice/attempt', englishRequestId)).status).toBe(200);
       const wrongNativeReplay = await send('/practice/attempt/native', englishRequestId);
@@ -504,14 +586,16 @@ describe('practice stuck cases', () => {
     });
 
     it('requires audio like the English route', async () => {
-      const { token, level } = await freshUser();
+      const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
 
       const r = await request(a)
         .post('/practice/attempt/native')
         .set('Authorization', `Bearer ${token}`)
         .field('questionId', questionId)
-        .field('requestId', randomUUID());
+        .field('requestId', randomUUID())
+        .field('cycleId', cycleId);
 
       expect(r.status).toBe(400);
       expect(r.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
@@ -521,6 +605,7 @@ describe('practice stuck cases', () => {
     it('fails 409 when the claim was replaced mid-assessment, keeping the request retryable', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       const requestId = randomUUID();
       const send = () =>
         request(a)
@@ -531,7 +616,8 @@ describe('practice stuck cases', () => {
             contentType: 'audio/mp4',
           })
           .field('questionId', questionId)
-          .field('requestId', requestId);
+          .field('requestId', requestId)
+          .field('cycleId', cycleId);
 
       // Mid-assessment, this worker's claim lease is replaced by a rival
       // claim (claim_id no longer matches) — exactly the expired-lease race
@@ -545,6 +631,7 @@ describe('practice stuck cases', () => {
         return {
           understood: true,
           transcript: 'మీరు అర్థం చేసుకున్నారు.',
+          translatedTranscript: 'You understood.',
           modelAnswer: 'A simple model answer in English.',
           feedback: 'Your answer shows you understood the question.',
         };
@@ -566,11 +653,17 @@ describe('practice stuck cases', () => {
     it('rolls back, releases, and clears the claim when native persistence fails', async () => {
       const { token, userId, level } = await freshUser();
       const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
       const persistenceError = new Error('injected native persistence failure');
 
       const { result, leases, failureInjected } = await observePoolLeases(
         () =>
-          answerForm(request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`), questionId),
+          answerForm(
+            request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+            questionId,
+            undefined,
+            cycleId,
+          ),
         { text: EXACT_CLAIM_DELETE, error: persistenceError },
       );
 
@@ -642,7 +735,7 @@ describe('practice stuck cases', () => {
       const skip = await request(a)
         .post('/practice/skip')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: rows[0].id });
+        .send({ questionId: rows[0].id, cycleId: first.body.cycleId });
       expect(skip.status).toBe(204);
 
       const second = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
@@ -663,6 +756,8 @@ describe('practice stuck cases', () => {
       const answer = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         servedId,
+        undefined,
+        served.body.cycleId,
       );
       expect(answer.status).toBe(200);
 

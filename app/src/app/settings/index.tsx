@@ -1,11 +1,13 @@
 import { useQueryClient } from '@tanstack/react-query';
-import { File, Paths } from 'expo-file-system';
 import { router, useFocusEffect, useNavigation } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
+  AccessibilityInfo,
   ActivityIndicator,
   Alert,
+  AppState,
+  type AppStateStatus,
   Pressable,
   ScrollView,
   Text,
@@ -17,6 +19,7 @@ import Button from '../../components/Button';
 import { useAds } from '../../lib/ads';
 import {
   apiConsumeAccountExportPages,
+  apiDeleteAllRecordings,
   apiRestartDiagnostic,
   apiUpdateProfile,
   userMessageForError,
@@ -29,22 +32,14 @@ import {
   getDailyReminder,
   refreshDailyReminderLanguage,
 } from '../../lib/daily-reminder';
+import { useGuestLanguage } from '../../lib/guest-language';
 import { translateFor, useT, useI18n, type UiLanguage } from '../../lib/i18n';
+import { NATIVE_LANGUAGE_OPTIONS, UI_LANGUAGE_OPTIONS } from '../../lib/language-options';
+import { usePracticeFlow } from '../../lib/practice-flow';
+import { claimPrivateExportFile, type OwnedPrivateFile } from '../../lib/private-artifacts';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage, User } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
-
-const LEARNING_LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
-  { code: 'te', english: 'Telugu', native: 'తెలుగు' },
-  { code: 'hi', english: 'Hindi', native: 'हिन्दी' },
-  { code: 'es', english: 'Spanish', native: 'Español' },
-  { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
-];
-
-const UI_LANGUAGES: { code: UiLanguage; english: string; native: string }[] = [
-  { code: 'en', english: 'English', native: 'English' },
-  ...LEARNING_LANGUAGES,
-];
 
 export function formatReminderHour(hour: number, language: UiLanguage = 'en'): string {
   try {
@@ -69,15 +64,24 @@ interface ReminderState {
  * and delete account.
  */
 export default function SettingsScreen() {
-  const { user, setUser, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } =
-    useAuth();
+  const {
+    user,
+    setUser,
+    logout,
+    resetStoredSession,
+    sessionVersion,
+    captureSessionLease,
+    isSessionLeaseCurrent,
+  } = useAuth();
   const t = useT();
+  const { mirrorAccountLanguage } = useGuestLanguage();
   const { language } = useI18n();
   const { privacyOptionsRequired, showPrivacyOptions } = useAds();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { colors } = theme;
   const queryClient = useQueryClient();
+  const { resetPracticeFlow } = usePracticeFlow();
   const navigation = useNavigation();
   // Bind callbacks to the session that rendered them. A stale native event
   // must not be able to call captureSessionLease later and mint authority for
@@ -102,6 +106,11 @@ export default function SettingsScreen() {
   const [exportBusy, setExportBusy] = useState(false);
   const [exportError, setExportError] = useState<string | null>(null);
 
+  const [recordingsDeleteBusy, setRecordingsDeleteBusy] = useState(false);
+  const [recordingsDeleteConfirming, setRecordingsDeleteConfirming] = useState(false);
+  const [recordingsDeleteSucceeded, setRecordingsDeleteSucceeded] = useState(false);
+  const [recordingsDeleteError, setRecordingsDeleteError] = useState<string | null>(null);
+
   const [reminder, setReminder] = useState<ReminderState | null>(null);
   const [reminderBusy, setReminderBusy] = useState(false);
   const [reminderError, setReminderError] = useState<string | null>(null);
@@ -123,6 +132,9 @@ export default function SettingsScreen() {
   const languageBusyRef = useRef(false);
   const exportBusyRef = useRef(false);
   const exportControllerRef = useRef<AbortController | null>(null);
+  const recordingsDeleteBusyRef = useRef<symbol | null>(null);
+  const recordingsDeleteConfirmingRef = useRef<symbol | null>(null);
+  const recordingsDeleteControllerRef = useRef<AbortController | null>(null);
   const reminderBusyRef = useRef(false);
   const privacyBusyRef = useRef<symbol | null>(null);
   const retakeBusyRef = useRef(false);
@@ -143,6 +155,8 @@ export default function SettingsScreen() {
       nameBusyRef.current ||
       languageBusyRef.current ||
       exportBusyRef.current ||
+      recordingsDeleteBusyRef.current !== null ||
+      recordingsDeleteConfirmingRef.current !== null ||
       reminderBusyRef.current ||
       privacyBusyRef.current !== null ||
       retakeBusyRef.current ||
@@ -164,6 +178,8 @@ export default function SettingsScreen() {
     nameBusy ||
     languageBusy ||
     exportBusy ||
+    recordingsDeleteBusy ||
+    recordingsDeleteConfirming ||
     reminderBusy ||
     privacyBusy ||
     retakeBusy ||
@@ -192,6 +208,7 @@ export default function SettingsScreen() {
       return () => {
         navigationStartedRef.current = true;
         exportControllerRef.current?.abort();
+        recordingsDeleteControllerRef.current?.abort();
       };
     }, []),
   );
@@ -214,9 +231,17 @@ export default function SettingsScreen() {
       // A replacement identity must never inherit a native confirmation or
       // the header lock owned by the account that just left this route.
       retakeConfirmingRef.current = null;
+      recordingsDeleteConfirmingRef.current = null;
+      recordingsDeleteControllerRef.current?.abort();
+      recordingsDeleteControllerRef.current = null;
+      recordingsDeleteBusyRef.current = null;
       privacyBusyRef.current = null;
       languageBusyRef.current = false;
       setRetakeConfirming(false);
+      setRecordingsDeleteConfirming(false);
+      setRecordingsDeleteBusy(false);
+      setRecordingsDeleteSucceeded(false);
+      setRecordingsDeleteError(null);
       setPrivacyBusy(false);
       setPrivacyError(null);
       setLanguageBusy(false);
@@ -229,7 +254,9 @@ export default function SettingsScreen() {
     return () => {
       activeIdentityRef.current = null;
       exportControllerRef.current?.abort();
+      recordingsDeleteControllerRef.current?.abort();
       retakeConfirmingRef.current = null;
+      recordingsDeleteConfirmingRef.current = null;
     };
   }, [activeIdentity]);
 
@@ -237,6 +264,10 @@ export default function SettingsScreen() {
     () => activeIdentityRef.current === activeIdentity && isSessionLeaseCurrent(renderSessionLease),
     [activeIdentity, isSessionLeaseCurrent, renderSessionLease],
   );
+  const renderOwnsIdentityRef = useRef(renderOwnsIdentity);
+  useLayoutEffect(() => {
+    renderOwnsIdentityRef.current = renderOwnsIdentity;
+  }, [renderOwnsIdentity]);
 
   const renderCanHandle = useCallback(
     () => !navigationStartedRef.current && renderOwnsIdentity(),
@@ -295,15 +326,29 @@ export default function SettingsScreen() {
 
   useEffect(() => {
     let active = true;
-    void getDailyReminder().then((stored) => {
-      if (active) {
-        setReminder({ enabled: stored !== null, hour: stored?.hour ?? DEFAULT_REMINDER_HOUR });
-      }
+    const reconcileReminder = () => {
+      void getDailyReminder().then((stored) => {
+        if (!active || !renderOwnsIdentityRef.current()) return;
+        setReminder((current) => ({
+          enabled: stored !== null,
+          // Preserve the learner's chosen hour when a revoked OS permission
+          // makes the preference disappear; re-enabling resumes there.
+          hour: stored?.hour ?? current?.hour ?? DEFAULT_REMINDER_HOUR,
+        }));
+      });
+    };
+    reconcileReminder();
+    let previousState: AppStateStatus | null = AppState.currentState;
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      const returnedToForeground = nextState === 'active' && previousState !== 'active';
+      previousState = nextState;
+      if (returnedToForeground) reconcileReminder();
     });
     return () => {
       active = false;
+      subscription?.remove?.();
     };
-  }, []);
+  }, [activeIdentity]);
 
   // The route gate redirects after logout/session expiry.
   if (!user) return null;
@@ -419,6 +464,7 @@ export default function SettingsScreen() {
     try {
       const updated = await apiUpdateProfile({ uiLanguage: code });
       if (!mergeProfileField(updated, { uiLanguage: updated.uiLanguage })) return;
+      mirrorAccountLanguage(updated.uiLanguage);
 
       // Notification title/body/channel copy is baked into the OS schedule.
       // Rebuild it in the confirmed UI language. This is best effort: the
@@ -474,7 +520,7 @@ export default function SettingsScreen() {
     publishNavigationLock();
     setExportBusy(true);
     setExportError(null);
-    const exportFile: { current: File | null } = { current: null };
+    const exportArtifact: { current: OwnedPrivateFile | null } = { current: null };
     try {
       if (!(await Sharing.isAvailableAsync())) {
         if (!renderCanHandle()) return;
@@ -484,6 +530,10 @@ export default function SettingsScreen() {
       if (!renderCanHandle()) return;
       let documentStarted = false;
       let hasAttempts = false;
+      let attemptsFinished = false;
+      let practiceCyclesStarted = false;
+      let hasPracticeCycles = false;
+      let practiceCyclesFinished = false;
       let recordingsStarted = false;
       let hasRecordings = false;
       await apiConsumeAccountExportPages(
@@ -492,39 +542,85 @@ export default function SettingsScreen() {
             controller.abort();
             throw new DOMException('The export session expired.', 'AbortError');
           }
-          const encodedAttempts = page.attempts.map((attempt) => JSON.stringify(attempt));
-          if (encodedAttempts.some((attempt) => typeof attempt !== 'string')) {
-            throw new Error('The export contains an invalid attempt.');
+          let encodedAttempts: (string | undefined)[] | null = null;
+          if (!attemptsFinished) {
+            encodedAttempts = page.attempts.map((attempt) => JSON.stringify(attempt));
+            if (encodedAttempts.some((attempt) => typeof attempt !== 'string')) {
+              throw new Error('The export contains an invalid attempt.');
+            }
           }
           if (!documentStarted) {
             const encodedUser = JSON.stringify(page.user);
-            if (typeof encodedUser !== 'string') throw new Error('The export user is invalid.');
-            exportFile.current = new File(Paths.cache, `ai-english-coach-data-${Date.now()}.json`);
-            exportFile.current.write(`{"user":${encodedUser},"attempts":[`, {
-              encoding: 'utf8',
-            });
+            const encodedPracticeProgress = JSON.stringify(page.practiceProgress);
+            const encodedDiagnosticState = JSON.stringify(page.diagnosticState);
+            if (
+              typeof encodedUser !== 'string' ||
+              typeof encodedPracticeProgress !== 'string' ||
+              typeof encodedDiagnosticState !== 'string'
+            ) {
+              throw new Error('The export snapshots are invalid.');
+            }
+            exportArtifact.current = claimPrivateExportFile(user.id);
+            exportArtifact.current.file.write(
+              `{"user":${encodedUser},"practiceProgress":${encodedPracticeProgress},"diagnosticState":${encodedDiagnosticState},"attempts":[`,
+              { encoding: 'utf8' },
+            );
             documentStarted = true;
           }
-          if (encodedAttempts.length > 0) {
-            exportFile.current!.write(`${hasAttempts ? ',' : ''}${encodedAttempts.join(',')}`, {
-              append: true,
-              encoding: 'utf8',
-            });
-            hasAttempts = true;
+
+          if (!attemptsFinished) {
+            if (encodedAttempts && encodedAttempts.length > 0) {
+              exportArtifact.current!.file.write(
+                `${hasAttempts ? ',' : ''}${encodedAttempts.join(',')}`,
+                {
+                  append: true,
+                  encoding: 'utf8',
+                },
+              );
+              hasAttempts = true;
+            }
+            if (page.attemptsDone) {
+              exportArtifact.current!.file.write('],"practiceCycles":[', {
+                append: true,
+                encoding: 'utf8',
+              });
+              attemptsFinished = true;
+              practiceCyclesStarted = true;
+            }
+            return;
           }
+
+          const encodedPracticeCycles = page.practiceCycles.map((cycle) => JSON.stringify(cycle));
+          if (encodedPracticeCycles.some((cycle) => typeof cycle !== 'string')) {
+            throw new Error('The export contains an invalid practice cycle.');
+          }
+          if (encodedPracticeCycles.length > 0) {
+            exportArtifact.current!.file.write(
+              `${hasPracticeCycles ? ',' : ''}${encodedPracticeCycles.join(',')}`,
+              { append: true, encoding: 'utf8' },
+            );
+            hasPracticeCycles = true;
+          }
+          practiceCyclesFinished = page.practiceCyclesDone;
         },
         (page) => {
           if (
             controller.signal.aborted ||
             !renderCanHandle() ||
             !documentStarted ||
-            !exportFile.current
+            !attemptsFinished ||
+            !practiceCyclesStarted ||
+            !practiceCyclesFinished ||
+            !exportArtifact.current
           ) {
             controller.abort();
             throw new DOMException('The export session expired.', 'AbortError');
           }
           if (!recordingsStarted) {
-            exportFile.current.write('],"recordings":[', { append: true, encoding: 'utf8' });
+            exportArtifact.current.file.write('],"recordings":[', {
+              append: true,
+              encoding: 'utf8',
+            });
             recordingsStarted = true;
           }
           const encodedRecordings = page.recordings.map((recording) => JSON.stringify(recording));
@@ -532,10 +628,13 @@ export default function SettingsScreen() {
             throw new Error('The export contains an invalid recording.');
           }
           if (encodedRecordings.length > 0) {
-            exportFile.current.write(`${hasRecordings ? ',' : ''}${encodedRecordings.join(',')}`, {
-              append: true,
-              encoding: 'utf8',
-            });
+            exportArtifact.current.file.write(
+              `${hasRecordings ? ',' : ''}${encodedRecordings.join(',')}`,
+              {
+                append: true,
+                encoding: 'utf8',
+              },
+            );
             hasRecordings = true;
           }
         },
@@ -546,11 +645,15 @@ export default function SettingsScreen() {
       // Fail closed if a mocked or incompatible implementation violates that
       // contract instead of sharing a malformed file.
       if (!documentStarted) throw new Error('The export returned no pages.');
+      if (!attemptsFinished) throw new Error('The attempt export did not finish.');
+      if (!practiceCyclesStarted || !practiceCyclesFinished) {
+        throw new Error('The practice-cycle export did not finish.');
+      }
       if (!recordingsStarted) throw new Error('The recording export returned no pages.');
-      const completedFile = exportFile.current;
-      if (completedFile === null) throw new Error('The export file is unavailable.');
-      completedFile.write(']}', { append: true, encoding: 'utf8' });
-      await Sharing.shareAsync(completedFile.uri, {
+      const completedArtifact = exportArtifact.current;
+      if (completedArtifact === null) throw new Error('The export file is unavailable.');
+      completedArtifact.file.write(']}', { append: true, encoding: 'utf8' });
+      await Sharing.shareAsync(completedArtifact.file.uri, {
         mimeType: 'application/json',
         dialogTitle: t('settings.export'),
       });
@@ -563,7 +666,7 @@ export default function SettingsScreen() {
       // page/write/share failure, or a session-triggered abort. Cleanup failure
       // must not mask the original outcome.
       try {
-        exportFile.current?.delete();
+        exportArtifact.current?.release();
       } catch {
         // The OS cache eviction will reclaim it eventually.
       }
@@ -574,6 +677,111 @@ export default function SettingsScreen() {
         setExportBusy(false);
       }
     }
+  };
+
+  const deleteAllRecordings = (): boolean => {
+    if (!renderCanHandle() || blockingOperationActive()) return false;
+    const operation = Symbol('delete-all-recordings');
+    const controller = new AbortController();
+    recordingsDeleteBusyRef.current = operation;
+    recordingsDeleteControllerRef.current = controller;
+    publishNavigationLock();
+    setRecordingsDeleteBusy(true);
+    setRecordingsDeleteSucceeded(false);
+    setRecordingsDeleteError(null);
+    void (async () => {
+      const operationIsCurrent = () =>
+        recordingsDeleteBusyRef.current === operation &&
+        recordingsDeleteControllerRef.current === controller &&
+        !controller.signal.aborted &&
+        renderCanHandle();
+      try {
+        await apiDeleteAllRecordings(controller.signal);
+        if (!operationIsCurrent()) return;
+        await Promise.all([
+          queryClient.cancelQueries({ queryKey: ['recordings', user.id], exact: true }),
+          queryClient.cancelQueries({ queryKey: ['practice-history', user.id], exact: true }),
+        ]);
+        if (!operationIsCurrent()) return;
+
+        // Retire inactive pages immediately so navigating back can never flash
+        // an audio action that no longer exists. Active pages stay mounted and
+        // are invalidated below, which lets their observers refetch safely.
+        queryClient.removeQueries({
+          queryKey: ['recordings', user.id],
+          exact: true,
+          type: 'inactive',
+        });
+        queryClient.removeQueries({
+          queryKey: ['practice-history', user.id],
+          exact: true,
+          type: 'inactive',
+        });
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ['recordings', user.id], exact: true }),
+          queryClient.invalidateQueries({
+            queryKey: ['practice-history', user.id],
+            exact: true,
+          }),
+        ]);
+        if (!operationIsCurrent()) return;
+        setRecordingsDeleteSucceeded(true);
+        AccessibilityInfo.announceForAccessibility(t('settings.recordingsDeleteAllSuccess'));
+      } catch (error) {
+        if (operationIsCurrent()) {
+          setRecordingsDeleteError(
+            userMessageForError(error, t('settings.recordingsDeleteAllFailed')),
+          );
+        }
+      } finally {
+        if (recordingsDeleteControllerRef.current === controller) {
+          recordingsDeleteControllerRef.current = null;
+        }
+        if (recordingsDeleteBusyRef.current !== operation) return;
+        recordingsDeleteBusyRef.current = null;
+        if (renderOwnsIdentity()) {
+          publishNavigationLock();
+          setRecordingsDeleteBusy(false);
+        }
+      }
+    })();
+    return true;
+  };
+
+  const confirmDeleteAllRecordings = () => {
+    if (!renderCanHandle() || blockingOperationActive()) return;
+    const confirmationOwner = Symbol('confirm-delete-all-recordings');
+    recordingsDeleteConfirmingRef.current = confirmationOwner;
+    setRecordingsDeleteConfirming(true);
+    setRecordingsDeleteSucceeded(false);
+    setRecordingsDeleteError(null);
+    publishNavigationLock();
+    const closeConfirmation = () => {
+      if (recordingsDeleteConfirmingRef.current !== confirmationOwner) return;
+      recordingsDeleteConfirmingRef.current = null;
+      if (!renderOwnsIdentity()) return;
+      setRecordingsDeleteConfirming(false);
+      publishNavigationLock();
+    };
+    Alert.alert(
+      t('settings.recordingsDeleteAllTitle'),
+      t('settings.recordingsDeleteAllBody'),
+      [
+        { text: t('common.cancel'), style: 'cancel', onPress: closeConfirmation },
+        {
+          text: t('settings.recordingsDeleteAllConfirm'),
+          style: 'destructive',
+          onPress: () => {
+            if (recordingsDeleteConfirmingRef.current !== confirmationOwner) return;
+            recordingsDeleteConfirmingRef.current = null;
+            if (!renderOwnsIdentity()) return;
+            setRecordingsDeleteConfirming(false);
+            if (!deleteAllRecordings()) publishNavigationLock();
+          },
+        },
+      ],
+      { cancelable: true, onDismiss: closeConfirmation },
+    );
   };
 
   const applyReminder = async (next: ReminderState) => {
@@ -673,6 +881,7 @@ export default function SettingsScreen() {
         // is allowed back at a newly assigned level.
         queryClient.removeQueries({ queryKey: ['practice-stats'], type: 'inactive' });
         queryClient.removeQueries({ queryKey: ['practice-history'] });
+        resetPracticeFlow();
         void queryClient.invalidateQueries({ queryKey: ['me'] });
         // Rebuild from the ref, not from this handler's closure: a name or
         // language change that resolved while the restart was in flight is
@@ -760,7 +969,18 @@ export default function SettingsScreen() {
       if (error instanceof LogoutCleanupError) {
         Alert.alert(t('logout.cleanupTitle'), error.message);
       } else if (renderIsMountedIdentity()) {
-        Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
+        Alert.alert(t('logout.failedTitle'), t('logout.localBody'), [
+          { text: t('common.cancel'), style: 'cancel' },
+          {
+            text: t('logout.thisDevice'),
+            style: 'destructive',
+            onPress: () => {
+              if (!renderIsMountedIdentity()) return;
+              resetStoredSession();
+              router.replace('/');
+            },
+          },
+        ]);
       }
     } finally {
       logoutBusyRef.current = false;
@@ -852,7 +1072,7 @@ export default function SettingsScreen() {
         <Text style={styles.label}>{t('settings.appLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.appLanguageHelp')}</Text>
         <View style={styles.languageGrid}>
-          {UI_LANGUAGES.map((lang) => {
+          {UI_LANGUAGE_OPTIONS.map((lang) => {
             const selected = user.uiLanguage === lang.code;
             const saving =
               languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === lang.code;
@@ -899,7 +1119,7 @@ export default function SettingsScreen() {
         <Text style={styles.label}>{t('settings.learningLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.learningLanguageHelp')}</Text>
         <View style={styles.languageGrid}>
-          {LEARNING_LANGUAGES.map((lang) => {
+          {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
             const selected = user.nativeLanguage === lang.code;
             const saving =
               languageBusy &&
@@ -1076,6 +1296,36 @@ export default function SettingsScreen() {
 
         <Pressable
           accessibilityRole="button"
+          accessibilityHint={t('settings.recordingsDeleteAllHint')}
+          accessibilityState={{ busy: recordingsDeleteBusy, disabled: screenBusy }}
+          disabled={screenBusy}
+          style={({ pressed }) => [
+            styles.actionRow,
+            screenBusy && styles.controlDisabled,
+            pressed && styles.actionRowPressed,
+          ]}
+          onPress={confirmDeleteAllRecordings}
+        >
+          <Text style={[styles.actionText, styles.actionTextDanger]}>
+            {recordingsDeleteBusy
+              ? t('settings.recordingsDeleteAllBusy')
+              : t('settings.recordingsDeleteAll')}
+          </Text>
+        </Pressable>
+        <Text style={styles.actionHelp}>{t('settings.recordingsDeleteAllHint')}</Text>
+        {recordingsDeleteSucceeded && (
+          <Text accessibilityLiveRegion="polite" style={styles.savedNote}>
+            {t('settings.recordingsDeleteAllSuccess')}
+          </Text>
+        )}
+        {recordingsDeleteError && (
+          <Text accessibilityRole="alert" style={styles.fieldError}>
+            {recordingsDeleteError}
+          </Text>
+        )}
+
+        <Pressable
+          accessibilityRole="button"
           disabled={screenBusy}
           style={({ pressed }) => [
             styles.actionRow,
@@ -1102,27 +1352,26 @@ export default function SettingsScreen() {
             {exportBusy ? t('settings.exportBusy') : t('settings.export')}
           </Text>
         </Pressable>
+        <Text style={styles.actionHelp}>{t('settings.exportHelp')}</Text>
         {exportError && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {exportError}
           </Text>
         )}
 
-        {user.diagnosticCompleted && (
-          <Pressable
-            accessibilityRole="button"
-            accessibilityState={{ busy: retakeBusy }}
-            disabled={retakeBusy || retakeConfirming || logoutBusy}
-            style={({ pressed }) => [
-              styles.actionRow,
-              (retakeBusy || retakeConfirming || logoutBusy) && styles.controlDisabled,
-              pressed && styles.actionRowPressed,
-            ]}
-            onPress={confirmRetake}
-          >
-            <Text style={styles.actionText}>{t('settings.retake')}</Text>
-          </Pressable>
-        )}
+        <Pressable
+          accessibilityRole="button"
+          accessibilityState={{ busy: retakeBusy }}
+          disabled={retakeBusy || retakeConfirming || logoutBusy}
+          style={({ pressed }) => [
+            styles.actionRow,
+            (retakeBusy || retakeConfirming || logoutBusy) && styles.controlDisabled,
+            pressed && styles.actionRowPressed,
+          ]}
+          onPress={confirmRetake}
+        >
+          <Text style={styles.actionText}>{t('settings.retake')}</Text>
+        </Pressable>
         {retakeError && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {retakeError}
@@ -1392,6 +1641,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 16,
     fontWeight: '600',
     color: colors.primary,
+  },
+  actionHelp: {
+    marginTop: spacing.sm,
+    marginBottom: spacing.sm,
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
   },
   actionTextDanger: {
     color: colors.danger,

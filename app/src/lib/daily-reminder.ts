@@ -96,7 +96,30 @@ async function getDailyReminderUnsafe(): Promise<DailyReminder | null> {
 
 /** The stored reminder preference; unreadable or invalid storage reads as off. */
 export function getDailyReminder(): Promise<DailyReminder | null> {
-  return withReminderLock(getDailyReminderUnsafe);
+  return withReminderLock(async () => {
+    const stored = await getDailyReminderUnsafe();
+    if (!stored) return null;
+
+    // SecureStore records the learner's intent, but the OS permission can be
+    // revoked later in system settings. Reconcile that external state whenever
+    // Settings/root hydration reads the preference so the switch can never stay
+    // ON for a notification the operating system is guaranteed not to deliver.
+    // Cleanup is best effort; the returned state must still fail closed to OFF.
+    let granted = false;
+    try {
+      granted = (await notifications().getPermissionsAsync()).granted;
+    } catch {
+      // A temporarily unavailable native module should not erase a valid
+      // preference. The next hydration will reconcile it again.
+      return stored;
+    }
+    if (granted) return stored;
+    await notifications()
+      .cancelAllScheduledNotificationsAsync()
+      .catch(() => undefined);
+    await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
+    return null;
+  });
 }
 
 /**
@@ -199,6 +222,22 @@ export function refreshDailyReminderLanguage(language: UiLanguage): Promise<Dail
   return withReminderLock(async () => {
     const stored = await getDailyReminderUnsafe();
     if (!stored) return null;
+    // Even unchanged copy must pass through permission reconciliation. OS
+    // settings are external state and may have changed since the preference was
+    // written.
+    let granted = false;
+    try {
+      granted = (await notifications().getPermissionsAsync()).granted;
+    } catch {
+      return stored;
+    }
+    if (!granted) {
+      await notifications()
+        .cancelAllScheduledNotificationsAsync()
+        .catch(() => undefined);
+      await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
+      return null;
+    }
     if (stored.uiLanguage === language) return stored;
     const outcome = await enableDailyReminderUnsafe(stored.hour, language);
     return outcome === 'enabled' ? { hour: stored.hour, uiLanguage: language } : null;

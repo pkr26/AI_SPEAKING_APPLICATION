@@ -75,7 +75,11 @@ async function startInspection(child = new FakeChild(), probeListing = '0\n') {
 
 function completeSuccessfully(child: FakeChild): void {
   // One second of mono 8 kHz signed 16-bit PCM.
-  child.stdout.emit('data', Buffer.alloc(8_000 * 2));
+  const pcm = Buffer.alloc(8_000 * 2);
+  for (let sampleIndex = 0; sampleIndex < 8_000; sampleIndex++) {
+    pcm.writeInt16LE(sampleIndex % 2 === 0 ? 128 : -128, sampleIndex * 2);
+  }
+  child.stdout.emit('data', pcm);
   child.emit('close', 0);
 }
 

@@ -4,6 +4,8 @@ import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'exp
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../../components/Button';
+import DataRefreshNotice from '../../components/DataRefreshNotice';
+import OfflineState from '../../components/OfflineState';
 import Recorder, {
   scrollToExpandedRecorderControls,
   type RecorderResultMetadata,
@@ -47,6 +49,11 @@ export default function AttemptScreen() {
   // Render state disables the switch, while this mirror closes the tiny window
   // between Recorder taking ownership of a recording and that disabled render.
   const recorderLockedRef = useRef(false);
+  const [recorderExitLockState, setRecorderExitLockState] = useState<{
+    owner: string | null;
+    locked: boolean;
+  }>({ owner: null, locked: false });
+  const recorderExitLockedRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
@@ -56,10 +63,23 @@ export default function AttemptScreen() {
   const activeRecorderOwnerRef = useRef<string | null>(null);
   const handledResultRequestIdsRef = useRef(new Set<string>());
   const recoveryExitRef = useRef<string | null>(null);
-  const params = useLocalSearchParams<{ questionId?: string }>();
+  const params = useLocalSearchParams<{
+    questionId?: string;
+    cycleId?: string;
+    attemptsUsed?: string;
+  }>();
   const questionId = firstParam(params.questionId);
+  const cycleId = firstParam(params.cycleId);
+  const attemptsUsedParam = firstParam(params.attemptsUsed);
   let validQuestionId: string | null = null;
   if (isUuid(questionId)) validQuestionId = questionId;
+  const validCycleId = isUuid(cycleId) ? cycleId : null;
+  const routedAttemptsUsed =
+    attemptsUsedParam !== undefined && /^[0-2]$/.test(attemptsUsedParam)
+      ? Number(attemptsUsedParam)
+      : null;
+  const validLink =
+    validQuestionId !== null && validCycleId !== null && routedAttemptsUsed !== null;
   const nativeMode = answerMode === 'native';
   const userId = user?.id ?? null;
   const renderOwner = `${sessionVersion}:${userId ?? 'anonymous'}`;
@@ -69,8 +89,12 @@ export default function AttemptScreen() {
     return captureSessionLease();
   }, [captureSessionLease, sessionVersion, userId]);
   const recorderOwner =
-    validQuestionId && `${renderOwner}:${validQuestionId}:${nativeMode ? 'native' : 'english'}`;
+    validQuestionId && validCycleId
+      ? `${renderOwner}:${validQuestionId}:${validCycleId}:${nativeMode ? 'native' : 'english'}`
+      : null;
   const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
+  const recorderExitLocked =
+    recorderExitLockState.owner === recorderOwner && recorderExitLockState.locked;
   const practiceQuestionKey = useMemo(
     () => ['practice-question', user?.id, user?.cefrLevel] as const,
     [user?.cefrLevel, user?.id],
@@ -91,6 +115,7 @@ export default function AttemptScreen() {
     handledResultRequestIdsRef.current = new Set();
     recoveryExitRef.current = null;
     recorderLockedRef.current = false;
+    recorderExitLockedRef.current = false;
   }, [recorderOwner]);
 
   const renderOwnsWork = useCallback(
@@ -108,7 +133,7 @@ export default function AttemptScreen() {
   const publishNavigationLock = useCallback(() => {
     if (!mountedRef.current || !focusedRef.current) return;
     navigation.setOptions(
-      recorderLockedRef.current
+      recorderExitLockedRef.current
         ? { headerBackVisible: false, gestureEnabled: false }
         : { headerBackVisible: true, gestureEnabled: true },
     );
@@ -132,7 +157,7 @@ export default function AttemptScreen() {
   // discard it. Restore normal exits as soon as the lock releases.
   useLayoutEffect(() => {
     publishNavigationLock();
-  }, [publishNavigationLock, recorderLocked]);
+  }, [publishNavigationLock, recorderExitLocked]);
 
   const helpQuery = useQuery({
     queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
@@ -142,7 +167,7 @@ export default function AttemptScreen() {
           signal,
         }),
       ),
-    enabled: !!user && !!validQuestionId,
+    enabled: !!user && validLink,
     retry: false,
   });
 
@@ -151,10 +176,10 @@ export default function AttemptScreen() {
 
   // Hardware back is a normal exit here, except while a recording, upload, or
   // recovery is active — popping then would let blur cleanup discard the take.
-  useHardwareBack(() => recorderLockedRef.current);
+  useHardwareBack(() => recorderExitLockedRef.current);
   useEffect(() => {
     const unsubscribe = navigation.addListener('beforeRemove', (event) => {
-      if (recorderLockedRef.current && event.data.action.type === 'GO_BACK') {
+      if (recorderExitLockedRef.current && event.data.action.type === 'GO_BACK') {
         event.preventDefault();
       }
     });
@@ -167,8 +192,19 @@ export default function AttemptScreen() {
     (locked: boolean) => {
       if (!recorderOwnsWork(recorderOwner)) return;
       recorderLockedRef.current = locked;
+      recorderExitLockedRef.current = locked;
       setRecorderLockState({ owner: recorderOwner, locked });
+      setRecorderExitLockState({ owner: recorderOwner, locked });
       if (locked) setRateLimitNotice(null);
+      publishNavigationLock();
+    },
+    [publishNavigationLock, recorderOwner, recorderOwnsWork],
+  );
+  const handleExitLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      recorderExitLockedRef.current = locked;
+      setRecorderExitLockState({ owner: recorderOwner, locked });
       publishNavigationLock();
     },
     [publishNavigationLock, recorderOwner, recorderOwnsWork],
@@ -179,6 +215,10 @@ export default function AttemptScreen() {
     if (
       !user ||
       !validQuestionId ||
+      !validCycleId ||
+      !promptWord ||
+      !questionText ||
+      !user.cefrLevel ||
       !recorderOwnsWork(owner) ||
       navigationStartedRef.current ||
       handledResultRequestIdsRef.current.has(metadata.requestId)
@@ -193,7 +233,20 @@ export default function AttemptScreen() {
     void queryClient.cancelQueries({ queryKey: practiceQuestionKey, exact: true });
     setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, validQuestionId, result);
-    showFeedback(validQuestionId, result);
+    if (result.recordingId) {
+      void queryClient.invalidateQueries({ queryKey: ['recordings', user.id] });
+    }
+    showFeedback(
+      validQuestionId,
+      result,
+      {
+        id: validQuestionId,
+        cefrLevel: user.cefrLevel,
+        promptWord,
+        questionText,
+      },
+      metadata.requestId,
+    );
     router.push('/practice/feedback');
   };
 
@@ -242,7 +295,7 @@ export default function AttemptScreen() {
   // A disabled query must not look like an indefinitely loading question.
   if (!user) return null;
 
-  if (!validQuestionId) {
+  if (!validLink) {
     return (
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
@@ -265,14 +318,20 @@ export default function AttemptScreen() {
           contentInsetAdjustmentBehavior="automatic"
           contentContainerStyle={styles.center}
         >
-          <ActivityIndicator
-            accessibilityLabel={t('attempt.loading')}
-            size="large"
-            color={theme.colors.primary}
-          />
-          <Text accessibilityLiveRegion="polite" style={styles.muted}>
-            {t('attempt.loading')}
-          </Text>
+          {helpQuery.fetchStatus === 'paused' ? (
+            <OfflineState />
+          ) : (
+            <>
+              <ActivityIndicator
+                accessibilityLabel={t('attempt.loading')}
+                size="large"
+                color={theme.colors.primary}
+              />
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('attempt.loading')}
+              </Text>
+            </>
+          )}
         </ScrollView>
       );
     }
@@ -309,21 +368,33 @@ export default function AttemptScreen() {
       contentInsetAdjustmentBehavior="automatic"
       contentContainerStyle={styles.container}
     >
+      <DataRefreshNotice
+        updating={helpQuery.isRefetching && !helpQuery.isRefetchError}
+        failed={helpQuery.isRefetchError}
+        onRetry={() => void helpQuery.refetch({ cancelRefetch: false })}
+      />
       <View style={styles.card}>
-        {attemptStatus !== null && attemptStatus.questionId === validQuestionId && (
+        {routedAttemptsUsed !== null && (
           <View style={styles.attemptChip}>
             <Text style={styles.attemptChipText}>
               {t('practice.attemptChip', {
-                current: PRACTICE_MAX_ATTEMPTS + 1 - attemptStatus.attemptsLeft,
+                current:
+                  attemptStatus !== null &&
+                  attemptStatus.questionId === validQuestionId &&
+                  attemptStatus.cycleId === validCycleId
+                    ? PRACTICE_MAX_ATTEMPTS + 1 - attemptStatus.attemptsLeft
+                    : routedAttemptsUsed + 1,
                 max: PRACTICE_MAX_ATTEMPTS,
               })}
             </Text>
           </View>
         )}
-        <Text accessibilityRole="header" style={styles.promptWord}>
+        <Text accessibilityLanguage="en-US" accessibilityRole="header" style={styles.promptWord}>
           {promptWord}
         </Text>
-        <Text style={styles.questionText}>{questionText}</Text>
+        <Text accessibilityLanguage="en-US" style={styles.questionText}>
+          {questionText}
+        </Text>
       </View>
 
       <Pressable
@@ -359,17 +430,23 @@ export default function AttemptScreen() {
 
       <View style={styles.recorderArea}>
         <Recorder
-          key={nativeMode ? 'native' : 'english'}
+          key={`${validCycleId}:${nativeMode ? 'native' : 'english'}`}
           ownerId={user.id}
-          questionId={validQuestionId}
+          questionId={validQuestionId!}
+          cycleId={validCycleId!}
           endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
-          parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
+          parseResult={(raw) =>
+            nativeMode
+              ? parseNativeAttemptResult(raw, validCycleId!)
+              : parseAttemptResult(raw, validCycleId!)
+          }
           onResultWithMetadata={handleResult}
           onError={handleError}
           onRateLimited={handleRateLimited}
           onRecoveryUnresolved={handleRecoveryUnresolved}
           onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
           onInteractionLockChange={handleLockChange}
+          onExitLockChange={handleExitLockChange}
           onExpandedControlsLayout={revealExpandedRecorderControls}
         />
       </View>

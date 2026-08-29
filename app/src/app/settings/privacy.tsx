@@ -4,7 +4,7 @@ import { ScrollView, Text, View } from 'react-native';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 
-/** Static, localized privacy summary. Placeholder copy pending owner review. */
+/** Static, localized summary of the data flows implemented by this app. */
 export default function PrivacyPolicyScreen() {
   const t = useT();
   const styles = themedStyles(useTheme());

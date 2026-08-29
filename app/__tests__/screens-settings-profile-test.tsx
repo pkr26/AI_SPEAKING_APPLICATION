@@ -1,15 +1,16 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react-native';
-import { File, Paths } from 'expo-file-system';
+import { Directory, File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import React from 'react';
-import { Alert, StyleSheet } from 'react-native';
+import { Alert, AppState, type AppStateStatus, StyleSheet } from 'react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 
 import SettingsScreen, { formatReminderHour } from '../src/app/settings/index';
 import {
   ApiError,
   apiConsumeAccountExportPages,
+  apiDeleteAllRecordings,
   apiRestartDiagnostic,
   apiUpdateProfile,
 } from '../src/lib/api';
@@ -22,7 +23,7 @@ import {
 } from '../src/lib/daily-reminder';
 import { deviceLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
-import type { User } from '../src/lib/types';
+import type { User, UserDataPage } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
@@ -75,13 +76,38 @@ jest.mock('expo-router', () => {
 
 const mockWrite = jest.fn();
 const mockDelete = jest.fn();
+const mockDirectoryCreate = jest.fn();
 let lastFileUri: string | null = null;
 let lastFileContents = '';
 
 jest.mock('expo-file-system', () => ({
   Paths: { cache: '/mock-cache' },
+  Directory: jest.fn().mockImplementation((...segments: unknown[]) => {
+    const path = segments
+      .map((segment) =>
+        typeof segment === 'string'
+          ? segment
+          : ((segment as { uri?: string }).uri ?? String(segment)),
+      )
+      .join('/')
+      .replace(/^file:\/\//, '');
+    return {
+      uri: `file://${path}`,
+      exists: true,
+      create: mockDirectoryCreate,
+      list: jest.fn(() => []),
+    };
+  }),
   File: jest.fn().mockImplementation((...segments: unknown[]) => {
-    const uri = `file://${(segments as string[]).join('/')}`;
+    const path = segments
+      .map((segment) =>
+        typeof segment === 'string'
+          ? segment
+          : ((segment as { uri?: string }).uri ?? String(segment)),
+      )
+      .join('/')
+      .replace(/^file:\/\//, '');
+    const uri = `file://${path}`;
     lastFileUri = uri;
     return { uri, write: mockWrite, delete: mockDelete };
   }),
@@ -104,8 +130,20 @@ jest.mock('../src/lib/daily-reminder', () => ({
 jest.mock('../src/lib/api', () => ({
   ...jest.requireActual('../src/lib/api'),
   apiConsumeAccountExportPages: jest.fn(),
+  apiDeleteAllRecordings: jest.fn(),
   apiRestartDiagnostic: jest.fn(),
   apiUpdateProfile: jest.fn(),
+}));
+
+const mockResetPracticeFlow = jest.fn();
+jest.mock('../src/lib/practice-flow', () => ({
+  ...jest.requireActual('../src/lib/practice-flow'),
+  usePracticeFlow: () => ({ resetPracticeFlow: mockResetPracticeFlow }),
+}));
+
+const mockMirrorAccountLanguage = jest.fn();
+jest.mock('../src/lib/guest-language', () => ({
+  useGuestLanguage: () => ({ mirrorAccountLanguage: mockMirrorAccountLanguage }),
 }));
 
 type AuthValue = ReturnType<typeof useAuth>;
@@ -137,6 +175,32 @@ const OTHER_USER: User = {
   email: 'grace@example.com',
   nativeLanguage: 'es',
 };
+
+const EXPORT_PROGRESS = [{ questionId: 'question-one', status: 'learning' }];
+const EXPORT_DIAGNOSTIC = { lowIndex: 1, highIndex: 4, questionsAsked: 2 };
+
+function userExportPage(overrides: Partial<UserDataPage> = {}): UserDataPage {
+  return {
+    user: USER,
+    attempts: [],
+    practiceProgress: EXPORT_PROGRESS,
+    practiceCycles: [],
+    diagnosticState: EXPORT_DIAGNOSTIC,
+    nextCursor: null,
+    nextPracticeCycleCursor: null,
+    attemptsDone: true,
+    practiceCyclesDone: true,
+    ...overrides,
+  };
+}
+
+async function emitTerminalUserExport(
+  consumePage: (page: UserDataPage, pageIndex: number) => void | Promise<void>,
+  attemptOverrides: Partial<UserDataPage> = {},
+): Promise<void> {
+  await consumePage(userExportPage(attemptOverrides), 0);
+  await consumePage(userExportPage(), 1);
+}
 
 /** Every language the screen offers, in the order the grid lays them out. */
 const LANGUAGE_CHIPS = [
@@ -184,6 +248,7 @@ jest.mock('../src/lib/auth', () => ({
 
 const mockUpdateProfile = apiUpdateProfile as jest.Mock;
 const mockConsumeExportPages = apiConsumeAccountExportPages as jest.Mock;
+const mockDeleteAllRecordings = apiDeleteAllRecordings as jest.Mock;
 const mockExportData = jest.fn();
 const mockRestartDiagnostic = apiRestartDiagnostic as jest.Mock;
 const mockGetReminder = getDailyReminder as jest.Mock;
@@ -192,6 +257,7 @@ const mockDisableReminder = disableDailyReminder as jest.Mock;
 const mockRefreshReminderLanguage = refreshDailyReminderLanguage as jest.Mock;
 const mockSharingAvailable = Sharing.isAvailableAsync as jest.Mock;
 const mockShareAsync = Sharing.shareAsync as jest.Mock;
+const mockDirectory = Directory as unknown as jest.Mock;
 const mockFile = File as unknown as jest.Mock;
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
@@ -372,6 +438,7 @@ beforeEach(() => {
   mockAuthValue = makeAuth();
   mockPrivacyOptionsRequired = false;
   mockShowAdPrivacyOptions.mockReset().mockResolvedValue(true);
+  mockMirrorAccountLanguage.mockReset();
   mockUpdateProfile.mockReset();
   mockExportData.mockReset().mockResolvedValue({ user: USER, attempts: [] });
   mockConsumeExportPages
@@ -381,16 +448,18 @@ beforeEach(() => {
         user: User;
         attempts: Record<string, unknown>[];
       };
-      await consumePage({ ...data, nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage, data);
       await consumeRecordings({ recordings: [], nextCursor: null }, 0);
     });
   mockRestartDiagnostic.mockReset();
+  mockDeleteAllRecordings.mockReset().mockResolvedValue(undefined);
   mockWrite
     .mockReset()
     .mockImplementation((content: string, options?: { append?: boolean; encoding?: string }) => {
       lastFileContents = options?.append ? `${lastFileContents}${content}` : content;
     });
   mockDelete.mockReset();
+  mockDirectoryCreate.mockReset();
   mockGetReminder.mockReset().mockResolvedValue(null);
   mockEnableReminder.mockReset().mockResolvedValue('enabled');
   mockRefreshReminderLanguage.mockReset().mockResolvedValue(null);
@@ -573,8 +642,8 @@ describe('settings profile card', () => {
     await renderSettings();
 
     expect(screen.getByText(t('settings.levelPending'))).toBeTruthy();
-    // No level test to retake yet.
-    expect(screen.queryByText(t('settings.retake'))).toBeNull();
+    // An interrupted test can be restarted to escape a stale durable question.
+    expect(screen.getByRole('button', { name: t('settings.retake') })).toBeTruthy();
   });
 
   it('re-syncs the name draft when the session user arrives after mount', async () => {
@@ -1103,6 +1172,7 @@ describe('settings profile card', () => {
       update.resolve({ ...USER, uiLanguage: 'hi' });
       await Promise.resolve();
     });
+    expect(mockMirrorAccountLanguage).toHaveBeenCalledWith('hi');
     expect(mockRefreshReminderLanguage).toHaveBeenCalledWith('hi');
     for (const [index] of UI_LANGUAGE_CHIPS.entries()) {
       expect(uiLanguageChip(index).props.accessibilityState).toMatchObject({ disabled: false });
@@ -1388,6 +1458,7 @@ describe('settings profile card', () => {
   it('shows and opens UMP privacy options only when the SDK requires them', async () => {
     const initial = await renderSettings();
     expect(screen.queryByRole('button', { name: t('ads.privacyOptions') })).toBeNull();
+    expect(screen.queryByRole('header', { name: t('ads.privacyOptions') })).toBeNull();
     await initial.unmount();
 
     mockPrivacyOptionsRequired = true;
@@ -1975,25 +2046,50 @@ describe('data export', () => {
     });
 
     expect(mockExportData).toHaveBeenCalledTimes(1);
-    // A timestamped .json name in the cache directory keeps repeat exports
-    // from colliding and keeps the payload out of user-visible storage.
-    expect(mockFile).toHaveBeenCalledWith(
+    // A unique account-scoped path under the app's dedicated cache tree keeps
+    // repeat exports from colliding and lets lifecycle cleanup find orphans.
+    expect(mockDirectory).toHaveBeenCalledWith(
       Paths.cache,
-      expect.stringMatching(/^ai-english-coach-data-\d+\.json$/),
+      'ai-english-coach-private-v1',
+      'exports',
+      USER.id,
     );
-    expect(lastFileContents).toBe(JSON.stringify({ ...exportData, recordings: [] }));
-    expect(mockWrite).toHaveBeenNthCalledWith(1, `{"user":${JSON.stringify(USER)},"attempts":[`, {
-      encoding: 'utf8',
-    });
+    expect(mockDirectoryCreate).toHaveBeenCalledWith({ idempotent: true, intermediates: true });
+    expect(mockFile).toHaveBeenCalledWith(
+      expect.objectContaining({
+        uri: expect.stringContaining(`/ai-english-coach-private-v1/exports/${USER.id}`),
+      }),
+      expect.stringMatching(/^account-data--[a-z0-9]+-[a-z0-9]+\.json$/),
+    );
+    expect(lastFileUri).toContain('/ai-english-coach-private-v1/exports/');
+    expect(lastFileContents).toBe(
+      JSON.stringify({
+        user: USER,
+        practiceProgress: EXPORT_PROGRESS,
+        diagnosticState: EXPORT_DIAGNOSTIC,
+        attempts: exportData.attempts,
+        practiceCycles: [],
+        recordings: [],
+      }),
+    );
+    expect(mockWrite).toHaveBeenNthCalledWith(
+      1,
+      `{"user":${JSON.stringify(USER)},"practiceProgress":${JSON.stringify(EXPORT_PROGRESS)},"diagnosticState":${JSON.stringify(EXPORT_DIAGNOSTIC)},"attempts":[`,
+      { encoding: 'utf8' },
+    );
     expect(mockWrite).toHaveBeenNthCalledWith(2, '{"id":"a1"}', {
       append: true,
       encoding: 'utf8',
     });
-    expect(mockWrite).toHaveBeenNthCalledWith(3, '],"recordings":[', {
+    expect(mockWrite).toHaveBeenNthCalledWith(3, '],"practiceCycles":[', {
       append: true,
       encoding: 'utf8',
     });
-    expect(mockWrite).toHaveBeenNthCalledWith(4, ']}', {
+    expect(mockWrite).toHaveBeenNthCalledWith(4, '],"recordings":[', {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(5, ']}', {
       append: true,
       encoding: 'utf8',
     });
@@ -2009,15 +2105,31 @@ describe('data export', () => {
     const cursor = '550e8400-e29b-41d4-a716-446655440041';
     const expected = {
       user: USER,
+      practiceProgress: EXPORT_PROGRESS,
+      diagnosticState: EXPORT_DIAGNOSTIC,
       attempts: [{ id: 'a1' }, { id: 'a2' }, { id: 'a3' }],
+      practiceCycles: [{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }],
       recordings: [],
     };
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
-      await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: cursor }, 0);
       await consumePage(
-        { user: USER, attempts: [{ id: 'a2' }, { id: 'a3' }], nextCursor: null },
-        1,
+        userExportPage({
+          attempts: [{ id: 'a1' }],
+          nextCursor: cursor,
+          attemptsDone: false,
+        }),
+        0,
       );
+      await consumePage(userExportPage({ attempts: [{ id: 'a2' }, { id: 'a3' }] }), 1);
+      await consumePage(
+        userExportPage({
+          practiceCycles: [{ id: 'c1' }, { id: 'c2' }],
+          nextPracticeCycleCursor: cursor,
+          practiceCyclesDone: false,
+        }),
+        2,
+      );
+      await consumePage(userExportPage({ practiceCycles: [{ id: 'c3' }] }), 3);
       await consumeRecordings({ recordings: [], nextCursor: null }, 0);
     });
     await renderSettings();
@@ -2026,7 +2138,7 @@ describe('data export', () => {
 
     expect(lastFileContents).toBe(JSON.stringify(expected));
     expect(parsedExportContents()).toEqual(expected);
-    expect(mockWrite).toHaveBeenCalledTimes(5);
+    expect(mockWrite).toHaveBeenCalledTimes(8);
     expect(mockShareAsync).toHaveBeenCalledTimes(1);
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
@@ -2049,7 +2161,7 @@ describe('data export', () => {
       availableAt: '2026-08-25T00:00:01.000Z',
     };
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
-      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage);
       await consumeRecordings({ recordings: [exportedRecording], nextCursor: null }, 0);
     });
     await renderSettings();
@@ -2057,7 +2169,10 @@ describe('data export', () => {
 
     expect(parsedExportContents()).toEqual({
       user: USER,
+      practiceProgress: EXPORT_PROGRESS,
+      diagnosticState: EXPORT_DIAGNOSTIC,
       attempts: [],
+      practiceCycles: [],
       recordings: [exportedRecording],
     });
     expect(lastFileContents).not.toContain('playbackUrl');
@@ -2070,7 +2185,7 @@ describe('data export', () => {
     const secondRecording = { id: 'recording-two', status: 'unavailable' };
     const thirdRecording = { id: 'recording-three', status: 'retention_pending' };
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
-      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage);
       await consumeRecordings(
         {
           recordings: [firstRecording, secondRecording],
@@ -2087,20 +2202,23 @@ describe('data export', () => {
     expect(lastFileContents).toBe(
       JSON.stringify({
         user: USER,
+        practiceProgress: EXPORT_PROGRESS,
+        diagnosticState: EXPORT_DIAGNOSTIC,
         attempts: [],
+        practiceCycles: [],
         recordings: [firstRecording, secondRecording, thirdRecording],
       }),
     );
-    expect(mockWrite).toHaveBeenNthCalledWith(2, '],"recordings":[', {
+    expect(mockWrite).toHaveBeenNthCalledWith(3, '],"recordings":[', {
       append: true,
       encoding: 'utf8',
     });
     expect(mockWrite).toHaveBeenNthCalledWith(
-      3,
+      4,
       `${JSON.stringify(firstRecording)},${JSON.stringify(secondRecording)}`,
       { append: true, encoding: 'utf8' },
     );
-    expect(mockWrite).toHaveBeenNthCalledWith(4, `,${JSON.stringify(thirdRecording)}`, {
+    expect(mockWrite).toHaveBeenNthCalledWith(5, `,${JSON.stringify(thirdRecording)}`, {
       append: true,
       encoding: 'utf8',
     });
@@ -2128,7 +2246,7 @@ describe('data export', () => {
     mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings, signal) => {
       exportSignal = signal;
-      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage);
       leaseCurrent = false;
       await consumeRecordings({ recordings: [], nextCursor: null }, 0);
     });
@@ -2137,7 +2255,7 @@ describe('data export', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
 
     expect(exportSignal?.aborted).toBe(true);
-    expect(lastFileContents).toBe(`{"user":${JSON.stringify(USER)},"attempts":[`);
+    expect(lastFileContents).toContain('"practiceCycles":[');
     expect(mockShareAsync).not.toHaveBeenCalled();
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
@@ -2145,7 +2263,7 @@ describe('data export', () => {
   it('rejects an unserializable recording before writing or sharing it', async () => {
     const invalidRecording = { toJSON: () => undefined };
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
-      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage);
       await consumeRecordings({ recordings: [invalidRecording], nextCursor: null }, 0);
     });
     await renderSettings();
@@ -2153,14 +2271,14 @@ describe('data export', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
 
     expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
-    expect(lastFileContents).toBe(`{"user":${JSON.stringify(USER)},"attempts":[],"recordings":[`);
+    expect(lastFileContents).toContain('"practiceCycles":[],"recordings":[');
     expect(mockShareAsync).not.toHaveBeenCalled();
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
 
   it('rejects a walker that returns without emitting a recording page', async () => {
     mockConsumeExportPages.mockImplementation(async (consumePage) => {
-      await consumePage({ user: USER, attempts: [], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage);
     });
     await renderSettings();
 
@@ -2174,11 +2292,11 @@ describe('data export', () => {
   it('deletes a partial file and never shares when a later page fails', async () => {
     mockConsumeExportPages.mockImplementation(async (consumePage) => {
       await consumePage(
-        {
-          user: USER,
+        userExportPage({
           attempts: [{ id: 'a1' }],
           nextCursor: '550e8400-e29b-41d4-a716-446655440041',
-        },
+          attemptsDone: false,
+        }),
         0,
       );
       throw new ApiError(500, 'page failed');
@@ -2196,7 +2314,7 @@ describe('data export', () => {
   it('rejects an unserializable attempt before creating an export file', async () => {
     const invalidAttempt = { toJSON: () => undefined };
     mockConsumeExportPages.mockImplementation(async (consumePage) => {
-      await consumePage({ user: USER, attempts: [invalidAttempt], nextCursor: null }, 0);
+      await consumePage(userExportPage({ attempts: [invalidAttempt] }), 0);
     });
     await renderSettings();
 
@@ -2211,7 +2329,7 @@ describe('data export', () => {
   it('rejects an unserializable current user before creating an export file', async () => {
     const invalidUser = { ...USER, toJSON: () => undefined };
     mockConsumeExportPages.mockImplementation(async (consumePage) => {
-      await consumePage({ user: invalidUser, attempts: [], nextCursor: null }, 0);
+      await consumePage(userExportPage({ user: invalidUser }), 0);
     });
     await renderSettings();
 
@@ -2225,7 +2343,7 @@ describe('data export', () => {
 
   it('rejects a wrong-account first page before creating or writing a file', async () => {
     mockConsumeExportPages.mockImplementation(async (consumePage) => {
-      await consumePage({ user: OTHER_USER, attempts: [{ id: 'foreign' }], nextCursor: null }, 0);
+      await consumePage(userExportPage({ user: OTHER_USER, attempts: [{ id: 'foreign' }] }), 0);
     });
     await renderSettings();
 
@@ -2244,11 +2362,11 @@ describe('data export', () => {
     mockConsumeExportPages.mockImplementation(async (consumePage, _consumeRecordings, signal) => {
       exportSignal = signal;
       await consumePage(
-        {
-          user: USER,
+        userExportPage({
           attempts: [{ id: 'a1' }],
           nextCursor: '550e8400-e29b-41d4-a716-446655440041',
-        },
+          attemptsDone: false,
+        }),
         0,
       );
       await remainingPages.promise;
@@ -2276,9 +2394,17 @@ describe('data export', () => {
     });
 
     expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
-    expect(lastFileContents).toBe(JSON.stringify({ user: USER, attempts: [], recordings: [] }));
-    // Each additive array writes one boundary even when both are empty.
-    expect(mockWrite).toHaveBeenCalledTimes(3);
+    expect(lastFileContents).toBe(
+      JSON.stringify({
+        user: USER,
+        practiceProgress: EXPORT_PROGRESS,
+        diagnosticState: EXPORT_DIAGNOSTIC,
+        attempts: [],
+        practiceCycles: [],
+        recordings: [],
+      }),
+    );
+    expect(mockWrite).toHaveBeenCalledTimes(4);
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
 
@@ -2286,7 +2412,7 @@ describe('data export', () => {
     let leaseCurrent = true;
     mockAuthValue.isSessionLeaseCurrent = jest.fn(() => leaseCurrent);
     mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
-      await consumePage({ user: USER, attempts: [{ id: 'a1' }], nextCursor: null }, 0);
+      await emitTerminalUserExport(consumePage, { attempts: [{ id: 'a1' }] });
       await consumeRecordings({ recordings: [], nextCursor: null }, 0);
       leaseCurrent = false;
     });
@@ -2402,6 +2528,47 @@ describe('data export', () => {
 });
 
 describe('daily reminder controls', () => {
+  it('turns the persisted switch off after OS permission is revoked in the background', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', { configurable: true, value: 'active' });
+    let onAppStateChange: ((state: AppStateStatus) => void) | undefined;
+    const remove = jest.fn();
+    const listener = jest.spyOn(AppState, 'addEventListener').mockImplementation((_event, next) => {
+      onAppStateChange = next;
+      return { remove } as ReturnType<typeof AppState.addEventListener>;
+    });
+    mockGetReminder.mockResolvedValueOnce({ hour: 8 }).mockResolvedValue(null);
+
+    try {
+      const view = await renderSettings();
+      expect(
+        screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+      ).toMatchObject({ checked: true });
+
+      await act(async () => {
+        onAppStateChange?.('background');
+        onAppStateChange?.('active');
+        await Promise.resolve();
+      });
+
+      await waitFor(() =>
+        expect(
+          screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+        ).toMatchObject({ checked: false }),
+      );
+      expect(screen.queryByText(reminderTimeText(8))).toBeNull();
+      await view.unmount();
+      expect(remove).toHaveBeenCalledTimes(1);
+    } finally {
+      listener.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
+  });
+
   it('enables the reminder at the default hour and shows the time picker', async () => {
     await renderSettings();
 
@@ -2597,6 +2764,23 @@ describe('daily reminder controls', () => {
 });
 
 describe('retake placement test', () => {
+  it('offers a confirmed restart while the level test is still in progress', async () => {
+    mockAuthValue = makeAuth({
+      user: { ...USER, diagnosticCompleted: false, cefrLevel: null },
+    });
+    await renderSettings();
+
+    const restart = screen.getByRole('button', { name: t('settings.retake') });
+    expect(restart.props.accessibilityState).toEqual({ disabled: false, busy: false });
+    await fireEvent.press(restart);
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('retake.confirmTitle'),
+      t('retake.confirmBody'),
+      expect.any(Array),
+      expect.objectContaining({ cancelable: true }),
+    );
+  });
+
   it('opens one navigation-locked confirmation and releases it on cancel', async () => {
     await renderSettings();
     const row = screen.getByRole('button', { name: t('settings.retake') });
@@ -2656,6 +2840,7 @@ describe('retake placement test', () => {
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-question'] });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'], type: 'inactive' });
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-history'] });
+    expect(mockResetPracticeFlow).toHaveBeenCalledTimes(1);
     // The session profile just lost its level: the cached /auth/me must refetch.
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockAuthValue.setUser).toHaveBeenCalledWith({
@@ -2971,6 +3156,122 @@ describe('account actions', () => {
     });
   });
 
+  it('renders an explicit destructive bulk-recording control with a count-independent confirmation', async () => {
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+    expect(row().props.accessibilityHint).toBe(t('settings.recordingsDeleteAllHint'));
+    expect(screen.getByText(t('settings.recordingsDeleteAllHint'))).toBeTruthy();
+    expect(row().props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(flattenedStyle(screen.getByText(t('settings.recordingsDeleteAll')))).toEqual({
+      fontSize: 16,
+      fontWeight: '600',
+      color: colors.danger,
+    });
+
+    const open = committedPressHandler(row());
+    await act(async () => {
+      open();
+      open();
+    });
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(latestAlertCall()).toEqual([
+      t('settings.recordingsDeleteAllTitle'),
+      t('settings.recordingsDeleteAllBody'),
+      [
+        { text: t('common.cancel'), style: 'cancel', onPress: expect.any(Function) },
+        {
+          text: t('settings.recordingsDeleteAllConfirm'),
+          style: 'destructive',
+          onPress: expect.any(Function),
+        },
+      ],
+      { cancelable: true, onDismiss: expect.any(Function) },
+    ]);
+    // The confirmation never relies on a potentially stale client-side count.
+    expect(latestAlertCall()[1]).not.toMatch(/\{count\}|\b\d+\b/);
+    expect(row().props.accessibilityState).toMatchObject({ disabled: true });
+
+    await pressAlertButton(t('common.cancel'));
+    expect(row().props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(mockDeleteAllRecordings).not.toHaveBeenCalled();
+  });
+
+  it('bulk-deletes once per confirmation frame and invalidates recording and history caches', async () => {
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    const client = makeQueryClient();
+    const cancel = jest.spyOn(client, 'cancelQueries');
+    const remove = jest.spyOn(client, 'removeQueries');
+    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    await renderSettings(client);
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+    const reopen = committedPressHandler(row());
+    await fireEvent.press(row());
+    const confirm = latestAlertButtons().find(
+      (button) => button.text === t('settings.recordingsDeleteAllConfirm'),
+    )?.onPress;
+    expect(confirm).toEqual(expect.any(Function));
+
+    await act(async () => {
+      confirm!();
+      confirm!();
+      reopen();
+      await Promise.resolve();
+    });
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+    expect(mockDeleteAllRecordings).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(
+      screen.getByRole('button', { name: t('settings.recordingsDeleteAllBusy') }).props
+        .accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+
+    await act(async () => request.resolve(undefined));
+    const success = await screen.findByText(t('settings.recordingsDeleteAllSuccess'));
+    expect(success.props.accessibilityLiveRegion).toBe('polite');
+    expect(cancel).toHaveBeenCalledWith({ queryKey: ['recordings', USER.id], exact: true });
+    expect(cancel).toHaveBeenCalledWith({
+      queryKey: ['practice-history', USER.id],
+      exact: true,
+    });
+    expect(remove).toHaveBeenCalledWith({
+      queryKey: ['recordings', USER.id],
+      exact: true,
+      type: 'inactive',
+    });
+    expect(remove).toHaveBeenCalledWith({
+      queryKey: ['practice-history', USER.id],
+      exact: true,
+      type: 'inactive',
+    });
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ['recordings', USER.id], exact: true });
+    expect(invalidate).toHaveBeenCalledWith({
+      queryKey: ['practice-history', USER.id],
+      exact: true,
+    });
+    expect(
+      screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }).props
+        .accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+  });
+
+  it('shows a localized bulk-delete failure and re-arms the destructive row', async () => {
+    mockDeleteAllRecordings.mockRejectedValueOnce(new Error('offline'));
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      t('settings.recordingsDeleteAllFailed'),
+    );
+    expect(
+      screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }).props
+        .accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+  });
+
   it('re-arms singleton navigation on focus and blocks saved handlers after blur', async () => {
     await renderSettings();
     const focus = mockFocusCallback;
@@ -3102,7 +3403,7 @@ describe('account actions', () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
-  it('reports a logout failure that is not a cleanup problem generically', async () => {
+  it('offers a local-only sign-out when the server cannot be reached', async () => {
     mockAuthValue = makeAuth({
       logout: jest.fn().mockRejectedValue(new Error('network down')),
     });
@@ -3110,11 +3411,22 @@ describe('account actions', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody')),
+      expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.localBody'), [
+        { text: t('common.cancel'), style: 'cancel' },
+        {
+          text: t('logout.thisDevice'),
+          style: 'destructive',
+          onPress: expect.any(Function),
+        },
+      ]),
     );
     // The raw transport message never reaches the user.
     expect(alertSpy).not.toHaveBeenCalledWith(t('logout.cleanupTitle'), 'network down');
     expect(mockRouter.replace).not.toHaveBeenCalled();
+
+    await pressAlertButton(t('logout.thisDevice'));
+    expect(mockAuthValue.resetStoredSession).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
   it('renders nothing without an authenticated user', async () => {
@@ -3166,6 +3478,64 @@ describe('settings async race fences', () => {
     await act(async () => Promise.resolve());
   });
 
+  it.each(['identity', 'unmount'] as const)(
+    'aborts bulk recording deletion and publishes no stale cache/UI finalizer after %s loss',
+    async (boundary) => {
+      const deletion = deferred<void>();
+      mockDeleteAllRecordings.mockReturnValue(deletion.promise);
+      const client = makeQueryClient();
+      const remove = jest.spyOn(client, 'removeQueries');
+      const invalidate = jest.spyOn(client, 'invalidateQueries');
+      const view = await renderSettings(client);
+      await fireEvent.press(
+        screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }),
+      );
+      await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+      const signal = mockDeleteAllRecordings.mock.calls[0][0] as AbortSignal;
+      expect(signal.aborted).toBe(false);
+
+      await crossSettingsOwnershipBoundary(view, boundary);
+      expect(signal.aborted).toBe(true);
+      remove.mockClear();
+      invalidate.mockClear();
+      mockSetOptions.mockClear();
+      await act(async () => deletion.resolve(undefined));
+
+      expect(remove).not.toHaveBeenCalled();
+      expect(invalidate).not.toHaveBeenCalled();
+      expect(mockSetOptions).not.toHaveBeenCalled();
+      if (boundary === 'identity') {
+        expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+        expect(screen.queryByText(t('settings.recordingsDeleteAllFailed'))).toBeNull();
+      }
+    },
+  );
+
+  it('does no bulk-recording cache work after its captured session lease expires', async () => {
+    let leaseCurrent = true;
+    const lease = { owner: USER.id } as never;
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => lease),
+      isSessionLeaseCurrent: jest.fn(() => leaseCurrent),
+    });
+    const deletion = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(deletion.promise);
+    const client = makeQueryClient();
+    const remove = jest.spyOn(client, 'removeQueries');
+    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    await renderSettings(client);
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    leaseCurrent = false;
+    await act(async () => deletion.resolve(undefined));
+
+    expect(remove).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    expect(screen.queryByText(t('settings.recordingsDeleteAllFailed'))).toBeNull();
+  });
+
   it.each([
     ['name', 'identity'],
     ['name', 'unmount'],
@@ -3196,6 +3566,12 @@ describe('settings async race fences', () => {
       });
       expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
       await crossSettingsOwnershipBoundary(view, boundary);
+      if (field === 'name' && boundary === 'identity') {
+        expect(mockSetOptions).toHaveBeenLastCalledWith({
+          headerBackVisible: true,
+          gestureEnabled: true,
+        });
+      }
       mockSetOptions.mockClear();
       alertSpy.mockClear();
 

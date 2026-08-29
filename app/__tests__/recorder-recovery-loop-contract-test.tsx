@@ -21,6 +21,7 @@ import {
   ensurePendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
+  markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   refundPendingAssessmentRecoveryPost,
@@ -116,6 +117,7 @@ jest.mock('../src/lib/pending-assessment', () => ({
   ensurePendingAssessment: jest.fn(),
   loadPendingAssessment: jest.fn(),
   markPendingAssessmentCancelled: jest.fn(),
+  markPendingAssessmentFeedbackPending: jest.fn(),
   markPendingAssessmentForReconciliation: jest.fn(),
   markPendingAssessmentStage: jest.fn(),
   refundPendingAssessmentRecoveryPost: jest.fn(),
@@ -167,6 +169,7 @@ function pendingRecord(overrides: Partial<PendingAssessment> = {}): PendingAsses
     questionId: QUESTION_ID,
     requestId: REQUEST_ID,
     createdAt: Date.now(),
+    retainRecording: false,
     stage: 'direct-posting',
     ...overrides,
   };
@@ -215,6 +218,7 @@ beforeEach(() => {
     async (candidate: PendingAssessment) => candidate,
   );
   asMock(clearPendingAssessment).mockResolvedValue(undefined);
+  asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(true);
   asMock(markPendingAssessmentForReconciliation).mockResolvedValue(true);
   asMock(markPendingAssessmentCancelled).mockResolvedValue(true);
   asMock(markPendingAssessmentStage).mockResolvedValue(true);

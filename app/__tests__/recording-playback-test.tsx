@@ -1,6 +1,7 @@
 import { InfiniteData, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import { createAudioPlayer } from 'expo-audio';
+import * as Sharing from 'expo-sharing';
 import React from 'react';
 import { AccessibilityInfo, Alert, AppState, StyleSheet } from 'react-native';
 
@@ -23,7 +24,12 @@ import {
 } from '../src/lib/audio-session';
 import { useAuth } from '../src/lib/auth';
 import { translateFor } from '../src/lib/i18n';
-import { lightColors, radii, spacing } from '../src/lib/theme';
+import {
+  claimPrivatePlaybackFile,
+  downloadPrivatePlaybackFile,
+  type OwnedPrivateFile,
+} from '../src/lib/private-artifacts';
+import { layout, lightColors, radii, spacing } from '../src/lib/theme';
 import type { HistoryPage, RecordingPage } from '../src/lib/types';
 
 const OWNER_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -34,7 +40,34 @@ const t = (key: Parameters<typeof translateFor>[1], params?: Record<string, stri
   translateFor('en', key, params);
 const asMock = (value: unknown) => value as jest.Mock;
 
+interface MockPrivatePlaybackFile extends OwnedPrivateFile {
+  release: jest.Mock;
+}
+
+const playbackFiles: MockPrivatePlaybackFile[] = [];
+
+jest.mock('../src/lib/private-artifacts', () => ({
+  claimPrivatePlaybackFile: jest.fn(),
+  cleanupPrivateArtifacts: jest.fn(async () => undefined),
+  downloadPrivatePlaybackFile: jest.fn(async () => undefined),
+}));
+
+function recordingActionLabel(
+  key:
+    | 'recordings.playLabel'
+    | 'recordings.pauseLabel'
+    | 'recordings.shareLabel'
+    | 'recordings.deleteAction',
+  recordingLabel: string,
+): string {
+  return `${t(key)}: ${recordingLabel}`;
+}
+
 interface MockPlayer {
+  isLoaded: boolean;
+  currentStatus: Record<string, unknown>;
+  muted: boolean;
+  volume: number;
   play: jest.Mock;
   pause: jest.Mock;
   seekTo: jest.Mock;
@@ -48,6 +81,8 @@ interface MockPlayer {
 const players: MockPlayer[] = [];
 let mockNextPlayerPlayError: Error | null = null;
 let mockNextAddListenerError: Error | null = null;
+let mockAutoLoadPlayer = true;
+let mockPlayerInitiallyLoaded = false;
 const mockSetAudioModeAsync = jest.fn<Promise<void>, [unknown]>(
   async (_options: unknown) => undefined,
 );
@@ -59,17 +94,62 @@ jest.mock('expo-audio', () => ({
     let listener: ((status: Record<string, unknown>) => void) | null = null;
     let lastListener: ((status: Record<string, unknown>) => void) | null = null;
     const listenerRemove = jest.fn(() => (listener = null));
+    const initialStatus = {
+      currentTime: 0,
+      duration: 0,
+      playing: false,
+      isLoaded: mockPlayerInitiallyLoaded,
+      isBuffering: false,
+      didJustFinish: false,
+      error: null,
+    };
     const player: MockPlayer = {
-      play: jest.fn(),
+      isLoaded: mockPlayerInitiallyLoaded,
+      currentStatus: initialStatus,
+      // Deliberately hostile defaults prove the component makes every fresh
+      // retained-recording player audible before requesting playback.
+      muted: true,
+      volume: 0,
+      play: jest.fn(() => {
+        if (!mockAutoLoadPlayer) return;
+        void Promise.resolve().then(() =>
+          player.emit({
+            currentTime: 0,
+            duration: 0,
+            playing: true,
+            isLoaded: true,
+            isBuffering: false,
+            didJustFinish: false,
+            error: null,
+          }),
+        );
+      }),
       pause: jest.fn(),
       seekTo: jest.fn(async () => undefined),
       remove: jest.fn(),
       addListener: jest.fn((_event: string, next: (status: Record<string, unknown>) => void) => {
         listener = next;
         lastListener = next;
+        if (mockAutoLoadPlayer) {
+          void Promise.resolve().then(() =>
+            player.emit({
+              currentTime: 0,
+              duration: 0,
+              playing: false,
+              isLoaded: true,
+              isBuffering: false,
+              didJustFinish: false,
+              error: null,
+            }),
+          );
+        }
         return { remove: listenerRemove };
       }),
-      emit: (status) => listener?.(status),
+      emit: (status) => {
+        player.currentStatus = { ...player.currentStatus, ...status };
+        if (typeof status.isLoaded === 'boolean') player.isLoaded = status.isLoaded;
+        listener?.(player.currentStatus);
+      },
       emitStale: (status) => lastListener?.(status),
       listenerRemove,
     };
@@ -91,6 +171,11 @@ jest.mock('expo-audio', () => ({
     return player;
   }),
   setAudioModeAsync: (options: unknown) => mockSetAudioModeAsync(options),
+}));
+
+jest.mock('expo-sharing', () => ({
+  isAvailableAsync: jest.fn(async () => true),
+  shareAsync: jest.fn(async () => undefined),
 }));
 
 interface FocusRegistration {
@@ -203,10 +288,14 @@ function historyItem(id: string, recordingId: string | null): HistoryPage['items
     questionText: 'Describe courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    cycleId: '550e8400-e29b-41d4-a716-446655440020',
     attemptNo: 1,
     score: 80,
     passed: true,
+    understood: null,
     transcript: 'I was brave.',
+    translatedTranscript: null,
+    modelAnswer: null,
     feedback: 'Good answer.',
     createdAt: '2026-08-25T00:00:00.000Z',
     recordingId,
@@ -289,8 +378,26 @@ beforeEach(async () => {
   mockAuth.sessionVersion = 1;
   setAppState('active');
   players.length = 0;
+  playbackFiles.length = 0;
+  asMock(claimPrivatePlaybackFile)
+    .mockReset()
+    .mockImplementation(() => {
+      let current = true;
+      const artifact: MockPrivatePlaybackFile = {
+        file: { uri: `file:///mock-private/playback-${playbackFiles.length + 1}.m4a` } as never,
+        isCurrent: () => current,
+        release: jest.fn(() => {
+          current = false;
+        }),
+      };
+      playbackFiles.push(artifact);
+      return artifact;
+    });
+  asMock(downloadPrivatePlaybackFile).mockReset().mockResolvedValue(undefined);
   mockNextPlayerPlayError = null;
   mockNextAddListenerError = null;
+  mockAutoLoadPlayer = true;
+  mockPlayerInitiallyLoaded = false;
   focusRegistrations.length = 0;
   asMock(useAuth).mockClear();
   mockAuth.captureSessionLease.mockClear();
@@ -299,6 +406,8 @@ beforeEach(async () => {
   asMock(apiDeleteRecording).mockReset();
   asMock(apiGetRecordingPlaybackGrant).mockResolvedValue(grant());
   asMock(apiDeleteRecording).mockResolvedValue(undefined);
+  asMock(Sharing.isAvailableAsync).mockReset().mockResolvedValue(true);
+  asMock(Sharing.shareAsync).mockReset().mockResolvedValue(undefined);
   mockSetAudioModeAsync.mockClear();
   mockAppStateSubscriptionRemove.mockClear();
   asMock(createAudioPlayer).mockClear();
@@ -406,11 +515,39 @@ describe('RecordingPlayback', () => {
     await renderPlayback();
 
     const play = screen.getByRole('button', { name: t('recordings.playLabel') });
+    const share = screen.getByRole('button', { name: t('recordings.shareLabel') });
     const remove = screen.getByRole('button', { name: t('recordings.deleteAction') });
     expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(screen.getByText(t('recordings.shareAction'))).toBeTruthy();
+    expect(screen.queryByText(t('recordings.sharing'))).toBeNull();
     expect(play.props.accessibilityState).toEqual({ disabled: false, busy: false });
     expect(remove.props.accessibilityHint).toBe(t('recordings.deleteHint'));
+    expect(share.props.accessibilityHint).toBe(t('recordings.shareHint'));
+    expect(share.props.accessibilityState).toEqual({ disabled: false, busy: false });
     expect(remove.props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(StyleSheet.flatten(play.props.style)).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      paddingVertical: spacing.md,
+      paddingHorizontal: spacing.xl,
+      borderWidth: 1,
+      borderColor: lightColors.primary,
+    });
+    expect(StyleSheet.flatten(remove.props.style)).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      paddingVertical: spacing.md,
+      paddingHorizontal: spacing.xl,
+      backgroundColor: lightColors.danger,
+    });
+    expect(StyleSheet.flatten(share.props.style)).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      paddingVertical: spacing.md,
+      paddingHorizontal: spacing.xl,
+      borderWidth: 1,
+      borderColor: lightColors.primary,
+    });
     expect(AppState.addEventListener).toHaveBeenCalledWith('change', expect.any(Function));
     expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
 
@@ -434,6 +571,190 @@ describe('RecordingPlayback', () => {
       StyleSheet.flatten(screen.getByTestId('recording-playback-detail-slot').props.style),
     ).toEqual({ minHeight: 88 });
   });
+
+  it('includes the recording label in every playback action name', async () => {
+    const recordingLabel = 'courage';
+    await renderPlayback({ recordingLabel });
+
+    const playLabel = recordingActionLabel('recordings.playLabel', recordingLabel);
+    const pauseLabel = recordingActionLabel('recordings.pauseLabel', recordingLabel);
+    const shareLabel = recordingActionLabel('recordings.shareLabel', recordingLabel);
+    const deleteLabel = recordingActionLabel('recordings.deleteAction', recordingLabel);
+    expect(screen.getByRole('button', { name: playLabel })).toBeTruthy();
+    expect(screen.getByRole('button', { name: deleteLabel })).toBeTruthy();
+    expect(screen.getByRole('button', { name: shareLabel })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: t('recordings.playLabel') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('recordings.deleteAction') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('recordings.shareLabel') })).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: playLabel }));
+    await waitFor(() => expect(screen.getByRole('button', { name: pauseLabel })).toBeTruthy());
+  });
+
+  it('shares only an app-owned private file and never exposes the signed playback URL', async () => {
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+
+    expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1);
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledWith(
+      RECORDING_ID,
+      expect.any(AbortSignal),
+    );
+    expect(claimPrivatePlaybackFile).toHaveBeenCalledWith(
+      OWNER_ID,
+      RECORDING_ID,
+      grant().contentType,
+    );
+    expect(downloadPrivatePlaybackFile).toHaveBeenCalledWith(
+      grant().playbackUrl,
+      playbackFiles[0],
+      expect.any(AbortSignal),
+    );
+    expect(Sharing.shareAsync).toHaveBeenCalledWith(playbackFiles[0].file.uri, {
+      mimeType: grant().contentType,
+      dialogTitle: t('recordings.shareAction'),
+    });
+    expect(Sharing.shareAsync).not.toHaveBeenCalledWith(grant().playbackUrl, expect.anything());
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    expect(createAudioPlayer).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+    ).toEqual({
+      disabled: false,
+      busy: false,
+    });
+  });
+
+  it('coalesces same-frame Share presses behind one owned operation', async () => {
+    const available = deferred<boolean>();
+    asMock(Sharing.isAvailableAsync).mockReturnValueOnce(available.promise);
+    await renderPlayback();
+    const share = rawButtonHandler(t('recordings.shareLabel'));
+
+    await act(async () => {
+      share();
+      share();
+      await Promise.resolve();
+    });
+    expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1);
+    expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recordings.sharing'))).toBeTruthy();
+
+    await act(async () => available.resolve(true));
+    await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+  });
+
+  it('reports unavailable or failed sharing without leaking a temporary artifact', async () => {
+    asMock(Sharing.isAvailableAsync).mockResolvedValueOnce(false);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.shareUnavailable')),
+    );
+    expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+    expect(claimPrivatePlaybackFile).not.toHaveBeenCalled();
+
+    asMock(Sharing.isAvailableAsync).mockResolvedValueOnce(true);
+    asMock(Sharing.shareAsync).mockRejectedValueOnce(new Error('native share failed'));
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.shareFailed')),
+    );
+    expect(playbackFiles).toHaveLength(1);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+  });
+
+  it('aborts and removes a partial share file when the app backgrounds', async () => {
+    const download = deferred<void>();
+    asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+
+    await emitAppState('background');
+    expect(signal.aborted).toBe(true);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    expect(Sharing.shareAsync).not.toHaveBeenCalled();
+
+    await act(async () => download.reject(signal.reason));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it.each(['blur', 'unmount', 'logout'] as const)(
+    'aborts and removes a partial share file on %s',
+    async (boundary) => {
+      const download = deferred<void>();
+      asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+      const view = await renderPlayback();
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+      await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+      const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+
+      if (boundary === 'blur') {
+        await act(async () => focusRegistrations[0].cleanup?.());
+      } else if (boundary === 'unmount') {
+        await view.unmount();
+      } else {
+        mockAuth.sessionVersion = 2;
+        leaseGeneration = 2;
+        await view.rerender(
+          <QueryClientProvider client={view.queryClient}>
+            <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+          </QueryClientProvider>,
+        );
+      }
+      expect(signal.aborted).toBe(true);
+      expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+      expect(Sharing.shareAsync).not.toHaveBeenCalled();
+
+      await act(async () => download.reject(signal.reason));
+      expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
+
+  it.each(['background', 'blur', 'unmount', 'logout'] as const)(
+    'keeps a handed-off share file through %s until the native promise settles',
+    async (boundary) => {
+      const nativeShare = deferred<void>();
+      asMock(Sharing.shareAsync).mockReturnValueOnce(nativeShare.promise);
+      const view = await renderPlayback();
+      await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+      await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+      expect(playbackFiles).toHaveLength(1);
+      expect(playbackFiles[0].release).not.toHaveBeenCalled();
+
+      if (boundary === 'background') {
+        await emitAppState('background');
+      } else if (boundary === 'blur') {
+        await act(async () => focusRegistrations[0].cleanup?.());
+      } else if (boundary === 'unmount') {
+        await view.unmount();
+      } else {
+        mockAuth.sessionVersion = 2;
+        leaseGeneration = 2;
+        await view.rerender(
+          <QueryClientProvider client={view.queryClient}>
+            <RecordingPlayback ownerId={OWNER_ID} recordingId={RECORDING_ID} />
+          </QueryClientProvider>,
+        );
+      }
+
+      // The OS already owns the URI. Removing it here can make Android's share
+      // chooser deliver an empty or missing attachment.
+      expect(playbackFiles[0].release).not.toHaveBeenCalled();
+
+      await act(async () => {
+        if (boundary === 'logout') nativeShare.reject(new Error('stale native share failure'));
+        else nativeShare.resolve(undefined);
+        await flushMicrotasks();
+      });
+      expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+      if (boundary !== 'unmount') expect(screen.queryByRole('alert')).toBeNull();
+    },
+  );
 
   it('applies only the compact padding override when requested', async () => {
     await renderPlayback({ compact: true });
@@ -460,6 +781,9 @@ describe('RecordingPlayback', () => {
     expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
     expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
     expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-preparing').props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
     expect(screen.getByTestId('recording-playback-preparing').parent?.props.testID).toBe(
       'recording-playback-detail-slot',
     );
@@ -481,14 +805,29 @@ describe('RecordingPlayback', () => {
     expect(mockSetAudioModeAsync).toHaveBeenCalledWith({
       allowsRecording: false,
       allowsBackgroundRecording: false,
+      interruptionMode: 'doNotMix',
       playsInSilentMode: true,
       shouldPlayInBackground: false,
+      shouldRouteThroughEarpiece: false,
     });
-    expect(createAudioPlayer).toHaveBeenCalledWith(grant().playbackUrl, { updateInterval: 250 });
+    expect(claimPrivatePlaybackFile).toHaveBeenCalledWith(
+      OWNER_ID,
+      RECORDING_ID,
+      grant().contentType,
+    );
+    expect(downloadPrivatePlaybackFile).toHaveBeenCalledWith(
+      grant().playbackUrl,
+      playbackFiles[0],
+      expect.any(AbortSignal),
+    );
+    expect(createAudioPlayer).toHaveBeenCalledWith(playbackFiles[0].file.uri, {
+      updateInterval: 250,
+    });
     expect(players[0].addListener).toHaveBeenCalledWith(
       'playbackStatusUpdate',
       expect.any(Function),
     );
+    expect(players[0]).toMatchObject({ muted: false, volume: 1 });
     expect(players[0].play).toHaveBeenCalledTimes(1);
     expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
     expect(screen.queryByText(t('recorder.play'))).toBeNull();
@@ -584,6 +923,157 @@ describe('RecordingPlayback', () => {
         error: null,
       });
     });
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('waits for a downloaded source to load before requesting native playback', async () => {
+    mockAutoLoadPlayer = false;
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    const player = players[0];
+    expect(player).toMatchObject({ muted: false, volume: 1 });
+    expect(player.play).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => {
+      player.emit({
+        currentTime: 0,
+        duration: 0,
+        playing: false,
+        isLoaded: false,
+        isBuffering: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(player.play).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => {
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: false,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(player.play).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => {
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: true,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('starts an already-loaded download cache hit after listener installation', async () => {
+    mockAutoLoadPlayer = false;
+    mockPlayerInitiallyLoaded = true;
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    const player = players[0];
+    expect(player.addListener.mock.invocationCallOrder[0]).toBeLessThan(
+      player.play.mock.invocationCallOrder[0],
+    );
+    expect(player.play).toHaveBeenCalledTimes(1);
+    expect(player).toMatchObject({ muted: false, volume: 1 });
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => {
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: true,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
+  });
+
+  it('fails a native player that never loads without letting a retained Play create duplicates', async () => {
+    jest.useFakeTimers();
+    mockAutoLoadPlayer = false;
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => {
+      retainedPlay();
+      await flushMicrotasks();
+    });
+    expect(players).toHaveLength(1);
+    expect(players[0].play).not.toHaveBeenCalled();
+
+    await act(async () => {
+      retainedPlay();
+      retainedPlay();
+      await flushMicrotasks();
+    });
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    expect(createAudioPlayer).toHaveBeenCalledTimes(1);
+
+    await act(async () => jest.advanceTimersByTimeAsync(29_999));
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+    expect(players[0].remove).not.toHaveBeenCalled();
+    await act(async () => jest.advanceTimersByTimeAsync(1));
+    expect(players[0].pause).toHaveBeenCalledTimes(1);
+    expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+  });
+
+  it('cancels the preparation watchdog once native playback is confirmed', async () => {
+    jest.useFakeTimers();
+    mockAutoLoadPlayer = false;
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => {
+      retainedPlay();
+      await flushMicrotasks();
+    });
+    const player = players[0];
+    await act(async () => {
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: false,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+      player.emit({
+        currentTime: 0,
+        duration: 8,
+        playing: true,
+        isLoaded: true,
+        isBuffering: false,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    await act(async () => jest.advanceTimersByTimeAsync(30_000));
+    expect(player.remove).not.toHaveBeenCalled();
+    expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
   });
 
@@ -898,7 +1388,7 @@ describe('RecordingPlayback', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(players).toHaveLength(2));
     expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2);
-    expect(createAudioPlayer).toHaveBeenLastCalledWith(distinctGrant(RECORDING_ID).playbackUrl, {
+    expect(createAudioPlayer).toHaveBeenLastCalledWith(playbackFiles[1].file.uri, {
       updateInterval: 250,
     });
     expect(getSubmittedRecordingPlaybackActive()).toBe(true);
@@ -954,8 +1444,14 @@ describe('RecordingPlayback', () => {
       recordingStatus: 'retention_pending',
       recordingLabel: 'old label',
     });
-    const retainedConfirm = rawButtonHandler(t('recordings.deleteAction'));
-    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    const retainedConfirm = rawButtonHandler(
+      recordingActionLabel('recordings.deleteAction', 'old label'),
+    );
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: recordingActionLabel('recordings.playLabel', 'old label'),
+      }),
+    );
     const signal = asMock(apiGetRecordingPlaybackGrant).mock.calls[0][1] as AbortSignal;
 
     await view.rerender(
@@ -974,6 +1470,11 @@ describe('RecordingPlayback', () => {
     expect(
       StyleSheet.flatten(screen.getByTestId('recording-playback-container').props.style),
     ).toEqual(expect.objectContaining({ padding: spacing.sm }));
+    expect(
+      screen.getByRole('button', {
+        name: recordingActionLabel('recordings.playLabel', 'latest label'),
+      }),
+    ).toBeTruthy();
     await act(async () => retainedConfirm());
     expect(Alert.alert).toHaveBeenLastCalledWith(
       t('recordings.deleteTitle'),
@@ -999,6 +1500,11 @@ describe('RecordingPlayback', () => {
     expect(players[0].pause).not.toHaveBeenCalled();
     expect(players[0].remove).not.toHaveBeenCalled();
     expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+    expect(
+      screen.getByRole('button', {
+        name: recordingActionLabel('recordings.pauseLabel', 'latest label'),
+      }),
+    ).toBeTruthy();
     expect(screen.queryByTestId('recording-playback-pending')).toBeNull();
     expect(
       StyleSheet.flatten(screen.getByTestId('recording-playback-container').props.style),
@@ -1113,12 +1619,9 @@ describe('RecordingPlayback', () => {
     await act(async () => focusRegistrations[0].cleanup?.());
     await fireEvent.press(playButtons[1]);
     await waitFor(() => expect(players).toHaveLength(1));
-    expect(createAudioPlayer).toHaveBeenLastCalledWith(
-      distinctGrant(OTHER_RECORDING_ID).playbackUrl,
-      {
-        updateInterval: 250,
-      },
-    );
+    expect(createAudioPlayer).toHaveBeenLastCalledWith(playbackFiles.at(-1)!.file.uri, {
+      updateInterval: 250,
+    });
 
     await act(async () => staleGrant.resolve(distinctGrant(RECORDING_ID)));
     await flushMicrotasks();
@@ -1155,15 +1658,14 @@ describe('RecordingPlayback', () => {
     expect(mockSetAudioModeAsync).toHaveBeenCalledWith({
       allowsRecording: false,
       allowsBackgroundRecording: false,
+      interruptionMode: 'doNotMix',
       playsInSilentMode: true,
       shouldPlayInBackground: false,
+      shouldRouteThroughEarpiece: false,
     });
-    expect(createAudioPlayer).toHaveBeenLastCalledWith(
-      distinctGrant(OTHER_RECORDING_ID).playbackUrl,
-      {
-        updateInterval: 250,
-      },
-    );
+    expect(createAudioPlayer).toHaveBeenLastCalledWith(playbackFiles.at(-1)!.file.uri, {
+      updateInterval: 250,
+    });
     expect(players[0].remove).not.toHaveBeenCalled();
     expect(getSubmittedRecordingPlaybackActive()).toBe(true);
   });
@@ -1199,6 +1701,7 @@ describe('RecordingPlayback', () => {
     await view.unmount();
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
     expect(listener).toHaveBeenCalledTimes(2);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
     unsubscribe();
   });
 
@@ -1211,6 +1714,7 @@ describe('RecordingPlayback', () => {
     expect(completedGrantSignal.aborted).toBe(false);
     await act(async () => mockAppStateListener?.('background'));
     expect(players[0].remove).toHaveBeenCalled();
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
     expect(completedGrantSignal.aborted).toBe(false);
 
     await view.rerender(
@@ -1219,6 +1723,79 @@ describe('RecordingPlayback', () => {
       </QueryClientProvider>,
     );
     expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
+  });
+
+  it('aborts and releases a partial private download on background', async () => {
+    const download = deferred<void>();
+    asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    expect(signal.aborted).toBe(false);
+
+    await emitAppState('background');
+    expect(signal.aborted).toBe(true);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    expect(players).toHaveLength(0);
+
+    await act(async () => download.reject(signal.reason));
+    await flushMicrotasks();
+    expect(players).toHaveLength(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('times out a stalled private download and returns a retryable playback action', async () => {
+    jest.useFakeTimers();
+    const download = deferred<void>();
+    asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+    await renderPlayback();
+
+    await act(async () => {
+      fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+      await flushMicrotasks();
+    });
+    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    await act(async () => jest.advanceTimersByTimeAsync(29_999));
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => jest.advanceTimersByTimeAsync(1));
+    expect(signal.aborted).toBe(true);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(players).toHaveLength(0);
+
+    await act(async () => download.reject(signal.reason));
+    await flushMicrotasks();
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+  });
+
+  it('does not let a stale download continuation release its refocused successor', async () => {
+    const staleDownload = deferred<void>();
+    asMock(downloadPrivatePlaybackFile)
+      .mockReturnValueOnce(staleDownload.promise)
+      .mockResolvedValueOnce(undefined);
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => retainedPlay());
+    await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+    await act(async () => focusRegistrations[0].cleanup?.());
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    await refocus();
+    await act(async () => retainedPlay());
+    await waitFor(() => expect(players).toHaveLength(1));
+    expect(playbackFiles).toHaveLength(2);
+    expect(playbackFiles[1].release).not.toHaveBeenCalled();
+
+    await act(async () => staleDownload.resolve());
+    await flushMicrotasks();
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(playbackFiles[1].release).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy();
   });
 
   it('continues teardown when listener, pause, and remove each throw', async () => {
@@ -1248,6 +1825,7 @@ describe('RecordingPlayback', () => {
     expect(players[0].listenerRemove).toHaveBeenCalledTimes(1);
     expect(players[0].pause).toHaveBeenCalledTimes(1);
     expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
     expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
     expect(screen.getByText(t('recorder.play'))).toBeTruthy();
@@ -1455,7 +2033,7 @@ describe('RecordingPlayback', () => {
     expect(screen.queryByText(t('recorder.pause'))).toBeNull();
   });
 
-  it('reuses a grant only while it remains strictly beyond the ten-second safety window', async () => {
+  it('reuses its owned local file after the signed download capability expires', async () => {
     jest.useFakeTimers();
     jest.setSystemTime(new Date('2026-08-25T00:00:00.000Z'));
     asMock(apiGetRecordingPlaybackGrant).mockResolvedValue({ ...grant(), expiresIn: 20 });
@@ -1470,11 +2048,13 @@ describe('RecordingPlayback', () => {
     expect(players[0].play).toHaveBeenCalledTimes(2);
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
 
-    jest.setSystemTime(new Date('2026-08-25T00:00:10.000Z'));
+    jest.setSystemTime(new Date('2026-08-25T00:01:00.000Z'));
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
-    await waitFor(() => expect(players).toHaveLength(2));
-    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(2);
-    expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(players).toHaveLength(1);
+    expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1);
+    expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1);
+    expect(players[0].remove).not.toHaveBeenCalled();
+    expect(players[0].play).toHaveBeenCalledTimes(3);
   });
 
   it('abandons a grant while playback mode is still configuring after focus loss', async () => {
@@ -1572,7 +2152,8 @@ describe('RecordingPlayback', () => {
     await waitFor(() =>
       expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.deleteFailed')),
     );
-    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
+    expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
     expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
     const completedDeleteSignal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
 
@@ -1712,6 +2293,7 @@ describe('RecordingPlayback', () => {
     expect(players[0].listenerRemove).toHaveBeenCalledTimes(1);
     expect(players[0].pause).toHaveBeenCalledTimes(1);
     expect(players[0].remove).toHaveBeenCalledTimes(1);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
     expect(apiDeleteRecording).toHaveBeenCalledTimes(1);
     deletion.reject(new ApiError(503, 'busy'));
@@ -1968,10 +2550,14 @@ describe('RecordingPlayback', () => {
               questionText: 'Describe courage.',
               cefrLevel: 'B1',
               context: 'practice',
+              cycleId: '550e8400-e29b-41d4-a716-446655440020',
               attemptNo: 1,
               score: 80,
               passed: true,
+              understood: null,
               transcript: 'I was brave.',
+              translatedTranscript: null,
+              modelAnswer: null,
               feedback: 'Good answer.',
               createdAt: '2026-08-25T00:00:00.000Z',
               recordingId: RECORDING_ID,
@@ -1984,7 +2570,11 @@ describe('RecordingPlayback', () => {
       pageParams: [undefined],
     });
 
-    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    await fireEvent.press(
+      screen.getByRole('button', {
+        name: recordingActionLabel('recordings.deleteAction', 'courage'),
+      }),
+    );
     expect(Alert.alert).toHaveBeenCalledWith(
       t('recordings.deleteTitle'),
       t('recordings.deleteBodyNamed', { name: 'courage' }),
@@ -2297,8 +2887,10 @@ describe('submitted-recording audio session', () => {
         {
           allowsRecording: false,
           allowsBackgroundRecording: false,
+          interruptionMode: 'doNotMix',
           playsInSilentMode: true,
           shouldPlayInBackground: false,
+          shouldRouteThroughEarpiece: false,
         },
       ],
       [

@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { z } from 'zod';
-import { pool } from './db';
+import { pool, type CefrLevel } from './db';
 import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
 import { logger } from './logger';
 import { ApiErrorCode, HttpError } from './middleware';
@@ -21,8 +21,17 @@ const COMPLETED_RETENTION_INTERVAL_SQL = `interval '${ASSESSMENT_REQUEST_COMPLET
 interface RequestRow {
   context: AssessmentContext;
   question_id: string;
+  practice_cycle_id: string | null;
+  retain_recording: boolean;
+  response_version: number;
   status: 'processing' | 'completed';
   response_body: Record<string, unknown> | null;
+}
+
+interface RequestStatusRow extends RequestRow {
+  question_cefr_level: CefrLevel;
+  question_prompt_word: string;
+  question_text: string;
 }
 
 function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
@@ -33,7 +42,6 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   const absent = z.undefined().optional();
-  const boundedString = (maximum: number) => z.string().max(maximum);
   const nonEmptyString = (maximum: number) =>
     z
       .string()
@@ -71,11 +79,16 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
         dueCount === undefined || dueCount <= masteredCount + learningCount,
     );
 
-  const practiceQuestionPayload = z.object({
-    question,
-    kind: z.enum(['revision', 'new']),
-    progress: practiceProgress,
-  });
+  const practiceQuestionPayload = z
+    .object({
+      cycleId: uuid,
+      attemptsUsed: integer(0, PRACTICE_MAX_ATTEMPTS - 1),
+      attemptsLeft: integer(1, PRACTICE_MAX_ATTEMPTS),
+      question,
+      kind: z.enum(['revision', 'new']),
+      progress: practiceProgress,
+    })
+    .refine(({ attemptsUsed, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - attemptsUsed);
 
   const levelUp = z.union([
     z.object({ from: z.literal('A1'), to: z.literal('A2') }),
@@ -90,31 +103,47 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
       ...recordingFields,
       passed: z.literal(false),
       score: failingScore,
-      transcript: boundedString(12_000),
+      transcript: nonEmptyString(12_000),
       feedback: nonEmptyString(800),
     }),
     z.object({
       ...recordingFields,
       passed: z.literal(true),
       score: passingScore,
-      transcript: boundedString(12_000),
+      transcript: nonEmptyString(12_000),
       feedback: nonEmptyString(800),
     }),
   ]);
+  const noDiagnosticSilenceField = { noSpeech: absent } as const;
   const diagnosticCompletion = z.discriminatedUnion('done', [
     z.object({ done: z.literal(true), level: cefrLevel, nextQuestion: absent }),
     z.object({ done: z.literal(false), level: absent, nextQuestion: question }),
   ]);
-  const diagnosticResponse = z.intersection(diagnosticOutcome, diagnosticCompletion);
+  const diagnosticScoredResponse = z.intersection(
+    z.intersection(diagnosticOutcome, z.object(noDiagnosticSilenceField)),
+    diagnosticCompletion,
+  );
+  const diagnosticSilenceResponse = z.object({
+    ...recordingFields,
+    passed: z.literal(false),
+    score: z.literal(0),
+    transcript: z.literal(''),
+    feedback: nonEmptyString(800),
+    noSpeech: z.literal(true),
+    done: z.literal(false),
+    level: absent,
+    nextQuestion: question,
+  });
+  const diagnosticResponse = z.union([diagnosticScoredResponse, diagnosticSilenceResponse]);
 
   const commonPracticeFields = {
     ...recordingFields,
+    cycleId: uuid,
     attemptNo: attemptNumber,
     feedback: nonEmptyString(800),
   } as const;
   const noConditionalPracticeFields = {
     noSpeech: absent,
-    attemptsLeft: absent,
     finalFeedback: absent,
     levelUp: absent,
   } as const;
@@ -165,6 +194,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const learningPassResponse = z.object({
     ...commonPracticeFields,
     ...noConditionalPracticeFields,
+    attemptsLeft: z.literal(0),
     passed: z.literal(true),
     mastered: z.literal(false),
     score: learningPassScore,
@@ -175,6 +205,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const masteryResponse = z.object({
     ...commonPracticeFields,
     ...noConditionalPracticeFields,
+    attemptsLeft: z.literal(0),
     passed: z.literal(true),
     mastered: z.literal(true),
     score: masteryScore,
@@ -186,7 +217,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
     .object({
       ...commonPracticeFields,
       noSpeech: absent,
-      attemptsLeft: absent,
+      attemptsLeft: z.literal(0),
       finalFeedback: absent,
       passed: z.literal(true),
       mastered: z.literal(true),
@@ -209,20 +240,44 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const nativeCommonFields = {
     ...recordingFields,
     mode: z.literal('native'),
+    cycleId: uuid,
+    attemptNo: attemptNumber,
     feedback: nonEmptyString(800),
   } as const;
   const nativeResponse = z.union([
-    z.object({
-      ...nativeCommonFields,
-      understood: z.literal(false),
-      transcript: z.literal(''),
-      modelAnswer: z.literal(''),
-    }),
+    z
+      .object({
+        ...nativeCommonFields,
+        understood: z.literal(false),
+        transcript: z.literal(''),
+        translatedTranscript: z.literal(''),
+        modelAnswer: z.literal(''),
+        noSpeech: z.literal(true),
+        attemptsLeft: integer(1, PRACTICE_MAX_ATTEMPTS),
+        next: absent,
+      })
+      .refine(({ attemptNo, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - (attemptNo - 1)),
+    z
+      .object({
+        ...nativeCommonFields,
+        understood: z.boolean(),
+        transcript: nonEmptyString(12_000),
+        translatedTranscript: nonEmptyString(12_000),
+        modelAnswer: nonEmptyString(800),
+        noSpeech: absent,
+        attemptsLeft: attemptNumber,
+        next: absent,
+      })
+      .refine(({ attemptNo, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - attemptNo),
     z.object({
       ...nativeCommonFields,
       understood: z.boolean(),
       transcript: nonEmptyString(12_000),
+      translatedTranscript: nonEmptyString(12_000),
       modelAnswer: nonEmptyString(800),
+      noSpeech: absent,
+      attemptsLeft: z.literal(0),
+      next: practiceQuestionPayload,
     }),
   ]);
 
@@ -269,7 +324,10 @@ export class AssessmentRequestInFlightError extends HttpError {
 /**
  * Claim a client request UUID before any quota/provider work. Completed rows
  * replay their exact response; concurrent processing returns 409 with a short
- * retry hint. The same UUID can never be reused for another question/context.
+ * retry hint. The same UUID can never be reused for another question,
+ * context, or durable practice cycle. Version-1 completed rows that cannot
+ * satisfy the new public contract remain non-replayable tombstones: a stable
+ * 409 prevents both invalid JSON and duplicate paid work until normal expiry.
  * In S3 ingress mode the submitted audioKey is recorded with the processing
  * claim so submitted-object cleanup can tell which object a live worker is
  * reading (see finalizeSubmittedPresignedAudio).
@@ -280,7 +338,15 @@ export async function claimAssessmentRequest(
   context: AssessmentContext,
   questionId: string,
   audioKey?: string,
+  practiceCycleId?: string,
+  retainRecording = true,
 ): Promise<AssessmentRequestClaim> {
+  if (
+    (context === 'diagnostic' && practiceCycleId !== undefined) ||
+    (context !== 'diagnostic' && practiceCycleId === undefined)
+  ) {
+    throw new Error('practice assessment requests require a cycle identity and diagnostic requests must omit it');
+  }
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -308,10 +374,22 @@ export async function claimAssessmentRequest(
     );
     const requestClaimId = randomUUID();
     const inserted = await client.query(
-      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, audio_key)
-       VALUES ($1, $2, $3, $4, $5, 'processing', $6)
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, audio_key, practice_cycle_id,
+          retain_recording, recording_retention_epoch)
+       VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8,
+               (SELECT recording_retention_epoch FROM users WHERE id = $1))
        ON CONFLICT DO NOTHING`,
-      [userId, requestId, requestClaimId, context, questionId, audioKey ?? null],
+      [
+        userId,
+        requestId,
+        requestClaimId,
+        context,
+        questionId,
+        audioKey ?? null,
+        practiceCycleId ?? null,
+        retainRecording,
+      ],
     );
     if (inserted.rowCount === 1) {
       await client.query('COMMIT');
@@ -319,7 +397,7 @@ export async function claimAssessmentRequest(
     }
 
     const existing = await client.query<RequestRow>(
-      `SELECT context, question_id, status, response_body
+      `SELECT context, question_id, practice_cycle_id, retain_recording, response_version, status, response_body
        FROM assessment_requests
        WHERE user_id = $1 AND request_id = $2
        FOR UPDATE`,
@@ -350,13 +428,25 @@ export async function claimAssessmentRequest(
         retryAfterSeconds: 2,
       });
     }
-    if (row.context !== context || row.question_id !== questionId) {
+    if (
+      row.context !== context ||
+      row.question_id !== questionId ||
+      (row.response_version === 2 && row.practice_cycle_id !== (practiceCycleId ?? null)) ||
+      row.retain_recording !== retainRecording
+    ) {
       if (row.status === 'processing') {
         throw new AssessmentRequestInFlightError('Assessment request identifier was already used', 'REQUEST_ID_REUSED');
       }
       throw new HttpError(409, 'Assessment request identifier was already used', 'REQUEST_ID_REUSED');
     }
     if (row.status === 'completed' && row.response_body) {
+      if (row.response_version !== 2) {
+        throw new HttpError(
+          409,
+          'This saved assessment result was created by an older app version; start a new answer',
+          'ASSESSMENT_RESULT_INCOMPATIBLE',
+        );
+      }
       const response = validatedAssessmentResponse(row.context, row.response_body);
       await client.query('COMMIT');
       return { kind: 'completed', response };
@@ -381,25 +471,66 @@ export async function completeAssessmentRequest(
   context: AssessmentContext,
   recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
-  const publicResponse = recording ? { ...response, recordingId: recording.id } : response;
-  const validatedResponse = validatedAssessmentResponse(context, publicResponse);
+  // A caller never owns recordingId directly. It is added only when the
+  // authoritative per-user retention epoch still matches the request's claim
+  // snapshot; delete-all advances that epoch before removing existing rows.
+  const responseWithoutRecording = { ...response };
+  delete responseWithoutRecording.recordingId;
+  const validatedResponseWithoutRecording = validatedAssessmentResponse(context, responseWithoutRecording);
+  const responseWithRecording = recording
+    ? validatedAssessmentResponse(context, {
+        ...responseWithoutRecording,
+        recordingId: recording.id,
+      })
+    : validatedResponseWithoutRecording;
   const completed = (await client.query(
-    `UPDATE assessment_requests
-     SET status = 'completed', response_body = $1::jsonb, completed_at = now()
-     WHERE user_id = $2 AND request_id = $3 AND claim_id = $4
-       AND context = $5 AND status = 'processing'
-     RETURNING question_id, audio_key`,
-    [JSON.stringify(validatedResponse), userId, requestId, claimId, context],
-  )) as { rowCount?: number | null; rows: Array<{ question_id: string; audio_key: string | null }> };
+    `WITH owner AS MATERIALIZED (
+       SELECT recording_retention_epoch
+       FROM users
+       WHERE id = $2
+       FOR UPDATE
+     )
+     UPDATE assessment_requests AS requests
+     SET status = 'completed',
+         response_body = CASE
+           WHEN $7::boolean
+             AND requests.recording_retention_epoch = owner.recording_retention_epoch
+             THEN $1::jsonb
+           ELSE $6::jsonb
+         END,
+         completed_at = now(),
+         response_version = 2
+     FROM owner
+     WHERE requests.user_id = $2 AND requests.request_id = $3 AND requests.claim_id = $4
+       AND requests.context = $5 AND requests.status = 'processing'
+     RETURNING requests.question_id, requests.audio_key,
+       ($7::boolean
+         AND requests.recording_retention_epoch = owner.recording_retention_epoch) AS recording_retained`,
+    [
+      JSON.stringify(responseWithRecording),
+      userId,
+      requestId,
+      claimId,
+      context,
+      JSON.stringify(validatedResponseWithoutRecording),
+      recording !== undefined,
+    ],
+  )) as {
+    rowCount?: number | null;
+    rows: Array<{ question_id: string; audio_key: string | null; recording_retained: boolean }>;
+  };
   if (completed.rowCount !== 1) {
     throw new HttpError(409, 'Assessment request ownership changed; please retry', 'STATE_CHANGED');
   }
-  if (recording) {
-    const owner = completed.rows[0];
+  const owner = completed.rows[0];
+  if (recording && !owner) {
+    throw new Error('recording completion has no authoritative S3 audio key');
+  }
+  if (recording && owner.recording_retained) {
     if (!owner?.audio_key) throw new Error('recording completion has no authoritative S3 audio key');
     await insertRetainedRecording(client, userId, requestId, owner.question_id, context, owner.audio_key, recording);
   }
-  return publicResponse;
+  return recording && owner?.recording_retained ? responseWithRecording : validatedResponseWithoutRecording;
 }
 
 export async function abandonAssessmentRequest(userId: string, requestId: string, claimId: string): Promise<void> {
@@ -425,12 +556,28 @@ export async function cleanupAssessmentRequests(): Promise<number> {
   );
 }
 
+export interface AssessmentRequestStatusQuestion {
+  id: string;
+  cefrLevel: CefrLevel;
+  promptWord: string;
+  questionText: string;
+}
+
+interface AssessmentRequestStatusBase {
+  context: AssessmentContext;
+  questionId: string;
+  cycleId: string | null;
+  question: AssessmentRequestStatusQuestion;
+}
+
 export type AssessmentRequestStatus =
-  | { status: 'processing'; context: AssessmentContext; questionId: string }
+  | ({ status: 'processing' } & AssessmentRequestStatusBase)
   | {
       status: 'completed';
       context: AssessmentContext;
       questionId: string;
+      cycleId: string | null;
+      question: AssessmentRequestStatusQuestion;
       response: Record<string, unknown>;
     };
 
@@ -438,28 +585,48 @@ export async function getAssessmentRequestStatus(
   userId: string,
   requestId: string,
 ): Promise<AssessmentRequestStatus | undefined> {
-  const { rows } = await pool.query<RequestRow & { question_id: string }>(
-    `SELECT context, question_id, status, response_body
-     FROM assessment_requests
-     WHERE user_id = $1 AND request_id = $2
+  const { rows } = await pool.query<RequestStatusRow>(
+    `SELECT ar.context, ar.question_id, ar.practice_cycle_id, ar.response_version, ar.status, ar.response_body,
+            q.cefr_level AS question_cefr_level, q.prompt_word AS question_prompt_word,
+            q.question_text AS question_text
+     FROM assessment_requests ar
+     JOIN questions q ON q.id = ar.question_id
+     WHERE ar.user_id = $1 AND ar.request_id = $2
        AND (
-         (status = 'processing' AND started_at >= now() - interval '5 minutes')
+         (ar.status = 'processing' AND ar.started_at >= now() - interval '5 minutes')
          OR
-         (status = 'completed' AND completed_at >= now() - ${COMPLETED_RETENTION_INTERVAL_SQL})
+         (ar.status = 'completed' AND ar.completed_at >= now() - ${COMPLETED_RETENTION_INTERVAL_SQL})
        )`,
     [userId, requestId],
   );
   const row = rows[0];
   if (!row) return undefined;
+  const details: AssessmentRequestStatusBase = {
+    context: row.context,
+    questionId: row.question_id,
+    cycleId: row.practice_cycle_id,
+    question: {
+      id: row.question_id,
+      cefrLevel: row.question_cefr_level,
+      promptWord: row.question_prompt_word,
+      questionText: row.question_text,
+    },
+  };
   if (row.status === 'completed' && row.response_body) {
+    if (row.response_version !== 2) {
+      throw new HttpError(
+        409,
+        'This saved assessment result was created by an older app version; start a new answer',
+        'ASSESSMENT_RESULT_INCOMPATIBLE',
+      );
+    }
     return {
       status: 'completed',
-      context: row.context,
-      questionId: row.question_id,
+      ...details,
       response: validatedAssessmentResponse(row.context, row.response_body),
     };
   }
-  return { status: 'processing', context: row.context, questionId: row.question_id };
+  return { status: 'processing', ...details };
 }
 
 /**

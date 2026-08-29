@@ -59,8 +59,9 @@ describe('assessment prompt context', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
+    await completeDiagnostic(a, token);
     assessMock.mockClear();
+    const assigned = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const question = await pool.query<{
       id: string;
       cefr_level: string;
@@ -68,14 +69,16 @@ describe('assessment prompt context', () => {
       question_text: string;
     }>(
       `SELECT id, cefr_level, prompt_word, question_text
-       FROM questions WHERE cefr_level = $1 ORDER BY id LIMIT 1`,
-      [level],
+       FROM questions WHERE id = $1`,
+      [assigned.body.question.id],
     );
     const q = question.rows[0];
 
     const response = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       q.id,
+      undefined,
+      assigned.body.cycleId,
     );
 
     expect(response.status).toBe(200);
@@ -101,10 +104,16 @@ describe('assessment prompt context', () => {
       translations: Record<string, { examples: Array<{ en: string }> }>;
     }>('SELECT id, translations FROM questions WHERE cefr_level = $1 ORDER BY id LIMIT 1', [level]);
     const q = question.rows[0];
-    await pool.query(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 2, 'prior answer', 50, false, 'Try again')`,
+    const cycle = await pool.query<{ id: string }>(
+      `INSERT INTO practice_cycles (user_id, question_id, kind, attempts_used)
+       VALUES ($1, $2, 'revision', 2) RETURNING id`,
       [userId, q.id],
+    );
+    await pool.query(
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 2, 'prior answer', 50, false, 'Try again', $3)`,
+      [userId, q.id, cycle.rows[0].id],
     );
     assessMock.mockReset();
     assessMock.mockResolvedValue({ transcript: 'final answer', score: 50, passed: false, feedback: 'Add detail.' });
@@ -112,6 +121,8 @@ describe('assessment prompt context', () => {
     const response = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       q.id,
+      undefined,
+      cycle.rows[0].id,
     );
 
     expect(response.status).toBe(200);

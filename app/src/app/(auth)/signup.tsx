@@ -12,28 +12,27 @@ import { Link, router, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
   MAX_PASSWORD_UTF8_BYTES,
+  emailAddressError,
   passwordPolicyError,
+  RegistrationCompletedLoginRequiredError,
   useAuth,
 } from '../../lib/auth';
+import { useGuestLanguage } from '../../lib/guest-language';
 import { useT } from '../../lib/i18n';
+import { NATIVE_LANGUAGE_OPTIONS } from '../../lib/language-options';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
-const LANGUAGES: { code: NativeLanguage; english: string; native: string }[] = [
-  { code: 'te', english: 'Telugu', native: 'తెలుగు' },
-  { code: 'hi', english: 'Hindi', native: 'हिन्दी' },
-  { code: 'es', english: 'Spanish', native: 'Español' },
-  { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
-];
-
 export default function SignupScreen() {
   const { register } = useAuth();
+  const { language: guestLanguage, persistenceError, setLanguage } = useGuestLanguage();
   const navigation = useNavigation();
   const t = useT();
   const theme = useTheme();
@@ -42,13 +41,18 @@ export default function SignupScreen() {
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
-  const [focusedField, setFocusedField] = useState<'name' | 'email' | 'password' | null>(null);
+  const [confirmPasswordVisible, setConfirmPasswordVisible] = useState(false);
+  const [focusedField, setFocusedField] = useState<
+    'name' | 'email' | 'password' | 'confirmPassword' | null
+  >(null);
   const [busy, setBusy] = useState(false);
   const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
   const [error, setError] = useState<string | null>(null);
   const emailRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
+  const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
 
@@ -79,16 +83,23 @@ export default function SignupScreen() {
 
   const chooseLanguage = (code: NativeLanguage) => {
     setNativeLanguage(code);
+    setError(null);
   };
 
   const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
+  const emailError = emailAddressError(email, t);
+  const confirmationError =
+    confirmPassword.length > 0 && confirmPassword !== password ? t('password.mismatch') : null;
 
   const canSubmit =
     name.trim().length > 0 &&
     name.trim().length <= MAX_NAME_LENGTH &&
     email.trim().length > 0 &&
     email.trim().length <= MAX_EMAIL_LENGTH &&
+    emailError === null &&
     passwordPolicyError(password) === null &&
+    confirmPassword.length > 0 &&
+    confirmPassword === password &&
     nativeLanguage !== null &&
     !busy;
 
@@ -99,11 +110,13 @@ export default function SignupScreen() {
     setBusy(true);
     setError(null);
     try {
-      await register(name.trim(), email.trim(), password, nativeLanguage);
+      await register(name.trim(), email.trim(), password, nativeLanguage, guestLanguage);
       if (mountedRef.current) router.replace('/');
     } catch (err) {
       if (!mountedRef.current) return;
-      if (err instanceof ApiError && err.status === 409) {
+      if (err instanceof RegistrationCompletedLoginRequiredError) {
+        router.replace({ pathname: '/login', params: { notice: 'registered' } });
+      } else if (err instanceof ApiError && err.status === 409) {
         setError(t('error.emailTaken'));
       } else {
         setError(userMessageForError(err, t('signup.failed')));
@@ -128,6 +141,12 @@ export default function SignupScreen() {
             {t('signup.title')}
           </Text>
           <Text style={styles.subtitle}>{t('signup.subtitle')}</Text>
+          <UiLanguagePicker
+            value={guestLanguage}
+            onChange={setLanguage}
+            disabled={busy}
+            error={persistenceError}
+          />
 
           <View style={styles.form}>
             <Text style={styles.label}>{t('signup.nameLabel')}</Text>
@@ -135,7 +154,10 @@ export default function SignupScreen() {
               accessibilityLabel={t('signup.nameLabel')}
               style={[styles.input, focusedField === 'name' && styles.inputFocused]}
               value={name}
-              onChangeText={setName}
+              onChangeText={(value) => {
+                setName(value);
+                setError(null);
+              }}
               onFocus={() => setFocusedField('name')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('signup.namePlaceholder')}
@@ -146,6 +168,7 @@ export default function SignupScreen() {
               returnKeyType="next"
               onSubmitEditing={() => emailRef.current?.focus()}
               maxLength={MAX_NAME_LENGTH}
+              editable={!busy}
             />
 
             <Text style={styles.label}>{t('login.emailLabel')}</Text>
@@ -154,7 +177,10 @@ export default function SignupScreen() {
               accessibilityLabel={t('login.emailLabel')}
               style={[styles.input, focusedField === 'email' && styles.inputFocused]}
               value={email}
-              onChangeText={setEmail}
+              onChangeText={(value) => {
+                setEmail(value);
+                setError(null);
+              }}
               onFocus={() => setFocusedField('email')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('login.emailPlaceholder')}
@@ -167,7 +193,13 @@ export default function SignupScreen() {
               returnKeyType="next"
               onSubmitEditing={() => passwordRef.current?.focus()}
               maxLength={MAX_EMAIL_LENGTH}
+              editable={!busy}
             />
+            {emailError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {emailError}
+              </Text>
+            )}
 
             <Text style={styles.label}>{t('login.passwordLabel')}</Text>
             <View style={styles.inputRow}>
@@ -184,7 +216,10 @@ export default function SignupScreen() {
                   focusedField === 'password' && styles.inputFocused,
                 ]}
                 value={password}
-                onChangeText={setPassword}
+                onChangeText={(value) => {
+                  setPassword(value);
+                  setError(null);
+                }}
                 onFocus={() => setFocusedField('password')}
                 onBlur={() => setFocusedField(null)}
                 placeholder={t('signup.passwordPlaceholder')}
@@ -194,17 +229,19 @@ export default function SignupScreen() {
                 autoComplete="new-password"
                 autoCorrect={false}
                 textContentType="newPassword"
-                returnKeyType="go"
-                onSubmitEditing={() => void handleSignup()}
+                returnKeyType="next"
+                onSubmitEditing={() => confirmPasswordRef.current?.focus()}
                 maxLength={MAX_PASSWORD_UTF8_BYTES}
+                editable={!busy}
               />
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={
                   passwordVisible ? t('common.hidePassword') : t('common.showPassword')
                 }
+                disabled={busy}
                 onPress={() => setPasswordVisible((visible) => !visible)}
-                style={styles.inputAction}
+                style={[styles.inputAction, busy && styles.controlDisabled]}
               >
                 <Text style={styles.inputActionText}>
                   {passwordVisible ? t('common.hide') : t('common.show')}
@@ -217,20 +254,86 @@ export default function SignupScreen() {
               </Text>
             )}
 
+            <Text style={styles.label}>{t('password.confirmLabel')}</Text>
+            <View style={styles.inputRow}>
+              <TextInput
+                ref={confirmPasswordRef}
+                accessibilityLabel={t('password.confirmLabel')}
+                style={[
+                  styles.input,
+                  styles.inputWithAction,
+                  focusedField === 'confirmPassword' && styles.inputFocused,
+                ]}
+                value={confirmPassword}
+                onChangeText={(value) => {
+                  setConfirmPassword(value);
+                  setError(null);
+                }}
+                onFocus={() => setFocusedField('confirmPassword')}
+                onBlur={() => setFocusedField(null)}
+                placeholder={t('password.confirmPlaceholder')}
+                placeholderTextColor={colors.muted}
+                secureTextEntry={!confirmPasswordVisible}
+                autoCapitalize="none"
+                autoComplete="new-password"
+                autoCorrect={false}
+                textContentType="newPassword"
+                returnKeyType="go"
+                onSubmitEditing={() => void handleSignup()}
+                maxLength={MAX_PASSWORD_UTF8_BYTES}
+                editable={!busy}
+              />
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={
+                  confirmPasswordVisible
+                    ? t('password.hideConfirmation')
+                    : t('password.showConfirmation')
+                }
+                disabled={busy}
+                onPress={() => setConfirmPasswordVisible((visible) => !visible)}
+                style={[styles.inputAction, busy && styles.controlDisabled]}
+              >
+                <Text style={styles.inputActionText}>
+                  {confirmPasswordVisible ? t('common.hide') : t('common.show')}
+                </Text>
+              </Pressable>
+            </View>
+            {confirmationError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {confirmationError}
+              </Text>
+            )}
+
             <Text style={styles.label}>{t('signup.languageLabel')}</Text>
             <Text style={styles.languageHelp}>{t('signup.languageHelp')}</Text>
             <View style={styles.languageGrid}>
-              {LANGUAGES.map((lang) => {
+              {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
                 const selected = nativeLanguage === lang.code;
                 return (
                   <Pressable
                     key={lang.code}
                     accessibilityRole="button"
                     accessibilityLabel={`${lang.english}, ${lang.native}`}
-                    accessibilityState={{ selected }}
+                    accessibilityState={{ selected, disabled: busy }}
+                    disabled={busy}
                     onPress={() => chooseLanguage(lang.code)}
-                    style={[styles.languageChip, selected && styles.languageChipSelected]}
+                    style={[
+                      styles.languageChip,
+                      selected && styles.languageChipSelected,
+                      busy && styles.controlDisabled,
+                    ]}
                   >
+                    {selected && (
+                      <Text
+                        testID={`signup-language-check-${lang.code}`}
+                        accessibilityElementsHidden
+                        importantForAccessibility="no-hide-descendants"
+                        style={styles.languageCheck}
+                      >
+                        ✓
+                      </Text>
+                    )}
                     <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
                       {lang.native}
                     </Text>
@@ -255,6 +358,25 @@ export default function SignupScreen() {
               onPress={() => void handleSignup()}
               style={styles.submitButton}
             />
+
+            <View style={styles.legalLinks}>
+              <Link
+                href="/settings/privacy"
+                accessibilityState={{ disabled: busy }}
+                onPress={blockLinkWhileBusy}
+                style={styles.legalLink}
+              >
+                {t('header.privacy')}
+              </Link>
+              <Link
+                href="/settings/terms"
+                accessibilityState={{ disabled: busy }}
+                onPress={blockLinkWhileBusy}
+                style={styles.legalLink}
+              >
+                {t('header.terms')}
+              </Link>
+            </View>
           </View>
 
           <View style={styles.footer}>
@@ -364,6 +486,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     gap: 10,
   },
   languageChip: {
+    position: 'relative',
     flexBasis: '47%',
     flexGrow: 1,
     borderWidth: 1.5,
@@ -395,6 +518,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   languageTextSelected: {
     color: colors.primary,
   },
+  languageCheck: {
+    position: 'absolute',
+    top: spacing.sm,
+    right: spacing.sm,
+    color: colors.primary,
+    fontSize: 16,
+    fontWeight: '800',
+  },
+  controlDisabled: {
+    opacity: 0.5,
+  },
   error: {
     marginTop: 14,
     color: colors.danger,
@@ -408,6 +542,23 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   submitButton: {
     marginTop: spacing.lg,
+  },
+  legalLinks: {
+    marginTop: spacing.sm,
+    minHeight: layout.minimumTarget,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.lg,
+  },
+  legalLink: {
+    minHeight: layout.minimumTarget,
+    paddingVertical: spacing.md,
+    color: colors.primary,
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
   },
   footer: {
     marginTop: spacing.xl,

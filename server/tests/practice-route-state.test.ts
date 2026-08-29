@@ -22,6 +22,8 @@ let a: ReturnType<typeof app>;
 
 const PRACTICE_READ_PARENT_LOCK =
   'SELECT cefr_level, diagnostic_completed, native_language FROM users WHERE id = $1 FOR SHARE';
+const PRACTICE_ASSIGN_PARENT_LOCK =
+  'SELECT cefr_level, diagnostic_completed, native_language FROM users WHERE id = $1 FOR UPDATE';
 const SKIP_PARENT_LOCK = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
 
 beforeEach(() => {
@@ -66,7 +68,7 @@ async function routeArtifacts(userId: string, requestId: string): Promise<RouteA
   return rows[0];
 }
 
-function fixedPracticeRequest(token: string, questionId: string, requestId: string) {
+function fixedPracticeRequest(token: string, questionId: string, requestId: string, cycleId: string) {
   return request(a)
     .post('/practice/attempt')
     .set('Authorization', `Bearer ${token}`)
@@ -75,22 +77,27 @@ function fixedPracticeRequest(token: string, questionId: string, requestId: stri
       contentType: 'audio/mp4',
     })
     .field('questionId', questionId)
-    .field('requestId', requestId);
+    .field('requestId', requestId)
+    .field('cycleId', cycleId);
 }
 
 async function registerPlacedPracticeUser(): Promise<{
   token: string;
   userId: string;
   questionId: string;
+  cycleId: string;
 }> {
   const { res } = await registerUser(a);
   const token = res.body.token as string;
   const userId = res.body.user.id as string;
   await pool.query("UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1", [userId]);
-  const question = await pool.query<{ id: string }>(
-    "SELECT id FROM questions WHERE cefr_level = 'A1' ORDER BY id LIMIT 1",
-  );
-  return { token, userId, questionId: question.rows[0].id };
+  const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+  return {
+    token,
+    userId,
+    questionId: assignment.body.question.id as string,
+    cycleId: assignment.body.cycleId as string,
+  };
 }
 
 /** Commit a user mutation between the generic request claim and practice claim. */
@@ -206,6 +213,7 @@ describe('practice read snapshots', () => {
 
     const { response, statements } = await withPracticeUserRace({
       userId,
+      parentLock: PRACTICE_ASSIGN_PARENT_LOCK,
       startRequest: () => request(a).get('/practice/question').set('Authorization', `Bearer ${token}`),
       mutateBeforeRelease: (blocker) => blocker.query('DELETE FROM users WHERE id = $1', [userId]),
     });
@@ -213,7 +221,7 @@ describe('practice read snapshots', () => {
     expect(response.status).toBe(409);
     expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });
     expect(statements[0]).toBe('BEGIN');
-    expect(statements[1]).toBe(PRACTICE_READ_PARENT_LOCK);
+    expect(statements[1]).toBe(PRACTICE_ASSIGN_PARENT_LOCK);
     expect(statements.at(-1)).toBe('ROLLBACK');
     const user = await pool.query('SELECT 1 FROM users WHERE id = $1', [userId]);
     expect(user.rowCount).toBe(0);
@@ -227,6 +235,7 @@ describe('practice read snapshots', () => {
 
     const { response, statements } = await withPracticeUserRace({
       userId,
+      parentLock: PRACTICE_ASSIGN_PARENT_LOCK,
       startRequest: () => request(a).get('/practice/question').set('Authorization', `Bearer ${token}`),
       mutateBeforeRelease: (blocker) => blocker.query("UPDATE users SET cefr_level = 'B1' WHERE id = $1", [userId]),
     });
@@ -240,7 +249,7 @@ describe('practice read snapshots', () => {
       dueCount: 0,
     });
     expect(statements[0]).toBe('BEGIN');
-    expect(statements[1]).toBe(PRACTICE_READ_PARENT_LOCK);
+    expect(statements[1]).toBe(PRACTICE_ASSIGN_PARENT_LOCK);
     expect(statements.at(-1)).toBe('COMMIT');
   });
 
@@ -297,12 +306,12 @@ describe('practice read snapshots', () => {
 
 describe('practice claim eligibility handoff', () => {
   it('abandons the request when account deletion lands before the practice claim', async () => {
-    const { token, userId, questionId } = await registerPlacedPracticeUser();
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
     const requestId = randomUUID();
 
     const response = await withMutationAfterRequestClaim(
       () => pool.query('DELETE FROM users WHERE id = $1', [userId]),
-      () => fixedPracticeRequest(token, questionId, requestId),
+      () => fixedPracticeRequest(token, questionId, requestId, cycleId),
     );
 
     expect(response.status).toBe(409);
@@ -311,12 +320,12 @@ describe('practice claim eligibility handoff', () => {
   });
 
   it('abandons the request when diagnostic eligibility is revoked before the practice claim', async () => {
-    const { token, userId, questionId } = await registerPlacedPracticeUser();
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
     const requestId = randomUUID();
 
     const response = await withMutationAfterRequestClaim(
       () => pool.query('UPDATE users SET diagnostic_completed = false WHERE id = $1', [userId]),
-      () => fixedPracticeRequest(token, questionId, requestId),
+      () => fixedPracticeRequest(token, questionId, requestId, cycleId),
     );
 
     expect(response.status).toBe(409);
@@ -325,12 +334,12 @@ describe('practice claim eligibility handoff', () => {
   });
 
   it('abandons the request when a rival promotion lands before the practice claim', async () => {
-    const { token, userId, questionId } = await registerPlacedPracticeUser();
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
     const requestId = randomUUID();
 
     const response = await withMutationAfterRequestClaim(
       () => pool.query("UPDATE users SET cefr_level = 'B1' WHERE id = $1", [userId]),
-      () => fixedPracticeRequest(token, questionId, requestId),
+      () => fixedPracticeRequest(token, questionId, requestId, cycleId),
     );
 
     expect(response.status).toBe(409);
@@ -341,13 +350,13 @@ describe('practice claim eligibility handoff', () => {
 
 describe('practice eligibility state', () => {
   it('rolls back and releases skip when account deletion wins its parent-lock wait', async () => {
-    const { token, userId, questionId } = await registerPlacedPracticeUser();
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
 
     const { response, statements, releaseCalls } = await withPracticeUserRace({
       userId,
       parentLock: SKIP_PARENT_LOCK,
       startRequest: () =>
-        request(a).post('/practice/skip').set('Authorization', `Bearer ${token}`).send({ questionId }),
+        request(a).post('/practice/skip').set('Authorization', `Bearer ${token}`).send({ questionId, cycleId }),
       mutateBeforeRelease: (blocker) => blocker.query('DELETE FROM users WHERE id = $1', [userId]),
     });
 
@@ -377,7 +386,7 @@ describe('practice eligibility state', () => {
     const skip = await request(a)
       .post('/practice/skip')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: question.rows[0].id });
+      .send({ questionId: question.rows[0].id, cycleId: randomUUID() });
     expect(skip.status).toBe(403);
     expect(skip.body).toEqual({ error: 'Diagnostic not completed', code: 'FORBIDDEN' });
 
@@ -391,7 +400,7 @@ describe('practice eligibility state', () => {
     expect(progress.rowCount).toBe(0);
 
     const requestId = randomUUID();
-    const attempt = await fixedPracticeRequest(token, question.rows[0].id, requestId);
+    const attempt = await fixedPracticeRequest(token, question.rows[0].id, requestId, randomUUID());
     expect(attempt.status).toBe(403);
     expect(attempt.body).toEqual({ error: 'Diagnostic not completed', code: 'FORBIDDEN' });
     expect(await routeArtifacts(userId, requestId)).toEqual({ attempts: 0, requests: 0 });
@@ -412,7 +421,7 @@ describe('practice eligibility state', () => {
     const questionId = other.rows[0].id;
     const requestId = randomUUID();
 
-    const response = await fixedPracticeRequest(token, questionId, requestId);
+    const response = await fixedPracticeRequest(token, questionId, requestId, randomUUID());
 
     expect(response.status).toBe(403);
     expect(response.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
@@ -427,12 +436,9 @@ describe('practice finalization and cleanup', () => {
     expect(res.body.user).toEqual(expect.objectContaining({ id: expect.any(String) }));
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
-    expect(question.rows[0]).toEqual({ id: expect.any(String) });
-    const questionId = question.rows[0].id;
+    await completeDiagnostic(a, token);
+    const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = assignment.body.question.id as string;
     const requestId = randomUUID();
 
     const triggerName = `test_remove_practice_claim_${randomUUID().replaceAll('-', '')}`;
@@ -463,7 +469,7 @@ describe('practice finalization and cleanup', () => {
         { text: `DROP FUNCTION IF EXISTS ${functionName}()` },
       ],
       async () => {
-        const response = await fixedPracticeRequest(token, questionId, requestId);
+        const response = await fixedPracticeRequest(token, questionId, requestId, assignment.body.cycleId);
 
         expect(response.status).toBe(409);
         expect(response.body).toEqual({ error: 'Assessment state changed; please try again', code: 'STATE_CHANGED' });

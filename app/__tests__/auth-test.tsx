@@ -12,15 +12,18 @@ import {
   setUnauthorizedHandler,
 } from '../src/lib/api';
 import {
+  AccountDeletionUnconfirmedError,
   AccountDeletedCleanupError,
   AuthProvider,
   LogoutCleanupError,
+  RegistrationCompletedLoginRequiredError,
   type SessionLease,
   useAuth,
 } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { cancelDailyReminderQuietly } from '../src/lib/daily-reminder';
 import { clearPendingAssessment } from '../src/lib/pending-assessment';
+import { cleanupPrivateArtifacts } from '../src/lib/private-artifacts';
 import { markSessionExpiredNotice } from '../src/lib/session-notice';
 import { ContractError, type User } from '../src/lib/types';
 
@@ -59,6 +62,10 @@ jest.mock('../src/lib/pending-assessment', () => ({
   clearPendingAssessment: jest.fn(),
 }));
 
+jest.mock('../src/lib/private-artifacts', () => ({
+  cleanupPrivateArtifacts: jest.fn(),
+}));
+
 jest.mock('../src/lib/session-notice', () => ({
   markSessionExpiredNotice: jest.fn(),
 }));
@@ -67,12 +74,18 @@ jest.mock('../src/lib/daily-reminder', () => ({
   cancelDailyReminderQuietly: jest.fn(async () => undefined),
 }));
 
+const mockMirrorAccountLanguage = jest.fn();
+jest.mock('../src/lib/guest-language', () => ({
+  useGuestLanguage: () => ({ mirrorAccountLanguage: mockMirrorAccountLanguage }),
+}));
+
 const mockedApiFetch = jest.mocked(apiFetch);
 const mockedGetToken = jest.mocked(getToken);
 const mockedSaveToken = jest.mocked(saveToken);
 const mockedClearToken = jest.mocked(clearToken);
 const mockedSetUnauthorizedHandler = jest.mocked(setUnauthorizedHandler);
 const mockedClearPendingAssessment = jest.mocked(clearPendingAssessment);
+const mockedCleanupPrivateArtifacts = jest.mocked(cleanupPrivateArtifacts);
 const mockedCancelDailyReminder = jest.mocked(cancelDailyReminderQuietly);
 const mockedMarkSessionExpiredNotice = jest.mocked(markSessionExpiredNotice);
 
@@ -210,11 +223,23 @@ beforeEach(() => {
   mockedSaveToken.mockResolvedValue(undefined);
   mockedClearToken.mockResolvedValue(true);
   mockedClearPendingAssessment.mockResolvedValue(undefined);
+  mockedCleanupPrivateArtifacts.mockResolvedValue(undefined);
   mockedMarkSessionExpiredNotice.mockResolvedValue(undefined);
   mockedCancelDailyReminder.mockResolvedValue(undefined);
+  mockMirrorAccountLanguage.mockReset();
 });
 
 describe('AuthProvider session restore', () => {
+  it('treats startup orphan cleanup as best effort', async () => {
+    mockedCleanupPrivateArtifacts.mockRejectedValueOnce(new Error('cache unavailable'));
+
+    await renderAuth(null);
+
+    expect(text('isRestoring')).toBe('false');
+    expect(text('token')).toBe('null');
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith();
+  });
+
   it('stays in the restoring state until secure storage settles', async () => {
     const stored = deferred<string | null>();
     mockedGetToken.mockReturnValue(stored.promise);
@@ -223,6 +248,8 @@ describe('AuthProvider session restore', () => {
 
     expect(text('isRestoring')).toBe('true');
     expect(text('token')).toBe('null');
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith();
     await act(async () => stored.resolve(null));
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
   });
@@ -330,6 +357,8 @@ describe('AuthProvider session restore', () => {
 
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith();
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledTimes(2);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenLastCalledWith(undefined);
     expect(text('restoreError')).toBe('null');
     expect(text('token')).toBe('null');
     expect(text('isRestoring')).toBe('false');
@@ -386,6 +415,7 @@ describe('login', () => {
     expect(text('sessionVersion')).toBe('2');
     expect(clearSpy).toHaveBeenCalledTimes(2);
     expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
+    expect(mockMirrorAccountLanguage).toHaveBeenCalledWith(USER.uiLanguage);
   });
 
   it('rejects a concurrent account operation', async () => {
@@ -437,7 +467,7 @@ describe('register', () => {
 
     let registered: User | undefined;
     await act(async () => {
-      registered = await auth!.register('Test User', 'a@example.com', ' secret1 ', 'hi');
+      registered = await auth!.register('Test User', 'a@example.com', ' secret1 ', 'hi', 'es');
     });
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/register', {
@@ -447,6 +477,7 @@ describe('register', () => {
         email: 'a@example.com',
         password: ' secret1 ',
         nativeLanguage: 'hi',
+        uiLanguage: 'es',
       },
       auth: false,
       expireSessionOn401: false,
@@ -455,6 +486,30 @@ describe('register', () => {
     expect(registered).toEqual(USER);
     expect(text('token')).toBe('tok-registered');
     expect(text('sessionVersion')).toBe('2');
+    expect(mockMirrorAccountLanguage).toHaveBeenCalledWith(USER.uiLanguage);
+  });
+
+  it('distinguishes a committed registration whose token cannot be persisted', async () => {
+    await renderAuth(null);
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-created'));
+    mockedSaveToken.mockRejectedValueOnce(new Error('secure store unavailable'));
+
+    await act(async () => {
+      await expect(
+        auth!.register('Test User', 'a@example.com', 'secret1', 'hi'),
+      ).rejects.toBeInstanceOf(RegistrationCompletedLoginRequiredError);
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    // Login keeps its existing error identity; only registration maps this
+    // post-commit persistence edge to the account-created recovery path.
+    const loginFailure = new Error('login secure store failure');
+    mockedApiFetch.mockResolvedValueOnce(authResponse('tok-login'));
+    mockedSaveToken.mockRejectedValueOnce(loginFailure);
+    await act(async () => {
+      await expect(auth!.login('a@example.com', 'secret1')).rejects.toBe(loginFailure);
+    });
   });
 
   it('releases the transition guard after a failed registration', async () => {
@@ -504,6 +559,7 @@ describe('logout', () => {
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith(USER.id);
     // The signed-out device must stop nudging its former user to practice.
     expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3); // mount + login + logout
@@ -512,6 +568,19 @@ describe('logout', () => {
     expect(text('sessionVersion')).toBe('3');
     // A user-initiated logout is not a surprise; no sign-out notice is left.
     expect(mockedMarkSessionExpiredNotice).not.toHaveBeenCalled();
+  });
+
+  it('does not let private-cache cleanup failure change successful logout semantics', async () => {
+    await renderLoggedIn();
+    mockedCleanupPrivateArtifacts.mockRejectedValueOnce(new Error('cache unavailable'));
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await expect(auth!.logout()).resolves.toBeUndefined();
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
   });
 
   it('tolerates a 401 from the logout endpoint', async () => {
@@ -538,6 +607,7 @@ describe('logout', () => {
 
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenLastCalledWith(undefined);
     expect(text('token')).toBe('null');
   });
 
@@ -653,6 +723,7 @@ describe('expireSession via the unauthorized handler', () => {
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith(USER.id);
     // P-M5: the login screen explains the surprise sign-out via a one-shot flag.
     expect(mockedMarkSessionExpiredNotice).toHaveBeenCalledTimes(1);
     expect(clearSpy).toHaveBeenCalledTimes(3);
@@ -1037,10 +1108,24 @@ describe('deleteAccount', () => {
     });
     expect(mockedClearToken).toHaveBeenCalledTimes(1);
     expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith(USER.id);
     expect(clearSpy).toHaveBeenCalledTimes(3);
     expect(text('token')).toBe('null');
     expect(text('userEmail')).toBe('null');
     expect(text('sessionVersion')).toBe('3');
+  });
+
+  it('does not let private-cache cleanup failure undo account deletion', async () => {
+    await renderLoggedIn();
+    mockedCleanupPrivateArtifacts.mockRejectedValueOnce(new Error('cache unavailable'));
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).resolves.toBeUndefined();
+    });
+
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
   });
 
   it('finishes account deletion without conditional token cleanup when no token is persisted', async () => {
@@ -1165,6 +1250,57 @@ describe('deleteAccount', () => {
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
     expect(text('sessionVersion')).toBe('2');
+    expect(mockedClearToken).not.toHaveBeenCalled();
+  });
+
+  it('reconciles a lost deletion response when the old token is now rejected', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockImplementation((async (path: string) => {
+      if (path === '/auth/account') throw new ApiError(0, 'connection lost');
+      if (path === '/auth/me') throw new ApiError(401, 'account gone');
+      throw new Error(`unexpected apiFetch call: ${path}`);
+    }) as unknown as typeof apiFetch);
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).resolves.toBeUndefined();
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me', {
+      expireSessionOn401: false,
+    });
+    expect(text('token')).toBe('null');
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
+  });
+
+  it('preserves the original deletion failure when verification proves the account remains', async () => {
+    await renderLoggedIn();
+    const failure = new ApiError(0, 'connection lost');
+    mockedApiFetch.mockImplementation((async (path: string) => {
+      if (path === '/auth/account') throw failure;
+      if (path === '/auth/me') return { user: USER };
+      throw new Error(`unexpected apiFetch call: ${path}`);
+    }) as unknown as typeof apiFetch);
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
+    });
+
+    expect(text('token')).toBe('tok-1');
+    expect(mockedClearToken).not.toHaveBeenCalled();
+  });
+
+  it('reports an unconfirmed deletion when both the response and verification are ambiguous', async () => {
+    await renderLoggedIn();
+    mockedApiFetch.mockRejectedValue(new ApiError(0, 'offline'));
+
+    await act(async () => {
+      await expect(auth!.deleteAccount('secret1')).rejects.toBeInstanceOf(
+        AccountDeletionUnconfirmedError,
+      );
+    });
+
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 });

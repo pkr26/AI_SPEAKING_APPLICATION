@@ -40,9 +40,46 @@ export const mutationLanes = Object.freeze({
       '__tests__/recorder-test.tsx',
     ],
   ),
-  i18n: lane(['src/lib/i18n.tsx'], ['__tests__/i18n-test.tsx']),
-  types: lane(['src/lib/types.ts'], ['__tests__/types-test.ts']),
+  i18n: lane(
+    ['src/lib/i18n.tsx'],
+    ['__tests__/i18n-test.tsx', '__tests__/guest-language-test.tsx'],
+  ),
+  guestLanguage: lane(
+    [
+      'src/components/UiLanguagePicker.tsx',
+      'src/lib/guest-language.tsx',
+      'src/lib/language-options.ts',
+    ],
+    ['__tests__/guest-language-test.tsx'],
+  ),
+  types: lane(
+    ['src/lib/types.ts'],
+    [
+      '__tests__/types-test.ts',
+      '__tests__/diagnostic-contract-updates-test.ts',
+      '__tests__/assessment-replay-test.ts',
+    ],
+  ),
   api: lane(['src/lib/api.ts'], ['__tests__/api-test.ts']),
+  connectivityAndUpgrade: lane(
+    [
+      'src/components/ClientUpgradeModal.tsx',
+      'src/components/DataRefreshNotice.tsx',
+      'src/components/NetworkStatusBanner.tsx',
+      'src/components/OfflineState.tsx',
+      'src/lib/client-upgrade-store.ts',
+      'src/lib/network-status.ts',
+    ],
+    [
+      '__tests__/client-upgrade-test.tsx',
+      '__tests__/data-state-components-test.tsx',
+      '__tests__/network-status-test.tsx',
+    ],
+  ),
+  assessmentReplay: lane(
+    ['src/lib/assessment-replay-provider.tsx', 'src/lib/assessment-replay.ts'],
+    ['__tests__/assessment-replay-provider-test.tsx', '__tests__/assessment-replay-test.ts'],
+  ),
   ads: lane(
     [
       'src/lib/ads.tsx',
@@ -51,6 +88,8 @@ export const mutationLanes = Object.freeze({
     ],
     ['__tests__/ads-test.tsx'],
   ),
+  // RecordingPlayback owns playback plus local-file sharing and single-item
+  // deletion; its focused test covers operation/file ownership for all three.
   recordings: lane(
     ['src/app/recordings.tsx', 'src/components/RecordingPlayback.tsx', 'src/lib/audio-session.ts'],
     [
@@ -64,6 +103,7 @@ export const mutationLanes = Object.freeze({
     ['src/lib/params.ts', 'src/lib/pending-assessment.ts'],
     ['__tests__/params-test.ts', '__tests__/pending-assessment-test.ts'],
   ),
+  privateArtifacts: lane(['src/lib/private-artifacts.ts'], ['__tests__/private-artifacts-test.ts']),
   libs: lane(
     [
       'src/lib/daily-reminder.ts',
@@ -105,7 +145,7 @@ export const mutationLanes = Object.freeze({
     ['__tests__/screens-gate-test.tsx'],
   ),
   authScreens: lane(
-    ['src/app/(auth)/login.tsx', 'src/app/(auth)/signup.tsx'],
+    ['src/app/(auth)/login.tsx', 'src/app/(auth)/signup.tsx', 'src/lib/identity-validation.ts'],
     // login.tsx is also rendered by the reset-password journey.
     ['__tests__/screens-auth-test.tsx', '__tests__/screens-reset-password-test.tsx'],
   ),
@@ -128,6 +168,8 @@ export const mutationLanes = Object.freeze({
     ],
     ['__tests__/screens-practice-test.tsx'],
   ),
+  // Includes the session-fenced, count-independent bulk recording deletion
+  // control and its recordings/history cache retirement contract.
   settingsProfile: lane(
     ['src/app/settings/index.tsx'],
     ['__tests__/screens-settings-profile-test.tsx'],

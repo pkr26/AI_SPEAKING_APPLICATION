@@ -450,6 +450,33 @@ describe('config env validation', () => {
     expect(prod.isProduction).toBe(true);
     expect(prod.s3.diagnostic.bucket).toBe('diagnostic-audio-bucket');
     expect(prod.s3.practice.bucket).toBe('practice-audio-bucket');
+    expect(prod.minClientVersion).toBe('1.1.0');
+
+    const lowerConfiguredFloor = await loadConfig(
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        ...TEST_S3_BUCKETS,
+        DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+        MIN_CLIENT_VERSION: '1.0.99',
+        ...PRODUCTION_MAIL,
+      }),
+    );
+    expect(lowerConfiguredFloor.minClientVersion).toBe('1.1.0');
+
+    const higherConfiguredFloor = await loadConfig(
+      baseEnv({
+        NODE_ENV: 'production',
+        MOCK_AI: 'false',
+        OPENAI_API_KEY: 'sk-real',
+        ...TEST_S3_BUCKETS,
+        DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+        MIN_CLIENT_VERSION: '1.2',
+        ...PRODUCTION_MAIL,
+      }),
+    );
+    expect(higherConfiguredFloor.minClientVersion).toBe('1.2');
   });
 
   it('requires a structured database URL and verified TLS in production', async () => {

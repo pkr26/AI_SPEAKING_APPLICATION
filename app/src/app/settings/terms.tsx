@@ -4,7 +4,7 @@ import { ScrollView, Text, View } from 'react-native';
 import { useT } from '../../lib/i18n';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 
-/** Static, localized terms of use. Placeholder copy pending owner review. */
+/** Static, localized terms matching the current educational service behavior. */
 export default function TermsScreen() {
   const t = useT();
   const styles = themedStyles(useTheme());

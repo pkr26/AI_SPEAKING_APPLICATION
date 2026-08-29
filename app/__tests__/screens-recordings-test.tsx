@@ -1,4 +1,9 @@
-import { InfiniteQueryObserver, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  InfiniteQueryObserver,
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { FlatList, StyleSheet } from 'react-native';
@@ -159,7 +164,23 @@ function expectScrollableState(): void {
   });
 }
 
+function refreshHandler(): () => void {
+  const [scroll] = screen.container.queryAll(
+    (candidate) => typeof candidate.props.refreshControl?.props?.onRefresh === 'function',
+  );
+  const onRefresh = scroll?.props.refreshControl?.props?.onRefresh;
+  if (typeof onRefresh !== 'function') throw new Error('No RefreshControl rendered');
+  return onRefresh as () => void;
+}
+
+function flatListProps(): Record<string, unknown> {
+  const props = asMock(FlatList).mock.calls.at(-1)?.[0] as Record<string, unknown> | undefined;
+  if (!props) throw new Error('No FlatList rendered');
+  return props;
+}
+
 beforeEach(() => {
+  onlineManager.setOnline(true);
   leaseCurrent = true;
   capturedLease = { id: ++leaseSerial } as unknown as SessionLease;
   mockAuth.user = USER;
@@ -183,6 +204,15 @@ afterEach(async () => {
 });
 
 describe('recordings library', () => {
+  it('shows an offline state instead of spinning before the first page', async () => {
+    onlineManager.setOnline(false);
+    asMock(apiGetRecordings).mockResolvedValue({ items: [], nextCursor: null });
+    await renderRecordings();
+
+    expect(await screen.findByRole('header', { name: t('network.offlineTitle') })).toBeTruthy();
+    expect(apiGetRecordings).not.toHaveBeenCalled();
+  });
+
   it('pins locale, formatting, pagination-boundary, and visual-style contracts', () => {
     expect(RECORDING_DATE_LOCALES).toEqual({
       en: 'en-US',
@@ -225,7 +255,7 @@ describe('recordings library', () => {
     expect(nextRecordingPageParam(next, [page(RECORDING_ID), next])).toBeUndefined();
     expect(
       nextRecordingPageParam(next, Array.from({ length: 499 }, () => page(SECOND_ID)).concat(next)),
-    ).toBeUndefined();
+    ).toBe(RECORDING_ID);
     expect(
       nextRecordingPageParam(next, Array.from({ length: 498 }, () => page(SECOND_ID)).concat(next)),
     ).toBe(RECORDING_ID);
@@ -317,7 +347,10 @@ describe('recordings library', () => {
     asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const mounted = await renderRecordings(client);
-    await screen.findByText('courage');
+    expect((await screen.findByText('courage')).props.accessibilityLanguage).toBe('en-US');
+    expect(
+      screen.getByText('Describe a time you showed courage.').props.accessibilityLanguage,
+    ).toBe('en-US');
     const firstLease = capturedLease;
     expect(mockAuth.captureSessionLease).toHaveBeenLastCalledWith();
 
@@ -362,6 +395,11 @@ describe('recordings library', () => {
     );
     expectScrollableState();
     expect(screen.getByText(t('recordings.emptyBody'))).toBeTruthy();
+    await act(async () => {
+      refreshHandler()();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
     await loading.unmount();
 
     asMock(apiGetRecordings).mockRejectedValueOnce(new Error('internal detail'));
@@ -445,9 +483,38 @@ describe('recordings library', () => {
         showStatus: false,
       },
     ]);
+    const onRefresh = flatListProps().onRefresh as () => void;
+    await act(async () => {
+      onRefresh();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+
+    leaseCurrent = false;
+    onRefresh();
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
+    leaseCurrent = true;
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.checkPending') }));
     expect(refetch).toHaveBeenLastCalledWith({ cancelRefetch: false });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(3));
+  });
+
+  it('retries a failed refresh without replacing cached recordings', async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(['recordings', USER.id], {
+      pages: [{ items: [recording()], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    asMock(apiGetRecordings)
+      .mockRejectedValueOnce(new Error('background failure'))
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: null });
+    await renderRecordings(client);
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved'));
+    expect(screen.getByText('courage')).toBeTruthy();
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
     await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    expect(screen.getByText('courage')).toBeTruthy();
   });
 
   it('formats byte, megabyte, missing-duration, and unavailable metadata', async () => {

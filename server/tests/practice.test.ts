@@ -266,17 +266,16 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const requestId = randomUUID();
 
     const r = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .field('questionId', question.rows[0].id)
-      .field('requestId', requestId);
+      .field('questionId', question.body.question.id)
+      .field('requestId', requestId)
+      .field('cycleId', question.body.cycleId);
     expect(r.status).toBe(400);
     expect(r.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
     const claims = await pool.query(
@@ -436,12 +435,16 @@ describe('practice', () => {
       const valid = await answerForm(
         request(scoped).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         q.body.question.id,
+        undefined,
+        q.body.cycleId,
       );
       expect(valid.status).toBe(200);
 
       const limited = await answerForm(
         request(scoped).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         q.body.question.id,
+        undefined,
+        q.body.cycleId,
       );
       expect(limited.status).toBe(429);
     } finally {
@@ -480,7 +483,8 @@ describe('practice', () => {
       .set('Authorization', `Bearer ${token}`)
       .attach('audio', Buffer.from('definitely not audio bytes'), { filename: 'answer.m4a', contentType: 'audio/mp4' })
       .field('questionId', q.body.question.id)
-      .field('requestId', randomUUID());
+      .field('requestId', randomUUID())
+      .field('cycleId', q.body.cycleId);
     expect(r.status).toBe(415);
     expect(r.body.error).toBe('Invalid audio file');
   });
@@ -489,11 +493,9 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
     const userId = res.body.user.id;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
-    const questionId = question.rows[0].id;
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = question.body.question.id as string;
     const existingClaimId = randomUUID();
     const requestId = randomUUID();
     await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
@@ -511,7 +513,8 @@ describe('practice', () => {
           contentType: 'audio/mp4',
         })
         .field('questionId', questionId)
-        .field('requestId', requestId);
+        .field('requestId', requestId)
+        .field('cycleId', question.body.cycleId);
 
       expect(response.status).toBe(409);
       expect(response.body).toEqual({
@@ -537,11 +540,9 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
-    const questionId = question.rows[0].id;
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = question.body.question.id as string;
     const existingClaimId = randomUUID();
     await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
       userId,
@@ -556,7 +557,8 @@ describe('practice', () => {
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
         .field('questionId', questionId)
-        .field('requestId', randomUUID());
+        .field('requestId', randomUUID())
+        .field('cycleId', question.body.cycleId);
 
       expect(response.status).toBe(400);
       expect(response.body).toEqual({ error: 'audio file is required', code: 'VALIDATION_FAILED' });
@@ -574,11 +576,9 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
-    const questionId = question.rows[0].id;
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = question.body.question.id as string;
     await pool.query(
       `INSERT INTO practice_inflight (user_id, question_id, claim_id, started_at)
        VALUES ($1, $2, $3, now() - interval '6 minutes')`,
@@ -588,6 +588,8 @@ describe('practice', () => {
     const response = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
+      undefined,
+      question.body.cycleId,
     );
 
     expect(response.status).toBe(200);
@@ -622,6 +624,8 @@ describe('practice', () => {
     const response = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       questionId,
+      undefined,
+      next.body.cycleId,
     );
 
     expect(response.status).toBe(200);
@@ -655,6 +659,8 @@ describe('practice', () => {
     const response = await answerForm(
       request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
       next.body.question.id as string,
+      undefined,
+      next.body.cycleId,
     );
 
     expect(response.status).toBe(200);
@@ -680,31 +686,33 @@ describe('practice', () => {
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     const questionId = q.body.question.id;
 
-    // Fire several attempts; mock scores are random, so verify the transition
-    // rule each response's own pass/fail implies instead of a fixed walk.
-    const seen: { attemptNo: number; passed: boolean }[] = [];
-    for (let i = 0; i < 6; i++) {
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+    const seen: number[] = [];
+    for (let i = 0; i < 3; i++) {
       const r = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        q.body.cycleId,
       );
       expect(r.status).toBe(200);
-      expect(r.body.attemptNo).toBeGreaterThanOrEqual(1);
-      expect(r.body.attemptNo).toBeLessThanOrEqual(3);
-      seen.push({ attemptNo: r.body.attemptNo, passed: r.body.passed });
-      if (i > 0) {
-        const prev = seen[i - 1];
-        const expected = !prev.passed && prev.attemptNo < 3 ? prev.attemptNo + 1 : 1;
-        expect(seen[i].attemptNo).toBe(expected);
-      }
+      seen.push(r.body.attemptNo);
     }
+    expect(seen).toEqual([1, 2, 3]);
+    const stale = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+      undefined,
+      q.body.cycleId,
+    );
+    expect(stale.status).toBe(409);
+    expect(stale.body.code).toBe('PRACTICE_CYCLE_CLOSED');
     const { rows } = await pool.query(
       `SELECT count(*)::int AS n FROM attempts
        WHERE user_id = (SELECT id FROM users WHERE email = $1) AND question_id = $2 AND context = 'practice'`,
       [res.body.user.email, questionId],
     );
-    expect(rows[0].n).toBe(seen.length); // every request inserted exactly one attempt row
-    expect(seen[0].attemptNo).toBe(1); // first attempt on a fresh question is always #1
+    expect(rows[0].n).toBe(3);
   });
 
   it('replays the same practice request without another attempt or quota reservation', async () => {
@@ -724,7 +732,8 @@ describe('practice', () => {
           contentType: 'audio/mp4',
         })
         .field('questionId', q.body.question.id)
-        .field('requestId', requestId);
+        .field('requestId', requestId)
+        .field('cycleId', q.body.cycleId);
 
     const first = await send();
     const replay = await send();
@@ -749,6 +758,8 @@ describe('practice', () => {
     const r = await answerForm(
       request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
       q.body.question.id,
+      undefined,
+      q.body.cycleId,
     );
 
     expect(r.status).toBe(200);
@@ -757,22 +768,20 @@ describe('practice', () => {
     expect(r.body.modelAnswer).toContain('MOCK_AI');
     const counts = await pool.query<{ attempts: number; progress: number }>(
       `SELECT
-         (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS attempts,
+         (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice-native') AS attempts,
          (SELECT count(*)::int FROM practice_progress WHERE user_id = $1) AS progress`,
       [userId],
     );
-    expect(counts.rows[0]).toEqual({ attempts: 0, progress: 0 });
+    expect(counts.rows[0]).toEqual({ attempts: 1, progress: 1 });
   });
 
   it('serializes native attempts per question and clears the in-flight claim on success', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
-    const questionId = question.rows[0].id;
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = question.body.question.id as string;
     const existingClaimId = randomUUID();
     await pool.query('INSERT INTO practice_inflight (user_id, question_id, claim_id) VALUES ($1, $2, $3)', [
       userId,
@@ -784,6 +793,8 @@ describe('practice', () => {
       const conflicted = await answerForm(
         request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
         questionId,
+        undefined,
+        question.body.cycleId,
       );
       expect(conflicted.status).toBe(409);
       expect(conflicted.body).toEqual({
@@ -804,6 +815,8 @@ describe('practice', () => {
     const succeeded = await answerForm(
       request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
       questionId,
+      undefined,
+      question.body.cycleId,
     );
     expect(succeeded.status).toBe(200);
     expect(succeeded.body.mode).toBe('native');
@@ -818,15 +831,15 @@ describe('practice', () => {
     const previousConcurrency = config.aiMaxConcurrency;
     const { res } = await registerUser(a);
     const token = res.body.token as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     config.aiMaxConcurrency = 0;
     try {
       const r = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
-        question.rows[0].id,
+        question.body.question.id,
+        undefined,
+        question.body.cycleId,
       );
       expect(r.status).toBe(503);
       expect(r.headers['retry-after']).toBe('5');
@@ -841,16 +854,16 @@ describe('practice', () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
-    const level = await completeDiagnostic(a, token);
-    const question = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const question = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     await pool.query('DELETE FROM assessment_usage WHERE user_id = $1', [userId]);
     config.assessDailyCap = 0;
     try {
       const r = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
-        question.rows[0].id,
+        question.body.question.id,
+        undefined,
+        question.body.cycleId,
       );
       expect(r.status).toBe(429);
       expect(r.body).toEqual({ error: 'Daily assessment limit reached', code: 'DAILY_LIMIT', retryAfterHours: 24 });
@@ -861,24 +874,31 @@ describe('practice', () => {
     }
   });
 
-  it('atomically enforces daily quota across different parallel questions', async () => {
+  it('atomically enforces daily quota across parallel submissions for the assigned cycle', async () => {
     const previousCap = config.assessDailyCap;
     const { res } = await registerUser(a);
     const token = res.body.token;
     const userId = res.body.user.id;
-    const level = await completeDiagnostic(a, token);
-    const questions = await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 2', [
-      level,
-    ]);
+    await completeDiagnostic(a, token);
+    const assigned = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     await pool.query('DELETE FROM assessment_usage WHERE user_id = $1', [userId]);
     config.assessDailyCap = 1;
     try {
-      const replies = await Promise.all(
-        questions.rows.map(({ id }) =>
-          answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), id),
+      const replies = await Promise.all([
+        answerForm(
+          request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+          assigned.body.question.id,
+          undefined,
+          assigned.body.cycleId,
         ),
-      );
-      expect(replies.map((r) => r.status).sort()).toEqual([200, 429]);
+        answerForm(
+          request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+          assigned.body.question.id,
+          undefined,
+          assigned.body.cycleId,
+        ),
+      ]);
+      expect(replies.map((r) => r.status).sort()).toEqual([200, 409]);
 
       const counts = await pool.query<{ attempts: number; usage: number; inflight: number }>(
         `SELECT

@@ -53,13 +53,14 @@ async function req(method, path, { token, json, form } = {}) {
   return { status: res.status, body: data, headers: res.headers };
 }
 
-function audioForm(questionId, requestId = randomUUID()) {
+function audioForm(questionId, requestId = randomUUID(), cycleId) {
   const form = new FormData();
   // Valid ISO BMFF header: box size 0x18, 'ftyp' at offset 4.
   const fakeAudio = new Blob([Buffer.from('00000018667479704d34412000000000', 'hex')], { type: 'audio/mp4' });
   form.append('audio', fakeAudio, 'answer.m4a');
   form.append('questionId', questionId);
   form.append('requestId', requestId);
+  if (cycleId) form.append('cycleId', cycleId);
   return form;
 }
 
@@ -195,8 +196,8 @@ ok(
   JSON.stringify(r.body),
 );
 ok(
-  'progress shape {asked:0,maxQuestions:5}',
-  r.body.progress?.asked === 0 && r.body.progress?.maxQuestions === 5,
+  'progress shape {asked:0,maxQuestions:3}',
+  r.body.progress?.asked === 0 && r.body.progress?.maxQuestions === 3,
   JSON.stringify(r.body.progress),
 );
 
@@ -227,7 +228,7 @@ let firstAnswerRequestId = null;
 // Every iteration asserts exactly twice: the score-fields check, then either
 // the done check (break) or the nextQuestion check.
 let diagAnswers = 0;
-for (let i = 1; i <= 5; i++) {
+for (let i = 1; i <= 3; i++) {
   diagAnswers++;
   const answerRequestId = randomUUID();
   if (i === 1) firstAnswerRequestId = answerRequestId;
@@ -249,7 +250,7 @@ for (let i = 1; i <= 5; i++) {
   ok(`diagnostic answer ${i} has nextQuestion`, questionShape(r.body.nextQuestion), JSON.stringify(r.body));
   question = r.body.nextQuestion;
 }
-ok('diagnostic finished within 5 answers', diagResult && diagResult.done === true && LEVELS.includes(diagResult.level));
+ok('diagnostic finished within 3 answers', diagResult && diagResult.done === true && LEVELS.includes(diagResult.level));
 const assignedLevel = diagResult.level;
 
 // The app's interrupted-upload recovery reconciles through this endpoint.
@@ -296,7 +297,8 @@ ok(
   (r.headers.get('cache-control') || '').includes('no-store'),
   r.headers.get('cache-control'),
 );
-const practiceQ = r.body.question;
+let practiceQ = r.body.question;
+let practiceCycleId = r.body.cycleId;
 
 r = await req('GET', `/practice/question/${practiceQ.id}/help`, { token });
 ok(
@@ -338,8 +340,16 @@ ok('help for unknown question returns 404', r.status === 404 && typeof r.body.er
 r = await req('GET', `/practice/question/not-a-uuid/help`, { token });
 ok('help with malformed UUID returns 400', r.status === 400 && typeof r.body.error === 'string', `got ${r.status}`);
 
-r = await req('POST', '/practice/skip', { token, json: { questionId: practiceQ.id } });
+r = await req('POST', '/practice/skip', {
+  token,
+  json: { questionId: practiceQ.id, cycleId: practiceCycleId },
+});
 ok('practice/skip returns an empty 204', r.status === 204 && r.body === null, JSON.stringify(r.body));
+
+r = await req('GET', '/practice/question', { token });
+ok('practice/skip advances to a new durable cycle', r.status === 200 && isUuid(r.body.cycleId), JSON.stringify(r.body));
+practiceQ = r.body.question;
+practiceCycleId = r.body.cycleId;
 
 r = await req('POST', '/practice/attempt', { token, form: new FormData() });
 ok(
@@ -358,7 +368,10 @@ let finalIterations = 0; // 4 ok() calls each: base + attemptNo 3 + finalFeedbac
 let ordinaryFailIterations = 0; // 2 ok() calls each: base + attemptsLeft
 for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
   attempts++;
-  r = await req('POST', '/practice/attempt', { token, form: audioForm(practiceQ.id) });
+  r = await req('POST', '/practice/attempt', {
+    token,
+    form: audioForm(practiceQ.id, randomUUID(), practiceCycleId),
+  });
   ok(
     `practice attempt ${attempts} responds 200 with score fields`,
     r.status === 200 &&
@@ -373,6 +386,8 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
     passIterations++;
     ok('pass response has mastered flag', typeof r.body.mastered === 'boolean', JSON.stringify(r.body));
     ok('pass response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
+    practiceQ = r.body.next.question;
+    practiceCycleId = r.body.next.cycleId;
   } else if (r.body.attemptsLeft === 0) {
     sawFinal = true;
     finalIterations++;
@@ -386,6 +401,8 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
       JSON.stringify(r.body),
     );
     ok('final-fail response has next payload', questionShape(r.body.next?.question), JSON.stringify(r.body));
+    practiceQ = r.body.next.question;
+    practiceCycleId = r.body.next.cycleId;
   } else {
     ordinaryFailIterations++;
     ok(
@@ -398,23 +415,36 @@ for (let i = 0; i < 300 && !(sawPass && sawFinal); i++) {
 ok(`observed a pass path (after ${attempts} attempts)`, sawPass);
 ok(`observed the attemptNo=3 final-feedback path (after ${attempts} attempts)`, sawFinal);
 
-r = await req('POST', '/practice/attempt', { token, form: audioForm(practiceQ.id) });
+r = await req('POST', '/practice/attempt', {
+  token,
+  form: audioForm(practiceQ.id, randomUUID(), practiceCycleId),
+});
 ok(
   'attemptNo resets to 1 after a pass or a 3rd failure',
   r.status === 200 && r.body.attemptNo === 1,
   JSON.stringify(r.body),
 );
+if (r.body.next) {
+  practiceQ = r.body.next.question;
+  practiceCycleId = r.body.next.cycleId;
+}
 
-// Native-language mode: comprehension only, never writes mastery.
-r = await req('POST', '/practice/attempt/native', { token, form: audioForm(practiceQ.id) });
+// Native-language mode consumes the same cycle budget without changing English mastery.
+r = await req('POST', '/practice/attempt/native', {
+  token,
+  form: audioForm(practiceQ.id, randomUUID(), practiceCycleId),
+});
 ok(
   'native attempt returns comprehension result',
   r.status === 200 &&
     r.body.mode === 'native' &&
     typeof r.body.understood === 'boolean' &&
     typeof r.body.transcript === 'string' &&
+    typeof r.body.translatedTranscript === 'string' &&
     typeof r.body.modelAnswer === 'string' &&
-    typeof r.body.feedback === 'string',
+    typeof r.body.feedback === 'string' &&
+    typeof r.body.attemptNo === 'number' &&
+    typeof r.body.attemptsLeft === 'number',
   JSON.stringify(r.body),
 );
 

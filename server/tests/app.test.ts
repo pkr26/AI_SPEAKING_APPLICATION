@@ -221,14 +221,28 @@ describe('app wiring', () => {
       question_text: string;
     }>('SELECT id, cefr_level, prompt_word, question_text FROM questions LIMIT 1');
     const q = question.rows[0];
+    const practiceCycleId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles
+           (user_id, question_id, kind, attempts_used, status, closed_at)
+         VALUES ($1, $2, 'revision', 1, 'closed', now())
+         RETURNING id`,
+        [first.body.user.id, q.id],
+      )
+    ).rows[0].id;
     const storedResponse = {
       passed: true,
       mastered: true,
+      cycleId: '22222222-2222-4222-8222-222222222222',
       attemptNo: 1,
+      attemptsLeft: 0,
       score: 81,
       transcript: 'A complete stored answer.',
       feedback: 'Clear and relevant.',
       next: {
+        cycleId: '33333333-3333-4333-8333-333333333333',
+        attemptsUsed: 0,
+        attemptsLeft: 3,
         question: {
           id: q.id,
           cefrLevel: q.cefr_level,
@@ -241,9 +255,10 @@ describe('app wiring', () => {
     };
     await pool.query(
       `INSERT INTO assessment_requests
-         (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at)
-       VALUES ($1, $2, $3, 'practice', $4, 'completed', $5, now())`,
-      [first.body.user.id, requestId, randomUUID(), q.id, storedResponse],
+         (user_id, request_id, claim_id, context, question_id, status, response_body, completed_at,
+          practice_cycle_id)
+       VALUES ($1, $2, $3, 'practice', $4, 'completed', $5, now(), $6)`,
+      [first.body.user.id, requestId, randomUUID(), q.id, storedResponse, practiceCycleId],
     );
 
     const completed = await request(a)
@@ -256,6 +271,13 @@ describe('app wiring', () => {
       response: storedResponse,
       context: 'practice',
       questionId: q.id,
+      cycleId: practiceCycleId,
+      question: {
+        id: q.id,
+        cefrLevel: q.cefr_level,
+        promptWord: q.prompt_word,
+        questionText: q.question_text,
+      },
     });
 
     const otherUser = await request(a)

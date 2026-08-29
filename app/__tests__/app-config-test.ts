@@ -7,7 +7,7 @@ describe('app identity configuration', () => {
     expect(expo.name).toBe('AI English Coach');
     expect(expo.slug).toBe('ai-english-coach');
     expect(expo.scheme).toBe('aienglishcoach');
-    expect(expo.version).toBe('1.0.0');
+    expect(expo.version).toBe('1.1.0');
   });
 
   it('pins the platform bundle identifiers', () => {
@@ -18,8 +18,8 @@ describe('app identity configuration', () => {
   it('carries per-build store metadata both stores reject uploads without', () => {
     // Both stores reject a second upload that reuses a build identifier, so
     // these must exist to be bumped; `version` alone is not enough.
-    expect(expo.ios.buildNumber).toBe('1');
-    expect(expo.android.versionCode).toBe(1);
+    expect(expo.ios.buildNumber).toBe('2');
+    expect(expo.android.versionCode).toBe(2);
     // Declaring the app exempt from the US export-encryption filing (it only
     // uses HTTPS) keeps every App Store upload from stalling on the
     // encryption questionnaire.
@@ -51,25 +51,27 @@ describe('app identity configuration', () => {
     expect(expo.plugins).toContainEqual([
       'expo-splash-screen',
       {
-        image: './assets/splash-icon.png',
+        image: './assets/splash-icon-v2.png',
         resizeMode: 'contain',
         backgroundColor: '#FFFFFF',
         dark: {
-          image: './assets/splash-icon.png',
+          image: './assets/splash-icon-v2.png',
           backgroundColor: '#0F1417',
         },
       },
     ]);
   });
 
-  it('keeps the existing icons and follows the OS color scheme', () => {
-    expect(expo.icon).toBe('./assets/icon.png');
+  it('uses the production-ready icons and follows the OS color scheme', () => {
+    expect(expo.icon).toBe('./assets/icon-v2.png');
+    // Phones and tablets must remain usable when the device or an assistive
+    // mount rotates; Expo defaults to supporting both orientations.
+    expect('orientation' in expo).toBe(false);
     // U-M8: dark mode — the app follows the device's light/dark setting.
     expect(expo.userInterfaceStyle).toBe('automatic');
     expect(expo.android.adaptiveIcon).toEqual({
       backgroundColor: '#E6F4FE',
       foregroundImage: './assets/android-icon-foreground.png',
-      backgroundImage: './assets/android-icon-background.png',
       monochromeImage: './assets/android-icon-monochrome.png',
     });
   });

@@ -316,6 +316,67 @@ describe('recording owner API', () => {
     expect(jobs.rows).toEqual([{ known_version_id: 'version-1' }]);
   });
 
+  it('bulk-deletes only the owner recordings, queues every object version, and remains idempotent', async () => {
+    const a = app();
+    const owner = await registerUser(a);
+    const stranger = await registerUser(a);
+    const first = await createRecording(owner.res.body.user.id);
+    const second = await createRecording(owner.res.body.user.id, 'retention_pending');
+    const foreign = await createRecording(stranger.res.body.user.id);
+    const authorization = { Authorization: `Bearer ${owner.res.body.token}` };
+
+    const deleted = await request(a).delete('/recordings').set(authorization);
+    expect(deleted.status).toBe(204);
+    expect(deleted.headers['cache-control']).toContain('no-store');
+    expect(
+      (
+        await pool.query<{ recording_retention_epoch: string }>(
+          'SELECT recording_retention_epoch FROM users WHERE id = $1',
+          [owner.res.body.user.id],
+        )
+      ).rows,
+    ).toEqual([{ recording_retention_epoch: '1' }]);
+    expect((await pool.query('SELECT id FROM recordings WHERE user_id = $1', [owner.res.body.user.id])).rows).toEqual(
+      [],
+    );
+    expect(
+      (
+        await pool.query(
+          `SELECT audio_key, known_version_id
+           FROM recording_deletion_jobs
+           WHERE audio_key = ANY($1::text[])
+           ORDER BY audio_key`,
+          [[first.audioKey, second.audioKey]],
+        )
+      ).rows,
+    ).toEqual(
+      [first.audioKey, second.audioKey].sort().map((audio_key) => ({ audio_key, known_version_id: 'version-1' })),
+    );
+    expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rows).toEqual([
+      { id: foreign.id },
+    ]);
+
+    expect((await request(a).delete('/recordings').set(authorization)).status).toBe(204);
+    expect(
+      (
+        await pool.query<{ recording_retention_epoch: string }>(
+          'SELECT recording_retention_epoch FROM users WHERE id = $1',
+          [owner.res.body.user.id],
+        )
+      ).rows,
+    ).toEqual([{ recording_retention_epoch: '2' }]);
+    expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rowCount).toBe(1);
+  });
+
+  it('requires authentication for bulk recording deletion', async () => {
+    const response = await request(app()).delete('/recordings');
+    expect(response.status).toBe(401);
+    expect(response.body).toEqual({
+      error: 'Missing or invalid Authorization header',
+      code: 'UNAUTHENTICATED',
+    });
+  });
+
   it('account deletion cascades metadata but preserves a durable object-deletion tombstone', async () => {
     const a = app();
     const { res: registered } = await registerUser(a);

@@ -52,6 +52,13 @@ interface PracticePick {
   kind: PracticeKind;
 }
 
+interface PracticeQuestionPayload extends PracticePick {
+  cycleId: string;
+  attemptsUsed: number;
+  attemptsLeft: number;
+  progress: PracticeProgressJson;
+}
+
 interface PracticeProgressJson {
   masteredCount: number;
   learningCount: number;
@@ -78,12 +85,13 @@ interface CurrentPracticeUser {
 async function withCurrentPracticeUser<T>(
   userId: string,
   read: (client: Queryable, user: CurrentPracticeUser) => Promise<T>,
+  lock: 'SHARE' | 'UPDATE' = 'SHARE',
 ): Promise<T> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
     const { rows } = await client.query<CurrentPracticeUser>(
-      'SELECT cefr_level, diagnostic_completed, native_language FROM users WHERE id = $1 FOR SHARE',
+      `SELECT cefr_level, diagnostic_completed, native_language FROM users WHERE id = $1 FOR ${lock}`,
       [userId],
     );
     const user = rows[0];
@@ -215,11 +223,11 @@ async function lastAttemptWasRevision(userId: string, db: Queryable): Promise<bo
        SELECT 1 FROM attempts earlier
        WHERE earlier.user_id = latest.user_id
          AND earlier.question_id = latest.question_id
-         AND earlier.context = 'practice'
+         AND earlier.context IN ('practice', 'practice-native')
          AND (earlier.created_at, earlier.id) < (latest.created_at, latest.id)
      ) AS was_revision
      FROM attempts latest
-     WHERE latest.user_id = $1 AND latest.context = 'practice'
+     WHERE latest.user_id = $1 AND latest.context IN ('practice', 'practice-native')
      ORDER BY latest.created_at DESC, latest.id DESC
      LIMIT 1`,
     [userId],
@@ -280,13 +288,99 @@ async function practiceProgressSnapshot(
   return rows[0];
 }
 
+interface ActivePracticeCycleRow extends QuestionJson {
+  cycleId: string;
+  kind: PracticeKind;
+  attemptsUsed: number;
+}
+
+async function activePracticeCycle(userId: string, db: Queryable): Promise<ActivePracticeCycleRow | undefined> {
+  const { rows } = await db.query<ActivePracticeCycleRow>(
+    `SELECT pc.id AS "cycleId", pc.kind, pc.attempts_used AS "attemptsUsed",
+            ${questionColumns()}
+     FROM practice_cycles pc
+     JOIN questions q ON q.id = pc.question_id
+     WHERE pc.user_id = $1 AND pc.status = 'active'
+     FOR UPDATE OF pc`,
+    [userId],
+  );
+  return rows[0];
+}
+
+async function createPracticeCyclePayload(
+  userId: string,
+  level: string,
+  db: Queryable,
+  excludeQuestionId?: string,
+): Promise<PracticeQuestionPayload | undefined> {
+  const pick = await pickPracticeNext(userId, level, db, excludeQuestionId);
+  if (!pick) return undefined;
+  const { rows } = await db.query<{ id: string }>(
+    `INSERT INTO practice_cycles (user_id, question_id, kind)
+     VALUES ($1, $2, $3)
+     RETURNING id`,
+    [userId, pick.question.id, pick.kind],
+  );
+  const progress = await practiceProgressSnapshot(userId, level, db);
+  return {
+    cycleId: rows[0].id,
+    attemptsUsed: 0,
+    attemptsLeft: MAX_ATTEMPTS,
+    question: pick.question,
+    kind: pick.kind,
+    progress,
+  };
+}
+
+/** Resume the assigned question after a remount, or atomically assign one. */
+async function getOrCreatePracticeCyclePayload(
+  userId: string,
+  level: string,
+  db: Queryable,
+): Promise<PracticeQuestionPayload | undefined> {
+  const active = await activePracticeCycle(userId, db);
+  if (active && active.cefrLevel === level) {
+    const progress = await practiceProgressSnapshot(userId, level, db);
+    return {
+      cycleId: active.cycleId,
+      attemptsUsed: active.attemptsUsed,
+      attemptsLeft: MAX_ATTEMPTS - active.attemptsUsed,
+      question: {
+        id: active.id,
+        cefrLevel: active.cefrLevel,
+        promptWord: active.promptWord,
+        questionText: active.questionText,
+      },
+      kind: active.kind,
+      progress,
+    };
+  }
+  if (active) {
+    // Defensive repair for a diagnostic re-placement or an older deployment
+    // that changed the level without closing its serving row.
+    await db.query(
+      `UPDATE practice_cycles
+       SET status = 'closed', closed_at = now(), updated_at = now()
+       WHERE id = $1 AND user_id = $2 AND status = 'active'`,
+      [active.cycleId, userId],
+    );
+  }
+  return createPracticeCyclePayload(userId, level, db);
+}
+
 interface PracticeClaim {
   attemptNo: number;
   claimId: string;
+  cycleId: string;
 }
 
 /** Claim one (user, question) attempt without holding a DB connection during AI work. */
-async function claimPracticeAttempt(userId: string, questionId: string, questionLevel: string): Promise<PracticeClaim> {
+async function claimPracticeAttempt(
+  userId: string,
+  questionId: string,
+  questionLevel: string,
+  cycleId: string,
+): Promise<PracticeClaim> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -310,6 +404,17 @@ async function claimPracticeAttempt(userId: string, questionId: string, question
     if (!currentUser.diagnostic_completed || currentUser.cefr_level !== questionLevel) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
+    const cycle = await client.query<{ attempts_used: number }>(
+      `SELECT attempts_used
+       FROM practice_cycles
+       WHERE id = $1 AND user_id = $2 AND question_id = $3 AND status = 'active'
+       FOR UPDATE`,
+      [cycleId, userId, questionId],
+    );
+    if (!cycle.rows[0]) {
+      throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+    }
+
     await client.query(
       `DELETE FROM practice_inflight
        WHERE user_id = $1 AND question_id = $2
@@ -328,19 +433,9 @@ async function claimPracticeAttempt(userId: string, questionId: string, question
       throw new HttpError(409, 'An assessment is already in progress for this question', 'ASSESSMENT_IN_PROGRESS');
     }
 
-    const { rows } = await client.query<{ attempt_no: number; passed: boolean | null }>(
-      `SELECT attempt_no, passed FROM attempts
-       WHERE user_id = $1 AND question_id = $2 AND context = 'practice'
-       ORDER BY created_at DESC, attempt_no DESC LIMIT 1`,
-      [userId, questionId],
-    );
-    const last = rows[0];
-    // Deliberate: attempt_no is per serving cycle, not lifetime. A pass or a
-    // final (third) failure closes the 3-attempt window, and the next attempt
-    // on this word restarts the cycle at 1.
-    const attemptNo = last && !last.passed && last.attempt_no < MAX_ATTEMPTS ? last.attempt_no + 1 : 1;
+    const attemptNo = cycle.rows[0].attempts_used + 1;
     await client.query('COMMIT');
-    return { attemptNo, claimId };
+    return { attemptNo, claimId, cycleId };
   } catch (err) {
     return await rollbackTransaction(client, { value: err });
   } finally {
@@ -411,11 +506,30 @@ async function storePracticeResult(
     if (owned.rowCount !== 1) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
+    const cycle = await client.query<{ attempts_used: number }>(
+      `SELECT attempts_used FROM practice_cycles
+       WHERE id = $1 AND user_id = $2 AND question_id = $3 AND status = 'active'
+       FOR UPDATE`,
+      [claim.cycleId, userId, questionId],
+    );
+    if (cycle.rows[0]?.attempts_used !== claim.attemptNo - 1) {
+      throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+    }
     const insertedAttempt = await client.query<{ id: string }>(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7)
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7, $8)
        RETURNING id`,
-      [userId, questionId, claim.attemptNo, result.transcript, result.score, result.passed, result.feedback],
+      [
+        userId,
+        questionId,
+        claim.attemptNo,
+        result.transcript,
+        result.score,
+        result.passed,
+        result.feedback,
+        claim.cycleId,
+      ],
     );
     if (recording) recording.attemptId = insertedAttempt.rows[0].id;
     // Lock the word's progress row (when it exists) so the mastery transition
@@ -519,6 +633,16 @@ async function storePracticeResult(
     // without levelUp, which this attempt did not earn.
     const staleLevel = lockedUserLevel !== level;
     const shouldRetry = !result.passed && claim.attemptNo < MAX_ATTEMPTS && !staleLevel;
+    await client.query(
+      `UPDATE practice_cycles
+       SET attempts_used = $1,
+           kind = CASE WHEN $2 THEN 'revision' ELSE kind END,
+           status = CASE WHEN $2 THEN 'active' ELSE 'closed' END,
+           closed_at = CASE WHEN $2 THEN NULL ELSE now() END,
+           updated_at = now()
+       WHERE id = $3 AND user_id = $4 AND status = 'active'`,
+      [claim.attemptNo, shouldRetry, claim.cycleId, userId],
+    );
     if (shouldRetry) {
       response = { ...body, attemptsLeft: MAX_ATTEMPTS - claim.attemptNo };
     } else {
@@ -528,11 +652,9 @@ async function storePracticeResult(
       // attempt's own, or a rival's that landed while the provider call was in
       // flight — both the next question and the progress snapshot come from
       // the CURRENT level.
-      const nextPick = await pickPracticeNext(userId, effectiveLevel, client, questionId);
-      const progress = await practiceProgressSnapshot(userId, effectiveLevel, client);
-      const next = nextPick ? { ...nextPick, progress } : undefined;
+      const next = await createPracticeCyclePayload(userId, effectiveLevel, client, questionId);
       response = result.passed
-        ? { ...body, levelUp, next }
+        ? { ...body, attemptsLeft: 0, levelUp, next }
         : { ...body, attemptsLeft: 0, finalFeedback, levelUp, next };
     }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
@@ -570,6 +692,7 @@ async function storeSilenceResult(
   requestId: string,
   requestClaimId: string,
   response: Record<string, unknown>,
+  context: 'practice' | 'practice-native',
   recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
@@ -592,22 +715,151 @@ async function storeSilenceResult(
     if (owned.rowCount !== 1) {
       throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
     }
+    const cycle = await client.query<{ attempts_used: number }>(
+      `SELECT attempts_used FROM practice_cycles
+       WHERE id = $1 AND user_id = $2 AND question_id = $3 AND status = 'active'
+       FOR UPDATE`,
+      [claim.cycleId, userId, questionId],
+    );
+    if (cycle.rows[0]?.attempts_used !== claim.attemptNo - 1) {
+      throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+    }
     await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
       userId,
       questionId,
       claim.claimId,
     ]);
-    response = await completeAssessmentRequest(
+    response = await completeAssessmentRequest(client, userId, requestId, requestClaimId, response, context, recording);
+    await client.query('COMMIT');
+    return response;
+  } catch (err) {
+    return await rollbackTransaction(client, { value: err });
+  } finally {
+    releaseTransactionClient(client);
+  }
+}
+
+/**
+ * Persist one spoken native-language try. It participates in the same durable
+ * three-attempt cycle and activity/history counters as English, while leaving
+ * English mastery, best score, status and SRS schedule unchanged.
+ */
+async function storeNativePracticeResult(
+  userId: string,
+  questionId: string,
+  claim: PracticeClaim,
+  result: NativeAssessResult,
+  feedback: string,
+  requestId: string,
+  requestClaimId: string,
+  level: string,
+  recording?: RecordingCapture,
+): Promise<Record<string, unknown>> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lockedUser = await client.query<{ cefr_level: string | null }>(
+      'SELECT cefr_level FROM users WHERE id = $1 FOR UPDATE',
+      [userId],
+    );
+    const effectiveLevel = lockedUser.rows[0]?.cefr_level;
+    if (!effectiveLevel) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
+    const owned = await client.query(
+      `SELECT 1 FROM practice_inflight
+       WHERE user_id = $1 AND question_id = $2 AND claim_id = $3
+       FOR UPDATE`,
+      [userId, questionId, claim.claimId],
+    );
+    if (owned.rowCount !== 1) {
+      throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
+    }
+    const cycle = await client.query<{ attempts_used: number }>(
+      `SELECT attempts_used FROM practice_cycles
+       WHERE id = $1 AND user_id = $2 AND question_id = $3 AND status = 'active'
+       FOR UPDATE`,
+      [claim.cycleId, userId, questionId],
+    );
+    if (cycle.rows[0]?.attempts_used !== claim.attemptNo - 1) {
+      throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+    }
+
+    const insertedAttempt = await client.query<{ id: string }>(
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback,
+          practice_cycle_id, understood, translated_transcript, model_answer)
+       VALUES ($1, $2, 'practice-native', $3, $4, NULL, NULL, $5, $6, $7, $8, $9)
+       RETURNING id`,
+      [
+        userId,
+        questionId,
+        claim.attemptNo,
+        result.transcript,
+        feedback,
+        claim.cycleId,
+        result.understood,
+        result.translatedTranscript,
+        result.modelAnswer,
+      ],
+    );
+    if (recording) recording.attemptId = insertedAttempt.rows[0].id;
+
+    await client.query(
+      `INSERT INTO practice_progress
+         (user_id, question_id, status, best_score, attempt_count, last_attempt_at,
+          srs_interval_index, due_at, skipped_until)
+       VALUES ($1, $2, 'learning', 0, 1, now(), 0, now(), NULL)
+       ON CONFLICT (user_id, question_id) DO UPDATE SET
+         attempt_count = practice_progress.attempt_count + 1,
+         last_attempt_at = now(),
+         skipped_until = NULL`,
+      [userId, questionId],
+    );
+
+    const shouldRetry = claim.attemptNo < MAX_ATTEMPTS && effectiveLevel === level;
+    await client.query(
+      `UPDATE practice_cycles
+       SET attempts_used = $1,
+           kind = CASE WHEN $2 THEN 'revision' ELSE kind END,
+           status = CASE WHEN $2 THEN 'active' ELSE 'closed' END,
+           closed_at = CASE WHEN $2 THEN NULL ELSE now() END,
+           updated_at = now()
+       WHERE id = $3 AND user_id = $4 AND status = 'active'`,
+      [claim.attemptNo, shouldRetry, claim.cycleId, userId],
+    );
+
+    const response: Record<string, unknown> = {
+      mode: 'native',
+      cycleId: claim.cycleId,
+      understood: result.understood,
+      transcript: result.transcript,
+      translatedTranscript: result.translatedTranscript,
+      modelAnswer: result.modelAnswer,
+      feedback,
+      attemptNo: claim.attemptNo,
+      attemptsLeft: shouldRetry ? MAX_ATTEMPTS - claim.attemptNo : 0,
+    };
+    if (!shouldRetry) {
+      response.next = await createPracticeCyclePayload(userId, effectiveLevel, client, questionId);
+    }
+
+    await client.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
+      userId,
+      questionId,
+      claim.claimId,
+    ]);
+    const completedResponse = await completeAssessmentRequest(
       client,
       userId,
       requestId,
       requestClaimId,
       response,
-      'practice',
+      'practice-native',
       recording,
     );
     await client.query('COMMIT');
-    return response;
+    return completedResponse;
   } catch (err) {
     return await rollbackTransaction(client, { value: err });
   } finally {
@@ -684,10 +936,14 @@ export function createPracticeRouter(limiters: Limiters) {
   });
   const skipBodySchema = z.object({
     questionId: z.string().uuid('questionId must be a valid UUID'),
+    cycleId: z.string().uuid('cycleId must be a valid UUID'),
   });
   const historyQuerySchema = z.object({
     limit: z.coerce.number().int().min(1).max(50).default(20),
     cursor: z.string().uuid('cursor must be a valid UUID').optional(),
+  });
+  const statsQuerySchema = z.object({
+    timeZone: z.string().trim().min(1).max(128).default('UTC'),
   });
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -710,15 +966,18 @@ export function createPracticeRouter(limiters: Limiters) {
     '/question',
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const body = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
-        if (!currentUser.diagnostic_completed || !currentUser.cefr_level) {
-          throw new HttpError(403, 'Diagnostic not completed');
-        }
-        const pick = await pickPracticeNext(user.id, currentUser.cefr_level, client);
-        if (!pick) throw new HttpError(500, 'No questions available for this level');
-        const progress = await practiceProgressSnapshot(user.id, currentUser.cefr_level, client);
-        return { question: pick.question, kind: pick.kind, progress };
-      });
+      const body = await withCurrentPracticeUser(
+        user.id,
+        async (client, currentUser) => {
+          if (!currentUser.diagnostic_completed || !currentUser.cefr_level) {
+            throw new HttpError(403, 'Diagnostic not completed');
+          }
+          const payload = await getOrCreatePracticeCyclePayload(user.id, currentUser.cefr_level, client);
+          if (!payload) throw new HttpError(500, 'No questions available for this level');
+          return payload;
+        },
+        'UPDATE',
+      );
       res.json(body);
     }),
   );
@@ -732,7 +991,7 @@ export function createPracticeRouter(limiters: Limiters) {
     validate({ body: skipBodySchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const { questionId } = validated(req, skipBodySchema);
+      const { questionId, cycleId } = validated(req, skipBodySchema);
       const client = await pool.connect();
       try {
         await client.query('BEGIN');
@@ -758,12 +1017,34 @@ export function createPracticeRouter(limiters: Limiters) {
         if (q.cefr_level !== currentUser.cefr_level) {
           throw new HttpError(403, 'Question is not available at your level');
         }
+        const currentCycle = await client.query(
+          `SELECT 1 FROM practice_cycles
+           WHERE id = $1 AND user_id = $2 AND question_id = $3 AND status = 'active'
+           FOR UPDATE`,
+          [cycleId, user.id, questionId],
+        );
+        if (currentCycle.rowCount !== 1) {
+          throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
+        }
+        const inFlight = await client.query('SELECT 1 FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [
+          user.id,
+          questionId,
+        ]);
+        if (inFlight.rowCount !== 0) {
+          throw new HttpError(409, 'An assessment is already in progress for this question', 'ASSESSMENT_IN_PROGRESS');
+        }
         await client.query(
           `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, skipped_until)
            VALUES ($1, $2, 'learning', 0, 0, now() + interval '${SKIP_DAYS} days')
            ON CONFLICT (user_id, question_id) DO UPDATE SET
              skipped_until = now() + interval '${SKIP_DAYS} days'`,
           [user.id, questionId],
+        );
+        await client.query(
+          `UPDATE practice_cycles
+           SET status = 'closed', closed_at = now(), updated_at = now()
+           WHERE id = $1 AND user_id = $2 AND status = 'active'`,
+          [cycleId, user.id],
         );
         await client.query('COMMIT');
       } catch (err) {
@@ -794,6 +1075,8 @@ export function createPracticeRouter(limiters: Limiters) {
         `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
                 q.question_text AS "questionText", q.cefr_level AS "cefrLevel", a.context,
                 a.attempt_no AS "attemptNo", a.score, a.passed, a.transcript, a.feedback,
+                a.practice_cycle_id AS "cycleId", a.understood,
+                a.translated_transcript AS "translatedTranscript", a.model_answer AS "modelAnswer",
                 a.created_at AS "createdAt", r.id AS "recordingId", r.status AS "recordingStatus"
          FROM attempts a
          JOIN questions q ON q.id = a.question_id
@@ -819,14 +1102,18 @@ export function createPracticeRouter(limiters: Limiters) {
   // is null and the progress counters are simply zero.
   router.get(
     '/stats',
+    validate({ query: statsQuerySchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
+      const { timeZone } = validated(req, statsQuerySchema);
       const body = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
+        const knownTimeZone = await client.query('SELECT 1 FROM pg_timezone_names WHERE name = $1 LIMIT 1', [timeZone]);
+        if (!knownTimeZone.rows[0]) throw new HttpError(400, 'timeZone must be a valid IANA time zone');
         const level = currentUser.cefr_level;
         const progress = level
           ? await practiceProgressSnapshot(user.id, level, client)
           : { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 };
-        // Streak = consecutive UTC calendar days with at least one practice
+        // Streak = consecutive learner-local calendar days with at least one practice
         // attempt, anchored on the most recent practiced day and counted only
         // when that anchor is today or yesterday (one quiet day is allowed
         // before the streak dies). Gaps-and-islands over the distinct day list:
@@ -839,9 +1126,9 @@ export function createPracticeRouter(limiters: Limiters) {
           lastPracticedAt: string | null;
         }>(
           `WITH practice_days AS (
-             SELECT DISTINCT (created_at AT TIME ZONE 'UTC')::date AS day
+             SELECT DISTINCT (created_at AT TIME ZONE $2)::date AS day
              FROM attempts
-             WHERE user_id = $1 AND context = 'practice'
+             WHERE user_id = $1 AND context IN ('practice', 'practice-native')
            ),
            ranked AS (
              SELECT day,
@@ -851,14 +1138,16 @@ export function createPracticeRouter(limiters: Limiters) {
            )
            SELECT
              (SELECT count(*)::int FROM ranked
-              WHERE latest >= (now() AT TIME ZONE 'UTC')::date - 1
+              WHERE latest >= (now() AT TIME ZONE $2)::date - 1
                 AND day = latest - (rn - 1)::int) AS "streakDays",
              (SELECT count(*)::int FROM attempts
-              WHERE user_id = $1 AND context = 'practice'
-                AND (created_at AT TIME ZONE 'UTC')::date = (now() AT TIME ZONE 'UTC')::date) AS "practicedToday",
-             (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice') AS "totalAttempts",
-             (SELECT max(created_at) FROM attempts WHERE user_id = $1 AND context = 'practice') AS "lastPracticedAt"`,
-          [user.id],
+              WHERE user_id = $1 AND context IN ('practice', 'practice-native')
+                AND (created_at AT TIME ZONE $2)::date = (now() AT TIME ZONE $2)::date) AS "practicedToday",
+             (SELECT count(*)::int FROM attempts
+              WHERE user_id = $1 AND context IN ('practice', 'practice-native')) AS "totalAttempts",
+             (SELECT max(created_at) FROM attempts
+              WHERE user_id = $1 AND context IN ('practice', 'practice-native')) AS "lastPracticedAt"`,
+          [user.id, timeZone],
         );
         const stats = rows[0];
         return {
@@ -868,6 +1157,7 @@ export function createPracticeRouter(limiters: Limiters) {
           practicedToday: stats.practicedToday,
           totalAttempts: stats.totalAttempts,
           lastPracticedAt: stats.lastPracticedAt,
+          timeZone,
         };
       });
       res.json(body);
@@ -935,7 +1225,8 @@ export function createPracticeRouter(limiters: Limiters) {
         respendAssessmentBudget: submission.respendAssessmentBudget,
         questionMissingError: () => new HttpError(404, 'Question not found'),
         requireQuestionAtUserLevel: true,
-        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id, question.cefr_level),
+        claimAttempt: (user, question) =>
+          claimPracticeAttempt(user.id, question.id, question.cefr_level, (req.body as { cycleId: string }).cycleId),
         assess: (audioPath, user, question, _claim, options) =>
           assessSpeaking(audioPath, assessQuestionContext(question), user.id, options),
         persist: (user, question, claim, result, requestId, requestClaimId, recording) => {
@@ -956,8 +1247,10 @@ export function createPracticeRouter(limiters: Limiters) {
                 score: 0,
                 transcript: '',
                 feedback: result.feedback,
+                cycleId: claim.cycleId,
                 attemptsLeft: MAX_ATTEMPTS - (claim.attemptNo - 1),
               },
+              'practice',
               recording,
             );
           }
@@ -969,6 +1262,7 @@ export function createPracticeRouter(limiters: Limiters) {
             score: result.score,
             transcript: result.transcript,
             feedback: result.feedback,
+            cycleId: claim.cycleId,
           };
 
           // Precompute the final-failure response without another provider
@@ -997,9 +1291,8 @@ export function createPracticeRouter(limiters: Limiters) {
 
   // Native-language mode ("answer in my language"): the learner answers in
   // their mother tongue; we check comprehension and return a model English
-  // answer. It never writes attempts or practice_progress — only English
-  // attempts move mastery. Idempotency, audio gates, and rate limits are
-  // identical to /attempt.
+  // answer. It consumes the same durable three-try budget and is retained in
+  // history/progress, but never changes English mastery or SRS state.
   router.post(
     '/attempt/native',
     ...submission.middleware,
@@ -1014,7 +1307,8 @@ export function createPracticeRouter(limiters: Limiters) {
         // Same per-question serialization as English practice: without a
         // claim, concurrent native submissions with distinct requestIds each
         // trigger their own paid provider calls for one question.
-        claimAttempt: (user, question) => claimPracticeAttempt(user.id, question.id, question.cefr_level),
+        claimAttempt: (user, question) =>
+          claimPracticeAttempt(user.id, question.id, question.cefr_level, (req.body as { cycleId: string }).cycleId),
         assess: (audioPath, user, question, _claim, options) =>
           assessNativeComprehension(
             audioPath,
@@ -1023,64 +1317,45 @@ export function createPracticeRouter(limiters: Limiters) {
             user.id,
             options,
           ),
-        persist: async (user, question, claim, result, requestId, requestClaimId, recording) => {
+        persist: (user, question, claim, result, requestId, requestClaimId, recording) => {
           const feedback =
             result.understood || result.transcript === ''
               ? result.feedback
               : buildNativeFallbackFeedback(result.feedback, authoredNativeExample(question, user.native_language));
-          const response: Record<string, unknown> = {
-            mode: 'native',
-            understood: result.understood,
-            transcript: result.transcript,
-            modelAnswer: result.modelAnswer,
-            feedback,
-          };
-          const client = await pool.connect();
-          try {
-            await client.query('BEGIN');
-            // Account deletion takes users before cascading into
-            // practice_inflight/assessment_requests. Keep this native path in
-            // the same parent-first order as scored and silent persistence.
-            const lockedUser = await client.query('SELECT 1 FROM users WHERE id = $1 FOR UPDATE', [user.id]);
-            if (lockedUser.rowCount !== 1) {
-              throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
-            }
-            // Same claim-ownership re-check as both English persist paths: a
-            // worker whose claim lease expired and was replaced must fail 409
-            // here instead of completing a duplicate paid result.
-            const owned = await client.query(
-              `SELECT 1 FROM practice_inflight
-               WHERE user_id = $1 AND question_id = $2 AND claim_id = $3
-               FOR UPDATE`,
-              [user.id, question.id, claim.claimId],
-            );
-            if (owned.rowCount !== 1) {
-              throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
-            }
-            // Clear the claim inside the persist transaction (like the
-            // English paths) so the response can never reach the client while
-            // its own inflight row is still visible.
-            await client.query(
-              'DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3',
-              [user.id, question.id, claim.claimId],
-            );
-            const completedResponse = await completeAssessmentRequest(
-              client,
+          if (result.transcript === '') {
+            return storeSilenceResult(
               user.id,
+              question.id,
+              claim,
               requestId,
               requestClaimId,
-              response,
+              {
+                mode: 'native',
+                cycleId: claim.cycleId,
+                understood: false,
+                transcript: '',
+                translatedTranscript: '',
+                modelAnswer: '',
+                feedback,
+                noSpeech: true,
+                attemptNo: claim.attemptNo,
+                attemptsLeft: MAX_ATTEMPTS - (claim.attemptNo - 1),
+              },
               'practice-native',
               recording,
             );
-            await client.query('COMMIT');
-            return completedResponse;
-          } catch (err) {
-            return await rollbackTransaction(client, { value: err });
-          } finally {
-            releaseTransactionClient(client);
           }
-          return response;
+          return storeNativePracticeResult(
+            user.id,
+            question.id,
+            claim,
+            result,
+            feedback,
+            requestId,
+            requestClaimId,
+            user.cefr_level!,
+            recording,
+          );
         },
         clearClaim: (user, question, claim) => clearPracticeClaim(user.id, question.id, claim.claimId),
       }),

@@ -8,7 +8,7 @@ import { createAuthRouter } from '../src/auth';
 import { config } from '../src/config';
 import { errorHandler } from '../src/middleware';
 import { buildLimiters } from '../src/rate-limit';
-import { app, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers';
+import { app, createClosedPracticeCycle, pool, registerUser, STRONG_PASSWORD, uniqueEmail } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -461,6 +461,23 @@ describe('auth: infrastructure failures', () => {
 });
 
 describe('auth: change-password token revocation', () => {
+  it('rejects reusing the current password before rotating credentials', async () => {
+    const { res, body } = await registerUser(a);
+    const unchanged = await request(a)
+      .post('/auth/change-password')
+      .set('Authorization', `Bearer ${res.body.token}`)
+      .send({ currentPassword: body.password, newPassword: body.password });
+
+    expect(unchanged.status).toBe(400);
+    expect(unchanged.body).toEqual({
+      error: 'newPassword: new password must be different from the current password',
+      code: 'VALIDATION_FAILED',
+    });
+
+    const me = await request(a).get('/auth/me').set('Authorization', `Bearer ${res.body.token}`);
+    expect(me.status).toBe(200);
+  });
+
   const a = app();
 
   it('rejects a wrong current password with 401', async () => {
@@ -666,10 +683,12 @@ describe('auth: delete account', () => {
 
     // Give the user an attempts row directly (question FK needs a real question).
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
+    const cycleId = await createClosedPracticeCycle(userId, q.rows[0].id);
     await pool.query(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 1, 'x', 50, false, 'y')`,
-      [userId, q.rows[0].id],
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'x', 50, false, 'y', $3)`,
+      [userId, q.rows[0].id, cycleId],
     );
     await pool.query('DELETE FROM assessment_usage');
     const usage = await pool.query<{ id: string }>('INSERT INTO assessment_usage (user_id) VALUES ($1) RETURNING id', [
@@ -799,10 +818,12 @@ describe('auth: data export', () => {
     const token = res.body.token as string;
     const userId = res.body.user.id as string;
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
+    const cycleId = await createClosedPracticeCycle(userId, q.rows[0].id);
     await pool.query(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 1, 'hello', 80, true, 'nice')`,
-      [userId, q.rows[0].id],
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'hello', 80, true, 'nice', $3)`,
+      [userId, q.rows[0].id, cycleId],
     );
 
     const r = await request(a).get('/auth/me/data').set('Authorization', `Bearer ${token}`);
@@ -826,10 +847,12 @@ describe('auth: data export', () => {
     const secondUserId = second.res.body.user.id as string;
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
     for (const transcript of ['first', 'second', 'third']) {
+      const cycleId = await createClosedPracticeCycle(firstUserId, q.rows[0].id);
       await pool.query(
-        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-         VALUES ($1, $2, 'practice', 1, $3, 80, true, 'nice')`,
-        [firstUserId, q.rows[0].id, transcript],
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+         VALUES ($1, $2, 'practice', 1, $3, 80, true, 'nice', $4)`,
+        [firstUserId, q.rows[0].id, transcript, cycleId],
       );
     }
 
@@ -845,12 +868,13 @@ describe('auth: data export', () => {
     expect(pageTwo.body.attempts).toHaveLength(1);
     expect(pageTwo.body.nextCursor).toBeNull();
 
+    const foreignCycleId = await createClosedPracticeCycle(secondUserId, q.rows[0].id);
     const foreignAttempt = await pool.query<{ id: string }>(
       `INSERT INTO attempts
-         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'practice', 1, 'foreign', 50, false, 'foreign feedback')
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'foreign', 50, false, 'foreign feedback', $3)
        RETURNING id`,
-      [secondUserId, q.rows[0].id],
+      [secondUserId, q.rows[0].id, foreignCycleId],
     );
     const foreignCursor = await request(a)
       .get(`/auth/me/data?cursor=${foreignAttempt.rows[0].id}`)

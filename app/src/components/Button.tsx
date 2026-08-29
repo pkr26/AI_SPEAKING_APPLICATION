@@ -58,6 +58,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   fullWidth: {
     alignSelf: 'stretch',
   },
+  pressed: {
+    transform: [{ scale: 0.985 }],
+  },
   disabled: {
     opacity: 0.5,
   },
@@ -150,6 +153,7 @@ export default function Button({
         styles[size],
         styles[variant],
         fullWidth && styles.fullWidth,
+        pressed && styles.pressed,
         pressed && styles[`${variant}Pressed`],
         blocked && styles.disabled,
         style,

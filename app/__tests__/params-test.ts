@@ -97,21 +97,25 @@ describe('route parameter helpers', () => {
 });
 
 describe('pending assessment metadata', () => {
+  const cycleId = '550e8400-e29b-41d4-a716-446655440004';
   const valid = {
     ownerId: '550e8400-e29b-41d4-a716-446655440000',
     endpoint: '/diagnostic/answer',
     questionId: '550e8400-e29b-41d4-a716-446655440001',
     requestId: '550e8400-e29b-41d4-a716-446655440002',
     createdAt: Date.now(),
+    retainRecording: false,
     stage: 'direct-posting',
   } as const;
 
   it('accepts bounded recovery metadata for either assessment endpoint', () => {
     expect(parsePendingAssessment(valid)).toEqual(valid);
-    expect(parsePendingAssessment({ ...valid, endpoint: '/practice/attempt' })).toEqual({
+    expect(parsePendingAssessment({ ...valid, endpoint: '/practice/attempt', cycleId })).toEqual({
       ...valid,
       endpoint: '/practice/attempt',
+      cycleId,
     });
+    expect(parsePendingAssessment({ ...valid, endpoint: '/practice/attempt' })).toBeNull();
   });
 
   it('upgrades metadata from the previous app build to direct posting', () => {

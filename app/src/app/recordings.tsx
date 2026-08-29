@@ -1,16 +1,16 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import React, { useEffect, useMemo, useRef } from 'react';
-import { ActivityIndicator, FlatList, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, RefreshControl, ScrollView, Text, View } from 'react-native';
 
 import Button from '../components/Button';
+import DataRefreshNotice from '../components/DataRefreshNotice';
+import OfflineState from '../components/OfflineState';
 import RecordingPlayback from '../components/RecordingPlayback';
 import { apiGetRecordings, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n, type MessageKey, type UiLanguage } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import type { RecordingItem, RecordingPage } from '../lib/types';
-
-const RECORDING_MAX_PAGES = 500;
 
 interface RecordingFetchMeta {
   fetchMore: { direction: 'forward' | 'backward' };
@@ -42,7 +42,7 @@ export function nextRecordingPageParam(
   allPages: RecordingPage[],
 ): string | undefined {
   const next = lastPage.nextCursor;
-  if (next === null || allPages.length >= RECORDING_MAX_PAGES) return undefined;
+  if (next === null) return undefined;
   return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
 }
 
@@ -75,10 +75,12 @@ function RecordingCard({
     <View style={styles.card}>
       <View style={styles.cardHeader}>
         <View style={styles.cardTitleWrap}>
-          <Text accessibilityRole="header" style={styles.promptWord}>
+          <Text accessibilityLanguage="en-US" accessibilityRole="header" style={styles.promptWord}>
             {item.promptWord}
           </Text>
-          <Text style={styles.question}>{item.questionText}</Text>
+          <Text accessibilityLanguage="en-US" style={styles.question}>
+            {item.questionText}
+          </Text>
         </View>
         <View style={styles.levelBadge}>
           <Text style={styles.levelBadgeText}>{item.cefrLevel}</Text>
@@ -154,14 +156,20 @@ export default function RecordingsScreen() {
   if (recordingsQuery.isPending) {
     return (
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
-        <ActivityIndicator
-          accessibilityLabel={t('recordings.loading')}
-          size="large"
-          color={theme.colors.primary}
-        />
-        <Text accessibilityLiveRegion="polite" style={styles.muted}>
-          {t('recordings.loading')}
-        </Text>
+        {recordingsQuery.fetchStatus === 'paused' ? (
+          <OfflineState />
+        ) : (
+          <>
+            <ActivityIndicator
+              accessibilityLabel={t('recordings.loading')}
+              size="large"
+              color={theme.colors.primary}
+            />
+            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+              {t('recordings.loading')}
+            </Text>
+          </>
+        )}
       </ScrollView>
     );
   }
@@ -186,7 +194,21 @@ export default function RecordingsScreen() {
 
   if (items.length === 0) {
     return (
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={styles.center}
+        refreshControl={
+          <RefreshControl
+            refreshing={recordingsQuery.isRefetching}
+            onRefresh={() => {
+              if (isSessionLeaseCurrent(sessionLease)) {
+                void recordingsQuery.refetch({ cancelRefetch: false });
+              }
+            }}
+            tintColor={theme.colors.primary}
+          />
+        }
+      >
         <Text accessibilityRole="header" style={styles.title}>
           {t('recordings.emptyTitle')}
         </Text>
@@ -246,18 +268,31 @@ export default function RecordingsScreen() {
       onEndReached={() => {
         if (!recordingsQuery.isFetchNextPageError) loadOlder();
       }}
+      refreshing={recordingsQuery.isRefetching}
+      onRefresh={() => {
+        if (mountedRef.current && isSessionLeaseCurrent(sessionLease)) {
+          void recordingsQuery.refetch({ cancelRefetch: false });
+        }
+      }}
       ListHeaderComponent={
-        <View style={styles.intro}>
-          <Text style={styles.introText}>{t('recordings.intro')}</Text>
-          {items.some((item) => item.status === 'retention_pending') && (
-            <Button
-              title={t('recordings.checkPending')}
-              variant="quiet"
-              size="sm"
-              onPress={() => void recordingsQuery.refetch({ cancelRefetch: false })}
-            />
-          )}
-        </View>
+        <>
+          <DataRefreshNotice
+            updating={recordingsQuery.isRefetching && !recordingsQuery.isRefetchError}
+            failed={recordingsQuery.isRefetchError}
+            onRetry={() => void recordingsQuery.refetch({ cancelRefetch: false })}
+          />
+          <View style={styles.intro}>
+            <Text style={styles.introText}>{t('recordings.intro')}</Text>
+            {items.some((item) => item.status === 'retention_pending') && (
+              <Button
+                title={t('recordings.checkPending')}
+                variant="quiet"
+                size="sm"
+                onPress={() => void recordingsQuery.refetch({ cancelRefetch: false })}
+              />
+            )}
+          </View>
+        </>
       }
       ListFooterComponent={
         recordingsQuery.isFetchingNextPage ? (

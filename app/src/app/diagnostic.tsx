@@ -1,28 +1,37 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, ScrollView, Text, View } from 'react-native';
+import {
+  AccessibilityInfo,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  ScrollView,
+  Text,
+  View,
+} from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../components/Button';
-import Recorder, { scrollToExpandedRecorderControls } from '../components/Recorder';
-import { apiFetch, userMessageForError } from '../lib/api';
+import OfflineState from '../components/OfflineState';
+import Recorder, {
+  scrollToExpandedRecorderControls,
+  type RecorderResultMetadata,
+} from '../components/Recorder';
+import { apiAcknowledgeDiagnostic, apiFetch, userMessageForError } from '../lib/api';
+import { useAssessmentReplay } from '../lib/assessment-replay-provider';
 import { LogoutCleanupError, useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
+import { acknowledgePendingAssessmentFeedback } from '../lib/pending-assessment';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import {
   parseDiagnosticAnswerResult,
   parseDiagnosticNext,
   type CefrLevel,
+  type DiagnosticAnswerSummary,
   type DiagnosticAnswerResult,
   type Question,
 } from '../lib/types';
 import { useHardwareBack } from '../lib/use-hardware-back';
-
-/** Per-answer outcome kept in screen state for the completion reveal. */
-interface AnswerRecord {
-  score: number;
-  passed: boolean;
-}
 
 interface DiagnosticProgress {
   asked: number;
@@ -53,25 +62,56 @@ export default function DiagnosticScreen() {
   const userId = user?.id ?? null;
   const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;
   const activeIdentityRef = useRef<string | null>(identityKey);
+  const { diagnosticReplay, clearDiagnosticReplay } = useAssessmentReplay();
   const sessionLease = useMemo(() => {
     void identityKey;
     return captureSessionLease();
   }, [captureSessionLease, identityKey]);
+  // The provider is identity-scoped, and this local binding prevents a replay
+  // object retained by a stale provider render from being adopted after an
+  // account/session switch. A genuinely new replay object binds to the current
+  // identity when first observed.
+  const [replayBinding, setReplayBinding] = useState<{
+    identity: string;
+    replay: NonNullable<typeof diagnosticReplay>;
+  } | null>(null);
+  let activeReplayBinding = replayBinding;
+  if (diagnosticReplay && replayBinding?.replay !== diagnosticReplay) {
+    activeReplayBinding = { identity: identityKey, replay: diagnosticReplay };
+    setReplayBinding(activeReplayBinding);
+  }
+  const currentDiagnosticReplay =
+    diagnosticReplay &&
+    activeReplayBinding?.replay === diagnosticReplay &&
+    activeReplayBinding.identity === identityKey &&
+    userId &&
+    isSessionLeaseCurrent(sessionLease)
+      ? diagnosticReplay
+      : null;
 
-  const [question, setQuestion] = useState<Question | null>(null);
+  const [question, setQuestion] = useState<Question | null>(
+    () => currentDiagnosticReplay?.question ?? null,
+  );
   const [progress, setProgress] = useState<DiagnosticProgress | null>(null);
-  const [result, setResult] = useState<DiagnosticAnswerResult | null>(null);
+  const [result, setResult] = useState<DiagnosticAnswerResult | null>(
+    () => currentDiagnosticReplay?.result ?? null,
+  );
+  const [resultRequestId, setResultRequestId] = useState<string | null>(
+    () => currentDiagnosticReplay?.requestId ?? null,
+  );
   const [level, setLevel] = useState<CefrLevel | null>(null);
   // One-shot per test state: tapping Start hides the intro for this session.
   // A resumed test (asked > 0) never shows it, so resuming is not blocked.
-  const [introStarted, setIntroStarted] = useState(false);
-  const [answers, setAnswers] = useState<AnswerRecord[]>([]);
+  const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);
+  const [answers, setAnswers] = useState<DiagnosticAnswerSummary[]>([]);
   const [stateIdentity, setStateIdentity] = useState(identityKey);
-  const [recorderLocked, setRecorderLocked] = useState(false);
   const recorderLockedRef = useRef(false);
+  const [recorderExitLocked, setRecorderExitLocked] = useState(false);
+  const recorderExitLockedRef = useRef(false);
   const logoutBusyRef = useRef(false);
   const [logoutBusy, setLogoutBusy] = useState(false);
   const practiceStartRef = useRef(false);
+  const [practiceStartBusy, setPracticeStartBusy] = useState(false);
   const mountedRef = useRef(true);
   const focusedRef = useRef(false);
   const accountActionRef = useRef(true);
@@ -83,7 +123,16 @@ export default function DiagnosticScreen() {
   // Mutate it at the same time as state: a passive-effect mirror leaves a
   // commit-sized window where a background refetch or a queued acknowledgement
   // can still act on the result React has already accepted.
-  const resultRef = useRef<DiagnosticAnswerResult | null>(null);
+  const resultRef = useRef<DiagnosticAnswerResult | null>(currentDiagnosticReplay?.result ?? null);
+  const resultRequestIdRef = useRef<string | null>(currentDiagnosticReplay?.requestId ?? null);
+  const replayResultRequestIdRef = useRef<string | null>(
+    currentDiagnosticReplay?.requestId ?? null,
+  );
+  const seededReplayKeyRef = useRef<string | null>(null);
+  const resultActionClaimRef = useRef<DiagnosticAnswerResult | null>(null);
+  const resultActionBusyRef = useRef(false);
+  const [resultActionBusy, setResultActionBusy] = useState(false);
+  const [resultActionError, setResultActionError] = useState(false);
 
   // The diagnostic is a root-like screen: Android hardware back would pop it
   // mid-test, and the stale question then costs a 409 mismatch and minutes of
@@ -121,12 +170,22 @@ export default function DiagnosticScreen() {
     setProgress(null);
     resultRef.current = null;
     setResult(null);
+    resultRequestIdRef.current = null;
+    setResultRequestId(null);
+    replayResultRequestIdRef.current = null;
+    seededReplayKeyRef.current = null;
+    resultActionClaimRef.current = null;
+    resultActionBusyRef.current = false;
+    setResultActionBusy(false);
+    setResultActionError(false);
     setLevel(null);
     setIntroStarted(false);
     setAnswers([]);
     practiceStartRef.current = false;
+    setPracticeStartBusy(false);
     recorderLockedRef.current = false;
-    setRecorderLocked(false);
+    recorderExitLockedRef.current = false;
+    setRecorderExitLocked(false);
     logoutBusyRef.current = false;
     setLogoutBusy(false);
     accountActionRef.current = !focusedRef.current;
@@ -135,6 +194,32 @@ export default function DiagnosticScreen() {
       if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;
     };
   }, [identityKey]);
+
+  // The provider normally publishes before routing here, but a same-route
+  // retry can deliver after this screen is already mounted. A layout seed
+  // keeps the replay card ahead of the passive /next observer in both cases.
+  useLayoutEffect(() => {
+    if (!currentDiagnosticReplay) return;
+    const replayKey = `${identityKey}:${currentDiagnosticReplay.requestId}`;
+    if (seededReplayKeyRef.current === replayKey) return;
+    seededReplayKeyRef.current = replayKey;
+    activeIdentityRef.current = identityKey;
+    setStateIdentity(identityKey);
+    setQuestion(currentDiagnosticReplay.question);
+    setProgress(null);
+    resultRef.current = currentDiagnosticReplay.result;
+    setResult(currentDiagnosticReplay.result);
+    resultRequestIdRef.current = currentDiagnosticReplay.requestId;
+    setResultRequestId(currentDiagnosticReplay.requestId);
+    replayResultRequestIdRef.current = currentDiagnosticReplay.requestId;
+    resultActionClaimRef.current = null;
+    resultActionBusyRef.current = false;
+    setResultActionBusy(false);
+    setResultActionError(false);
+    setLevel(null);
+    setIntroStarted(true);
+    setAnswers([]);
+  }, [currentDiagnosticReplay, identityKey]);
 
   const nextQuery = useQuery({
     queryKey: ['diagnostic-next', sessionVersion, userId],
@@ -149,7 +234,29 @@ export default function DiagnosticScreen() {
     if (activeIdentityRef.current !== identityKey || !isSessionLeaseCurrent(sessionLease)) {
       return;
     }
-    if (resultRef.current) return;
+    if (resultRef.current) {
+      if (
+        replayResultRequestIdRef.current !== null &&
+        resultRequestIdRef.current === replayResultRequestIdRef.current
+      ) {
+        // The canonical endpoint has already advanced beyond this replayed
+        // answer. Keep the original question/result card visible, while using
+        // canonical history and one-step-prior progress behind that card.
+        setStateIdentity(identityKey);
+        setAnswers(data.answers ?? []);
+        setProgress(
+          data.done
+            ? null
+            : {
+                ...data.progress,
+                asked: resultRef.current.noSpeech
+                  ? data.progress.asked
+                  : Math.max(0, data.progress.asked - 1),
+              },
+        );
+      }
+      return;
+    }
     // An unacknowledged answer card outranks a background refetch: the stale
     // /next response (pre-answer state) must not skip the learner past the
     // result they have not acknowledged. advance() applies the next question
@@ -157,14 +264,23 @@ export default function DiagnosticScreen() {
     setStateIdentity(identityKey);
     resultRef.current = null;
     setResult(null);
+    resultRequestIdRef.current = null;
+    setResultRequestId(null);
+    replayResultRequestIdRef.current = null;
+    resultActionClaimRef.current = null;
+    resultActionBusyRef.current = false;
+    setResultActionBusy(false);
+    setResultActionError(false);
     if (data.done) {
       setQuestion(null);
       setProgress(null);
       setLevel(data.level);
+      setAnswers(data.answers ?? []);
     } else {
       setLevel(null);
       setQuestion(data.question);
       setProgress(data.progress);
+      setAnswers(data.answers ?? []);
     }
   }, [identityKey, isSessionLeaseCurrent, nextQuery.data, sessionLease, userId]);
 
@@ -182,13 +298,68 @@ export default function DiagnosticScreen() {
     result: currentResult,
     level: currentLevel,
   } = currentViewState;
+  const currentResultRequestId = stateIdentity === identityKey ? resultRequestId : null;
+  // Each step replaces content inside one route. Give the visible step a
+  // stable identity so visual position and VoiceOver context advance with it.
+  const showIntro =
+    currentQuestion !== null &&
+    !introStarted &&
+    !currentResult &&
+    (currentProgress?.asked ?? 0) === 0;
+  const accessibleStepKey = currentLevel
+    ? `${identityKey}:level:${currentLevel}`
+    : currentResult
+      ? `${identityKey}:result:${currentQuestion?.id ?? 'none'}:${currentResult.noSpeech}:${currentResult.done}`
+      : currentQuestion
+        ? `${identityKey}:${showIntro ? 'intro' : 'question'}:${currentQuestion.id}`
+        : null;
+  const accessibleStepAnnouncement = currentLevel
+    ? `${t('diag.completeTitle')}. ${t('diag.levelIntro')} ${currentLevel}.`
+    : currentResult
+      ? currentResult.noSpeech
+        ? `${t('diag.noSpeechTitle')}. ${currentResult.feedback}`
+        : `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
+            score: currentResult.score,
+            result: currentResult.passed ? t('diag.passed') : t('diag.notPassed'),
+          })}`
+      : currentQuestion
+        ? `${
+            currentProgress
+              ? `${t('diag.progress', {
+                  current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
+                  max: currentProgress.maxQuestions,
+                })}. `
+              : ''
+          }${currentQuestion.promptWord}. ${currentQuestion.questionText}`
+        : null;
+  const lastAccessibleStepRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!accessibleStepKey || !accessibleStepAnnouncement) {
+      lastAccessibleStepRef.current = null;
+      return;
+    }
+    if (lastAccessibleStepRef.current === accessibleStepKey) return;
+    const hadPreviousStep = lastAccessibleStepRef.current !== null;
+    lastAccessibleStepRef.current = accessibleStepKey;
+    if (hadPreviousStep) {
+      questionScrollRef.current?.scrollTo({ y: 0, animated: false });
+    }
+    // Android receives the authored live-region updates in the result card.
+    // VoiceOver does not implement live regions, so queue the same transition.
+    if (Platform.OS === 'ios') {
+      AccessibilityInfo.announceForAccessibilityWithOptions(accessibleStepAnnouncement, {
+        queue: true,
+      });
+    }
+  }, [accessibleStepAnnouncement, accessibleStepKey]);
   const recorderOwner = currentQuestion !== null ? `${identityKey}:${currentQuestion.id}` : null;
 
   useLayoutEffect(() => {
     activeRecorderOwnerRef.current = recorderOwner;
     recoveryRefreshRef.current = null;
     recorderLockedRef.current = false;
-    setRecorderLocked(false);
+    recorderExitLockedRef.current = false;
+    setRecorderExitLocked(false);
   }, [recorderOwner]);
 
   const renderOwnsWork = useCallback(
@@ -209,17 +380,38 @@ export default function DiagnosticScreen() {
     scrollToExpandedRecorderControls(questionScrollRef.current, recorderOwnsWork(recorderOwner));
   }, [recorderOwner, recorderOwnsWork]);
 
-  const handleResult = (data: DiagnosticAnswerResult) => {
+  const handleResult = (data: DiagnosticAnswerResult, metadata?: RecorderResultMetadata) => {
     if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
     resultRef.current = data;
+    resultRequestIdRef.current = metadata?.requestId ?? null;
+    replayResultRequestIdRef.current = null;
+    setResultRequestId(metadata?.requestId ?? null);
+    resultActionClaimRef.current = null;
+    resultActionBusyRef.current = false;
+    setResultActionBusy(false);
+    setResultActionError(false);
     void queryClient.cancelQueries({
       queryKey: ['diagnostic-next', sessionVersion, userId],
       exact: true,
     });
+    if (data.recordingId && userId) {
+      void queryClient.invalidateQueries({ queryKey: ['recordings', userId] });
+    }
     setResult(data);
-    // Remember the per-answer outcome for the completion reveal. A resumed
-    // test only lists the answers given in this session.
-    setAnswers((previous) => [...previous, { score: data.score, passed: data.passed }]);
+    if (!data.noSpeech && currentQuestion) {
+      setAnswers((previous) => [
+        ...previous,
+        {
+          attemptNo: previous.length + 1,
+          promptWord: currentQuestion.promptWord,
+          questionText: currentQuestion.questionText,
+          transcript: data.transcript,
+          score: data.score,
+          passed: data.passed,
+          feedback: data.feedback,
+        },
+      ]);
+    }
   };
 
   const handleError = (message: string) => {
@@ -253,7 +445,17 @@ export default function DiagnosticScreen() {
       if (!recorderOwnsWork(recorderOwner)) return;
       if (locked && resultRef.current !== null) return;
       recorderLockedRef.current = locked;
-      setRecorderLocked(locked);
+      recorderExitLockedRef.current = locked;
+      setRecorderExitLocked(locked);
+    },
+    [recorderOwner, recorderOwnsWork],
+  );
+  const handleRecorderExitLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      if (locked && resultRef.current !== null) return;
+      recorderExitLockedRef.current = locked;
+      setRecorderExitLocked(locked);
     },
     [recorderOwner, recorderOwnsWork],
   );
@@ -261,8 +463,10 @@ export default function DiagnosticScreen() {
   const handleSettings = () => {
     if (
       !renderOwnsWork() ||
-      recorderLockedRef.current ||
+      recorderExitLockedRef.current ||
       logoutBusyRef.current ||
+      practiceStartRef.current ||
+      resultActionBusyRef.current ||
       accountActionRef.current
     ) {
       return;
@@ -274,8 +478,10 @@ export default function DiagnosticScreen() {
   const handleLogout = async () => {
     if (
       !renderOwnsWork() ||
-      recorderLockedRef.current ||
+      recorderExitLockedRef.current ||
       logoutBusyRef.current ||
+      practiceStartRef.current ||
+      resultActionBusyRef.current ||
       accountActionRef.current
     ) {
       return;
@@ -303,45 +509,174 @@ export default function DiagnosticScreen() {
     }
   };
 
-  const advance = () => {
-    if (!renderOwnsWork() || !currentResult || resultRef.current !== currentResult) {
+  const commitAdvance = (
+    expectedResult: DiagnosticAnswerResult,
+    expectedRequestId: string | null,
+  ) => {
+    if (
+      !renderOwnsWork() ||
+      resultRef.current !== expectedResult ||
+      resultRequestIdRef.current !== expectedRequestId
+    ) {
       return;
     }
     // Claim this exact card synchronously. A second tap delivered against the
     // old committed handler, or an even older handler replayed after a refetch,
     // is now a no-op rather than rewinding diagnostic state.
+    resultActionClaimRef.current = null;
+    resultActionBusyRef.current = false;
+    setResultActionBusy(false);
+    setResultActionError(false);
     resultRef.current = null;
-    if (currentResult.done) {
-      const determinedLevel = currentResult.level ?? null;
+    resultRequestIdRef.current = null;
+    replayResultRequestIdRef.current = null;
+    setResultRequestId(null);
+    if (expectedResult.noSpeech) {
+      setResult(null);
+      return;
+    }
+    if (expectedResult.done) {
+      const determinedLevel = expectedResult.level ?? null;
       setLevel(determinedLevel);
       setResult(null);
-    } else if (currentResult.nextQuestion) {
-      setQuestion(currentResult.nextQuestion);
+    } else if (expectedResult.nextQuestion) {
+      setQuestion(expectedResult.nextQuestion);
       setProgress((prev) => (prev ? { ...prev, asked: prev.asked + 1 } : prev));
       setResult(null);
     }
   };
 
-  const startPracticing = () => {
-    if (practiceStartRef.current || !renderOwnsWork() || !user || !currentLevel) {
+  const advance = () => {
+    if (
+      !renderOwnsWork() ||
+      !currentResult ||
+      resultRef.current !== currentResult ||
+      resultActionClaimRef.current === currentResult
+    ) {
       return;
     }
+    const requestId = currentResultRequestId;
+    resultActionClaimRef.current = currentResult;
+    setResultActionError(false);
+    if (!requestId) {
+      commitAdvance(currentResult, requestId);
+      return;
+    }
+    if (!userId) {
+      resultActionClaimRef.current = null;
+      setResultActionError(true);
+      return;
+    }
+
+    resultActionBusyRef.current = true;
+    setResultActionBusy(true);
+    void (async () => {
+      let acknowledged = false;
+      try {
+        acknowledged = await acknowledgePendingAssessmentFeedback(userId, requestId);
+      } catch {
+        // Secure storage details stay private; the result card exposes one safe
+        // retry state below and remains the sole owner of this transition.
+      }
+      const resultStillBelongsToSession =
+        mountedRef.current &&
+        activeIdentityRef.current === identityKey &&
+        isSessionLeaseCurrent(sessionLease) &&
+        resultRef.current === currentResult &&
+        resultRequestIdRef.current === requestId;
+      if (!resultStillBelongsToSession) return;
+      if (!acknowledged) {
+        resultActionClaimRef.current = null;
+        resultActionBusyRef.current = false;
+        setResultActionBusy(false);
+        setResultActionError(true);
+        return;
+      }
+      clearDiagnosticReplay(requestId);
+      if (!focusedRef.current) {
+        // The pointer is durably gone, but route ownership was lost while the
+        // delete was in flight. Rearm this same card as a legacy card so a
+        // later refocus can finish without trying to delete it twice.
+        resultRequestIdRef.current = null;
+        replayResultRequestIdRef.current = null;
+        setResultRequestId(null);
+        resultActionClaimRef.current = null;
+        resultActionBusyRef.current = false;
+        setResultActionBusy(false);
+        return;
+      }
+      commitAdvance(currentResult, requestId);
+    })();
+  };
+
+  const startPracticing = async () => {
+    if (
+      practiceStartRef.current ||
+      accountActionRef.current ||
+      recorderLockedRef.current ||
+      logoutBusyRef.current ||
+      !renderOwnsWork() ||
+      !user ||
+      !currentLevel
+    ) {
+      return;
+    }
+    accountActionRef.current = true;
     practiceStartRef.current = true;
+    setPracticeStartBusy(true);
     // Keep the diagnostic route protected until the completion screen has
     // actually been acknowledged; changing this earlier removes the screen.
     // A cross-device diagnostic restart can leave a cached pre-placement
     // stats response for this same account. This screen has no active stats
     // observer, so retire it here before Home mounts at the new level rather
     // than removing Home's own live query during a route-gate transition.
-    queryClient.removeQueries({ queryKey: ['practice-stats'] });
-    setUser({
-      ...user,
-      diagnosticCompleted: true,
-      cefrLevel: currentLevel,
-    });
-    void queryClient.invalidateQueries({ queryKey: ['me'] });
-    router.replace('/');
+    try {
+      await apiAcknowledgeDiagnostic();
+      if (!renderOwnsWork()) return;
+      queryClient.removeQueries({ queryKey: ['practice-stats'] });
+      setUser({
+        ...user,
+        diagnosticCompleted: true,
+        diagnosticAcknowledged: true,
+        cefrLevel: currentLevel,
+      });
+      void queryClient.invalidateQueries({ queryKey: ['me'] });
+      router.replace('/');
+    } catch (error) {
+      if (renderOwnsWork()) {
+        Alert.alert(t('diag.ackFailedTitle'), userMessageForError(error, t('diag.ackFailed')));
+        practiceStartRef.current = false;
+        accountActionRef.current = false;
+      }
+    } finally {
+      if (mountedRef.current && activeIdentityRef.current === identityKey) {
+        setPracticeStartBusy(false);
+      }
+    }
   };
+
+  const accountActionsLocked =
+    recorderExitLocked || logoutBusy || practiceStartBusy || resultActionBusy;
+  const renderAccountActions = () => (
+    <View style={styles.accountActions}>
+      <Button
+        title={t('header.settings')}
+        variant="secondary"
+        size="sm"
+        accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
+        disabled={accountActionsLocked}
+        onPress={handleSettings}
+      />
+      <Button
+        title={t('common.logOut')}
+        variant="secondary"
+        size="sm"
+        accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
+        disabled={accountActionsLocked}
+        onPress={() => void handleLogout()}
+      />
+    </View>
+  );
 
   // ----- Loading / error states -----
   if (!user) return null;
@@ -353,8 +688,15 @@ export default function DiagnosticScreen() {
           contentInsetAdjustmentBehavior="automatic"
           contentContainerStyle={styles.centerScroll}
         >
-          <ActivityIndicator size="large" color={theme.colors.primary} />
-          <Text style={styles.muted}>{t('diag.preparing')}</Text>
+          {nextQuery.fetchStatus === 'paused' ? (
+            <OfflineState />
+          ) : (
+            <>
+              <ActivityIndicator size="large" color={theme.colors.primary} />
+              <Text style={styles.muted}>{t('diag.preparing')}</Text>
+            </>
+          )}
+          {renderAccountActions()}
         </ScrollView>
       );
     }
@@ -376,6 +718,7 @@ export default function DiagnosticScreen() {
             onPress={() => void nextQuery.refetch({ cancelRefetch: false })}
             style={styles.primaryAction}
           />
+          {renderAccountActions()}
         </ScrollView>
       );
     }
@@ -385,6 +728,7 @@ export default function DiagnosticScreen() {
   if (currentLevel) {
     return (
       <ScrollView
+        ref={questionScrollRef}
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.centerScroll}
       >
@@ -407,23 +751,42 @@ export default function DiagnosticScreen() {
           <View style={styles.answersCard}>
             <Text style={styles.answersTitle}>{t('diag.answersTitle')}</Text>
             {answers.map((answer, index) => (
-              <Text key={index} style={styles.answerLine}>
-                {t('diag.answerLine', {
-                  number: index + 1,
-                  score: answer.score,
-                  mark: answer.passed ? '✓' : '✗',
-                })}
-              </Text>
+              <View key={answer.attemptNo} style={styles.answerSummary}>
+                <Text style={styles.answerLine}>
+                  {t('diag.answerLine', {
+                    number: index + 1,
+                    score: answer.score,
+                    mark: answer.passed ? '✓' : '✗',
+                  })}
+                </Text>
+                <Text style={styles.answerQuestion}>
+                  {t('diag.answerQuestion', {
+                    word: answer.promptWord,
+                    question: answer.questionText,
+                  })}
+                </Text>
+                <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
+                <Text accessibilityLanguage="en-US" selectable style={styles.answerDetail}>
+                  {answer.transcript}
+                </Text>
+                <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
+                <Text accessibilityLanguage="en-US" style={styles.answerDetail}>
+                  {answer.feedback}
+                </Text>
+              </View>
             ))}
           </View>
         )}
         <Text style={styles.congratsHint}>{t('diag.levelHint')}</Text>
         <Button
-          title={t('diag.startPracticing')}
+          title={practiceStartBusy ? t('diag.startPracticingBusy') : t('diag.startPracticing')}
           fullWidth
-          onPress={startPracticing}
+          disabled={practiceStartBusy}
+          loading={practiceStartBusy}
+          onPress={() => void startPracticing()}
           style={styles.primaryAction}
         />
+        {renderAccountActions()}
       </ScrollView>
     );
   }
@@ -434,13 +797,15 @@ export default function DiagnosticScreen() {
 
   // The intro shows once per fresh test, before the first question. A resumed
   // test (asked > 0) goes straight to its question.
-  const showIntro = !introStarted && !currentResult && (currentProgress?.asked ?? 0) === 0;
-  const accountActionsLocked = recorderLocked || logoutBusy;
   // Keep the result branch safe even when mutation testing deliberately forces
   // it with no result. The outer rendering selector is then rejected by direct
   // mount-state assertions instead of cascading through a null dereference.
   const resultActionTitle =
-    currentResult?.done === true ? t('diag.seeLevel') : t('diag.nextQuestion');
+    currentResult?.noSpeech === true
+      ? t('diag.recordAgain')
+      : currentResult?.done === true
+        ? t('diag.seeLevel')
+        : t('diag.nextQuestion');
 
   // ----- Question view -----
   return (
@@ -482,21 +847,55 @@ export default function DiagnosticScreen() {
 
           <View style={styles.card}>
             <Text style={styles.cardLabel}>{t('label.word')}</Text>
-            <Text style={styles.promptWord}>{currentQuestion.promptWord}</Text>
+            <Text accessibilityLanguage="en-US" style={styles.promptWord}>
+              {currentQuestion.promptWord}
+            </Text>
             <Text style={styles.cardLabel}>{t('label.question')}</Text>
-            <Text style={styles.questionText}>{currentQuestion.questionText}</Text>
+            <Text accessibilityLanguage="en-US" style={styles.questionText}>
+              {currentQuestion.questionText}
+            </Text>
           </View>
 
           {currentResult ? (
             <View accessibilityLiveRegion="polite" style={styles.resultCard}>
-              <Text style={styles.resultTitle}>{t('diag.answerSavedTitle')}</Text>
-              <Text style={styles.resultText}>{t('diag.answerSavedBody')}</Text>
+              <Text accessibilityRole="header" style={styles.resultTitle}>
+                {currentResult.noSpeech ? t('diag.noSpeechTitle') : t('diag.answerCheckedTitle')}
+              </Text>
+              {currentResult.noSpeech ? (
+                <Text accessibilityLanguage="en-US" style={styles.resultText}>
+                  {currentResult.feedback}
+                </Text>
+              ) : (
+                <>
+                  <Text style={styles.scoreText}>
+                    {t('diag.scoreLine', {
+                      score: currentResult.score,
+                      result: currentResult.passed ? t('diag.passed') : t('diag.notPassed'),
+                    })}
+                  </Text>
+                  <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
+                  <Text accessibilityLanguage="en-US" selectable style={styles.transcriptText}>
+                    {currentResult.transcript}
+                  </Text>
+                  <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
+                  <Text accessibilityLanguage="en-US" style={styles.feedbackText}>
+                    {currentResult.feedback}
+                  </Text>
+                </>
+              )}
               <Button
                 title={resultActionTitle}
                 fullWidth
-                onPress={advance}
+                disabled={resultActionBusy}
+                loading={resultActionBusy}
+                onPress={() => void advance()}
                 style={styles.primaryAction}
               />
+              {resultActionError && (
+                <Text accessibilityRole="alert" style={styles.resultActionError}>
+                  {t('boundary.body')}
+                </Text>
+              )}
             </View>
           ) : (
             <Recorder
@@ -504,34 +903,18 @@ export default function DiagnosticScreen() {
               questionId={currentQuestion.id}
               endpoint="/diagnostic/answer"
               parseResult={parseDiagnosticAnswerResult}
-              onResult={handleResult}
+              onResultWithMetadata={handleResult}
               onError={handleError}
               onRecoveryUnresolved={handleRecoveryUnresolved}
               onInteractionLockChange={handleRecorderLockChange}
+              onExitLockChange={handleRecorderExitLockChange}
               onExpandedControlsLayout={revealExpandedRecorderControls}
             />
           )}
         </>
       )}
 
-      <View style={styles.accountActions}>
-        <Button
-          title={t('header.settings')}
-          variant="secondary"
-          size="sm"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={accountActionsLocked}
-          onPress={handleSettings}
-        />
-        <Button
-          title={t('common.logOut')}
-          variant="secondary"
-          size="sm"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={accountActionsLocked}
-          onPress={() => void handleLogout()}
-        />
-      </View>
+      {renderAccountActions()}
     </ScrollView>
   );
 }
@@ -626,6 +1009,39 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     lineHeight: 22,
     color: colors.muted,
   },
+  scoreText: {
+    marginTop: spacing.md,
+    fontSize: 18,
+    fontWeight: '700',
+    color: colors.text,
+  },
+  resultLabel: {
+    marginTop: spacing.lg,
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+  },
+  transcriptText: {
+    marginTop: spacing.xs,
+    fontSize: 17,
+    lineHeight: 25,
+    color: colors.text,
+  },
+  feedbackText: {
+    marginTop: spacing.xs,
+    fontSize: 16,
+    lineHeight: 24,
+    color: colors.text,
+  },
+  resultActionError: {
+    marginTop: spacing.md,
+    color: colors.danger,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: 'center',
+  },
   congratsEmoji: {
     fontSize: 56,
   },
@@ -684,6 +1100,25 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   answerLine: {
     marginTop: spacing.sm,
     fontSize: 15,
+    color: colors.text,
+  },
+  answerSummary: {
+    marginTop: spacing.md,
+    paddingTop: spacing.md,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+  },
+  answerQuestion: {
+    marginTop: spacing.xs,
+    fontSize: 15,
+    fontWeight: '600',
+    lineHeight: 22,
+    color: colors.text,
+  },
+  answerDetail: {
+    marginTop: spacing.xs,
+    fontSize: 15,
+    lineHeight: 22,
     color: colors.text,
   },
   introLine: {

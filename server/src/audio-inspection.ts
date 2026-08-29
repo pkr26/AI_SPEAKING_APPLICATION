@@ -26,6 +26,96 @@ const MAX_VERSION_BYTES = 16_384;
 const DECODED_SAMPLE_RATE = 8_000;
 const DECODED_BYTES_PER_SAMPLE = 2;
 
+// These thresholds are deliberately far below ordinary microphone speech:
+// 16 signed-PCM units is about -66 dBFS peak and 1 unit is about -90 dBFS
+// RMS. The gate removes digital silence and near-zero encoder residue without
+// trying to classify quiet speech (that remains the transcription/grading
+// pipeline's job).
+export const MIN_AUDIO_PEAK_AMPLITUDE = 16;
+export const MIN_AUDIO_RMS_AMPLITUDE = 1;
+
+export interface PcmS16LeSignalAccumulator {
+  readonly sampleCount: number;
+  readonly sumSquares: number;
+  readonly peakAmplitude: number;
+  /** Low byte held when a stream chunk ends halfway through one sample. */
+  readonly pendingLowByte?: number;
+}
+
+export interface PcmS16LeSignalSummary {
+  readonly sampleCount: number;
+  readonly peakAmplitude: number;
+  readonly rmsAmplitude: number;
+  readonly hasPartialSample: boolean;
+}
+
+export function createPcmS16LeSignalAccumulator(): PcmS16LeSignalAccumulator {
+  return { sampleCount: 0, sumSquares: 0, peakAmplitude: 0 };
+}
+
+function signedSampleFromBytes(lowByte: number, highByte: number): number {
+  const unsigned = lowByte | (highByte << 8);
+  return unsigned >= 0x8000 ? unsigned - 0x1_0000 : unsigned;
+}
+
+/**
+ * Pure streaming reducer for mono signed 16-bit little-endian PCM. Native
+ * stdout chunk boundaries are arbitrary, so an odd final byte is carried into
+ * the next call rather than being dropped or read as a different sample.
+ */
+export function accumulatePcmS16LeSignal(
+  previous: PcmS16LeSignalAccumulator,
+  chunk: Buffer,
+): PcmS16LeSignalAccumulator {
+  let sampleCount = previous.sampleCount;
+  let sumSquares = previous.sumSquares;
+  let peakAmplitude = previous.peakAmplitude;
+  let pendingLowByte = previous.pendingLowByte;
+  let offset = 0;
+
+  const accumulateSample = (sample: number) => {
+    const amplitude = Math.abs(sample);
+    sampleCount++;
+    sumSquares += sample * sample;
+    if (amplitude > peakAmplitude) peakAmplitude = amplitude;
+  };
+
+  if (pendingLowByte !== undefined && chunk.length > 0) {
+    accumulateSample(signedSampleFromBytes(pendingLowByte, chunk[0]));
+    pendingLowByte = undefined;
+    offset = 1;
+  }
+  for (; offset + 1 < chunk.length; offset += DECODED_BYTES_PER_SAMPLE) {
+    accumulateSample(signedSampleFromBytes(chunk[offset], chunk[offset + 1]));
+  }
+  if (offset < chunk.length) pendingLowByte = chunk[offset];
+
+  return {
+    sampleCount,
+    sumSquares,
+    peakAmplitude,
+    ...(pendingLowByte === undefined ? {} : { pendingLowByte }),
+  };
+}
+
+export function summarizePcmS16LeSignal(state: PcmS16LeSignalAccumulator): PcmS16LeSignalSummary {
+  return {
+    sampleCount: state.sampleCount,
+    peakAmplitude: state.peakAmplitude,
+    rmsAmplitude: state.sampleCount === 0 ? 0 : Math.sqrt(state.sumSquares / state.sampleCount),
+    hasPartialSample: state.pendingLowByte !== undefined,
+  };
+}
+
+export function hasAssessableAudioSignal(summary: PcmS16LeSignalSummary): boolean {
+  return (
+    !summary.hasPartialSample &&
+    summary.sampleCount > 0 &&
+    summary.peakAmplitude >= MIN_AUDIO_PEAK_AMPLITUDE &&
+    summary.rmsAmplitude >= MIN_AUDIO_RMS_AMPLITUDE
+  );
+}
+
 function decodedBytesPerSecond(): number {
   return DECODED_SAMPLE_RATE * DECODED_BYTES_PER_SAMPLE;
 }
@@ -181,7 +271,11 @@ function inspectionFailureHttpError(kind: InspectionFailure): HttpError {
  * directory is server-private (mode 0700), so a hostile swap between the two
  * opens is not reachable; both opens still re-verify a regular file.
  */
-async function inspectDecodedDuration(filePath: string): Promise<number> {
+interface DecodedAudioInspection extends PcmS16LeSignalSummary {
+  durationSeconds: number;
+}
+
+async function inspectDecodedAudio(filePath: string): Promise<DecodedAudioInspection> {
   const inputFormat = inputFormatFor(path.extname(filePath).toLowerCase());
   if (!inputFormat) throw new InvalidInspectionError();
 
@@ -196,7 +290,7 @@ async function inspectDecodedDuration(filePath: string): Promise<number> {
     inputFormat === 'mov' ? ['-enable_drefs', '0', '-use_absolute_path', '0', '-ignore_editlist', '1'] : [];
 
   await verifySingleAudioStream(filePath, inputFormat, movSafetyOptions);
-  return decodeMeasuredDuration(filePath, inputFormat, movSafetyOptions);
+  return decodeMeasuredAudio(filePath, inputFormat, movSafetyOptions);
 }
 
 // Keep this classification on the runtime path instead of in module-static
@@ -398,8 +492,12 @@ function verifySingleAudioStream(filePath: string, inputFormat: string, movSafet
   });
 }
 
-/** Decode the single known audio stream and measure it by counted PCM bytes. */
-function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafetyOptions: string[]): Promise<number> {
+/** Decode the single known audio stream and measure its duration and signal. */
+function decodeMeasuredAudio(
+  filePath: string,
+  inputFormat: string,
+  movSafetyOptions: string[],
+): Promise<DecodedAudioInspection> {
   return new Promise((resolve, reject) => {
     let inputFd: number;
     try {
@@ -481,10 +579,11 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
     const stderr = child.stderr;
     let settled = false;
     let terminating = false;
-    let pendingOutcome!: number | Error;
+    let pendingOutcome!: DecodedAudioInspection | number | Error;
     let reapTimeout: NodeJS.Timeout | undefined;
     let diagnosticBytes = 0;
     let decodedBytes = 0;
+    let signalAccumulator = createPcmS16LeSignalAccumulator();
 
     const stop = () => {
       try {
@@ -493,14 +592,22 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
         // The bounded reap fallback still settles the inspection.
       }
     };
-    const settle = (duration: number | Error) => {
+    const settle = (outcome: DecodedAudioInspection | number | Error) => {
       settled = true;
       clearTimeout(timeout);
       clearTimeout(reapTimeout);
-      if (duration instanceof Error) reject(duration);
-      else resolve(duration);
+      if (outcome instanceof Error) reject(outcome);
+      else if (typeof outcome === 'number') {
+        resolve({
+          durationSeconds: outcome,
+          sampleCount: 0,
+          peakAmplitude: 0,
+          rmsAmplitude: 0,
+          hasPartialSample: false,
+        });
+      } else resolve(outcome);
     };
-    const terminate = (outcome: number | Error) => {
+    const terminate = (outcome: DecodedAudioInspection | number | Error) => {
       if (settled || terminating) return;
       terminating = true;
       pendingOutcome = outcome;
@@ -516,7 +623,11 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
     };
     const countDecodedBytes = (chunk: Buffer) => {
       decodedBytes += chunk.length;
-      if (decodedBytes > maxDecodedBytes()) terminate(MAX_AUDIO_DURATION_SECONDS + 1);
+      if (decodedBytes > maxDecodedBytes()) {
+        terminate(MAX_AUDIO_DURATION_SECONDS + 1);
+        return;
+      }
+      signalAccumulator = accumulatePcmS16LeSignal(signalAccumulator, chunk);
     };
 
     const timeout = setTimeout(() => terminate(new InspectionError('timeout')), INSPECTION_TIMEOUT_MS);
@@ -532,7 +643,12 @@ function decodeMeasuredDuration(filePath: string, inputFormat: string, movSafety
       } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
         settle(new InvalidInspectionError());
       } else {
-        settle(decodedBytes / decodedBytesPerSecond());
+        const signal = summarizePcmS16LeSignal(signalAccumulator);
+        if (signal.hasPartialSample || signal.sampleCount * DECODED_BYTES_PER_SAMPLE !== decodedBytes) {
+          settle(new InvalidInspectionError());
+          return;
+        }
+        settle({ durationSeconds: decodedBytes / decodedBytesPerSecond(), ...signal });
       }
     });
 
@@ -708,25 +824,32 @@ export function assertAudioInspectorAvailable({ force = false }: { force?: boole
   return availabilityInFlight;
 }
 
-/** Reject invalid, implausibly short, or overlong media and return measured duration. */
+/**
+ * Reject invalid, implausibly short, overlong, or signal-free media and return
+ * measured duration. Signal rejection happens before any paid provider work or
+ * retained-recording persistence in the shared assessment pipeline.
+ */
 export async function measureAudioDuration(filePath: string): Promise<number> {
   const releaseSlot = acquireInspectionSlot();
-  let duration: number;
+  let inspection: DecodedAudioInspection;
   try {
-    duration = await inspectDecodedDuration(filePath);
+    inspection = await inspectDecodedAudio(filePath);
   } catch (error) {
     if (error instanceof InspectionError) throw inspectionFailureHttpError(error.kind);
     throw new HttpError(415, 'Invalid or unsupported audio file', 'AUDIO_UNREADABLE');
   } finally {
     releaseSlot();
   }
-  if (duration < MIN_AUDIO_DURATION_SECONDS) {
+  if (inspection.durationSeconds < MIN_AUDIO_DURATION_SECONDS) {
     throw new HttpError(422, 'Recording is too short to assess', 'AUDIO_INVALID');
   }
-  if (duration > MAX_AUDIO_DURATION_SECONDS) {
+  if (inspection.durationSeconds > MAX_AUDIO_DURATION_SECONDS) {
     throw new HttpError(413, 'Recording must be two minutes or shorter', 'AUDIO_TOO_LONG');
   }
-  return duration;
+  if (!hasAssessableAudioSignal(inspection)) {
+    throw new HttpError(422, 'No audible signal was detected in the recording', 'AUDIO_SILENT');
+  }
+  return inspection.durationSeconds;
 }
 
 /** Backward-compatible boolean gate for callers that do not need metadata. */

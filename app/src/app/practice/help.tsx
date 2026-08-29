@@ -1,10 +1,12 @@
 import React from 'react';
-import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
+import { ActivityIndicator, RefreshControl, ScrollView, Text, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import DataRefreshNotice from '../../components/DataRefreshNotice';
+import OfflineState from '../../components/OfflineState';
 import { apiFetch, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
@@ -21,13 +23,30 @@ const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
 
 export default function HelpScreen() {
   const insets = useSafeAreaInsets();
-  const { user } = useAuth();
+  const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
+  const sessionLease = React.useMemo(() => {
+    void sessionVersion;
+    void user?.id;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion, user?.id]);
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
-  const params = useLocalSearchParams<{ questionId?: string }>();
+  const params = useLocalSearchParams<{
+    questionId?: string;
+    cycleId?: string;
+    attemptsUsed?: string;
+  }>();
   const questionId = firstParam(params.questionId);
+  const cycleId = firstParam(params.cycleId);
+  const attemptsUsedParam = firstParam(params.attemptsUsed);
   const validQuestionId = isUuid(questionId) ? questionId : null;
+  const validCycleId = isUuid(cycleId) ? cycleId : null;
+  const attemptsUsed =
+    attemptsUsedParam !== undefined && /^[0-2]$/.test(attemptsUsedParam)
+      ? Number(attemptsUsedParam)
+      : null;
+  const validLink = !!validQuestionId && !!validCycleId && attemptsUsed !== null;
 
   const helpQuery = useQuery({
     queryKey: ['question-help', user?.id, user?.nativeLanguage, validQuestionId],
@@ -37,7 +56,7 @@ export default function HelpScreen() {
           signal,
         }),
       ),
-    enabled: !!user && !!validQuestionId,
+    enabled: !!user && validLink,
     retry: false,
     // Help content only changes when the server re-seeds.
     staleTime: 60 * 60_000,
@@ -50,7 +69,7 @@ export default function HelpScreen() {
   if (!user) return null;
   const nativeAccessibilityLanguage = NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage];
 
-  if (!validQuestionId) {
+  if (!validLink) {
     return (
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
         <Text accessibilityRole="header" style={styles.errorTitle}>
@@ -74,14 +93,20 @@ export default function HelpScreen() {
           style={styles.stateScroll}
           contentContainerStyle={styles.center}
         >
-          <ActivityIndicator
-            accessibilityLabel={t('help.loading')}
-            size="large"
-            color={theme.colors.primary}
-          />
-          <Text accessibilityLiveRegion="polite" style={styles.muted}>
-            {t('help.loading')}
-          </Text>
+          {helpQuery.fetchStatus === 'paused' ? (
+            <OfflineState />
+          ) : (
+            <>
+              <ActivityIndicator
+                accessibilityLabel={t('help.loading')}
+                size="large"
+                color={theme.colors.primary}
+              />
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('help.loading')}
+              </Text>
+            </>
+          )}
         </ScrollView>
       )}
 
@@ -114,10 +139,28 @@ export default function HelpScreen() {
           <ScrollView
             contentInsetAdjustmentBehavior="automatic"
             contentContainerStyle={styles.content}
+            refreshControl={
+              <RefreshControl
+                refreshing={helpQuery.isRefetching}
+                onRefresh={() => {
+                  if (isSessionLeaseCurrent(sessionLease)) {
+                    void helpQuery.refetch({ cancelRefetch: false });
+                  }
+                }}
+                tintColor={theme.colors.primary}
+              />
+            }
           >
+            <DataRefreshNotice
+              updating={helpQuery.isRefetching && !helpQuery.isRefetchError}
+              failed={helpQuery.isRefetchError}
+              onRetry={() => void helpQuery.refetch({ cancelRefetch: false })}
+            />
             <View style={styles.section}>
               <Text style={styles.sectionLabel}>{t('label.word')}</Text>
-              <Text style={styles.promptWord}>{help.promptWord}</Text>
+              <Text accessibilityLanguage="en-US" style={styles.promptWord}>
+                {help.promptWord}
+              </Text>
               <Text accessibilityLanguage={nativeAccessibilityLanguage} style={styles.nativeText}>
                 {help.promptWordNative}
               </Text>
@@ -125,7 +168,9 @@ export default function HelpScreen() {
 
             <View style={styles.section}>
               <Text style={styles.sectionLabel}>{t('label.question')}</Text>
-              <Text style={styles.englishText}>{help.questionText}</Text>
+              <Text accessibilityLanguage="en-US" style={styles.englishText}>
+                {help.questionText}
+              </Text>
               <Text accessibilityLanguage={nativeAccessibilityLanguage} style={styles.nativeText}>
                 {help.questionTextNative}
               </Text>
@@ -138,7 +183,9 @@ export default function HelpScreen() {
                   <Text style={styles.exampleNumber}>
                     {t('help.exampleNumber', { number: index + 1 })}
                   </Text>
-                  <Text style={styles.englishText}>{example.en}</Text>
+                  <Text accessibilityLanguage="en-US" style={styles.englishText}>
+                    {example.en}
+                  </Text>
                   <Text
                     accessibilityLanguage={nativeAccessibilityLanguage}
                     style={styles.nativeText}
@@ -154,14 +201,7 @@ export default function HelpScreen() {
             <View style={styles.bottomBarContent}>
               <Button
                 title={t('help.startPractice')}
-                onPress={() =>
-                  router.navigate({
-                    pathname: '/practice/attempt',
-                    params: {
-                      questionId: validQuestionId,
-                    },
-                  })
-                }
+                onPress={() => router.dismissTo('/practice')}
               />
             </View>
           </View>

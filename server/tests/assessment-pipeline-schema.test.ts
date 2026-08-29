@@ -28,7 +28,24 @@ describe('assessment submission schema', () => {
     const questionId = '00000000-0000-4000-8000-000000000001';
     const requestId = '00000000-0000-4000-8000-000000000002';
 
-    expect(bodySchema.safeParse({ questionId, requestId }).success).toBe(true);
+    expect(bodySchema.safeParse({ questionId, requestId })).toMatchObject({
+      success: true,
+      data: { questionId, requestId, retainRecording: true },
+    });
+    expect(bodySchema.safeParse({ questionId, requestId, retainRecording: false })).toMatchObject({
+      success: true,
+      data: { questionId, requestId, retainRecording: false },
+    });
+    expect(bodySchema.safeParse({ questionId, requestId, retainRecording: 'false' })).toMatchObject({
+      success: true,
+      data: { questionId, requestId, retainRecording: false },
+    });
+    expect(bodySchema.safeParse({ questionId, requestId, retainRecording: 'true' })).toMatchObject({
+      success: true,
+      data: { questionId, requestId, retainRecording: true },
+    });
+    expect(bodySchema.safeParse({ questionId, requestId, retainRecording: 'TRUE' }).success).toBe(false);
+    expect(bodySchema.safeParse({ questionId, requestId, retainRecording: 1 }).success).toBe(false);
     const badQuestion = bodySchema.safeParse({ questionId: 'bad', requestId });
     const badRequest = bodySchema.safeParse({ questionId, requestId: 'bad' });
     expect(badQuestion.success).toBe(false);
@@ -48,10 +65,14 @@ describe('assessment submission schema', () => {
     const ids = {
       questionId: '00000000-0000-4000-8000-000000000001',
       requestId: '00000000-0000-4000-8000-000000000002',
+      cycleId: '00000000-0000-4000-8000-000000000003',
     };
 
     expect(bodySchema.safeParse(ids).success).toBe(false);
-    expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(512) }).success).toBe(true);
+    expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(512) })).toMatchObject({
+      success: true,
+      data: { ...ids, retainRecording: true, audioKey: 'x'.repeat(512) },
+    });
     expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(513) }).success).toBe(false);
     expect(storageScope).toBe('practice');
   });

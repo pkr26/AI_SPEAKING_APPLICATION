@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import request from 'supertest';
 
-import { createClientConfigRouter, publicClientConfig, type AdsPolicyConfig } from '../src/client-config';
+import {
+  accountAdultEligibilityEnforcementReady,
+  createClientConfigRouter,
+  publicClientConfig,
+  type AdsPolicyConfig,
+} from '../src/client-config';
 import express from 'express';
 
 const enabled: AdsPolicyConfig = {
@@ -12,16 +17,20 @@ const enabled: AdsPolicyConfig = {
 };
 
 describe('public client configuration', () => {
-  it('enables only explicitly configured adult-only placements', () => {
+  it('keeps the release guard closed until per-account adult eligibility exists', () => {
+    expect(accountAdultEligibilityEnforcementReady()).toBe(false);
+  });
+
+  it('does not let operator adult-only flags enable public placements', () => {
     expect(publicClientConfig(enabled)).toEqual({
       ads: {
-        enabled: true,
+        enabled: false,
         audienceMode: 'adult-only',
-        placements: { homeBanner: true, historyNative: true },
+        placements: { homeBanner: false, historyNative: false },
       },
     });
     expect(publicClientConfig({ ...enabled, historyNativeEnabled: false }).ads.placements).toEqual({
-      homeBanner: true,
+      homeBanner: false,
       historyNative: false,
     });
   });

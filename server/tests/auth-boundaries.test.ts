@@ -1,6 +1,6 @@
 import { afterAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
-import { app, pool, registerUser } from './helpers';
+import { app, createClosedPracticeCycle, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -68,10 +68,12 @@ describe('auth: data export pagination boundary', () => {
   async function seedAttempts(userId: string, transcripts: string[]) {
     const q = await pool.query('SELECT id FROM questions LIMIT 1');
     for (const transcript of transcripts) {
+      const cycleId = await createClosedPracticeCycle(userId, q.rows[0].id);
       await pool.query(
-        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-         VALUES ($1, $2, 'practice', 1, $3, 80, true, 'nice')`,
-        [userId, q.rows[0].id, transcript],
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+         VALUES ($1, $2, 'practice', 1, $3, 80, true, 'nice', $4)`,
+        [userId, q.rows[0].id, transcript, cycleId],
       );
     }
   }

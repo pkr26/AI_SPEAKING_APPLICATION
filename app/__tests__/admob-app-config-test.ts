@@ -22,6 +22,21 @@ function plugin(
   return found as [string, Record<string, unknown>];
 }
 
+function configureValidProductionEnvironment(): void {
+  process.env.NODE_ENV = 'production';
+  process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
+  process.env.ADMOB_IOS_APP_ID = 'ca-app-pub-2222222222222222~2222222222';
+  process.env.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID = 'ca-app-pub-1111111111111111/1111111111';
+  process.env.EXPO_PUBLIC_ADMOB_IOS_HOME_BANNER_ID = 'ca-app-pub-2222222222222222/2222222222';
+  process.env.EXPO_PUBLIC_ADMOB_ANDROID_HISTORY_NATIVE_ID =
+    'ca-app-pub-1111111111111111/3333333333';
+  process.env.EXPO_PUBLIC_ADMOB_IOS_HISTORY_NATIVE_ID = 'ca-app-pub-2222222222222222/4444444444';
+  process.env.EXPO_PUBLIC_IOS_APP_STORE_URL =
+    'https://apps.apple.com/us/app/ai-english-coach/id1234567890';
+  process.env.EXPO_PUBLIC_ANDROID_PLAY_STORE_URL =
+    'https://play.google.com/store/apps/details?id=com.aienglish.coach';
+}
+
 afterEach(() => {
   process.env = { ...ORIGINAL_ENV };
 });
@@ -40,6 +55,10 @@ describe('dynamic AdMob Expo configuration', () => {
         delayAppMeasurementInit: true,
       }),
     );
+    expect(config.extra?.storeUrls).toEqual({
+      ios: 'https://apps.apple.com/us/search?term=AI%20English%20Coach',
+      android: 'https://play.google.com/store/apps/details?id=com.aienglish.coach',
+    });
   });
 
   it.each([
@@ -57,14 +76,7 @@ describe('dynamic AdMob Expo configuration', () => {
   });
 
   it('accepts distinct valid production app IDs', () => {
-    process.env.NODE_ENV = 'production';
-    process.env.ADMOB_ANDROID_APP_ID = 'ca-app-pub-1111111111111111~1111111111';
-    process.env.ADMOB_IOS_APP_ID = 'ca-app-pub-2222222222222222~2222222222';
-    process.env.EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID = 'ca-app-pub-1111111111111111/1111111111';
-    process.env.EXPO_PUBLIC_ADMOB_IOS_HOME_BANNER_ID = 'ca-app-pub-2222222222222222/2222222222';
-    process.env.EXPO_PUBLIC_ADMOB_ANDROID_HISTORY_NATIVE_ID =
-      'ca-app-pub-1111111111111111/3333333333';
-    process.env.EXPO_PUBLIC_ADMOB_IOS_HISTORY_NATIVE_ID = 'ca-app-pub-2222222222222222/4444444444';
+    configureValidProductionEnvironment();
 
     const config = buildConfig(CONFIG_CONTEXT, process.env);
     expect(plugin(config, 'react-native-google-mobile-ads')[1]).toEqual(
@@ -74,6 +86,54 @@ describe('dynamic AdMob Expo configuration', () => {
         delayAppMeasurementInit: true,
       }),
     );
+    expect(config.extra?.storeUrls).toEqual({
+      ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
+      android: 'https://play.google.com/store/apps/details?id=com.aienglish.coach',
+    });
+  });
+
+  it.each(['EXPO_PUBLIC_IOS_APP_STORE_URL', 'EXPO_PUBLIC_ANDROID_PLAY_STORE_URL'] as const)(
+    'fails production when %s is missing',
+    (name) => {
+      configureValidProductionEnvironment();
+      delete process.env[name];
+
+      expect(() => buildConfig(CONFIG_CONTEXT, process.env)).toThrow(
+        `${name} must be configured in production`,
+      );
+    },
+  );
+
+  it.each([
+    [
+      'an App Store search instead of a numeric listing',
+      'EXPO_PUBLIC_IOS_APP_STORE_URL',
+      'https://apps.apple.com/us/search?term=AI%20English%20Coach',
+      /numeric app ID/,
+    ],
+    [
+      'an App Store look-alike host',
+      'EXPO_PUBLIC_IOS_APP_STORE_URL',
+      'https://apps.apple.com.example.test/us/app/coach/id1234567890',
+      /apps.apple.com/,
+    ],
+    [
+      'the wrong Android package',
+      'EXPO_PUBLIC_ANDROID_PLAY_STORE_URL',
+      'https://play.google.com/store/apps/details?id=com.attacker.app',
+      /com.aienglish.coach/,
+    ],
+    [
+      'a non-Google Android host',
+      'EXPO_PUBLIC_ANDROID_PLAY_STORE_URL',
+      'https://example.test/store/apps/details?id=com.aienglish.coach',
+      /Google Play URL/,
+    ],
+  ])('rejects %s', (_label, name, value, expected) => {
+    configureValidProductionEnvironment();
+    process.env[name] = value;
+
+    expect(() => buildConfig(CONFIG_CONTEXT, process.env)).toThrow(expected);
   });
 
   it('fails production when any real placement unit ID is missing', () => {

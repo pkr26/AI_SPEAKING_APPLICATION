@@ -131,6 +131,7 @@ describe('diagnostic transaction rollback precedence', () => {
       ui_language: 'en',
       cefr_level: null,
       diagnostic_completed: false,
+      diagnostic_acknowledged: false,
       token_version: 1,
       created_at: new Date().toISOString(),
     };
@@ -252,6 +253,7 @@ describe('diagnostic transaction rollback precedence', () => {
       ui_language: 'en',
       cefr_level: null,
       diagnostic_completed: false,
+      diagnostic_acknowledged: false,
       token_version: 1,
       created_at: new Date().toISOString(),
     };
@@ -314,6 +316,7 @@ describe('diagnostic transaction rollback precedence', () => {
       ui_language: 'en',
       cefr_level: 'B1',
       diagnostic_completed: true,
+      diagnostic_acknowledged: true,
       token_version: 1,
       created_at: new Date().toISOString(),
     };
@@ -379,6 +382,7 @@ describe('diagnostic transaction rollback precedence', () => {
       ui_language: 'en',
       cefr_level: 'B1',
       diagnostic_completed: true,
+      diagnostic_acknowledged: true,
       token_version: 1,
       created_at: new Date().toISOString(),
     };
@@ -408,7 +412,11 @@ describe('diagnostic transaction rollback precedence', () => {
             rowCount: 1,
           };
         }
-        if (text.includes('UPDATE diagnostic_state') || text.includes('UPDATE users')) {
+        if (
+          text.includes('UPDATE diagnostic_state') ||
+          text.includes('UPDATE practice_cycles') ||
+          text.includes('UPDATE users')
+        ) {
           return { rows: [], rowCount: 1 };
         }
         throw new Error(`unexpected successful restart query: ${text}`);
@@ -443,6 +451,7 @@ describe('diagnostic transaction rollback precedence', () => {
       'SELECT 1 FROM users WHERE id = $1 FOR UPDATE',
       'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE',
       expect.stringContaining('UPDATE diagnostic_state'),
+      expect.stringContaining('UPDATE practice_cycles'),
       expect.stringContaining('UPDATE users'),
       'COMMIT',
     ]);

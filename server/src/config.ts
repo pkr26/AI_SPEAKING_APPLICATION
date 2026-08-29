@@ -122,9 +122,9 @@ const envSchema = z
     ADS_AUDIENCE_MODE: z.enum(['unknown', 'adult-only', 'child']).default('unknown'),
     ADS_HOME_BANNER_ENABLED: bool,
     ADS_HISTORY_NATIVE_ENABLED: bool,
-    // Oldest app version the API still answers ("1.2.3"); empty disables the
-    // X-Client-Version gate. Response contracts are additive-only, so this is
-    // for retiring clients that predate a required behavior, not routine use.
+    // Oldest app version the API still answers ("1.2.3"). Empty disables the
+    // gate outside production. Production has a hard 1.1.0 floor because
+    // earlier clients do not understand durable shared practice cycles.
     MIN_CLIENT_VERSION: z
       .string()
       .trim()
@@ -412,6 +412,16 @@ export function formatConfigProblems(issues: ReadonlyArray<{ path: Array<string 
   return issues.map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`).join('\n');
 }
 
+function compareDottedVersions(left: string, right: string): number {
+  const leftParts = left.split('.').map(Number);
+  const rightParts = right.split('.').map(Number);
+  for (let index = 0; index < 3; index++) {
+    const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return 0;
+}
+
 if (!parsed.success) {
   const problems = formatConfigProblems(parsed.error.issues);
   // Config is loaded before the logger exists; stderr + exit is the intended fail-fast.
@@ -447,7 +457,15 @@ export const config = {
     homeBannerEnabled: env.ADS_HOME_BANNER_ENABLED,
     historyNativeEnabled: env.ADS_HISTORY_NATIVE_ENABLED,
   },
-  minClientVersion: env.MIN_CLIENT_VERSION || undefined,
+  // Practice serving cycles are a required request/response behavior, not an
+  // additive field older apps can safely ignore. Production therefore retires
+  // pre-cycle builds even when the deploy forgot to set the explicit knob.
+  minClientVersion:
+    env.NODE_ENV === 'production'
+      ? compareDottedVersions(env.MIN_CLIENT_VERSION || '1.1.0', '1.1.0') < 0
+        ? '1.1.0'
+        : env.MIN_CLIENT_VERSION || '1.1.0'
+      : env.MIN_CLIENT_VERSION || undefined,
   ffmpegPath: env.FFMPEG_PATH,
   ffprobePath: env.FFPROBE_PATH,
   rateLimit: {

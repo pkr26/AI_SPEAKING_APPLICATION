@@ -1,6 +1,7 @@
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
+import { randomUUID } from 'crypto';
 import request from 'supertest';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, createClosedPracticeCycle, pool, registerUser } from './helpers';
 import { QuestionRow } from '../src/db';
 import {
   authoredAnswerHint,
@@ -75,18 +76,25 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     await completeDiagnostic(a, token);
     const q = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
     expect(q.status).toBe(200);
-    return { token, userId, questionId: q.body.question.id as string };
+    return {
+      token,
+      userId,
+      questionId: q.body.question.id as string,
+      cycleId: q.body.cycleId as string,
+    };
   }
 
-  it('walks attempts 1-3 on repeated failures, then resets to 1', async () => {
+  it('walks attempts 1-3 on repeated failures, then permanently closes the serving cycle', async () => {
     vi.spyOn(Math, 'random').mockReturnValue(FAIL_SCORE);
-    const { token, userId, questionId } = await freshUserAtQuestion();
-    const attempt = async () => {
+    const { token, userId, questionId, cycleId } = await freshUserAtQuestion();
+    const attempt = async (expectedStatus = 200) => {
       const response = await answerForm(
         request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
         questionId,
+        randomUUID(),
+        cycleId,
       );
-      expect(response.status, JSON.stringify(response.body)).toBe(200);
+      expect(response.status, JSON.stringify(response.body)).toBe(expectedStatus);
       await vi.waitFor(async () => {
         const claim = await pool.query<{ count: number }>(
           'SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1 AND question_id = $2',
@@ -111,15 +119,30 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     expect(third.body.next).toBeDefined();
     expect(third.body.next.question.id).not.toBe(questionId);
 
-    // attempt_no 3 is NOT < MAX_ATTEMPTS: the next attempt restarts at 1.
-    const fourth = await attempt();
-    expect(fourth.body).toMatchObject({ passed: false, attemptNo: 1, attemptsLeft: 2 });
+    // The stale cycle cannot be reopened for a direct fourth submission.
+    const fourth = await attempt(409);
+    expect(fourth.status).toBe(409);
+    expect(fourth.body.code).toBe('PRACTICE_CYCLE_CLOSED');
+
+    const next = third.body.next;
+    const nextAttempt = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      next.question.id,
+      randomUUID(),
+      next.cycleId,
+    );
+    expect(nextAttempt.body).toMatchObject({ attemptNo: 1, attemptsLeft: 2 });
   });
 
   it('resets to attempt 1 after a pass and offers the next question', async () => {
-    const { token, questionId } = await freshUserAtQuestion();
+    const { token, questionId, cycleId } = await freshUserAtQuestion();
     const attempt = () =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        questionId,
+        randomUUID(),
+        cycleId,
+      );
 
     vi.spyOn(Math, 'random').mockReturnValue(FAIL_SCORE);
     const failed = await attempt();
@@ -130,12 +153,20 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     expect(passed.body).toMatchObject({ passed: true, attemptNo: 2 });
     expect(passed.body.next).toBeDefined();
     expect(passed.body.next.question.id).not.toBe(questionId);
-    expect(passed.body.attemptsLeft).toBeUndefined();
+    expect(passed.body.attemptsLeft).toBe(0);
     expect(passed.body.finalFeedback).toBeUndefined();
 
-    // A passed last attempt restarts numbering at 1.
+    // A passed cycle is closed; only the returned next cycle starts at 1.
     const afterPass = await attempt();
-    expect(afterPass.body).toMatchObject({ attemptNo: 1 });
+    expect(afterPass.status).toBe(409);
+    const next = passed.body.next;
+    const nextAnswer = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      next.question.id,
+      randomUUID(),
+      next.cycleId,
+    );
+    expect(nextAnswer.body).toMatchObject({ attemptNo: 1 });
   });
 
   it('excludes the completed question even when ranking would otherwise select it again', async () => {
@@ -149,14 +180,28 @@ describe('practice attempt numbering (deterministic mock scores)', () => {
     ]);
     const [current, ...alternatives] = questions.rows;
     for (const alternative of alternatives) {
+      const cycleId = await createClosedPracticeCycle(userId, alternative.id);
       await pool.query(
-        `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-         VALUES ($1, $2, 'practice', 1, 'prior answer', 90, true, 'passed')`,
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+         VALUES ($1, $2, 'practice', 1, 'prior answer', 90, true, 'passed', $3)`,
+        [userId, alternative.id, cycleId],
+      );
+      await pool.query(
+        `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count)
+         VALUES ($1, $2, 'mastered', 90, 1)`,
         [userId, alternative.id],
       );
     }
+    const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(assignment.body.question.id).toBe(current.id);
     const attempt = () =>
-      answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), current.id);
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        current.id,
+        randomUUID(),
+        assignment.body.cycleId,
+      );
 
     expect((await attempt()).body).toMatchObject({ attemptNo: 1, attemptsLeft: 2 });
     expect((await attempt()).body).toMatchObject({ attemptNo: 2, attemptsLeft: 1 });

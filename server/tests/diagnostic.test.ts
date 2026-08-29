@@ -38,7 +38,7 @@ describe('diagnostic', () => {
     expect(next.status).toBe(200);
     expect(next.body).toMatchObject({
       done: false,
-      progress: { asked: 0, maxQuestions: 5 },
+      progress: { asked: 0, maxQuestions: 3 },
       question: { id: expect.any(String), cefrLevel: 'B1' },
     });
     const state = await pool.query(

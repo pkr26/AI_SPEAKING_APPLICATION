@@ -22,7 +22,9 @@ export type ApiErrorCode =
   | 'DIAGNOSTIC_DONE'
   | 'REQUEST_IN_FLIGHT'
   | 'REQUEST_ID_REUSED'
+  | 'ASSESSMENT_RESULT_INCOMPATIBLE'
   | 'ASSESSMENT_IN_PROGRESS'
+  | 'PRACTICE_CYCLE_CLOSED'
   | 'STATE_CHANGED'
   | 'RATE_LIMITED'
   | 'DAILY_LIMIT'
@@ -30,6 +32,7 @@ export type ApiErrorCode =
   | 'CAPACITY_BUSY'
   | 'POOL_SATURATED'
   | 'AUDIO_INVALID'
+  | 'AUDIO_SILENT'
   | 'AUDIO_UPLOAD_MISSING'
   | 'AUDIO_TOO_LARGE'
   | 'AUDIO_TOO_LONG'
@@ -99,6 +102,7 @@ export interface UserRow {
   ui_language: string;
   cefr_level: string | null;
   diagnostic_completed: boolean;
+  diagnostic_acknowledged: boolean;
   token_version: number;
   created_at: string;
 }
@@ -246,7 +250,21 @@ export function parseClientVersion(value: string): number[] | undefined {
  * is additive-only, so an absent or unparseable header passes through — this
  * is a compatibility gate, not a security control.
  */
+const RECORDING_DELETE_PATH =
+  /^\/recordings\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/** Stable privacy/account exits remain usable while an old build updates. */
+export function clientVersionGateExempt(method: string | undefined, path: string | undefined) {
+  if (!method || !path) return false;
+  if (method === 'POST' && path === '/auth/logout') return true;
+  if (method === 'DELETE' && path === '/auth/account') return true;
+  if (method === 'GET' && (path === '/auth/me/data' || path === '/recordings/export')) return true;
+  if (method === 'DELETE' && path === '/recordings') return true;
+  return method === 'DELETE' && RECORDING_DELETE_PATH.test(path);
+}
+
 export const clientVersionGate: RequestHandler = (req, _res, next) => {
+  if (clientVersionGateExempt(req.method, req.path)) return next();
   const minimumRaw = config.minClientVersion;
   if (!minimumRaw) return next();
   const header = req.headers['x-client-version'];

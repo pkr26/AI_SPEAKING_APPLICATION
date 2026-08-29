@@ -52,6 +52,7 @@ describe('shared Button', () => {
     await fireEvent(button('Continue'), 'responderGrant', responderEvent());
     expect(flattenedStyle(button('Continue'))).toMatchObject({
       backgroundColor: colors.primaryDark,
+      transform: [{ scale: 0.985 }],
     });
     await fireEvent(button('Continue'), 'responderTerminate', responderEvent());
     await waitFor(() =>

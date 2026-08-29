@@ -1,13 +1,21 @@
-import { QueryClient, QueryClientProvider, QueryObserver } from '@tanstack/react-query';
+import {
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+} from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert, BackHandler, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Alert, BackHandler, ScrollView, StyleSheet } from 'react-native';
 
 import DiagnosticScreen from '../src/app/diagnostic';
-import { ApiError, apiFetch, userMessageForError } from '../src/lib/api';
+import type { RecorderResultMetadata } from '../src/components/Recorder';
+import { ApiError, apiAcknowledgeDiagnostic, apiFetch, userMessageForError } from '../src/lib/api';
+import type { DiagnosticFeedbackReplay } from '../src/lib/assessment-replay-provider';
 import { LogoutCleanupError, type SessionLease, type useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
+import { acknowledgePendingAssessmentFeedback } from '../src/lib/pending-assessment';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import {
   parseDiagnosticAnswerResult,
@@ -67,10 +75,11 @@ interface CapturedRecorderProps {
   questionId: string;
   endpoint: string;
   parseResult: (data: unknown) => DiagnosticAnswerResult;
-  onResult: (data: DiagnosticAnswerResult) => void;
+  onResult: (data: DiagnosticAnswerResult, metadata?: RecorderResultMetadata) => void;
   onError: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
+  onExitLockChange?: (locked: boolean) => void;
   onExpandedControlsLayout?: () => void;
 }
 
@@ -78,12 +87,27 @@ let mockRecorderProps: CapturedRecorderProps | null = null;
 const mockRecorderPublications: CapturedRecorderProps[] = [];
 const mockScrollToExpandedRecorderControls = jest.fn();
 
-function MockRecorder(props: CapturedRecorderProps) {
+interface MockRecorderProps extends Omit<CapturedRecorderProps, 'onResult'> {
+  onResult?: (data: DiagnosticAnswerResult) => void;
+  onResultWithMetadata?: (data: DiagnosticAnswerResult, metadata: RecorderResultMetadata) => void;
+}
+
+function MockRecorder(props: MockRecorderProps) {
   React.useLayoutEffect(() => {
-    mockRecorderPublications.push(props);
-    mockRecorderProps = props;
+    const captured: CapturedRecorderProps = {
+      ...props,
+      onResult: (data, metadata) => {
+        if (props.onResultWithMetadata) {
+          props.onResultWithMetadata(data, metadata as RecorderResultMetadata);
+        } else {
+          props.onResult?.(data);
+        }
+      },
+    };
+    mockRecorderPublications.push(captured);
+    mockRecorderProps = captured;
     return () => {
-      if (mockRecorderProps === props) mockRecorderProps = null;
+      if (mockRecorderProps === captured) mockRecorderProps = null;
     };
   }, [props]);
   return null;
@@ -118,6 +142,10 @@ const OTHER_USER: User = {
 };
 
 let mockAuthValue: AuthValue;
+let mockAssessmentReplayValue: {
+  diagnosticReplay: DiagnosticFeedbackReplay | null;
+  clearDiagnosticReplay: jest.Mock;
+};
 
 function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
   return {
@@ -145,19 +173,31 @@ jest.mock('../src/lib/auth', () => ({
   useAuth: () => mockAuthValue,
 }));
 
+jest.mock('../src/lib/assessment-replay-provider', () => ({
+  useAssessmentReplay: () => mockAssessmentReplayValue,
+}));
+
 // ----- api mock -----
 
 jest.mock('../src/lib/api', () => {
   const actual = jest.requireActual<typeof import('../src/lib/api')>('../src/lib/api');
   return {
     ...actual,
+    apiAcknowledgeDiagnostic: jest.fn(),
     apiFetch: jest.fn(),
     userMessageForError: jest.fn(actual.userMessageForError),
   };
 });
 
+jest.mock('../src/lib/pending-assessment', () => ({
+  ...jest.requireActual('../src/lib/pending-assessment'),
+  acknowledgePendingAssessmentFeedback: jest.fn(),
+}));
+
 const mockApiFetch = apiFetch as jest.Mock;
+const mockAcknowledgeDiagnostic = jest.mocked(apiAcknowledgeDiagnostic);
 const mockUserMessageForError = jest.mocked(userMessageForError);
+const mockAcknowledgePendingFeedback = jest.mocked(acknowledgePendingAssessmentFeedback);
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
   navigate: jest.Mock;
@@ -180,11 +220,23 @@ const QUESTION_2: Question = {
   questionText: 'Tell me about a memorable journey.',
 };
 
+const DIAGNOSTIC_REQUEST_ID = '550e8400-e29b-41d4-a716-446655440099';
+
+const ANSWER_1 = {
+  attemptNo: 1,
+  promptWord: QUESTION_1.promptWord,
+  questionText: QUESTION_1.questionText,
+  transcript: 'A durable answer.',
+  score: 88,
+  passed: true,
+  feedback: 'Durable feedback.',
+};
+
 function nextPayload(question: Question, asked: number) {
   return {
     done: false,
     question,
-    progress: { asked, maxQuestions: 5 },
+    progress: { asked, maxQuestions: 3 },
   };
 }
 
@@ -341,11 +393,18 @@ async function focusScreen(): Promise<void> {
 }
 
 beforeEach(() => {
+  onlineManager.setOnline(true);
   jest.clearAllMocks();
   mockApiFetch.mockReset();
+  mockAcknowledgeDiagnostic.mockReset().mockResolvedValue(undefined);
+  mockAcknowledgePendingFeedback.mockReset().mockResolvedValue(true);
   mockRecorderProps = null;
   mockRecorderPublications.length = 0;
   mockAuthValue = makeAuth();
+  mockAssessmentReplayValue = {
+    diagnosticReplay: null,
+    clearDiagnosticReplay: jest.fn(),
+  };
   mockFocusRegistrations.length = 0;
   alertSpy = jest.spyOn(Alert, 'alert').mockImplementation(() => undefined);
   backHandlers = [];
@@ -377,6 +436,16 @@ afterEach(async () => {
 });
 
 describe('diagnostic screen', () => {
+  it('shows an offline state before the level test can load', async () => {
+    onlineManager.setOnline(false);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+
+    expect(await screen.findByRole('header', { name: t('network.offlineTitle') })).toBeTruthy();
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    expect(mockRecorderProps).toBeNull();
+  });
+
   it('leaves the fresh intro for the Recorder before longer diagnostic cases run', async () => {
     diagnosticRenderSentinelAttempted = true;
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
@@ -386,7 +455,7 @@ describe('diagnostic screen', () => {
     await fireEvent.press(start);
     const introExited = screen.queryByText(t('diag.introTitle')) === null;
     const recorderEntered =
-      mockRecorderProps !== null && screen.queryByText(t('diag.answerSavedTitle')) === null;
+      mockRecorderProps !== null && screen.queryByText(t('diag.answerCheckedTitle')) === null;
     diagnosticRenderSentinelPassed = introExited && recorderEntered;
 
     expect(introExited).toBe(true);
@@ -398,6 +467,15 @@ describe('diagnostic screen', () => {
     await renderScreen();
     expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
     expect(mockRecorderProps).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
   });
 
   it('renders the question, progress, and wires the recorder', async () => {
@@ -406,10 +484,12 @@ describe('diagnostic screen', () => {
     await renderScreen(queryClient);
 
     await startFreshTest();
-    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    expect(
+      screen.getByText('Describe a time you showed courage.').props.accessibilityLanguage,
+    ).toBe('en-US');
     expect(mockUserMessageForError).not.toHaveBeenCalled();
-    expect(screen.getByText('courage')).toBeTruthy();
-    expect(screen.getByText(t('diag.progress', { current: 1, max: 5 }))).toBeTruthy();
+    expect(screen.getByText('courage').props.accessibilityLanguage).toBe('en-US');
+    expect(screen.getByText(t('diag.progress', { current: 1, max: 3 }))).toBeTruthy();
     expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
     // Both halves of the prompt card are named for the learner.
     expect(screen.getByText(t('label.word'))).toBeTruthy();
@@ -433,6 +513,174 @@ describe('diagnostic screen', () => {
         exact: true,
       }),
     ).toBeDefined();
+  });
+
+  it('seeds a nonfinal cold replay before canonical next state and keeps it visible', async () => {
+    const canonical = deferred<ReturnType<typeof nextPayload> & { answers: [typeof ANSWER_1] }>();
+    const replayResult: DiagnosticAnswerResult = {
+      passed: true,
+      score: 88,
+      transcript: ANSWER_1.transcript,
+      feedback: ANSWER_1.feedback,
+      done: false,
+      nextQuestion: QUESTION_2,
+    };
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: replayResult,
+    };
+    mockApiFetch.mockReturnValue(canonical.promise);
+    await renderScreen();
+
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+    expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+    expect(mockRecorderProps).toBeNull();
+
+    await act(async () => {
+      canonical.resolve({
+        ...nextPayload(QUESTION_2, 1),
+        answers: [ANSWER_1],
+      });
+      await canonical.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+    expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+    expect(await screen.findByText(t('diag.progress', { current: 1, max: 3 }))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).toHaveBeenCalledWith(
+      DIAGNOSTIC_REQUEST_ID,
+    );
+  });
+
+  it('adopts a new replay that arrives while the same diagnostic route remains mounted', async () => {
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: 88,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: false,
+        nextQuestion: QUESTION_2,
+      },
+    };
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    const rendered = await renderScreen();
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: '650e8400-e29b-41d4-a716-446655440099',
+      question: QUESTION_2,
+      result: {
+        passed: false,
+        score: 42,
+        transcript: 'A second restored answer.',
+        feedback: 'A second restored feedback card.',
+        done: true,
+        level: 'B1',
+      },
+    };
+    await act(async () => rendered.rerenderScreen());
+
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(screen.getByText('A second restored answer.').props.accessibilityLanguage).toBe('en-US');
+    expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
+  });
+
+  it('keeps a final cold replay ahead of canonical completion and hydrates its answers', async () => {
+    const canonical = deferred<{ done: true; level: 'B2'; answers: [typeof ANSWER_1] }>();
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: ANSWER_1.score,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: true,
+        level: 'B2',
+      },
+    };
+    mockApiFetch.mockReturnValue(canonical.promise);
+    await renderScreen();
+
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('diag.completeTitle'))).toBeNull();
+
+    await act(async () => {
+      canonical.resolve({ done: true, level: 'B2', answers: [ANSWER_1] });
+      await canonical.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('diag.completeTitle'))).toBeNull();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(screen.getByText(ANSWER_1.transcript).props.accessibilityLanguage).toBe('en-US');
+    expect(screen.getByText(ANSWER_1.feedback)).toBeTruthy();
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).toHaveBeenCalledWith(
+      DIAGNOSTIC_REQUEST_ID,
+    );
+  });
+
+  it('rejects a replay object retained across an account boundary', async () => {
+    const retainedReplay: DiagnosticFeedbackReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: 88,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: false,
+        nextQuestion: QUESTION_2,
+      },
+    };
+    mockAssessmentReplayValue.diagnosticReplay = retainedReplay;
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    const rendered = await renderScreen();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+
+    expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
+    expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
+    expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).not.toHaveBeenCalled();
+  });
+
+  it('does not seed a cold replay through an expired session lease', async () => {
+    mockAuthValue = makeAuth({ isSessionLeaseCurrent: jest.fn(() => false) });
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: 88,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: false,
+        nextQuestion: QUESTION_2,
+      },
+    };
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen();
+
+    expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
+    expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
+    expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
   });
 
   it('does not scroll expanded Recorder controls after Diagnostic loses ownership', async () => {
@@ -481,7 +729,7 @@ describe('diagnostic screen', () => {
 
     expect((await screen.findByText(t('diag.introTitle'))).props.accessibilityRole).toBe('header');
     expect(screen.getByText(t('diag.introWhat'))).toBeTruthy();
-    expect(screen.getByText(t('diag.introCount', { count: 5 }))).toBeTruthy();
+    expect(screen.getByText(t('diag.introCount', { count: 3 }))).toBeTruthy();
     expect(screen.getByText(t('diag.introRecorded'))).toBeTruthy();
     expect(screen.getByText(t('diag.introSpeakEnglish'))).toBeTruthy();
     // The question and recorder stay hidden until the learner starts.
@@ -501,7 +749,7 @@ describe('diagnostic screen', () => {
 
     expect(await screen.findByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
-    expect(screen.getByText(t('diag.progress', { current: 3, max: 5 }))).toBeTruthy();
+    expect(screen.getByText(t('diag.progress', { current: 3, max: 3 }))).toBeTruthy();
     expect(recorderProps().questionId).toBe(QUESTION_1.id);
   });
 
@@ -682,7 +930,7 @@ describe('diagnostic screen', () => {
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
 
-      expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+      expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
       expect(screen.getByText('Tell me about a memorable journey.')).toBeTruthy();
       expect(alertSpy).not.toHaveBeenCalled();
       expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleRecovery);
@@ -705,7 +953,7 @@ describe('diagnostic screen', () => {
           nextQuestion: QUESTION_1,
         }),
       );
-      expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+      expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     },
   );
 
@@ -783,7 +1031,7 @@ describe('diagnostic screen', () => {
         await Promise.resolve();
       });
 
-      expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+      expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
       expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
       expect(alertSpy).not.toHaveBeenCalled();
       expect(mockApiFetch).toHaveBeenCalledTimes(requestsBeforeBoundary);
@@ -831,7 +1079,7 @@ describe('diagnostic screen', () => {
 
       expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
       expect(screen.queryByText('Tell me about a memorable journey.')).toBeNull();
-      expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+      expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
       expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleAdvance);
       expect(nextSetUser).not.toHaveBeenCalled();
       expect(mockRouter.replace).not.toHaveBeenCalled();
@@ -901,7 +1149,7 @@ describe('diagnostic screen', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
 
     expect(
-      parentOf(screen.getByText(t('diag.answerSavedTitle'))).props.accessibilityLiveRegion,
+      parentOf(screen.getByText(t('diag.answerCheckedTitle'))).props.accessibilityLiveRegion,
     ).toBe('polite');
     expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
     expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
@@ -955,21 +1203,47 @@ describe('diagnostic screen', () => {
   });
 
   it('acknowledges an answer and advances to the next question', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
+    const scrollToTopSpy = jest
+      .spyOn(ScrollView.prototype, 'scrollTo')
+      .mockImplementation(() => undefined);
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
-    await renderScreen();
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(queryClient);
     await startFreshTest();
+    announceSpy.mockClear();
+    scrollToTopSpy.mockClear();
 
     const result: DiagnosticAnswerResult = {
       passed: true,
       score: 88,
       transcript: 'I showed courage at work.',
       feedback: 'Well done.',
+      recordingId: '550e8400-e29b-41d4-a716-446655440090',
       done: false,
       nextQuestion: QUESTION_2,
     };
     await act(async () => recorderProps().onResult(result));
 
-    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
+        score: 88,
+        result: t('diag.passed'),
+      })}`,
+      { queue: true },
+    );
+    expect(scrollToTopSpy).toHaveBeenLastCalledWith({ y: 0, animated: false });
+
+    expect(screen.getByRole('header', { name: t('diag.answerCheckedTitle') })).toBeTruthy();
+    expect(screen.getByText('I showed courage at work.').props.selectable).toBe(true);
+    expect(screen.getByText('Well done.').props.accessibilityLanguage).toBe('en-US');
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['recordings', USER.id] });
+    expect(
+      screen.getByText(t('diag.scoreLine', { score: 88, result: t('diag.passed') })),
+    ).toBeTruthy();
     expect(mockRecorderProps).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('diag.nextQuestion') }),
@@ -984,8 +1258,170 @@ describe('diagnostic screen', () => {
 
     expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
     expect(screen.getByText('journey')).toBeTruthy();
-    expect(screen.getByText(t('diag.progress', { current: 2, max: 5 }))).toBeTruthy();
+    expect(screen.getByText(t('diag.progress', { current: 2, max: 3 }))).toBeTruthy();
     expect(recorderProps().questionId).toBe(QUESTION_2.id);
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.progress', { current: 2, max: 3 })}. journey. ${QUESTION_2.questionText}`,
+      { queue: true },
+    );
+    expect(scrollToTopSpy).toHaveBeenLastCalledWith({ y: 0, animated: false });
+    announceSpy.mockRestore();
+    scrollToTopSpy.mockRestore();
+  });
+
+  it('durably acknowledges one request before advancing its result card', async () => {
+    const acknowledgement = deferred<boolean>();
+    mockAcknowledgePendingFeedback.mockReturnValue(acknowledgement.promise);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    await act(async () =>
+      recorderProps().onResult(
+        {
+          passed: true,
+          score: 88,
+          transcript: 'A durable answer.',
+          feedback: 'Durable feedback.',
+          done: false,
+          nextQuestion: QUESTION_2,
+        },
+        { requestId: DIAGNOSTIC_REQUEST_ID },
+      ),
+    );
+    const nextQuestion = capturedPressHandler(t('diag.nextQuestion'));
+
+    await act(async () => {
+      nextQuestion();
+      nextQuestion();
+      await Promise.resolve();
+    });
+
+    expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
+    expect(mockAcknowledgePendingFeedback).toHaveBeenCalledWith(USER.id, DIAGNOSTIC_REQUEST_ID);
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('diag.nextQuestion') }).props.accessibilityState,
+    ).toMatchObject({
+      disabled: true,
+      busy: true,
+    });
+
+    await act(async () => {
+      acknowledgement.resolve(true);
+      await acknowledgement.promise;
+    });
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+  });
+
+  it('does not advance after durable acknowledgement resolves off-focus', async () => {
+    const acknowledgement = deferred<boolean>();
+    mockAcknowledgePendingFeedback.mockReturnValue(acknowledgement.promise);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    await act(async () =>
+      recorderProps().onResult(
+        {
+          passed: true,
+          score: 88,
+          transcript: 'A durable answer.',
+          feedback: 'Durable feedback.',
+          done: false,
+          nextQuestion: QUESTION_2,
+        },
+        { requestId: DIAGNOSTIC_REQUEST_ID },
+      ),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    await blurScreen();
+
+    await act(async () => {
+      acknowledgement.resolve(true);
+      await acknowledgement.promise;
+    });
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+
+    await focusScreen();
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+    expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['false result', 'rejection'] as const)(
+    'keeps the diagnostic result retryable after acknowledgement %s',
+    async (failure) => {
+      if (failure === 'false result') {
+        mockAcknowledgePendingFeedback.mockResolvedValueOnce(false);
+      } else {
+        mockAcknowledgePendingFeedback.mockRejectedValueOnce(new Error('private storage error'));
+      }
+      mockAcknowledgePendingFeedback.mockResolvedValueOnce(true);
+      mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+      await renderScreen();
+      await screen.findByText(QUESTION_1.questionText);
+      await act(async () =>
+        recorderProps().onResult(
+          {
+            passed: true,
+            score: 88,
+            transcript: 'A durable answer.',
+            feedback: 'Durable feedback.',
+            done: false,
+            nextQuestion: QUESTION_2,
+          },
+          { requestId: DIAGNOSTIC_REQUEST_ID },
+        ),
+      );
+
+      await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+      expect(await screen.findByRole('alert')).toHaveTextContent(t('boundary.body'));
+      expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+      expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+      expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
+
+      await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+      expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+      expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('keeps diagnostic silence on the same question without advancing progress', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: 'Please speak clearly and try again.',
+        noSpeech: true,
+        done: false,
+        nextQuestion: QUESTION_1,
+      }),
+    );
+
+    expect(screen.getByRole('header', { name: t('diag.noSpeechTitle') })).toBeTruthy();
+    expect(
+      screen.getByText('Please speak clearly and try again.').props.accessibilityLanguage,
+    ).toBe('en-US');
+    expect(screen.queryByText(t('diag.answersTitle'))).toBeNull();
+    expect(
+      screen.queryByText(
+        t('diag.scoreLine', {
+          score: 0,
+          result: t('diag.notPassed'),
+        }),
+      ),
+    ).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.recordAgain') }));
+
+    expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
+    expect(screen.getByText(t('diag.progress', { current: 2, max: 3 }))).toBeTruthy();
+    expect(recorderProps().questionId).toBe(QUESTION_1.id);
   });
 
   it('rejects callbacks retained by the previous question Recorder after advancing', async () => {
@@ -1026,7 +1462,7 @@ describe('diagnostic screen', () => {
     });
 
     expect(screen.getByText(QUESTION_2.questionText)).toBeTruthy();
-    expect(screen.queryByText(t('diag.answerSavedTitle'))).toBeNull();
+    expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
     expect(alertSpy).not.toHaveBeenCalled();
     expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeReplay);
     expect(
@@ -1038,7 +1474,7 @@ describe('diagnostic screen', () => {
   });
 
   it('reveals the level and completes the diagnostic', async () => {
-    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 2));
     const queryClient = makeQueryClient();
     const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
     const removeSpy = jest.spyOn(queryClient, 'removeQueries');
@@ -1060,6 +1496,12 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(t('diag.levelIntro'))).toBeTruthy();
     expect(screen.getByText('B2')).toBeTruthy();
     expect(screen.getByText(t('cefr.B2'))).toBeTruthy();
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
     // The reveal closes by telling the learner what the level is used for.
     expect(screen.getByText(t('diag.levelHint'))).toBeTruthy();
     // The per-answer reveal lists this session's answers with pass marks.
@@ -1092,13 +1534,69 @@ describe('diagnostic screen', () => {
     expect(mockAuthValue.setUser).toHaveBeenCalledWith({
       ...USER,
       diagnosticCompleted: true,
+      diagnosticAcknowledged: true,
       cefrLevel: 'B2',
     });
+    expect(mockAcknowledgeDiagnostic).toHaveBeenCalledTimes(1);
     expect(mockAuthValue.setUser).toHaveBeenCalledTimes(1);
     expect(removeSpy).toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
     expect(mockRouter.replace).toHaveBeenCalledWith('/');
     expect(mockRouter.replace).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the durable level reveal open when acknowledgement fails and allows retry', async () => {
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
+    mockAcknowledgeDiagnostic
+      .mockRejectedValueOnce(new ApiError(503, 'busy'))
+      .mockResolvedValueOnce(undefined);
+    await renderScreen();
+    await screen.findByText(t('diag.completeTitle'));
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
+    expect(alertSpy).toHaveBeenCalledWith(t('diag.ackFailedTitle'), t('error.serverBusy'));
+    expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(mockAcknowledgeDiagnostic).toHaveBeenCalledTimes(2);
+  });
+
+  it('gives completion acknowledgement exclusive ownership of account actions', async () => {
+    const acknowledgement = deferred<void>();
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
+    mockAcknowledgeDiagnostic.mockReturnValue(acknowledgement.promise);
+    await renderScreen();
+    await screen.findByText(t('diag.completeTitle'));
+    const startPracticing = capturedPressHandler(t('diag.startPracticing'));
+    const openSettings = capturedPressHandler(t('header.settings'));
+    const logOut = capturedPressHandler(t('common.logOut'));
+
+    await act(async () => {
+      void startPracticing();
+      openSettings();
+      void logOut();
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole('button', { name: t('diag.startPracticingBusy') })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: t('diag.startPracticing') })).toBeNull();
+    expect(mockAcknowledgeDiagnostic).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => {
+      acknowledgement.resolve();
+      await acknowledgement.promise;
+    });
+    expect(mockRouter.replace).toHaveBeenCalledWith('/');
   });
 
   it('accepts only the first recorder result until its card is acknowledged', async () => {
@@ -1167,8 +1665,12 @@ describe('diagnostic screen', () => {
         nextQuestion: QUESTION_2,
       }),
     );
-    // Scores stay hidden mid-test; the saved card only acknowledges the answer.
-    expect(screen.getByText(t('diag.answerSavedBody'))).toBeTruthy();
+    // Every answer is explained immediately, before the learner moves on.
+    expect(screen.getByText('first answer')).toBeTruthy();
+    expect(screen.getByText('first feedback')).toBeTruthy();
+    expect(
+      screen.getByText(t('diag.scoreLine', { score: 35, result: t('diag.notPassed') })),
+    ).toBeTruthy();
     expect(screen.queryByText(t('diag.answersTitle'))).toBeNull();
     expect(
       screen.queryByText(t('diag.answerLine', { number: 1, score: 35, mark: '✗' })),
@@ -1237,7 +1739,7 @@ describe('diagnostic screen', () => {
     );
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
 
-    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(mockRecorderProps).toBeNull();
   });
@@ -1319,7 +1821,7 @@ describe('diagnostic screen', () => {
         nextQuestion: QUESTION_2,
       }),
     );
-    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
 
     // The 5-minute-stale query refetches on focus and resolves with the
     // advanced server state (answer committed, next question current). The
@@ -1332,7 +1834,7 @@ describe('diagnostic screen', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    expect(screen.getByText(t('diag.answerSavedTitle'))).toBeTruthy();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
 
     // Continuing still advances locally from the acknowledged result.
@@ -1436,6 +1938,31 @@ describe('diagnostic screen', () => {
     expect(screen.queryByText(t('diag.answersTitle'))).toBeNull();
   });
 
+  it('restores transcripts and feedback on a durable completed result', async () => {
+    mockApiFetch.mockResolvedValue({
+      done: true,
+      level: 'A2',
+      answers: [
+        {
+          attemptNo: 1,
+          promptWord: QUESTION_1.promptWord,
+          questionText: QUESTION_1.questionText,
+          transcript: 'A durable transcript.',
+          score: 72,
+          passed: true,
+          feedback: 'Durable feedback.',
+        },
+      ],
+    });
+    await renderScreen();
+
+    expect((await screen.findByText('A durable transcript.')).props.accessibilityLanguage).toBe(
+      'en-US',
+    );
+    expect(screen.getByText('Durable feedback.').props.accessibilityLanguage).toBe('en-US');
+    expect(screen.getByText(QUESTION_1.questionText, { exact: false })).toBeTruthy();
+  });
+
   it('shows a retryable error when the question fails to load', async () => {
     mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
     await renderScreen();
@@ -1444,6 +1971,12 @@ describe('diagnostic screen', () => {
       'header',
     );
     expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.tryAgain') }),
       {
@@ -1953,6 +2486,26 @@ describe('diagnostic screen', () => {
     expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
   });
 
+  it('releases account exits while a recovery is parked', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await act(async () => {
+      recorderProps().onInteractionLockChange?.(true);
+      recorderProps().onExitLockChange?.(false);
+    });
+
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+  });
+
   it('rejects captured account actions immediately after the Recorder acquires its lock', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
@@ -2113,7 +2666,7 @@ describe('diagnostic presentation', () => {
     );
     for (const line of [
       t('diag.introWhat'),
-      t('diag.introCount', { count: 5 }),
+      t('diag.introCount', { count: 3 }),
       t('diag.introRecorded'),
       t('diag.introSpeakEnglish'),
     ]) {
@@ -2129,7 +2682,7 @@ describe('diagnostic presentation', () => {
     await renderScreen();
     await startFreshTest();
 
-    expect(flattenedStyle(screen.getByText(t('diag.progress', { current: 1, max: 5 })))).toEqual({
+    expect(flattenedStyle(screen.getByText(t('diag.progress', { current: 1, max: 3 })))).toEqual({
       marginTop: spacing.xs,
       fontSize: 14,
       color: colors.muted,
@@ -2159,7 +2712,7 @@ describe('diagnostic presentation', () => {
     );
   });
 
-  it('renders the saved-answer card from the tokens', async () => {
+  it('renders the checked-answer detail card from the tokens', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
     await startFreshTest();
@@ -2174,7 +2727,7 @@ describe('diagnostic presentation', () => {
       }),
     );
 
-    const savedTitle = screen.getByText(t('diag.answerSavedTitle'));
+    const savedTitle = screen.getByText(t('diag.answerCheckedTitle'));
     expect(flattenedStyle(savedTitle)).toEqual(CARD_TITLE);
     expect(flattenedStyle(parentOf(savedTitle))).toEqual({
       marginTop: spacing.xl,
@@ -2184,11 +2737,27 @@ describe('diagnostic presentation', () => {
       backgroundColor: colors.card,
       borderColor: colors.border,
     });
-    expect(flattenedStyle(screen.getByText(t('diag.answerSavedBody')))).toEqual({
-      marginTop: spacing.sm,
-      fontSize: 15,
-      lineHeight: 22,
-      color: colors.muted,
+    expect(
+      flattenedStyle(
+        screen.getByText(t('diag.scoreLine', { score: 88, result: t('diag.passed') })),
+      ),
+    ).toEqual({
+      marginTop: spacing.md,
+      fontSize: 18,
+      fontWeight: '700',
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText('An answer.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 17,
+      lineHeight: 25,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText('Great answer.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      lineHeight: 24,
+      color: colors.text,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('diag.nextQuestion') }))).toEqual(
       PRIMARY_ACTION,
@@ -2196,7 +2765,7 @@ describe('diagnostic presentation', () => {
   });
 
   it('lays the completion reveal out on the page tokens', async () => {
-    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 4));
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 2));
     await renderScreen();
     await screen.findByText('Describe a time you showed courage.');
     await act(async () =>

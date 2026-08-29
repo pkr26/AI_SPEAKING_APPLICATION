@@ -85,22 +85,91 @@ describe('A1-English source copy pins for critical safety strings', () => {
     expect(dictionaries.en['recorder.privacyNote']).toBe(
       'We send your recording only after you tap Send Answer.',
     );
+    expect(dictionaries.en['recorder.retentionNote']).toBe(
+      'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on Save this recording.',
+    );
+    expect(dictionaries.en['recorder.saveRecordingLabel']).toBe('Save this recording');
+    expect(dictionaries.en['recorder.discard']).toBe('Discard Take');
+    expect(dictionaries.en['recorder.discardBody']).toBe(
+      'This unsent recording will be deleted from this device. Nothing will be sent.',
+    );
+    expect(dictionaries.en['recorder.saveRecordingHint']).toContain('Off by default');
+    expect(dictionaries.en['practiceIntro.native']).toContain('only an English answer');
   });
 
-  it('pins retained-recording and temporary-upload privacy disclosures without removing the legal placeholder', () => {
-    expect(dictionaries.en['privacy.p1']).toBe(
-      'We store your name, email, practice answers, and successful submitted recordings so you can replay them until you delete the recording or your account.',
-    );
-    expect(dictionaries.en['privacy.p2']).toBe(
-      'Failed or abandoned uploads are temporary. AI providers process submitted audio and its transcript to assess your answer.',
-    );
-    expect(dictionaries.en['legal.placeholderNote']).toContain('must review and replace');
+  it('pins the implemented providers, retention behavior, and effective date', () => {
+    expect(dictionaries.en['privacy.p2']).toContain('OpenAI');
+    expect(dictionaries.en['privacy.p2']).toContain('Amazon S3');
+    expect(dictionaries.en['privacy.p2']).toContain('Google Mobile Ads');
+    expect(dictionaries.en['privacy.p2']).toContain('audio you choose not to save are temporary');
+    expect(dictionaries.en['privacy.p2']).toContain('recordings you choose to retain');
+    expect(dictionaries.en['privacy.p3']).toContain('asynchronous permanent deletion');
+    expect(dictionaries.en['legal.placeholderNote']).toContain('Effective August 28, 2026');
+    expect(dictionaries.en['legal.placeholderNote']).not.toContain('replace');
   });
 
   it('pins the delete-account warning', () => {
-    expect(dictionaries.en['da.warningBody']).toBe(
-      'Deleting your account removes your profile, your test results, and your practice history. This cannot be undone.',
+    expect(dictionaries.en['da.warningBody']).toContain('immediately removes');
+    expect(dictionaries.en['da.warningBody']).toContain('queued for permanent deletion');
+  });
+
+  it('does not promise a bounded recording-deletion time in any locale', () => {
+    expect(dictionaries.en['da.confirmBody']).toContain(
+      'until asynchronous permanent deletion completes',
     );
+    expect(dictionaries.en['privacy.p3']).toContain(
+      'until asynchronous permanent deletion completes',
+    );
+    expect(dictionaries.te['da.confirmBody']).toContain('పూర్తయ్యే వరకు');
+    expect(dictionaries.te['privacy.p3']).toContain('పూర్తయ్యే వరకు');
+    expect(dictionaries.hi['da.confirmBody']).toContain('पूरा होने तक');
+    expect(dictionaries.hi['privacy.p3']).toContain('पूरा होने तक');
+    expect(dictionaries.es['da.confirmBody']).toContain('hasta que termina');
+    expect(dictionaries.es['privacy.p3']).toContain('hasta que termina');
+    expect(dictionaries.zh['da.confirmBody']).toContain('直到');
+    expect(dictionaries.zh['privacy.p3']).toContain('直到');
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(dictionaries[language]['da.confirmBody']).not.toContain('short time');
+      expect(dictionaries[language]['privacy.p3']).not.toContain('short time');
+    }
+  });
+
+  it('does not claim stored recording audio is deleted synchronously', () => {
+    expect(dictionaries.en['recordings.deleteBody']).toContain('queued for permanent deletion');
+    expect(dictionaries.en['recordings.deleted']).toContain('queued for permanent deletion');
+    expect(dictionaries.te['recordings.deleted']).toContain('క్యూలో');
+    expect(dictionaries.hi['recordings.deleted']).toContain('कतार');
+    expect(dictionaries.es['recordings.deleted']).toContain('cola');
+    expect(dictionaries.zh['recordings.deleted']).toContain('排队');
+  });
+
+  it('keeps bulk deletion and private audio sharing explicit in every locale', () => {
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(dictionaries[language]['settings.recordingsDeleteAllSuccess']).not.toBe(
+        dictionaries[language]['settings.recordingsDeleteAllFailed'],
+      );
+      expect(dictionaries[language]['recordings.shareAction']).not.toBe(
+        dictionaries[language]['recordings.deleteAction'],
+      );
+      expect(dictionaries[language]['recordings.shareHint'].trim()).not.toBe('');
+    }
+    expect(dictionaries.en['settings.recordingsDeleteAllBody']).toContain(
+      'queued for permanent deletion',
+    );
+    expect(dictionaries.en['settings.recordingsDeleteAllBody']).toContain('will stay');
+    expect(dictionaries.en['settings.recordingsDeleteAllBody']).toContain('cannot be undone');
+    expect(dictionaries.en['recordings.shareHint']).toContain('temporary private copy');
+    expect(dictionaries.te['settings.recordingsDeleteAllSuccess']).toContain('క్యూలో');
+    expect(dictionaries.hi['settings.recordingsDeleteAllSuccess']).toContain('कतार');
+    expect(dictionaries.es['settings.recordingsDeleteAllSuccess']).toContain('cola');
+    expect(dictionaries.zh['settings.recordingsDeleteAllSuccess']).toContain('排队');
+  });
+
+  it('states in every locale that the JSON export excludes audio bytes', () => {
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(dictionaries[language]['settings.exportHelp']).toContain('JSON');
+    }
+    expect(dictionaries.en['settings.exportHelp']).toContain('Audio files and audio bytes');
   });
 
   it('pins the surprise-logout explanation', () => {
@@ -115,10 +184,57 @@ describe('A1-English source copy pins for critical safety strings', () => {
     );
   });
 
+  it('keeps the parked-result recovery actions distinct in every locale', () => {
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(dictionaries[language]['replay.pendingTitle'].trim()).not.toBe('');
+      expect(dictionaries[language]['replay.pendingBody'].trim()).not.toBe('');
+      expect(dictionaries[language]['replay.checkNow']).not.toBe(
+        dictionaries[language]['replay.checkLater'],
+      );
+    }
+    expect(dictionaries.en['replay.pendingTitle']).toBe('Saved answer waiting');
+    expect(dictionaries.en['replay.pendingBody']).toBe(
+      'Your answer is safe. Check again to restore feedback when it is ready.',
+    );
+    expect(dictionaries.en['replay.checkNow']).toBe('Check Now');
+  });
+
   it('pins the expired-reset-code copy to the code the mail actually carries', () => {
     expect(dictionaries.en['error.resetInvalid']).toBe(
       'This code does not work or it is too old. Please ask for a new code.',
     );
+  });
+
+  it('gives signal-free recordings a clear microphone action in every locale', () => {
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(dictionaries[language]['error.audioSilent']).not.toBe(
+        dictionaries[language]['error.audioInvalid'],
+      );
+    }
+    expect(dictionaries.en['error.audioSilent']).toContain('microphone');
+    expect(dictionaries.te['error.audioSilent']).toContain('మైక్రోఫోన్');
+    expect(dictionaries.hi['error.audioSilent']).toContain('माइक्रोफ़ोन');
+    expect(dictionaries.es['error.audioSilent']).toContain('micrófono');
+    expect(dictionaries.zh['error.audioSilent']).toContain('麦克风');
+  });
+
+  it('says in every locale that silence leaves the upcoming practice try available', () => {
+    const expected: Record<UiLanguage, string> = {
+      en: 'Try 2 of 3 is still available',
+      te: 'ప్రయత్నం 2 / 3 ఇంకా అందుబాటులో ఉంది',
+      hi: '3 में से कोशिश 2 अभी भी उपलब्ध है',
+      es: 'El intento 2 de 3 sigue disponible',
+      zh: '第 2 次尝试（共 3 次）仍可使用',
+    };
+
+    for (const language of SUPPORTED_UI_LANGUAGES) {
+      expect(translateFor(language, 'feedback.attemptStillAvailable', { current: 2, max: 3 })).toBe(
+        expected[language],
+      );
+      expect(dictionaries[language]['feedback.attemptStillAvailable']).not.toBe(
+        dictionaries[language]['feedback.attemptLine'],
+      );
+    }
   });
 });
 
@@ -151,10 +267,10 @@ describe('reset-failure copy names the emailed code', () => {
 });
 
 describe('unified auth terminology', () => {
-  it('pins the English auth actions to Log in / Create account / Log out', () => {
+  it('pins the English auth actions and makes global logout explicit', () => {
     expect(dictionaries.en['login.submit']).toBe('Log in');
     expect(dictionaries.en['signup.submit']).toBe('Create account');
-    expect(dictionaries.en['common.logOut']).toBe('Log out');
+    expect(dictionaries.en['common.logOut']).toBe('Log out on all devices');
   });
 
   it.each(SUPPORTED_UI_LANGUAGES.map((language) => [language]))(
@@ -334,7 +450,7 @@ describe('I18nProvider language selection', () => {
     expect(translate('login.submit')).toBe(dictionaries.te['login.submit']);
   });
 
-  it('always uses English when signed out', async () => {
+  it('defaults to English when a legacy caller omits the signed-out preference', async () => {
     await render(
       <I18nProvider accountLanguage={null}>
         <Probe />
@@ -344,7 +460,30 @@ describe('I18nProvider language selection', () => {
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.en['login.submit']);
   });
 
-  it('supports an account UI language independently of learning language', async () => {
+  it.each(SUPPORTED_UI_LANGUAGES.map((language) => [language]))(
+    'uses the persisted %s device preference while signed out',
+    async (language) => {
+      await render(
+        <I18nProvider accountLanguage={null} guestLanguage={language}>
+          <Probe />
+        </I18nProvider>,
+      );
+      expect(screen.getByTestId('lang')).toHaveTextContent(language);
+      expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries[language]['login.submit']);
+    },
+  );
+
+  it('lets the account language override a different device preference', async () => {
+    await render(
+      <I18nProvider accountLanguage="hi" guestLanguage="es">
+        <Probe />
+      </I18nProvider>,
+    );
+    expect(screen.getByTestId('lang')).toHaveTextContent('hi');
+    expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.hi['login.submit']);
+  });
+
+  it('supports an account UI language independently of mother tongue', async () => {
     await render(
       <I18nProvider accountLanguage="hi">
         <Probe />

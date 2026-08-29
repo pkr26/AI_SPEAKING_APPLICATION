@@ -259,6 +259,7 @@ describe('real API responses satisfy the mobile app parsers', () => {
     expect(questionResponse.status).toBe(200);
     const practice = frontend.parsePracticeQuestion(questionResponse.body) as {
       question: { id: string };
+      cycleId: string;
     };
 
     const help = await request(a).get(`/practice/question/${practice.question.id}/help`).set(bearer(user.token));
@@ -276,8 +277,11 @@ describe('real API responses satisfy the mobile app parsers', () => {
     const skip = await request(a)
       .post('/practice/skip')
       .set(bearer(user.token))
-      .send({ questionId: practice.question.id });
+      .send({ questionId: practice.question.id, cycleId: practice.cycleId });
     expectEmpty204(skip);
+    let current = frontend.parsePracticeQuestion(
+      (await request(a).get('/practice/question').set(bearer(user.token))).body,
+    ) as { question: { id: string }; cycleId: string };
 
     providerMocks.speaking.mockReset();
     for (let index = 0; index < 3; index++) {
@@ -322,11 +326,14 @@ describe('real API responses satisfy the mobile app parsers', () => {
       if (index === 4) masteredRequestId = requestId;
       const attempt = await answerForm(
         request(a).post('/practice/attempt').set(bearer(user.token)),
-        practice.question.id,
+        current.question.id,
         requestId,
+        current.cycleId,
       );
       expect(attempt.status).toBe(200);
-      expect(frontend.parseAttemptResult(attempt.body)).toMatchObject(expectedBranch);
+      const parsed = frontend.parseAttemptResult(attempt.body) as typeof attempt.body;
+      expect(parsed).toMatchObject(expectedBranch);
+      if (attempt.body.next) current = attempt.body.next;
     }
 
     const replay = await request(a).get(`/assessments/${masteredRequestId}`).set(bearer(user.token));
@@ -339,12 +346,14 @@ describe('real API responses satisfy the mobile app parsers', () => {
       .mockResolvedValueOnce({
         understood: true,
         transcript: 'నేను ప్రశ్నను అర్థం చేసుకున్నాను.',
+        translatedTranscript: 'I understood the question.',
         modelAnswer: 'I understood the question and answered it clearly.',
         feedback: 'You understood the question.',
       })
       .mockResolvedValueOnce({
         understood: false,
         transcript: '',
+        translatedTranscript: '',
         modelAnswer: '',
         feedback: 'I could not hear enough speech. Please try again.',
       });
@@ -352,7 +361,9 @@ describe('real API responses satisfy the mobile app parsers', () => {
     for (const expectedUnderstood of [true, false]) {
       const native = await answerForm(
         request(a).post('/practice/attempt/native').set(bearer(user.token)),
-        practice.question.id,
+        current.question.id,
+        undefined,
+        current.cycleId,
       );
       expect(native.status).toBe(200);
       expect(frontend.parseNativeAttemptResult(native.body)).toMatchObject({ understood: expectedUnderstood });

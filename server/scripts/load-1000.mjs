@@ -241,7 +241,7 @@ const questionShape = (question) =>
   typeof question.questionText === 'string' &&
   question.questionText.length > 0;
 
-function audioForm(questionId, requestId) {
+function audioForm(questionId, requestId, cycleId) {
   const boundary = `----load1000${randomUUID().replace(/-/g, '')}`;
   // Valid ISO BMFF magic bytes, intentionally not playable audio; MOCK_AI
   // skips native duration inspection. Same fixture as scripts/smoke.mjs.
@@ -251,7 +251,9 @@ function audioForm(questionId, requestId) {
   );
   const tail = Buffer.from(
     `\r\n--${boundary}\r\nContent-Disposition: form-data; name="questionId"\r\n\r\n${questionId}\r\n` +
-      `--${boundary}\r\nContent-Disposition: form-data; name="requestId"\r\n\r\n${requestId}\r\n--${boundary}--\r\n`,
+      `--${boundary}\r\nContent-Disposition: form-data; name="requestId"\r\n\r\n${requestId}\r\n` +
+      (cycleId ? `--${boundary}\r\nContent-Disposition: form-data; name="cycleId"\r\n\r\n${cycleId}\r\n` : '') +
+      `--${boundary}--\r\n`,
   );
   return { body: Buffer.concat([head, audio, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
 }
@@ -400,7 +402,7 @@ async function actionDiagnosticJourney(user) {
     return;
   }
   let current = next.body.question;
-  for (let round = 0; round < 5 && current; round++) {
+  for (let round = 0; round < 3 && current; round++) {
     const grant = await reqRobust('POST', '/uploads/audio-url', {
       token: user.token,
       json: {
@@ -459,7 +461,7 @@ async function actionPracticeQuestion(user) {
     fail(user, 'practice/question', `expected 200, got ${response.ok ? response.status : 'NETERR'}`);
     return;
   }
-  const { question, kind, progress } = response.body || {};
+  const { question, kind, progress, cycleId } = response.body || {};
   if (
     !questionShape(question) ||
     question.cefrLevel !== user.level ||
@@ -467,12 +469,14 @@ async function actionPracticeQuestion(user) {
     !progress ||
     progress.masteredCount !== 0 ||
     progress.learningCount !== 0 ||
-    progress.totalAtLevel !== 100
+    progress.totalAtLevel !== 100 ||
+    !isUuid(cycleId)
   ) {
     fail(user, 'practice/question', `bad shape ${JSON.stringify(response.body)?.slice(0, 250)}`);
     return;
   }
   user.practiceQuestionId = question.id;
+  user.practiceCycleId = cycleId;
 }
 
 async function actionHelp(user) {
@@ -503,7 +507,7 @@ async function actionHelp(user) {
   user.helpOk = true;
 }
 
-async function englishAttemptOnce(user, questionId) {
+async function englishAttemptOnce(user, questionId, cycleId) {
   const grant = await reqRobust('POST', '/uploads/audio-url', {
     token: user.token,
     json: {
@@ -518,7 +522,7 @@ async function englishAttemptOnce(user, questionId) {
   const requestId = randomUUID();
   const response = await reqRobust('POST', '/practice/attempt', {
     token: user.token,
-    form: audioForm(questionId, requestId),
+    form: audioForm(questionId, requestId, cycleId),
   });
   if (!response.ok || response.status !== 200 || !mockAssessmentValid(response.body)) {
     fail(
@@ -538,9 +542,10 @@ async function englishAttemptOnce(user, questionId) {
 
 async function actionEnglishJourney(user) {
   let questionId = user.practiceQuestionId;
+  let cycleId = user.practiceCycleId;
   let expectedAttemptNo = 1;
   while (expectedAttemptNo <= 3) {
-    const attempt = await englishAttemptOnce(user, questionId);
+    const attempt = await englishAttemptOnce(user, questionId, cycleId);
     if (!attempt) return;
     if (attempt.body.attemptNo !== expectedAttemptNo) {
       fail(user, 'practice/attempt', `attemptNo ${attempt.body.attemptNo}, expected ${expectedAttemptNo}`);
@@ -559,6 +564,7 @@ async function actionEnglishJourney(user) {
         return;
       }
       user.practiceQuestionId = attempt.body.next.question.id;
+      user.practiceCycleId = attempt.body.next.cycleId;
       return;
     }
     if (expectedAttemptNo < 3) {
@@ -575,6 +581,7 @@ async function actionEnglishJourney(user) {
       return;
     }
     user.practiceQuestionId = attempt.body.next.question.id;
+    user.practiceCycleId = attempt.body.next.cycleId;
     return;
   }
 }
@@ -602,6 +609,8 @@ async function actionEnglishProgress(user) {
     return;
   }
   user.progressAfterEnglish = { masteredCount: progress.masteredCount, learningCount: progress.learningCount };
+  user.practiceQuestionId = response.body.question.id;
+  user.practiceCycleId = response.body.cycleId;
 }
 
 async function actionNativeJourney(user) {
@@ -620,7 +629,7 @@ async function actionNativeJourney(user) {
   const questionId = user.practiceQuestionId;
   const response = await reqRobust('POST', '/practice/attempt/native', {
     token: user.token,
-    form: audioForm(questionId, requestId),
+    form: audioForm(questionId, requestId, user.practiceCycleId),
   });
   const body = response.ok ? response.body : null;
   const nativeValid =
@@ -628,10 +637,13 @@ async function actionNativeJourney(user) {
     body.mode === 'native' &&
     body.understood === true &&
     body.transcript === '(mock transcript)' &&
+    body.translatedTranscript === '(mock English translation)' &&
     typeof body.modelAnswer === 'string' &&
     body.modelAnswer.includes('MOCK_AI=true') &&
     typeof body.feedback === 'string' &&
-    body.feedback.includes('MOCK_AI=true');
+    body.feedback.includes('MOCK_AI=true') &&
+    body.attemptNo === 1 &&
+    body.attemptsLeft === 2;
   if (!response.ok || response.status !== 200 || !nativeValid) {
     fail(
       user,
@@ -640,7 +652,7 @@ async function actionNativeJourney(user) {
     );
     return;
   }
-  user.nativeAttempt = { questionId, requestId, response: body };
+  user.nativeAttempt = { questionId, cycleId: user.practiceCycleId, requestId, response: body };
 
   const status = await reqRobust('GET', `/assessments/${requestId}`, { token: user.token });
   if (
@@ -661,10 +673,10 @@ async function actionNativeJourney(user) {
 }
 
 async function actionNativeReplay(user) {
-  const { questionId, requestId, response: original } = user.nativeAttempt;
+  const { questionId, cycleId, requestId, response: original } = user.nativeAttempt;
   const replay = await reqRobust('POST', '/practice/attempt/native', {
     token: user.token,
-    form: audioForm(questionId, requestId),
+    form: audioForm(questionId, requestId, cycleId),
   });
   // The stored response round-trips through JSONB, which does not preserve
   // key order — compare structurally, not by serialization.
@@ -673,7 +685,7 @@ async function actionNativeReplay(user) {
     return;
   }
   user.nativeReplayOk = true;
-  // Native mode must not move mastery.
+  // Native mode consumes a shared try but must not move English mastery.
   const after = await reqRobust('GET', '/practice/question', { token: user.token });
   const expected = user.progressAfterEnglish || { masteredCount: 0, learningCount: 0 };
   const progress = after.body?.progress;
@@ -682,9 +694,21 @@ async function actionNativeReplay(user) {
     after.status !== 200 ||
     !progress ||
     progress.masteredCount !== expected.masteredCount ||
-    progress.learningCount !== expected.learningCount
+    progress.learningCount !== expected.learningCount + 1
   ) {
-    fail(user, 'native progress invariance', `expected ${JSON.stringify(expected)}, got ${JSON.stringify(progress)}`);
+    fail(
+      user,
+      'native mastery invariance',
+      `expected mastered=${expected.masteredCount}, learning=${expected.learningCount + 1}; got ${JSON.stringify(progress)}`,
+    );
+    return;
+  }
+  if (
+    after.body.cycleId !== cycleId ||
+    after.body.attemptsUsed !== original.attemptNo ||
+    after.body.attemptsLeft !== original.attemptsLeft
+  ) {
+    fail(user, 'native shared attempt budget', `unexpected ${JSON.stringify(after.body)?.slice(0, 250)}`);
   }
 }
 
@@ -694,7 +718,7 @@ async function actionExport(user) {
     fail(user, 'export', `expected 200, got ${response.ok ? response.status : 'NETERR'}`);
     return;
   }
-  const expectedAttempts = user.diagnosticAnswers.length + user.englishAttempts.length;
+  const expectedAttempts = user.diagnosticAnswers.length + user.englishAttempts.length + 1;
   const attempts = response.body?.attempts;
   if (
     response.body?.user?.id !== user.id ||
@@ -712,7 +736,8 @@ async function actionExport(user) {
   }
   if (
     attempts.filter((a) => a.context === 'diagnostic').length !== user.diagnosticAnswers.length ||
-    attempts.filter((a) => a.context === 'practice').length !== user.englishAttempts.length
+    attempts.filter((a) => a.context === 'practice').length !== user.englishAttempts.length ||
+    attempts.filter((a) => a.context === 'practice-native').length !== 1
   ) {
     fail(user, 'export', 'attempt contexts mismatch');
     return;
@@ -924,7 +949,7 @@ async function main() {
   );
   const nativeDone = nativeCohort.filter((u) => u.nativeStatusOk && u.failures.length === 0);
   await concurrentPhase(
-    'native replay + progress invariance',
+    'native replay + mastery invariance',
     full.filter((u) => nativeDone.includes(u)),
     actionNativeReplay,
   );
@@ -1002,9 +1027,16 @@ async function main() {
           diagnosticAnswers: u.diagnosticAnswers,
           level: u.level,
           practiceQuestionId: u.practiceQuestionId,
+          practiceCycleId: u.practiceCycleId,
           englishAttempts: u.englishAttempts,
           nativeAttempt: u.nativeAttempt
-            ? { questionId: u.nativeAttempt.questionId, requestId: u.nativeAttempt.requestId }
+            ? {
+                questionId: u.nativeAttempt.questionId,
+                cycleId: u.nativeAttempt.cycleId,
+                requestId: u.nativeAttempt.requestId,
+                attemptNo: u.nativeAttempt.response.attemptNo,
+                understood: u.nativeAttempt.response.understood,
+              }
             : null,
           changedPassword: u.changedPassword,
           deleted: u.deleted,

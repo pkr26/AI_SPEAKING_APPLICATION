@@ -5,11 +5,13 @@ import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from
 import {
   AccessibilityInfo,
   ActivityIndicator,
+  Alert,
   Animated,
   AppState,
   Linking,
   Platform,
   Pressable,
+  Switch,
   Text,
   useAnimatedValue,
   View,
@@ -50,6 +52,7 @@ import {
   ensurePendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
+  markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
   refundPendingAssessmentRecoveryPost,
@@ -60,7 +63,7 @@ import { createThemedStyles, useTheme } from '../lib/theme';
 import { ContractError } from '../lib/types';
 import Button from './Button';
 
-export type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering';
+export type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering' | 'parked';
 
 export interface RecorderResultMetadata {
   requestId: string;
@@ -80,6 +83,8 @@ export function scrollToExpandedRecorderControls(
 interface RecorderCommonProps<T> {
   ownerId: string;
   questionId: string;
+  /** Practice-only server serving cycle; omitted for diagnostic answers. */
+  cycleId?: string;
   /** Externally disables recorder actions while a sibling mutation is active. */
   disabled?: boolean;
   /** Ref-safe guard for a Start/Re-record handler captured before that mutation. */
@@ -98,6 +103,8 @@ interface RecorderCommonProps<T> {
   onRecoveryUnresolved: () => void;
   /** Locks controls that would discard or retarget the current recording. */
   onInteractionLockChange?: (locked: boolean) => void;
+  /** Locks route exits separately; parked recovery keeps controls locked but allows leaving. */
+  onExitLockChange?: (locked: boolean) => void;
   /** Requests that the host reveal review/upload actions after they are laid out. */
   onExpandedControlsLayout?: () => void;
   /** Lets a screen restore the endpoint saved with an interrupted submission. */
@@ -130,6 +137,7 @@ interface AssessmentIdentity {
   ownerId: string;
   endpoint: AssessmentEndpoint;
   questionId: string;
+  cycleId?: string;
 }
 
 let activeRecoveryOwner: symbol | null = null;
@@ -148,6 +156,7 @@ const MAX_CAPACITY_RETRIES = 3;
 const CAPACITY_RETRY_ATTEMPTS = [0, 1, 2, 3] as const;
 const CAPACITY_RETRY_MAX_DELAY_MS = 30_000;
 const RECOVERY_POLL_MS = 2_000;
+const RECOVERY_CHECK_LATER_MS = 15_000;
 const NOT_FOUND_CONFIRMATIONS = 3;
 const S3_RESUBMIT_BASE_BACKOFF_MS = 5_000;
 /** Automatic re-uploads of the surviving local recording per recovery cycle. */
@@ -176,6 +185,14 @@ function isDefiniteAssessmentServerFailure(error: unknown): error is ApiError {
       error.code === 'CAPACITY_BUSY' ||
       error.code === 'POOL_SATURATED' ||
       error.code === 'INTERNAL')
+  );
+}
+
+function isIncompatibleSavedAssessment(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    error.code === 'ASSESSMENT_RESULT_INCOMPATIBLE'
   );
 }
 
@@ -249,11 +266,13 @@ export function assessmentIdentityMatches(
   ownerId: string,
   endpoint: AssessmentEndpoint,
   questionId: string,
+  cycleId?: string,
 ): boolean {
   return (
     current.ownerId === ownerId &&
     current.endpoint === endpoint &&
-    current.questionId === questionId
+    current.questionId === questionId &&
+    current.cycleId === cycleId
   );
 }
 
@@ -409,11 +428,14 @@ export function pendingAssessmentCanUpload(
   endpoint: AssessmentEndpoint,
   questionId: string,
   requestId: string,
+  retainRecording: boolean,
+  cycleId?: string,
 ): boolean {
   return (
     pending.requestId === requestId &&
-    assessmentIdentityMatches(pending, ownerId, endpoint, questionId) &&
+    assessmentIdentityMatches(pending, ownerId, endpoint, questionId, cycleId) &&
     pending.stage === 'prepared' &&
+    pending.retainRecording === retainRecording &&
     pending.cancelRequested !== true &&
     (pending.recoveryPostAttempts ?? 0) === 0
   );
@@ -747,7 +769,8 @@ export function recordingStartIsBlocked(
     recovering ||
     phase === 'recording' ||
     phase === 'uploading' ||
-    phase === 'recovering'
+    phase === 'recovering' ||
+    phase === 'parked'
   );
 }
 
@@ -871,6 +894,7 @@ function cleanupOrphanedRecordingCache(): void {
 export default function Recorder<T>({
   ownerId,
   questionId,
+  cycleId,
   disabled = false,
   isStartBlocked,
   endpoint,
@@ -881,6 +905,7 @@ export default function Recorder<T>({
   onRateLimited,
   onRecoveryUnresolved,
   onInteractionLockChange,
+  onExitLockChange,
   onExpandedControlsLayout,
   onRecoveryEndpointMismatch,
 }: RecorderProps<T>) {
@@ -951,10 +976,14 @@ export default function Recorder<T>({
   const [recoveryRetryNeeded, setRecoveryRetryNeeded] = useState(false);
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);
+  const permissionNeedsSettingsRef = useRef(false);
   const [reduceMotion, setReduceMotion] = useState(false);
   const [recordedDurationMillis, setRecordedDurationMillis] = useState(0);
   const [waitElapsedMillis, setWaitElapsedMillis] = useState(0);
+  const [remoteTransferStarted, setRemoteTransferStarted] = useState(false);
+  const [assessmentRequestStarted, setAssessmentRequestStarted] = useState(false);
   const [previewPlaying, setPreviewPlaying] = useState(false);
+  const [retainRecording, setRetainRecording] = useState(false);
   const pulse = useAnimatedValue(1);
   const phaseRef = useRef<Phase>('idle');
   const operationOwnerRef = useRef<symbol | null>(null);
@@ -972,7 +1001,7 @@ export default function Recorder<T>({
   const hasObservedRecordingRef = useRef(false);
   const recordingInterruptionHandledRef = useRef(false);
   const autoStoppedAtRef = useRef<number | null>(null);
-  const previousIdentityRef = useRef({ ownerId, endpoint, questionId });
+  const previousIdentityRef = useRef({ ownerId, endpoint, questionId, cycleId });
   const requestIdRef = useRef<string | null>(null);
   const cancelRequestedRef = useRef(false);
   const assessmentPostedRef = useRef(false);
@@ -984,6 +1013,7 @@ export default function Recorder<T>({
     ownerId: string;
     endpoint: AssessmentEndpoint;
     questionId: string;
+    cycleId?: string;
     response: { granted: boolean; canAskAgain?: boolean };
   } | null>(null);
   const startRecordingRef = useRef<() => Promise<void>>(async () => undefined);
@@ -1014,6 +1044,7 @@ export default function Recorder<T>({
     isStartBlocked,
     onError,
     onExpandedControlsLayout,
+    onExitLockChange,
     onInteractionLockChange,
     onRateLimited,
     onRecoveryEndpointMismatch,
@@ -1069,7 +1100,7 @@ export default function Recorder<T>({
     audioRestorePromiseRef.current = promise;
     return promise;
   }, []);
-  const identityRef = useRef({ ownerId, endpoint, questionId });
+  const identityRef = useRef({ ownerId, endpoint, questionId, cycleId });
 
   useLayoutEffect(() => {
     callbacksRef.current = {
@@ -1077,6 +1108,7 @@ export default function Recorder<T>({
       isStartBlocked,
       onError,
       onExpandedControlsLayout,
+      onExitLockChange,
       onInteractionLockChange,
       onRateLimited,
       onRecoveryEndpointMismatch,
@@ -1090,6 +1122,7 @@ export default function Recorder<T>({
     isStartBlocked,
     onError,
     onExpandedControlsLayout,
+    onExitLockChange,
     onInteractionLockChange,
     onRateLimited,
     onRecoveryEndpointMismatch,
@@ -1100,8 +1133,8 @@ export default function Recorder<T>({
   ]);
 
   useLayoutEffect(() => {
-    identityRef.current = { ownerId, endpoint, questionId };
-  }, [endpoint, ownerId, questionId]);
+    identityRef.current = { ownerId, endpoint, questionId, cycleId };
+  }, [cycleId, endpoint, ownerId, questionId]);
 
   useLayoutEffect(() => {
     currentRecorderRef.current = recorder;
@@ -1119,6 +1152,8 @@ export default function Recorder<T>({
   // unlocked state.
   const lockedRef = useRef<boolean | null>(null);
   const interactionLockCallbackRef = useRef(onInteractionLockChange);
+  const exitLockedRef = useRef<boolean | null>(null);
+  const exitLockCallbackRef = useRef(onExitLockChange);
 
   const publishOperation = useCallback(() => {
     if (!operationCanPublish(mountedRef.current, unmountingRef.current)) return;
@@ -1126,6 +1161,10 @@ export default function Recorder<T>({
     if (lockedRef.current !== true) {
       lockedRef.current = true;
       callbacksRef.current.onInteractionLockChange?.(true);
+    }
+    if (exitLockedRef.current !== true) {
+      exitLockedRef.current = true;
+      callbacksRef.current.onExitLockChange?.(true);
     }
   }, []);
 
@@ -1232,6 +1271,7 @@ export default function Recorder<T>({
 
   useLayoutEffect(() => {
     const locked = phase !== 'idle' || operationActive;
+    const exitLocked = (phase !== 'idle' && phase !== 'parked') || operationActive;
     if (interactionLockCallbackRef.current !== onInteractionLockChange) {
       interactionLockCallbackRef.current?.(false);
       interactionLockCallbackRef.current = onInteractionLockChange;
@@ -1240,14 +1280,25 @@ export default function Recorder<T>({
     // Only an actual transition is reported: screens clear their inline
     // notices whenever the recorder locks, so re-announcing a lock the phase
     // never left would wipe the 429 wait line published in the same commit.
-    if (lockedRef.current === locked) return;
-    lockedRef.current = locked;
-    onInteractionLockChange?.(locked);
-  }, [onInteractionLockChange, operationActive, phase]);
+    if (lockedRef.current !== locked) {
+      lockedRef.current = locked;
+      onInteractionLockChange?.(locked);
+    }
+    if (exitLockCallbackRef.current !== onExitLockChange) {
+      exitLockCallbackRef.current?.(false);
+      exitLockCallbackRef.current = onExitLockChange;
+      exitLockedRef.current = null;
+    }
+    if (exitLockedRef.current !== exitLocked) {
+      exitLockedRef.current = exitLocked;
+      onExitLockChange?.(exitLocked);
+    }
+  }, [onExitLockChange, onInteractionLockChange, operationActive, phase]);
 
   useEffect(() => {
     return () => {
       interactionLockCallbackRef.current?.(false);
+      exitLockCallbackRef.current?.(false);
     };
   }, []);
 
@@ -1328,6 +1379,30 @@ export default function Recorder<T>({
       return false;
     }
   }, []);
+
+  /**
+   * A versioned server tombstone proves an old completed result can neither be
+   * displayed by this app nor become compatible by polling/reposting. Retire
+   * the durable handoff before unlocking, remove its stale take, and ask the
+   * owning screen to reload canonical question/profile state so the learner
+   * can make a genuinely new answer with a new requestId.
+   */
+  const retireIncompatibleSavedAssessment = useCallback(
+    async (requestId: string, contextIsCurrent: () => boolean) => {
+      const cleared = await clearRequestTracking(requestId);
+      if (!contextIsCurrent()) return;
+      if (!cleared) {
+        failRecoveryAwaitingRetry(translate('recorder.errRetryInfoClear'));
+        return;
+      }
+      discardRecording();
+      updatePhase('idle');
+      callbacksRef.current.onRecoveryUnresolved();
+      if (!contextIsCurrent()) return;
+      callbacksRef.current.onError(translate('error.assessmentResultIncompatible'));
+    },
+    [clearRequestTracking, discardRecording, failRecoveryAwaitingRetry, updatePhase],
+  );
 
   const invalidateRecovery = useCallback(() => {
     recoveryGenerationRef.current += 1;
@@ -1525,7 +1600,7 @@ export default function Recorder<T>({
   const recoverPending = useCallback(async () => {
     const instanceId = instanceIdRef.current;
     const identityIsCurrent = () =>
-      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId, cycleId) &&
       currentRecorderRef.current === recorder;
     if (activeRecoveryOwner !== null && activeRecoveryOwner !== instanceId) {
       if (phaseRef.current === 'recovering' && mountedRef.current) {
@@ -1630,6 +1705,7 @@ export default function Recorder<T>({
     const endpointMismatch =
       pending.ownerId === ownerId &&
       pending.questionId === questionId &&
+      pending.cycleId === cycleId &&
       pending.endpoint !== endpoint;
     if (endpointMismatch) {
       let endpointRestored: boolean;
@@ -1720,7 +1796,10 @@ export default function Recorder<T>({
         return;
       }
 
-      const routeMatches = pending.endpoint === endpoint && pending.questionId === questionId;
+      const routeMatches =
+        pending.endpoint === endpoint &&
+        pending.questionId === questionId &&
+        pending.cycleId === cycleId;
       /**
        * Releases a handoff that provably claimed nothing server-side and hands
        * the take back for review: the never-uploaded 'prepared' stage, and a
@@ -1872,7 +1951,7 @@ export default function Recorder<T>({
           } else if (status.status === 'completed' && 'response' in status) {
             if (!routeMatches) {
               try {
-                if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
+                if (!(await markPendingAssessmentFeedbackPending(pending.requestId, Date.now()))) {
                   throw new Error();
                 }
               } catch {
@@ -1887,7 +1966,6 @@ export default function Recorder<T>({
               discardRecording();
               updatePhase('idle');
               callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
-              void clearRequestTracking(pending.requestId);
               return;
             }
             let data: T;
@@ -1915,7 +1993,7 @@ export default function Recorder<T>({
             }
             if (!isCurrent()) return;
             try {
-              if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
+              if (!(await markPendingAssessmentFeedbackPending(pending.requestId, Date.now()))) {
                 throw new Error();
               }
             } catch {
@@ -1930,7 +2008,6 @@ export default function Recorder<T>({
             discardRecording();
             updatePhase('idle');
             deliverResult(data, pending.requestId);
-            void clearRequestTracking(pending.requestId);
             return;
           } else {
             await finishUnresolved(translate('recorder.errRecoveryMismatch'), false);
@@ -1938,6 +2015,10 @@ export default function Recorder<T>({
           }
         } catch (error) {
           if (!isCurrent()) return;
+          if (isIncompatibleSavedAssessment(error)) {
+            await retireIncompatibleSavedAssessment(pending.requestId, isCurrent);
+            return;
+          }
           if (error instanceof ApiError && error.status === 404) {
             notFoundCount += 1;
             if (resubmissionConflictPending) {
@@ -2004,6 +2085,8 @@ export default function Recorder<T>({
                   body: {
                     questionId: pending.questionId,
                     requestId: pending.requestId,
+                    ...(pending.cycleId === undefined ? {} : { cycleId: pending.cycleId }),
+                    retainRecording: pending.retainRecording,
                     audioKey: currentAudioKey,
                   },
                   signal: recoveryController.signal,
@@ -2025,7 +2108,9 @@ export default function Recorder<T>({
                   return;
                 }
                 try {
-                  if (!(await markPendingAssessmentForReconciliation(pending.requestId))) {
+                  if (
+                    !(await markPendingAssessmentFeedbackPending(pending.requestId, Date.now()))
+                  ) {
                     throw new Error();
                   }
                 } catch {
@@ -2038,9 +2123,14 @@ export default function Recorder<T>({
                 discardRecording();
                 updatePhase('idle');
                 deliverResult(data, pending.requestId);
-                void clearRequestTracking(pending.requestId);
                 return;
               } catch (retryError) {
+                if (isIncompatibleSavedAssessment(retryError)) {
+                  if (isCurrent()) {
+                    await retireIncompatibleSavedAssessment(pending.requestId, isCurrent);
+                  }
+                  return;
+                }
                 if (!recoveryPostStarted) {
                   await refundPendingAssessmentRecoveryPost(pending.requestId).catch(() => {});
                   if (isCurrent()) {
@@ -2176,6 +2266,7 @@ export default function Recorder<T>({
   }, [
     beginOperation,
     clearRequestTracking,
+    cycleId,
     deliverResult,
     discardRecording,
     endOperation,
@@ -2187,6 +2278,7 @@ export default function Recorder<T>({
     publishOperation,
     questionId,
     recorder,
+    retireIncompatibleSavedAssessment,
     updatePhase,
   ]);
 
@@ -2223,6 +2315,33 @@ export default function Recorder<T>({
         }
         void (async () => {
           await lifecycleStopPromiseRef.current;
+          if (permissionNeedsSettingsRef.current) {
+            const permissionIdentity = { ...identityRef.current };
+            try {
+              const permission = await AudioModule.getRecordingPermissionsAsync();
+              if (
+                permission.granted &&
+                mountedRef.current &&
+                focusedRef.current &&
+                appIsActive() &&
+                assessmentIdentityMatches(
+                  identityRef.current,
+                  permissionIdentity.ownerId,
+                  permissionIdentity.endpoint,
+                  permissionIdentity.questionId,
+                  permissionIdentity.cycleId,
+                )
+              ) {
+                permissionNeedsSettingsRef.current = false;
+                setPermissionNeedsSettings(false);
+                setPermissionDenied(false);
+                AccessibilityInfo.announceForAccessibility(translate('recorder.permissionGranted'));
+              }
+            } catch {
+              // Keep the actionable Settings guidance visible and retry after
+              // the next foreground transition or explicit record tap.
+            }
+          }
           const deferredPermission = deferredPermissionResponseRef.current;
           if (deferredPermission) {
             deferredPermissionResponseRef.current = null;
@@ -2231,12 +2350,15 @@ export default function Recorder<T>({
               identityRef.current.ownerId,
               identityRef.current.endpoint,
               identityRef.current.questionId,
+              identityRef.current.cycleId,
             );
             if (identityMatches && mountedRef.current && focusedRef.current) {
               if (deferredPermission.response.granted) {
                 await startRecordingRef.current();
               } else {
                 setPermissionDenied(true);
+                permissionNeedsSettingsRef.current =
+                  deferredPermission.response.canAskAgain === false;
                 setPermissionNeedsSettings(deferredPermission.response.canAskAgain === false);
               }
             }
@@ -2268,17 +2390,20 @@ export default function Recorder<T>({
     if (
       previous.ownerId !== ownerId ||
       previous.endpoint !== endpoint ||
-      previous.questionId !== questionId
+      previous.questionId !== questionId ||
+      previous.cycleId !== cycleId
     ) {
-      previousIdentityRef.current = { ownerId, endpoint, questionId };
+      previousIdentityRef.current = { ownerId, endpoint, questionId, cycleId };
       deferredPermissionResponseRef.current = null;
       // stopForLifecycle invalidates the epoch synchronously before its first
       // await. Keeping this in the commit's layout phase prevents old async
       // work from observing the new identity before cleanup begins.
       void stopForLifecycle();
       setPermissionDenied(false);
+      permissionNeedsSettingsRef.current = false;
+      setPermissionNeedsSettings(false);
     }
-  }, [endpoint, ownerId, questionId, stopForLifecycle]);
+  }, [cycleId, endpoint, ownerId, questionId, stopForLifecycle]);
 
   useEffect(() => {
     let active = true;
@@ -2491,13 +2616,14 @@ export default function Recorder<T>({
     const operationToken = beginOperation();
     if (!operationToken) return;
     let lifecycleEpoch = lifecycleEpochRef.current;
-    const startIdentity = { ownerId, endpoint, questionId, recorder };
+    const startIdentity = { ownerId, endpoint, questionId, cycleId, recorder };
     const identityIsCurrent = () =>
       assessmentIdentityMatches(
         identityRef.current,
         startIdentity.ownerId,
         startIdentity.endpoint,
         startIdentity.questionId,
+        startIdentity.cycleId,
       ) && currentRecorderRef.current === startIdentity.recorder;
     const isCurrentLifecycle = () =>
       recorderOperationIsCurrent(
@@ -2519,7 +2645,11 @@ export default function Recorder<T>({
     let preparedCandidateUri: string | null = null;
     let recoverAfterStart = false;
     releasePreviewPlayer();
-    if (mountedRef.current) setPermissionDenied(false);
+    if (mountedRef.current) {
+      setPermissionDenied(false);
+      permissionNeedsSettingsRef.current = false;
+      setPermissionNeedsSettings(false);
+    }
     try {
       if (!appIsActive()) {
         await waitForForeground(PERMISSION_PROMPT_RESUME_MS);
@@ -2548,6 +2678,7 @@ export default function Recorder<T>({
             ownerId: startIdentity.ownerId,
             endpoint: startIdentity.endpoint,
             questionId: startIdentity.questionId,
+            ...(startIdentity.cycleId === undefined ? {} : { cycleId: startIdentity.cycleId }),
             response,
           };
           return;
@@ -2559,6 +2690,7 @@ export default function Recorder<T>({
       if (!response.granted) {
         if (mountedRef.current) {
           setPermissionDenied(true);
+          permissionNeedsSettingsRef.current = response.canAskAgain === false;
           setPermissionNeedsSettings(response.canAskAgain === false);
         }
         return;
@@ -2649,6 +2781,10 @@ export default function Recorder<T>({
         deleteRecording(previousUri);
       }
       activeUriRef.current = null;
+      // Retention is a per-take choice, never a sticky account/device
+      // preference. Reset only after a genuinely new recording has begun so a
+      // failed Re-record attempt keeps the previous take's selection.
+      setRetainRecording(false);
       updatePhase('recording');
     } catch {
       if (prepared) {
@@ -2685,7 +2821,7 @@ export default function Recorder<T>({
     // operation-token currency already proves the epoch is current here.
     const isCurrentLifecycle = () =>
       operationIsCurrent(operationToken) &&
-      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId, cycleId) &&
       currentRecorderRef.current === recorder &&
       recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState);
     const recordingStartedAt = recordingStartedAtRef.current;
@@ -2780,6 +2916,7 @@ export default function Recorder<T>({
 
   const submit = async () => {
     if (phaseRef.current !== 'recorded') return;
+    const submissionRetainRecording = retainRecording;
     const pendingGeneration = capturePendingAssessmentGeneration();
     const operationToken = beginOperation();
     if (!operationToken) return;
@@ -2799,6 +2936,8 @@ export default function Recorder<T>({
     releasePreviewPlayer();
     cancelRequestedRef.current = false;
     assessmentPostedRef.current = false;
+    setRemoteTransferStarted(false);
+    setAssessmentRequestStarted(false);
     cancelPersistenceRef.current = null;
     cancelledSubmissionRequestIdRef.current = null;
     updatePhase('uploading');
@@ -2806,7 +2945,7 @@ export default function Recorder<T>({
     // so token currency already proves the epoch cannot have changed.
     const isCurrentSubmission = () =>
       operationIsCurrent(operationToken) &&
-      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId) &&
+      assessmentIdentityMatches(identityRef.current, ownerId, endpoint, questionId, cycleId) &&
       currentRecorderRef.current === recorder &&
       recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState);
     const controller = new AbortController();
@@ -2827,8 +2966,10 @@ export default function Recorder<T>({
         ownerId,
         endpoint,
         questionId,
+        ...(cycleId === undefined ? {} : { cycleId }),
         requestId,
         createdAt: Date.now(),
+        retainRecording: submissionRetainRecording,
         stage: 'prepared',
       };
       let authoritativePending: PendingAssessment | null;
@@ -2849,7 +2990,15 @@ export default function Recorder<T>({
         return;
       }
       if (
-        !pendingAssessmentCanUpload(authoritativePending, ownerId, endpoint, questionId, requestId)
+        !pendingAssessmentCanUpload(
+          authoritativePending,
+          ownerId,
+          endpoint,
+          questionId,
+          requestId,
+          submissionRetainRecording,
+          cycleId,
+        )
       ) {
         recoverAfterUpload = true;
         updatePhase('recovering');
@@ -2885,11 +3034,19 @@ export default function Recorder<T>({
             if (grant.mode === 's3') {
               return await apiFetch<unknown>(endpoint, {
                 method: 'POST',
-                body: { questionId, requestId, audioKey: grant.audioKey },
+                body: {
+                  questionId,
+                  requestId,
+                  ...(cycleId === undefined ? {} : { cycleId }),
+                  retainRecording: submissionRetainRecording,
+                  audioKey: grant.audioKey,
+                },
                 signal: controller.signal,
                 timeoutMs: AUDIO_TIMEOUT_MS,
                 onRequestStarted: () => {
                   assessmentPostedRef.current = true;
+                  if (mountedRef.current) setRemoteTransferStarted(true);
+                  if (mountedRef.current) setAssessmentRequestStarted(true);
                 },
               });
             }
@@ -2899,11 +3056,18 @@ export default function Recorder<T>({
             return await apiUploadAudio<unknown>(
               endpoint,
               uri,
-              { questionId, requestId },
+              {
+                questionId,
+                requestId,
+                ...(cycleId === undefined ? {} : { cycleId }),
+                retainRecording: String(submissionRetainRecording),
+              },
               {
                 signal: controller.signal,
                 onRequestStarted: () => {
                   assessmentPostedRef.current = true;
+                  if (mountedRef.current) setRemoteTransferStarted(true);
+                  if (mountedRef.current) setAssessmentRequestStarted(true);
                 },
               },
             );
@@ -2916,6 +3080,7 @@ export default function Recorder<T>({
             // for its Retry-After there is no assessment request in flight, so
             // Cancel can return the take immediately without reconciliation.
             assessmentPostedRef.current = false;
+            if (mountedRef.current) setAssessmentRequestStarted(false);
             const delayMs = capacityRetryDelayMillis(error.retryAfterSeconds);
             await sleepAbortable(delayMs, controller.signal);
             if (!canContinueSubmission()) throw error;
@@ -2938,6 +3103,7 @@ export default function Recorder<T>({
           return;
         }
         if (!canContinueSubmission()) return;
+        if (mountedRef.current) setRemoteTransferStarted(true);
         await apiPostPresignedAudio(
           grant.uploadUrl,
           grant.uploadFields,
@@ -2995,7 +3161,7 @@ export default function Recorder<T>({
       }
       discardRecording();
       try {
-        if (!(await markPendingAssessmentForReconciliation(requestId))) {
+        if (!(await markPendingAssessmentFeedbackPending(requestId, Date.now()))) {
           throw new Error();
         }
       } catch {
@@ -3006,7 +3172,6 @@ export default function Recorder<T>({
       if (!canContinueSubmission()) return;
       updatePhase('idle');
       deliverResult(data, requestId);
-      void clearRequestTracking(requestId);
     } catch (error) {
       if (controller.signal.aborted) {
         // Lifecycle cleanup (blur, background, unmount) owns non-user aborts.
@@ -3024,8 +3189,10 @@ export default function Recorder<T>({
             failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
             return;
           }
-          recoverAfterUpload = true;
-          updatePhase('recovering');
+          // The learner explicitly chose Stop Waiting. Keep the same durable
+          // request for a later GET, but do not start another foreground poll.
+          recoverAfterUpload = false;
+          updatePhase('parked');
           return;
         }
         // Nothing was claimed server-side: forget the handoff and hand the
@@ -3042,6 +3209,13 @@ export default function Recorder<T>({
         return;
       }
       if (!isCurrentSubmission()) return;
+      if (isIncompatibleSavedAssessment(error)) {
+        const requestId = requestIdRef.current;
+        if (requestId) {
+          await retireIncompatibleSavedAssessment(requestId, isCurrentSubmission);
+        }
+        return;
+      }
       // 426 belongs here: the client-version gate rejects ahead of the
       // idempotency claim, so it can never accompany a committed attempt.
       const definitelyRejected =
@@ -3172,7 +3346,57 @@ export default function Recorder<T>({
   // Escape hatch for a terminally failed recovery (e.g. SecureStore threw):
   // re-run the same recovery path the focus/foreground triggers would run.
   const retryRecovery = () => {
+    if (phaseRef.current === 'parked') updatePhase('recovering');
     void recoverPending();
+  };
+
+  const checkRecoveryLater = () => {
+    if (phaseRef.current !== 'recovering') return;
+    // This is not cancellation: keep every durable claim/key/counter intact.
+    // Only stop this screen's GET loop and release route exits.
+    invalidateRecovery();
+    updatePhase('parked');
+  };
+
+  const discardTake = async () => {
+    if (phaseRef.current !== 'recorded' || callbacksRef.current.disabled || operationIsInFlight()) {
+      return;
+    }
+    const operationToken = beginOperation();
+    if (!operationToken) return;
+    releasePreviewPlayer();
+    try {
+      const requestId = requestIdRef.current;
+      const cleared = requestId ? await clearRequestTracking(requestId) : true;
+      if (!operationIsCurrent(operationToken) || phaseRef.current !== 'recorded') return;
+      if (!cleared) {
+        callbacksRef.current.onError(translate('recorder.errDiscardFailed'));
+        return;
+      }
+      discardRecording();
+      recordingCompletionRef.current = null;
+      autoStoppedAtRef.current = null;
+      setRecordedDurationMillis(0);
+      setRetainRecording(false);
+      updatePhase('idle');
+      AccessibilityInfo.announceForAccessibility(translate('recorder.discarded'));
+    } finally {
+      endOperation(operationToken);
+    }
+  };
+
+  const confirmDiscardTake = () => {
+    if (phaseRef.current !== 'recorded' || callbacksRef.current.disabled || operationIsInFlight()) {
+      return;
+    }
+    Alert.alert(translate('recorder.discardTitle'), translate('recorder.discardBody'), [
+      { text: translate('common.cancel'), style: 'cancel' },
+      {
+        text: translate('recorder.discard'),
+        style: 'destructive',
+        onPress: () => void discardTake(),
+      },
+    ]);
   };
 
   const togglePreview = async () => {
@@ -3292,7 +3516,8 @@ export default function Recorder<T>({
   };
 
   const busy = phase === 'uploading' || phase === 'recovering';
-  const controlsDisabled = recorderControlsAreDisabled(disabled, busy, operationActive);
+  const parked = phase === 'parked';
+  const controlsDisabled = recorderControlsAreDisabled(disabled, busy || parked, operationActive);
   const reviewActionsDisabled = recorderControlsAreDisabled(disabled, false, operationActive);
   const elapsed = formatElapsed(
     phase === 'recorded' ? recordedDurationMillis : (recorderState.durationMillis ?? 0),
@@ -3312,11 +3537,15 @@ export default function Recorder<T>({
     <View style={styles.container}>
       {permissionDenied && (
         <View accessibilityRole="alert" style={styles.permissionBanner}>
-          <Text style={styles.permissionText}>{t('recorder.permissionBody')}</Text>
+          <Text style={styles.permissionText}>
+            {t(
+              permissionNeedsSettings ? 'recorder.permissionBody' : 'recorder.permissionRetryBody',
+            )}
+          </Text>
           {permissionNeedsSettings && (
             <Button
               title={t('recorder.openSettings')}
-              variant="danger"
+              variant="secondary"
               size="sm"
               onPress={() => {
                 void Linking.openSettings().catch(() =>
@@ -3382,9 +3611,11 @@ export default function Recorder<T>({
               ? t('recorder.a11ySaved')
               : phase === 'recovering'
                 ? t('recorder.a11yRecovering')
-                : busy
-                  ? t('recorder.a11yUploading')
-                  : t('recorder.a11yIdle')
+                : parked
+                  ? t('replay.failedBody')
+                  : busy
+                    ? t('recorder.a11yUploading')
+                    : t('recorder.a11yIdle')
         }
         style={styles.statusText}
       >
@@ -3394,12 +3625,15 @@ export default function Recorder<T>({
             ? t('recorder.statusRecorded', { elapsed })
             : phase === 'recovering'
               ? t('recorder.statusRecovering')
-              : busy
-                ? uploadStageText
-                : t('recorder.statusIdle')}
+              : parked
+                ? t('replay.failedBody')
+                : busy
+                  ? uploadStageText
+                  : t('recorder.statusIdle')}
       </Text>
 
       <Text style={styles.privacyText}>{t('recorder.privacyNote')}</Text>
+      <Text style={styles.retentionText}>{t('recorder.retentionNote')}</Text>
 
       {busy && (
         <View
@@ -3423,10 +3657,18 @@ export default function Recorder<T>({
           </Text>
           {phase === 'uploading' && (
             <Button
-              title={t('common.cancel')}
+              title={t(
+                assessmentRequestStarted ? 'recorder.stopWaiting' : 'recorder.cancelSending',
+              )}
               variant="secondary"
               size="sm"
-              accessibilityHint={t('recorder.cancelHint')}
+              accessibilityHint={t(
+                assessmentRequestStarted
+                  ? 'recorder.stopWaitingHint'
+                  : remoteTransferStarted
+                    ? 'recorder.cancelAfterTransferHint'
+                    : 'recorder.cancelBeforeTransferHint',
+              )}
               onPress={cancelUpload}
               disabled={disabled}
               style={styles.cancelButton}
@@ -3442,6 +3684,36 @@ export default function Recorder<T>({
               style={styles.cancelButton}
             />
           )}
+          {phase === 'recovering' && waitElapsedMillis >= RECOVERY_CHECK_LATER_MS && (
+            <Button
+              title={t('replay.checkLater')}
+              variant="secondary"
+              size="sm"
+              onPress={checkRecoveryLater}
+              disabled={disabled}
+              style={styles.cancelButton}
+            />
+          )}
+        </View>
+      )}
+
+      {parked && (
+        <View
+          testID="recorder-expanded-controls"
+          style={styles.expandedControls}
+          onLayout={revealExpandedControls}
+        >
+          <Text accessibilityRole="alert" style={styles.waitHintText}>
+            {t('replay.failedBody')}
+          </Text>
+          <Button
+            title={t('common.tryAgain')}
+            variant="secondary"
+            size="sm"
+            onPress={retryRecovery}
+            disabled={disabled}
+            style={styles.cancelButton}
+          />
         </View>
       )}
 
@@ -3451,6 +3723,24 @@ export default function Recorder<T>({
           style={styles.actions}
           onLayout={revealExpandedControls}
         >
+          <View style={styles.retentionChoice}>
+            <View style={styles.retentionChoiceRow}>
+              <Text style={styles.retentionChoiceLabel}>{t('recorder.saveRecordingLabel')}</Text>
+              <Switch
+                accessibilityLabel={t('recorder.saveRecordingLabel')}
+                accessibilityHint={t('recorder.saveRecordingHint')}
+                accessibilityState={{ disabled: reviewActionsDisabled }}
+                style={styles.retentionSwitch}
+                value={retainRecording}
+                onValueChange={(value) => {
+                  if (!reviewActionsDisabled) setRetainRecording(value);
+                }}
+                disabled={reviewActionsDisabled}
+                trackColor={{ false: theme.colors.border, true: theme.colors.primary }}
+              />
+            </View>
+            <Text style={styles.retentionChoiceHint}>{t('recorder.saveRecordingHint')}</Text>
+          </View>
           <Button
             title={previewPlaying ? t('recorder.pause') : t('recorder.play')}
             variant="secondary"
@@ -3469,13 +3759,20 @@ export default function Recorder<T>({
             onPress={() => void startRecording()}
             disabled={reviewActionsDisabled}
           />
+          <Button
+            title={t('recorder.discard')}
+            variant="danger"
+            accessibilityHint={t('recorder.discardHint')}
+            onPress={confirmDiscardTake}
+            disabled={reviewActionsDisabled}
+          />
         </View>
       )}
     </View>
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
   container: {
     width: '100%',
     alignSelf: 'stretch',
@@ -3595,6 +3892,13 @@ const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => 
     color: colors.muted,
     textAlign: 'center',
   },
+  retentionText: {
+    marginTop: spacing.xs,
+    fontSize: 12,
+    lineHeight: 17,
+    color: colors.muted,
+    textAlign: 'center',
+  },
   spinner: {
     marginTop: spacing.ml,
   },
@@ -3606,5 +3910,34 @@ const themedStyles = createThemedStyles(({ colors, radii, scheme, spacing }) => 
     marginTop: spacing.xl,
     alignSelf: 'stretch',
     gap: spacing.md,
+  },
+  retentionChoice: {
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radii.input,
+    padding: spacing.md,
+    gap: spacing.xs,
+  },
+  retentionChoiceRow: {
+    minHeight: layout.minimumTarget,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: spacing.md,
+  },
+  retentionChoiceLabel: {
+    flex: 1,
+    color: colors.text,
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  retentionChoiceHint: {
+    color: colors.muted,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  retentionSwitch: {
+    minWidth: layout.minimumTarget,
+    minHeight: layout.minimumTarget,
   },
 }));

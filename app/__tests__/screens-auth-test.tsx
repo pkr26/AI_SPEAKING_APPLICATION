@@ -10,6 +10,8 @@ import {
   MAX_EMAIL_LENGTH,
   MAX_NAME_LENGTH,
   MAX_PASSWORD_UTF8_BYTES,
+  RegistrationCompletedLoginRequiredError,
+  isValidEmailAddress,
   type useAuth,
 } from '../src/lib/auth';
 import {
@@ -29,6 +31,23 @@ import type { User } from '../src/lib/types';
 // through the typed catalog.
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
+const MAX_LENGTH_EMAIL = `${'a'.repeat(64)}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+
+describe('email validation parity with the API', () => {
+  it.each(['ada@example.c', 'ada@example.12', 'ada@example.c1', 'ada@example.c-m'])(
+    'rejects the server-invalid final domain in %s',
+    (email) => {
+      expect(isValidEmailAddress(email)).toBe(false);
+    },
+  );
+
+  it.each(['ada@example.co', 'ada@learn.example.org', 'student+practice@example.museum'])(
+    'accepts the server-valid address %s',
+    (email) => {
+      expect(isValidEmailAddress(email)).toBe(true);
+    },
+  );
+});
 
 // session-notice persists through expo-secure-store, which has no native
 // module under jest; only the consume entry point is faked per test.
@@ -45,6 +64,17 @@ jest.mock('../src/lib/session-notice', () => ({
 }));
 
 const mockedConsumeSessionExpiredNotice = jest.mocked(consumeSessionExpiredNotice);
+const mockSetGuestLanguage = jest.fn();
+
+jest.mock('../src/lib/guest-language', () => ({
+  useGuestLanguage: () => ({
+    language: 'en',
+    isRestoring: false,
+    persistenceError: null,
+    setLanguage: mockSetGuestLanguage,
+    mirrorAccountLanguage: jest.fn(),
+  }),
+}));
 
 interface MockKeyboardAvoidingViewProps {
   behavior?: 'height' | 'position' | 'padding';
@@ -393,6 +423,9 @@ describe('login screen', () => {
       '/forgot-password',
     );
     expect(screen.getByRole('link', { name: t('login.footerLink') }).props.href).toBe('/signup');
+    for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
+      expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityRole).toBe('radio');
+    }
   });
 
   it('lets an idle login Link navigate', async () => {
@@ -401,6 +434,15 @@ describe('login screen', () => {
     await fireEvent.press(screen.getByRole('link', { name: t('login.forgot') }));
 
     expect(mockLinkNavigate).toHaveBeenCalledWith('/forgot-password');
+  });
+
+  it('sends an app-language choice to the guest-language preference', async () => {
+    await render(<LoginScreen />);
+
+    await fireEvent.press(screen.getByTestId('ui-language-es'));
+
+    expect(mockSetGuestLanguage).toHaveBeenCalledTimes(1);
+    expect(mockSetGuestLanguage).toHaveBeenCalledWith('es');
   });
 
   it('resubscribes the login removal guard when navigation identity changes', async () => {
@@ -615,6 +657,16 @@ describe('login screen', () => {
     );
   });
 
+  it('rejects a malformed email locally before login', async () => {
+    await render(<LoginScreen />);
+    await fillLogin('not-an-email', 'password1');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(logInButton().props.accessibilityState.disabled).toBe(true);
+    await fireEvent.press(logInButton());
+    expect(mockAuthValue.login).not.toHaveBeenCalled();
+  });
+
   it('rejects whitespace-only and oversized email values while accepting the exact limit', async () => {
     await render(<LoginScreen />);
 
@@ -624,12 +676,12 @@ describe('login screen', () => {
       busy: false,
     });
 
-    await fillLogin('a'.repeat(MAX_EMAIL_LENGTH), 'password1');
+    await fillLogin(MAX_LENGTH_EMAIL, 'password1');
     expect(logInButton().props.accessibilityState.disabled).toBe(false);
 
     // Surrounding whitespace is trimmed before the limit is measured, so a
     // padded address that fits exactly still submits.
-    await fillLogin(`  ${'a'.repeat(MAX_EMAIL_LENGTH)}  `, 'password1');
+    await fillLogin(`  ${MAX_LENGTH_EMAIL}  `, 'password1');
     expect(logInButton().props.accessibilityState.disabled).toBe(false);
 
     await fillLogin('a'.repeat(MAX_EMAIL_LENGTH + 1), 'password1');
@@ -791,6 +843,13 @@ describe('login screen', () => {
     expect(screen.queryByText(t('auth.sessionExpired'))).toBeNull();
   });
 
+  it('explains a committed registration that needs a fresh login', async () => {
+    mockSearchParams = { notice: 'registered' };
+    await render(<LoginScreen />);
+
+    expect(screen.getByText(t('signup.createdLoginBanner')).props.accessibilityRole).toBe('alert');
+  });
+
   it('shows no signed-out banner without a stored notice', async () => {
     await render(<LoginScreen />);
 
@@ -848,6 +907,12 @@ describe('login screen', () => {
         disabled: true,
         busy: true,
       });
+      expect(screen.getByLabelText(t('login.emailLabel')).props.editable).toBe(false);
+      expect(screen.getByLabelText(t('login.passwordLabel')).props.editable).toBe(false);
+      const passwordToggle = screen.getByRole('button', { name: t('common.showPassword') });
+      expect(passwordToggle.props.accessibilityState).toEqual({ disabled: true });
+      await fireEvent.press(passwordToggle);
+      expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
     } finally {
       try {
         await act(async () => login.resolve(USER));
@@ -973,6 +1038,22 @@ describe('login screen', () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
+  it('clears a stale credential error when either credential changes', async () => {
+    mockAuthValue.login = jest.fn().mockRejectedValue(new ApiError(401, 'unauthorized'));
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', 'password1');
+    await fireEvent.press(logInButton());
+    expect(await screen.findByText(t('error.wrongCredentials'))).toBeTruthy();
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'new@example.com');
+    expect(screen.queryByText(t('error.wrongCredentials'))).toBeNull();
+
+    await fireEvent.press(logInButton());
+    expect(await screen.findByText(t('error.wrongCredentials'))).toBeTruthy();
+    await fireEvent.changeText(screen.getByLabelText(t('login.passwordLabel')), 'password2');
+    expect(screen.queryByText(t('error.wrongCredentials'))).toBeNull();
+  });
+
   it('maps a 429 through userMessageForError', async () => {
     mockAuthValue.login = jest.fn().mockRejectedValue(new ApiError(429, 'slow down'));
     await render(<LoginScreen />);
@@ -1027,6 +1108,10 @@ async function fillSignup(name: string, email: string, password: string, _lang: 
     screen.getByPlaceholderText(translateFor('en', 'signup.passwordPlaceholder')),
     password,
   );
+  await fireEvent.changeText(
+    screen.getByPlaceholderText(translateFor('en', 'password.confirmPlaceholder')),
+    password,
+  );
 }
 
 function signUpButton(_lang: UiLanguage = 'en') {
@@ -1049,6 +1134,20 @@ describe('signup screen', () => {
     await fireEvent.press(screen.getByRole('link', { name: t('signup.footerLink') }));
 
     expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('links to the public Privacy Policy and Terms of Use before account creation', async () => {
+    await render(<SignupScreen />);
+
+    const privacy = screen.getByRole('link', { name: t('header.privacy') });
+    const terms = screen.getByRole('link', { name: t('header.terms') });
+    expect(privacy.props.href).toBe('/settings/privacy');
+    expect(terms.props.href).toBe('/settings/terms');
+
+    await fireEvent.press(privacy);
+    await fireEvent.press(terms);
+    expect(mockLinkNavigate).toHaveBeenNthCalledWith(1, '/settings/privacy');
+    expect(mockLinkNavigate).toHaveBeenNthCalledWith(2, '/settings/terms');
   });
 
   it('resubscribes the signup removal guard when navigation identity changes', async () => {
@@ -1085,6 +1184,20 @@ describe('signup screen', () => {
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.getByText(t('signup.footerPrompt'))).toBeTruthy();
     expect(screen.getByRole('link', { name: t('signup.footerLink') }).props.href).toBe('/login');
+    expect(screen.getByRole('link', { name: t('header.privacy') })).toBeTruthy();
+    expect(screen.getByRole('link', { name: t('header.terms') })).toBeTruthy();
+    for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
+      expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityRole).toBe('radio');
+    }
+  });
+
+  it('sends an app-language choice to the guest-language preference', async () => {
+    await render(<SignupScreen />);
+
+    await fireEvent.press(screen.getByTestId('ui-language-hi'));
+
+    expect(mockSetGuestLanguage).toHaveBeenCalledTimes(1);
+    expect(mockSetGuestLanguage).toHaveBeenCalledWith('hi');
   });
 
   it('lays out the signup screen on the shared token scale', async () => {
@@ -1169,7 +1282,7 @@ describe('signup screen', () => {
       alignItems: 'center',
       paddingHorizontal: spacing.sm,
     });
-    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+    expect(flattenedStyle(screen.getAllByText(t('common.show'))[0])).toEqual({
       flexShrink: 1,
       color: colors.primary,
       fontSize: 14,
@@ -1255,6 +1368,20 @@ describe('signup screen', () => {
     );
   });
 
+  it('requires a matching password confirmation and a valid email', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'not-an-email', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'different1');
+    expect(screen.getByText(t('password.mismatch')).props.accessibilityLiveRegion).toBe('polite');
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+  });
+
   it('keeps language selection mutually exclusive and exposed to accessibility', async () => {
     await render(<SignupScreen />);
     const telugu = screen.getByLabelText('Telugu, తెలుగు');
@@ -1262,8 +1389,9 @@ describe('signup screen', () => {
 
     expect(telugu.props.accessibilityRole).toBe('button');
     expect(spanish.props.accessibilityRole).toBe('button');
-    expect(telugu.props.accessibilityState).toEqual({ selected: false });
-    expect(spanish.props.accessibilityState).toEqual({ selected: false });
+    expect(telugu.props.accessibilityState).toEqual({ selected: false, disabled: false });
+    expect(spanish.props.accessibilityState).toEqual({ selected: false, disabled: false });
+    expect(screen.queryByTestId('signup-language-check-te')).toBeNull();
     expect(flattenedStyle(telugu)).toMatchObject({
       alignItems: 'center',
       backgroundColor: colors.card,
@@ -1287,7 +1415,14 @@ describe('signup screen', () => {
     const selectedTelugu = screen.getByLabelText('Telugu, తెలుగు');
     expect(selectedTelugu.props.accessibilityState).toEqual({
       selected: true,
+      disabled: false,
     });
+    const teluguCheck = screen.getByTestId('signup-language-check-te', {
+      includeHiddenElements: true,
+    });
+    expect(teluguCheck).toHaveTextContent('✓');
+    expect(teluguCheck.props.accessibilityElementsHidden).toBe(true);
+    expect(teluguCheck.props.importantForAccessibility).toBe('no-hide-descendants');
     expect(flattenedStyle(selectedTelugu)).toMatchObject({
       backgroundColor: colors.primaryLight,
       borderColor: colors.primary,
@@ -1300,15 +1435,24 @@ describe('signup screen', () => {
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       selected: false,
+      disabled: false,
     });
 
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
       selected: false,
+      disabled: false,
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       selected: true,
+      disabled: false,
     });
+    expect(
+      screen.queryByTestId('signup-language-check-te', { includeHiddenElements: true }),
+    ).toBeNull();
+    expect(
+      screen.getByTestId('signup-language-check-es', { includeHiddenElements: true }),
+    ).toHaveTextContent('✓');
   });
 
   it('keeps signed-out UI English when a learning language is selected', async () => {
@@ -1334,13 +1478,13 @@ describe('signup screen', () => {
     await fillSignup('Ada', '   ', 'password1', 'te');
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
 
-    await fillSignup('n'.repeat(MAX_NAME_LENGTH), 'e'.repeat(MAX_EMAIL_LENGTH), 'password1', 'te');
+    await fillSignup('n'.repeat(MAX_NAME_LENGTH), MAX_LENGTH_EMAIL, 'password1', 'te');
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(false);
 
     // Both limits are measured after trimming, so padded exact-limit values pass.
     await fillSignup(
       `  ${'n'.repeat(MAX_NAME_LENGTH)}  `,
-      `  ${'e'.repeat(MAX_EMAIL_LENGTH)}  `,
+      `  ${MAX_LENGTH_EMAIL}  `,
       'password1',
       'te',
     );
@@ -1390,17 +1534,20 @@ describe('signup screen', () => {
       autoComplete: 'new-password',
       autoCorrect: false,
       textContentType: 'newPassword',
-      returnKeyType: 'go',
+      returnKeyType: 'next',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
     });
   });
 
-  it('chains name to email to password and submits from the password field', async () => {
+  it('chains name to email to password confirmation and submits from confirmation', async () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const emailFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.emailLabel')));
     const passwordFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.passwordLabel')));
+    const confirmationFocus = spyOnTextInputFocus(
+      screen.getByLabelText(t('password.confirmLabel')),
+    );
 
     await fireEvent(screen.getByLabelText(t('signup.nameLabel')), 'submitEditing');
     expect(emailFocus).toHaveBeenCalledTimes(1);
@@ -1409,12 +1556,15 @@ describe('signup screen', () => {
     expect(passwordFocus).toHaveBeenCalledTimes(1);
 
     await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
+    expect(confirmationFocus).toHaveBeenCalledTimes(1);
+    await fireEvent(screen.getByLabelText(t('password.confirmLabel')), 'submitEditing');
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.register).toHaveBeenCalledWith(
       'Ada',
       'ada@example.com',
       'password1',
       'te',
+      'en',
     );
   });
 
@@ -1456,7 +1606,12 @@ describe('signup screen', () => {
   it('changes only the focused signup border color so focus does not move the form', async () => {
     await render(<SignupScreen />);
 
-    for (const label of [t('signup.nameLabel'), t('login.emailLabel'), t('login.passwordLabel')]) {
+    for (const label of [
+      t('signup.nameLabel'),
+      t('login.emailLabel'),
+      t('login.passwordLabel'),
+      t('password.confirmLabel'),
+    ]) {
       const input = () => screen.getByLabelText(label);
       expect(flattenedStyle(input())).toMatchObject({
         borderWidth: 1,
@@ -1481,7 +1636,7 @@ describe('signup screen', () => {
     await render(<SignupScreen />);
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
 
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(false);
@@ -1489,7 +1644,16 @@ describe('signup screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('password.showConfirmation') }));
+    expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.getByRole('button', { name: t('password.hideConfirmation') })).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('password.hideConfirmation') }));
+    expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(true);
+    expect(screen.queryByText(t('common.hide'))).toBeNull();
   });
 
   it('rejects names over the maximum length client-side', async () => {
@@ -1567,6 +1731,7 @@ describe('signup screen', () => {
       'ada@example.com',
       'password1',
       'es',
+      'en',
     );
   });
 
@@ -1582,6 +1747,7 @@ describe('signup screen', () => {
       'ada@example.com',
       ' Password1 ',
       'es',
+      'en',
     );
   });
 
@@ -1600,6 +1766,7 @@ describe('signup screen', () => {
         'ada@example.com',
         'password1',
         code,
+        'en',
       ),
     );
   });
@@ -1621,6 +1788,38 @@ describe('signup screen', () => {
         disabled: true,
         busy: true,
       });
+      for (const label of [
+        t('signup.nameLabel'),
+        t('login.emailLabel'),
+        t('login.passwordLabel'),
+        t('password.confirmLabel'),
+      ]) {
+        expect(screen.getByLabelText(label).props.editable).toBe(false);
+      }
+      for (const label of [t('common.showPassword'), t('password.showConfirmation')]) {
+        const toggle = screen.getByRole('button', { name: label });
+        expect(toggle.props.accessibilityState).toEqual({ disabled: true });
+        await fireEvent.press(toggle);
+      }
+      expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
+      expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(true);
+      expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+        selected: true,
+        disabled: true,
+      });
+      await fireEvent.press(screen.getByLabelText('Spanish, Español'));
+      expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
+      expect(
+        screen.getByRole('link', { name: t('header.privacy') }).props.accessibilityState,
+      ).toEqual({ disabled: true });
+      expect(
+        screen.getByRole('link', { name: t('header.terms') }).props.accessibilityState,
+      ).toEqual({
+        disabled: true,
+      });
+      await fireEvent.press(screen.getByRole('link', { name: t('header.privacy') }));
+      await fireEvent.press(screen.getByRole('link', { name: t('header.terms') }));
+      expect(mockLinkNavigate).not.toHaveBeenCalled();
     } finally {
       try {
         await act(async () => registration.resolve(USER));
@@ -1753,6 +1952,53 @@ describe('signup screen', () => {
       textAlign: 'center',
     });
     expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it.each(['name', 'email', 'password', 'confirmation', 'language'] as const)(
+    'clears a stale registration error when the %s value changes',
+    async (field) => {
+      mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(409, 'exists'));
+      await render(<SignupScreen />);
+      await fillSignup('Ada', 'ada@example.com', 'password1');
+      await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+      await fireEvent.press(signUpButton('te'));
+      expect(await screen.findByText(t('error.emailTaken'))).toBeTruthy();
+
+      if (field === 'name') {
+        await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Grace');
+      } else if (field === 'email') {
+        await fireEvent.changeText(
+          screen.getByLabelText(t('login.emailLabel')),
+          'grace@example.com',
+        );
+      } else if (field === 'password') {
+        await fireEvent.changeText(screen.getByLabelText(t('login.passwordLabel')), 'password2');
+      } else if (field === 'confirmation') {
+        await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'password2');
+      } else {
+        await fireEvent.press(screen.getByLabelText('Spanish, Español'));
+      }
+
+      expect(screen.queryByText(t('error.emailTaken'))).toBeNull();
+    },
+  );
+
+  it('routes a committed registration persistence failure to login recovery', async () => {
+    mockAuthValue.register = jest
+      .fn()
+      .mockRejectedValue(new RegistrationCompletedLoginRequiredError());
+    await render(<SignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.press(signUpButton());
+
+    await waitFor(() =>
+      expect(mockRouter.replace).toHaveBeenCalledWith({
+        pathname: '/login',
+        params: { notice: 'registered' },
+      }),
+    );
+    expect(screen.queryByText(t('signup.failed'))).toBeNull();
   });
 
   it('maps a 429 through userMessageForError', async () => {

@@ -9,7 +9,12 @@ import DeleteAccountScreen from '../src/app/settings/delete-account';
 import PrivacyPolicyScreen from '../src/app/settings/privacy';
 import TermsScreen from '../src/app/settings/terms';
 import { ApiError } from '../src/lib/api';
-import { AccountDeletedCleanupError, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
+import {
+  AccountDeletionUnconfirmedError,
+  AccountDeletedCleanupError,
+  MAX_PASSWORD_UTF8_BYTES,
+  useAuth,
+} from '../src/lib/auth';
 import {
   I18nProvider,
   setActiveLanguage,
@@ -455,6 +460,27 @@ async function fillChangePassword(current: string, next: string, confirm: string
   await fireEvent.changeText(screen.getByPlaceholderText(t('cp.confirmPlaceholder')), confirm);
 }
 
+const CHANGE_PASSWORD_FIELD_LABEL_KEYS = {
+  current: 'cp.currentLabel',
+  next: 'cp.newLabel',
+  confirm: 'cp.confirmLabel',
+} as const;
+
+type ChangePasswordField = keyof typeof CHANGE_PASSWORD_FIELD_LABEL_KEYS;
+
+function visibilityControlLabel(
+  field: ChangePasswordField,
+  visible = false,
+  language: UiLanguage = 'en',
+): string {
+  const fieldLabel = translateFor(language, CHANGE_PASSWORD_FIELD_LABEL_KEYS[field]);
+  const actionLabel = translateFor(
+    language,
+    visible ? 'common.hidePassword' : 'common.showPassword',
+  );
+  return `${fieldLabel}: ${actionLabel}`;
+}
+
 function updateButton() {
   return screen.getByRole('button', { name: t('cp.submit') });
 }
@@ -523,7 +549,7 @@ describe('change password screen', () => {
     expect(screen.getAllByText(t('common.show'))).toHaveLength(3);
     expect(screen.queryByText(t('common.hide'))).toBeNull();
 
-    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[1]);
+    await fireEvent.press(screen.getByRole('button', { name: visibilityControlLabel('next') }));
     expect(screen.getByText(t('common.hide'))).toBeTruthy();
     expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
   });
@@ -554,7 +580,8 @@ describe('change password screen', () => {
       // The field yields horizontal space while the intrinsically sized action does not.
       expect(flattenedStyle(input)).toEqual(PASSWORD_INPUT_STYLE);
     }
-    for (const toggle of screen.getAllByRole('button', { name: t('common.showPassword') })) {
+    for (const field of Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]) {
+      const toggle = screen.getByRole('button', { name: visibilityControlLabel(field) });
       expect(flattenedStyle(toggle)).toEqual(INPUT_ACTION_STYLE);
     }
     for (const caption of screen.getAllByText(t('common.show'))) {
@@ -654,9 +681,11 @@ describe('change password screen', () => {
     async (language) => {
       await renderLocalizedScreen(<ChangePasswordScreen />, language);
 
-      const localizedAction = translateFor(language, 'common.showPassword');
       const localizedCaption = translateFor(language, 'common.show');
-      const toggles = screen.getAllByRole('button', { name: localizedAction });
+      const toggles = (Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]).map(
+        (field) =>
+          screen.getByRole('button', { name: visibilityControlLabel(field, false, language) }),
+      );
       expect(toggles).toHaveLength(3);
       expect(screen.getAllByText(localizedCaption)).toHaveLength(3);
       for (const toggle of toggles) {
@@ -677,24 +706,30 @@ describe('change password screen', () => {
       expect(screen.getByLabelText(label).props.secureTextEntry).toBe(true);
     }
 
-    // One Show toggle per field, in render order.
-    const showToggles = screen.getAllByRole('button', { name: t('common.showPassword') });
-    expect(showToggles).toHaveLength(3);
+    // Each field exposes a unique Show toggle, so assistive commands never rely
+    // on visual/render order to choose the intended password.
+    for (const field of Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]) {
+      expect(screen.getByRole('button', { name: visibilityControlLabel(field) })).toBeTruthy();
+    }
 
-    await fireEvent.press(showToggles[1]);
+    await fireEvent.press(screen.getByRole('button', { name: visibilityControlLabel('next') }));
     expect(screen.getByLabelText(t('cp.currentLabel')).props.secureTextEntry).toBe(true);
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(false);
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
 
-    await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
+    await fireEvent.press(
+      screen.getByRole('button', { name: visibilityControlLabel('next', true) }),
+    );
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getAllByRole('button', { name: t('common.showPassword') })).toHaveLength(3);
+    for (const field of Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]) {
+      expect(screen.getByRole('button', { name: visibilityControlLabel(field) })).toBeTruthy();
+    }
 
-    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[0]);
+    await fireEvent.press(screen.getByRole('button', { name: visibilityControlLabel('current') }));
     expect(screen.getByLabelText(t('cp.currentLabel')).props.secureTextEntry).toBe(false);
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
 
-    await fireEvent.press(screen.getAllByRole('button', { name: t('common.showPassword') })[1]);
+    await fireEvent.press(screen.getByRole('button', { name: visibilityControlLabel('confirm') }));
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(false);
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
   });
@@ -734,6 +769,16 @@ describe('change password screen', () => {
     await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
     expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe('polite');
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
+  });
+
+  it('rejects choosing the current password as the replacement', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('samepass1', 'samepass1', 'samepass1');
+
+    expect(screen.getByText(t('cp.sameAsCurrent')).props.accessibilityLiveRegion).toBe('polite');
+    expect(updateButton().props.accessibilityState.disabled).toBe(true);
+    await fireEvent.press(updateButton());
+    expect(mockAuthValue.changePassword).not.toHaveBeenCalled();
   });
 
   it('treats password whitespace as significant when confirming', async () => {
@@ -1545,6 +1590,20 @@ describe('delete account screen', () => {
     await pressAlertButton(t('da.confirmDelete'));
 
     expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
+  });
+
+  it('distinguishes an unconfirmed deletion from a definite failure', async () => {
+    mockAuthValue.deleteAccount = jest
+      .fn()
+      .mockRejectedValue(new AccountDeletionUnconfirmedError());
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+
+    const message = await screen.findByText(t('da.unconfirmed'));
+    expect(message.props.accessibilityRole).toBe('alert');
+    expect(screen.queryByText(t('da.failed'))).toBeNull();
   });
 
   it('surfaces local cleanup failures after deletion in an alert', async () => {

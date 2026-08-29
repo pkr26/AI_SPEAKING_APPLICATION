@@ -11,9 +11,17 @@ import React, {
 
 import { ApiError, apiFetch, clearToken, getToken, saveToken, setUnauthorizedHandler } from './api';
 import { cancelDailyReminderQuietly } from './daily-reminder';
+import { useGuestLanguage } from './guest-language';
 import { translate } from './i18n';
-import { parseAuthResponse, parseUserResponse, type NativeLanguage, type User } from './types';
+import {
+  parseAuthResponse,
+  parseUserResponse,
+  type NativeLanguage,
+  type UiLanguage,
+  type User,
+} from './types';
 import { clearPendingAssessment } from './pending-assessment';
+import { cleanupPrivateArtifacts } from './private-artifacts';
 import { markSessionExpiredNotice } from './session-notice';
 export {
   comparablePasswordError,
@@ -23,6 +31,7 @@ export {
   passwordPolicyError,
   utf8ByteLength,
 } from './password-policy';
+export { emailAddressError, isValidEmailAddress } from './identity-validation';
 
 const sessionLeaseBrand: unique symbol = Symbol('SessionLease');
 
@@ -66,6 +75,7 @@ interface AuthContextValue {
     email: string,
     password: string,
     nativeLanguage: NativeLanguage,
+    uiLanguage?: UiLanguage,
   ) => Promise<User>;
   logout: () => Promise<void>;
   changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
@@ -80,6 +90,13 @@ export class AccountDeletedCleanupError extends Error {
   }
 }
 
+export class AccountDeletionUnconfirmedError extends Error {
+  constructor() {
+    super(translate('da.unconfirmed'));
+    this.name = 'AccountDeletionUnconfirmedError';
+  }
+}
+
 export class LogoutCleanupError extends Error {
   constructor() {
     super(translate('auth.logoutCleanupFailed'));
@@ -87,10 +104,18 @@ export class LogoutCleanupError extends Error {
   }
 }
 
+export class RegistrationCompletedLoginRequiredError extends Error {
+  constructor() {
+    super(translate('auth.registrationCompletedLoginRequired'));
+    this.name = 'RegistrationCompletedLoginRequiredError';
+  }
+}
+
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const queryClient = useQueryClient();
+  const { mirrorAccountLanguage } = useGuestLanguage();
   const [token, setToken] = useState<string | null>(null);
   const [user, setUserState] = useState<User | null>(null);
   const [sessionVersion, setSessionVersion] = useState(0);
@@ -103,6 +128,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const userRef = useRef<User | null>(null);
   const pendingCleanupTailRef = useRef<Promise<void>>(Promise.resolve());
   const pendingCleanupFailedRef = useRef(false);
+
+  useEffect(() => {
+    // A process can be killed while the OS share sheet is open or while a
+    // retained recording is playing. Those files live only in our dedicated
+    // cache tree, so every fresh provider lifetime can safely reap orphans.
+    void cleanupPrivateArtifacts().catch(() => undefined);
+  }, []);
 
   const setUser = useCallback((nextUser: React.SetStateAction<User | null>) => {
     // Keep the imperative identity guard ahead of React's asynchronous commit.
@@ -183,11 +215,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // explicitly fail closed if it cannot establish or remove the session.
       if (rejectedToken && transitionRef.current) return;
       const tokenToClear = rejectedToken ?? tokenRef.current;
+      const artifactOwnerId = userRef.current?.id;
       epochRef.current += 1;
       // The learner did not ask to sign out; leave a one-shot explanation for
       // the login screen. Best effort — expiry itself must never block.
       void markSessionExpiredNotice().catch(() => undefined);
       void schedulePendingCleanup().catch(() => undefined);
+      void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
       // A dead session must not keep nudging this device to practice.
       void cancelDailyReminderQuietly();
       resetMemorySession();
@@ -266,6 +300,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // otherwise an unreadable old token can leave a prior learner's reminder
     // (or assessment metadata) behind until somebody signs in again.
     void schedulePendingCleanup().catch(() => undefined);
+    void cleanupPrivateArtifacts(userRef.current?.id).catch(() => undefined);
     void cancelDailyReminderQuietly();
     resetMemorySession();
   }, [resetMemorySession, schedulePendingCleanup]);
@@ -279,13 +314,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   const establishSession = useCallback(
-    async (response: unknown, epoch: number): Promise<User> => {
+    async (
+      response: unknown,
+      epoch: number,
+      tokenPersistenceError?: () => Error,
+    ): Promise<User> => {
       const parsed = parseAuthResponse(response);
       await waitForPendingCleanup();
       if (epoch !== epochRef.current) {
         throw new Error('The account operation was cancelled.');
       }
-      await saveToken(parsed.token);
+      try {
+        await saveToken(parsed.token);
+      } catch (error) {
+        if (tokenPersistenceError) throw tokenPersistenceError();
+        throw error;
+      }
       if (epoch !== epochRef.current) {
         // Only remove the token written by this cancelled transition. If a
         // newer transition already saved another token, conditional cleanup
@@ -297,10 +341,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       tokenRef.current = parsed.token;
       setToken(parsed.token);
       setUser(parsed.user);
+      mirrorAccountLanguage(parsed.user.uiLanguage);
       setSessionVersion((version) => version + 1);
       return parsed.user;
     },
-    [queryClient, setUser, waitForPendingCleanup],
+    [mirrorAccountLanguage, queryClient, setUser, waitForPendingCleanup],
   );
 
   const login = useCallback(
@@ -322,16 +367,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const register = useCallback(
-    async (name: string, email: string, password: string, nativeLanguage: NativeLanguage) => {
+    async (
+      name: string,
+      email: string,
+      password: string,
+      nativeLanguage: NativeLanguage,
+      uiLanguage: UiLanguage = 'en',
+    ) => {
       const epoch = beginTransition();
       try {
         const response = await apiFetch<unknown>('/auth/register', {
           method: 'POST',
-          body: { name, email, password, nativeLanguage },
+          body: { name, email, password, nativeLanguage, uiLanguage },
           auth: false,
           expireSessionOn401: false,
         });
-        return await establishSession(response, epoch);
+        return await establishSession(
+          response,
+          epoch,
+          () => new RegistrationCompletedLoginRequiredError(),
+        );
       } finally {
         transitionRef.current = false;
       }
@@ -342,6 +397,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(async () => {
     const epoch = beginTransition();
     const sessionToken = tokenRef.current;
+    const artifactOwnerId = userRef.current?.id;
     try {
       // Revoke the bearer token before removing the local copy. Logout applies
       // to all devices until refresh-token families are introduced server-side.
@@ -359,6 +415,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // The learner signed out: stop the daily practice reminder on this
       // device. Best effort — logout must not fail on notification cleanup.
       void cancelDailyReminderQuietly();
+      void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
       const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
         sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
         schedulePendingCleanup(),
@@ -439,7 +496,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async (password: string) => {
       beginTransition();
       const sessionToken = tokenRef.current;
+      const artifactOwnerId = userRef.current?.id;
       try {
+        let deletionConfirmed = false;
         try {
           await apiFetch<void>('/auth/account', {
             method: 'DELETE',
@@ -447,15 +506,36 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             expireSessionOn401: false,
             expectedStatus: 204,
           });
+          deletionConfirmed = true;
         } catch (error) {
           if (error instanceof ApiError && error.status === 401) {
             await verifySessionAfterCredentialError();
+            throw error;
           }
-          throw error;
+          if (
+            error instanceof ApiError &&
+            (error.status === 0 || error.status === 408 || error.status >= 500)
+          ) {
+            try {
+              await apiFetch<unknown>('/auth/me', {
+                expireSessionOn401: false,
+              });
+            } catch (verificationError) {
+              if (verificationError instanceof ApiError && verificationError.status === 401) {
+                deletionConfirmed = true;
+              } else {
+                throw new AccountDeletionUnconfirmedError();
+              }
+            }
+            if (!deletionConfirmed) throw error;
+          } else {
+            throw error;
+          }
         }
 
         // The account is gone; its practice reminder must not outlive it.
         void cancelDailyReminderQuietly();
+        void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
         const [tokenCleanup, pendingCleanup] = await Promise.allSettled([
           sessionToken ? clearToken(sessionToken) : Promise.resolve(true),
           schedulePendingCleanup(),

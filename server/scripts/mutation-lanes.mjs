@@ -51,6 +51,7 @@ export const codeMutationLanes = Object.freeze({
       'tests/auth-boundaries.test.ts',
       'tests/auth-janitor-unit.test.ts',
       'tests/password-reset.test.ts',
+      'tests/practice-cycles.test.ts',
       'tests/profile.test.ts',
     ],
   ),
@@ -79,6 +80,7 @@ export const codeMutationLanes = Object.freeze({
     ['src/diagnostic.ts'],
     [
       'tests/diagnostic.test.ts',
+      'tests/diagnostic-silence-and-resume.test.ts',
       'tests/diagnostic-search.test.ts',
       'tests/level-progression.test.ts',
       'tests/assessment-context.test.ts',
@@ -95,6 +97,7 @@ export const codeMutationLanes = Object.freeze({
     ['src/practice.ts'],
     [
       'tests/practice.test.ts',
+      'tests/practice-cycles.test.ts',
       'tests/practice-boundaries.test.ts',
       'tests/practice-history-stats.test.ts',
       'tests/practice-mastery.test.ts',
@@ -116,6 +119,8 @@ export const codeMutationLanes = Object.freeze({
     ['src/audio-upload.ts'],
     ['tests/audio-upload.test.ts', 'tests/audio-upload-client.test.ts', 'tests/audio-upload-s3.test.ts'],
   ),
+  // Route coverage includes owner-isolated single and bulk deletion plus the
+  // per-row exact-version deletion-outbox contract.
   recordings: lane(
     ['src/recording-store.ts', 'src/recordings.ts'],
     ['tests/recordings.test.ts', 'tests/recording-maintenance.test.ts', 'tests/audio-upload-s3.test.ts'],

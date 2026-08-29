@@ -318,6 +318,29 @@ export function createRecordingsRouter(limiters: Limiters) {
     }),
   );
 
+  router.delete(
+    new RegExp('^/$'),
+    limiters.recordingBulkDelete,
+    h(async (req: AuthedRequest, res) => {
+      // One statement is one transaction: advancing the owner epoch fences
+      // retain=true assessments that are still in provider work, deleting only
+      // this owner's metadata preserves isolation, and the existing per-row
+      // AFTER DELETE trigger commits every exact-version outbox job atomically.
+      await pool.query(
+        `WITH owner AS (
+           UPDATE users
+           SET recording_retention_epoch = recording_retention_epoch + 1
+           WHERE id = $1
+           RETURNING id
+         )
+         DELETE FROM recordings
+         WHERE user_id IN (SELECT id FROM owner)`,
+        [req.user!.id],
+      );
+      res.status(204).end();
+    }),
+  );
+
   router.post(
     '/:id/playback-url',
     limiters.playbackGrant,

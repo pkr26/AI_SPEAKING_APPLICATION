@@ -104,19 +104,19 @@ describe('diagnostic adaptive binary search', () => {
 
     const q = await pool.query<{ id: string }>(`SELECT id FROM questions WHERE cefr_level = 'A2' LIMIT 1`);
     await pool.query(
-      `UPDATE diagnostic_state SET low_idx = 1, high_idx = 1, questions_asked = 4, current_question_id = $1
+      `UPDATE diagnostic_state SET low_idx = 1, high_idx = 1, questions_asked = 2, current_question_id = $1
        WHERE user_id = $2`,
       [q.rows[0].id, userId],
     );
 
     const r = await answer(token, q.rows[0].id);
-    // attemptNo 5 >= MAX_QUESTIONS ends the diagnostic even though low <= high.
+    // attemptNo 3 >= MAX_QUESTIONS ends the diagnostic even though low <= high.
     expect(r).toMatchObject({ done: true, level: 'A2' });
     const { rows } = await pool.query<{ low_idx: number; high_idx: number; questions_asked: number }>(
       'SELECT low_idx, high_idx, questions_asked FROM diagnostic_state WHERE user_id = $1',
       [userId],
     );
-    expect(rows[0]).toEqual({ low_idx: 2, high_idx: 1, questions_asked: 5 });
+    expect(rows[0]).toEqual({ low_idx: 2, high_idx: 1, questions_asked: 3 });
   });
 
   it('rejects answers after completion', async () => {

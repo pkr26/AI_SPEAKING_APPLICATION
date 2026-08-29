@@ -8,6 +8,7 @@ import Button from '../components/Button';
 import { ApiError, apiFetch, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
+import { useNetworkStatus } from '../lib/network-status';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import { parseUserResponse } from '../lib/types';
 
@@ -45,6 +46,7 @@ function LoadingView({ label }: { label: string }) {
 export default function Gate() {
   const t = useT();
   const styles = themedStyles(useTheme());
+  const { reachability } = useNetworkStatus();
   const {
     token,
     user,
@@ -71,7 +73,14 @@ export default function Gate() {
     queryKey: ['me', sessionVersion],
     queryFn: async ({ signal }) =>
       parseUserResponse(await apiFetch<unknown>('/auth/me', { signal })).user,
-    enabled: !!token && !user,
+    // Refresh even when SecureStore restored a cached user. Profile edits made
+    // on another device (name, UI language, learning language, placement reset)
+    // otherwise remain invisible for the entire local session because no other
+    // screen owns an authoritative /me observer.
+    // Root's persistent ProfileRefreshBridge is the sole eager owner. This
+    // observer supplies Gate's loading/error/retry UI without issuing a second
+    // request or disappearing after the redirect.
+    enabled: false,
     retry: false,
   });
 
@@ -113,6 +122,22 @@ export default function Gate() {
     return <Redirect href="/login" />;
   }
 
+  // TanStack pauses a new profile query while offline. Keep the restored
+  // bearer token intact and wait for its automatic reconnect instead of
+  // turning an unavailable network into a logout or an endless spinner.
+  if (!user && !meQuery.data && (reachability === 'offline' || meQuery.fetchStatus === 'paused')) {
+    return (
+      <FallbackScreen>
+        <Text accessibilityRole="header" style={styles.title}>
+          {t('gate.offlineTitle')}
+        </Text>
+        <Text accessibilityLiveRegion="polite" style={styles.muted}>
+          {t('gate.offlineBody')}
+        </Text>
+      </FallbackScreen>
+    );
+  }
+
   if (!user && meQuery.isPending) {
     return <LoadingView label={t('gate.loadingProfile')} />;
   }
@@ -145,7 +170,13 @@ export default function Gate() {
     return <LoadingView label={t('gate.loadingProfile')} />;
   }
 
-  return <Redirect href={profile.diagnosticCompleted ? '/home' : '/diagnostic'} />;
+  const placementRevealPending =
+    profile.diagnosticCompleted && profile.diagnosticAcknowledged === false;
+  return (
+    <Redirect
+      href={profile.diagnosticCompleted && !placementRevealPending ? '/home' : '/diagnostic'}
+    />
+  );
 }
 
 const themedStyles = createThemedStyles(({ colors, layout, spacing }) => ({

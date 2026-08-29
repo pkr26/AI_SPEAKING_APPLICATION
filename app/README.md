@@ -7,11 +7,20 @@ from the backend in `../server`. The current assessment does not measure
 pronunciation, accent, timing, or prosody. Content is tailored for native
 speakers of Telugu, Hindi, Spanish, and Chinese (Simplified).
 
+Audio is temporary by default. While reviewing a completed take, the learner
+can explicitly enable **Save this recording** for that submission. The durable
+handoff preserves the choice across direct/S3 posts, retries, and recovery;
+scores, transcripts, and feedback are kept whether or not the audio is saved.
+Saved recordings can be replayed, shared through a temporary app-owned local
+file, deleted individually, or deleted together from Settings without removing
+their assessment results.
+
 ## Stack
 
 - Expo SDK 57, TypeScript (strict)
 - expo-router (file-based routing)
 - @tanstack/react-query (server state)
+- expo-network (native reachability + React Query pause/resume)
 - expo-audio (microphone recording, m4a/AAC via `RecordingPresets.HIGH_QUALITY`)
 - expo-secure-store (auth token persistence)
 - Hand-rolled StyleSheet UI (no UI kit)
@@ -23,8 +32,9 @@ AdMob also requires a native development/release build; it is not supported by
 Expo Go. Development builds use Google's official sample app/unit IDs. A
 production config evaluation fails unless the two owner app IDs and four
 platform/placement unit IDs documented in `.env.example` are valid, unique,
-and not Google sample IDs. Remote `/client-config` policy and UMP consent still
-default every placement off at runtime.
+and not Google sample IDs. The current `/client-config` release guard hard-disables
+every placement regardless of operator flags; UMP consent remains an additional
+fail-closed prerequisite for a future reviewed rollout.
 
 ## Run
 
@@ -32,6 +42,14 @@ default every placement off at runtime.
 npm ci
 npx expo start
 ```
+
+The cycle-aware mobile contract is release `1.1.0` (`app.json`, `package.json`,
+and `package-lock.json` stay aligned); its iOS build number and Android version
+code are both `2`. Production API deployments must reject earlier app versions.
+An exact `426 CLIENT_UPGRADE_REQUIRED` response from the first-party API latches
+a non-dismissible update overlay without unmounting the active route. Production
+builds must inject both store URLs from `.env.example`; until a real numeric iOS
+App Store ID exists, nonproduction builds use a safe App Store search fallback.
 
 Useful checks:
 
@@ -207,8 +225,17 @@ dev machine's LAN IP from `expoConfig.hostUri` as a fallback.)
 Set all six values from `.env.example` for production EAS/export builds. App
 IDs use the `ca-app-pub-…~…` form; ad-unit IDs use `ca-app-pub-…/…`. Never use
 Google's sample IDs in a store build. Ads remain disabled until the backend
-operator explicitly sets `ADS_ENABLED=true`, `ADS_AUDIENCE_MODE=adult-only`,
-and the individual placement switch after the audience decision is approved.
+implements and enforces a reviewed, per-account adult-eligibility flow. The
+`ADS_ENABLED`, `ADS_AUDIENCE_MODE`, and individual placement switches are
+reserved for that future rollout and cannot currently enable public ads.
+
+### Production store links
+
+Set `EXPO_PUBLIC_IOS_APP_STORE_URL` to the final HTTPS `apps.apple.com` product
+URL ending in the app's numeric `/id…`. Set `EXPO_PUBLIC_ANDROID_PLAY_STORE_URL`
+to `https://play.google.com/store/apps/details?id=com.aienglish.coach`.
+Production config refuses missing, malformed, cross-origin, or wrong-package
+links so a forced update can never send learners to an untrusted destination.
 
 ## Project structure
 
@@ -217,8 +244,8 @@ src/
   app/                  expo-router routes
     _layout.tsx         providers, protected Stack, focus bridge + error boundary
     +not-found.tsx      safe fallback for invalid or stale deep links
-    index.tsx           gate: routes to login / diagnostic / practice
-    (auth)/             login + signup (native-language picker)
+    index.tsx           gate: routes to login / diagnostic / Home
+    (auth)/             login + signup (mother-tongue picker)
     diagnostic.tsx      CEFR diagnostic test flow
     practice/
       index.tsx         mastery/revision question + answer mode + Recorder + help
@@ -230,9 +257,16 @@ src/
       delete-account.tsx  destructive account-deletion confirmation
   components/
     Recorder.tsx        shared recorder used by diagnostic + practice
+    RecordingPlayback.tsx shared retained-audio playback/share/delete controls
+    NetworkStatusBanner.tsx global offline/reconnected feedback
+    ClientUpgradeModal.tsx non-dismissible store-update overlay
   lib/
     api.ts              API URL, Bearer requests, direct/S3 audio upload
+    audio-session.ts    serialized microphone/speaker mode and playback ownership
     auth.tsx            SecureStore-backed auth context and cache isolation
+    identity-validation.ts client email syntax aligned with the API
+    network-status.ts   Expo reachability store + React Query online bridge
+    client-upgrade-store.ts one-way first-party 426 upgrade latch
     password-policy.ts  UTF-8-aware password rules shared by auth screens
     pending-assessment.ts durable interrupted-upload state machine
     practice-flow.tsx   session-scoped handoff from attempt to feedback
@@ -248,17 +282,31 @@ calls `POST /uploads/audio-url` with `{contentType,assessmentEndpoint}`.
 Production receives a short-lived, size-constrained S3 multipart-POST grant
 that echoes the endpoint and carries a route-scoped
 `audio-uploads/{diagnostic|practice}/{ownerId}/...` key. The app uploads the
-native file directly, then POSTs `{questionId,requestId,audioKey}` to that exact
-assessment endpoint. Local development receives endpoint-bound `mode: direct`
-and sends multipart form data with file field `audio`. The same UUID
-`requestId` identifies every retry of one logical submission. API and
+native file directly, then POSTs `{questionId,requestId,retainRecording,audioKey}`
+for diagnostic or `{questionId,requestId,cycleId,retainRecording,audioKey}` for
+practice to that exact assessment endpoint. Local development receives
+endpoint-bound `mode: direct` and sends multipart form data with file field
+`audio`, boolean-string `retainRecording`, and the practice-only `cycleId`. The
+same UUID `requestId` identifies every retry of one logical submission. API and
 upstream-provider error bodies are never shown directly to users. Device-only
-secure storage records the owner, endpoint, question, request, upload stage,
-and scoped S3 key when applicable, allowing the app to reconcile an interrupted
+secure storage records the owner, endpoint, question, request, immutable
+retention choice, upload stage, and scoped S3 key when applicable, allowing the app to reconcile an interrupted
 handoff through authenticated `GET /assessments/:requestId`; the server replay
 expires after 48 hours.
 
-English practice responses report whether the word was mastered (score 75+),
-and silence is returned as an explicit free-retry result. Native-language
-practice uses `POST /practice/attempt/native`; it checks comprehension and
-returns a model English answer but does not create an attempt or change mastery.
+`GET /practice/question` returns a durable server-owned `cycleId`; English and
+mother-tongue speech share exactly three tries in that cycle, while silence is
+an explicit free retry. English responses report mastery (score 75+).
+`POST /practice/attempt/native` persists a real non-scored attempt with the
+original transcript, faithful English translation, comprehension feedback, and
+a separate model English answer; it never changes English mastery or SRS.
+
+History and Recordings share `RecordingPlayback`. It downloads each short-lived
+signed audio URL before starting, waits for authoritative loaded status, and
+uses the serialized playback audio mode with full app volume, iOS silent-mode
+playback, and speaker routing rather than the earpiece. Share Audio uses the
+same private download path but gives `expo-sharing` only the temporary local
+file URI; operation ownership removes that copy after success, failure,
+background, unmount, or logout. Settings' count-independent **Delete all
+recordings** confirmation calls the idempotent bulk endpoint and retires both
+recording-library and history caches after success.

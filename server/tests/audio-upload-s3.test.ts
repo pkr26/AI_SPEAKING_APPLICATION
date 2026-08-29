@@ -110,6 +110,16 @@ const resolvePresignedAudio = (
   response: Parameters<typeof resolveScopedPresignedAudio>[2],
 ) => resolveScopedPresignedAudio('diagnostic', request, response);
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 async function registerAndGetQuestion(a: ReturnType<typeof app>) {
   const { res: reg } = await registerUser(a);
   if (reg.status !== 201) {
@@ -1267,8 +1277,9 @@ describe('submitted S3 cleanup lifecycle', () => {
     // nothing, so only the audio-key claim check can stop its post-response
     // delete from landing under the live worker.
     await pool.query(
-      `INSERT INTO assessment_requests (user_id, request_id, claim_id, context, question_id, status, audio_key)
-       VALUES ($1, $2, $3, 'practice', $4, 'processing', $5)`,
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, audio_key, response_version)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', $5, 1)`,
       [userId, randomUUID(), randomUUID(), question.rows[0].id, audioKey],
     );
     const req = {
@@ -2160,6 +2171,163 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
     ]);
   });
 
+  it('keeps assessment text but deletes transient audio when retention is explicitly off', async () => {
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+
+    const response = await request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId, requestId, audioKey, retainRecording: false });
+
+    expect(response.status).toBe(200);
+    expect(response.body).not.toHaveProperty('recordingId');
+    expect(response.body).toMatchObject({
+      transcript: expect.any(String),
+      feedback: expect.any(String),
+      score: expect.any(Number),
+    });
+    await vi.waitFor(() => {
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
+    });
+    expect(sendMock.mock.calls.map(([command]) => command.kind)).not.toContain('tag-retained');
+    const requestChoice = await pool.query<{ retain_recording: boolean }>(
+      `SELECT retain_recording FROM assessment_requests
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+    expect(requestChoice.rows).toEqual([{ retain_recording: false }]);
+    const recordings = await pool.query('SELECT 1 FROM recordings WHERE user_id = $1 AND request_id = $2', [
+      userId,
+      requestId,
+    ]);
+    expect(recordings.rowCount).toBe(0);
+  });
+
+  it('fences an older retain=true assessment when bulk deletion commits during provider work', async () => {
+    const providerStarted = deferred<void>();
+    const releaseProvider = deferred<void>();
+    const a = app();
+    const { token, userId, questionId } = await registerAndGetQuestion(a);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+    routeMocks.useLiveAssess = true;
+    routeMocks.assess.mockImplementationOnce(
+      async (
+        _audioPath: string,
+        _question: unknown,
+        _userId: string,
+        options?: { onCapacityReserved?: () => void },
+      ) => {
+        options?.onCapacityReserved?.();
+        providerStarted.resolve(undefined);
+        await releaseProvider.promise;
+        return {
+          transcript: 'A complete response that finished after delete all.',
+          score: 80,
+          passed: true,
+          feedback: 'Clear and relevant.',
+        };
+      },
+    );
+
+    const answer = request(a)
+      .post('/diagnostic/answer')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId, requestId, audioKey, retainRecording: true })
+      .then((response) => response);
+    try {
+      await providerStarted.promise;
+      const deleted = await request(a).delete('/recordings').set('Authorization', `Bearer ${token}`);
+      expect(deleted.status).toBe(204);
+
+      const epochsBeforeFinalization = await pool.query<{
+        request_epoch: string;
+        user_epoch: string;
+      }>(
+        `SELECT ar.recording_retention_epoch AS request_epoch,
+                u.recording_retention_epoch AS user_epoch
+         FROM assessment_requests ar
+         JOIN users u ON u.id = ar.user_id
+         WHERE ar.user_id = $1 AND ar.request_id = $2`,
+        [userId, requestId],
+      );
+      expect(epochsBeforeFinalization.rows).toEqual([{ request_epoch: '0', user_epoch: '1' }]);
+
+      releaseProvider.resolve(undefined);
+      const response = await answer;
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        transcript: 'A complete response that finished after delete all.',
+        feedback: 'Clear and relevant.',
+        score: 80,
+      });
+      expect(response.body).not.toHaveProperty('recordingId');
+      expect((await pool.query('SELECT 1 FROM recordings WHERE user_id = $1', [userId])).rowCount).toBe(0);
+      const stored = await pool.query<{ response_body: Record<string, unknown> }>(
+        `SELECT response_body FROM assessment_requests
+         WHERE user_id = $1 AND request_id = $2`,
+        [userId, requestId],
+      );
+      expect(stored.rows[0].response_body).toEqual(response.body);
+      expect(stored.rows[0].response_body).not.toHaveProperty('recordingId');
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('delete');
+      });
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).not.toContain('tag-retained');
+
+      // Delete-all is a cutoff, not a permanent opt-out: a request claimed
+      // afterward snapshots the advanced epoch and may honor a fresh explicit
+      // retain=true choice normally.
+      sendMock.mockClear();
+      const next = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+      expect(next.status).toBe(200);
+      expect(next.body.done).toBe(false);
+      const laterAudioKey = ownedKey(userId);
+      const laterRequestId = randomUUID();
+      const later = await request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`).send({
+        questionId: next.body.question.id,
+        requestId: laterRequestId,
+        audioKey: laterAudioKey,
+        retainRecording: true,
+      });
+      expect(later.status).toBe(200);
+      expect(later.body.recordingId).toMatch(/^[0-9a-f-]{36}$/i);
+      expect(
+        (
+          await pool.query<{
+            request_epoch: string;
+            user_epoch: string;
+          }>(
+            `SELECT ar.recording_retention_epoch AS request_epoch,
+                    u.recording_retention_epoch AS user_epoch
+             FROM assessment_requests ar
+             JOIN users u ON u.id = ar.user_id
+             WHERE ar.user_id = $1 AND ar.request_id = $2`,
+            [userId, laterRequestId],
+          )
+        ).rows,
+      ).toEqual([{ request_epoch: '1', user_epoch: '1' }]);
+      await vi.waitFor(() => {
+        expect(sendMock.mock.calls.map(([command]) => command.kind)).toContain('tag-retained');
+      });
+    } finally {
+      releaseProvider.resolve(undefined);
+      await answer.catch(() => undefined);
+      routeMocks.useLiveAssess = false;
+    }
+  });
+
   it('persists measured retained metadata and links it to the diagnostic attempt outside mock mode', async () => {
     const previousMockAi = config.mockAi;
     config.mockAi = false;
@@ -2888,10 +3056,12 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const diagnosticKey = `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`;
     sendMock.mockClear();
 
-    const response = await request(a)
-      .post('/practice/attempt')
-      .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey: diagnosticKey });
+    const response = await request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`).send({
+      questionId: next.body.question.id,
+      requestId: randomUUID(),
+      cycleId: next.body.cycleId,
+      audioKey: diagnosticKey,
+    });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toBe('audioKey is missing or invalid');
@@ -2923,7 +3093,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       const response = await request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId, requestId: randomUUID(), audioKey });
+        .send({ questionId, requestId: randomUUID(), cycleId: next.body.cycleId, audioKey });
 
       expect(response.status).toBe(409);
       expect(response.body).toEqual({
@@ -2953,7 +3123,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: 'not-a-uuid', audioKey });
+      .send({ questionId: next.body.question.id, requestId: 'not-a-uuid', cycleId: next.body.cycleId, audioKey });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('requestId must be a valid UUID');
@@ -2975,7 +3145,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: 42, audioKey });
+      .send({ questionId: next.body.question.id, requestId: 42, cycleId: next.body.cycleId, audioKey });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toContain('requestId');
@@ -2996,7 +3166,12 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId, audioKey: { key: ownedKey(userId) } });
+      .send({
+        questionId: next.body.question.id,
+        requestId,
+        cycleId: next.body.cycleId,
+        audioKey: { key: ownedKey(userId) },
+      });
 
     expect(response.status).toBe(400);
     expect(response.body.error).toMatch(/^audioKey:/);
@@ -3024,7 +3199,12 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId, audioKey: `audio-uploads/${userId}/x\u0000y.m4a` });
+      .send({
+        questionId: next.body.question.id,
+        requestId,
+        cycleId: next.body.cycleId,
+        audioKey: `audio-uploads/${userId}/x\u0000y.m4a`,
+      });
 
     expect(response.status).toBe(400);
     expect(response.body).toEqual({ error: 'audioKey is missing or invalid', code: 'VALIDATION_FAILED' });
@@ -3050,7 +3230,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: randomUUID(), requestId, audioKey });
+      .send({ questionId: randomUUID(), requestId, cycleId: randomUUID(), audioKey });
 
     expect(response.status).toBe(404);
     expect(response.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
@@ -3086,7 +3266,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       const response = await request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey });
+        .send({ questionId: next.body.question.id, requestId: randomUUID(), cycleId: next.body.cycleId, audioKey });
 
       expect(response.status).toBe(500);
       expect(response.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
@@ -3120,7 +3300,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId, audioKey });
+      .send({ questionId: next.body.question.id, requestId, cycleId: next.body.cycleId, audioKey });
 
     expect(response.status).toBe(200);
     await vi.waitFor(() => {
@@ -3171,7 +3351,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: next.body.question.id, requestId, audioKey });
+        .send({ questionId: next.body.question.id, requestId, cycleId: next.body.cycleId, audioKey });
 
     const previousConcurrency = config.aiMaxConcurrency;
     config.aiMaxConcurrency = 0;
@@ -3220,7 +3400,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: next.body.question.id, requestId, audioKey });
+        .send({ questionId: next.body.question.id, requestId, cycleId: next.body.cycleId, audioKey });
 
     const ownerRequest = submit();
     const ownerResponse = ownerRequest.then(
@@ -3276,7 +3456,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const ownerRequest = request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey });
+      .send({ questionId: next.body.question.id, requestId: randomUUID(), cycleId: next.body.cycleId, audioKey });
     const ownerResponse = ownerRequest.then(
       (response) => ({ status: 'fulfilled' as const, response }),
       (reason: unknown) => ({ status: 'rejected' as const, reason }),
@@ -3292,7 +3472,7 @@ describe('POST /practice/attempt (S3 mode)', () => {
       const duplicate = await request(a)
         .post('/practice/attempt')
         .set('Authorization', `Bearer ${token}`)
-        .send({ questionId: randomUUID(), requestId: randomUUID(), audioKey });
+        .send({ questionId: randomUUID(), requestId: randomUUID(), cycleId: randomUUID(), audioKey });
       expect(duplicate.status).toBe(404);
       expect(duplicate.body).toEqual({ error: 'Question not found', code: 'NOT_FOUND' });
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
@@ -3324,7 +3504,12 @@ describe('POST /practice/attempt (S3 mode)', () => {
     const response = await request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
-      .send({ questionId: next.body.question.id, requestId: randomUUID(), audioKey: ownedKey(randomUUID()) });
+      .send({
+        questionId: next.body.question.id,
+        requestId: randomUUID(),
+        cycleId: next.body.cycleId,
+        audioKey: ownedKey(randomUUID()),
+      });
 
     expect(response.status).toBe(400);
     expect(sendMock).not.toHaveBeenCalled();

@@ -16,6 +16,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import Button from '../../components/Button';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
+  AccountDeletionUnconfirmedError,
   AccountDeletedCleanupError,
   comparablePasswordError,
   MAX_PASSWORD_UTF8_BYTES,
@@ -93,6 +94,8 @@ export default function DeleteAccountScreen() {
         // already unmounted this screen: only a native alert outlives it to
         // deliver the "restart before logging in again" instruction.
         Alert.alert(t('da.deletedTitle'), err.message);
+      } else if (err instanceof AccountDeletionUnconfirmedError) {
+        if (mountedRef.current) setError(err.message);
       } else if (mountedRef.current) {
         setError(userMessageForError(err, t('da.failed')));
       }

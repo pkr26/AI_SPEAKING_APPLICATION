@@ -898,14 +898,33 @@ function validateNativeResponse(body) {
   rejectMockMarker(body);
   assertCondition(isUuid(body?.recordingId), 'native response omitted retained recording id');
   assertCondition(body?.mode === 'native' && typeof body.understood === 'boolean', 'bad native response mode');
+  assertCondition(isUuid(body.cycleId), 'native response omitted cycle id');
+  assertCondition(
+    Number.isInteger(body.attemptNo) && body.attemptNo >= 1 && body.attemptNo <= 3,
+    'bad native attempt number',
+  );
+  assertCondition(
+    Number.isInteger(body.attemptsLeft) && body.attemptsLeft >= 0 && body.attemptsLeft <= 3,
+    'bad native attempts left',
+  );
   assertCondition(typeof body.transcript === 'string' && body.transcript.length <= 12_000, 'bad native transcript');
+  assertCondition(
+    typeof body.translatedTranscript === 'string' && body.translatedTranscript.length <= 12_000,
+    'bad native translated transcript',
+  );
   assertCondition(
     typeof body.feedback === 'string' && body.feedback.trim().length > 0 && body.feedback.length <= 800,
     'bad native feedback',
   );
   assertCondition(typeof body.modelAnswer === 'string' && body.modelAnswer.length <= 800, 'bad native model answer');
   if (body.transcript === '') {
-    assertCondition(body.understood === false && body.modelAnswer === '', 'native silence contract mismatch');
+    assertCondition(
+      body.understood === false &&
+        body.modelAnswer === '' &&
+        body.translatedTranscript === '' &&
+        body.noSpeech === true,
+      'native silence contract mismatch',
+    );
   } else {
     assertCondition(body.modelAnswer.trim().length > 0, 'native non-silence omitted model answer');
   }
@@ -1259,10 +1278,13 @@ function assessmentEssentials(context, body) {
     mode: body.mode,
     understood: body.understood,
     transcriptEmpty: body.transcript === '',
+    attemptNo: body.attemptNo,
+    attemptsLeft: body.attemptsLeft,
+    translatedTranscriptEmpty: body.translatedTranscript === '',
   };
 }
 
-async function performFreshAssessment(user, endpoint, questionId, context, mode) {
+async function performFreshAssessment(user, endpoint, questionId, context, mode, cycleId) {
   reserveFreshAssessment();
   const audio = pickAudio(user, mode);
   const { grant, object } = await issueGrant(user, endpoint, audio);
@@ -1273,6 +1295,7 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode)
   action.assessment = {
     requestId,
     questionId,
+    cycleId: cycleId || null,
     keyHash: object.keyHash,
     audioFixtureId: audio.id,
     scope: object.scope,
@@ -1294,7 +1317,12 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode)
       user,
       action,
       endpoint,
-      { questionId, requestId, audioKey: grant.audioKey },
+      {
+        questionId,
+        requestId,
+        audioKey: grant.audioKey,
+        ...(context === 'diagnostic' ? {} : { cycleId }),
+      },
       context,
       validator,
       true,
@@ -1322,7 +1350,7 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode)
       { ...assessmentEssentials(context, result.body), recoveredByStatus: result.recoveredByStatus },
       result.body,
     );
-    return { body: result.body, requestId, object, grant };
+    return { body: result.body, requestId, questionId, cycleId, object, grant };
   } catch (error) {
     object.outcome = 'assessment-failed';
     const lastAssessmentPost = action.attempts.filter((attempt) => attempt.method === 'POST').at(-1);
@@ -1348,6 +1376,7 @@ async function replayAssessment(user, prior, context, validator) {
   action.assessment = {
     requestId: prior.requestId,
     questionId: prior.questionId,
+    cycleId: prior.cycleId || null,
     keyHash: prior.object.keyHash,
     scope: prior.object.scope,
     context,
@@ -1363,7 +1392,12 @@ async function replayAssessment(user, prior, context, validator) {
       user,
       action,
       endpoint,
-      { questionId: prior.questionId, requestId: prior.requestId, audioKey: prior.grant.audioKey },
+      {
+        questionId: prior.questionId,
+        requestId: prior.requestId,
+        audioKey: prior.grant.audioKey,
+        ...(context === 'diagnostic' ? {} : { cycleId: prior.cycleId }),
+      },
       context,
       validator,
       false,
@@ -1383,8 +1417,8 @@ function attemptExpectation(context, questionId, attemptNo, body) {
     context,
     questionId,
     attemptNo,
-    score: body.score,
-    passed: body.passed,
+    score: body.score ?? null,
+    passed: body.passed ?? null,
     transcriptDigest: sha256(body.transcript),
     feedbackDigest: sha256(body.feedback),
     recordingId: body.recordingId,
@@ -1450,6 +1484,24 @@ function applyExpectedPracticeAttempt(user, questionId, body, actionStartedMs, a
     dueAtMax: new Date(dueBaseMax + 5_000).toISOString(),
     skippedUntilMin: null,
     skippedUntilMax: null,
+  });
+}
+
+function applyExpectedNativeAttempt(user, questionId, actionStartedMs, actionFinishedMs) {
+  const prior = user._progress.get(questionId);
+  const due = prior ? { min: prior.dueAtMin, max: prior.dueAtMax } : isoAround(actionStartedMs);
+  user._progress.set(questionId, {
+    questionId,
+    status: prior?.status ?? 'learning',
+    bestScore: prior?.bestScore ?? 0,
+    attemptCount: (prior?.attemptCount ?? 0) + 1,
+    srsIntervalIndex: prior?.srsIntervalIndex ?? 0,
+    dueAtMin: due.min,
+    dueAtMax: due.max,
+    skippedUntilMin: null,
+    skippedUntilMax: null,
+    lastAttemptAtMin: new Date(actionStartedMs - 5_000).toISOString(),
+    lastAttemptAtMax: new Date(actionFinishedMs + 5_000).toISOString(),
   });
 }
 
@@ -1741,7 +1793,7 @@ async function getDiagnosticNext(user) {
     } else {
       assertCondition(validQuestion(response.body?.question), 'diagnostic next omitted question');
       assertCondition(
-        Number.isInteger(response.body.progress?.asked) && response.body.progress?.maxQuestions === 5,
+        Number.isInteger(response.body.progress?.asked) && response.body.progress?.maxQuestions === 3,
         'diagnostic progress invalid',
       );
     }
@@ -1756,7 +1808,7 @@ async function getDiagnosticNext(user) {
 async function actionDiagnosticJourney(user) {
   let next = await getDiagnosticNext(user);
   let question = next.question;
-  for (let answerIndex = 0; answerIndex < 5 && !next.done; answerIndex++) {
+  for (let answerIndex = 0; answerIndex < 3 && !next.done; answerIndex++) {
     const result = await performFreshAssessment(user, ENDPOINTS.diagnostic, question.id, 'diagnostic', 'english');
     const expected = attemptExpectation('diagnostic', question.id, answerIndex + 1, result.body);
     expected.seq = user.expectedAttempts.length + 1;
@@ -1771,7 +1823,7 @@ async function actionDiagnosticJourney(user) {
       question = next.nextQuestion;
     }
   }
-  assertCondition(next.done === true && LEVELS.includes(user._level), 'diagnostic did not finish within five answers');
+  assertCondition(next.done === true && LEVELS.includes(user._level), 'diagnostic did not finish within three answers');
 }
 
 async function actionPracticeQuestion(user, logicalAction = 'practice-question') {
@@ -1783,11 +1835,14 @@ async function actionPracticeQuestion(user, logicalAction = 'practice-question')
     assertCondition(response.body.question.cefrLevel === user._level, 'practice question level mismatch');
     assertCondition(response.body.kind === 'new' || response.body.kind === 'revision', 'practice kind invalid');
     assertCondition(validProgress(response.body.progress), 'practice progress invalid');
+    assertCondition(isUuid(response.body.cycleId), 'practice cycle id invalid');
     user._practiceQuestion = response.body.question;
+    user._practiceCycleId = response.body.cycleId;
     passAction(
       action,
       {
         questionId: response.body.question.id,
+        cycleId: response.body.cycleId,
         kind: response.body.kind,
         progress: response.body.progress,
       },
@@ -1807,7 +1862,7 @@ async function actionSkip(user) {
   try {
     const response = await requestOnce(user, action, 'POST', '/practice/skip', {
       token: user._token,
-      json: { questionId },
+      json: { questionId, cycleId: user._practiceCycleId },
     });
     const finishedMs = Date.now();
     assertCondition(!response.networkError && response.status === 204, 'practice skip did not return 204');
@@ -1853,7 +1908,14 @@ async function actionEnglishJourney(user) {
   const questionId = user._practiceQuestion.id;
   for (let logicalAttempt = 1; logicalAttempt <= 3; logicalAttempt++) {
     const startedMs = Date.now();
-    const result = await performFreshAssessment(user, ENDPOINTS.practice, questionId, 'practice', 'english');
+    const result = await performFreshAssessment(
+      user,
+      ENDPOINTS.practice,
+      questionId,
+      'practice',
+      'english',
+      user._practiceCycleId,
+    );
     const finishedMs = Date.now();
     const body = result.body;
     if (body.transcript === '') {
@@ -1867,6 +1929,7 @@ async function actionEnglishJourney(user) {
     applyExpectedPracticeAttempt(user, questionId, body, startedMs, finishedMs);
     if (body.passed || body.attemptsLeft === 0) {
       user._practiceQuestion = body.next.question;
+      user._practiceCycleId = body.next.cycleId;
       if (body.levelUp) {
         user._level = body.levelUp.to;
         user.expectedFinal.cefrLevel = body.levelUp.to;
@@ -1880,14 +1943,28 @@ async function actionEnglishJourney(user) {
 
 async function actionNativeJourney(user) {
   const questionId = user._practiceQuestion.id;
-  const progressBefore = canonicalJson([...user._progress.values()]);
-  const result = await performFreshAssessment(user, ENDPOINTS.native, questionId, 'practice-native', 'native');
-  user._nativeAssessment = { ...result, questionId };
-  user.nativeInvariantExpected = true;
-  assertCondition(
-    progressBefore === canonicalJson([...user._progress.values()]),
-    'native mode changed expected progress',
+  const startedMs = Date.now();
+  const result = await performFreshAssessment(
+    user,
+    ENDPOINTS.native,
+    questionId,
+    'practice-native',
+    'native',
+    user._practiceCycleId,
   );
+  const finishedMs = Date.now();
+  user._nativeAssessment = { ...result, questionId };
+  if (result.body.transcript !== '') {
+    const expected = attemptExpectation('practice-native', questionId, result.body.attemptNo, result.body);
+    expected.seq = user.expectedAttempts.length + 1;
+    user.expectedAttempts.push(expected);
+    applyExpectedNativeAttempt(user, questionId, startedMs, finishedMs);
+    if (result.body.attemptsLeft === 0) {
+      user._practiceQuestion = result.body.next.question;
+      user._practiceCycleId = result.body.next.cycleId;
+    }
+  }
+  user.nativeInvariantExpected = true;
 }
 
 async function actionNativeReplay(user) {
@@ -2099,7 +2176,9 @@ async function actionStats(user) {
     assertCondition(!response.networkError && response.status === 200, 'practice stats did not return 200');
     assertCondition(response.body?.level === user._level, 'practice stats level mismatch');
     assertCondition(validProgress(response.body?.progress), 'practice stats progress invalid');
-    const practiceAttempts = user.expectedAttempts.filter((item) => item.context === 'practice');
+    const practiceAttempts = user.expectedAttempts.filter((item) =>
+      ['practice', 'practice-native'].includes(item.context),
+    );
     const expectedPracticeAttempts = practiceAttempts.length;
     const currentUtcDay = new Date().toISOString().slice(0, 10);
     const expectedPracticedToday = practiceAttempts.filter(

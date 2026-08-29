@@ -3,12 +3,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import request from 'supertest';
 import {
   abandonAssessmentRequest,
-  claimAssessmentRequest,
+  claimAssessmentRequest as claimAssessmentRequestWithCycle,
   cleanupAssessmentRequests,
   completeAssessmentRequest,
   isAssessmentRequestProcessing,
 } from '../src/idempotency';
-import { app, pool, registerUser } from './helpers';
+import { answerForm, app, pool, registerUser } from './helpers';
 
 afterAll(async () => {
   await pool.end();
@@ -20,6 +20,8 @@ describe('assessment request recovery', () => {
   let ownerToken: string;
   let outsiderToken: string;
   let questionId: string;
+  let question: { id: string; cefrLevel: string; promptWord: string; questionText: string };
+  let practiceCycleId: string;
 
   beforeAll(async () => {
     const owner = await registerUser(a);
@@ -29,7 +31,23 @@ describe('assessment request recovery', () => {
     ownerId = owner.res.body.user.id;
     ownerToken = owner.res.body.token;
     outsiderToken = outsider.res.body.token;
-    questionId = (await pool.query<{ id: string }>('SELECT id FROM questions ORDER BY id LIMIT 1')).rows[0].id;
+    question = (
+      await pool.query<{ id: string; cefrLevel: string; promptWord: string; questionText: string }>(
+        `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
+         FROM questions ORDER BY id LIMIT 1`,
+      )
+    ).rows[0];
+    questionId = question.id;
+    await pool.query("UPDATE users SET diagnostic_completed = true, cefr_level = 'A1' WHERE id = $1", [ownerId]);
+    practiceCycleId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles
+           (user_id, question_id, kind, attempts_used, status, closed_at)
+         VALUES ($1, $2, 'revision', 0, 'closed', now())
+         RETURNING id`,
+        [ownerId, questionId],
+      )
+    ).rows[0].id;
   });
 
   async function insertRequest(
@@ -40,23 +58,30 @@ describe('assessment request recovery', () => {
       completedAt?: string;
       response?: Record<string, unknown>;
       claimId?: string;
+      context?: 'diagnostic' | 'practice' | 'practice-native';
+      responseVersion?: 1 | 2;
+      practiceCycleId?: string | null;
     } = {},
   ) {
     const status = options.status ?? 'processing';
     const response = options.response ?? null;
     await pool.query(
       `INSERT INTO assessment_requests
-         (user_id, request_id, claim_id, context, question_id, status, response_body, started_at, completed_at)
-       VALUES ($1, $2, $3, 'practice', $4, $5, $6::jsonb, $7::timestamptz, $8::timestamptz)`,
+         (user_id, request_id, claim_id, context, question_id, status, response_body,
+          started_at, completed_at, response_version, practice_cycle_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz, $9::timestamptz, $10, $11)`,
       [
         ownerId,
         requestId,
         options.claimId ?? randomUUID(),
+        options.context ?? 'practice',
         questionId,
         status,
         response ? JSON.stringify(response) : null,
         options.startedAt ?? new Date().toISOString(),
         options.completedAt ?? null,
+        options.responseVersion ?? 2,
+        options.practiceCycleId === undefined ? practiceCycleId : options.practiceCycleId,
       ],
     );
   }
@@ -65,11 +90,16 @@ describe('assessment request recovery', () => {
     return {
       passed: true,
       mastered: score >= 75,
+      cycleId: '22222222-2222-4222-8222-222222222222',
       attemptNo: 1,
+      attemptsLeft: 0,
       score,
       transcript: 'A recovered transcript.',
       feedback: 'Clear and relevant.',
       next: {
+        cycleId: '33333333-3333-4333-8333-333333333333',
+        attemptsUsed: 0,
+        attemptsLeft: 3,
         question: {
           id: questionId,
           cefrLevel: 'A1',
@@ -108,7 +138,29 @@ describe('assessment request recovery', () => {
     const response = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${ownerToken}`);
 
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ status: 'processing', context: 'practice', questionId });
+    expect(response.body).toEqual({
+      status: 'processing',
+      context: 'practice',
+      questionId,
+      cycleId: practiceCycleId,
+      question,
+    });
+  });
+
+  it('returns a null cycle with the original question for a diagnostic request', async () => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, { context: 'diagnostic', practiceCycleId: null });
+
+    const response = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${ownerToken}`);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      status: 'processing',
+      context: 'diagnostic',
+      questionId,
+      cycleId: null,
+      question,
+    });
   });
 
   it('replays a completed response privately without cache storage', async () => {
@@ -128,6 +180,8 @@ describe('assessment request recovery', () => {
       status: 'completed',
       context: 'practice',
       questionId,
+      cycleId: practiceCycleId,
+      question,
       response: storedResponse,
     });
   });
@@ -144,6 +198,109 @@ describe('assessment request recovery', () => {
 
     expect(response.status).toBe(500);
     expect(response.body).toEqual({ error: 'Stored assessment response is invalid', code: 'INTERNAL' });
+  });
+
+  it.each([
+    {
+      label: 'practice',
+      context: 'practice' as const,
+      endpoint: '/practice/attempt',
+      cycleId: (): string | null => practiceCycleId,
+      response: {
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 50,
+        transcript: 'legacy practice speech',
+        feedback: 'Try again.',
+      },
+    },
+    {
+      label: 'native practice',
+      context: 'practice-native' as const,
+      endpoint: '/practice/attempt/native',
+      cycleId: (): string | null => practiceCycleId,
+      response: {
+        mode: 'native',
+        understood: true,
+        transcript: 'legacy native speech',
+        modelAnswer: 'A model answer.',
+        feedback: 'Understood.',
+      },
+    },
+    {
+      label: 'silent diagnostic',
+      context: 'diagnostic' as const,
+      endpoint: '/diagnostic/answer',
+      cycleId: (): string | null => null,
+      response: {
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: 'No speech was detected.',
+        done: false,
+        nextQuestion: {
+          id: '00000000-0000-4000-8000-000000000001',
+          cefrLevel: 'A1',
+          promptWord: 'legacy',
+          questionText: 'Describe a legacy answer.',
+        },
+      },
+    },
+  ])('keeps an incompatible legacy $label response as a non-spending replay tombstone', async (testCase) => {
+    const requestId = randomUUID();
+    await insertRequest(requestId, {
+      context: testCase.context,
+      status: 'completed',
+      completedAt: new Date().toISOString(),
+      response: testCase.response,
+      responseVersion: 1,
+      practiceCycleId: null,
+    });
+    const beforeAttempts = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM attempts WHERE user_id = $1',
+      [ownerId],
+    );
+    const beforeUsage = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [ownerId],
+    );
+    const expectedError = {
+      error: 'This saved assessment result was created by an older app version; start a new answer',
+      code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+    };
+
+    const status = await request(a).get(`/assessments/${requestId}`).set('Authorization', `Bearer ${ownerToken}`);
+    expect(status.status).toBe(409);
+    expect(status.body).toEqual(expectedError);
+
+    const replay = await answerForm(
+      request(a).post(testCase.endpoint).set('Authorization', `Bearer ${ownerToken}`),
+      questionId,
+      requestId,
+      testCase.cycleId(),
+    );
+    expect(replay.status).toBe(409);
+    expect(replay.body).toEqual(expectedError);
+
+    const afterAttempts = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM attempts WHERE user_id = $1',
+      [ownerId],
+    );
+    const afterUsage = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [ownerId],
+    );
+    expect(afterAttempts.rows[0].n).toBe(beforeAttempts.rows[0].n);
+    expect(afterUsage.rows[0].n).toBe(beforeUsage.rows[0].n);
+    await expect(
+      pool.query(
+        `SELECT 1 FROM assessment_requests
+         WHERE user_id = $1 AND request_id = $2 AND response_version = 1 AND status = 'completed'`,
+        [ownerId, requestId],
+      ),
+    ).resolves.toMatchObject({ rowCount: 1 });
   });
 
   it('uses the status-specific retention timestamp when deciding whether a request is recoverable', async () => {
@@ -189,7 +346,14 @@ describe('assessment request recovery', () => {
       startedAt: new Date(Date.now() - 6 * 60 * 1000).toISOString(),
     });
 
-    const replacement = await claimAssessmentRequest(ownerId, requestId, 'practice', questionId);
+    const replacement = await claimAssessmentRequestWithCycle(
+      ownerId,
+      requestId,
+      'practice',
+      questionId,
+      undefined,
+      practiceCycleId,
+    );
     expect(replacement.kind).toBe('claimed');
     if (replacement.kind !== 'claimed') throw new Error('expected a replacement claim');
     expect(replacement.claimId).not.toBe(staleClaimId);

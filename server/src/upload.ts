@@ -77,8 +77,10 @@ export const upload = multer({
     // exact-cap upload is accepted while the first byte beyond it is rejected.
     fileSize: MAX_AUDIO_BYTES + 1,
     files: 1,
-    fields: 2,
-    parts: 4,
+    // Practice carries questionId + requestId + durable cycleId. Diagnostic
+    // still validates its two-field schema and rejects an unexpected third.
+    fields: 3,
+    parts: 5,
     fieldNameSize: 64,
     fieldSize: 128,
     headerPairs: 50,

@@ -2,6 +2,7 @@ import { randomUUID } from 'crypto';
 import type { PoolClient } from 'pg';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
+import jwt from 'jsonwebtoken';
 
 const speakMock = vi.hoisted(() => vi.fn());
 const nativeMock = vi.hoisted(() => vi.fn());
@@ -107,16 +108,43 @@ describe('CEFR level progression', () => {
     return rows[0].cefr_level;
   }
 
-  const attempt = (token: string, questionId: string) =>
-    answerForm(request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`), questionId);
+  async function assignedCycle(token: string, questionId: string): Promise<string> {
+    const userId = jwt.decode(token)!.sub as string;
+    const active = await pool.query<{ id: string; question_id: string }>(
+      "SELECT id, question_id FROM practice_cycles WHERE user_id = $1 AND status = 'active'",
+      [userId],
+    );
+    if (active.rows[0]?.question_id === questionId) return active.rows[0].id;
+    if (active.rows[0]) {
+      await pool.query(
+        `UPDATE practice_cycles SET status = 'closed', closed_at = now(), updated_at = now() WHERE id = $1`,
+        [active.rows[0].id],
+      );
+    }
+    const created = await pool.query<{ id: string }>(
+      `INSERT INTO practice_cycles (user_id, question_id, kind)
+       VALUES ($1, $2, 'revision') RETURNING id`,
+      [userId, questionId],
+    );
+    return created.rows[0].id;
+  }
 
-  const fixedAttempt = (token: string, questionId: string, requestId: string) =>
+  const attempt = async (token: string, questionId: string) =>
+    answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+      undefined,
+      await assignedCycle(token, questionId),
+    );
+
+  const fixedAttempt = async (token: string, questionId: string, requestId: string, cycleId?: string) =>
     request(a)
       .post('/practice/attempt')
       .set('Authorization', `Bearer ${token}`)
       .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
       .field('questionId', questionId)
-      .field('requestId', requestId);
+      .field('requestId', requestId)
+      .field('cycleId', cycleId ?? (await assignedCycle(token, questionId)));
 
   it('promotes at exactly ceil(0.85 * totalAtLevel) mastered words, answering from the NEW level', async () => {
     const { token, userId } = await freshUserAt('A1');
@@ -153,10 +181,11 @@ describe('CEFR level progression', () => {
     await seedMastered(userId, ids.slice(0, threshold - 1));
     const target = ids[threshold - 1];
     const requestId = randomUUID();
+    const cycleId = await assignedCycle(token, target);
 
     mockScore(90);
-    const first = await fixedAttempt(token, target, requestId);
-    const replay = await fixedAttempt(token, target, requestId);
+    const first = await fixedAttempt(token, target, requestId, cycleId);
+    const replay = await fixedAttempt(token, target, requestId, cycleId);
 
     expect(first.status).toBe(200);
     expect(first.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
@@ -229,65 +258,50 @@ describe('CEFR level progression', () => {
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
     await seedMastered(userId, ids.slice(0, threshold - 1));
-    const [targetA, targetB] = [ids[threshold - 1], ids[threshold]];
+    const target = ids[threshold - 1];
 
     mockScore(90);
-    const { result, queries } = await observeExplicitLeaseQueries(() =>
-      Promise.all([attempt(token, targetA), attempt(token, targetB)]),
-    );
+    const cycleId = await assignedCycle(token, target);
+    const send = () =>
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        target,
+        undefined,
+        cycleId,
+      );
+    const { result, queries } = await observeExplicitLeaseQueries(() => Promise.all([send(), send()]));
     const [ra, rb] = result;
 
-    expect(ra.status).toBe(200);
-    expect(rb.status).toBe(200);
-    // The promotion commits exactly once, and the waiter observes that new
-    // level from the parent-row lock instead of running a redundant old-level
-    // mastery aggregate or a guaranteed-zero guarded UPDATE. Only the attempt
-    // whose own mastery crossed the threshold reports levelUp — the waiter's
-    // mastered pass keeps its normal outcome shape without the flag.
-    expect(ra.body.mastered).toBe(true);
-    expect(rb.body.mastered).toBe(true);
-    expect([ra.body.levelUp, rb.body.levelUp].filter(Boolean)).toEqual([{ from: 'A1', to: 'A2' }]);
-    expect(ra.body.next.question.cefrLevel).toBe('A2');
-    expect(rb.body.next.question.cefrLevel).toBe('A2');
+    expect([ra.status, rb.status].sort()).toEqual([200, 409]);
+    const winner = ra.status === 200 ? ra : rb;
+    const loser = ra.status === 409 ? ra : rb;
+    expect(winner.body).toMatchObject({ mastered: true, levelUp: { from: 'A1', to: 'A2' } });
+    expect(winner.body.next.question.cefrLevel).toBe('A2');
+    expect(['ASSESSMENT_IN_PROGRESS', 'PRACTICE_CYCLE_CLOSED']).toContain(loser.body.code);
     const oldLevelMasterySnapshots = queries.filter(
       ({ text, values }) => text.includes("count(*) FILTER (WHERE pp.status = 'mastered')") && values?.[1] === 'A1',
     );
     expect(oldLevelMasterySnapshots).toHaveLength(1);
     expect(queries.filter(({ text }) => text.startsWith('UPDATE users SET cefr_level = $1'))).toHaveLength(1);
-    // The user row was promoted exactly one step, never A1 -> A2 -> B1.
     expect(await userLevel(userId)).toBe('A2');
   });
 
-  it('does not miss the threshold when two different words are mastered concurrently', async () => {
+  it('does not miss the threshold when two different assigned words are mastered sequentially', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
     await seedMastered(userId, ids.slice(0, threshold - 2));
     const [targetA, targetB] = [ids[threshold - 2], ids[threshold - 1]];
 
-    const assessment = {
-      transcript: 'a scored answer',
-      score: 90,
-      passed: true,
-      feedback: 'scored 90',
-    };
-    const release: Array<(value: typeof assessment) => void> = [];
-    speakMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          release.push(resolve);
-          if (release.length === 2) {
-            for (const resolveAssessment of release) resolveAssessment(assessment);
-          }
-        }),
-    );
-
-    const [ra, rb] = await Promise.all([attempt(token, targetA), attempt(token, targetB)]);
+    mockScore(90);
+    const ra = await attempt(token, targetA);
+    const rb = await attempt(token, targetB);
 
     expect(ra.status).toBe(200);
     expect(rb.status).toBe(200);
-    expect([ra.body.levelUp, rb.body.levelUp]).toContainEqual({ from: 'A1', to: 'A2' });
-    expect([ra.body.next.question.cefrLevel, rb.body.next.question.cefrLevel]).toContain('A2');
+    expect(ra.body.levelUp).toBeUndefined();
+    expect(rb.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    expect(rb.body.next.question.cefrLevel).toBe('A2');
     expect(await userLevel(userId)).toBe('A2');
     const progress = await pool.query<{ mastered: number }>(
       `SELECT count(*)::int AS mastered
@@ -299,7 +313,7 @@ describe('CEFR level progression', () => {
     expect(progress.rows[0].mastered).toBe(threshold);
   });
 
-  it('answers a non-mastering result from the new level when it waits behind a promotion', async () => {
+  it('rejects a different off-cycle question while the assigned promotion is in flight', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
@@ -308,80 +322,64 @@ describe('CEFR level progression', () => {
 
     type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
     let releasePromoter!: (result: Assessment) => void;
-    let releaseWaiter!: (result: Assessment) => void;
-    speakMock
-      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)))
-      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseWaiter = resolve)));
-
-    const promoterPromise = Promise.resolve(attempt(token, promotingQuestion));
+    speakMock.mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)));
+    const cycleId = await assignedCycle(token, promotingQuestion);
+    const promoterPromise = Promise.resolve(
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        promotingQuestion,
+        undefined,
+        cycleId,
+      ),
+    );
     await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(1));
-    const waiterPromise = Promise.resolve(attempt(token, waitingQuestion));
-    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(2));
+    const rejected = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      waitingQuestion,
+      undefined,
+      cycleId,
+    );
+    expect(rejected.status).toBe(409);
+    expect(rejected.body.code).toBe('PRACTICE_CYCLE_CLOSED');
+    expect(speakMock).toHaveBeenCalledTimes(1);
 
     releasePromoter({ transcript: 'mastered', score: 90, passed: true, feedback: 'great' });
     const promoted = await promoterPromise;
     expect(promoted.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
     expect(await userLevel(userId)).toBe('A2');
-
-    releaseWaiter({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
-    const waited = await waiterPromise;
-    expect(waited.status).toBe(200);
-    // The rival earned the promotion, not this attempt: no levelUp (the client
-    // contract rejects the flag on a non-mastering attempt), while the next
-    // question and progress still come from the promoted level.
-    expect(waited.body).toMatchObject({ passed: true, mastered: false });
-    expect(waited.body.levelUp).toBeUndefined();
-    expect(waited.body.attemptsLeft).toBeUndefined();
-    expect(waited.body.finalFeedback).toBeUndefined();
-    expect(waited.body.next.question.cefrLevel).toBe('A2');
-    expect(await userLevel(userId)).toBe('A2');
   });
 
-  it('closes the run instead of arming a doomed retry when a rival promotion lands mid-assessment', async () => {
+  it('closes the promoted cycle and rejects concurrent or stale submissions', async () => {
     const { token, userId } = await freshUserAt('A1');
     const ids = await levelQuestionIds('A1');
     const threshold = Math.ceil(0.85 * ids.length);
     await seedMastered(userId, ids.slice(0, threshold - 1));
-    const [promotingQuestion, waitingQuestion] = [ids[threshold - 1], ids[threshold]];
+    const promotingQuestion = ids[threshold - 1];
 
     type Assessment = { transcript: string; score: number; passed: boolean; feedback: string };
     let releasePromoter!: (result: Assessment) => void;
-    let releaseWaiter!: (result: Assessment) => void;
-    speakMock
-      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)))
-      .mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releaseWaiter = resolve)));
-
-    const promoterPromise = Promise.resolve(attempt(token, promotingQuestion));
+    speakMock.mockImplementationOnce(() => new Promise<Assessment>((resolve) => (releasePromoter = resolve)));
+    const cycleId = await assignedCycle(token, promotingQuestion);
+    const send = () =>
+      answerForm(
+        request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+        promotingQuestion,
+        undefined,
+        cycleId,
+      );
+    const promoterPromise = Promise.resolve(send());
     await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(1));
-    const waiterPromise = Promise.resolve(attempt(token, waitingQuestion));
-    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledTimes(2));
+    const concurrent = await send();
+    expect(concurrent.status).toBe(409);
+    expect(concurrent.body.code).toBe('ASSESSMENT_IN_PROGRESS');
 
     releasePromoter({ transcript: 'mastered', score: 90, passed: true, feedback: 'great' });
-    expect((await promoterPromise).body.levelUp).toEqual({ from: 'A1', to: 'A2' });
-    releaseWaiter({ transcript: 'missed', score: 45, passed: false, feedback: 'try again' });
-    const waited = await waiterPromise;
-
-    expect(waited.status).toBe(200);
-    // The answered A1 question is off-level now, so the retry this miss would
-    // otherwise advertise could never be scored: the run closes with the final
-    // feedback and a next question from A2. levelUp stays off — the client
-    // contract rejects a promotion flag this attempt did not earn.
-    expect(waited.body).toMatchObject({
-      passed: false,
-      mastered: false,
-      attemptNo: 1,
-      attemptsLeft: 0,
-    });
-    expect(waited.body.levelUp).toBeUndefined();
-    expect(waited.body.finalFeedback).toContain('final feedback');
-    expect(waited.body.next.question.cefrLevel).toBe('A2');
-    expect(waited.body.next.progress.totalAtLevel).toBe((await levelQuestionIds('A2')).length);
-
-    // Exactly the retry the old shape invited, and exactly why it had to go.
-    const retry = await attempt(token, waitingQuestion);
+    const promoted = await promoterPromise;
+    expect(promoted.body.levelUp).toEqual({ from: 'A1', to: 'A2' });
+    const retry = await send();
     expect(retry.status).toBe(403);
     expect(retry.body).toEqual({ error: 'Question is not available at your level', code: 'FORBIDDEN' });
-    expect(speakMock).toHaveBeenCalledTimes(2);
+    expect(speakMock).toHaveBeenCalledTimes(1);
   });
 
   it('rejects an in-flight scored result when diagnostic state was reset before persistence', async () => {
@@ -477,6 +475,8 @@ describe('POST /diagnostic/restart', () => {
         await answerForm(
           request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
           q.body.question.id,
+          undefined,
+          q.body.cycleId,
         )
       ).status,
     ).toBe(200);

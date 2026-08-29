@@ -1,16 +1,31 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
-import { useIsFocused } from 'expo-router';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Pressable, ScrollView, SectionList, Text, View } from 'react-native';
+import { router, useFocusEffect, useIsFocused } from 'expo-router';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  ActivityIndicator,
+  Pressable,
+  RefreshControl,
+  ScrollView,
+  SectionList,
+  Text,
+  View,
+} from 'react-native';
 
 import Button from '../components/Button';
+import DataRefreshNotice from '../components/DataRefreshNotice';
 import HistoryNativeAdCard from '../components/HistoryNativeAdCard';
+import OfflineState from '../components/OfflineState';
 import RecordingPlayback from '../components/RecordingPlayback';
 import { apiGetPracticeHistory, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useI18n, type Translator, type UiLanguage } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
-import { PRACTICE_MASTER_SCORE, PRACTICE_PASS_SCORE, type HistoryItem } from '../lib/types';
+import {
+  PRACTICE_MASTER_SCORE,
+  PRACTICE_PASS_SCORE,
+  type HistoryItem,
+  type NativeLanguage,
+} from '../lib/types';
 
 /** BCP-47 tags for day headings, matching the app's UI languages. */
 const DATE_LOCALES: Record<UiLanguage, string> = {
@@ -21,12 +36,17 @@ const DATE_LOCALES: Record<UiLanguage, string> = {
   zh: 'zh-Hans',
 };
 
+const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
+  te: 'te-IN',
+  hi: 'hi-IN',
+  es: 'es-ES',
+  zh: 'zh-Hans',
+};
+
 interface DaySection {
   title: string;
   data: HistoryItem[];
 }
-
-const HISTORY_MAX_PAGES = 500;
 
 interface HistoryFetchMeta {
   fetchMore?: { direction?: 'forward' | 'backward' };
@@ -67,26 +87,60 @@ function scoreChipStyles(styles: HistoryStyles, score: number) {
   return { chip: styles.scoreChipFailed, text: styles.scoreChipFailedText };
 }
 
-function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; t: Translator }) {
+function HistoryRow({
+  item,
+  ownerId,
+  nativeLanguage,
+  t,
+}: {
+  item: HistoryItem;
+  ownerId: string;
+  nativeLanguage: NativeLanguage;
+  t: Translator;
+}) {
   const styles = themedStyles(useTheme());
   const [expanded, setExpanded] = useState(false);
-  const chip = scoreChipStyles(styles, item.score);
+  const native = item.context === 'practice-native';
+  const scoreLabel =
+    item.score === null
+      ? item.understood
+        ? t('feedback.nativeUnderstoodTitle')
+        : t('feedback.nativeMissedTitle')
+      : t('feedback.scoreLine', { score: item.score });
+  const contextLabel =
+    item.context === 'diagnostic'
+      ? t('history.contextDiagnostic')
+      : native
+        ? t('history.contextNative')
+        : t('history.contextPractice');
+  const attemptLabel =
+    item.context === 'diagnostic' ? null : t('history.attemptNo', { number: item.attemptNo });
+  const detailsLabel = expanded ? t('history.hideDetails') : t('history.showDetails');
+  const chip =
+    item.score === null
+      ? {
+          chip: item.understood ? styles.scoreChipMastered : styles.scoreChipFailed,
+          text: item.understood ? styles.scoreChipMasteredText : styles.scoreChipFailedText,
+        }
+      : scoreChipStyles(styles, item.score);
   return (
     <View style={styles.row}>
       <Pressable
         accessibilityRole="button"
         accessibilityState={{ expanded }}
-        accessibilityLabel={`${item.promptWord}. ${t('feedback.scoreLine', { score: item.score })}`}
+        accessibilityLabel={[item.promptWord, scoreLabel, contextLabel, attemptLabel, detailsLabel]
+          .filter((part): part is string => part !== null)
+          .join('. ')}
         style={({ pressed }) => [styles.rowHeader, pressed && styles.rowHeaderPressed]}
         onPress={() => setExpanded((current) => !current)}
       >
         <View style={styles.rowHeaderText}>
-          <Text style={styles.promptWord}>{item.promptWord}</Text>
+          <Text accessibilityLanguage="en-US" style={styles.promptWord}>
+            {item.promptWord}
+          </Text>
           <View style={styles.badgeRow}>
             <View style={[styles.scoreChip, chip.chip]}>
-              <Text style={[styles.scoreChipText, chip.text]}>
-                {t('feedback.scoreLine', { score: item.score })}
-              </Text>
+              <Text style={[styles.scoreChipText, chip.text]}>{scoreLabel}</Text>
             </View>
             <View
               style={[
@@ -100,12 +154,10 @@ function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; 
                   item.context === 'diagnostic' && styles.contextBadgeDiagnosticText,
                 ]}
               >
-                {item.context === 'diagnostic'
-                  ? t('history.contextDiagnostic')
-                  : t('history.contextPractice')}
+                {contextLabel}
               </Text>
             </View>
-            {item.context === 'practice' && (
+            {item.context !== 'diagnostic' && (
               <Text style={styles.attemptText}>
                 {t('history.attemptNo', { number: item.attemptNo })}
               </Text>
@@ -119,15 +171,49 @@ function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; 
       {expanded && (
         <View style={styles.rowDetails}>
           <Text style={styles.detailLabel}>{t('label.question')}</Text>
-          <Text style={styles.detailText}>{item.questionText}</Text>
+          <Text accessibilityLanguage="en-US" style={styles.detailText}>
+            {item.questionText}
+          </Text>
           {!!item.transcript && (
             <>
-              <Text style={styles.detailLabel}>{t('feedback.weHeard')}</Text>
-              <Text style={styles.transcript}>“{item.transcript}”</Text>
+              <Text style={styles.detailLabel}>
+                {native
+                  ? t('feedback.originalTranscript', {
+                      language: t(`language.${nativeLanguage}`),
+                    })
+                  : t('feedback.weHeard')}
+              </Text>
+              <Text
+                accessibilityLanguage={
+                  native ? NATIVE_ACCESSIBILITY_LANGUAGES[nativeLanguage] : 'en-US'
+                }
+                selectable
+                style={styles.transcript}
+              >
+                “{item.transcript}”
+              </Text>
+            </>
+          )}
+          {native && item.translatedTranscript && (
+            <>
+              <Text style={styles.detailLabel}>{t('feedback.englishTranslation')}</Text>
+              <Text accessibilityLanguage="en-US" selectable style={styles.detailText}>
+                {item.translatedTranscript}
+              </Text>
             </>
           )}
           <Text style={styles.detailLabel}>{t('feedback.feedbackLabel')}</Text>
-          <Text style={styles.detailText}>{item.feedback}</Text>
+          <Text accessibilityLanguage="en-US" style={styles.detailText}>
+            {item.feedback}
+          </Text>
+          {native && item.modelAnswer && (
+            <>
+              <Text style={styles.detailLabel}>{t('feedback.exampleEnglishAnswer')}</Text>
+              <Text accessibilityLanguage="en-US" selectable style={styles.detailText}>
+                {item.modelAnswer}
+              </Text>
+            </>
+          )}
           {item.recordingId && (
             <>
               <Text style={styles.detailLabel}>{t('recordings.yourRecording')}</Text>
@@ -163,6 +249,23 @@ export default function HistoryScreen() {
     void userId;
     return captureSessionLease();
   }, [captureSessionLease, sessionVersion, userId]);
+  // Match Home's focus-owned navigation contract: an empty-state tap may only
+  // leave the currently focused account's screen, and rapid taps share one
+  // synchronous claim before React or the router can publish a new render.
+  const navigationStartedRef = useRef(true);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => {
+        navigationStartedRef.current = true;
+      };
+    }, []),
+  );
+  const startPractice = useCallback(() => {
+    if (navigationStartedRef.current || !isSessionLeaseCurrent(sessionLease)) return;
+    navigationStartedRef.current = true;
+    router.navigate('/practice');
+  }, [isSessionLeaseCurrent, sessionLease]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -182,7 +285,7 @@ export default function HistoryScreen() {
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage, allPages) => {
       const next = lastPage.nextCursor ?? undefined;
-      if (!next || allPages.length >= HISTORY_MAX_PAGES) return undefined;
+      if (!next) return undefined;
       // A malformed server must not keep onEndReached walking the same cursor
       // (or a cursor cycle) forever and appending duplicate pages.
       return allPages.slice(0, -1).some((page) => page.nextCursor === next) ? undefined : next;
@@ -207,14 +310,20 @@ export default function HistoryScreen() {
   if (items.length === 0 && historyQuery.isPending) {
     return (
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
-        <ActivityIndicator
-          accessibilityLabel={t('history.loading')}
-          size="large"
-          color={theme.colors.primary}
-        />
-        <Text accessibilityLiveRegion="polite" style={styles.muted}>
-          {t('history.loading')}
-        </Text>
+        {historyQuery.fetchStatus === 'paused' ? (
+          <OfflineState />
+        ) : (
+          <>
+            <ActivityIndicator
+              accessibilityLabel={t('history.loading')}
+              size="large"
+              color={theme.colors.primary}
+            />
+            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+              {t('history.loading')}
+            </Text>
+          </>
+        )}
       </ScrollView>
     );
   }
@@ -239,11 +348,31 @@ export default function HistoryScreen() {
 
   if (items.length === 0) {
     return (
-      <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.center}>
+      <ScrollView
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={styles.center}
+        refreshControl={
+          <RefreshControl
+            refreshing={historyQuery.isRefetching}
+            onRefresh={() => {
+              if (isSessionLeaseCurrent(sessionLease)) {
+                void historyQuery.refetch({ cancelRefetch: false });
+              }
+            }}
+            tintColor={theme.colors.primary}
+          />
+        }
+      >
         <Text accessibilityRole="header" style={styles.errorTitle}>
           {t('history.emptyTitle')}
         </Text>
         <Text style={styles.muted}>{t('history.emptyBody')}</Text>
+        <Button
+          title={t('home.startPractice')}
+          fullWidth
+          onPress={startPractice}
+          style={styles.emptyAction}
+        />
       </ScrollView>
     );
   }
@@ -310,7 +439,7 @@ export default function HistoryScreen() {
       keyExtractor={(item) => item.id}
       renderItem={({ item }) => (
         <>
-          <HistoryRow item={item} ownerId={user.id} t={t} />
+          <HistoryRow item={item} ownerId={user.id} nativeLanguage={user.nativeLanguage} t={t} />
           {item.id === historyAdAnchorId ? <HistoryNativeAdCard focused={focused} /> : null}
         </>
       )}
@@ -321,6 +450,19 @@ export default function HistoryScreen() {
       )}
       onEndReachedThreshold={0.4}
       onEndReached={loadOlderOnScroll}
+      refreshing={historyQuery.isRefetching}
+      onRefresh={() => {
+        if (mountedRef.current && isSessionLeaseCurrent(sessionLease)) {
+          void historyQuery.refetch({ cancelRefetch: false });
+        }
+      }}
+      ListHeaderComponent={
+        <DataRefreshNotice
+          updating={historyQuery.isRefetching && !historyQuery.isRefetchError}
+          failed={historyQuery.isRefetchError}
+          onRetry={() => void historyQuery.refetch({ cancelRefetch: false })}
+        />
+      }
       ListFooterComponent={
         <>
           {historyQuery.isFetchingNextPage ? (
@@ -395,6 +537,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     textAlign: 'center',
   },
   retryButton: {
+    marginTop: spacing.lg,
+  },
+  emptyAction: {
     marginTop: spacing.lg,
   },
   sectionHeader: {

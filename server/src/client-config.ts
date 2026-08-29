@@ -21,12 +21,22 @@ export interface PublicClientConfig {
 }
 
 /**
- * Fail closed unless the operator enabled ads and explicitly attested that the
- * product audience is adult-only. Unknown and child audiences never receive
- * an enabled placement, even if a placement flag was accidentally switched on.
+ * Release guard for account-level ad eligibility. Operator configuration can
+ * describe an intended audience, but it cannot prove that the authenticated
+ * learner is an adult. This deliberately returns false until a reviewed,
+ * per-account adult-eligibility flow is implemented end to end.
+ */
+export function accountAdultEligibilityEnforcementReady(): boolean {
+  return false;
+}
+
+/**
+ * Fail closed until adult eligibility is enforced for each account. The
+ * operator and placement switches remain part of the future rollout gate, but
+ * cannot enable ads by themselves.
  */
 export function publicClientConfig(policy: AdsPolicyConfig): PublicClientConfig {
-  const eligible = policy.enabled && policy.audienceMode === 'adult-only';
+  const eligible = accountAdultEligibilityEnforcementReady() && policy.enabled && policy.audienceMode === 'adult-only';
   return {
     ads: {
       enabled: eligible,

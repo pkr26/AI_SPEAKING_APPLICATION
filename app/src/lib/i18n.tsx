@@ -15,7 +15,8 @@ export type { UiLanguage } from './types';
  *
  * Language selection:
  * - Signed in: the account's `uiLanguage`.
- * - Signed out: English.
+ * - Signed out or before an offline profile loads: the device preference,
+ *   initially derived from `deviceLanguage()`.
  * - `nativeLanguage` never selects interface copy; it is reserved for
  *   learning help, native answers, and transcription hints.
  *
@@ -36,7 +37,7 @@ const en = {
   'common.hide': 'Hide',
   'common.showPassword': 'Show password',
   'common.hidePassword': 'Hide password',
-  'common.logOut': 'Log out',
+  'common.logOut': 'Log out on all devices',
   'common.backToPractice': 'Back to Practice',
   'label.word': 'Word',
   'label.question': 'Question',
@@ -77,6 +78,8 @@ const en = {
     'This internet connection used all its practice for today. Please try again tomorrow.',
   'error.busy': 'Many people are practicing right now. Please wait a little and try again.',
   'error.audioInvalid': 'We could not use this recording. Please record your answer again.',
+  'error.audioSilent':
+    'We did not hear any sound. Check your microphone, then record your answer again.',
   'error.audioTooLong': 'The recording is too long. Please keep your answer under two minutes.',
   'error.audioUnreadable': 'We could not hear this recording. Please record your answer again.',
   'error.checkFailed': 'We could not check your answer. Please try again.',
@@ -84,7 +87,10 @@ const en = {
   // the user pasted, and the action that fixes it.
   'error.resetInvalid': 'This code does not work or it is too old. Please ask for a new code.',
   'error.upgradeRequired': 'Please update the app to keep using it.',
+  'error.assessmentResultIncompatible':
+    'This saved answer cannot be shown after the app update. Your questions were reloaded. Please record a new answer.',
   'error.internal': 'Something went wrong. Please try again.',
+  'email.invalid': 'Enter a valid email address.',
 
   // ----- Auth / session -----
   'auth.sessionExpired': 'You were logged out to keep your account safe. Please log in again.',
@@ -93,11 +99,28 @@ const en = {
     'You are logged out, but the app could not clean up. Please close and open the app before you log in again.',
   'auth.accountDeletedCleanupFailed':
     'Your account was deleted, but the app could not clean up. Please close and open the app before you log in again.',
+  'auth.registrationCompletedLoginRequired':
+    'Your account was created, but this device could not save the login.',
 
   // ----- Password rules -----
   'password.tooShort': 'The password must have at least 8 characters.',
   'password.needsLetterAndNumber': 'The password must have at least one letter and one number.',
   'password.tooLong': 'The password is too long. Please use a shorter one.',
+  'password.confirmLabel': 'Confirm password',
+  'password.confirmPlaceholder': 'Type the password again',
+  'password.mismatch': 'The passwords do not match.',
+  'password.showConfirmation': 'Show password confirmation',
+  'password.hideConfirmation': 'Hide password confirmation',
+
+  // ----- Language names -----
+  'language.appLabel': 'App language',
+  'language.appHelp': 'Choose the language used by the app on this device.',
+  'language.saveFailed': 'The app language changed, but it could not be saved on this device.',
+  'language.en': 'English',
+  'language.te': 'Telugu',
+  'language.hi': 'Hindi',
+  'language.es': 'Spanish',
+  'language.zh': 'Chinese',
 
   // ----- Log in -----
   'login.title': 'AI English Coach',
@@ -118,11 +141,14 @@ const en = {
   'signup.nameLabel': 'Name',
   'signup.namePlaceholder': 'Your name',
   'signup.passwordPlaceholder': 'At least 8 characters, with a letter and a number',
-  'signup.languageLabel': 'Learning language',
-  'signup.languageHelp': 'Used for help and answers in your language.',
+  'signup.languageLabel': 'Mother tongue',
+  'signup.languageHelp':
+    'Used for translated help and answers in your language. It is separate from the app language.',
   'signup.submit': 'Create account',
   'signup.submitBusy': 'Creating your account…',
   'signup.failed': 'We could not create your account. Please check your information and try again.',
+  'signup.createdLoginBanner':
+    'Your account was created, but this device could not save the login. Log in with your new password.',
   'signup.footerPrompt': 'Already have an account? ',
   'signup.footerLink': 'Log in',
 
@@ -134,6 +160,31 @@ const en = {
   'gate.resetSession': 'Delete saved login',
   'gate.serverErrorTitle': 'We cannot reach the server',
   'gate.profileFailed': 'We could not load your profile. Please try again.',
+  'gate.offlineTitle': 'You are offline',
+  'gate.offlineBody': 'Your login is still saved. Reconnect to load your profile.',
+
+  // ----- Global connection / upgrade status -----
+  'network.offline': 'No internet connection. Your saved work is safe.',
+  'network.backOnline': 'Back online',
+  'network.offlineTitle': 'You are offline',
+  'network.offlineBody': 'Reconnect to load this screen. It will continue automatically.',
+  'refresh.updating': 'Updating…',
+  'refresh.failedUsingSaved': 'Could not refresh. Showing your saved information.',
+  'upgrade.title': 'Update required',
+  'upgrade.body':
+    'You need a newer version of AI English Coach to keep using your learning data safely.',
+  'upgrade.action': 'Update App',
+  'upgrade.actionHint': 'Opens the app store page for AI English Coach.',
+  'upgrade.openFailed':
+    'We could not open the app store. Please open it and update AI English Coach.',
+  'replay.checkingTitle': 'Checking your saved answer',
+  'replay.checkingBody': 'Your answer is safe. We are restoring your feedback.',
+  'replay.failedTitle': 'We could not restore your feedback',
+  'replay.failedBody': 'Your saved answer is still safe. Try again now or check later.',
+  'replay.checkLater': 'Check Later',
+  'replay.pendingTitle': 'Saved answer waiting',
+  'replay.pendingBody': 'Your answer is safe. Check again to restore feedback when it is ready.',
+  'replay.checkNow': 'Check Now',
 
   // ----- Screen titles -----
   'header.diagnostic': 'English Level Test',
@@ -154,19 +205,30 @@ const en = {
   'diag.loadFailed': 'We could not load the test. Please try again.',
   'diag.introTitle': 'Before you start',
   'diag.introWhat': 'This short test finds your English level.',
-  'diag.introCount': 'You will answer up to {count} questions.',
+  'diag.introCount': 'You will answer 2 or 3 questions.',
   'diag.introRecorded': 'Your answers are recorded.',
   'diag.introSpeakEnglish': 'Please speak in English.',
   'diag.introStart': 'Start Test',
   'diag.progress': 'Question {current} of up to {max}',
   'diag.answerSavedTitle': 'Answer saved',
   'diag.answerSavedBody': 'Your answer is saved. You will see your scores at the end of the test.',
+  'diag.answerCheckedTitle': 'Answer checked',
+  'diag.noSpeechTitle': 'We could not hear you',
+  'diag.recordAgain': 'Record Again',
+  'diag.scoreLine': '{score}/100 — {result}',
+  'diag.passed': 'pass',
+  'diag.notPassed': 'not a pass yet',
+  'diag.transcriptLabel': 'What we heard',
+  'diag.answerQuestion': '{word}: {question}',
   'diag.nextQuestion': 'Next Question',
   'diag.seeLevel': 'See My Level',
   'diag.completeTitle': 'Test complete!',
   'diag.levelIntro': 'Your English level is',
   'diag.levelHint': 'We will give you practice questions for this level.',
   'diag.startPracticing': 'Start Practicing',
+  'diag.startPracticingBusy': 'Opening practice…',
+  'diag.ackFailedTitle': 'We could not open practice',
+  'diag.ackFailed': 'Your level is saved. Please try again to continue.',
   'diag.answersTitle': 'Your answers',
   'diag.answerLine': 'Question {number} — {score}/100 {mark}',
   'diag.assessFailedTitle': 'We could not check your answer',
@@ -182,6 +244,9 @@ const en = {
   // ----- Log out -----
   'logout.failedTitle': 'We could not log you out',
   'logout.failedBody': 'Please check your internet and try again.',
+  'logout.localBody':
+    'We could not contact the server. You can remove this login from this device; other devices will stay signed in.',
+  'logout.thisDevice': 'Sign Out on This Device',
   'logout.cleanupTitle': 'Logged out',
 
   // ----- Practice -----
@@ -204,6 +269,8 @@ const en = {
   'practiceIntro.master': 'Score {score} or more to master a word.',
   'practiceIntro.tries': 'You get {count} tries for each word.',
   'practiceIntro.silence': 'If we hear nothing, it does not count. You can try again.',
+  'practiceIntro.native':
+    'An answer in your language uses one try and checks understanding, but only an English answer can master the word.',
   'practiceIntro.dismiss': 'Got it',
 
   // ----- Feedback -----
@@ -238,6 +305,14 @@ const en = {
   'feedback.tryInEnglish': 'Try in English',
   'feedback.tryAgainNative': 'Try Again in My Language',
   'feedback.seeHelp': 'See translation and examples',
+  'feedback.attemptLine': 'Try {current} of {max}',
+  'feedback.attemptStillAvailable': 'Try {current} of {max} is still available',
+  'feedback.wordAndQuestion': 'Word and question',
+  'feedback.originalTranscript': 'What we heard in {language}',
+  'feedback.englishTranslation': 'English translation',
+  'feedback.exampleEnglishAnswer': 'Example English answer',
+  'feedback.nativeFinalTitle': 'No more tries',
+  'feedback.nativeFinalBody': 'This answer used your last try. You will see this word again later.',
 
   // ----- Help -----
   'help.invalidLinkTitle': 'This link does not work',
@@ -262,25 +337,30 @@ const en = {
   'cp.confirmLabel': 'Confirm new password',
   'cp.confirmPlaceholder': 'Type the new password again',
   'cp.mismatch': 'The passwords do not match.',
+  'cp.sameAsCurrent': 'Choose a password different from your current password.',
   'cp.wrongCurrent': 'Your current password is wrong.',
   'cp.failed': 'We could not change your password. Please try again.',
   'cp.updatedTitle': 'Password updated',
-  'cp.updatedBody': 'Your password is changed.',
+  'cp.updatedBody': 'Your password is changed. Other devices have been signed out.',
   'cp.submit': 'Update Password',
   'cp.submitBusy': 'Updating…',
 
   // ----- Delete account -----
   'da.warningTitle': 'This cannot be undone',
   'da.warningBody':
-    'Deleting your account removes your profile, your test results, and your practice history. This cannot be undone.',
+    'Deleting your account immediately removes your profile, results, progress, and access to recordings. Stored recording files are then queued for permanent deletion, which may take additional time. This cannot be undone.',
   'da.passwordLabel': 'Enter your password',
   'da.passwordPlaceholder': 'Your password',
   'da.wrongPassword': 'Wrong password.',
   'da.failed': 'We could not delete your account. Please try again.',
+  'da.unconfirmed':
+    'We could not confirm whether your account was deleted. Reconnect and try signing in before repeating deletion.',
   'da.deletedTitle': 'Account deleted',
-  'da.deletedBody': 'Your account and all its data are deleted.',
+  'da.deletedBody':
+    'Your account data is deleted and stored recording files are queued for permanent deletion.',
   'da.confirmTitle': 'Delete your account?',
-  'da.confirmBody': 'This deletes your account and all your progress forever.',
+  'da.confirmBody':
+    'This permanently deletes your account and progress. Stored recording files remain queued until asynchronous permanent deletion completes.',
   'da.confirmDelete': 'Delete',
   'da.submit': 'Delete My Account',
   'da.submitBusy': 'Deleting…',
@@ -302,11 +382,11 @@ const en = {
   'recorder.stopLabel': 'Stop recording',
   'recorder.listening': 'Listening…',
   'recorder.statusRecording': 'Recording… {elapsed} of 2:00 — tap to stop',
-  'recorder.statusRecorded': 'Recorded {elapsed} — ready to send',
+  'recorder.statusRecorded': 'Recorded {elapsed} — ready to send. Keep this app open.',
   'recorder.statusRecovering': 'Checking if your last answer was saved…',
   'recorder.statusIdle': 'Tap the microphone to record your answer',
   'recorder.a11yRecording': 'Recording. Tap the microphone to stop.',
-  'recorder.a11ySaved': 'Recording saved. Ready to send.',
+  'recorder.a11ySaved': 'Take ready to send. Leaving or closing deletes it.',
   'recorder.a11yUploading': 'Sending and checking your answer.',
   'recorder.a11yRecovering': 'Checking your last answer.',
   'recorder.a11yIdle': 'Ready to record.',
@@ -317,13 +397,35 @@ const en = {
   'recorder.waitHint': 'This is taking longer than usual — checking your result…',
   'recorder.waitingFor': 'Waiting for {elapsed}',
   'recorder.privacyNote': 'We send your recording only after you tap Send Answer.',
+  'recorder.retentionNote':
+    'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on Save this recording.',
+  'recorder.saveRecordingLabel': 'Save this recording',
+  'recorder.saveRecordingHint':
+    'Off by default. When on, this audio stays in Recordings until you delete it.',
   'recorder.play': 'Play',
   'recorder.pause': 'Pause',
   'recorder.playLabel': 'Play your recording',
   'recorder.pauseLabel': 'Pause playback',
   'recorder.submit': 'Send Answer',
   'recorder.rerecord': 'Record Again',
+  'recorder.discard': 'Discard Take',
+  'recorder.discardHint': 'Delete this unsent recording from this device.',
+  'recorder.discardTitle': 'Discard this take?',
+  'recorder.discardBody':
+    'This unsent recording will be deleted from this device. Nothing will be sent.',
+  'recorder.discarded': 'Take discarded. Nothing was sent.',
+  'recorder.errDiscardFailed': "We couldn't discard this take safely. Try again.",
   'recorder.cancelHint': 'Stops sending and keeps your recording.',
+  'recorder.cancelSending': 'Cancel Sending',
+  'recorder.cancelBeforeTransferHint': 'Stops before audio leaves this device and keeps this take.',
+  'recorder.cancelAfterTransferHint':
+    'Stops submission. A temporary audio upload may remain briefly and will expire.',
+  'recorder.stopWaiting': 'Stop Waiting',
+  'recorder.stopWaitingHint':
+    'Stops checking on this screen. Your answer may already have been sent or saved.',
+  'recorder.permissionRetryBody':
+    'Microphone access was not allowed. Tap Start recording to ask again.',
+  'recorder.permissionGranted': 'Microphone access is on. Tap Start recording.',
   'recorder.oneMinuteLeft': 'One minute left',
   'recorder.thirtySecondsLeft': 'Thirty seconds left',
   'recorder.tenSecondsLeft': 'Ten seconds left',
@@ -360,9 +462,9 @@ const en = {
     'We could not save app info, so your recording was not sent. Please try again.',
   'recorder.errNotSent': 'We could not send your recording. Please try again.',
   'recorder.errDeviceInterrupted':
-    'The phone stopped the recording. Please record your answer again.',
+    'The phone stopped the recording before it was saved. Nothing was sent. Record again when you are ready.',
   'recorder.errBackgroundDiscarded':
-    'Your recording was not kept when you left the app. Please record your answer again.',
+    'Your unsent take was deleted when you left the app. Nothing was sent. Record again when you are ready.',
   'recorder.errTooShort': 'The recording was too short. Please record your answer again.',
   'recorder.errSaveFailed': 'We could not save the recording. Please record your answer again.',
   'recorder.errNoRecording': 'No recording was saved. Please record again.',
@@ -421,6 +523,7 @@ const en = {
   'history.loadingMore': 'Loading more…',
   'history.contextDiagnostic': 'Level test',
   'history.contextPractice': 'Practice',
+  'history.contextNative': 'Answer in your language',
   'history.attemptNo': 'Try {number}',
   'history.showDetails': 'Show details',
   'history.hideDetails': 'Hide details',
@@ -430,7 +533,8 @@ const en = {
   'recordings.loadFailedTitle': 'We could not load your recordings',
   'recordings.loadFailed': 'We could not load your recordings. Please try again.',
   'recordings.emptyTitle': 'No saved recordings',
-  'recordings.emptyBody': 'Record and send an answer — your saved recordings will appear here.',
+  'recordings.emptyBody':
+    'Turn on Save this recording before you send an answer. Saved recordings will appear here.',
   'recordings.loadMore': 'Show older recordings',
   'recordings.loadingMore': 'Loading more…',
   'recordings.intro':
@@ -446,18 +550,27 @@ const en = {
   'recordings.playLabel': 'Play your submitted recording',
   'recordings.pauseLabel': 'Pause your submitted recording',
   'recordings.playFailed': 'We could not play this recording. Please try again.',
+  'recordings.shareAction': 'Share audio',
+  'recordings.shareLabel': 'Share your submitted recording',
+  'recordings.shareHint':
+    'Downloads a temporary private copy and opens your device’s sharing options.',
+  'recordings.sharing': 'Preparing audio…',
+  'recordings.shareUnavailable': 'Sharing does not work on this device.',
+  'recordings.shareFailed': 'We could not share this recording. Please try again.',
   'recordings.preparing': 'Preparing…',
   'recordings.pending': 'This recording is still being prepared. We will check again briefly.',
   'recordings.unavailable': 'This recording is unavailable.',
   'recordings.deleteTitle': 'Delete this recording?',
   'recordings.deleteBody':
-    'The audio will be deleted. Your score, transcript, and feedback will stay.',
+    'The recording will be removed now and its stored audio queued for permanent deletion. Your score, transcript, and feedback will stay.',
   'recordings.deleteBodyNamed':
-    'Delete the recording for “{name}”? Your score, transcript, and feedback will stay.',
+    'Remove the recording for “{name}” and queue its stored audio for permanent deletion? Your score, transcript, and feedback will stay.',
   'recordings.deleteAction': 'Delete recording',
-  'recordings.deleteHint': 'Deletes only the saved audio, not your result.',
+  'recordings.deleteHint':
+    'Removes the recording now and queues stored audio for permanent deletion; your result stays.',
   'recordings.deleteFailed': 'We could not delete this recording. Please try again.',
-  'recordings.deleted': 'Recording deleted. Your result is still saved.',
+  'recordings.deleted':
+    'Recording removed; stored audio queued for permanent deletion. Your result is still saved.',
   'recordings.progressLabel': 'Recording playback progress',
 
   // ----- Skip word -----
@@ -476,12 +589,15 @@ const en = {
   'reset.sentBody':
     'If an account exists for this email, we sent a code. The code works for 30 minutes.',
   'reset.continue': 'I have the code',
+  'reset.resend': 'Send code again',
+  'reset.resendBusy': 'Sending again…',
   'reset.newTitle': 'Choose a new password',
   'reset.codeLabel': 'Code from the email',
   'reset.codePlaceholder': 'Paste the code here',
   'reset.submitNew': 'Save new password',
   'reset.submitNewBusy': 'Saving…',
-  'reset.doneBanner': 'Your password is changed. Please log in.',
+  'reset.doneBanner':
+    'Your password is changed and existing sessions were signed out. Please log in.',
   'reset.backToLogin': 'Back to log in',
 
   // ----- Settings / profile -----
@@ -493,8 +609,9 @@ const en = {
   'settings.levelLabel': 'English level',
   'settings.appLanguageLabel': 'App language',
   'settings.appLanguageHelp': 'Choose the language used for buttons and messages.',
-  'settings.learningLanguageLabel': 'Learning language',
-  'settings.learningLanguageHelp': 'Used for help and answers in your language.',
+  'settings.learningLanguageLabel': 'Mother tongue',
+  'settings.learningLanguageHelp':
+    'Used only for translated help and answers in your language. It does not change buttons or messages; use App language for that.',
   'settings.levelPending': 'Not tested yet',
   'settings.saveName': 'Save name',
   'settings.saveNameBusy': 'Saving…',
@@ -502,12 +619,26 @@ const en = {
   'settings.updateFailed': 'We could not save your changes. Please try again.',
   'settings.export': 'Export my data',
   'settings.exportBusy': 'Preparing your data…',
+  'settings.exportHelp':
+    'The JSON includes your learning data and saved-recording details. Audio files and audio bytes are not included.',
   'settings.exportFailed': 'We could not export your data. Please try again.',
   'settings.exportUnavailable': 'Sharing does not work on this device.',
-  'settings.retake': 'Retake the level test',
-  'retake.confirmTitle': 'Retake the level test?',
-  'retake.confirmBody': 'You will take the level test again. Your practice history is kept.',
-  'retake.confirm': 'Retake test',
+  'settings.recordingsDeleteAll': 'Delete all recordings',
+  'settings.recordingsDeleteAllHint':
+    'Removes every saved recording while keeping your scores, transcripts, and feedback.',
+  'settings.recordingsDeleteAllBusy': 'Deleting recordings…',
+  'settings.recordingsDeleteAllTitle': 'Delete all recordings?',
+  'settings.recordingsDeleteAllBody':
+    'Every saved recording will be removed now and its stored audio queued for permanent deletion. Your scores, transcripts, and feedback will stay. This cannot be undone.',
+  'settings.recordingsDeleteAllConfirm': 'Delete all',
+  'settings.recordingsDeleteAllSuccess':
+    'All recordings were removed; stored audio was queued for permanent deletion. Your results are still saved.',
+  'settings.recordingsDeleteAllFailed': 'We could not delete all recordings. Please try again.',
+  'settings.retake': 'Restart Level Test',
+  'retake.confirmTitle': 'Restart the level test?',
+  'retake.confirmBody':
+    'This clears the current level-test progress and starts again. Your practice history is kept.',
+  'retake.confirm': 'Restart test',
   'retake.failed': 'We could not restart the test. Please try again.',
 
   // ----- Daily reminder -----
@@ -521,17 +652,21 @@ const en = {
   'reminder.notificationTitle': 'Practice time!',
   'reminder.notificationBody': 'Take a few minutes to practice English today.',
 
-  // ----- Legal (placeholder copy pending owner review) -----
+  // ----- Legal summaries -----
   'legal.placeholderNote':
-    'This page is a general example. The app owner must review and replace it before release.',
+    'Effective August 28, 2026. This summary describes how the current app handles data.',
   'privacy.p1':
-    'We store your name, email, practice answers, and successful submitted recordings so you can replay them until you delete the recording or your account.',
+    'We store your name, email, password hash, language settings, level, learning progress, assessment results, transcripts, feedback, and metadata for retained recordings. The service also processes request and network information needed for authentication, security, rate limits, reliability, and abuse prevention.',
   'privacy.p2':
-    'Failed or abandoned uploads are temporary. AI providers process submitted audio and its transcript to assess your answer.',
-  'privacy.p3': 'You can export your data or delete your account at any time in Settings.',
-  'terms.p1': 'This app helps you practice English. It does not give official certificates.',
-  'terms.p2': 'Please use the app fairly. Do not share your account with other people.',
-  'terms.p3': 'We may change or stop parts of the app to keep it safe and working.',
+    'Submitted audio and transcripts are processed by OpenAI for transcription and learning feedback. Production audio is stored privately with Amazon S3. Password-reset email uses the configured mail delivery service. When ads are enabled and consent permits, Google Mobile Ads and its consent tools process ad-related data. Unsuccessful uploads and audio you choose not to save are temporary; recordings you choose to retain remain until you delete them or your account.',
+  'privacy.p3':
+    'Settings lets you export the account data currently included in the export, delete individual recordings, change eligible ad privacy choices, or delete your account. Account data is removed immediately when deletion succeeds; stored recording files remain queued until asynchronous permanent deletion completes.',
+  'terms.p1':
+    'This app provides AI-assisted English practice and estimated CEFR placement. Results and feedback may be incomplete or wrong, are not professional advice, and are not an official certificate.',
+  'terms.p2':
+    'Keep your credentials private and use only an account you are authorized to use. Do not misuse the service, evade limits, interfere with other users, upload unlawful content, or try to compromise the app or its providers.',
+  'terms.p3':
+    'Service availability, AI assessments, recordings, ads, limits, and features may change or be unavailable. You may stop using the app and delete your account in Settings. Deleting an account cannot be undone, and stored recording-file cleanup finishes asynchronously.',
 } as const;
 
 export type MessageKey = keyof typeof en;
@@ -544,7 +679,7 @@ const te: Record<MessageKey, string> = {
   'common.hide': 'దాచు',
   'common.showPassword': 'పాస్‌వర్డ్ చూపించు',
   'common.hidePassword': 'పాస్‌వర్డ్ దాచు',
-  'common.logOut': 'లాగ్ అవుట్',
+  'common.logOut': 'అన్ని పరికరాల్లో లాగ్ అవుట్',
   'common.backToPractice': 'ప్రాక్టీస్‌కు వెళ్లండి',
   'label.word': 'పదం',
   'label.question': 'ప్రశ్న',
@@ -584,13 +719,18 @@ const te: Record<MessageKey, string> = {
   'error.busy': 'ఇప్పుడు చాలా మంది ప్రాక్టీస్ చేస్తున్నారు. దయచేసి కాసేపు ఆగి మళ్లీ ప్రయత్నించండి.',
   'error.audioInvalid':
     'ఈ రికార్డింగ్‌ను ఉపయోగించలేకపోయాము. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
+  'error.audioSilent':
+    'మాకు ఏ శబ్దమూ వినిపించలేదు. మీ మైక్రోఫోన్‌ను తనిఖీ చేసి, మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'error.audioTooLong': 'రికార్డింగ్ చాలా పొడవుగా ఉంది. దయచేసి మీ జవాబు రెండు నిమిషాల లోపు ఉంచండి.',
   'error.audioUnreadable':
     'ఈ రికార్డింగ్ మాకు వినిపించలేదు. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'error.checkFailed': 'మీ జవాబును తనిఖీ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'error.resetInvalid': 'ఈ కోడ్ పనిచేయదు లేదా చాలా పాతది. దయచేసి కొత్త కోడ్ అడగండి.',
   'error.upgradeRequired': 'యాప్‌ను ఉపయోగించడానికి దయచేసి యాప్‌ను అప్‌డేట్ చేయండి.',
+  'error.assessmentResultIncompatible':
+    'యాప్ అప్‌డేట్ తర్వాత ఈ సేవ్ చేసిన జవాబును చూపలేము. మీ ప్రశ్నలు మళ్లీ లోడ్ అయ్యాయి. దయచేసి కొత్త జవాబును రికార్డ్ చేయండి.',
   'error.internal': 'ఏదో తప్పు జరిగింది. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'email.invalid': 'చెల్లుబాటు అయ్యే ఇమెయిల్ చిరునామాను నమోదు చేయండి.',
 
   'auth.sessionExpired':
     'మీ ఖాతా భద్రత కోసం మిమ్మల్ని లాగ్ అవుట్ చేశాము. దయచేసి మళ్లీ లాగిన్ అవ్వండి.',
@@ -600,10 +740,25 @@ const te: Record<MessageKey, string> = {
     'మీరు లాగ్ అవుట్ అయ్యారు, కానీ యాప్ శుభ్రం చేయలేకపోయింది. మళ్లీ లాగిన్ అయ్యే ముందు యాప్‌ను మూసి మళ్లీ తెరవండి.',
   'auth.accountDeletedCleanupFailed':
     'మీ ఖాతా తొలగించబడింది, కానీ యాప్ శుభ్రం చేయలేకపోయింది. మళ్లీ లాగిన్ అయ్యే ముందు యాప్‌ను మూసి మళ్లీ తెరవండి.',
+  'auth.registrationCompletedLoginRequired':
+    'మీ ఖాతా సృష్టించబడింది, కానీ ఈ పరికరం లాగిన్‌ను సేవ్ చేయలేకపోయింది.',
 
   'password.tooShort': 'పాస్‌వర్డ్‌లో కనీసం 8 అక్షరాలు ఉండాలి.',
   'password.needsLetterAndNumber': 'పాస్‌వర్డ్‌లో కనీసం ఒక అక్షరం, ఒక అంకె ఉండాలి.',
   'password.tooLong': 'పాస్‌వర్డ్ చాలా పొడవుగా ఉంది. దయచేసి చిన్నది ఉపయోగించండి.',
+  'password.confirmLabel': 'పాస్‌వర్డ్‌ను నిర్ధారించండి',
+  'password.confirmPlaceholder': 'పాస్‌వర్డ్‌ను మళ్లీ టైప్ చేయండి',
+  'password.mismatch': 'పాస్‌వర్డ్‌లు సరిపోలడం లేదు.',
+  'password.showConfirmation': 'పాస్‌వర్డ్ నిర్ధారణను చూపించు',
+  'password.hideConfirmation': 'పాస్‌వర్డ్ నిర్ధారణను దాచు',
+  'language.appLabel': 'యాప్ భాష',
+  'language.appHelp': 'ఈ పరికరంలో యాప్ ఉపయోగించే భాషను ఎంచుకోండి.',
+  'language.saveFailed': 'యాప్ భాష మారింది, కానీ ఈ పరికరంలో దాన్ని సేవ్ చేయలేకపోయాము.',
+  'language.en': 'ఇంగ్లీష్',
+  'language.te': 'తెలుగు',
+  'language.hi': 'హిందీ',
+  'language.es': 'స్పానిష్',
+  'language.zh': 'చైనీస్',
 
   'login.title': 'AI English Coach',
   'login.subtitle': 'మీ AI కోచ్‌తో ఇంగ్లీష్ మాట్లాడడం ప్రాక్టీస్ చేయండి.',
@@ -622,11 +777,14 @@ const te: Record<MessageKey, string> = {
   'signup.nameLabel': 'పేరు',
   'signup.namePlaceholder': 'మీ పేరు',
   'signup.passwordPlaceholder': 'కనీసం 8 అక్షరాలు, ఒక అక్షరం మరియు ఒక అంకెతో',
-  'signup.languageLabel': 'అభ్యాస భాష',
-  'signup.languageHelp': 'సహాయం మరియు మీ భాషలో సమాధానాల కోసం ఉపయోగించబడుతుంది.',
+  'signup.languageLabel': 'మాతృభాష',
+  'signup.languageHelp':
+    'అనువదించిన సహాయం మరియు మీ భాషలో జవాబుల కోసం ఉపయోగిస్తాము. ఇది యాప్ భాషకు వేరు.',
   'signup.submit': 'ఖాతా సృష్టించండి',
   'signup.submitBusy': 'మీ ఖాతా సృష్టిస్తున్నాము…',
   'signup.failed': 'మీ ఖాతాను సృష్టించలేకపోయాము. దయచేసి మీ సమాచారం చూసుకుని మళ్లీ ప్రయత్నించండి.',
+  'signup.createdLoginBanner':
+    'మీ ఖాతా సృష్టించబడింది, కానీ ఈ పరికరం లాగిన్‌ను సేవ్ చేయలేకపోయింది. మీ కొత్త పాస్‌వర్డ్‌తో లాగిన్ అవ్వండి.',
   'signup.footerPrompt': 'ఇప్పటికే ఖాతా ఉందా? ',
   'signup.footerLink': 'లాగిన్',
 
@@ -637,6 +795,34 @@ const te: Record<MessageKey, string> = {
   'gate.resetSession': 'సేవ్ చేసిన లాగిన్‌ను తొలగించండి',
   'gate.serverErrorTitle': 'సర్వర్‌కు చేరుకోలేకపోతున్నాము',
   'gate.profileFailed': 'మీ ప్రొఫైల్ లోడ్ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'gate.offlineTitle': 'మీరు ఆఫ్‌లైన్‌లో ఉన్నారు',
+  'gate.offlineBody':
+    'మీ లాగిన్ ఇంకా సేవ్ అయి ఉంది. మీ ప్రొఫైల్ లోడ్ చేయడానికి ఇంటర్నెట్‌కు మళ్లీ కనెక్ట్ అవ్వండి.',
+
+  'network.offline': 'ఇంటర్నెట్ కనెక్షన్ లేదు. మీరు సేవ్ చేసిన పని సురక్షితం.',
+  'network.backOnline': 'మళ్లీ ఆన్‌లైన్‌లో ఉన్నారు',
+  'network.offlineTitle': 'మీరు ఆఫ్‌లైన్‌లో ఉన్నారు',
+  'network.offlineBody':
+    'ఈ స్క్రీన్ లోడ్ కావడానికి మళ్లీ కనెక్ట్ అవ్వండి. అది స్వయంగా కొనసాగుతుంది.',
+  'refresh.updating': 'అప్‌డేట్ చేస్తున్నాము…',
+  'refresh.failedUsingSaved': 'రిఫ్రెష్ చేయలేకపోయాము. సేవ్ చేసిన సమాచారాన్ని చూపిస్తున్నాము.',
+  'upgrade.title': 'అప్‌డేట్ అవసరం',
+  'upgrade.body':
+    'మీ అభ్యాస డేటాను సురక్షితంగా ఉపయోగించడం కొనసాగించడానికి AI English Coach కొత్త వెర్షన్ అవసరం.',
+  'upgrade.action': 'యాప్‌ను అప్‌డేట్ చేయండి',
+  'upgrade.actionHint': 'AI English Coach కోసం యాప్ స్టోర్ పేజీని తెరుస్తుంది.',
+  'upgrade.openFailed':
+    'యాప్ స్టోర్‌ను తెరవలేకపోయాము. దయచేసి దాన్ని తెరిచి AI English Coachను అప్‌డేట్ చేయండి.',
+  'replay.checkingTitle': 'మీ సేవ్ చేసిన జవాబును చూస్తున్నాము',
+  'replay.checkingBody': 'మీ జవాబు సురక్షితంగా ఉంది. మీ ఫీడ్‌బ్యాక్‌ను తిరిగి తెస్తున్నాము.',
+  'replay.failedTitle': 'మీ ఫీడ్‌బ్యాక్‌ను తిరిగి తెచ్చలేకపోయాము',
+  'replay.failedBody':
+    'మీ సేవ్ చేసిన జవాబు ఇంకా సురక్షితంగా ఉంది. ఇప్పుడు మళ్లీ ప్రయత్నించండి లేదా తర్వాత చూడండి.',
+  'replay.checkLater': 'తర్వాత చూడండి',
+  'replay.pendingTitle': 'సేవ్ చేసిన జవాబు వేచి ఉంది',
+  'replay.pendingBody':
+    'మీ జవాబు సురక్షితంగా ఉంది. ఫీడ్‌బ్యాక్ సిద్ధమైనప్పుడు తిరిగి తెచ్చేందుకు మళ్లీ తనిఖీ చేయండి.',
+  'replay.checkNow': 'ఇప్పుడే తనిఖీ చేయండి',
 
   'header.diagnostic': 'ఇంగ్లీష్ స్థాయి పరీక్ష',
   'header.practice': 'ప్రాక్టీస్',
@@ -654,19 +840,30 @@ const te: Record<MessageKey, string> = {
   'diag.loadFailed': 'పరీక్షను లోడ్ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'diag.introTitle': 'మొదలుపెట్టే ముందు',
   'diag.introWhat': 'ఈ చిన్న పరీక్ష మీ ఇంగ్లీష్ స్థాయిని కనుగొంటుంది.',
-  'diag.introCount': 'మీరు గరిష్ఠంగా {count} ప్రశ్నలకు జవాబిస్తారు.',
+  'diag.introCount': 'మీరు 2 లేదా 3 ప్రశ్నలకు జవాబిస్తారు.',
   'diag.introRecorded': 'మీ జవాబులు రికార్డ్ అవుతాయి.',
   'diag.introSpeakEnglish': 'దయచేసి ఇంగ్లీషులో మాట్లాడండి.',
   'diag.introStart': 'పరీక్ష మొదలుపెట్టండి',
   'diag.progress': 'ప్రశ్న {current}, గరిష్ఠంగా {max}లో',
   'diag.answerSavedTitle': 'జవాబు సేవ్ అయింది',
   'diag.answerSavedBody': 'మీ జవాబు సేవ్ అయింది. పరీక్ష చివర మీ స్కోర్లు చూస్తారు.',
+  'diag.answerCheckedTitle': 'జవాబు తనిఖీ అయింది',
+  'diag.noSpeechTitle': 'మీ మాట వినిపించలేదు',
+  'diag.recordAgain': 'మళ్లీ రికార్డ్ చేయండి',
+  'diag.scoreLine': '{score}/100 — {result}',
+  'diag.passed': 'పాస్',
+  'diag.notPassed': 'ఇంకా పాస్ కాలేదు',
+  'diag.transcriptLabel': 'మేము విన్నది',
+  'diag.answerQuestion': '{word}: {question}',
   'diag.nextQuestion': 'తర్వాతి ప్రశ్న',
   'diag.seeLevel': 'నా స్థాయి చూడండి',
   'diag.completeTitle': 'పరీక్ష పూర్తయింది!',
   'diag.levelIntro': 'మీ ఇంగ్లీష్ స్థాయి',
   'diag.levelHint': 'ఈ స్థాయికి తగిన ప్రాక్టీస్ ప్రశ్నలు ఇస్తాము.',
   'diag.startPracticing': 'ప్రాక్టీస్ మొదలుపెట్టండి',
+  'diag.startPracticingBusy': 'ప్రాక్టీస్ తెరుస్తున్నాము…',
+  'diag.ackFailedTitle': 'ప్రాక్టీస్ తెరవలేకపోయాము',
+  'diag.ackFailed': 'మీ స్థాయి సేవ్ అయింది. కొనసాగడానికి మళ్లీ ప్రయత్నించండి.',
   'diag.answersTitle': 'మీ జవాబులు',
   'diag.answerLine': 'ప్రశ్న {number} — {score}/100 {mark}',
   'diag.assessFailedTitle': 'మీ జవాబును తనిఖీ చేయలేకపోయాము',
@@ -680,6 +877,9 @@ const te: Record<MessageKey, string> = {
 
   'logout.failedTitle': 'మిమ్మల్ని లాగ్ అవుట్ చేయలేకపోయాము',
   'logout.failedBody': 'దయచేసి మీ ఇంటర్నెట్ చూసుకుని మళ్లీ ప్రయత్నించండి.',
+  'logout.localBody':
+    'సర్వర్‌ను సంప్రదించలేకపోయాము. ఈ పరికరం నుంచి లాగిన్‌ను తొలగించవచ్చు; ఇతర పరికరాలు లాగిన్‌లోనే ఉంటాయి.',
+  'logout.thisDevice': 'ఈ పరికరంలో లాగ్ అవుట్ చేయండి',
   'logout.cleanupTitle': 'లాగ్ అవుట్ అయ్యారు',
 
   'practice.greeting': 'హాయ్, {name}',
@@ -700,6 +900,8 @@ const te: Record<MessageKey, string> = {
   'practiceIntro.master': 'ఒక పదాన్ని నేర్చుకోవడానికి {score} లేదా ఎక్కువ స్కోర్ చేయండి.',
   'practiceIntro.tries': 'ప్రతి పదానికి మీకు {count} ప్రయత్నాలు ఉంటాయి.',
   'practiceIntro.silence': 'ఏమీ వినిపించకపోతే, అది లెక్కలోకి రాదు. మళ్లీ ప్రయత్నించవచ్చు.',
+  'practiceIntro.native':
+    'మీ భాషలో జవాబు ఒక ప్రయత్నంగా లెక్కపడుతుంది మరియు అర్థం చేసుకున్నారో చూస్తుంది; పదాన్ని నేర్చుకోవడానికి ఇంగ్లీష్‌లో జవాబు ఇవ్వాలి.',
   'practiceIntro.dismiss': 'అర్థమైంది',
 
   'feedback.noResultTitle': 'చూపించడానికి ఏమీ లేదు',
@@ -735,6 +937,15 @@ const te: Record<MessageKey, string> = {
   'feedback.tryInEnglish': 'ఇంగ్లీషులో ప్రయత్నించండి',
   'feedback.tryAgainNative': 'నా భాషలో మళ్లీ ప్రయత్నిస్తాను',
   'feedback.seeHelp': 'అనువాదం, ఉదాహరణలు చూడండి',
+  'feedback.attemptLine': 'ప్రయత్నం {current} / {max}',
+  'feedback.attemptStillAvailable': 'ప్రయత్నం {current} / {max} ఇంకా అందుబాటులో ఉంది',
+  'feedback.wordAndQuestion': 'పదం మరియు ప్రశ్న',
+  'feedback.originalTranscript': '{language}లో మేము విన్నది',
+  'feedback.englishTranslation': 'ఇంగ్లీష్ అనువాదం',
+  'feedback.exampleEnglishAnswer': 'ఉదాహరణ ఇంగ్లీష్ జవాబు',
+  'feedback.nativeFinalTitle': 'ప్రయత్నాలు అయిపోయాయి',
+  'feedback.nativeFinalBody':
+    'ఈ జవాబు మీ చివరి ప్రయత్నాన్ని ఉపయోగించింది. ఈ పదం తర్వాత మళ్లీ కనిపిస్తుంది.',
 
   'help.invalidLinkTitle': 'ఈ లింక్ పనిచేయదు',
   'help.invalidLinkBody': 'ప్రాక్టీస్‌కు వెళ్లి, మీ ప్రశ్న నుంచి సహాయం తెరవండి.',
@@ -756,24 +967,29 @@ const te: Record<MessageKey, string> = {
   'cp.confirmLabel': 'కొత్త పాస్‌వర్డ్‌ను నిర్ధారించండి',
   'cp.confirmPlaceholder': 'కొత్త పాస్‌వర్డ్‌ను మళ్లీ టైప్ చేయండి',
   'cp.mismatch': 'పాస్‌వర్డ్‌లు సరిపోలడం లేదు.',
+  'cp.sameAsCurrent': 'ప్రస్తుత పాస్‌వర్డ్‌కు భిన్నమైన పాస్‌వర్డ్‌ను ఎంచుకోండి.',
   'cp.wrongCurrent': 'మీ ప్రస్తుత పాస్‌వర్డ్ తప్పు.',
   'cp.failed': 'మీ పాస్‌వర్డ్ మార్చలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'cp.updatedTitle': 'పాస్‌వర్డ్ మారింది',
-  'cp.updatedBody': 'మీ పాస్‌వర్డ్ మార్చబడింది.',
+  'cp.updatedBody': 'మీ పాస్‌వర్డ్ మార్చబడింది. ఇతర పరికరాలు లాగ్ అవుట్ అయ్యాయి.',
   'cp.submit': 'పాస్‌వర్డ్ మార్చండి',
   'cp.submitBusy': 'మారుస్తున్నాము…',
 
   'da.warningTitle': 'దీన్ని వెనక్కి తీసుకోలేరు',
   'da.warningBody':
-    'మీ ఖాతాను తొలగిస్తే మీ ప్రొఫైల్, పరీక్ష ఫలితాలు, ప్రాక్టీస్ చరిత్ర అన్నీ పోతాయి. దీన్ని వెనక్కి తీసుకోలేరు.',
+    'మీ ఖాతాను తొలగిస్తే మీ ప్రొఫైల్, ఫలితాలు, పురోగతి మరియు రికార్డింగ్స్‌కు ప్రాప్యత వెంటనే తొలగిపోతాయి. నిల్వ చేసిన రికార్డింగ్ ఫైళ్లు శాశ్వత తొలగింపుకు క్యూలో చేరతాయి; దీనికి కొంత సమయం పట్టవచ్చు. దీన్ని వెనక్కి తీసుకోలేరు.',
   'da.passwordLabel': 'మీ పాస్‌వర్డ్ నమోదు చేయండి',
   'da.passwordPlaceholder': 'మీ పాస్‌వర్డ్',
   'da.wrongPassword': 'పాస్‌వర్డ్ తప్పు.',
   'da.failed': 'మీ ఖాతాను తొలగించలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'da.unconfirmed':
+    'మీ ఖాతా తొలగించబడిందో నిర్ధారించలేకపోయాము. మళ్లీ తొలగించే ముందు ఇంటర్నెట్‌కు కనెక్ట్ అయి లాగిన్ ప్రయత్నించండి.',
   'da.deletedTitle': 'ఖాతా తొలగించబడింది',
-  'da.deletedBody': 'మీ ఖాతా, దాని డేటా అంతా తొలగించబడ్డాయి.',
+  'da.deletedBody':
+    'మీ ఖాతా డేటా తొలగించబడింది. నిల్వ చేసిన రికార్డింగ్ ఫైళ్లు శాశ్వత తొలగింపుకు క్యూలో ఉన్నాయి.',
   'da.confirmTitle': 'మీ ఖాతాను తొలగించాలా?',
-  'da.confirmBody': 'ఇది మీ ఖాతాను, మీ పురోగతి అంతటినీ శాశ్వతంగా తొలగిస్తుంది.',
+  'da.confirmBody':
+    'ఇది మీ ఖాతా మరియు పురోగతిని శాశ్వతంగా తొలగిస్తుంది. నిల్వ చేసిన రికార్డింగ్ ఫైళ్లు నేపథ్యంలో శాశ్వత తొలగింపు పూర్తయ్యే వరకు క్యూలో ఉంటాయి.',
   'da.confirmDelete': 'తొలగించండి',
   'da.submit': 'నా ఖాతాను తొలగించండి',
   'da.submitBusy': 'తొలగిస్తున్నాము…',
@@ -793,11 +1009,13 @@ const te: Record<MessageKey, string> = {
   'recorder.stopLabel': 'రికార్డింగ్ ఆపండి',
   'recorder.listening': 'వింటున్నాము…',
   'recorder.statusRecording': 'రికార్డ్ అవుతోంది… 2:00లో {elapsed} — ఆపడానికి నొక్కండి',
-  'recorder.statusRecorded': '{elapsed} రికార్డ్ అయింది — పంపడానికి సిద్ధం',
+  'recorder.statusRecorded':
+    '{elapsed} రికార్డ్ అయింది — పంపడానికి సిద్ధం. ఈ యాప్‌ను తెరిచి ఉంచండి.',
   'recorder.statusRecovering': 'మీ చివరి జవాబు సేవ్ అయిందో లేదో చూస్తున్నాము…',
   'recorder.statusIdle': 'మీ జవాబును రికార్డ్ చేయడానికి మైక్రోఫోన్ నొక్కండి',
   'recorder.a11yRecording': 'రికార్డ్ అవుతోంది. ఆపడానికి మైక్రోఫోన్ నొక్కండి.',
-  'recorder.a11ySaved': 'రికార్డింగ్ సేవ్ అయింది. పంపడానికి సిద్ధం.',
+  'recorder.a11ySaved':
+    'టేక్ పంపడానికి సిద్ధంగా ఉంది. యాప్‌ను వదిలితే లేదా మూసితే ఇది తొలగిపోతుంది.',
   'recorder.a11yUploading': 'మీ జవాబును పంపి తనిఖీ చేస్తున్నాము.',
   'recorder.a11yRecovering': 'మీ చివరి జవాబును చూస్తున్నాము.',
   'recorder.a11yIdle': 'రికార్డ్ చేయడానికి సిద్ధం.',
@@ -808,13 +1026,35 @@ const te: Record<MessageKey, string> = {
   'recorder.waitHint': 'ఇది మామూలు కంటే ఎక్కువ సమయం తీసుకుంటోంది — మీ ఫలితాన్ని చూస్తున్నాము…',
   'recorder.waitingFor': '{elapsed} నుంచి వేచి ఉన్నాము',
   'recorder.privacyNote': '“జవాబు పంపండి” నొక్కిన తర్వాత మాత్రమే మీ రికార్డింగ్‌ను పంపుతాము.',
+  'recorder.retentionNote':
+    'మీ స్కోర్, ట్రాన్స్‌క్రిప్ట్ మరియు సూచనలు ఏ ఎంపిక చేసినా సేవ్ అవుతాయి. “ఈ రికార్డింగ్‌ను సేవ్ చేయండి” ఆన్ చేయకపోతే, తనిఖీ చేసిన తర్వాత ఆడియో తొలగించబడుతుంది.',
+  'recorder.saveRecordingLabel': 'ఈ రికార్డింగ్‌ను సేవ్ చేయండి',
+  'recorder.saveRecordingHint':
+    'డిఫాల్ట్‌గా ఆఫ్‌లో ఉంటుంది. ఆన్ చేస్తే, మీరు తొలగించే వరకు ఈ ఆడియో రికార్డింగ్స్‌లో ఉంటుంది.',
   'recorder.play': 'ప్లే',
   'recorder.pause': 'పాజ్',
   'recorder.playLabel': 'మీ రికార్డింగ్ ప్లే చేయండి',
   'recorder.pauseLabel': 'ప్లేబ్యాక్ పాజ్ చేయండి',
   'recorder.submit': 'జవాబు పంపండి',
   'recorder.rerecord': 'మళ్లీ రికార్డ్ చేయండి',
+  'recorder.discard': 'టేక్‌ను తొలగించండి',
+  'recorder.discardHint': 'పంపని ఈ రికార్డింగ్‌ను ఈ పరికరం నుంచి తొలగించండి.',
+  'recorder.discardTitle': 'ఈ టేక్‌ను తొలగించాలా?',
+  'recorder.discardBody': 'పంపని ఈ రికార్డింగ్ ఈ పరికరం నుంచి తొలగించబడుతుంది. ఏదీ పంపబడదు.',
+  'recorder.discarded': 'టేక్ తొలగించబడింది. ఏదీ పంపబడలేదు.',
+  'recorder.errDiscardFailed': 'ఈ టేక్‌ను సురక్షితంగా తొలగించలేకపోయాము. మళ్లీ ప్రయత్నించండి.',
   'recorder.cancelHint': 'పంపడం ఆపి మీ రికార్డింగ్‌ను ఉంచుతుంది.',
+  'recorder.cancelSending': 'పంపడం రద్దు చేయండి',
+  'recorder.cancelBeforeTransferHint':
+    'ఆడియో ఈ పరికరం నుంచి వెళ్లే ముందు ఆపి, ఈ టేక్‌ను ఉంచుతుంది.',
+  'recorder.cancelAfterTransferHint':
+    'జవాబు పంపడాన్ని ఆపుతుంది. తాత్కాలిక ఆడియో అప్‌లోడ్ కొద్దిసేపు ఉండి తర్వాత తొలగుతుంది.',
+  'recorder.stopWaiting': 'వేచి ఉండటం ఆపండి',
+  'recorder.stopWaitingHint':
+    'ఈ స్క్రీన్‌లో తనిఖీని ఆపుతుంది. మీ జవాబు ఇప్పటికే పంపబడి లేదా సేవ్ అయి ఉండవచ్చు.',
+  'recorder.permissionRetryBody':
+    'మైక్రోఫోన్ అనుమతి ఇవ్వలేదు. మళ్లీ అడగడానికి “రికార్డింగ్ మొదలుపెట్టండి” నొక్కండి.',
+  'recorder.permissionGranted': 'మైక్రోఫోన్ అనుమతి ఆన్‌లో ఉంది. రికార్డింగ్ మొదలుపెట్టండి.',
   'recorder.oneMinuteLeft': 'ఇంకా ఒక నిమిషం ఉంది',
   'recorder.thirtySecondsLeft': 'ఇంకా ముప్పై సెకన్లు ఉన్నాయి',
   'recorder.tenSecondsLeft': 'ఇంకా పది సెకన్లు ఉన్నాయి',
@@ -850,9 +1090,9 @@ const te: Record<MessageKey, string> = {
     'యాప్ సమాచారం సేవ్ చేయలేకపోయాము, అందుకే మీ రికార్డింగ్ పంపబడలేదు. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'recorder.errNotSent': 'మీ రికార్డింగ్‌ను పంపలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'recorder.errDeviceInterrupted':
-    'ఫోన్ రికార్డింగ్‌ను ఆపేసింది. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
+    'సేవ్ కాకముందే ఫోన్ రికార్డింగ్‌ను ఆపింది. ఏదీ పంపబడలేదు. సిద్ధంగా ఉన్నప్పుడు మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errBackgroundDiscarded':
-    'మీరు యాప్ నుంచి బయటకు వెళ్లినప్పుడు మీ రికార్డింగ్ ఉంచబడలేదు. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
+    'మీరు యాప్‌ను వదిలినప్పుడు పంపని టేక్ తొలగించబడింది. ఏదీ పంపబడలేదు. సిద్ధంగా ఉన్నప్పుడు మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errTooShort': 'రికార్డింగ్ చాలా చిన్నది. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
   'recorder.errSaveFailed':
     'రికార్డింగ్‌ను సేవ్ చేయలేకపోయాము. దయచేసి మీ జవాబును మళ్లీ రికార్డ్ చేయండి.',
@@ -907,6 +1147,7 @@ const te: Record<MessageKey, string> = {
   'history.loadingMore': 'మరిన్ని లోడ్ అవుతున్నాయి…',
   'history.contextDiagnostic': 'స్థాయి పరీక్ష',
   'history.contextPractice': 'ప్రాక్టీస్',
+  'history.contextNative': 'మీ భాషలో జవాబు',
   'history.attemptNo': 'ప్రయత్నం {number}',
   'history.showDetails': 'వివరాలు చూపించు',
   'history.hideDetails': 'వివరాలు దాచు',
@@ -916,7 +1157,7 @@ const te: Record<MessageKey, string> = {
   'recordings.loadFailed': 'మీ రికార్డింగ్స్‌ను లోడ్ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'recordings.emptyTitle': 'సేవ్ చేసిన రికార్డింగ్స్ లేవు',
   'recordings.emptyBody':
-    'జవాబు రికార్డ్ చేసి పంపండి — సేవ్ చేసిన రికార్డింగ్స్ ఇక్కడ కనిపిస్తాయి.',
+    'జవాబు పంపే ముందు “ఈ రికార్డింగ్‌ను సేవ్ చేయండి” ఆన్ చేయండి. సేవ్ చేసిన రికార్డింగ్స్ ఇక్కడ కనిపిస్తాయి.',
   'recordings.loadMore': 'పాత రికార్డింగ్స్ చూపించు',
   'recordings.loadingMore': 'మరిన్ని లోడ్ అవుతున్నాయి…',
   'recordings.intro':
@@ -932,18 +1173,27 @@ const te: Record<MessageKey, string> = {
   'recordings.playLabel': 'మీరు పంపిన రికార్డింగ్ ప్లే చేయండి',
   'recordings.pauseLabel': 'మీరు పంపిన రికార్డింగ్‌ను పాజ్ చేయండి',
   'recordings.playFailed': 'ఈ రికార్డింగ్ ప్లే చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'recordings.shareAction': 'ఆడియోను పంచుకోండి',
+  'recordings.shareLabel': 'మీరు పంపిన రికార్డింగ్‌ను పంచుకోండి',
+  'recordings.shareHint':
+    'తాత్కాలిక ప్రైవేట్ కాపీని డౌన్‌లోడ్ చేసి, మీ ఫోన్‌లోని పంచుకునే ఎంపికలను తెరుస్తుంది.',
+  'recordings.sharing': 'ఆడియోను సిద్ధం చేస్తున్నాము…',
+  'recordings.shareUnavailable': 'ఈ ఫోన్‌లో పంచుకోవడం పనిచేయదు.',
+  'recordings.shareFailed': 'ఈ రికార్డింగ్‌ను పంచుకోలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'recordings.preparing': 'సిద్ధం చేస్తున్నాము…',
   'recordings.pending': 'ఈ రికార్డింగ్ ఇంకా సిద్ధమవుతోంది. కొద్దిసేపు మళ్లీ తనిఖీ చేస్తాము.',
   'recordings.unavailable': 'ఈ రికార్డింగ్ అందుబాటులో లేదు.',
   'recordings.deleteTitle': 'ఈ రికార్డింగ్‌ను తొలగించాలా?',
   'recordings.deleteBody':
-    'ఆడియో తొలగించబడుతుంది. మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
+    'రికార్డింగ్ ఇప్పుడు తీసివేయబడుతుంది; నిల్వ చేసిన ఆడియో శాశ్వత తొలగింపుకు క్యూలో చేరుతుంది. మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
   'recordings.deleteBodyNamed':
-    '“{name}” రికార్డింగ్‌ను తొలగించాలా? మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
+    '“{name}” రికార్డింగ్‌ను తీసివేసి, నిల్వ చేసిన ఆడియోను శాశ్వత తొలగింపుకు క్యూలో పెట్టాలా? మీ స్కోరు, ట్రాన్స్‌క్రిప్ట్, ఫీడ్‌బ్యాక్ ఉంటాయి.',
   'recordings.deleteAction': 'రికార్డింగ్ తొలగించు',
-  'recordings.deleteHint': 'సేవ్ చేసిన ఆడియోను మాత్రమే తొలగిస్తుంది, ఫలితాన్ని కాదు.',
+  'recordings.deleteHint':
+    'రికార్డింగ్‌ను ఇప్పుడు తీసివేసి, ఆడియోను శాశ్వత తొలగింపుకు క్యూలో పెడుతుంది; మీ ఫలితం ఉంటుంది.',
   'recordings.deleteFailed': 'ఈ రికార్డింగ్‌ను తొలగించలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
-  'recordings.deleted': 'రికార్డింగ్ తొలగించబడింది. మీ ఫలితం ఇంకా సేవ్ అయి ఉంది.',
+  'recordings.deleted':
+    'రికార్డింగ్ తీసివేయబడింది; నిల్వ చేసిన ఆడియో శాశ్వత తొలగింపుకు క్యూలో ఉంది. మీ ఫలితం ఇంకా సేవ్ అయి ఉంది.',
   'recordings.progressLabel': 'రికార్డింగ్ ప్లేబ్యాక్ పురోగతి',
 
   'practice.skipWord': 'ఈ పదాన్ని ఇప్పటికి దాటవేయండి',
@@ -959,12 +1209,15 @@ const te: Record<MessageKey, string> = {
   'reset.sentTitle': 'మీ ఇమెయిల్ చూడండి',
   'reset.sentBody': 'ఈ ఇమెయిల్‌కు ఖాతా ఉంటే, ఒక కోడ్ పంపాము. కోడ్ 30 నిమిషాలు పనిచేస్తుంది.',
   'reset.continue': 'నా దగ్గర కోడ్ ఉంది',
+  'reset.resend': 'కోడ్‌ను మళ్లీ పంపండి',
+  'reset.resendBusy': 'మళ్లీ పంపుతున్నాము…',
   'reset.newTitle': 'కొత్త పాస్‌వర్డ్ ఎంచుకోండి',
   'reset.codeLabel': 'ఇమెయిల్‌లోని కోడ్',
   'reset.codePlaceholder': 'కోడ్‌ను ఇక్కడ పెట్టండి',
   'reset.submitNew': 'కొత్త పాస్‌వర్డ్ సేవ్ చేయండి',
   'reset.submitNewBusy': 'సేవ్ చేస్తున్నాము…',
-  'reset.doneBanner': 'మీ పాస్‌వర్డ్ మారింది. దయచేసి లాగిన్ అవ్వండి.',
+  'reset.doneBanner':
+    'మీ పాస్‌వర్డ్ మారింది మరియు ఉన్న సెషన్లు లాగ్ అవుట్ అయ్యాయి. దయచేసి లాగిన్ అవ్వండి.',
   'reset.backToLogin': 'లాగిన్‌కు వెళ్లండి',
 
   'settings.profileTitle': 'మీ ప్రొఫైల్',
@@ -975,8 +1228,9 @@ const te: Record<MessageKey, string> = {
   'settings.levelLabel': 'ఇంగ్లీష్ స్థాయి',
   'settings.appLanguageLabel': 'యాప్ భాష',
   'settings.appLanguageHelp': 'బటన్లు మరియు సందేశాల కోసం ఉపయోగించే భాషను ఎంచుకోండి.',
-  'settings.learningLanguageLabel': 'అభ్యాస భాష',
-  'settings.learningLanguageHelp': 'సహాయం మరియు మీ భాషలో సమాధానాల కోసం ఉపయోగించబడుతుంది.',
+  'settings.learningLanguageLabel': 'మాతృభాష',
+  'settings.learningLanguageHelp':
+    'అనువదించిన సహాయం మరియు మీ భాషలో జవాబుల కోసం మాత్రమే ఉపయోగిస్తాము. ఇది బటన్లు లేదా సందేశాలను మార్చదు; వాటికి యాప్ భాషను ఉపయోగించండి.',
   'settings.levelPending': 'ఇంకా పరీక్ష చేయలేదు',
   'settings.saveName': 'పేరు సేవ్ చేయండి',
   'settings.saveNameBusy': 'సేవ్ చేస్తున్నాము…',
@@ -984,12 +1238,27 @@ const te: Record<MessageKey, string> = {
   'settings.updateFailed': 'మీ మార్పులను సేవ్ చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'settings.export': 'నా డేటాను ఎగుమతి చేయండి',
   'settings.exportBusy': 'మీ డేటాను సిద్ధం చేస్తున్నాము…',
+  'settings.exportHelp':
+    'JSONలో మీ అభ్యాస డేటా మరియు సేవ్ చేసిన రికార్డింగ్ వివరాలు ఉంటాయి. ఆడియో ఫైళ్లు లేదా ఆడియో బైట్లు ఉండవు.',
   'settings.exportFailed': 'మీ డేటాను ఎగుమతి చేయలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
   'settings.exportUnavailable': 'ఈ ఫోన్‌లో పంచుకోవడం పనిచేయదు.',
-  'settings.retake': 'స్థాయి పరీక్షను మళ్లీ రాయండి',
-  'retake.confirmTitle': 'స్థాయి పరీక్షను మళ్లీ రాయాలా?',
-  'retake.confirmBody': 'మీరు స్థాయి పరీక్షను మళ్లీ రాస్తారు. మీ ప్రాక్టీస్ చరిత్ర అలాగే ఉంటుంది.',
-  'retake.confirm': 'మళ్లీ రాయండి',
+  'settings.recordingsDeleteAll': 'అన్ని రికార్డింగ్స్ తొలగించండి',
+  'settings.recordingsDeleteAllHint':
+    'మీ స్కోర్లు, ట్రాన్స్‌క్రిప్ట్స్, ఫీడ్‌బ్యాక్‌ను ఉంచి, సేవ్ చేసిన అన్ని రికార్డింగ్స్‌ను తీసివేస్తుంది.',
+  'settings.recordingsDeleteAllBusy': 'రికార్డింగ్స్ తొలగిస్తున్నాము…',
+  'settings.recordingsDeleteAllTitle': 'అన్ని రికార్డింగ్స్‌ను తొలగించాలా?',
+  'settings.recordingsDeleteAllBody':
+    'సేవ్ చేసిన అన్ని రికార్డింగ్స్ ఇప్పుడు తీసివేయబడతాయి; వాటి నిల్వ ఆడియో శాశ్వత తొలగింపుకు క్యూలో చేరుతుంది. మీ స్కోర్లు, ట్రాన్స్‌క్రిప్ట్స్, ఫీడ్‌బ్యాక్ ఉంటాయి. దీన్ని తిరిగి మార్చలేరు.',
+  'settings.recordingsDeleteAllConfirm': 'అన్నీ తొలగించండి',
+  'settings.recordingsDeleteAllSuccess':
+    'అన్ని రికార్డింగ్స్ తీసివేయబడ్డాయి; నిల్వ ఆడియో శాశ్వత తొలగింపుకు క్యూలో ఉంది. మీ ఫలితాలు ఇంకా సేవ్ అయి ఉన్నాయి.',
+  'settings.recordingsDeleteAllFailed':
+    'అన్ని రికార్డింగ్స్‌ను తొలగించలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
+  'settings.retake': 'స్థాయి పరీక్షను మళ్లీ ప్రారంభించండి',
+  'retake.confirmTitle': 'స్థాయి పరీక్షను మళ్లీ ప్రారంభించాలా?',
+  'retake.confirmBody':
+    'ఇది ప్రస్తుత స్థాయి పరీక్ష పురోగతిని తొలగించి మళ్లీ మొదలుపెడుతుంది. మీ ప్రాక్టీస్ చరిత్ర అలాగే ఉంటుంది.',
+  'retake.confirm': 'పరీక్షను మళ్లీ ప్రారంభించండి',
   'retake.failed': 'పరీక్షను మళ్లీ మొదలుపెట్టలేకపోయాము. దయచేసి మళ్లీ ప్రయత్నించండి.',
 
   'reminder.toggleLabel': 'రోజువారీ గుర్తు',
@@ -1003,18 +1272,19 @@ const te: Record<MessageKey, string> = {
   'reminder.notificationBody': 'ఈ రోజు కొన్ని నిమిషాలు ఇంగ్లీష్ ప్రాక్టీస్ చేయండి.',
 
   'legal.placeholderNote':
-    'ఈ పేజీ ఒక సాధారణ ఉదాహరణ. విడుదలకు ముందు యాప్ యజమాని దీన్ని సమీక్షించి మార్చాలి.',
+    'ఆగస్టు 28, 2026 నుండి అమల్లో ఉంది. ప్రస్తుత యాప్ డేటాను ఎలా నిర్వహిస్తుందో ఈ సారాంశం వివరిస్తుంది.',
   'privacy.p1':
-    'మీరు రికార్డింగ్ లేదా ఖాతాను తొలగించే వరకు మళ్లీ వినడానికి మీ పేరు, ఇమెయిల్, ప్రాక్టీస్ జవాబులు మరియు విజయవంతంగా పంపిన రికార్డింగ్స్‌ను నిల్వ చేస్తాము.',
+    'మీ పేరు, ఇమెయిల్, పాస్‌వర్డ్ హాష్, భాష సెట్టింగ్స్, స్థాయి, అభ్యాస పురోగతి, అంచనా ఫలితాలు, ట్రాన్స్‌క్రిప్ట్స్, ఫీడ్‌బ్యాక్ మరియు నిల్వ చేసిన రికార్డింగ్స్ మెటాడేటాను ఉంచుతాము. ధృవీకరణ, భద్రత, రేట్ లిమిట్స్, విశ్వసనీయత మరియు దుర్వినియోగ నిరోధానికి అవసరమైన అభ్యర్థన, నెట్‌వర్క్ సమాచారాన్ని కూడా సేవ ప్రాసెస్ చేస్తుంది.',
   'privacy.p2':
-    'విఫలమైన లేదా మధ్యలో వదిలిన అప్‌లోడ్లు తాత్కాలికం. పంపిన ఆడియోను మరియు దాని ట్రాన్స్‌క్రిప్ట్‌ను AI సేవలు ప్రాసెస్ చేస్తాయి.',
+    'పంపిన ఆడియో మరియు ట్రాన్స్‌క్రిప్ట్స్‌ను లిప్యంతరీకరణ, అభ్యాస ఫీడ్‌బ్యాక్ కోసం OpenAI ప్రాసెస్ చేస్తుంది. ప్రొడక్షన్ ఆడియో Amazon S3లో ప్రైవేట్‌గా నిల్వ అవుతుంది. పాస్‌వర్డ్ రీసెట్ ఇమెయిల్ కాన్ఫిగర్ చేసిన మెయిల్ సేవను ఉపయోగిస్తుంది. ప్రకటనలు ఆన్ ఉండి సమ్మతి అనుమతిస్తే Google Mobile Ads మరియు దాని సమ్మతి సాధనాలు ప్రకటన డేటాను ప్రాసెస్ చేస్తాయి. విఫలమైన అప్‌లోడ్లు మరియు మీరు సేవ్ చేయకూడదని ఎంచుకున్న ఆడియో తాత్కాలికం; మీరు సేవ్ చేయాలని ఎంచుకున్న రికార్డింగ్స్‌ను లేదా ఖాతాను తొలగించే వరకు అవి ఉంటాయి.',
   'privacy.p3':
-    'సెట్టింగ్స్‌లో మీరు ఎప్పుడైనా మీ డేటాను ఎగుమతి చేయవచ్చు లేదా మీ ఖాతాను తొలగించవచ్చు.',
+    'సెట్టింగ్స్‌లో ప్రస్తుతం ఎగుమతిలో ఉన్న ఖాతా డేటాను ఎగుమతి చేయవచ్చు, ఒక్కో రికార్డింగ్‌ను తొలగించవచ్చు, అందుబాటులో ఉన్న ప్రకటన గోప్యత ఎంపికలను మార్చవచ్చు లేదా ఖాతాను తొలగించవచ్చు. ఖాతా తొలగింపు విజయవంతమైన వెంటనే ఖాతా డేటా పోతుంది; నిల్వ చేసిన రికార్డింగ్ ఫైళ్లు నేపథ్యంలో శాశ్వత తొలగింపు పూర్తయ్యే వరకు క్యూలో ఉంటాయి.',
   'terms.p1':
-    'ఈ యాప్ మీకు ఇంగ్లీష్ ప్రాక్టీస్ చేయడంలో సహాయపడుతుంది. ఇది అధికారిక సర్టిఫికెట్లు ఇవ్వదు.',
-  'terms.p2': 'దయచేసి యాప్‌ను న్యాయంగా ఉపయోగించండి. మీ ఖాతాను ఇతరులతో పంచుకోవద్దు.',
+    'ఈ యాప్ AI సహాయంతో ఇంగ్లీష్ ప్రాక్టీస్ మరియు అంచనా CEFR స్థాయిని అందిస్తుంది. ఫలితాలు, ఫీడ్‌బ్యాక్ అసంపూర్ణంగా లేదా తప్పుగా ఉండవచ్చు; ఇవి వృత్తిపరమైన సలహా లేదా అధికారిక సర్టిఫికెట్ కావు.',
+  'terms.p2':
+    'మీ లాగిన్ వివరాలను రహస్యంగా ఉంచండి మరియు మీకు అధికారం ఉన్న ఖాతానే ఉపయోగించండి. సేవను దుర్వినియోగం చేయవద్దు, పరిమితులను తప్పించవద్దు, ఇతరులకు ఆటంకం కలిగించవద్దు, చట్టవిరుద్ధ కంటెంట్ అప్‌లోడ్ చేయవద్దు లేదా యాప్/సేవలను దెబ్బతీయడానికి ప్రయత్నించవద్దు.',
   'terms.p3':
-    'యాప్‌ను సురక్షితంగా, పనిచేసేలా ఉంచడానికి మేము కొన్ని భాగాలను మార్చవచ్చు లేదా ఆపవచ్చు.',
+    'సేవ, AI అంచనాలు, రికార్డింగ్స్, ప్రకటనలు, పరిమితులు మరియు ఫీచర్లు మారవచ్చు లేదా అందుబాటులో ఉండకపోవచ్చు. సెట్టింగ్స్‌లో ఖాతాను తొలగించి యాప్ వాడటం ఆపవచ్చు. ఖాతా తొలగింపును వెనక్కి తీసుకోలేరు; రికార్డింగ్ ఫైళ్ల తొలగింపు నేపథ్యంలో పూర్తవుతుంది.',
 };
 
 const hi: Record<MessageKey, string> = {
@@ -1025,7 +1295,7 @@ const hi: Record<MessageKey, string> = {
   'common.hide': 'छिपाएँ',
   'common.showPassword': 'पासवर्ड दिखाएँ',
   'common.hidePassword': 'पासवर्ड छिपाएँ',
-  'common.logOut': 'लॉग आउट',
+  'common.logOut': 'सभी डिवाइस से लॉग आउट',
   'common.backToPractice': 'प्रैक्टिस पर जाएँ',
   'label.word': 'शब्द',
   'label.question': 'सवाल',
@@ -1065,12 +1335,17 @@ const hi: Record<MessageKey, string> = {
   'error.busy': 'अभी बहुत से लोग प्रैक्टिस कर रहे हैं। कृपया थोड़ा रुकें और फिर से कोशिश करें।',
   'error.audioInvalid':
     'हम इस रिकॉर्डिंग का इस्तेमाल नहीं कर पाए। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
+  'error.audioSilent':
+    'हमें कोई आवाज़ नहीं सुनाई दी। अपना माइक्रोफ़ोन जाँचें, फिर अपना जवाब दोबारा रिकॉर्ड करें।',
   'error.audioTooLong': 'रिकॉर्डिंग बहुत लंबी है। कृपया अपना जवाब दो मिनट से कम रखें।',
   'error.audioUnreadable': 'हमें यह रिकॉर्डिंग सुनाई नहीं दी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'error.checkFailed': 'हम आपके जवाब की जाँच नहीं कर पाए। कृपया फिर से कोशिश करें।',
   'error.resetInvalid': 'यह कोड काम नहीं करता या बहुत पुराना है। कृपया नया कोड माँगें।',
   'error.upgradeRequired': 'ऐप का इस्तेमाल जारी रखने के लिए कृपया ऐप अपडेट करें।',
+  'error.assessmentResultIncompatible':
+    'ऐप अपडेट के बाद यह सेव किया हुआ जवाब नहीं दिखाया जा सकता। आपके सवाल दोबारा लोड किए गए हैं। कृपया नया जवाब रिकॉर्ड करें।',
   'error.internal': 'कुछ गड़बड़ हो गई। कृपया फिर से कोशिश करें।',
+  'email.invalid': 'एक सही ईमेल पता दर्ज करें।',
 
   'auth.sessionExpired':
     'आपके खाते की सुरक्षा के लिए आपको लॉग आउट कर दिया गया। कृपया फिर से लॉग इन करें।',
@@ -1080,10 +1355,25 @@ const hi: Record<MessageKey, string> = {
     'आप लॉग आउट हो गए हैं, लेकिन ऐप सफ़ाई नहीं कर पाया। फिर से लॉग इन करने से पहले ऐप बंद करके दोबारा खोलें।',
   'auth.accountDeletedCleanupFailed':
     'आपका खाता हटा दिया गया, लेकिन ऐप सफ़ाई नहीं कर पाया। फिर से लॉग इन करने से पहले ऐप बंद करके दोबारा खोलें।',
+  'auth.registrationCompletedLoginRequired':
+    'आपका खाता बन गया, लेकिन यह डिवाइस लॉगिन सेव नहीं कर पाया।',
 
   'password.tooShort': 'पासवर्ड में कम से कम 8 अक्षर होने चाहिए।',
   'password.needsLetterAndNumber': 'पासवर्ड में कम से कम एक अक्षर और एक अंक होना चाहिए।',
   'password.tooLong': 'पासवर्ड बहुत लंबा है। कृपया छोटा पासवर्ड चुनें।',
+  'password.confirmLabel': 'पासवर्ड की पुष्टि करें',
+  'password.confirmPlaceholder': 'पासवर्ड फिर से लिखें',
+  'password.mismatch': 'पासवर्ड मेल नहीं खाते।',
+  'password.showConfirmation': 'पासवर्ड पुष्टि दिखाएँ',
+  'password.hideConfirmation': 'पासवर्ड पुष्टि छिपाएँ',
+  'language.appLabel': 'ऐप की भाषा',
+  'language.appHelp': 'इस डिवाइस पर ऐप में इस्तेमाल होने वाली भाषा चुनें।',
+  'language.saveFailed': 'ऐप की भाषा बदल गई, लेकिन हम इसे इस डिवाइस पर सेव नहीं कर पाए।',
+  'language.en': 'अंग्रेज़ी',
+  'language.te': 'तेलुगु',
+  'language.hi': 'हिन्दी',
+  'language.es': 'स्पेनिश',
+  'language.zh': 'चीनी',
 
   'login.title': 'AI English Coach',
   'login.subtitle': 'अपने AI कोच के साथ अंग्रेज़ी बोलने की प्रैक्टिस करें।',
@@ -1102,11 +1392,14 @@ const hi: Record<MessageKey, string> = {
   'signup.nameLabel': 'नाम',
   'signup.namePlaceholder': 'आपका नाम',
   'signup.passwordPlaceholder': 'कम से कम 8 अक्षर, एक अक्षर और एक अंक के साथ',
-  'signup.languageLabel': 'सीखने की भाषा',
-  'signup.languageHelp': 'मदद और अपनी भाषा में जवाब देने के लिए इसका उपयोग होता है।',
+  'signup.languageLabel': 'मातृभाषा',
+  'signup.languageHelp':
+    'अनुवादित मदद और अपनी भाषा में जवाब देने के लिए इसका उपयोग होता है। यह ऐप की भाषा से अलग है।',
   'signup.submit': 'खाता बनाएँ',
   'signup.submitBusy': 'आपका खाता बन रहा है…',
   'signup.failed': 'हम आपका खाता नहीं बना पाए। कृपया अपनी जानकारी जाँचें और फिर से कोशिश करें।',
+  'signup.createdLoginBanner':
+    'आपका खाता बन गया, लेकिन यह डिवाइस लॉगिन सेव नहीं कर पाया। अपने नए पासवर्ड से लॉग इन करें।',
   'signup.footerPrompt': 'पहले से खाता है? ',
   'signup.footerLink': 'लॉग इन करें',
 
@@ -1117,6 +1410,33 @@ const hi: Record<MessageKey, string> = {
   'gate.resetSession': 'सेव किया हुआ लॉगिन हटाएँ',
   'gate.serverErrorTitle': 'हम सर्वर से जुड़ नहीं पा रहे',
   'gate.profileFailed': 'हम आपकी प्रोफ़ाइल लोड नहीं कर पाए। कृपया फिर से कोशिश करें।',
+  'gate.offlineTitle': 'आप ऑफ़लाइन हैं',
+  'gate.offlineBody':
+    'आपका लॉगिन अभी भी सुरक्षित है। अपनी प्रोफ़ाइल लोड करने के लिए इंटरनेट से फिर जुड़ें।',
+
+  'network.offline': 'इंटरनेट कनेक्शन नहीं है। आपका सहेजा हुआ काम सुरक्षित है।',
+  'network.backOnline': 'फिर से ऑनलाइन',
+  'network.offlineTitle': 'आप ऑफ़लाइन हैं',
+  'network.offlineBody': 'यह स्क्रीन लोड करने के लिए फिर जुड़ें। यह अपने आप जारी रहेगी।',
+  'refresh.updating': 'अपडेट हो रहा है…',
+  'refresh.failedUsingSaved': 'रीफ़्रेश नहीं हो सका। आपकी सेव की हुई जानकारी दिखाई जा रही है।',
+  'upgrade.title': 'अपडेट ज़रूरी है',
+  'upgrade.body':
+    'अपने सीखने के डेटा का सुरक्षित उपयोग जारी रखने के लिए AI English Coach का नया संस्करण चाहिए।',
+  'upgrade.action': 'ऐप अपडेट करें',
+  'upgrade.actionHint': 'AI English Coach का ऐप स्टोर पेज खोलता है।',
+  'upgrade.openFailed':
+    'हम ऐप स्टोर नहीं खोल पाए। कृपया उसे खोलें और AI English Coach को अपडेट करें।',
+  'replay.checkingTitle': 'आपका सेव किया हुआ जवाब देखा जा रहा है',
+  'replay.checkingBody': 'आपका जवाब सुरक्षित है। हम आपका फ़ीडबैक वापस ला रहे हैं।',
+  'replay.failedTitle': 'हम आपका फ़ीडबैक वापस नहीं ला पाए',
+  'replay.failedBody':
+    'आपका सेव किया हुआ जवाब अभी सुरक्षित है। अभी फिर कोशिश करें या बाद में देखें।',
+  'replay.checkLater': 'बाद में देखें',
+  'replay.pendingTitle': 'सेव किया गया जवाब इंतज़ार में है',
+  'replay.pendingBody':
+    'आपका जवाब सुरक्षित है। फ़ीडबैक तैयार होने पर उसे वापस लाने के लिए फिर से जाँचें।',
+  'replay.checkNow': 'अभी जाँचें',
 
   'header.diagnostic': 'अंग्रेज़ी स्तर टेस्ट',
   'header.practice': 'प्रैक्टिस',
@@ -1134,19 +1454,30 @@ const hi: Record<MessageKey, string> = {
   'diag.loadFailed': 'हम टेस्ट लोड नहीं कर पाए। कृपया फिर से कोशिश करें।',
   'diag.introTitle': 'शुरू करने से पहले',
   'diag.introWhat': 'यह छोटा टेस्ट आपका अंग्रेज़ी स्तर पता करता है।',
-  'diag.introCount': 'आप ज़्यादा से ज़्यादा {count} सवालों के जवाब देंगे।',
+  'diag.introCount': 'आप 2 या 3 सवालों के जवाब देंगे।',
   'diag.introRecorded': 'आपके जवाब रिकॉर्ड होते हैं।',
   'diag.introSpeakEnglish': 'कृपया अंग्रेज़ी में बोलें।',
   'diag.introStart': 'टेस्ट शुरू करें',
   'diag.progress': 'सवाल {current}, ज़्यादा से ज़्यादा {max} में से',
   'diag.answerSavedTitle': 'जवाब सेव हो गया',
   'diag.answerSavedBody': 'आपका जवाब सेव हो गया है। टेस्ट के अंत में आप अपने स्कोर देखेंगे।',
+  'diag.answerCheckedTitle': 'जवाब जाँचा गया',
+  'diag.noSpeechTitle': 'हम आपको सुन नहीं पाए',
+  'diag.recordAgain': 'फिर से रिकॉर्ड करें',
+  'diag.scoreLine': '{score}/100 — {result}',
+  'diag.passed': 'पास',
+  'diag.notPassed': 'अभी पास नहीं',
+  'diag.transcriptLabel': 'हमने यह सुना',
+  'diag.answerQuestion': '{word}: {question}',
   'diag.nextQuestion': 'अगला सवाल',
   'diag.seeLevel': 'मेरा स्तर देखें',
   'diag.completeTitle': 'टेस्ट पूरा हुआ!',
   'diag.levelIntro': 'आपका अंग्रेज़ी स्तर है',
   'diag.levelHint': 'हम आपको इस स्तर के प्रैक्टिस सवाल देंगे।',
   'diag.startPracticing': 'प्रैक्टिस शुरू करें',
+  'diag.startPracticingBusy': 'प्रैक्टिस खुल रही है…',
+  'diag.ackFailedTitle': 'हम प्रैक्टिस नहीं खोल पाए',
+  'diag.ackFailed': 'आपका स्तर सेव है। आगे बढ़ने के लिए फिर से कोशिश करें।',
   'diag.answersTitle': 'आपके जवाब',
   'diag.answerLine': 'सवाल {number} — {score}/100 {mark}',
   'diag.assessFailedTitle': 'हम आपके जवाब की जाँच नहीं कर पाए',
@@ -1160,6 +1491,9 @@ const hi: Record<MessageKey, string> = {
 
   'logout.failedTitle': 'हम आपको लॉग आउट नहीं कर पाए',
   'logout.failedBody': 'कृपया अपना इंटरनेट देखें और फिर से कोशिश करें।',
+  'logout.localBody':
+    'हम सर्वर से संपर्क नहीं कर पाए। आप इस डिवाइस से लॉगिन हटा सकते हैं; दूसरे डिवाइस लॉग इन रहेंगे।',
+  'logout.thisDevice': 'इस डिवाइस से साइन आउट करें',
   'logout.cleanupTitle': 'लॉग आउट हो गए',
 
   'practice.greeting': 'नमस्ते, {name}',
@@ -1181,6 +1515,8 @@ const hi: Record<MessageKey, string> = {
   'practiceIntro.tries': 'हर शब्द के लिए आपको {count} कोशिशें मिलती हैं।',
   'practiceIntro.silence':
     'अगर कुछ सुनाई नहीं देता, तो वह गिना नहीं जाता। आप फिर से कोशिश कर सकते हैं।',
+  'practiceIntro.native':
+    'अपनी भाषा में दिया जवाब एक कोशिश गिनता है और समझ की जाँच करता है, लेकिन शब्द में महारत केवल अंग्रेज़ी जवाब से मिलती है।',
   'practiceIntro.dismiss': 'समझ गया',
 
   'feedback.noResultTitle': 'दिखाने के लिए कुछ नहीं',
@@ -1214,6 +1550,15 @@ const hi: Record<MessageKey, string> = {
   'feedback.tryInEnglish': 'अंग्रेज़ी में कोशिश करें',
   'feedback.tryAgainNative': 'अपनी भाषा में फिर से कोशिश करूँगा',
   'feedback.seeHelp': 'अनुवाद और उदाहरण देखें',
+  'feedback.attemptLine': 'कोशिश {current} / {max}',
+  'feedback.attemptStillAvailable': '{max} में से कोशिश {current} अभी भी उपलब्ध है',
+  'feedback.wordAndQuestion': 'शब्द और सवाल',
+  'feedback.originalTranscript': 'हमने {language} में यह सुना',
+  'feedback.englishTranslation': 'अंग्रेज़ी अनुवाद',
+  'feedback.exampleEnglishAnswer': 'अंग्रेज़ी जवाब का उदाहरण',
+  'feedback.nativeFinalTitle': 'कोशिशें पूरी हुईं',
+  'feedback.nativeFinalBody':
+    'इस जवाब में आपकी आखिरी कोशिश इस्तेमाल हुई। यह शब्द आपको बाद में फिर दिखेगा।',
 
   'help.invalidLinkTitle': 'यह लिंक काम नहीं करता',
   'help.invalidLinkBody': 'प्रैक्टिस पर वापस जाएँ और अपने सवाल से मदद खोलें।',
@@ -1235,24 +1580,29 @@ const hi: Record<MessageKey, string> = {
   'cp.confirmLabel': 'नया पासवर्ड फिर से लिखें',
   'cp.confirmPlaceholder': 'नया पासवर्ड दोबारा टाइप करें',
   'cp.mismatch': 'पासवर्ड मेल नहीं खाते।',
+  'cp.sameAsCurrent': 'मौजूदा पासवर्ड से अलग पासवर्ड चुनें।',
   'cp.wrongCurrent': 'आपका मौजूदा पासवर्ड गलत है।',
   'cp.failed': 'हम आपका पासवर्ड नहीं बदल पाए। कृपया फिर से कोशिश करें।',
   'cp.updatedTitle': 'पासवर्ड बदल गया',
-  'cp.updatedBody': 'आपका पासवर्ड बदल दिया गया है।',
+  'cp.updatedBody': 'आपका पासवर्ड बदल दिया गया है। दूसरे डिवाइस लॉग आउट हो गए हैं।',
   'cp.submit': 'पासवर्ड बदलें',
   'cp.submitBusy': 'बदला जा रहा है…',
 
   'da.warningTitle': 'यह वापस नहीं हो सकता',
   'da.warningBody':
-    'खाता हटाने से आपकी प्रोफ़ाइल, टेस्ट के नतीजे और प्रैक्टिस की हिस्ट्री हट जाती है। यह वापस नहीं हो सकता।',
+    'खाता हटाने से आपकी प्रोफ़ाइल, नतीजे, प्रगति और रिकॉर्डिंग तक पहुँच तुरंत हट जाती है। रिकॉर्डिंग फ़ाइलें स्थायी रूप से मिटाने की कतार में जाती हैं, जिसमें कुछ समय लग सकता है। यह वापस नहीं हो सकता।',
   'da.passwordLabel': 'अपना पासवर्ड डालें',
   'da.passwordPlaceholder': 'आपका पासवर्ड',
   'da.wrongPassword': 'पासवर्ड गलत है।',
   'da.failed': 'हम आपका खाता नहीं हटा पाए। कृपया फिर से कोशिश करें।',
+  'da.unconfirmed':
+    'हम पुष्टि नहीं कर पाए कि आपका खाता हटा या नहीं। दोबारा हटाने से पहले इंटरनेट से जुड़कर लॉग इन करने की कोशिश करें।',
   'da.deletedTitle': 'खाता हटा दिया गया',
-  'da.deletedBody': 'आपका खाता और उसका सारा डेटा हटा दिया गया है।',
+  'da.deletedBody':
+    'आपके खाते का डेटा हटा दिया गया है और रिकॉर्डिंग फ़ाइलें स्थायी रूप से मिटाने की कतार में हैं।',
   'da.confirmTitle': 'अपना खाता हटाएँ?',
-  'da.confirmBody': 'इससे आपका खाता और आपकी सारी प्रगति हमेशा के लिए हट जाएगी।',
+  'da.confirmBody':
+    'इससे आपका खाता और प्रगति हमेशा के लिए हट जाएगी। रिकॉर्डिंग फ़ाइलें बाद में होने वाला स्थायी मिटाना पूरा होने तक कतार में रहती हैं।',
   'da.confirmDelete': 'हटाएँ',
   'da.submit': 'मेरा खाता हटाएँ',
   'da.submitBusy': 'हटाया जा रहा है…',
@@ -1272,11 +1622,11 @@ const hi: Record<MessageKey, string> = {
   'recorder.stopLabel': 'रिकॉर्डिंग रोकें',
   'recorder.listening': 'सुन रहे हैं…',
   'recorder.statusRecording': 'रिकॉर्ड हो रहा है… 2:00 में से {elapsed} — रोकने के लिए टैप करें',
-  'recorder.statusRecorded': '{elapsed} रिकॉर्ड हुआ — भेजने के लिए तैयार',
+  'recorder.statusRecorded': '{elapsed} रिकॉर्ड हुआ — भेजने के लिए तैयार। ऐप खुला रखें।',
   'recorder.statusRecovering': 'देख रहे हैं कि आपका पिछला जवाब सेव हुआ या नहीं…',
   'recorder.statusIdle': 'अपना जवाब रिकॉर्ड करने के लिए माइक्रोफ़ोन टैप करें',
   'recorder.a11yRecording': 'रिकॉर्ड हो रहा है। रोकने के लिए माइक्रोफ़ोन टैप करें।',
-  'recorder.a11ySaved': 'रिकॉर्डिंग सेव हो गई। भेजने के लिए तैयार।',
+  'recorder.a11ySaved': 'टेक भेजने के लिए तैयार है। ऐप छोड़ने या बंद करने पर यह मिट जाएगा।',
   'recorder.a11yUploading': 'आपका जवाब भेजा और जाँचा जा रहा है।',
   'recorder.a11yRecovering': 'आपका पिछला जवाब देखा जा रहा है।',
   'recorder.a11yIdle': 'रिकॉर्ड करने के लिए तैयार।',
@@ -1287,13 +1637,35 @@ const hi: Record<MessageKey, string> = {
   'recorder.waitHint': 'इसमें सामान्य से ज़्यादा समय लग रहा है — आपका नतीजा देखा जा रहा है…',
   'recorder.waitingFor': '{elapsed} से इंतज़ार हो रहा है',
   'recorder.privacyNote': 'हम आपकी रिकॉर्डिंग तभी भेजते हैं जब आप “जवाब भेजें” दबाते हैं।',
+  'recorder.retentionNote':
+    'आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक दोनों स्थितियों में सेव होते हैं। “यह रिकॉर्डिंग सेव करें” चालू न होने पर, जाँच के बाद ऑडियो मिट जाता है।',
+  'recorder.saveRecordingLabel': 'यह रिकॉर्डिंग सेव करें',
+  'recorder.saveRecordingHint':
+    'डिफ़ॉल्ट रूप से बंद। चालू करने पर यह ऑडियो रिकॉर्डिंग में तब तक रहेगा, जब तक आप इसे मिटाएँ।',
   'recorder.play': 'चलाएँ',
   'recorder.pause': 'रोकें',
   'recorder.playLabel': 'अपनी रिकॉर्डिंग चलाएँ',
   'recorder.pauseLabel': 'प्लेबैक रोकें',
   'recorder.submit': 'जवाब भेजें',
   'recorder.rerecord': 'फिर से रिकॉर्ड करें',
+  'recorder.discard': 'टेक मिटाएँ',
+  'recorder.discardHint': 'इस बिना भेजी रिकॉर्डिंग को इस डिवाइस से मिटाएँ।',
+  'recorder.discardTitle': 'यह टेक मिटाएँ?',
+  'recorder.discardBody': 'यह बिना भेजी रिकॉर्डिंग इस डिवाइस से मिट जाएगी। कुछ भी भेजा नहीं जाएगा।',
+  'recorder.discarded': 'टेक मिटा दिया गया। कुछ भी नहीं भेजा गया।',
+  'recorder.errDiscardFailed': 'हम इस टेक को सुरक्षित रूप से नहीं मिटा पाए। फिर से कोशिश करें।',
   'recorder.cancelHint': 'भेजना रोकता है और आपकी रिकॉर्डिंग रखता है।',
+  'recorder.cancelSending': 'भेजना रद्द करें',
+  'recorder.cancelBeforeTransferHint':
+    'ऑडियो इस डिवाइस से जाने से पहले रोकता है और यह टेक रखता है।',
+  'recorder.cancelAfterTransferHint':
+    'जवाब भेजना रोकता है। अस्थायी ऑडियो अपलोड थोड़ी देर रह सकता है और फिर मिट जाएगा।',
+  'recorder.stopWaiting': 'इंतज़ार रोकें',
+  'recorder.stopWaitingHint':
+    'इस स्क्रीन पर जाँच रोकता है। आपका जवाब पहले ही भेजा या सेव किया जा सकता है।',
+  'recorder.permissionRetryBody':
+    'माइक्रोफ़ोन की अनुमति नहीं मिली। फिर पूछने के लिए रिकॉर्डिंग शुरू करें पर टैप करें।',
+  'recorder.permissionGranted': 'माइक्रोफ़ोन की अनुमति चालू है। रिकॉर्डिंग शुरू करें।',
   'recorder.oneMinuteLeft': 'एक मिनट बचा है',
   'recorder.thirtySecondsLeft': 'तीस सेकंड बचे हैं',
   'recorder.tenSecondsLeft': 'दस सेकंड बचे हैं',
@@ -1330,9 +1702,9 @@ const hi: Record<MessageKey, string> = {
     'हम ऐप की जानकारी सेव नहीं कर पाए, इसलिए आपकी रिकॉर्डिंग नहीं भेजी गई। कृपया फिर से कोशिश करें।',
   'recorder.errNotSent': 'हम आपकी रिकॉर्डिंग नहीं भेज पाए। कृपया फिर से कोशिश करें।',
   'recorder.errDeviceInterrupted':
-    'फ़ोन ने रिकॉर्डिंग रोक दी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
+    'सेव होने से पहले फ़ोन ने रिकॉर्डिंग रोक दी। कुछ भी नहीं भेजा गया। तैयार होने पर फिर रिकॉर्ड करें।',
   'recorder.errBackgroundDiscarded':
-    'आपने ऐप छोड़ा, इसलिए आपकी रिकॉर्डिंग नहीं रखी गई। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
+    'ऐप छोड़ने पर आपका न भेजा गया टेक मिटा दिया गया। कुछ भी नहीं भेजा गया। तैयार होने पर फिर रिकॉर्ड करें।',
   'recorder.errTooShort': 'रिकॉर्डिंग बहुत छोटी थी। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'recorder.errSaveFailed': 'हम रिकॉर्डिंग सेव नहीं कर पाए। कृपया अपना जवाब फिर से रिकॉर्ड करें।',
   'recorder.errNoRecording': 'कोई रिकॉर्डिंग सेव नहीं हुई। कृपया फिर से रिकॉर्ड करें।',
@@ -1386,6 +1758,7 @@ const hi: Record<MessageKey, string> = {
   'history.loadingMore': 'और लोड हो रहे हैं…',
   'history.contextDiagnostic': 'स्तर टेस्ट',
   'history.contextPractice': 'प्रैक्टिस',
+  'history.contextNative': 'अपनी भाषा में जवाब',
   'history.attemptNo': 'कोशिश {number}',
   'history.showDetails': 'विवरण दिखाएँ',
   'history.hideDetails': 'विवरण छिपाएँ',
@@ -1394,7 +1767,8 @@ const hi: Record<MessageKey, string> = {
   'recordings.loadFailedTitle': 'हम आपकी रिकॉर्डिंग लोड नहीं कर पाए',
   'recordings.loadFailed': 'हम आपकी रिकॉर्डिंग लोड नहीं कर पाए। कृपया फिर से कोशिश करें।',
   'recordings.emptyTitle': 'कोई रिकॉर्डिंग सहेजी नहीं गई',
-  'recordings.emptyBody': 'जवाब रिकॉर्ड करके भेजें — सहेजी गई रिकॉर्डिंग यहाँ दिखेंगी।',
+  'recordings.emptyBody':
+    'जवाब भेजने से पहले “यह रिकॉर्डिंग सेव करें” चालू करें। सेव की गई रिकॉर्डिंग यहाँ दिखेंगी।',
   'recordings.loadMore': 'पुरानी रिकॉर्डिंग दिखाएँ',
   'recordings.loadingMore': 'और लोड हो रहा है…',
   'recordings.intro': 'अपनी भेजी हुई रिकॉर्डिंग सुनें, या अपने नतीजे रखते हुए केवल ऑडियो हटाएँ।',
@@ -1409,17 +1783,27 @@ const hi: Record<MessageKey, string> = {
   'recordings.playLabel': 'अपनी भेजी हुई रिकॉर्डिंग चलाएँ',
   'recordings.pauseLabel': 'अपनी भेजी हुई रिकॉर्डिंग रोकें',
   'recordings.playFailed': 'हम यह रिकॉर्डिंग नहीं चला पाए। कृपया फिर से कोशिश करें।',
+  'recordings.shareAction': 'ऑडियो साझा करें',
+  'recordings.shareLabel': 'अपनी भेजी हुई रिकॉर्डिंग साझा करें',
+  'recordings.shareHint':
+    'एक अस्थायी निजी कॉपी डाउनलोड करके आपके डिवाइस के साझा करने के विकल्प खोलता है।',
+  'recordings.sharing': 'ऑडियो तैयार हो रहा है…',
+  'recordings.shareUnavailable': 'इस डिवाइस पर साझा करना काम नहीं करता।',
+  'recordings.shareFailed': 'हम यह रिकॉर्डिंग साझा नहीं कर पाए। कृपया फिर से कोशिश करें।',
   'recordings.preparing': 'तैयार हो रही है…',
   'recordings.pending': 'यह रिकॉर्डिंग अभी तैयार हो रही है। हम थोड़ी देर तक फिर जाँचेंगे।',
   'recordings.unavailable': 'यह रिकॉर्डिंग उपलब्ध नहीं है।',
   'recordings.deleteTitle': 'यह रिकॉर्डिंग हटाएँ?',
-  'recordings.deleteBody': 'ऑडियो हट जाएगा। आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
+  'recordings.deleteBody':
+    'रिकॉर्डिंग अभी हटेगी और सहेजा ऑडियो स्थायी रूप से मिटाने की कतार में जाएगा। आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
   'recordings.deleteBodyNamed':
-    '“{name}” की रिकॉर्डिंग हटाएँ? आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
+    '“{name}” की रिकॉर्डिंग हटाकर सहेजे ऑडियो को स्थायी रूप से मिटाने की कतार में डालें? आपका स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेगा।',
   'recordings.deleteAction': 'रिकॉर्डिंग हटाएँ',
-  'recordings.deleteHint': 'केवल सहेजा हुआ ऑडियो हटाता है, आपका नतीजा नहीं।',
+  'recordings.deleteHint':
+    'रिकॉर्डिंग अभी हटती है और ऑडियो स्थायी मिटाने की कतार में जाता है; आपका नतीजा रहता है।',
   'recordings.deleteFailed': 'हम यह रिकॉर्डिंग नहीं हटा पाए। कृपया फिर से कोशिश करें।',
-  'recordings.deleted': 'रिकॉर्डिंग हटा दी गई। आपका नतीजा अभी भी सहेजा हुआ है।',
+  'recordings.deleted':
+    'रिकॉर्डिंग हटा दी गई; सहेजा ऑडियो स्थायी रूप से मिटाने की कतार में है। आपका नतीजा अभी भी सहेजा है।',
   'recordings.progressLabel': 'रिकॉर्डिंग चलने की प्रगति',
 
   'practice.skipWord': 'यह शब्द अभी छोड़ दें',
@@ -1435,12 +1819,15 @@ const hi: Record<MessageKey, string> = {
   'reset.sentTitle': 'अपना ईमेल देखें',
   'reset.sentBody': 'अगर इस ईमेल से खाता है, तो हमने एक कोड भेजा है। कोड 30 मिनट तक काम करता है।',
   'reset.continue': 'मेरे पास कोड है',
+  'reset.resend': 'कोड फिर से भेजें',
+  'reset.resendBusy': 'फिर से भेज रहे हैं…',
   'reset.newTitle': 'नया पासवर्ड चुनें',
   'reset.codeLabel': 'ईमेल वाला कोड',
   'reset.codePlaceholder': 'कोड यहाँ डालें',
   'reset.submitNew': 'नया पासवर्ड सहेजें',
   'reset.submitNewBusy': 'सहेज रहे हैं…',
-  'reset.doneBanner': 'आपका पासवर्ड बदल गया है। कृपया लॉग इन करें।',
+  'reset.doneBanner':
+    'आपका पासवर्ड बदल गया है और मौजूदा सत्र लॉग आउट हो गए हैं। कृपया लॉग इन करें।',
   'reset.backToLogin': 'लॉग इन पर जाएँ',
 
   'settings.profileTitle': 'आपकी प्रोफ़ाइल',
@@ -1451,8 +1838,9 @@ const hi: Record<MessageKey, string> = {
   'settings.levelLabel': 'अंग्रेज़ी स्तर',
   'settings.appLanguageLabel': 'ऐप की भाषा',
   'settings.appLanguageHelp': 'बटन और संदेशों के लिए भाषा चुनें।',
-  'settings.learningLanguageLabel': 'सीखने की भाषा',
-  'settings.learningLanguageHelp': 'मदद और अपनी भाषा में जवाब देने के लिए इसका उपयोग होता है।',
+  'settings.learningLanguageLabel': 'मातृभाषा',
+  'settings.learningLanguageHelp':
+    'केवल अनुवादित मदद और अपनी भाषा में जवाब देने के लिए। इससे बटन या संदेश नहीं बदलते; उसके लिए ऐप की भाषा बदलें।',
   'settings.levelPending': 'अभी टेस्ट नहीं हुआ',
   'settings.saveName': 'नाम सहेजें',
   'settings.saveNameBusy': 'सहेज रहे हैं…',
@@ -1460,12 +1848,26 @@ const hi: Record<MessageKey, string> = {
   'settings.updateFailed': 'हम आपके बदलाव नहीं सहेज पाए। कृपया फिर से कोशिश करें।',
   'settings.export': 'मेरा डेटा निर्यात करें',
   'settings.exportBusy': 'आपका डेटा तैयार हो रहा है…',
+  'settings.exportHelp':
+    'JSON में आपका सीखने का डेटा और सहेजी गई रिकॉर्डिंग का विवरण शामिल है। ऑडियो फ़ाइलें या ऑडियो बाइट्स शामिल नहीं हैं।',
   'settings.exportFailed': 'हम आपका डेटा निर्यात नहीं कर पाए। कृपया फिर से कोशिश करें।',
   'settings.exportUnavailable': 'इस फ़ोन पर साझा करना काम नहीं करता।',
-  'settings.retake': 'स्तर टेस्ट फिर से दें',
-  'retake.confirmTitle': 'स्तर टेस्ट फिर से दें?',
-  'retake.confirmBody': 'आप स्तर टेस्ट फिर से देंगे। आपका प्रैक्टिस इतिहास बना रहेगा।',
-  'retake.confirm': 'फिर से दें',
+  'settings.recordingsDeleteAll': 'सभी रिकॉर्डिंग हटाएँ',
+  'settings.recordingsDeleteAllHint':
+    'आपके स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक रखते हुए हर सहेजी रिकॉर्डिंग हटाता है।',
+  'settings.recordingsDeleteAllBusy': 'रिकॉर्डिंग हट रही हैं…',
+  'settings.recordingsDeleteAllTitle': 'सभी रिकॉर्डिंग हटाएँ?',
+  'settings.recordingsDeleteAllBody':
+    'हर सहेजी रिकॉर्डिंग अभी हटेगी और उसका ऑडियो स्थायी रूप से मिटाने की कतार में जाएगा। आपके स्कोर, ट्रांसक्रिप्ट और फ़ीडबैक सुरक्षित रहेंगे। इसे वापस नहीं किया जा सकता।',
+  'settings.recordingsDeleteAllConfirm': 'सभी हटाएँ',
+  'settings.recordingsDeleteAllSuccess':
+    'सभी रिकॉर्डिंग हटा दी गईं; सहेजा ऑडियो स्थायी रूप से मिटाने की कतार में है। आपके नतीजे अभी भी सहेजे हैं।',
+  'settings.recordingsDeleteAllFailed': 'हम सभी रिकॉर्डिंग नहीं हटा पाए। कृपया फिर से कोशिश करें।',
+  'settings.retake': 'स्तर टेस्ट फिर से शुरू करें',
+  'retake.confirmTitle': 'स्तर टेस्ट फिर से शुरू करें?',
+  'retake.confirmBody':
+    'यह मौजूदा स्तर टेस्ट की प्रगति साफ़ करके फिर शुरू करता है। आपका प्रैक्टिस इतिहास बना रहेगा।',
+  'retake.confirm': 'टेस्ट फिर शुरू करें',
   'retake.failed': 'हम टेस्ट फिर से शुरू नहीं कर पाए। कृपया फिर से कोशिश करें।',
 
   'reminder.toggleLabel': 'रोज़ का रिमाइंडर',
@@ -1478,16 +1880,19 @@ const hi: Record<MessageKey, string> = {
   'reminder.notificationBody': 'आज कुछ मिनट अंग्रेज़ी की प्रैक्टिस करें।',
 
   'legal.placeholderNote':
-    'यह पेज एक सामान्य उदाहरण है। रिलीज़ से पहले ऐप के मालिक को इसे देखकर बदलना होगा।',
+    '28 अगस्त 2026 से प्रभावी। यह सारांश बताता है कि मौजूदा ऐप डेटा कैसे संभालता है।',
   'privacy.p1':
-    'हम आपका नाम, ईमेल, प्रैक्टिस जवाब और सफलतापूर्वक भेजी गई रिकॉर्डिंग सहेजते हैं, ताकि रिकॉर्डिंग या खाता हटाने तक आप उन्हें फिर सुन सकें।',
+    'हम आपका नाम, ईमेल, पासवर्ड हैश, भाषा सेटिंग, स्तर, सीखने की प्रगति, आकलन के नतीजे, ट्रांसक्रिप्ट, फ़ीडबैक और रखी गई रिकॉर्डिंग का मेटाडेटा सहेजते हैं। सेवा प्रमाणीकरण, सुरक्षा, दर सीमाओं, विश्वसनीयता और दुरुपयोग रोकने के लिए आवश्यक अनुरोध और नेटवर्क जानकारी भी प्रोसेस करती है।',
   'privacy.p2':
-    'असफल या अधूरे अपलोड अस्थायी होते हैं। AI सेवाएँ भेजे गए ऑडियो और उसकी ट्रांसक्रिप्ट को प्रोसेस करती हैं।',
-  'privacy.p3': 'सेटिंग्स में आप कभी भी अपना डेटा निर्यात कर सकते हैं या अपना खाता हटा सकते हैं।',
+    'भेजे गए ऑडियो और ट्रांसक्रिप्ट को OpenAI लिप्यंतरण और सीखने के फ़ीडबैक के लिए प्रोसेस करता है। प्रोडक्शन ऑडियो Amazon S3 में निजी रूप से रखा जाता है। पासवर्ड-रीसेट ईमेल कॉन्फ़िगर की गई मेल सेवा का उपयोग करता है। विज्ञापन चालू हों और सहमति मिले तो Google Mobile Ads और उसके सहमति टूल विज्ञापन डेटा प्रोसेस करते हैं। असफल अपलोड और सेव न करने के लिए चुना गया ऑडियो अस्थायी होता है; जिन रिकॉर्डिंग को आप रखने का विकल्प चुनते हैं, वे आपके रिकॉर्डिंग या खाता हटाने तक रहती हैं।',
+  'privacy.p3':
+    'सेटिंग्स में आप अभी निर्यात में शामिल खाता डेटा निर्यात कर सकते हैं, रिकॉर्डिंग हटा सकते हैं, उपलब्ध विज्ञापन गोपनीयता विकल्प बदल सकते हैं या खाता हटा सकते हैं। सफल खाता हटाने पर खाता डेटा तुरंत हटता है; रिकॉर्डिंग फ़ाइलें बाद में होने वाला स्थायी मिटाना पूरा होने तक कतार में रहती हैं।',
   'terms.p1':
-    'यह ऐप आपको अंग्रेज़ी की प्रैक्टिस में मदद करता है। यह आधिकारिक प्रमाणपत्र नहीं देता।',
-  'terms.p2': 'कृपया ऐप का सही उपयोग करें। अपना खाता दूसरों के साथ साझा न करें।',
-  'terms.p3': 'ऐप को सुरक्षित और चालू रखने के लिए हम इसके कुछ हिस्से बदल या बंद कर सकते हैं।',
+    'यह ऐप AI की मदद से अंग्रेज़ी प्रैक्टिस और अनुमानित CEFR स्तर देता है। नतीजे और फ़ीडबैक अधूरे या गलत हो सकते हैं, पेशेवर सलाह नहीं हैं और आधिकारिक प्रमाणपत्र नहीं हैं।',
+  'terms.p2':
+    'अपने लॉगिन विवरण निजी रखें और केवल वही खाता उपयोग करें जिसके लिए आप अधिकृत हैं। सेवा का दुरुपयोग, सीमाओं से बचना, दूसरों को बाधित करना, गैरकानूनी सामग्री अपलोड करना या ऐप/प्रदाताओं को नुकसान पहुँचाने की कोशिश न करें।',
+  'terms.p3':
+    'सेवा, AI आकलन, रिकॉर्डिंग, विज्ञापन, सीमाएँ और सुविधाएँ बदल सकती हैं या उपलब्ध नहीं हो सकतीं। आप सेटिंग्स में खाता हटाकर उपयोग बंद कर सकते हैं। खाता हटाना वापस नहीं हो सकता और रिकॉर्डिंग फ़ाइलों की सफ़ाई बाद में पूरी होती है।',
 };
 
 const es: Record<MessageKey, string> = {
@@ -1498,7 +1903,7 @@ const es: Record<MessageKey, string> = {
   'common.hide': 'Ocultar',
   'common.showPassword': 'Mostrar contraseña',
   'common.hidePassword': 'Ocultar contraseña',
-  'common.logOut': 'Cerrar sesión',
+  'common.logOut': 'Cerrar sesión en todos los dispositivos',
   'common.backToPractice': 'Volver a practicar',
   'label.word': 'Palabra',
   'label.question': 'Pregunta',
@@ -1537,12 +1942,17 @@ const es: Record<MessageKey, string> = {
     'Esta conexión de internet usó toda su práctica de hoy. Intenta de nuevo mañana.',
   'error.busy': 'Muchas personas están practicando ahora. Espera un poco e intenta de nuevo.',
   'error.audioInvalid': 'No pudimos usar esta grabación. Graba tu respuesta de nuevo.',
+  'error.audioSilent':
+    'No oímos ningún sonido. Revisa el micrófono y vuelve a grabar tu respuesta.',
   'error.audioTooLong': 'La grabación es muy larga. Haz tu respuesta de menos de dos minutos.',
   'error.audioUnreadable': 'No pudimos oír esta grabación. Graba tu respuesta de nuevo.',
   'error.checkFailed': 'No pudimos revisar tu respuesta. Intenta de nuevo.',
   'error.resetInvalid': 'Este código no funciona o es muy viejo. Pide un código nuevo, por favor.',
   'error.upgradeRequired': 'Actualiza la app para seguir usándola.',
+  'error.assessmentResultIncompatible':
+    'Esta respuesta guardada no se puede mostrar después de actualizar la app. Tus preguntas se cargaron de nuevo. Graba una respuesta nueva.',
   'error.internal': 'Algo salió mal. Intenta de nuevo.',
+  'email.invalid': 'Escribe una dirección de email válida.',
 
   'auth.sessionExpired':
     'Cerramos tu sesión para proteger tu cuenta. Inicia sesión de nuevo, por favor.',
@@ -1552,10 +1962,25 @@ const es: Record<MessageKey, string> = {
     'Cerraste sesión, pero la app no pudo limpiar sus datos. Cierra y abre la app antes de iniciar sesión de nuevo.',
   'auth.accountDeletedCleanupFailed':
     'Tu cuenta fue eliminada, pero la app no pudo limpiar sus datos. Cierra y abre la app antes de iniciar sesión de nuevo.',
+  'auth.registrationCompletedLoginRequired':
+    'Tu cuenta fue creada, pero este dispositivo no pudo guardar la sesión.',
 
   'password.tooShort': 'La contraseña debe tener al menos 8 caracteres.',
   'password.needsLetterAndNumber': 'La contraseña debe tener al menos una letra y un número.',
   'password.tooLong': 'La contraseña es muy larga. Usa una más corta, por favor.',
+  'password.confirmLabel': 'Confirmar contraseña',
+  'password.confirmPlaceholder': 'Escribe la contraseña otra vez',
+  'password.mismatch': 'Las contraseñas no coinciden.',
+  'password.showConfirmation': 'Mostrar confirmación de contraseña',
+  'password.hideConfirmation': 'Ocultar confirmación de contraseña',
+  'language.appLabel': 'Idioma de la app',
+  'language.appHelp': 'Elige el idioma que usa la app en este dispositivo.',
+  'language.saveFailed': 'El idioma de la app cambió, pero no se pudo guardar en este dispositivo.',
+  'language.en': 'Inglés',
+  'language.te': 'Telugu',
+  'language.hi': 'Hindi',
+  'language.es': 'Español',
+  'language.zh': 'Chino',
 
   'login.title': 'AI English Coach',
   'login.subtitle': 'Practica hablar inglés con tu coach de IA.',
@@ -1574,11 +1999,14 @@ const es: Record<MessageKey, string> = {
   'signup.nameLabel': 'Nombre',
   'signup.namePlaceholder': 'Tu nombre',
   'signup.passwordPlaceholder': 'Al menos 8 caracteres, con una letra y un número',
-  'signup.languageLabel': 'Idioma de aprendizaje',
-  'signup.languageHelp': 'Se usa para la ayuda y las respuestas en tu idioma.',
+  'signup.languageLabel': 'Lengua materna',
+  'signup.languageHelp':
+    'Se usa para la ayuda traducida y las respuestas en tu idioma. Es diferente del idioma de la app.',
   'signup.submit': 'Crear cuenta',
   'signup.submitBusy': 'Creando tu cuenta…',
   'signup.failed': 'No pudimos crear tu cuenta. Revisa tu información e intenta de nuevo.',
+  'signup.createdLoginBanner':
+    'Tu cuenta fue creada, pero este dispositivo no pudo guardar la sesión. Inicia sesión con tu contraseña nueva.',
   'signup.footerPrompt': '¿Ya tienes una cuenta? ',
   'signup.footerLink': 'Iniciar sesión',
 
@@ -1589,6 +2017,33 @@ const es: Record<MessageKey, string> = {
   'gate.resetSession': 'Borrar sesión guardada',
   'gate.serverErrorTitle': 'No podemos conectar con el servidor',
   'gate.profileFailed': 'No pudimos cargar tu perfil. Intenta de nuevo.',
+  'gate.offlineTitle': 'Estás sin conexión',
+  'gate.offlineBody':
+    'Tu sesión sigue guardada. Vuelve a conectarte a internet para cargar tu perfil.',
+
+  'network.offline': 'No hay conexión a internet. Tu trabajo guardado está seguro.',
+  'network.backOnline': 'Conexión restablecida',
+  'network.offlineTitle': 'Estás sin conexión',
+  'network.offlineBody':
+    'Vuelve a conectarte para cargar esta pantalla. Continuará automáticamente.',
+  'refresh.updating': 'Actualizando…',
+  'refresh.failedUsingSaved': 'No se pudo actualizar. Mostramos tu información guardada.',
+  'upgrade.title': 'Debes actualizar la app',
+  'upgrade.body':
+    'Necesitas una versión más nueva de AI English Coach para seguir usando tus datos de aprendizaje de forma segura.',
+  'upgrade.action': 'Actualizar app',
+  'upgrade.actionHint': 'Abre la página de AI English Coach en la tienda de apps.',
+  'upgrade.openFailed': 'No pudimos abrir la tienda de apps. Ábrela y actualiza AI English Coach.',
+  'replay.checkingTitle': 'Comprobando tu respuesta guardada',
+  'replay.checkingBody': 'Tu respuesta está segura. Estamos recuperando tus comentarios.',
+  'replay.failedTitle': 'No pudimos recuperar tus comentarios',
+  'replay.failedBody':
+    'Tu respuesta guardada sigue segura. Intenta de nuevo ahora o revísala después.',
+  'replay.checkLater': 'Revisar después',
+  'replay.pendingTitle': 'Respuesta guardada en espera',
+  'replay.pendingBody':
+    'Tu respuesta está segura. Vuelve a comprobar para recuperar los comentarios cuando estén listos.',
+  'replay.checkNow': 'Comprobar ahora',
 
   'header.diagnostic': 'Prueba de nivel de inglés',
   'header.practice': 'Práctica',
@@ -1606,19 +2061,30 @@ const es: Record<MessageKey, string> = {
   'diag.loadFailed': 'No pudimos cargar la prueba. Intenta de nuevo.',
   'diag.introTitle': 'Antes de empezar',
   'diag.introWhat': 'Esta prueba corta encuentra tu nivel de inglés.',
-  'diag.introCount': 'Vas a responder hasta {count} preguntas.',
+  'diag.introCount': 'Vas a responder 2 o 3 preguntas.',
   'diag.introRecorded': 'Tus respuestas se graban.',
   'diag.introSpeakEnglish': 'Habla en inglés, por favor.',
   'diag.introStart': 'Empezar la prueba',
   'diag.progress': 'Pregunta {current} de hasta {max}',
   'diag.answerSavedTitle': 'Respuesta guardada',
   'diag.answerSavedBody': 'Tu respuesta está guardada. Verás tus puntos al final de la prueba.',
+  'diag.answerCheckedTitle': 'Respuesta revisada',
+  'diag.noSpeechTitle': 'No pudimos oírte',
+  'diag.recordAgain': 'Grabar de nuevo',
+  'diag.scoreLine': '{score}/100 — {result}',
+  'diag.passed': 'aprobado',
+  'diag.notPassed': 'todavía no aprobado',
+  'diag.transcriptLabel': 'Lo que oímos',
+  'diag.answerQuestion': '{word}: {question}',
   'diag.nextQuestion': 'Siguiente pregunta',
   'diag.seeLevel': 'Ver mi nivel',
   'diag.completeTitle': '¡Prueba completa!',
   'diag.levelIntro': 'Tu nivel de inglés es',
   'diag.levelHint': 'Te daremos preguntas de práctica para este nivel.',
   'diag.startPracticing': 'Empezar a practicar',
+  'diag.startPracticingBusy': 'Abriendo la práctica…',
+  'diag.ackFailedTitle': 'No pudimos abrir la práctica',
+  'diag.ackFailed': 'Tu nivel está guardado. Intenta de nuevo para continuar.',
   'diag.answersTitle': 'Tus respuestas',
   'diag.answerLine': 'Pregunta {number} — {score}/100 {mark}',
   'diag.assessFailedTitle': 'No pudimos revisar tu respuesta',
@@ -1632,6 +2098,9 @@ const es: Record<MessageKey, string> = {
 
   'logout.failedTitle': 'No pudimos cerrar tu sesión',
   'logout.failedBody': 'Revisa tu internet e intenta de nuevo, por favor.',
+  'logout.localBody':
+    'No pudimos contactar con el servidor. Puedes quitar la sesión de este dispositivo; los demás seguirán conectados.',
+  'logout.thisDevice': 'Cerrar sesión en este dispositivo',
   'logout.cleanupTitle': 'Sesión cerrada',
 
   'practice.greeting': 'Hola, {name}',
@@ -1652,6 +2121,8 @@ const es: Record<MessageKey, string> = {
   'practiceIntro.master': 'Consigue {score} puntos o más para dominar una palabra.',
   'practiceIntro.tries': 'Tienes {count} intentos para cada palabra.',
   'practiceIntro.silence': 'Si no oímos nada, no cuenta. Puedes intentarlo de nuevo.',
+  'practiceIntro.native':
+    'Responder en tu idioma usa un intento y comprueba la comprensión, pero solo una respuesta en inglés puede dominar la palabra.',
   'practiceIntro.dismiss': 'Entendido',
 
   'feedback.noResultTitle': 'Nada que mostrar',
@@ -1685,6 +2156,15 @@ const es: Record<MessageKey, string> = {
   'feedback.tryInEnglish': 'Intentar en inglés',
   'feedback.tryAgainNative': 'Intentar de nuevo en mi idioma',
   'feedback.seeHelp': 'Ver traducción y ejemplos',
+  'feedback.attemptLine': 'Intento {current} de {max}',
+  'feedback.attemptStillAvailable': 'El intento {current} de {max} sigue disponible',
+  'feedback.wordAndQuestion': 'Palabra y pregunta',
+  'feedback.originalTranscript': 'Lo que oímos en {language}',
+  'feedback.englishTranslation': 'Traducción al inglés',
+  'feedback.exampleEnglishAnswer': 'Ejemplo de respuesta en inglés',
+  'feedback.nativeFinalTitle': 'No quedan intentos',
+  'feedback.nativeFinalBody':
+    'Esta respuesta usó tu último intento. Volverás a ver esta palabra más adelante.',
 
   'help.invalidLinkTitle': 'Este enlace no funciona',
   'help.invalidLinkBody': 'Vuelve a la práctica y abre la ayuda desde tu pregunta.',
@@ -1706,24 +2186,29 @@ const es: Record<MessageKey, string> = {
   'cp.confirmLabel': 'Confirma la contraseña nueva',
   'cp.confirmPlaceholder': 'Escribe la contraseña nueva otra vez',
   'cp.mismatch': 'Las contraseñas no son iguales.',
+  'cp.sameAsCurrent': 'Elige una contraseña diferente de la actual.',
   'cp.wrongCurrent': 'Tu contraseña actual es incorrecta.',
   'cp.failed': 'No pudimos cambiar tu contraseña. Intenta de nuevo.',
   'cp.updatedTitle': 'Contraseña cambiada',
-  'cp.updatedBody': 'Tu contraseña fue cambiada.',
+  'cp.updatedBody': 'Tu contraseña fue cambiada. Los otros dispositivos cerraron sesión.',
   'cp.submit': 'Cambiar contraseña',
   'cp.submitBusy': 'Cambiando…',
 
   'da.warningTitle': 'Esto no se puede deshacer',
   'da.warningBody':
-    'Eliminar tu cuenta borra tu perfil, tus resultados de la prueba y tu historial de práctica. Esto no se puede deshacer.',
+    'Eliminar tu cuenta borra de inmediato tu perfil, resultados, progreso y acceso a grabaciones. Los archivos de grabación se ponen en cola para su eliminación permanente, que puede tardar más. Esto no se puede deshacer.',
   'da.passwordLabel': 'Escribe tu contraseña',
   'da.passwordPlaceholder': 'Tu contraseña',
   'da.wrongPassword': 'Contraseña incorrecta.',
   'da.failed': 'No pudimos eliminar tu cuenta. Intenta de nuevo.',
+  'da.unconfirmed':
+    'No pudimos confirmar si tu cuenta se eliminó. Vuelve a conectarte e intenta iniciar sesión antes de repetir la eliminación.',
   'da.deletedTitle': 'Cuenta eliminada',
-  'da.deletedBody': 'Tu cuenta y todos sus datos fueron eliminados.',
+  'da.deletedBody':
+    'Los datos de tu cuenta fueron eliminados y los archivos de grabación están en cola para su eliminación permanente.',
   'da.confirmTitle': '¿Eliminar tu cuenta?',
-  'da.confirmBody': 'Esto elimina tu cuenta y todo tu progreso para siempre.',
+  'da.confirmBody':
+    'Esto elimina para siempre tu cuenta y progreso. Los archivos de grabación permanecen en cola hasta que termina su eliminación permanente asíncrona.',
   'da.confirmDelete': 'Eliminar',
   'da.submit': 'Eliminar mi cuenta',
   'da.submitBusy': 'Eliminando…',
@@ -1743,11 +2228,11 @@ const es: Record<MessageKey, string> = {
   'recorder.stopLabel': 'Parar la grabación',
   'recorder.listening': 'Escuchando…',
   'recorder.statusRecording': 'Grabando… {elapsed} de 2:00 — toca para parar',
-  'recorder.statusRecorded': 'Grabado {elapsed} — listo para enviar',
+  'recorder.statusRecorded': 'Grabado {elapsed} — listo para enviar. Mantén la app abierta.',
   'recorder.statusRecovering': 'Comprobando si tu última respuesta se guardó…',
   'recorder.statusIdle': 'Toca el micrófono para grabar tu respuesta',
   'recorder.a11yRecording': 'Grabando. Toca el micrófono para parar.',
-  'recorder.a11ySaved': 'Grabación guardada. Lista para enviar.',
+  'recorder.a11ySaved': 'Toma lista para enviar. Se elimina si sales o cierras la app.',
   'recorder.a11yUploading': 'Enviando y revisando tu respuesta.',
   'recorder.a11yRecovering': 'Comprobando tu última respuesta.',
   'recorder.a11yIdle': 'Listo para grabar.',
@@ -1758,13 +2243,37 @@ const es: Record<MessageKey, string> = {
   'recorder.waitHint': 'Esto tarda más de lo normal — comprobando tu resultado…',
   'recorder.waitingFor': 'Esperando desde hace {elapsed}',
   'recorder.privacyNote': 'Enviamos tu grabación solo cuando tocas “Enviar respuesta”.',
+  'recorder.retentionNote':
+    'Tu puntuación, transcripción y comentarios se guardan en ambos casos. El audio se elimina después de revisarlo, salvo que actives Guardar esta grabación.',
+  'recorder.saveRecordingLabel': 'Guardar esta grabación',
+  'recorder.saveRecordingHint':
+    'Está desactivado de forma predeterminada. Si lo activas, el audio se guarda en Grabaciones hasta que lo elimines.',
   'recorder.play': 'Reproducir',
   'recorder.pause': 'Pausar',
   'recorder.playLabel': 'Reproducir tu grabación',
   'recorder.pauseLabel': 'Pausar la reproducción',
   'recorder.submit': 'Enviar respuesta',
   'recorder.rerecord': 'Grabar de nuevo',
+  'recorder.discard': 'Descartar toma',
+  'recorder.discardHint': 'Elimina esta grabación no enviada de este dispositivo.',
+  'recorder.discardTitle': '¿Descartar esta toma?',
+  'recorder.discardBody':
+    'Esta grabación no enviada se eliminará de este dispositivo. No se enviará nada.',
+  'recorder.discarded': 'Toma descartada. No se envió nada.',
+  'recorder.errDiscardFailed':
+    'No pudimos descartar esta toma de forma segura. Inténtalo de nuevo.',
   'recorder.cancelHint': 'Para el envío y guarda tu grabación.',
+  'recorder.cancelSending': 'Cancelar envío',
+  'recorder.cancelBeforeTransferHint':
+    'Se detiene antes de que el audio salga del dispositivo y conserva esta toma.',
+  'recorder.cancelAfterTransferHint':
+    'Detiene el envío. Una carga temporal de audio puede quedar brevemente y luego caducará.',
+  'recorder.stopWaiting': 'Dejar de esperar',
+  'recorder.stopWaitingHint':
+    'Deja de comprobar en esta pantalla. Es posible que tu respuesta ya se haya enviado o guardado.',
+  'recorder.permissionRetryBody':
+    'No se permitió el micrófono. Toca Empezar a grabar para volver a pedir permiso.',
+  'recorder.permissionGranted': 'El micrófono está permitido. Toca Empezar a grabar.',
   'recorder.oneMinuteLeft': 'Queda un minuto',
   'recorder.thirtySecondsLeft': 'Quedan treinta segundos',
   'recorder.tenSecondsLeft': 'Quedan diez segundos',
@@ -1800,9 +2309,10 @@ const es: Record<MessageKey, string> = {
   'recorder.errInfoNotSavedNotUploaded':
     'No pudimos guardar la información de la app, así que tu grabación no se envió. Intenta de nuevo.',
   'recorder.errNotSent': 'No pudimos enviar tu grabación. Intenta de nuevo.',
-  'recorder.errDeviceInterrupted': 'El teléfono paró la grabación. Graba tu respuesta de nuevo.',
+  'recorder.errDeviceInterrupted':
+    'El teléfono detuvo la grabación antes de guardarla. No se envió nada. Graba de nuevo cuando estés listo.',
   'recorder.errBackgroundDiscarded':
-    'Tu grabación no se guardó cuando saliste de la app. Graba tu respuesta de nuevo.',
+    'Tu toma sin enviar se eliminó cuando saliste de la app. No se envió nada. Graba de nuevo cuando estés listo.',
   'recorder.errTooShort': 'La grabación fue muy corta. Graba tu respuesta de nuevo.',
   'recorder.errSaveFailed': 'No pudimos guardar la grabación. Graba tu respuesta de nuevo.',
   'recorder.errNoRecording': 'No se guardó ninguna grabación. Graba de nuevo, por favor.',
@@ -1855,6 +2365,7 @@ const es: Record<MessageKey, string> = {
   'history.loadingMore': 'Cargando más…',
   'history.contextDiagnostic': 'Prueba de nivel',
   'history.contextPractice': 'Práctica',
+  'history.contextNative': 'Respuesta en tu idioma',
   'history.attemptNo': 'Intento {number}',
   'history.showDetails': 'Ver detalles',
   'history.hideDetails': 'Ocultar detalles',
@@ -1863,7 +2374,8 @@ const es: Record<MessageKey, string> = {
   'recordings.loadFailedTitle': 'No pudimos cargar tus grabaciones',
   'recordings.loadFailed': 'No pudimos cargar tus grabaciones. Intenta de nuevo.',
   'recordings.emptyTitle': 'No hay grabaciones guardadas',
-  'recordings.emptyBody': 'Graba y envía una respuesta; tus grabaciones guardadas aparecerán aquí.',
+  'recordings.emptyBody':
+    'Activa Guardar esta grabación antes de enviar una respuesta. Las grabaciones guardadas aparecerán aquí.',
   'recordings.loadMore': 'Ver grabaciones anteriores',
   'recordings.loadingMore': 'Cargando más…',
   'recordings.intro':
@@ -1879,18 +2391,27 @@ const es: Record<MessageKey, string> = {
   'recordings.playLabel': 'Reproducir tu grabación enviada',
   'recordings.pauseLabel': 'Pausar tu grabación enviada',
   'recordings.playFailed': 'No pudimos reproducir esta grabación. Intenta de nuevo.',
+  'recordings.shareAction': 'Compartir audio',
+  'recordings.shareLabel': 'Compartir tu grabación enviada',
+  'recordings.shareHint':
+    'Descarga una copia privada temporal y abre las opciones para compartir de tu dispositivo.',
+  'recordings.sharing': 'Preparando el audio…',
+  'recordings.shareUnavailable': 'Compartir no funciona en este dispositivo.',
+  'recordings.shareFailed': 'No pudimos compartir esta grabación. Intenta de nuevo.',
   'recordings.preparing': 'Preparando…',
   'recordings.pending': 'Esta grabación aún se está preparando. La comprobaremos brevemente.',
   'recordings.unavailable': 'Esta grabación no está disponible.',
   'recordings.deleteTitle': '¿Eliminar esta grabación?',
   'recordings.deleteBody':
-    'Se eliminará el audio. Tu puntuación, transcripción y comentarios se conservarán.',
+    'La grabación se quitará ahora y su audio guardado quedará en cola para eliminación permanente. Tu puntuación, transcripción y comentarios se conservarán.',
   'recordings.deleteBodyNamed':
-    '¿Eliminar la grabación de “{name}”? Tu puntuación, transcripción y comentarios se conservarán.',
+    '¿Quitar la grabación de “{name}” y poner su audio guardado en cola para eliminación permanente? Tu puntuación, transcripción y comentarios se conservarán.',
   'recordings.deleteAction': 'Eliminar grabación',
-  'recordings.deleteHint': 'Elimina solo el audio guardado, no tu resultado.',
+  'recordings.deleteHint':
+    'Quita la grabación ahora y pone el audio en cola para eliminación permanente; tu resultado se conserva.',
   'recordings.deleteFailed': 'No pudimos eliminar esta grabación. Intenta de nuevo.',
-  'recordings.deleted': 'Grabación eliminada. Tu resultado sigue guardado.',
+  'recordings.deleted':
+    'Grabación quitada; audio guardado en cola para eliminación permanente. Tu resultado sigue guardado.',
   'recordings.progressLabel': 'Progreso de reproducción de la grabación',
 
   'practice.skipWord': 'Saltar esta palabra por ahora',
@@ -1907,12 +2428,15 @@ const es: Record<MessageKey, string> = {
   'reset.sentBody':
     'Si existe una cuenta con este email, te enviamos un código. El código funciona por 30 minutos.',
   'reset.continue': 'Ya tengo el código',
+  'reset.resend': 'Enviar código de nuevo',
+  'reset.resendBusy': 'Enviando de nuevo…',
   'reset.newTitle': 'Elige una contraseña nueva',
   'reset.codeLabel': 'Código del email',
   'reset.codePlaceholder': 'Pega el código aquí',
   'reset.submitNew': 'Guardar contraseña nueva',
   'reset.submitNewBusy': 'Guardando…',
-  'reset.doneBanner': 'Tu contraseña cambió. Inicia sesión, por favor.',
+  'reset.doneBanner':
+    'Tu contraseña cambió y las sesiones existentes se cerraron. Inicia sesión, por favor.',
   'reset.backToLogin': 'Volver a iniciar sesión',
 
   'settings.profileTitle': 'Tu perfil',
@@ -1923,8 +2447,9 @@ const es: Record<MessageKey, string> = {
   'settings.levelLabel': 'Nivel de inglés',
   'settings.appLanguageLabel': 'Idioma de la aplicación',
   'settings.appLanguageHelp': 'Elige el idioma de los botones y mensajes.',
-  'settings.learningLanguageLabel': 'Idioma de aprendizaje',
-  'settings.learningLanguageHelp': 'Se usa para la ayuda y las respuestas en tu idioma.',
+  'settings.learningLanguageLabel': 'Lengua materna',
+  'settings.learningLanguageHelp':
+    'Se usa solo para la ayuda traducida y las respuestas en tu idioma. No cambia los botones ni mensajes; usa Idioma de la app para eso.',
   'settings.levelPending': 'Aún sin prueba',
   'settings.saveName': 'Guardar nombre',
   'settings.saveNameBusy': 'Guardando…',
@@ -1932,12 +2457,27 @@ const es: Record<MessageKey, string> = {
   'settings.updateFailed': 'No pudimos guardar tus cambios. Intenta de nuevo.',
   'settings.export': 'Exportar mis datos',
   'settings.exportBusy': 'Preparando tus datos…',
+  'settings.exportHelp':
+    'El JSON incluye tus datos de aprendizaje y los detalles de las grabaciones guardadas. No incluye archivos ni bytes de audio.',
   'settings.exportFailed': 'No pudimos exportar tus datos. Intenta de nuevo.',
   'settings.exportUnavailable': 'Compartir no funciona en este teléfono.',
-  'settings.retake': 'Repetir la prueba de nivel',
-  'retake.confirmTitle': '¿Repetir la prueba de nivel?',
-  'retake.confirmBody': 'Harás la prueba de nivel otra vez. Tu historial de práctica se conserva.',
-  'retake.confirm': 'Repetir prueba',
+  'settings.recordingsDeleteAll': 'Eliminar todas las grabaciones',
+  'settings.recordingsDeleteAllHint':
+    'Quita todas las grabaciones guardadas y conserva tus puntuaciones, transcripciones y comentarios.',
+  'settings.recordingsDeleteAllBusy': 'Eliminando grabaciones…',
+  'settings.recordingsDeleteAllTitle': '¿Eliminar todas las grabaciones?',
+  'settings.recordingsDeleteAllBody':
+    'Todas las grabaciones guardadas se quitarán ahora y su audio quedará en cola para eliminación permanente. Tus puntuaciones, transcripciones y comentarios se conservarán. Esta acción no se puede deshacer.',
+  'settings.recordingsDeleteAllConfirm': 'Eliminar todas',
+  'settings.recordingsDeleteAllSuccess':
+    'Se quitaron todas las grabaciones; el audio guardado quedó en cola para eliminación permanente. Tus resultados siguen guardados.',
+  'settings.recordingsDeleteAllFailed':
+    'No pudimos eliminar todas las grabaciones. Intenta de nuevo.',
+  'settings.retake': 'Reiniciar prueba de nivel',
+  'retake.confirmTitle': '¿Reiniciar la prueba de nivel?',
+  'retake.confirmBody':
+    'Esto borra el progreso de la prueba de nivel actual y empieza de nuevo. Tu historial de práctica se conserva.',
+  'retake.confirm': 'Reiniciar prueba',
   'retake.failed': 'No pudimos reiniciar la prueba. Intenta de nuevo.',
 
   'reminder.toggleLabel': 'Recordatorio diario',
@@ -1951,15 +2491,19 @@ const es: Record<MessageKey, string> = {
   'reminder.notificationBody': 'Dedica unos minutos hoy a practicar inglés.',
 
   'legal.placeholderNote':
-    'Esta página es un ejemplo general. El dueño de la app debe revisarla y cambiarla antes del lanzamiento.',
+    'Vigente desde el 28 de agosto de 2026. Este resumen describe cómo la app actual maneja los datos.',
   'privacy.p1':
-    'Guardamos tu nombre, email, respuestas y grabaciones enviadas correctamente para que puedas escucharlas hasta que borres la grabación o tu cuenta.',
+    'Guardamos tu nombre, email, hash de contraseña, ajustes de idioma, nivel, progreso, resultados de evaluaciones, transcripciones, comentarios y metadatos de grabaciones retenidas. El servicio también procesa información de solicitudes y red necesaria para autenticación, seguridad, límites, fiabilidad y prevención de abuso.',
   'privacy.p2':
-    'Las subidas fallidas o abandonadas son temporales. Los servicios de IA procesan el audio enviado y su transcripción.',
-  'privacy.p3': 'Puedes exportar tus datos o borrar tu cuenta en cualquier momento desde Ajustes.',
-  'terms.p1': 'Esta app te ayuda a practicar inglés. No da certificados oficiales.',
-  'terms.p2': 'Usa la app de forma justa, por favor. No compartas tu cuenta con otras personas.',
-  'terms.p3': 'Podemos cambiar o detener partes de la app para mantenerla segura y funcionando.',
+    'OpenAI procesa el audio y las transcripciones enviados para transcripción y comentarios de aprendizaje. El audio de producción se guarda de forma privada en Amazon S3. El email de restablecimiento usa el servicio de correo configurado. Cuando los anuncios están activos y el consentimiento lo permite, Google Mobile Ads y sus herramientas de consentimiento procesan datos publicitarios. Las subidas fallidas y el audio que eliges no guardar son temporales; las grabaciones que decides conservar permanecen hasta que las borres o elimines tu cuenta.',
+  'privacy.p3':
+    'En Ajustes puedes exportar los datos de cuenta actualmente incluidos, borrar grabaciones, cambiar opciones de privacidad publicitaria disponibles o eliminar tu cuenta. Los datos de cuenta se borran de inmediato al completar la eliminación; los archivos de grabación permanecen en cola hasta que termina su eliminación permanente asíncrona.',
+  'terms.p1':
+    'Esta app ofrece práctica de inglés asistida por IA y una estimación de nivel CEFR. Los resultados y comentarios pueden ser incompletos o incorrectos, no son asesoramiento profesional ni un certificado oficial.',
+  'terms.p2':
+    'Mantén tus credenciales privadas y usa solo una cuenta autorizada. No abuses del servicio, evadas límites, interfieras con otros, subas contenido ilegal ni intentes comprometer la app o sus proveedores.',
+  'terms.p3':
+    'La disponibilidad, evaluaciones de IA, grabaciones, anuncios, límites y funciones pueden cambiar o no estar disponibles. Puedes dejar de usar la app y eliminar tu cuenta en Ajustes. La eliminación no se puede deshacer y la limpieza de archivos de grabación termina de forma asíncrona.',
 };
 
 const zh: Record<MessageKey, string> = {
@@ -1970,7 +2514,7 @@ const zh: Record<MessageKey, string> = {
   'common.hide': '隐藏',
   'common.showPassword': '显示密码',
   'common.hidePassword': '隐藏密码',
-  'common.logOut': '退出登录',
+  'common.logOut': '在所有设备上退出登录',
   'common.backToPractice': '返回练习',
   'label.word': '单词',
   'label.question': '问题',
@@ -2005,12 +2549,16 @@ const zh: Record<MessageKey, string> = {
   'error.networkDailyLimit': '这个网络今天的练习用完了。请明天再试。',
   'error.busy': '现在练习的人很多。请稍等一下再试。',
   'error.audioInvalid': '我们无法使用这段录音。请重新录你的回答。',
+  'error.audioSilent': '我们没有听到任何声音。请检查麦克风，然后重新录制你的回答。',
   'error.audioTooLong': '录音太长了。回答请不要超过两分钟。',
   'error.audioUnreadable': '我们听不到这段录音。请重新录你的回答。',
   'error.checkFailed': '我们无法检查你的回答。请再试一次。',
   'error.resetInvalid': '这个验证码无效或者太旧了。请重新申请一个验证码。',
   'error.upgradeRequired': '请更新应用后继续使用。',
+  'error.assessmentResultIncompatible':
+    '应用更新后无法显示这个已保存的回答。你的题目已重新加载。请录制一个新回答。',
   'error.internal': '出了点问题。请再试一次。',
+  'email.invalid': '请输入有效的邮箱地址。',
 
   'auth.sessionExpired': '为了保护你的账户，你已被退出登录。请重新登录。',
   'auth.restoreUnavailable': '我们无法打开你保存的登录。请解锁手机后再试一次。',
@@ -2018,10 +2566,24 @@ const zh: Record<MessageKey, string> = {
     '你已退出登录，但应用没能完成清理。请先关闭应用再打开，然后重新登录。',
   'auth.accountDeletedCleanupFailed':
     '你的账户已删除，但应用没能完成清理。请先关闭应用再打开，然后重新登录。',
+  'auth.registrationCompletedLoginRequired': '你的账户已创建，但此设备无法保存登录信息。',
 
   'password.tooShort': '密码至少要有 8 个字符。',
   'password.needsLetterAndNumber': '密码至少要有一个字母和一个数字。',
   'password.tooLong': '密码太长了。请用短一点的密码。',
+  'password.confirmLabel': '确认密码',
+  'password.confirmPlaceholder': '再次输入密码',
+  'password.mismatch': '两次输入的密码不一致。',
+  'password.showConfirmation': '显示确认密码',
+  'password.hideConfirmation': '隐藏确认密码',
+  'language.appLabel': '应用语言',
+  'language.appHelp': '选择此设备上应用使用的语言。',
+  'language.saveFailed': '应用语言已更改，但无法保存在此设备上。',
+  'language.en': '英语',
+  'language.te': '泰卢固语',
+  'language.hi': '印地语',
+  'language.es': '西班牙语',
+  'language.zh': '中文',
 
   'login.title': 'AI English Coach',
   'login.subtitle': '和你的 AI 教练一起练习说英语。',
@@ -2040,11 +2602,12 @@ const zh: Record<MessageKey, string> = {
   'signup.nameLabel': '名字',
   'signup.namePlaceholder': '你的名字',
   'signup.passwordPlaceholder': '至少 8 个字符，包含一个字母和一个数字',
-  'signup.languageLabel': '学习语言',
-  'signup.languageHelp': '用于帮助内容和用你的语言回答。',
+  'signup.languageLabel': '母语',
+  'signup.languageHelp': '用于翻译帮助和用你的语言回答。这与应用语言是分开的。',
   'signup.submit': '创建账户',
   'signup.submitBusy': '正在创建你的账户…',
   'signup.failed': '我们无法创建你的账户。请检查你的信息后再试一次。',
+  'signup.createdLoginBanner': '你的账户已创建，但此设备无法保存登录信息。请用新密码登录。',
   'signup.footerPrompt': '已经有账户？',
   'signup.footerLink': '登录',
 
@@ -2055,6 +2618,28 @@ const zh: Record<MessageKey, string> = {
   'gate.resetSession': '删除保存的登录',
   'gate.serverErrorTitle': '我们无法连接服务器',
   'gate.profileFailed': '我们无法加载你的资料。请再试一次。',
+  'gate.offlineTitle': '你已离线',
+  'gate.offlineBody': '你的登录信息仍然保留。请重新连接网络以加载个人资料。',
+
+  'network.offline': '没有网络连接。你保存的内容是安全的。',
+  'network.backOnline': '网络已恢复',
+  'network.offlineTitle': '你已离线',
+  'network.offlineBody': '重新联网以加载此页面。它会自动继续。',
+  'refresh.updating': '正在更新…',
+  'refresh.failedUsingSaved': '无法刷新。正在显示已保存的信息。',
+  'upgrade.title': '需要更新',
+  'upgrade.body': '你需要更新版 AI English Coach，才能继续安全使用学习数据。',
+  'upgrade.action': '更新应用',
+  'upgrade.actionHint': '打开 AI English Coach 的应用商店页面。',
+  'upgrade.openFailed': '无法打开应用商店。请打开商店并更新 AI English Coach。',
+  'replay.checkingTitle': '正在检查你保存的回答',
+  'replay.checkingBody': '你的回答是安全的。我们正在恢复反馈。',
+  'replay.failedTitle': '无法恢复你的反馈',
+  'replay.failedBody': '你保存的回答仍然安全。现在重试，或稍后再查看。',
+  'replay.checkLater': '稍后查看',
+  'replay.pendingTitle': '已保存的回答正在等待',
+  'replay.pendingBody': '你的回答是安全的。反馈准备好后，请再次检查以恢复反馈。',
+  'replay.checkNow': '立即检查',
 
   'header.diagnostic': '英语水平测试',
   'header.practice': '练习',
@@ -2072,19 +2657,30 @@ const zh: Record<MessageKey, string> = {
   'diag.loadFailed': '我们无法加载测试。请再试一次。',
   'diag.introTitle': '开始之前',
   'diag.introWhat': '这个小测试会找出你的英语水平。',
-  'diag.introCount': '你最多回答 {count} 个问题。',
+  'diag.introCount': '你会回答 2 或 3 个问题。',
   'diag.introRecorded': '你的回答会被录音。',
   'diag.introSpeakEnglish': '请说英语。',
   'diag.introStart': '开始测试',
   'diag.progress': '第 {current} 题，最多 {max} 题',
   'diag.answerSavedTitle': '回答已保存',
   'diag.answerSavedBody': '你的回答已保存。测试结束时你会看到你的分数。',
+  'diag.answerCheckedTitle': '回答已检查',
+  'diag.noSpeechTitle': '我们没有听到你的声音',
+  'diag.recordAgain': '重新录音',
+  'diag.scoreLine': '{score}/100 — {result}',
+  'diag.passed': '通过',
+  'diag.notPassed': '尚未通过',
+  'diag.transcriptLabel': '我们听到的内容',
+  'diag.answerQuestion': '{word}：{question}',
   'diag.nextQuestion': '下一题',
   'diag.seeLevel': '看我的水平',
   'diag.completeTitle': '测试完成！',
   'diag.levelIntro': '你的英语水平是',
   'diag.levelHint': '我们会给你这个水平的练习题。',
   'diag.startPracticing': '开始练习',
+  'diag.startPracticingBusy': '正在打开练习…',
+  'diag.ackFailedTitle': '我们无法打开练习',
+  'diag.ackFailed': '你的等级已保存。请重试以继续。',
   'diag.answersTitle': '你的回答',
   'diag.answerLine': '第 {number} 题 — {score}/100 {mark}',
   'diag.assessFailedTitle': '我们无法检查你的回答',
@@ -2098,6 +2694,8 @@ const zh: Record<MessageKey, string> = {
 
   'logout.failedTitle': '我们无法帮你退出登录',
   'logout.failedBody': '请检查网络后再试一次。',
+  'logout.localBody': '无法联系服务器。你可以移除此设备上的登录；其他设备会保持登录。',
+  'logout.thisDevice': '在此设备上退出登录',
   'logout.cleanupTitle': '已退出登录',
 
   'practice.greeting': '你好，{name}',
@@ -2118,6 +2716,8 @@ const zh: Record<MessageKey, string> = {
   'practiceIntro.master': '得 {score} 分或更多，就掌握一个单词。',
   'practiceIntro.tries': '每个单词你有 {count} 次机会。',
   'practiceIntro.silence': '如果我们什么都没听到，不算次数。你可以再试。',
+  'practiceIntro.native':
+    '用你的语言回答会占用一次尝试，并检查理解；只有英语回答才能掌握这个单词。',
   'practiceIntro.dismiss': '知道了',
 
   'feedback.noResultTitle': '没有可显示的内容',
@@ -2149,6 +2749,14 @@ const zh: Record<MessageKey, string> = {
   'feedback.tryInEnglish': '用英语试试',
   'feedback.tryAgainNative': '用我的语言再试一次',
   'feedback.seeHelp': '看翻译和例子',
+  'feedback.attemptLine': '第 {current} 次，共 {max} 次',
+  'feedback.attemptStillAvailable': '第 {current} 次尝试（共 {max} 次）仍可使用',
+  'feedback.wordAndQuestion': '单词和问题',
+  'feedback.originalTranscript': '我们听到的{language}内容',
+  'feedback.englishTranslation': '英语翻译',
+  'feedback.exampleEnglishAnswer': '英语示例答案',
+  'feedback.nativeFinalTitle': '没有更多尝试了',
+  'feedback.nativeFinalBody': '这个回答用掉了最后一次尝试。以后你还会再看到这个单词。',
 
   'help.invalidLinkTitle': '这个链接无效',
   'help.invalidLinkBody': '请返回练习，从你的问题打开帮助。',
@@ -2170,23 +2778,26 @@ const zh: Record<MessageKey, string> = {
   'cp.confirmLabel': '确认新密码',
   'cp.confirmPlaceholder': '再输入一次新密码',
   'cp.mismatch': '两次密码不一样。',
+  'cp.sameAsCurrent': '请选择与当前密码不同的密码。',
   'cp.wrongCurrent': '你现在的密码不对。',
   'cp.failed': '我们无法修改你的密码。请再试一次。',
   'cp.updatedTitle': '密码已修改',
-  'cp.updatedBody': '你的密码已经改好了。',
+  'cp.updatedBody': '你的密码已经改好了。其他设备已退出登录。',
   'cp.submit': '修改密码',
   'cp.submitBusy': '正在修改…',
 
   'da.warningTitle': '此操作无法撤销',
-  'da.warningBody': '删除账户会删除你的资料、测试结果和练习记录。此操作无法撤销。',
+  'da.warningBody':
+    '删除账户会立即删除你的资料、结果、进度和录音访问权限。录音文件会排队等待永久删除，这可能需要额外时间。此操作无法撤销。',
   'da.passwordLabel': '输入你的密码',
   'da.passwordPlaceholder': '你的密码',
   'da.wrongPassword': '密码不对。',
   'da.failed': '我们无法删除你的账户。请再试一次。',
+  'da.unconfirmed': '无法确认账户是否已删除。请重新联网并尝试登录，再决定是否重复删除。',
   'da.deletedTitle': '账户已删除',
-  'da.deletedBody': '你的账户和所有数据都已删除。',
+  'da.deletedBody': '你的账户数据已删除，录音文件已排队等待永久删除。',
   'da.confirmTitle': '要删除你的账户吗？',
-  'da.confirmBody': '这会永久删除你的账户和所有进度。',
+  'da.confirmBody': '这会永久删除你的账户和进度。录音文件会保留在队列中，直到异步永久删除完成。',
   'da.confirmDelete': '删除',
   'da.submit': '删除我的账户',
   'da.submitBusy': '正在删除…',
@@ -2205,11 +2816,11 @@ const zh: Record<MessageKey, string> = {
   'recorder.stopLabel': '停止录音',
   'recorder.listening': '正在听…',
   'recorder.statusRecording': '正在录音… {elapsed} / 2:00 — 点一下停止',
-  'recorder.statusRecorded': '已录 {elapsed} — 可以发送了',
+  'recorder.statusRecorded': '已录 {elapsed} — 可以发送了。请保持应用打开。',
   'recorder.statusRecovering': '正在确认你上一个回答有没有保存…',
   'recorder.statusIdle': '点麦克风，录下你的回答',
   'recorder.a11yRecording': '正在录音。点麦克风停止。',
-  'recorder.a11ySaved': '录音已保存。可以发送了。',
+  'recorder.a11ySaved': '录音已准备发送。离开或关闭应用会删除它。',
   'recorder.a11yUploading': '正在发送并检查你的回答。',
   'recorder.a11yRecovering': '正在确认你上一个回答。',
   'recorder.a11yIdle': '可以开始录音。',
@@ -2220,13 +2831,30 @@ const zh: Record<MessageKey, string> = {
   'recorder.waitHint': '这次比平时慢一点 — 正在查看你的结果…',
   'recorder.waitingFor': '已等待 {elapsed}',
   'recorder.privacyNote': '只有你点“发送回答”之后，我们才会发送你的录音。',
+  'recorder.retentionNote':
+    '无论是否保存录音，你的分数、文字记录和反馈都会保留。除非你打开“保存这段录音”，否则音频会在检查后删除。',
+  'recorder.saveRecordingLabel': '保存这段录音',
+  'recorder.saveRecordingHint': '默认关闭。打开后，这段音频会保存在“录音”中，直到你删除它。',
   'recorder.play': '播放',
   'recorder.pause': '暂停',
   'recorder.playLabel': '播放你的录音',
   'recorder.pauseLabel': '暂停播放',
   'recorder.submit': '发送回答',
   'recorder.rerecord': '重新录音',
+  'recorder.discard': '丢弃这次录音',
+  'recorder.discardHint': '从此设备删除这段尚未发送的录音。',
+  'recorder.discardTitle': '丢弃这次录音？',
+  'recorder.discardBody': '这段尚未发送的录音将从此设备删除，不会发送任何内容。',
+  'recorder.discarded': '这次录音已丢弃，未发送任何内容。',
+  'recorder.errDiscardFailed': '无法安全地丢弃这次录音，请重试。',
   'recorder.cancelHint': '停止发送并保留你的录音。',
+  'recorder.cancelSending': '取消发送',
+  'recorder.cancelBeforeTransferHint': '在音频离开此设备前停止，并保留这次录音。',
+  'recorder.cancelAfterTransferHint': '停止提交。临时音频上传可能会短暂保留，之后会自动过期。',
+  'recorder.stopWaiting': '停止等待',
+  'recorder.stopWaitingHint': '停止在此页面检查。你的回答可能已经发送或保存。',
+  'recorder.permissionRetryBody': '麦克风权限未允许。点“开始录音”可再次请求。',
+  'recorder.permissionGranted': '麦克风权限已开启。点“开始录音”。',
   'recorder.oneMinuteLeft': '还剩一分钟',
   'recorder.thirtySecondsLeft': '还剩三十秒',
   'recorder.tenSecondsLeft': '还剩十秒',
@@ -2251,8 +2879,9 @@ const zh: Record<MessageKey, string> = {
     '你的回答已保存，但我们无法保存应用信息。请关闭应用再打开来完成。',
   'recorder.errInfoNotSavedNotUploaded': '我们无法保存应用信息，所以你的录音没有发送。请再试一次。',
   'recorder.errNotSent': '我们无法发送你的录音。请再试一次。',
-  'recorder.errDeviceInterrupted': '手机停止了录音。请重新录你的回答。',
-  'recorder.errBackgroundDiscarded': '你离开应用时录音没有保留。请重新录你的回答。',
+  'recorder.errDeviceInterrupted': '录音保存前被手机停止。没有发送任何内容。准备好后请重新录音。',
+  'recorder.errBackgroundDiscarded':
+    '你离开应用时，未发送的录音已被删除。没有发送任何内容。准备好后请重新录音。',
   'recorder.errTooShort': '录音太短了。请重新录你的回答。',
   'recorder.errSaveFailed': '我们无法保存录音。请重新录你的回答。',
   'recorder.errNoRecording': '没有保存任何录音。请重新录音。',
@@ -2303,6 +2932,7 @@ const zh: Record<MessageKey, string> = {
   'history.loadingMore': '正在加载更多…',
   'history.contextDiagnostic': '等级测试',
   'history.contextPractice': '练习',
+  'history.contextNative': '用你的语言回答',
   'history.attemptNo': '第 {number} 次',
   'history.showDetails': '显示详情',
   'history.hideDetails': '隐藏详情',
@@ -2311,7 +2941,7 @@ const zh: Record<MessageKey, string> = {
   'recordings.loadFailedTitle': '我们无法加载你的录音',
   'recordings.loadFailed': '我们无法加载你的录音。请再试一次。',
   'recordings.emptyTitle': '还没有保存的录音',
-  'recordings.emptyBody': '录制并发送回答后，保存的录音会显示在这里。',
+  'recordings.emptyBody': '发送回答前，请打开“保存这段录音”。保存的录音会显示在这里。',
   'recordings.loadMore': '查看更早的录音',
   'recordings.loadingMore': '正在加载更多…',
   'recordings.intro': '收听你提交的录音，或只删除音频并保留学习结果。',
@@ -2326,16 +2956,24 @@ const zh: Record<MessageKey, string> = {
   'recordings.playLabel': '播放你提交的录音',
   'recordings.pauseLabel': '暂停你提交的录音',
   'recordings.playFailed': '我们无法播放这段录音。请再试一次。',
+  'recordings.shareAction': '分享音频',
+  'recordings.shareLabel': '分享你提交的录音',
+  'recordings.shareHint': '下载临时私密副本并打开设备的分享选项。',
+  'recordings.sharing': '正在准备音频…',
+  'recordings.shareUnavailable': '此设备不支持分享。',
+  'recordings.shareFailed': '我们无法分享这段录音。请再试一次。',
   'recordings.preparing': '正在准备…',
   'recordings.pending': '这段录音仍在准备中。我们会短暂重试。',
   'recordings.unavailable': '这段录音不可用。',
   'recordings.deleteTitle': '删除这段录音？',
-  'recordings.deleteBody': '音频会被删除，但你的分数、转写和反馈会保留。',
-  'recordings.deleteBodyNamed': '删除“{name}”的录音？你的分数、转写和反馈会保留。',
+  'recordings.deleteBody':
+    '录音会立即移除，存储的音频将排队等待永久删除。你的分数、转写和反馈会保留。',
+  'recordings.deleteBodyNamed':
+    '移除“{name}”的录音并将存储音频排队等待永久删除？你的分数、转写和反馈会保留。',
   'recordings.deleteAction': '删除录音',
-  'recordings.deleteHint': '只删除保存的音频，不删除你的结果。',
+  'recordings.deleteHint': '立即移除录音并将音频排队等待永久删除；你的结果会保留。',
   'recordings.deleteFailed': '我们无法删除这段录音。请再试一次。',
-  'recordings.deleted': '录音已删除。你的结果仍然保留。',
+  'recordings.deleted': '录音已移除；存储的音频已排队等待永久删除。你的结果仍然保留。',
   'recordings.progressLabel': '录音播放进度',
 
   'practice.skipWord': '暂时跳过这个单词',
@@ -2351,12 +2989,14 @@ const zh: Record<MessageKey, string> = {
   'reset.sentTitle': '请查看你的邮箱',
   'reset.sentBody': '如果这个邮箱有账户，我们已发送验证码。验证码 30 分钟内有效。',
   'reset.continue': '我有验证码了',
+  'reset.resend': '再次发送验证码',
+  'reset.resendBusy': '正在再次发送…',
   'reset.newTitle': '选择一个新密码',
   'reset.codeLabel': '邮件里的验证码',
   'reset.codePlaceholder': '把验证码粘贴到这里',
   'reset.submitNew': '保存新密码',
   'reset.submitNewBusy': '正在保存…',
-  'reset.doneBanner': '你的密码已修改。请登录。',
+  'reset.doneBanner': '你的密码已修改，现有会话已退出。请登录。',
   'reset.backToLogin': '返回登录',
 
   'settings.profileTitle': '你的资料',
@@ -2367,8 +3007,9 @@ const zh: Record<MessageKey, string> = {
   'settings.levelLabel': '英语等级',
   'settings.appLanguageLabel': '应用语言',
   'settings.appLanguageHelp': '选择按钮和消息所用的语言。',
-  'settings.learningLanguageLabel': '学习语言',
-  'settings.learningLanguageHelp': '用于帮助内容和用你的语言回答。',
+  'settings.learningLanguageLabel': '母语',
+  'settings.learningLanguageHelp':
+    '仅用于翻译帮助和用你的语言回答。它不会更改按钮或消息；请用“应用语言”更改界面。',
   'settings.levelPending': '还没有测试',
   'settings.saveName': '保存名字',
   'settings.saveNameBusy': '正在保存…',
@@ -2376,12 +3017,24 @@ const zh: Record<MessageKey, string> = {
   'settings.updateFailed': '我们无法保存你的修改。请再试一次。',
   'settings.export': '导出我的数据',
   'settings.exportBusy': '正在准备你的数据…',
+  'settings.exportHelp':
+    'JSON 包含你的学习数据和已保存录音的详细信息，但不包含音频文件或音频字节。',
   'settings.exportFailed': '我们无法导出你的数据。请再试一次。',
   'settings.exportUnavailable': '这台设备不支持分享。',
-  'settings.retake': '重新参加等级测试',
-  'retake.confirmTitle': '重新参加等级测试？',
-  'retake.confirmBody': '你将重新参加等级测试。你的练习历史会保留。',
-  'retake.confirm': '重新测试',
+  'settings.recordingsDeleteAll': '删除所有录音',
+  'settings.recordingsDeleteAllHint': '移除所有已保存的录音，同时保留你的分数、转写和反馈。',
+  'settings.recordingsDeleteAllBusy': '正在删除录音…',
+  'settings.recordingsDeleteAllTitle': '删除所有录音？',
+  'settings.recordingsDeleteAllBody':
+    '所有已保存的录音都会立即移除，存储的音频将排队等待永久删除。你的分数、转写和反馈会保留。此操作无法撤销。',
+  'settings.recordingsDeleteAllConfirm': '全部删除',
+  'settings.recordingsDeleteAllSuccess':
+    '所有录音已移除；存储的音频已排队等待永久删除。你的结果仍然保留。',
+  'settings.recordingsDeleteAllFailed': '我们无法删除所有录音。请再试一次。',
+  'settings.retake': '重新开始等级测试',
+  'retake.confirmTitle': '重新开始等级测试？',
+  'retake.confirmBody': '这会清除当前等级测试进度并重新开始。你的练习历史会保留。',
+  'retake.confirm': '重新开始测试',
   'retake.failed': '我们无法重新开始测试。请再试一次。',
 
   'reminder.toggleLabel': '每日提醒',
@@ -2393,14 +3046,19 @@ const zh: Record<MessageKey, string> = {
   'reminder.notificationTitle': '练习时间到！',
   'reminder.notificationBody': '今天花几分钟练习英语吧。',
 
-  'legal.placeholderNote': '本页面只是一个通用示例。应用所有者必须在发布前审核并替换它。',
+  'legal.placeholderNote': '自 2026 年 8 月 28 日起生效。本摘要说明当前应用如何处理数据。',
   'privacy.p1':
-    '我们会保存你的名字、邮箱、练习回答和成功提交的录音，供你重复收听，直到你删除录音或账户。',
-  'privacy.p2': '失败或放弃的上传是临时的。AI 服务会处理已提交的音频及其转写文本。',
-  'privacy.p3': '你可以随时在设置里导出你的数据或删除你的账户。',
-  'terms.p1': '这个应用帮助你练习英语。它不颁发官方证书。',
-  'terms.p2': '请合理使用这个应用。不要把你的账户分享给别人。',
-  'terms.p3': '为了保持应用安全和正常运行，我们可能会修改或停止部分功能。',
+    '我们保存你的姓名、邮箱、密码哈希、语言设置、等级、学习进度、评估结果、转写文本、反馈和保留录音的元数据。服务还会处理身份验证、安全、速率限制、可靠性和防止滥用所需的请求与网络信息。',
+  'privacy.p2':
+    'OpenAI 会处理提交的音频和转写文本，用于转写和学习反馈。生产环境音频私密存储在 Amazon S3。密码重置邮件使用配置的邮件服务。启用广告且同意允许时，Google Mobile Ads 及其同意工具会处理广告相关数据。失败的上传和你选择不保存的音频是临时的；你选择保留的录音会保存到你删除录音或账户为止。',
+  'privacy.p3':
+    '你可以在设置中导出当前导出范围内的账户数据、删除单个录音、更改可用的广告隐私选项或删除账户。账户删除成功后，账户数据会立即删除；录音文件会保留在队列中，直到异步永久删除完成。',
+  'terms.p1':
+    '本应用提供 AI 辅助英语练习和估算的 CEFR 等级。结果和反馈可能不完整或错误，不是专业建议，也不是官方证书。',
+  'terms.p2':
+    '请保密登录信息，只使用你有权使用的账户。不得滥用服务、规避限制、干扰他人、上传违法内容，或试图破坏应用及其服务提供商。',
+  'terms.p3':
+    '服务可用性、AI 评估、录音、广告、限制和功能可能变化或不可用。你可以在设置中删除账户并停止使用。账户删除无法撤销，录音文件清理会异步完成。',
 };
 
 export const dictionaries: Readonly<Record<UiLanguage, Record<MessageKey, string>>> = {
@@ -2455,7 +3113,7 @@ export function deviceLanguage(): UiLanguage {
 /**
  * The language used by non-React code (API error mapping, auth errors,
  * recorder callbacks). The provider keeps it in sync with the UI language; it
- * starts in English because every signed-out surface is deliberately English.
+ * starts in English only until the root language preference finishes loading.
  */
 let activeLanguage: UiLanguage | null = null;
 
@@ -2491,13 +3149,16 @@ const FALLBACK_CONTEXT: I18nContextValue = {
 
 export function I18nProvider({
   accountLanguage,
+  guestLanguage = 'en',
   children,
 }: {
   /** The signed-in account's UI language; null when signed out. */
   accountLanguage: UiLanguage | null;
+  /** Persisted device preference used while signed out or before profile load. */
+  guestLanguage?: UiLanguage;
   children: React.ReactNode;
 }) {
-  const language: UiLanguage = accountLanguage ?? 'en';
+  const language: UiLanguage = accountLanguage ?? guestLanguage;
 
   // Alerts and API errors are built outside React at event time; keep the
   // module-level language they read in sync with the rendered language.

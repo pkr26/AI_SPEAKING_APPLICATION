@@ -123,7 +123,10 @@ export const layout = {
   screenPadding: 20,
   formMaxWidth: 560,
   contentMaxWidth: 760,
-  minimumTarget: 44,
+  // Apple accepts 44pt while Material recommends 48dp. Using the larger
+  // cross-platform target makes compact controls easier for motor-impaired
+  // learners without branching every component by platform.
+  minimumTarget: 48,
 } as const;
 
 export const radii = {

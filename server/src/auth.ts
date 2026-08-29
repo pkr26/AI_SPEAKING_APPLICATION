@@ -50,6 +50,7 @@ function toUserJson(row: UserRow) {
     uiLanguage: row.ui_language,
     cefrLevel: row.cefr_level,
     diagnosticCompleted: row.diagnostic_completed,
+    diagnosticAcknowledged: row.diagnostic_acknowledged,
   };
 }
 
@@ -125,19 +126,48 @@ const loginSchema = z.object({
   password: comparablePasswordSchema('password'),
 });
 
-const changePasswordSchema = z.object({
-  currentPassword: comparablePasswordSchema('currentPassword'),
-  newPassword: passwordSchema,
-});
+const changePasswordSchema = z
+  .object({
+    currentPassword: comparablePasswordSchema('currentPassword'),
+    newPassword: passwordSchema,
+  })
+  .refine(({ currentPassword, newPassword }) => currentPassword !== newPassword, {
+    path: ['newPassword'],
+    message: 'new password must be different from the current password',
+  });
 
 const deleteAccountSchema = z.object({
   password: comparablePasswordSchema('password'),
 });
 
-const exportQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(500).default(100),
-  cursor: z.string().uuid('cursor must be a valid UUID').optional(),
-});
+const exportDoneFlag = z
+  .enum(['true', 'false'])
+  .default('false')
+  .transform((value) => value === 'true');
+const exportQuerySchema = z
+  .object({
+    limit: z.coerce.number().int().min(1).max(500).default(100),
+    cursor: z.string().uuid('cursor must be a valid UUID').optional(),
+    practiceCycleCursor: z.string().uuid('practiceCycleCursor must be a valid UUID').optional(),
+    attemptsDone: exportDoneFlag,
+    practiceCyclesDone: exportDoneFlag,
+  })
+  .superRefine(({ attemptsDone, practiceCyclesDone, cursor, practiceCycleCursor }, ctx) => {
+    if (attemptsDone && cursor) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cursor'],
+        message: 'must be omitted when attemptsDone=true',
+      });
+    }
+    if (practiceCyclesDone && practiceCycleCursor) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['practiceCycleCursor'],
+        message: 'must be omitted when practiceCyclesDone=true',
+      });
+    }
+  });
 
 const forgotPasswordSchema = z.object({
   email: emailSchema('email is required'),
@@ -481,40 +511,103 @@ export function createAuthRouter(limiters: Limiters) {
   );
 
   // Paginated data export: bounded memory/response size even for long-lived
-  // accounts. Follow nextCursor until it is null to export every attempt.
+  // accounts. Follow nextCursor and nextPracticeCycleCursor independently
+  // until both are null to export every attempt and every serving cycle.
   authRouter.get(
     '/me/data',
     requireAuth,
     validate({ query: exportQuerySchema }),
     h(async (req: AuthedRequest, res) => {
       const user = req.user!;
-      const { limit, cursor } = validated(req, exportQuerySchema);
+      const { limit, cursor, practiceCycleCursor, attemptsDone, practiceCyclesDone } = validated(
+        req,
+        exportQuerySchema,
+      );
       if (cursor) {
         const cursorRow = await pool.query('SELECT 1 FROM attempts WHERE id = $1 AND user_id = $2', [cursor, user.id]);
         if (!cursorRow.rows[0]) throw new HttpError(400, 'Invalid export cursor');
       }
+      if (practiceCycleCursor) {
+        const cursorRow = await pool.query('SELECT 1 FROM practice_cycles WHERE id = $1 AND user_id = $2', [
+          practiceCycleCursor,
+          user.id,
+        ]);
+        if (!cursorRow.rows[0]) throw new HttpError(400, 'Invalid practice cycle export cursor');
+      }
 
-      const { rows } = await pool.query(
-        `SELECT id, question_id AS "questionId", context, attempt_no AS "attemptNo",
-              transcript, score, passed, feedback, created_at AS "createdAt"
-       FROM attempts
-       WHERE user_id = $1
-         AND (
-           $2::uuid IS NULL
-           OR (created_at, id) > (
-             SELECT created_at, id FROM attempts WHERE id = $2 AND user_id = $1
-           )
-         )
-       ORDER BY created_at ASC, id ASC
-       LIMIT $3`,
-        [user.id, cursor ?? null, limit + 1],
+      const { rows } = attemptsDone
+        ? { rows: [] }
+        : await pool.query(
+            `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
+                    q.question_text AS "questionText", q.cefr_level AS "cefrLevel",
+                    a.context, a.attempt_no AS "attemptNo",
+                    a.transcript, a.score, a.passed, a.feedback,
+                    a.practice_cycle_id AS "cycleId", a.understood,
+                    a.translated_transcript AS "translatedTranscript", a.model_answer AS "modelAnswer",
+                    a.created_at AS "createdAt"
+             FROM attempts a
+             JOIN questions q ON q.id = a.question_id
+             WHERE a.user_id = $1
+               AND (
+                 $2::uuid IS NULL
+                 OR (a.created_at, a.id) > (
+                   SELECT created_at, id FROM attempts WHERE id = $2 AND user_id = $1
+                 )
+               )
+             ORDER BY a.created_at ASC, a.id ASC
+             LIMIT $3`,
+            [user.id, cursor ?? null, limit + 1],
+          );
+      const progressResult = await pool.query(
+        `SELECT pp.question_id AS "questionId", q.prompt_word AS "promptWord",
+                q.cefr_level AS "cefrLevel", pp.status, pp.best_score AS "bestScore",
+                pp.attempt_count AS "attemptCount", pp.last_attempt_at AS "lastAttemptAt",
+                pp.due_at AS "dueAt", pp.srs_interval_index AS "srsIntervalIndex",
+                pp.skipped_until AS "skippedUntil"
+         FROM practice_progress pp
+         JOIN questions q ON q.id = pp.question_id
+         WHERE pp.user_id = $1
+         ORDER BY q.cefr_level, q.prompt_word, pp.question_id`,
+        [user.id],
       );
+      const diagnosticResult = await pool.query(
+        `SELECT low_idx AS "lowIndex", high_idx AS "highIndex",
+                questions_asked AS "questionsAsked", current_question_id AS "currentQuestionId"
+         FROM diagnostic_state WHERE user_id = $1`,
+        [user.id],
+      );
+      const cycleResult = practiceCyclesDone
+        ? { rows: [] }
+        : await pool.query(
+            `SELECT id, question_id AS "questionId", kind,
+                    attempts_used AS "attemptsUsed", status,
+                    created_at AS "createdAt", updated_at AS "updatedAt", closed_at AS "closedAt"
+             FROM practice_cycles
+             WHERE user_id = $1
+               AND (
+                 $2::uuid IS NULL
+                 OR (created_at, id) > (
+                   SELECT created_at, id FROM practice_cycles WHERE id = $2 AND user_id = $1
+                 )
+               )
+             ORDER BY created_at ASC, id ASC
+             LIMIT $3`,
+            [user.id, practiceCycleCursor ?? null, limit + 1],
+          );
       const hasMore = rows.length > limit;
       const attempts = hasMore ? rows.slice(0, limit) : rows;
+      const hasMorePracticeCycles = cycleResult.rows.length > limit;
+      const practiceCycles = hasMorePracticeCycles ? cycleResult.rows.slice(0, limit) : cycleResult.rows;
       res.json({
         user: toUserJson(user),
         attempts,
+        practiceProgress: progressResult.rows,
+        practiceCycles,
+        diagnosticState: diagnosticResult.rows[0] ?? null,
         nextCursor: hasMore ? attempts[attempts.length - 1].id : null,
+        nextPracticeCycleCursor: hasMorePracticeCycles ? practiceCycles[practiceCycles.length - 1].id : null,
+        attemptsDone: attemptsDone || !hasMore,
+        practiceCyclesDone: practiceCyclesDone || !hasMorePracticeCycles,
       });
     }),
   );

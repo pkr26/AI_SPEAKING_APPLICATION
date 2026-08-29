@@ -29,6 +29,7 @@ describe('PATCH /auth/me', () => {
         uiLanguage: 'en',
         cefrLevel: null,
         diagnosticCompleted: false,
+        diagnosticAcknowledged: false,
       },
     });
 

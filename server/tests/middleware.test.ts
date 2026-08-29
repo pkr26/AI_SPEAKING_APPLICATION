@@ -11,6 +11,7 @@ import { shedRequestsTotal } from '../src/metrics';
 import {
   AuthedRequest,
   clientVersionGate,
+  clientVersionGateExempt,
   defaultErrorCode,
   errorHandler,
   h,
@@ -411,6 +412,33 @@ describe('clientVersionGate', () => {
     expect(forwarded).toBeInstanceOf(HttpError);
     expect(forwarded.status).toBe(426);
     expect(forwarded.code).toBe('CLIENT_UPGRADE_REQUIRED');
+  });
+
+  it.each([
+    ['POST', '/auth/logout'],
+    ['DELETE', '/auth/account'],
+    ['GET', '/auth/me/data'],
+    ['GET', '/recordings/export'],
+    ['DELETE', '/recordings'],
+    ['DELETE', '/recordings/550e8400-e29b-41d4-a716-446655440000'],
+  ])('keeps the stable privacy exit %s %s available to an outdated client', (method, path) => {
+    expect(clientVersionGateExempt(method, path)).toBe(true);
+    config.minClientVersion = '2.0.0';
+    const next = vi.fn();
+    clientVersionGate({ method, path, headers: { 'x-client-version': '1.0.0' } } as never, {} as never, next);
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it.each([
+    ['GET', '/auth/logout'],
+    ['POST', '/auth/account'],
+    ['POST', '/auth/me/data'],
+    ['POST', '/recordings'],
+    ['GET', '/recordings/550e8400-e29b-41d4-a716-446655440000'],
+    ['DELETE', '/recordings/not-a-uuid'],
+    ['GET', '/practice/question'],
+  ])('does not exempt unrelated or wrong-method route %s %s', (method, path) => {
+    expect(clientVersionGateExempt(method, path)).toBe(false);
   });
 });
 

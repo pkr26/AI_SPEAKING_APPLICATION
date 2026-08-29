@@ -1,9 +1,10 @@
 import type { InfiniteData, QueryClient } from '@tanstack/react-query';
 import { useQueryClient } from '@tanstack/react-query';
+import { createAudioPlayer, type AudioPlayer, type AudioStatus } from 'expo-audio';
 import { useFocusEffect } from 'expo-router';
+import * as Sharing from 'expo-sharing';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { AccessibilityInfo, Alert, AppState, Text, View } from 'react-native';
-import { createAudioPlayer, type AudioPlayer } from 'expo-audio';
 
 import {
   ApiError,
@@ -14,6 +15,11 @@ import {
 import { claimPlaybackOwner, configurePlaybackAudioMode } from '../lib/audio-session';
 import { useAuth } from '../lib/auth';
 import { translate, useT } from '../lib/i18n';
+import {
+  claimPrivatePlaybackFile,
+  downloadPrivatePlaybackFile,
+  type OwnedPrivateFile,
+} from '../lib/private-artifacts';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import type {
   HistoryPage,
@@ -36,7 +42,11 @@ interface RecordingPlaybackProps {
   onDeleted?: (recordingId: string) => void | Promise<void>;
 }
 
-const PLAYBACK_EXPIRY_SAFETY_MS = 10_000;
+// A normal two-minute 64 kbps learner take is roughly 1 MB. Give slow links a
+// generous bounded preparation window, while ensuring a native download or
+// decoder that never reports ready cannot leave the UI saying "Preparing"
+// forever.
+const PLAYBACK_PREPARE_TIMEOUT_MS = 30_000;
 
 function abortError(): Error {
   const error = new Error('Aborted');
@@ -135,6 +145,7 @@ export default function RecordingPlayback({
     return Symbol();
   }, [ownerId, recordingId]);
   const [phase, setPhase] = useState<PlaybackPhase>('idle');
+  const [sharing, setSharing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
@@ -143,14 +154,23 @@ export default function RecordingPlayback({
   const lifecycleRef = useRef(Symbol());
   const playerRef = useRef<AudioPlayer | null>(null);
   const playerListenerRef = useRef<{ remove: () => void } | null>(null);
+  const playbackFileRef = useRef<OwnedPrivateFile | null>(null);
   const playbackControllerRef = useRef<AbortController | null>(null);
+  const playbackPrepareTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const preparingPlayerRef = useRef<AudioPlayer | null>(null);
   const deleteControllerRef = useRef<AbortController | null>(null);
+  const shareControllerRef = useRef<AbortController | null>(null);
+  const shareFileRef = useRef<OwnedPrivateFile | null>(null);
+  // Once expo-sharing receives a local URI, Android's chooser may background
+  // or blur the app while it is still reading that file. Lifecycle cleanup may
+  // retire the logical operation, but this exact lease must survive until the
+  // native share promise settles.
+  const nativeShareFileRef = useRef<OwnedPrivateFile | null>(null);
   const operationRef = useRef<symbol | null>(null);
   const deleteOperationRef = useRef<symbol | null>(null);
+  const shareOperationRef = useRef<symbol | null>(null);
   const deletedRef = useRef<boolean | null>(null);
-  const playbackExpiryRef = useRef(0);
   const releaseOwnerRef = useRef<(() => void) | null>(null);
-  const playbackOwnerRef = useRef(Symbol());
   const committedIdentityRef = useRef(identityToken);
   const onDeletedRef = useRef(onDeleted);
   const recordingLabelRef = useRef(recordingLabel);
@@ -183,11 +203,31 @@ export default function RecordingPlayback({
     deleteOperationRef.current = null;
   }, []);
 
+  const cancelShare = useCallback(() => {
+    shareControllerRef.current?.abort();
+    shareControllerRef.current = null;
+    shareOperationRef.current = null;
+    const shareFile = shareFileRef.current;
+    if (shareFile !== null && nativeShareFileRef.current !== shareFile) {
+      shareFileRef.current = null;
+      shareFile.release();
+    }
+    if (mountedRef.current === true) setSharing(false);
+  }, []);
+
+  const clearPlaybackPrepareTimer = useCallback(() => {
+    if (playbackPrepareTimerRef.current !== null) {
+      clearTimeout(playbackPrepareTimerRef.current);
+      playbackPrepareTimerRef.current = null;
+    }
+  }, []);
+
   const releasePlayer = useCallback(() => {
+    clearPlaybackPrepareTimer();
     playbackControllerRef.current?.abort();
     playbackControllerRef.current = null;
     operationRef.current = null;
-    playbackExpiryRef.current = 0;
+    preparingPlayerRef.current = null;
     try {
       playerListenerRef.current?.remove();
     } catch {
@@ -206,9 +246,12 @@ export default function RecordingPlayback({
     } catch {
       // Native player release is best effort.
     }
+    const playbackFile = playbackFileRef.current;
+    playbackFileRef.current = null;
+    playbackFile?.release();
     releaseOwnerRef.current?.();
     releaseOwnerRef.current = null;
-  }, []);
+  }, [clearPlaybackPrepareTimer]);
 
   const resetPlaybackUi = useCallback(() => {
     if (mountedRef.current !== true) return;
@@ -227,22 +270,23 @@ export default function RecordingPlayback({
     return () => {
       mountedRef.current = false;
       cancelDelete();
+      cancelShare();
       releasePlayer();
     };
-  }, [cancelDelete, releasePlayer]);
+  }, [cancelDelete, cancelShare, releasePlayer]);
 
   useLayoutEffect(() => {
     committedIdentityRef.current = identityToken;
     lifecycleRef.current = Symbol();
-    playbackOwnerRef.current = Symbol();
     cancelDelete();
+    cancelShare();
     deletedRef.current = false;
     releasePlayer();
     // Identity changes must synchronously discard account-scoped UI before paint.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setErrorMessage(null);
     resetPlaybackUi();
-  }, [cancelDelete, identityToken, releasePlayer, resetPlaybackUi]);
+  }, [cancelDelete, cancelShare, identityToken, releasePlayer, resetPlaybackUi, sessionLease]);
 
   useLayoutEffect(() => {
     const unavailable = recordingStatus === 'unavailable';
@@ -265,9 +309,10 @@ export default function RecordingPlayback({
         focusedRef.current = false;
         lifecycleRef.current = Symbol();
         cancelDelete();
+        cancelShare();
         stopPlayback();
       };
-    }, [cancelDelete, stopPlayback]),
+    }, [cancelDelete, cancelShare, stopPlayback]),
   );
 
   useEffect(() => {
@@ -275,10 +320,11 @@ export default function RecordingPlayback({
       if (state === 'active') return;
       lifecycleRef.current = Symbol();
       cancelDelete();
+      if (state === 'background') cancelShare();
       stopPlayback();
     });
     return () => subscription.remove();
-  }, [cancelDelete, stopPlayback]);
+  }, [cancelDelete, cancelShare, stopPlayback]);
 
   const playbackGrant = useCallback(
     async (signal: AbortSignal) => {
@@ -310,15 +356,19 @@ export default function RecordingPlayback({
     if (
       playbackUnavailableRef.current ||
       operationRef.current ||
+      preparingPlayerRef.current ||
       deleteOperationRef.current ||
+      shareOperationRef.current ||
       deletedRef.current === true
     ) {
       return;
     }
     const lifecycle = lifecycleRef.current;
     const existing = playerRef.current;
-    if (existing && playbackExpiryRef.current > Date.now() + PLAYBACK_EXPIRY_SAFETY_MS) {
+    if (existing) {
       try {
+        existing.muted = false;
+        existing.volume = 1;
         existing.play();
         setPhase('playing');
         return;
@@ -337,10 +387,34 @@ export default function RecordingPlayback({
       committedIdentityRef.current === identityToken &&
       operationRef.current === operation &&
       contextIsCurrent(lifecycle);
+    let operationReleaseOwner: (() => void) | null = null;
+    let operationPlaybackFile: OwnedPrivateFile | null = null;
+    const releaseStaleOperationResources = () => {
+      if (operationPlaybackFile !== null) {
+        if (playbackFileRef.current === operationPlaybackFile) playbackFileRef.current = null;
+        operationPlaybackFile.release();
+      }
+      // Only the exact release closure still published by this operation may
+      // clear the global slot; a successor may already own it.
+      if (operationReleaseOwner !== null && releaseOwnerRef.current === operationReleaseOwner) {
+        releaseOwnerRef.current = null;
+        operationReleaseOwner();
+      }
+    };
+    playbackPrepareTimerRef.current = setTimeout(() => {
+      const stillPreparingThisOperation =
+        operationRef.current === operation ||
+        (operationPlaybackFile !== null && playbackFileRef.current === operationPlaybackFile);
+      if (!stillPreparingThisOperation || !contextIsCurrent(lifecycle)) return;
+      releasePlayer();
+      setErrorMessage(translate('recordings.playFailed'));
+      setPhase('error');
+    }, PLAYBACK_PREPARE_TIMEOUT_MS);
     try {
       const grant = await playbackGrant(controller.signal);
       if (!operationIsCurrent()) return;
-      const releaseOwner = await claimPlaybackOwner(playbackOwnerRef.current, stopPlayback);
+      const releaseOwner = await claimPlaybackOwner(operation, stopPlayback);
+      operationReleaseOwner = releaseOwner;
       if (!operationIsCurrent()) {
         releaseOwner();
         return;
@@ -348,13 +422,30 @@ export default function RecordingPlayback({
       releaseOwnerRef.current = releaseOwner;
       await configurePlaybackAudioMode();
       if (!operationIsCurrent()) {
-        releasePlayer();
+        releaseStaleOperationResources();
         return;
       }
-      const player = createAudioPlayer(grant.playbackUrl, { updateInterval: 250 });
+      // Keep submitted audio under app ownership. The native audio module's
+      // download-first cache cannot be enumerated or purged on logout, whereas
+      // this unique account-scoped file is released on every lifecycle exit.
+      const playbackFile = claimPrivatePlaybackFile(ownerId, recordingId, grant.contentType);
+      operationPlaybackFile = playbackFile;
+      playbackFileRef.current = playbackFile;
+      await downloadPrivatePlaybackFile(grant.playbackUrl, playbackFile, controller.signal);
+      if (!operationIsCurrent()) {
+        releaseStaleOperationResources();
+        return;
+      }
+      const player = createAudioPlayer(playbackFile.file.uri, { updateInterval: 250 });
       playerRef.current = player;
-      playbackExpiryRef.current = Date.now() + grant.expiresIn * 1_000;
-      playerListenerRef.current = player.addListener('playbackStatusUpdate', (status) => {
+      preparingPlayerRef.current = player;
+      // New native players should already default to audible output, but make
+      // that contract explicit so a platform/default regression cannot present
+      // a progressing yet app-muted recording.
+      player.muted = false;
+      player.volume = 1;
+      let playRequested = false;
+      const handlePlaybackStatus = (status: AudioStatus) => {
         if (playerRef.current !== player || !contextIsCurrent(lifecycle)) return;
         if (status.error) {
           releasePlayer();
@@ -364,7 +455,22 @@ export default function RecordingPlayback({
         }
         setCurrentTime(status.currentTime);
         setDuration(status.duration);
+        if (status.isLoaded && !playRequested) {
+          playRequested = true;
+          try {
+            player.muted = false;
+            player.volume = 1;
+            player.play();
+          } catch {
+            releasePlayer();
+            setErrorMessage(translate('recordings.playFailed'));
+            setPhase('error');
+            return;
+          }
+        }
         if (status.didJustFinish) {
+          clearPlaybackPrepareTimer();
+          if (preparingPlayerRef.current === player) preparingPlayerRef.current = null;
           setPhase('paused');
           void Promise.resolve(player.seekTo(0)).catch(() => {
             if (playerRef.current === player) {
@@ -373,14 +479,35 @@ export default function RecordingPlayback({
               setPhase('error');
             }
           });
-        } else if (status.playing) {
+        } else if (playRequested && status.playing) {
+          clearPlaybackPrepareTimer();
+          if (preparingPlayerRef.current === player) preparingPlayerRef.current = null;
           setPhase('playing');
         }
-      });
-      player.play();
-      setPhase('playing');
+      };
+      const playerListener = player.addListener('playbackStatusUpdate', handlePlaybackStatus);
+      if (playerRef.current === player) {
+        playerListenerRef.current = playerListener;
+      } else {
+        // A native implementation is allowed to deliver its current status
+        // while installing the listener. If that synchronous status failed
+        // playback, do not retain the just-created stale subscription.
+        playerListener.remove();
+      }
+      // A local decoder can finish loading between native construction and
+      // listener installation, so sample authoritative status after
+      // subscribing and close that lost-wakeup window.
+      if (playerRef.current === player) {
+        const currentStatus = player.currentStatus;
+        if (player.isLoaded || currentStatus.isLoaded || currentStatus.error) {
+          handlePlaybackStatus(currentStatus);
+        }
+      }
     } catch (error) {
-      if (!operationIsCurrent()) return;
+      if (!operationIsCurrent()) {
+        releaseStaleOperationResources();
+        return;
+      }
       releasePlayer();
       setErrorMessage(userMessageForError(error, t('recordings.playFailed')));
       setPhase('error');
@@ -388,7 +515,17 @@ export default function RecordingPlayback({
       if (playbackControllerRef.current === controller) playbackControllerRef.current = null;
       if (operationRef.current === operation) operationRef.current = null;
     }
-  }, [contextIsCurrent, identityToken, playbackGrant, releasePlayer, stopPlayback, t]);
+  }, [
+    clearPlaybackPrepareTimer,
+    contextIsCurrent,
+    identityToken,
+    ownerId,
+    playbackGrant,
+    recordingId,
+    releasePlayer,
+    stopPlayback,
+    t,
+  ]);
 
   const togglePlayback = () => {
     const lifecycle = lifecycleRef.current;
@@ -410,12 +547,85 @@ export default function RecordingPlayback({
     void startPlayback();
   };
 
+  const shareAudio = useCallback(async () => {
+    const lifecycle = lifecycleRef.current;
+    if (
+      committedIdentityRef.current !== identityToken ||
+      !contextIsCurrent(lifecycle) ||
+      playbackUnavailableRef.current ||
+      operationRef.current ||
+      preparingPlayerRef.current ||
+      deleteOperationRef.current ||
+      shareOperationRef.current ||
+      deletedRef.current === true
+    ) {
+      return;
+    }
+
+    // Sharing and playback both consume a temporary copy. Stop playback first
+    // so one user action owns all native/file resources for this recording.
+    releasePlayer();
+    const operation = Symbol('share-recording');
+    const controller = new AbortController();
+    shareOperationRef.current = operation;
+    shareControllerRef.current = controller;
+    setErrorMessage(null);
+    setSharing(true);
+    let operationFile: OwnedPrivateFile | null = null;
+    const operationIsCurrent = () =>
+      committedIdentityRef.current === identityToken &&
+      shareOperationRef.current === operation &&
+      shareControllerRef.current === controller &&
+      !controller.signal.aborted &&
+      contextIsCurrent(lifecycle);
+    try {
+      if (!(await Sharing.isAvailableAsync())) {
+        if (operationIsCurrent()) setErrorMessage(t('recordings.shareUnavailable'));
+        return;
+      }
+      if (!operationIsCurrent()) return;
+      const grant = await playbackGrant(controller.signal);
+      if (!operationIsCurrent()) return;
+
+      // The signed capability is consumed only by the app-owned downloader.
+      // The OS share sheet receives a cache-scoped local URI and never sees a
+      // reusable S3 URL or storage coordinate.
+      operationFile = claimPrivatePlaybackFile(ownerId, recordingId, grant.contentType);
+      shareFileRef.current = operationFile;
+      await downloadPrivatePlaybackFile(grant.playbackUrl, operationFile, controller.signal);
+      if (!operationIsCurrent() || !operationFile.isCurrent()) return;
+      // Publish ownership before invoking the native method: it is allowed to
+      // synchronously background the app before returning its promise.
+      nativeShareFileRef.current = operationFile;
+      await Sharing.shareAsync(operationFile.file.uri, {
+        mimeType: grant.contentType,
+        dialogTitle: t('recordings.shareAction'),
+      });
+    } catch (error) {
+      if (operationIsCurrent()) {
+        setErrorMessage(userMessageForError(error, t('recordings.shareFailed')));
+      }
+    } finally {
+      if (operationFile !== null) {
+        if (shareFileRef.current === operationFile) shareFileRef.current = null;
+        if (nativeShareFileRef.current === operationFile) nativeShareFileRef.current = null;
+        if (operationFile.isCurrent()) operationFile.release();
+      }
+      if (shareControllerRef.current === controller) shareControllerRef.current = null;
+      if (shareOperationRef.current === operation) {
+        shareOperationRef.current = null;
+        if (mountedRef.current === true) setSharing(false);
+      }
+    }
+  }, [contextIsCurrent, identityToken, ownerId, playbackGrant, recordingId, releasePlayer, t]);
+
   const performDelete = useCallback(
     async (lifecycle: symbol, expectedIdentity: symbol) => {
       if (
         committedIdentityRef.current !== expectedIdentity ||
         !contextIsCurrent(lifecycle) ||
         deleteOperationRef.current ||
+        shareOperationRef.current ||
         deletedRef.current === true
       ) {
         return;
@@ -456,7 +666,10 @@ export default function RecordingPlayback({
       } catch (error) {
         if (!operationIsCurrent()) return;
         setErrorMessage(userMessageForError(error, t('recordings.deleteFailed')));
-        setPhase('error');
+        // A delete failure says nothing about playback. Restore the ordinary
+        // Play action instead of relabeling it "Try Again" (which retries
+        // playback and was misleading beside a delete error message).
+        setPhase('idle');
       } finally {
         if (deleteControllerRef.current === controller) deleteControllerRef.current = null;
         if (deleteOperationRef.current === operation) deleteOperationRef.current = null;
@@ -471,6 +684,7 @@ export default function RecordingPlayback({
       committedIdentityRef.current !== identityToken ||
       !contextIsCurrent(lifecycle) ||
       deleteOperationRef.current ||
+      shareOperationRef.current ||
       deletedRef.current === true
     ) {
       return;
@@ -510,6 +724,8 @@ export default function RecordingPlayback({
   const progressMax = Number.isFinite(duration) ? Math.max(duration, 1) : 1;
   const finiteCurrentTime = Number.isFinite(currentTime) ? currentTime : 0;
   const progressNow = Math.min(Math.max(finiteCurrentTime, 0), progressMax);
+  const accessibleActionLabel = (action: string) =>
+    recordingLabel ? `${action}: ${recordingLabel}` : action;
   return (
     <View
       testID="recording-playback-container"
@@ -525,20 +741,37 @@ export default function RecordingPlayback({
                 : t('recorder.play')
           }
           accessibilityLabel={
-            phase === 'playing' ? t('recordings.pauseLabel') : t('recordings.playLabel')
+            phase === 'playing'
+              ? accessibleActionLabel(t('recordings.pauseLabel'))
+              : accessibleActionLabel(t('recordings.playLabel'))
           }
           variant="secondary"
-          size="sm"
+          size="md"
+          fullWidth
           loading={loading}
-          disabled={deleting || unavailable}
+          disabled={deleting || sharing || unavailable}
           onPress={togglePlayback}
         />
         <Button
+          title={sharing ? t('recordings.sharing') : t('recordings.shareAction')}
+          accessibilityLabel={accessibleActionLabel(t('recordings.shareLabel'))}
+          accessibilityHint={t('recordings.shareHint')}
+          variant="secondary"
+          size="md"
+          fullWidth
+          loading={sharing}
+          disabled={deleting || loading || unavailable}
+          onPress={() => void shareAudio()}
+        />
+        <Button
           title={t('recordings.deleteAction')}
+          accessibilityLabel={accessibleActionLabel(t('recordings.deleteAction'))}
           accessibilityHint={t('recordings.deleteHint')}
-          variant="quiet"
-          size="sm"
+          variant="danger"
+          size="md"
+          fullWidth
           loading={deleting}
+          disabled={sharing}
           onPress={confirmDelete}
         />
       </View>

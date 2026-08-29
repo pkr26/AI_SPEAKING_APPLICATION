@@ -225,6 +225,10 @@ jobs:
         env:
           NODE_ENV: production
           EXPO_PUBLIC_API_URL: https://api.example.invalid
+          # CI-only store destinations validate the forced-upgrade wiring. Real
+          # releases inject the final numeric App Store listing URL.
+          EXPO_PUBLIC_IOS_APP_STORE_URL: https://apps.apple.com/us/app/ai-english-coach/id1234567890
+          EXPO_PUBLIC_ANDROID_PLAY_STORE_URL: https://play.google.com/store/apps/details?id=com.aienglish.coach
           # Syntactically valid, non-Google, CI-only identifiers. No ad request
           # is made by expo export; real release builds inject owner IDs.
           ADMOB_ANDROID_APP_ID: ca-app-pub-1111111111111111~1111111111

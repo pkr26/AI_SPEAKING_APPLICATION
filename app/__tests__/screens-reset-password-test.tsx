@@ -15,6 +15,7 @@ import type { User } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
+const MAX_LENGTH_EMAIL = `${'a'.repeat(64)}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
 
 /** Mirrors the reset-code cap the screen keeps private; pinned via maxLength. */
 const MAX_RESET_CODE_LENGTH = 128;
@@ -124,6 +125,18 @@ jest.mock('expo-router', () => {
 
 jest.mock('../src/lib/session-notice', () => ({
   consumeSessionExpiredNotice: jest.fn(async () => false),
+}));
+
+const mockSetGuestLanguage = jest.fn();
+
+jest.mock('../src/lib/guest-language', () => ({
+  useGuestLanguage: () => ({
+    language: 'en',
+    isRestoring: false,
+    persistenceError: null,
+    setLanguage: mockSetGuestLanguage,
+    mirrorAccountLanguage: jest.fn(),
+  }),
 }));
 
 jest.mock('../src/lib/api', () => ({
@@ -406,12 +419,39 @@ describe('login entry points', () => {
 });
 
 describe('forgot-password screen', () => {
+  it('rejects malformed email locally', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(
+      screen.getByRole('button', { name: t('reset.submitRequest') }).props.accessibilityState
+        .disabled,
+    ).toBe(true);
+    expect(mockForgot).not.toHaveBeenCalled();
+  });
+
   it('lets the idle Back to login Link navigate', async () => {
     await render(<ForgotPasswordScreen />);
 
     await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
 
     expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('sends app-language choices from both request states to the device preference', async () => {
+    await render(<ForgotPasswordScreen />);
+
+    await fireEvent.press(screen.getByTestId('ui-language-es'));
+    expect(mockSetGuestLanguage).toHaveBeenLastCalledWith('es');
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await screen.findByText(t('reset.sentTitle'));
+    await fireEvent.press(screen.getByTestId('ui-language-hi'));
+
+    expect(mockSetGuestLanguage).toHaveBeenCalledTimes(2);
+    expect(mockSetGuestLanguage).toHaveBeenLastCalledWith('hi');
   });
 
   it('resubscribes the removal guard when navigation identity changes', async () => {
@@ -474,6 +514,38 @@ describe('forgot-password screen', () => {
     });
   });
 
+  it('resends through the same neutral endpoint for the pinned email', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), ' ada@example.com ');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await screen.findByText(t('reset.sentTitle'));
+    mockForgot.mockClear();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(mockForgot).toHaveBeenCalledWith('ada@example.com');
+    expect(screen.getByText(t('reset.sentBody'))).toBeTruthy();
+  });
+
+  it('keeps the neutral sent state and allows another resend after failure', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await screen.findByText(t('reset.sentTitle'));
+    mockForgot.mockRejectedValueOnce(new Error('mail transport unavailable'));
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect((await screen.findByText(t('reset.requestFailed'))).props.accessibilityRole).toBe(
+      'alert',
+    );
+    expect(
+      screen.getByRole('button', { name: t('reset.resend') }).props.accessibilityState,
+    ).toMatchObject({
+      disabled: false,
+      busy: false,
+    });
+    expect(screen.getByText(t('reset.sentBody'))).toBeTruthy();
+  });
+
   it('routes a double-tapped Continue through the deduping navigation', async () => {
     await render(<ForgotPasswordScreen />);
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
@@ -529,6 +601,9 @@ describe('forgot-password screen', () => {
     expect(screen.getByText(t('login.emailLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('login.emailLabel')).props.value).toBe('');
     expect(screen.getByRole('button', { name: t('reset.submitRequest') })).toBeTruthy();
+    for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
+      expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityRole).toBe('radio');
+    }
     // Nothing is in flight yet, so the sending label must not be on screen.
     expect(screen.queryByText(t('reset.submitRequestBusy'))).toBeNull();
   });
@@ -603,12 +678,12 @@ describe('forgot-password screen', () => {
     await fireEvent.changeText(email(), '   ');
     expect(submitDisabled()).toBe(true);
 
-    await fireEvent.changeText(email(), 'a'.repeat(MAX_EMAIL_LENGTH));
+    await fireEvent.changeText(email(), MAX_LENGTH_EMAIL);
     expect(submitDisabled()).toBe(false);
 
     // Padding is trimmed before the limit is measured, so an address that fits
     // exactly still submits.
-    await fireEvent.changeText(email(), `  ${'a'.repeat(MAX_EMAIL_LENGTH)}  `);
+    await fireEvent.changeText(email(), `  ${MAX_LENGTH_EMAIL}  `);
     expect(submitDisabled()).toBe(false);
 
     await fireEvent.changeText(email(), 'a'.repeat(MAX_EMAIL_LENGTH + 1));
@@ -653,6 +728,28 @@ describe('forgot-password screen', () => {
       await pending.promise;
     });
     expect(screen.getByText(t('reset.sentTitle'))).toBeTruthy();
+  });
+
+  it('blocks the sent-state Back link while a resend is in flight', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await screen.findByText(t('reset.sentTitle'));
+
+    const resend = deferred<void>();
+    mockForgot.mockReturnValueOnce(resend.promise);
+    mockLinkNavigate.mockClear();
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(screen.getByRole('button', { name: t('reset.resendBusy') })).toBeTruthy();
+    const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
+    expect(backToLogin.props.accessibilityState).toEqual({ disabled: true });
+    await fireEvent.press(backToLogin);
+    expect(mockLinkNavigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resend.resolve();
+      await resend.promise;
+    });
   });
 
   it('locks native exits and Back to login while a reset email is pending, then retries', async () => {
@@ -788,6 +885,7 @@ describe('forgot-password screen', () => {
 
     const link = await screen.findByRole('link', { name: t('reset.backToLogin') });
     expect(link.props.href).toBe('/login');
+    expect(link.props.accessibilityState).toEqual({ disabled: false });
     expect(flattenedStyle(link)).toEqual(footerLink);
     expect(screen.getByText(t('reset.sentBody')).props.accessibilityLiveRegion).toBe('polite');
   });
@@ -817,6 +915,15 @@ describe('reset-password screen', () => {
     expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
   });
 
+  it('sends an app-language choice to the guest-language preference', async () => {
+    await render(<ResetPasswordScreen />);
+
+    await fireEvent.press(screen.getByTestId('ui-language-zh'));
+
+    expect(mockSetGuestLanguage).toHaveBeenCalledTimes(1);
+    expect(mockSetGuestLanguage).toHaveBeenCalledWith('zh');
+  });
+
   it('resubscribes the removal guard when navigation identity changes', async () => {
     mockSearchParams = { email: 'ada@example.com' };
     const first = navigationHarness();
@@ -838,6 +945,7 @@ describe('reset-password screen', () => {
       ' 0123456789abcdef0123456789abcdef ',
     );
     await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
   }
 
   it('prefills the email carried over from the request step', async () => {
@@ -867,32 +975,68 @@ describe('reset-password screen', () => {
     expect(button().props.accessibilityState).toMatchObject({ disabled: true });
 
     await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    expect(button().props.accessibilityState).toMatchObject({ disabled: true });
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
     expect(button().props.accessibilityState).toMatchObject({ disabled: false });
+  });
+
+  it('announces an invalid reset email inline', async () => {
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+  });
+
+  it('requires the reset password confirmation to match', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'somecode');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'Different123');
+
+    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe('polite');
+    expect(
+      screen.getByRole('button', { name: t('reset.submitNew') }).props.accessibilityState.disabled,
+    ).toBe(true);
+    expect(mockReset).not.toHaveBeenCalled();
   });
 
   it('reveals and hides the new password from the accessible toggle', async () => {
     await render(<ResetPasswordScreen />);
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
+    const confirmationToggle = screen.getByLabelText(t('password.showConfirmation'));
+    expect(confirmationToggle.props.accessibilityRole).toBe('button');
+    expect(confirmationToggle.props.accessibilityLabel).toBe(t('password.showConfirmation'));
     // The visible label mirrors the accessible name of the same control.
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
     expect(screen.queryByText(t('common.hide'))).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(false);
     expect(screen.getByText(t('common.hide'))).toBeTruthy();
-    expect(screen.queryByText(t('common.show'))).toBeNull();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(1);
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('password.showConfirmation') }));
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(false);
+    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.getByRole('button', { name: t('password.hideConfirmation') })).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('password.hideConfirmation') }));
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
+    expect(screen.queryByText(t('common.hide'))).toBeNull();
   });
 
-  it('chains email to code to password and submits from the password field', async () => {
+  it('chains email to code to password confirmation and submits from confirmation', async () => {
     mockSearchParams = { email: 'ada@example.com' };
     await render(<ResetPasswordScreen />);
     await fillValidForm();
     const codeFocus = spyOnTextInputFocus(screen.getByLabelText(t('reset.codeLabel')));
     const passwordFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.newLabel')));
+    const confirmFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.confirmLabel')));
 
     await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'submitEditing');
     expect(codeFocus).toHaveBeenCalledTimes(1);
@@ -901,6 +1045,8 @@ describe('reset-password screen', () => {
     expect(passwordFocus).toHaveBeenCalledTimes(1);
 
     await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'submitEditing');
+    expect(confirmFocus).toHaveBeenCalledTimes(1);
+    await fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'submitEditing');
     await waitFor(() =>
       expect(mockReset).toHaveBeenCalledWith(
         'ada@example.com',
@@ -913,7 +1059,12 @@ describe('reset-password screen', () => {
   it('changes only the focused field border color so focus does not move the form', async () => {
     await render(<ResetPasswordScreen />);
 
-    for (const label of [t('login.emailLabel'), t('reset.codeLabel'), t('cp.newLabel')]) {
+    for (const label of [
+      t('login.emailLabel'),
+      t('reset.codeLabel'),
+      t('cp.newLabel'),
+      t('cp.confirmLabel'),
+    ]) {
       const input = () => screen.getByLabelText(label);
       expect(flattenedStyle(input())).toMatchObject({
         borderWidth: 1,
@@ -964,6 +1115,7 @@ describe('reset-password screen', () => {
     await render(<ResetPasswordScreen />);
     await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'reset-code');
     await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), ' NewPass123 ');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), ' NewPass123 ');
 
     await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
 
@@ -1017,6 +1169,9 @@ describe('reset-password screen', () => {
     // An untouched password carries no policy complaint.
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.queryByText(t('password.needsLetterAndNumber'))).toBeNull();
+    for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
+      expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityRole).toBe('radio');
+    }
   });
 
   it('configures the reset fields for one-time code and new-password entry', async () => {
@@ -1053,7 +1208,7 @@ describe('reset-password screen', () => {
       autoComplete: 'new-password',
       autoCorrect: false,
       textContentType: 'newPassword',
-      returnKeyType: 'go',
+      returnKeyType: 'next',
       maxLength: MAX_PASSWORD_UTF8_BYTES,
     });
   });
@@ -1101,7 +1256,7 @@ describe('reset-password screen', () => {
       alignItems: 'center',
       paddingHorizontal: spacing.sm,
     });
-    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
+    expect(flattenedStyle(screen.getAllByText(t('common.show'))[0])).toEqual({
       flexShrink: 1,
       color: colors.primary,
       fontSize: 14,
@@ -1131,6 +1286,7 @@ describe('reset-password screen', () => {
       screen.getByRole('button', { name: t('reset.submitNew') }).props.accessibilityState.disabled;
 
     await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
     await fireEvent.changeText(code(), '0123456789abcdef');
     // A code alone never unlocks the submit: the address is still missing.
     expect(submitDisabled()).toBe(true);
@@ -1138,7 +1294,7 @@ describe('reset-password screen', () => {
     await fireEvent.changeText(email(), '   ');
     expect(submitDisabled()).toBe(true);
 
-    await fireEvent.changeText(email(), 'a'.repeat(MAX_EMAIL_LENGTH));
+    await fireEvent.changeText(email(), MAX_LENGTH_EMAIL);
     expect(submitDisabled()).toBe(false);
 
     await fireEvent.changeText(email(), 'a'.repeat(MAX_EMAIL_LENGTH + 1));

@@ -126,8 +126,10 @@ beforeEach(() => {
     sessionTally: { attempts: 0, passed: 0, mastered: 0, levelUps: 0 },
     setAnswerMode: jest.fn(),
     showFeedback: jest.fn(),
+    restoreFeedback: jest.fn(),
     clearFeedback: jest.fn(),
     resetSessionTally: jest.fn(),
+    resetPracticeFlow: jest.fn(),
   };
   jest.spyOn(BackHandler, 'addEventListener').mockImplementation(() => ({ remove: jest.fn() }));
 });

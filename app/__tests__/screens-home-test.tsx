@@ -1,4 +1,9 @@
-import { notifyManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  notifyManager,
+  onlineManager,
+  QueryClient,
+  QueryClientProvider,
+} from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
@@ -116,8 +121,10 @@ function makePracticeFlow(overrides: Partial<PracticeFlowValue> = {}): PracticeF
     sessionTally: { attempts: 0, passed: 0, mastered: 0, levelUps: 0 },
     setAnswerMode: jest.fn(),
     showFeedback: jest.fn(),
+    restoreFeedback: jest.fn(),
     clearFeedback: jest.fn(),
     resetSessionTally: jest.fn(),
+    resetPracticeFlow: jest.fn(),
     ...overrides,
   };
 }
@@ -252,6 +259,15 @@ function scrollContentStyle(): SemanticStyle {
   return StyleSheet.flatten(node.props.contentContainerStyle) ?? {};
 }
 
+function refreshHandler(): () => void {
+  const [scroll] = screen.container.queryAll(
+    (candidate) => typeof candidate.props.refreshControl?.props?.onRefresh === 'function',
+  );
+  const onRefresh = scroll?.props.refreshControl?.props?.onRefresh;
+  if (typeof onRefresh !== 'function') throw new Error('No RefreshControl rendered');
+  return onRefresh as () => void;
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -261,6 +277,7 @@ function responderEvent() {
 }
 
 beforeEach(() => {
+  onlineManager.setOnline(true);
   jest.clearAllMocks();
   mockGetStats.mockReset();
   mockAuthValue = makeAuth();
@@ -301,6 +318,16 @@ afterEach(async () => {
 });
 
 describe('home screen', () => {
+  it('shows an auto-resuming offline state instead of an endless first-load spinner', async () => {
+    onlineManager.setOnline(false);
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+
+    expect(await screen.findByRole('header', { name: t('network.offlineTitle') })).toBeTruthy();
+    expect(screen.getByText(t('network.offlineBody'))).toBeTruthy();
+    expect(mockGetStats).not.toHaveBeenCalled();
+  });
+
   it('shows a loading state while stats load', async () => {
     mockGetStats.mockReturnValue(new Promise(() => undefined));
     const queryClient = makeQueryClient();
@@ -425,7 +452,9 @@ describe('home screen', () => {
   it('keeps cached stats visible when their background refresh fails', async () => {
     const queryClient = makeQueryClient();
     queryClient.setQueryData(['practice-stats', USER.id], STATS);
-    mockGetStats.mockRejectedValue(new ApiError(500, 'background failure'));
+    mockGetStats
+      .mockRejectedValueOnce(new ApiError(500, 'background failure'))
+      .mockResolvedValueOnce(STATS);
     await renderHome(queryClient);
 
     await waitFor(() =>
@@ -433,7 +462,26 @@ describe('home screen', () => {
     );
     expect(screen.getByText('B1')).toBeTruthy();
     expect(screen.queryByText(t('home.loadFailedTitle'))).toBeNull();
+    expect(screen.getByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved'));
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    await waitFor(() => expect(mockGetStats).toHaveBeenCalledTimes(2));
     expect(screen.getByRole('button', { name: t('home.startPractice') })).toBeTruthy();
+  });
+
+  it('pulls loaded stats to refresh only while the rendered session lease is current', async () => {
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+
+    await act(async () => {
+      refreshHandler()();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockGetStats).toHaveBeenCalledTimes(2));
+
+    jest.mocked(mockAuthValue.isSessionLeaseCurrent).mockReturnValue(false);
+    refreshHandler()();
+    expect(mockGetStats).toHaveBeenCalledTimes(2);
   });
 
   it('renders level, mastery progress, streak, due chip, and today line from stats', async () => {
@@ -886,16 +934,25 @@ describe('home screen presentation', () => {
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
     ).toMatchObject({ marginTop: spacing.xl });
-    // History and Settings sit side by side, centred, under the CTA.
+    // Peer destinations are outlined actions that grow into the available row
+    // and wrap instead of squeezing localized labels on narrow screens.
     expect(
       flattenedStyle(parentOf(screen.getByRole('button', { name: t('header.history') }))),
     ).toEqual({
       marginTop: spacing.lg,
       flexDirection: 'row',
-      justifyContent: 'center',
       flexWrap: 'wrap',
-      gap: spacing.xl,
+      gap: spacing.md,
     });
+    for (const label of [t('header.history'), t('header.recordings'), t('header.settings')]) {
+      expect(flattenedStyle(screen.getByRole('button', { name: label }))).toMatchObject({
+        minHeight: layout.minimumTarget,
+        borderWidth: 1,
+        borderColor: colors.primary,
+        flexBasis: 140,
+        flexGrow: 1,
+      });
+    }
   });
 
   it('centres the loading state and names the spinner for screen readers', async () => {

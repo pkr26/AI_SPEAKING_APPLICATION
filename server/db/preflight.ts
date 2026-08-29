@@ -40,17 +40,70 @@ function integrityChecks(): IntegrityCheck[] {
       name: 'invalid attempts',
       sql: `SELECT count(*)::int AS n FROM attempts
           WHERE user_id IS NULL OR question_id IS NULL OR transcript IS NULL
-             OR score IS NULL OR passed IS NULL OR feedback IS NULL OR created_at IS NULL
+             OR feedback IS NULL OR created_at IS NULL
              OR CASE context
                   WHEN 'diagnostic' THEN attempt_no NOT BETWEEN 1 AND 5
                   WHEN 'practice' THEN attempt_no NOT BETWEEN 1 AND 3
+                  WHEN 'practice-native' THEN attempt_no NOT BETWEEN 1 AND 3
                   ELSE true
                 END
-             OR score NOT BETWEEN 0 AND 100
-             OR passed IS DISTINCT FROM (score >= 60)
+             OR (context IN ('diagnostic', 'practice') AND (
+                  score IS NULL OR passed IS NULL OR score NOT BETWEEN 0 AND 100
+                  OR passed IS DISTINCT FROM (score >= 60)
+                ))
+             OR (context = 'practice-native' AND (
+                  score IS NOT NULL OR passed IS NOT NULL
+                  OR (to_jsonb(attempts)->>'understood')::boolean IS NULL
+                  OR btrim(coalesce(to_jsonb(attempts)->>'translated_transcript', ''), ${JS_TRIM_CHARACTERS_SQL}) = ''
+                  OR btrim(coalesce(to_jsonb(attempts)->>'model_answer', ''), ${JS_TRIM_CHARACTERS_SQL}) = ''
+                ))
+             OR (
+               to_jsonb(attempts) ? 'practice_cycle_id'
+               AND (
+                 (context = 'diagnostic' AND to_jsonb(attempts)->>'practice_cycle_id' IS NOT NULL)
+                 OR (
+                   context IN ('practice', 'practice-native')
+                   AND to_jsonb(attempts)->>'practice_cycle_id' IS NULL
+                 )
+               )
+             )
              OR char_length(transcript) > 12000
              OR char_length(feedback) NOT BETWEEN 1 AND 800
              OR btrim(feedback, ${JS_TRIM_CHARACTERS_SQL}) = ''`,
+    },
+    {
+      name: 'duplicate practice cycle attempt numbers',
+      // to_jsonb keeps this read-only preflight compatible with a genuine 017
+      // database, where practice_cycle_id does not exist yet. Once migration
+      // 018 is present, it audits the partial unique-index invariant too.
+      sql: `SELECT count(*)::int AS n FROM (
+            SELECT 1
+            FROM attempts
+            WHERE to_jsonb(attempts) ? 'practice_cycle_id'
+              AND to_jsonb(attempts)->>'practice_cycle_id' IS NOT NULL
+            GROUP BY to_jsonb(attempts)->>'practice_cycle_id', attempt_no
+            HAVING count(*) > 1
+          ) duplicates`,
+    },
+    {
+      name: 'invalid assessment request cycle versions',
+      // response_version/practice_cycle_id arrive together in migration 018;
+      // absent JSON keys make every legacy-017 row skip this post-upgrade
+      // integrity branch instead of blocking the migration that backfills it.
+      sql: `SELECT count(*)::int AS n FROM assessment_requests
+          WHERE to_jsonb(assessment_requests) ? 'response_version'
+            AND (
+              (to_jsonb(assessment_requests)->>'response_version')::int NOT IN (1, 2)
+              OR (
+                context = 'diagnostic'
+                AND to_jsonb(assessment_requests)->>'practice_cycle_id' IS NOT NULL
+              )
+              OR (
+                context IN ('practice', 'practice-native')
+                AND (to_jsonb(assessment_requests)->>'response_version')::int = 2
+                AND to_jsonb(assessment_requests)->>'practice_cycle_id' IS NULL
+              )
+            )`,
     },
     {
       name: 'invalid diagnostic states',

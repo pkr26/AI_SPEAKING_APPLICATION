@@ -173,8 +173,8 @@ describe('upload fileFilter extension/MIME matrix', () => {
       // maximum without permitting any additional payload byte.
       fileSize: 25 * 1024 * 1024 + 1,
       files: 1,
-      fields: 2,
-      parts: 4,
+      fields: 3,
+      parts: 5,
       fieldNameSize: 64,
       fieldSize: 128,
       headerPairs: 50,

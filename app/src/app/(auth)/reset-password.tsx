@@ -12,8 +12,15 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { apiResetPassword, userMessageForError } from '../../lib/api';
-import { MAX_EMAIL_LENGTH, MAX_PASSWORD_UTF8_BYTES, passwordPolicyError } from '../../lib/auth';
+import {
+  emailAddressError,
+  MAX_EMAIL_LENGTH,
+  MAX_PASSWORD_UTF8_BYTES,
+  passwordPolicyError,
+} from '../../lib/auth';
+import { useGuestLanguage } from '../../lib/guest-language';
 import { useT } from '../../lib/i18n';
 import { firstParam } from '../../lib/params';
 import { createThemedStyles, useTheme } from '../../lib/theme';
@@ -27,6 +34,7 @@ const MAX_RESET_CODE_LENGTH = 128;
  */
 export default function ResetPasswordScreen() {
   const t = useT();
+  const { language: guestLanguage, persistenceError, setLanguage } = useGuestLanguage();
   const navigation = useNavigation();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -35,12 +43,17 @@ export default function ResetPasswordScreen() {
   const [email, setEmail] = useState(() => firstParam(params.email) ?? '');
   const [code, setCode] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
-  const [focusedField, setFocusedField] = useState<'email' | 'code' | 'password' | null>(null);
+  const [confirmPasswordVisible, setConfirmPasswordVisible] = useState(false);
+  const [focusedField, setFocusedField] = useState<
+    'email' | 'code' | 'password' | 'confirmPassword' | null
+  >(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<TextInput>(null);
   const passwordRef = useRef<TextInput>(null);
+  const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
 
@@ -72,12 +85,18 @@ export default function ResetPasswordScreen() {
   const trimmedEmail = email.trim();
   const trimmedCode = code.trim();
   const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
+  const emailError = emailAddressError(email, t);
+  const confirmationError =
+    confirmPassword.length > 0 && confirmPassword !== password ? t('cp.mismatch') : null;
   const canSubmit =
     trimmedEmail.length > 0 &&
     trimmedEmail.length <= MAX_EMAIL_LENGTH &&
+    emailError === null &&
     trimmedCode.length > 0 &&
     trimmedCode.length <= MAX_RESET_CODE_LENGTH &&
     passwordPolicyError(password) === null &&
+    confirmPassword.length > 0 &&
+    confirmPassword === password &&
     !busy;
 
   const handleSubmit = async () => {
@@ -116,6 +135,12 @@ export default function ResetPasswordScreen() {
           <Text accessibilityRole="header" style={styles.title}>
             {t('reset.newTitle')}
           </Text>
+          <UiLanguagePicker
+            value={guestLanguage}
+            onChange={setLanguage}
+            disabled={busy}
+            error={persistenceError}
+          />
 
           <Text style={styles.label}>{t('login.emailLabel')}</Text>
           <TextInput
@@ -136,6 +161,11 @@ export default function ResetPasswordScreen() {
             onSubmitEditing={() => codeRef.current?.focus()}
             maxLength={MAX_EMAIL_LENGTH}
           />
+          {emailError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {emailError}
+            </Text>
+          )}
 
           <Text style={styles.label}>{t('reset.codeLabel')}</Text>
           <TextInput
@@ -182,8 +212,8 @@ export default function ResetPasswordScreen() {
               autoComplete="new-password"
               autoCorrect={false}
               textContentType="newPassword"
-              returnKeyType="go"
-              onSubmitEditing={() => void handleSubmit()}
+              returnKeyType="next"
+              onSubmitEditing={() => confirmPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
             />
             <Pressable
@@ -202,6 +232,52 @@ export default function ResetPasswordScreen() {
           {passwordError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {passwordError}
+            </Text>
+          )}
+
+          <Text style={styles.label}>{t('cp.confirmLabel')}</Text>
+          <View style={styles.inputRow}>
+            <TextInput
+              ref={confirmPasswordRef}
+              accessibilityLabel={t('cp.confirmLabel')}
+              style={[
+                styles.input,
+                styles.inputWithAction,
+                focusedField === 'confirmPassword' && styles.inputFocused,
+              ]}
+              value={confirmPassword}
+              onChangeText={setConfirmPassword}
+              onFocus={() => setFocusedField('confirmPassword')}
+              onBlur={() => setFocusedField(null)}
+              placeholder={t('cp.confirmPlaceholder')}
+              placeholderTextColor={colors.muted}
+              secureTextEntry={!confirmPasswordVisible}
+              autoCapitalize="none"
+              autoComplete="new-password"
+              autoCorrect={false}
+              textContentType="newPassword"
+              returnKeyType="go"
+              onSubmitEditing={() => void handleSubmit()}
+              maxLength={MAX_PASSWORD_UTF8_BYTES}
+            />
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={
+                confirmPasswordVisible
+                  ? t('password.hideConfirmation')
+                  : t('password.showConfirmation')
+              }
+              onPress={() => setConfirmPasswordVisible((visible) => !visible)}
+              style={styles.inputAction}
+            >
+              <Text style={styles.inputActionText}>
+                {confirmPasswordVisible ? t('common.hide') : t('common.show')}
+              </Text>
+            </Pressable>
+          </View>
+          {confirmationError && (
+            <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+              {confirmationError}
             </Text>
           )}
 

@@ -1250,6 +1250,12 @@ describe('ad surfaces', () => {
     expect(screen.getByTestId('banner-ad').props.accessibilityValue).toEqual({
       text: 'ANCHORED:720',
     });
+    await fireEvent(screen.getByLabelText('Advertisement'), 'layout', {
+      nativeEvent: { layout: { width: 0, height: 108, x: 0, y: 0 } },
+    });
+    expect(screen.getByTestId('banner-ad').props.accessibilityValue).toEqual({
+      text: 'ANCHORED:720',
+    });
     await view.rerender(
       <AdsProvider>
         <HomeBannerAd focused={false} />
@@ -1461,6 +1467,7 @@ describe('ad surfaces', () => {
     const reserved = screen.getByTestId('history-native-ad-reserved');
     const reservedHeight = historyNativeAdReservedHeight(Dimensions.get('window').fontScale);
     expect(reserved.props.accessibilityLabel).toBe('Advertisement');
+    expect(reserved).toHaveTextContent('Advertisement');
     expect(StyleSheet.flatten(reserved.props.style)).toEqual({
       marginTop: 24,
       marginBottom: 24,

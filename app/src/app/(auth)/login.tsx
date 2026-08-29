@@ -12,13 +12,16 @@ import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
   comparablePasswordError,
+  emailAddressError,
   MAX_EMAIL_LENGTH,
   MAX_PASSWORD_UTF8_BYTES,
   useAuth,
 } from '../../lib/auth';
+import { useGuestLanguage } from '../../lib/guest-language';
 import { useT } from '../../lib/i18n';
 import { firstParam } from '../../lib/params';
 import { consumeSessionExpiredNotice } from '../../lib/session-notice';
@@ -27,6 +30,7 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export default function LoginScreen() {
   const { login } = useAuth();
+  const { language: guestLanguage, persistenceError, setLanguage } = useGuestLanguage();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
@@ -35,6 +39,7 @@ export default function LoginScreen() {
   const navigation = useNavigation();
   // One-shot success banner set by the reset-password screen's redirect.
   const resetDone = firstParam(params.notice) === 'reset';
+  const registrationNeedsLogin = firstParam(params.notice) === 'registered';
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
@@ -86,9 +91,11 @@ export default function LoginScreen() {
   // reports the 72-byte bcrypt ceiling, so it already returns null for an empty
   // password. Guarding it was dead code.
   const passwordError = comparablePasswordError(password);
+  const emailError = emailAddressError(email, t);
   const canSubmit =
     email.trim().length > 0 &&
     email.trim().length <= MAX_EMAIL_LENGTH &&
+    emailError === null &&
     password.length > 0 &&
     passwordError === null &&
     !busy;
@@ -129,6 +136,12 @@ export default function LoginScreen() {
             {t('login.title')}
           </Text>
           <Text style={styles.subtitle}>{t('login.subtitle')}</Text>
+          <UiLanguagePicker
+            value={guestLanguage}
+            onChange={setLanguage}
+            disabled={busy}
+            error={persistenceError}
+          />
 
           {sessionNotice && (
             <Text accessibilityRole="alert" style={styles.noticeBanner}>
@@ -142,13 +155,22 @@ export default function LoginScreen() {
             </Text>
           )}
 
+          {registrationNeedsLogin && (
+            <Text accessibilityRole="alert" style={styles.successBanner}>
+              {t('signup.createdLoginBanner')}
+            </Text>
+          )}
+
           <View style={styles.form}>
             <Text style={styles.label}>{t('login.emailLabel')}</Text>
             <TextInput
               accessibilityLabel={t('login.emailLabel')}
               style={[styles.input, focusedField === 'email' && styles.inputFocused]}
               value={email}
-              onChangeText={setEmail}
+              onChangeText={(value) => {
+                setEmail(value);
+                setError(null);
+              }}
               onFocus={() => setFocusedField('email')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('login.emailPlaceholder')}
@@ -161,7 +183,13 @@ export default function LoginScreen() {
               returnKeyType="next"
               onSubmitEditing={() => passwordRef.current?.focus()}
               maxLength={MAX_EMAIL_LENGTH}
+              editable={!busy}
             />
+            {emailError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {emailError}
+              </Text>
+            )}
 
             <Text style={styles.label}>{t('login.passwordLabel')}</Text>
             <View style={styles.inputRow}>
@@ -178,7 +206,10 @@ export default function LoginScreen() {
                   focusedField === 'password' && styles.inputFocused,
                 ]}
                 value={password}
-                onChangeText={setPassword}
+                onChangeText={(value) => {
+                  setPassword(value);
+                  setError(null);
+                }}
                 onFocus={() => setFocusedField('password')}
                 onBlur={() => setFocusedField(null)}
                 placeholder={t('login.passwordPlaceholder')}
@@ -191,14 +222,16 @@ export default function LoginScreen() {
                 returnKeyType="go"
                 onSubmitEditing={() => void handleLogin()}
                 maxLength={MAX_PASSWORD_UTF8_BYTES}
+                editable={!busy}
               />
               <Pressable
                 accessibilityRole="button"
                 accessibilityLabel={
                   passwordVisible ? t('common.hidePassword') : t('common.showPassword')
                 }
+                disabled={busy}
                 onPress={() => setPasswordVisible((visible) => !visible)}
-                style={styles.inputAction}
+                style={[styles.inputAction, busy && styles.controlDisabled]}
               >
                 <Text style={styles.inputActionText}>
                   {passwordVisible ? t('common.hide') : t('common.show')}
@@ -362,6 +395,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  controlDisabled: {
+    opacity: 0.5,
   },
   error: {
     marginTop: 14,

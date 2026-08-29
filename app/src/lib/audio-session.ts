@@ -40,8 +40,10 @@ export function configurePlaybackAudioMode(): Promise<void> {
     setAudioModeAsync({
       allowsRecording: false,
       allowsBackgroundRecording: false,
+      interruptionMode: 'doNotMix',
       playsInSilentMode: true,
       shouldPlayInBackground: false,
+      shouldRouteThroughEarpiece: false,
     }),
   );
 }

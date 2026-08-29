@@ -1,15 +1,25 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { router, useFocusEffect, useNavigation } from 'expo-router';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'react-native';
+import {
+  AccessibilityInfo,
+  ActivityIndicator,
+  Alert,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+} from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import OfflineState from '../../components/OfflineState';
 import Recorder, {
   scrollToExpandedRecorderControls,
   type RecorderResultMetadata,
 } from '../../components/Recorder';
-import { apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
+import { ApiError, apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
 import { LogoutCleanupError, useAuth } from '../../lib/auth';
 import { useT } from '../../lib/i18n';
 import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
@@ -22,6 +32,7 @@ import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_MAX_ATTEMPTS,
   type PracticeOutcome,
+  type PracticeQuestionPayload,
 } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
@@ -29,13 +40,21 @@ import { useHardwareBack } from '../../lib/use-hardware-back';
 // still suppressing recovery replays for the current recorder owner.
 const MAX_HANDLED_RESULT_REQUEST_IDS = 8;
 
+function isClosedPracticeCycle(error: unknown): error is ApiError {
+  return (
+    error instanceof ApiError &&
+    error.status === 409 &&
+    (error.code === 'PRACTICE_CYCLE_CLOSED' || error.code === 'STATE_CHANGED')
+  );
+}
+
 export default function PracticeScreen() {
   const { user, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const navigation = useNavigation();
-  const { answerMode, attemptStatus, setAnswerMode, showFeedback } = usePracticeFlow();
+  const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
   const queryClient = useQueryClient();
   const insets = useSafeAreaInsets();
   const scrollViewRef = useRef<ScrollView>(null);
@@ -47,6 +66,11 @@ export default function PracticeScreen() {
   // mirror as well as render state so a second, same-frame tap cannot skip the
   // question, switch modes, or navigate away before React disables the control.
   const recorderLockedRef = useRef(false);
+  const [recorderExitLockState, setRecorderExitLockState] = useState<{
+    owner: string | null;
+    locked: boolean;
+  }>({ owner: null, locked: false });
+  const recorderExitLockedRef = useRef(false);
   const [skipBusy, setSkipBusy] = useState(false);
   const skipBusyRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
@@ -61,6 +85,11 @@ export default function PracticeScreen() {
   const activeRecorderOwnerRef = useRef<string | null>(null);
   const handledResultRequestIdsRef = useRef(new Set<string>());
   const recoveryRefreshRef = useRef<string | null>(null);
+  const focusRevalidationRef = useRef<{
+    owner: string;
+    controller: AbortController;
+  } | null>(null);
+  const [focusEpoch, setFocusEpoch] = useState(0);
   // First-practice-visit one-shot explainer of the mastery rules. The stored
   // flag is keyed by account so a stale read from a previous session's user
   // can never show or hide the card for the wrong learner; while unknown
@@ -73,6 +102,10 @@ export default function PracticeScreen() {
     void userId;
     return captureSessionLease();
   }, [captureSessionLease, sessionVersion, userId]);
+  const cancelFocusRevalidation = useCallback(() => {
+    focusRevalidationRef.current?.controller.abort();
+    focusRevalidationRef.current = null;
+  }, []);
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -81,8 +114,9 @@ export default function PracticeScreen() {
       focusedRef.current = false;
       navigationStartedRef.current = true;
       activeRenderOwnerRef.current = null;
+      cancelFocusRevalidation();
     };
-  }, []);
+  }, [cancelFocusRevalidation]);
 
   useLayoutEffect(() => {
     activeRenderOwnerRef.current = renderOwner;
@@ -121,17 +155,23 @@ export default function PracticeScreen() {
   const question = questionQuery.data?.question;
   const kind = questionQuery.data?.kind;
   const progress = questionQuery.data?.progress;
+  const cycleId = questionQuery.data?.cycleId;
+  const attemptsUsed = questionQuery.data?.attemptsUsed;
   const recorderQuestionId = question?.id ?? null;
   const recorderOwner =
-    recorderQuestionId &&
-    `${renderOwner}:${recorderQuestionId}:${nativeMode ? 'native' : 'english'}`;
+    recorderQuestionId && cycleId
+      ? `${renderOwner}:${recorderQuestionId}:${cycleId}:${nativeMode ? 'native' : 'english'}`
+      : null;
   const recorderLocked = recorderLockState.owner === recorderOwner && recorderLockState.locked;
+  const recorderExitLocked =
+    recorderExitLockState.owner === recorderOwner && recorderExitLockState.locked;
 
   useLayoutEffect(() => {
     activeRecorderOwnerRef.current = recorderOwner;
     handledResultRequestIdsRef.current = new Set();
     recoveryRefreshRef.current = null;
     recorderLockedRef.current = false;
+    recorderExitLockedRef.current = false;
   }, [recorderOwner]);
 
   const renderOwnsWork = useCallback(
@@ -153,67 +193,215 @@ export default function PracticeScreen() {
   }, [recorderOwner, recorderOwnsWork]);
 
   const interactionLocked = recorderLocked || skipBusy || logoutBusy;
+  const navigationLocked = recorderExitLocked || skipBusy || logoutBusy;
   const interactionLockedNow = useCallback(
     () => recorderLockedRef.current || skipBusyRef.current || logoutBusyRef.current,
     [],
   );
+  const navigationLockedNow = useCallback(
+    () => recorderExitLockedRef.current || skipBusyRef.current || logoutBusyRef.current,
+    [],
+  );
+
+  // A served cycle can advance on another device while this route remains in
+  // the stack. Revalidate when Practice receives focus, but keep that GET out
+  // of TanStack's live query so a response can be discarded instead of
+  // replacing a Recorder that acquired ownership while the request was in
+  // flight. The initial no-cache fetch is already canonical and needs no
+  // duplicate request.
+  const scheduleFocusRevalidation = useCallback(() => {
+    const cachedAtFocus = queryClient.getQueryData<PracticeQuestionPayload>(questionQueryKey);
+    const queryStateAtFocus = queryClient.getQueryState(questionQueryKey);
+    if (!cachedAtFocus || queryStateAtFocus?.fetchStatus === 'fetching' || interactionLockedNow()) {
+      return () => undefined;
+    }
+
+    const source = {
+      questionId: cachedAtFocus.question.id,
+      cycleId: cachedAtFocus.cycleId,
+      attemptsUsed: cachedAtFocus.attemptsUsed,
+    };
+    const owner = `${renderOwner}:${source.questionId}:${source.cycleId}:${source.attemptsUsed}`;
+    // Defer one JS turn so the returning route and Recorder can publish any
+    // navigation/recovery ownership acquired by the same focus transition.
+    const task = setTimeout(() => {
+      if (
+        !renderOwnsWork() ||
+        navigationStartedRef.current ||
+        interactionLockedNow() ||
+        focusRevalidationRef.current !== null
+      ) {
+        return;
+      }
+      const current = queryClient.getQueryData<PracticeQuestionPayload>(questionQueryKey);
+      if (
+        !current ||
+        current.question.id !== source.questionId ||
+        current.cycleId !== source.cycleId ||
+        current.attemptsUsed !== source.attemptsUsed
+      ) {
+        return;
+      }
+
+      const controller = new AbortController();
+      const revalidation = { owner, controller };
+      focusRevalidationRef.current = revalidation;
+      void Promise.resolve(apiFetch<unknown>('/practice/question', { signal: controller.signal }))
+        .then(parsePracticeQuestion)
+        .then((canonical) => {
+          if (
+            controller.signal.aborted ||
+            !renderOwnsWork() ||
+            navigationStartedRef.current ||
+            interactionLockedNow() ||
+            focusRevalidationRef.current !== revalidation
+          ) {
+            return;
+          }
+          const stillCurrent = queryClient.getQueryData<PracticeQuestionPayload>(questionQueryKey);
+          if (
+            !stillCurrent ||
+            stillCurrent.question.id !== source.questionId ||
+            stillCurrent.cycleId !== source.cycleId ||
+            stillCurrent.attemptsUsed !== source.attemptsUsed
+          ) {
+            return;
+          }
+          queryClient.setQueryData(questionQueryKey, canonical);
+          if (canonical.question.cefrLevel !== user?.cefrLevel) {
+            void queryClient.invalidateQueries({ queryKey: ['me'] });
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          if (focusRevalidationRef.current === revalidation) {
+            focusRevalidationRef.current = null;
+          }
+        });
+    }, 0);
+    return () => clearTimeout(task);
+  }, [
+    interactionLockedNow,
+    queryClient,
+    questionQueryKey,
+    renderOwner,
+    renderOwnsWork,
+    user?.cefrLevel,
+  ]);
   const publishNavigationLock = useCallback(() => {
     if (!mountedRef.current || !focusedRef.current) return;
     navigation.setOptions(
-      interactionLockedNow()
+      navigationLockedNow()
         ? { headerBackVisible: false, gestureEnabled: false }
         : { headerBackVisible: true, gestureEnabled: true },
     );
-  }, [interactionLockedNow, navigation]);
+  }, [navigationLockedNow, navigation]);
 
   // Practice now sits above Home. Leaving is a normal exit, except while a
   // recording, upload, or recovery is active — popping then would let blur
   // cleanup discard the take. Hardware back, header back, and the iOS swipe
   // gesture all follow the same lock.
-  useHardwareBack(interactionLockedNow);
+  useHardwareBack(navigationLockedNow);
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
       navigationStartedRef.current = false;
+      setFocusEpoch((current) => current + 1);
       publishNavigationLock();
+      const cancelScheduledRevalidation = scheduleFocusRevalidation();
       return () => {
+        cancelScheduledRevalidation();
+        cancelFocusRevalidation();
         focusedRef.current = false;
         navigationStartedRef.current = true;
       };
-    }, [publishNavigationLock]),
+    }, [cancelFocusRevalidation, publishNavigationLock, scheduleFocusRevalidation]),
   );
+
+  // Replacing a question inside this long-lived route must also replace the
+  // learner's visual and VoiceOver context. Include cycleId because a resumed
+  // serving can legitimately reuse the same word under a new hard try budget.
+  const accessibleQuestionKey =
+    question && cycleId && introSeen === true ? `${renderOwner}:${question.id}:${cycleId}` : null;
+  const accessibleQuestionAnnouncement =
+    question && accessibleQuestionKey ? `${question.promptWord}. ${question.questionText}` : null;
+  const lastAccessibleQuestionRef = useRef<string | null>(null);
+  useEffect(() => {
+    void focusEpoch;
+    if (!focusedRef.current || !isSessionLeaseCurrent(sessionLease)) return;
+    if (!accessibleQuestionKey || !accessibleQuestionAnnouncement) {
+      lastAccessibleQuestionRef.current = null;
+      return;
+    }
+    if (lastAccessibleQuestionRef.current === accessibleQuestionKey) return;
+    const hadPreviousQuestion = lastAccessibleQuestionRef.current !== null;
+    lastAccessibleQuestionRef.current = accessibleQuestionKey;
+    if (hadPreviousQuestion) {
+      scrollViewRef.current?.scrollTo({ y: 0, animated: false });
+    }
+    if (Platform.OS === 'ios') {
+      AccessibilityInfo.announceForAccessibilityWithOptions(accessibleQuestionAnnouncement, {
+        queue: true,
+      });
+    }
+  }, [
+    accessibleQuestionAnnouncement,
+    accessibleQuestionKey,
+    focusEpoch,
+    isSessionLeaseCurrent,
+    sessionLease,
+  ]);
   const claimNavigation = useCallback(() => {
-    if (navigationStartedRef.current || interactionLockedNow() || !renderOwnsWork()) return false;
+    if (navigationStartedRef.current || navigationLockedNow() || !renderOwnsWork()) return false;
+    cancelFocusRevalidation();
     navigationStartedRef.current = true;
     return true;
-  }, [interactionLockedNow, renderOwnsWork]);
+  }, [cancelFocusRevalidation, navigationLockedNow, renderOwnsWork]);
   useEffect(() => {
     const unsubscribe = navigation.addListener('beforeRemove', (event) => {
       // Header back and the native swipe gesture dispatch GO_BACK. Read the
       // synchronous recorder ref so an event already queued in the lock's
       // pre-render window cannot discard the take. Route-gate resets and the
       // recorder's deliberate dismiss flows remain free to remove the screen.
-      if (interactionLockedNow() && event.data.action.type === 'GO_BACK') {
+      if (navigationLockedNow() && event.data.action.type === 'GO_BACK') {
         event.preventDefault();
+        return;
       }
+      // Once any permitted removal begins, the old route may stay focused for
+      // part of the transition. Retire its background canonical refresh now so
+      // it cannot publish into a screen that is already leaving.
+      navigationStartedRef.current = true;
+      cancelFocusRevalidation();
     });
     return unsubscribe;
-  }, [interactionLockedNow, navigation]);
+  }, [cancelFocusRevalidation, navigationLockedNow, navigation]);
   useLayoutEffect(() => {
     publishNavigationLock();
-  }, [interactionLocked, publishNavigationLock]);
+  }, [navigationLocked, publishNavigationLock]);
 
   // A new submission owns the inline space again: clear the old wait line the
   // moment the recorder locks for the next take.
   const handleLockChange = useCallback(
     (locked: boolean) => {
       if (!recorderOwnsWork(recorderOwner)) return;
+      if (locked) cancelFocusRevalidation();
       recorderLockedRef.current = locked;
+      recorderExitLockedRef.current = locked;
       // Close the pre-render window for native header/gesture exits as well as
       // the custom controls below. Recorder publishes its lock synchronously,
       // so the navigator can consume it before React commits disabled props.
       setRecorderLockState({ owner: recorderOwner, locked });
+      setRecorderExitLockState({ owner: recorderOwner, locked });
       if (locked) setRateLimitNotice(null);
+      publishNavigationLock();
+    },
+    [cancelFocusRevalidation, publishNavigationLock, recorderOwner, recorderOwnsWork],
+  );
+  const handleExitLockChange = useCallback(
+    (locked: boolean) => {
+      if (!recorderOwnsWork(recorderOwner)) return;
+      recorderExitLockedRef.current = locked;
+      setRecorderExitLockState({ owner: recorderOwner, locked });
       publishNavigationLock();
     },
     [publishNavigationLock, recorderOwner, recorderOwnsWork],
@@ -234,11 +422,15 @@ export default function PracticeScreen() {
     handledResultRequestIdsRef.current = new Set(
       [...handledResultRequestIdsRef.current].slice(-MAX_HANDLED_RESULT_REQUEST_IDS),
     );
+    cancelFocusRevalidation();
     navigationStartedRef.current = true;
     void queryClient.cancelQueries({ queryKey: questionQueryKey, exact: true });
     setRateLimitNotice(null);
     applyFailedAttemptToQuestionCache(queryClient, user, question.id, result);
-    showFeedback(question.id, result);
+    if (result.recordingId) {
+      void queryClient.invalidateQueries({ queryKey: ['recordings', user.id] });
+    }
+    showFeedback(question.id, result, question, metadata.requestId);
     router.push('/practice/feedback');
   };
 
@@ -261,6 +453,7 @@ export default function PracticeScreen() {
     ) {
       return;
     }
+    cancelFocusRevalidation();
     recoveryRefreshRef.current = owner;
     const refresh = questionQuery.refetch();
     void refresh.then(
@@ -292,6 +485,7 @@ export default function PracticeScreen() {
     const owner = recorderOwner;
     if (
       !question ||
+      !cycleId ||
       !recorderOwnsWork(owner) ||
       navigationStartedRef.current ||
       skipBusyRef.current ||
@@ -301,10 +495,11 @@ export default function PracticeScreen() {
       return;
     }
     skipBusyRef.current = true;
+    cancelFocusRevalidation();
     setSkipBusy(true);
     publishNavigationLock();
     try {
-      await apiSkipPracticeWord(question.id);
+      await apiSkipPracticeWord(question.id, cycleId);
       if (!recorderOwnsWork(owner) || navigationStartedRef.current) return;
       setRateLimitNotice(null);
       // refetch() swallows its own failure: without this check the just-parked
@@ -317,6 +512,27 @@ export default function PracticeScreen() {
         );
       }
     } catch (error) {
+      if (isClosedPracticeCycle(error)) {
+        if (recorderOwnsWork(owner) && !navigationStartedRef.current) {
+          setRateLimitNotice(null);
+          // Another request/device already advanced this serving cycle, or
+          // changed placement/level state. Revalidate both authorities: the
+          // question refresh replaces a same-level stale assignment, while
+          // /auth/me lets the persistent profile bridge move the route/cache
+          // key when the learner's placement or CEFR level changed.
+          const [refetched] = await Promise.all([
+            questionQuery.refetch({ cancelRefetch: false }),
+            queryClient.invalidateQueries({ queryKey: ['me'] }),
+          ]);
+          if (refetched.isError && recorderOwnsWork(owner) && !navigationStartedRef.current) {
+            Alert.alert(
+              t('practice.skipFailedTitle'),
+              userMessageForError(refetched.error, t('practice.loadFailed')),
+            );
+          }
+        }
+        return;
+      }
       if (recorderOwnsWork(owner) && !navigationStartedRef.current) {
         Alert.alert(
           t('practice.skipFailedTitle'),
@@ -372,18 +588,22 @@ export default function PracticeScreen() {
       >
         {user && <Text style={styles.greeting}>{t('practice.greeting', { name: user.name })}</Text>}
 
-        {!question && questionQuery.isPending && (
-          <View style={styles.center}>
-            <ActivityIndicator
-              accessibilityLabel={t('practice.loadingQuestion')}
-              size="large"
-              color={theme.colors.primary}
-            />
-            <Text accessibilityLiveRegion="polite" style={styles.muted}>
-              {t('practice.loadingQuestion')}
-            </Text>
-          </View>
-        )}
+        {!question &&
+          questionQuery.isPending &&
+          (questionQuery.fetchStatus === 'paused' ? (
+            <OfflineState />
+          ) : (
+            <View style={styles.center}>
+              <ActivityIndicator
+                accessibilityLabel={t('practice.loadingQuestion')}
+                size="large"
+                color={theme.colors.primary}
+              />
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('practice.loadingQuestion')}
+              </Text>
+            </View>
+          ))}
 
         {!question && questionQuery.isError && (
           <View style={styles.center}>
@@ -401,6 +621,19 @@ export default function PracticeScreen() {
           </View>
         )}
 
+        {question && introSeen === null && (
+          <View style={styles.center}>
+            <ActivityIndicator
+              accessibilityLabel={t('practice.loadingQuestion')}
+              size="large"
+              color={theme.colors.primary}
+            />
+            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+              {t('practice.loadingQuestion')}
+            </Text>
+          </View>
+        )}
+
         {question && introSeen === false && (
           <View style={styles.introCard}>
             <Text accessibilityRole="header" style={styles.introTitle}>
@@ -413,6 +646,7 @@ export default function PracticeScreen() {
               {t('practiceIntro.tries', { count: PRACTICE_MAX_ATTEMPTS })}
             </Text>
             <Text style={styles.introLine}>{t('practiceIntro.silence')}</Text>
+            <Text style={styles.introLine}>{t('practiceIntro.native')}</Text>
             <Button
               title={t('practiceIntro.dismiss')}
               onPress={dismissIntro}
@@ -421,7 +655,7 @@ export default function PracticeScreen() {
           </View>
         )}
 
-        {question && (
+        {question && introSeen === true && (
           <>
             <View style={styles.card}>
               <View style={styles.badgeRow}>
@@ -440,11 +674,11 @@ export default function PracticeScreen() {
                     </Text>
                   </View>
                 )}
-                {attemptStatus !== null && attemptStatus.questionId === question.id && (
+                {attemptsUsed !== undefined && (
                   <View style={styles.attemptChip}>
                     <Text style={styles.attemptChipText}>
                       {t('practice.attemptChip', {
-                        current: PRACTICE_MAX_ATTEMPTS + 1 - attemptStatus.attemptsLeft,
+                        current: attemptsUsed + 1,
                         max: PRACTICE_MAX_ATTEMPTS,
                       })}
                     </Text>
@@ -464,7 +698,11 @@ export default function PracticeScreen() {
                 </Text>
               )}
               <Text style={styles.cardLabel}>{t('label.word')}</Text>
-              <Text accessibilityRole="header" style={styles.promptWord}>
+              <Text
+                accessibilityLanguage="en-US"
+                accessibilityRole="header"
+                style={styles.promptWord}
+              >
                 {question.promptWord}
               </Text>
               <View style={styles.questionHeadingRow}>
@@ -475,7 +713,6 @@ export default function PracticeScreen() {
                   accessibilityRole="button"
                   accessibilityLabel={t('practice.helpLabel')}
                   accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-                  accessibilityState={{ disabled: interactionLocked }}
                   disabled={interactionLocked}
                   hitSlop={4}
                   style={({ pressed }) => [
@@ -487,14 +724,20 @@ export default function PracticeScreen() {
                     if (!claimNavigation()) return;
                     router.navigate({
                       pathname: '/practice/help',
-                      params: { questionId: question.id },
+                      params: {
+                        questionId: question.id,
+                        cycleId,
+                        attemptsUsed: String(attemptsUsed),
+                      },
                     });
                   }}
                 >
                   <Text style={styles.helpButtonText}>?</Text>
                 </Pressable>
               </View>
-              <Text style={styles.questionText}>{question.questionText}</Text>
+              <Text accessibilityLanguage="en-US" style={styles.questionText}>
+                {question.questionText}
+              </Text>
             </View>
 
             <Pressable
@@ -511,6 +754,7 @@ export default function PracticeScreen() {
               ]}
               onPress={() => {
                 if (!interactionLockedNow() && renderOwnsWork()) {
+                  cancelFocusRevalidation();
                   setAnswerMode(nativeMode ? 'english' : 'native');
                 }
               }}
@@ -530,19 +774,25 @@ export default function PracticeScreen() {
 
             <View style={styles.recorderArea}>
               <Recorder
-                key={nativeMode ? 'native' : 'english'}
+                key={`${cycleId}:${nativeMode ? 'native' : 'english'}`}
                 ownerId={user.id}
                 questionId={question.id}
+                cycleId={cycleId}
                 disabled={skipBusy || logoutBusy}
                 isStartBlocked={() => skipBusyRef.current || logoutBusyRef.current}
                 endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
-                parseResult={nativeMode ? parseNativeAttemptResult : parseAttemptResult}
+                parseResult={(raw) =>
+                  nativeMode
+                    ? parseNativeAttemptResult(raw, cycleId)
+                    : parseAttemptResult(raw, cycleId)
+                }
                 onResultWithMetadata={handleResult}
                 onError={handleError}
                 onRateLimited={handleRateLimited}
                 onRecoveryUnresolved={handleRecoveryUnresolved}
                 onRecoveryEndpointMismatch={handleRecoveryEndpointMismatch}
                 onInteractionLockChange={handleLockChange}
+                onExitLockChange={handleExitLockChange}
                 onExpandedControlsLayout={revealExpandedRecorderControls}
               />
             </View>
@@ -565,10 +815,10 @@ export default function PracticeScreen() {
       <View style={[styles.footerRow, { paddingBottom: Math.max(insets.bottom, 10) }]}>
         <Pressable
           accessibilityRole="button"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={interactionLocked}
+          accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
+          disabled={navigationLocked}
           hitSlop={4}
-          style={[styles.footerButton, interactionLocked && styles.controlDisabled]}
+          style={[styles.footerButton, navigationLocked && styles.controlDisabled]}
           onPress={() => {
             if (claimNavigation()) router.navigate('/settings');
           }}
@@ -577,10 +827,10 @@ export default function PracticeScreen() {
         </Pressable>
         <Pressable
           accessibilityRole="button"
-          accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={interactionLocked}
+          accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
+          disabled={navigationLocked}
           hitSlop={4}
-          style={[styles.footerButton, interactionLocked && styles.controlDisabled]}
+          style={[styles.footerButton, navigationLocked && styles.controlDisabled]}
           onPress={() => void handleLogout()}
         >
           <Text style={styles.footerButtonText}>{t('common.logOut')}</Text>
@@ -832,6 +1082,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   footerRow: {
     minHeight: 56,
     flexDirection: 'row',
+    flexWrap: 'wrap',
     justifyContent: 'center',
     gap: spacing.xl,
     paddingTop: spacing.xs,
@@ -841,13 +1092,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     backgroundColor: colors.card,
   },
   footerButton: {
+    flexShrink: 1,
+    maxWidth: '100%',
     minHeight: layout.minimumTarget,
     justifyContent: 'center',
     paddingHorizontal: spacing.ml,
   },
   footerButtonText: {
+    flexShrink: 1,
     fontSize: 14,
     color: colors.muted,
     textDecorationLine: 'underline',
+    textAlign: 'center',
   },
 }));

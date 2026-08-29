@@ -1,21 +1,21 @@
 # syntax=docker/dockerfile:1
 
 # ---- deps: full install (incl. dev deps) for building ----
-FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS deps
+FROM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 # python3/make/g++ only needed if a native module (bcrypt) has no musl prebuild
 RUN apk add --no-cache python3 make g++ && npm ci
 
 # ---- build: compile TypeScript, then trim to production deps ----
-FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS build
+FROM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS build
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build && npm prune --omit=dev
 
 # ---- runtime: prod deps + dist only, non-root ----
-FROM node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS runtime
+FROM node:26-alpine@sha256:2d984a15c9b54fd0aeb608b8e0d0d83529eb34d2966db27a1fb4f1edc3d298a3 AS runtime
 WORKDIR /app
 # Bound the ffmpeg major family: the audio duration/stream-count gates are
 # designed and tested against the 6.1–8.x CLI/AVOption surface (see

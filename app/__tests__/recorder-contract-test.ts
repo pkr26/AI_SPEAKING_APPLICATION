@@ -1,5 +1,6 @@
 import {
   assessmentIdentityMatches,
+  assessmentRejectionRequiresCanonicalRefresh,
   audioSessionIsOwnedBy,
   autoStopTapIsWithinGrace,
   canBeginRecorderOperation,
@@ -110,6 +111,38 @@ describe('Recorder mutation-first pure contracts', () => {
     expect(
       recoveryRetryDelayMillis(new ApiError(500, 'wrong status', 7, { code: 'REQUEST_IN_FLIGHT' })),
     ).toBeNull();
+  });
+
+  it.each([
+    'PRACTICE_CYCLE_CLOSED',
+    'STATE_CHANGED',
+    'QUESTION_MISMATCH',
+    'REQUEST_ID_REUSED',
+    'DIAGNOSTIC_DONE',
+    'ASSESSMENT_IN_PROGRESS',
+  ] as const)('classifies the stable %s rejection for canonical refresh', (code) => {
+    expect(
+      assessmentRejectionRequiresCanonicalRefresh(
+        new ApiError(409, 'state changed', undefined, { code }),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps in-flight, unknown, wrong-status, and non-API conflicts conservative', () => {
+    expect(
+      assessmentRejectionRequiresCanonicalRefresh(
+        new ApiError(409, 'processing', undefined, { code: 'REQUEST_IN_FLIGHT' }),
+      ),
+    ).toBe(false);
+    expect(assessmentRejectionRequiresCanonicalRefresh(new ApiError(409, 'unknown'))).toBe(false);
+    expect(
+      assessmentRejectionRequiresCanonicalRefresh(
+        new ApiError(500, 'wrong status', undefined, { code: 'STATE_CHANGED' }),
+      ),
+    ).toBe(false);
+    expect(
+      assessmentRejectionRequiresCanonicalRefresh({ status: 409, code: 'STATE_CHANGED' }),
+    ).toBe(false);
   });
 
   it('uses the monotonic clock and its wall-clock fallback', () => {

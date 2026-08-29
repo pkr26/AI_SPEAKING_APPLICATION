@@ -78,6 +78,31 @@ const expectedProgressForUser = (user) => {
   return byQuestion;
 };
 const aliveProgress = alive.flatMap((user) => [...expectedProgressForUser(user).values()]);
+const expectedCycles = new Map();
+for (const user of alive) {
+  for (const attempt of user.englishAttempts) {
+    if (!attempt.cycleId) throw new Error(`ledger user ${user.index + 1} English attempt omitted cycleId`);
+    const prior = expectedCycles.get(attempt.cycleId) || {
+      id: attempt.cycleId,
+      userId: user.id,
+      questionId: attempt.questionId,
+      attemptsUsed: 0,
+      status: 'closed',
+    };
+    prior.attemptsUsed += 1;
+    expectedCycles.set(attempt.cycleId, prior);
+  }
+  if (!user.practiceCycleId || !user.practiceQuestionId) {
+    throw new Error(`ledger user ${user.index + 1} omitted the active practice cycle`);
+  }
+  expectedCycles.set(user.practiceCycleId, {
+    id: user.practiceCycleId,
+    userId: user.id,
+    questionId: user.practiceQuestionId,
+    attemptsUsed: user.nativeAttempt?.cycleId === user.practiceCycleId ? user.nativeAttempt.attemptNo : 0,
+    status: 'active',
+  });
+}
 const expected = {
   aliveUsers: alive.length,
   deletedUsers: deleted.length,
@@ -92,6 +117,7 @@ const expected = {
   masteredRows: aliveProgress.filter((row) => row.mastered).length,
   learningRows: aliveProgress.filter((row) => !row.mastered).length,
   changedPassword: alive.filter((u) => u.changedPassword).length,
+  practiceCycles: expectedCycles.size,
 };
 expected.assessments = expected.diagAnswers + expected.englishAttempts + expected.nativeAttempts;
 expected.assessmentsIncludingDeleted =
@@ -217,8 +243,72 @@ try {
 
   const processing = await scalar("SELECT count(*)::int AS n FROM assessment_requests WHERE status = 'processing'");
   check('assessment_requests: nothing stuck in processing', processing.n === 0, `db=${processing.n}`);
+  const requestLanguageDrift = await scalar(
+    `SELECT count(*)::int AS n
+     FROM assessment_requests
+     WHERE (
+       context = 'practice-native'
+       AND (
+         native_language NOT IN ('te', 'hi', 'es', 'zh')
+         OR response_body->>'nativeLanguage' IS DISTINCT FROM native_language
+       )
+     )
+     OR (context IN ('diagnostic', 'practice') AND native_language IS NOT NULL)`,
+  );
+  check(
+    'assessment_requests: native responses retain their exact durable claim-language snapshot',
+    requestLanguageDrift.n === 0,
+    `db=${requestLanguageDrift.n}`,
+  );
 
-  // --- D. practice_progress ---------------------------------------------------
+  // --- D. practice_cycles ----------------------------------------------------
+  const cycleRows = await client.query(
+    `SELECT id::text, user_id::text AS "userId", question_id::text AS "questionId",
+            attempts_used AS "attemptsUsed", status
+     FROM practice_cycles
+     ORDER BY id`,
+  );
+  const actualCycles = new Map(cycleRows.rows.map((row) => [row.id, row]));
+  check(
+    'practice_cycles: row count and every durable assignment match the ledger',
+    actualCycles.size === expectedCycles.size &&
+      [...expectedCycles.values()].every((wanted) => {
+        const actual = actualCycles.get(wanted.id);
+        return (
+          actual?.userId === wanted.userId &&
+          actual.questionId === wanted.questionId &&
+          actual.attemptsUsed === wanted.attemptsUsed &&
+          actual.status === wanted.status
+        );
+      }),
+    `db=${actualCycles.size} expected=${expectedCycles.size}`,
+  );
+  const activeCycleCounts = await client.query(
+    `SELECT user_id::text AS "userId", count(*)::int AS n
+     FROM practice_cycles WHERE status = 'active' GROUP BY user_id`,
+  );
+  check(
+    'practice_cycles: every surviving learner has exactly one active assignment',
+    activeCycleCounts.rowCount === alive.length && activeCycleCounts.rows.every((row) => row.n === 1),
+    JSON.stringify(activeCycleCounts.rows.slice(0, 10)),
+  );
+  const cycleAttemptDrift = await scalar(
+    `SELECT count(*)::int AS n
+     FROM (
+       SELECT pc.id
+       FROM practice_cycles pc
+       LEFT JOIN attempts a ON a.practice_cycle_id = pc.id
+       GROUP BY pc.id, pc.attempts_used
+       HAVING pc.attempts_used <> count(a)
+     ) drift`,
+  );
+  check(
+    'practice_cycles: attempts_used equals persisted English/native attempts',
+    cycleAttemptDrift.n === 0,
+    `db=${cycleAttemptDrift.n}`,
+  );
+
+  // --- E. practice_progress ---------------------------------------------------
   const progressTotal = await scalar('SELECT count(*)::int AS n FROM practice_progress');
   check(
     'practice_progress: one row per user that made a spoken practice attempt',
@@ -355,10 +445,11 @@ try {
            (SELECT count(*) FROM attempts WHERE user_id = $1)::int AS attempts,
            (SELECT count(*) FROM diagnostic_state WHERE user_id = $1)::int AS diag,
            (SELECT count(*) FROM practice_progress WHERE user_id = $1)::int AS progress,
+           (SELECT count(*) FROM practice_cycles WHERE user_id = $1)::int AS cycles,
            (SELECT count(*) FROM assessment_requests WHERE user_id = $1)::int AS requests`,
         [user.id],
       );
-      const total = leftovers.attempts + leftovers.diag + leftovers.progress + leftovers.requests;
+      const total = leftovers.attempts + leftovers.diag + leftovers.progress + leftovers.cycles + leftovers.requests;
       if (total !== 0) {
         deepFailures++;
         console.log(`FAIL: ${label} delete cascade left ${JSON.stringify(leftovers)}`);
@@ -384,7 +475,8 @@ try {
     }
 
     const attemptRows = await client.query(
-      `SELECT context, question_id::text AS qid, attempt_no AS "attemptNo", score, passed
+      `SELECT context, question_id::text AS qid, attempt_no AS "attemptNo", score, passed,
+              native_language AS "nativeLanguage"
        FROM attempts WHERE user_id = $1 ORDER BY created_at ASC, id ASC`,
       [user.id],
     );
@@ -394,12 +486,14 @@ try {
         qid: a.questionId,
         score: a.score,
         passed: a.passed,
+        nativeLanguage: null,
       })),
       ...user.englishAttempts.map((a) => ({
         context: 'practice',
         qid: a.questionId,
         score: a.score,
         passed: a.passed,
+        nativeLanguage: null,
       })),
       ...(user.nativeAttempt
         ? [
@@ -408,6 +502,7 @@ try {
               qid: user.nativeAttempt.questionId,
               score: null,
               passed: null,
+              nativeLanguage: user.nativeAttempt.nativeLanguage,
               attemptNo: user.nativeAttempt.attemptNo,
             },
           ]
@@ -423,7 +518,8 @@ try {
           row.context !== want.context ||
           row.qid !== want.qid ||
           row.score !== want.score ||
-          row.passed !== want.passed
+          row.passed !== want.passed ||
+          row.nativeLanguage !== want.nativeLanguage
         ) {
           attemptsOk = false;
           break;

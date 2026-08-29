@@ -870,7 +870,7 @@ function validatePracticeResponse(body) {
     return;
   }
   if (body.passed) {
-    assertCondition(body.attemptsLeft === undefined && body.finalFeedback === undefined, 'pass exposed failure fields');
+    assertCondition(body.attemptsLeft === 0 && body.finalFeedback === undefined, 'pass response contract mismatch');
     validatePracticeNext(body.next);
   } else if (body.attemptNo < 3) {
     assertCondition(body.attemptsLeft === 3 - body.attemptNo && body.next === undefined, 'retry contract mismatch');
@@ -898,6 +898,7 @@ function validateNativeResponse(body) {
   rejectMockMarker(body);
   assertCondition(isUuid(body?.recordingId), 'native response omitted retained recording id');
   assertCondition(body?.mode === 'native' && typeof body.understood === 'boolean', 'bad native response mode');
+  assertCondition(NATIVE_LANGUAGES.includes(body.nativeLanguage), 'native response omitted language snapshot');
   assertCondition(isUuid(body.cycleId), 'native response omitted cycle id');
   assertCondition(
     Number.isInteger(body.attemptNo) && body.attemptNo >= 1 && body.attemptNo <= 3,
@@ -1311,7 +1312,10 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode,
       ? validateDiagnosticResponse
       : context === 'practice'
         ? validatePracticeResponse
-        : validateNativeResponse;
+        : (body) => {
+            validateNativeResponse(body);
+            assertCondition(body.nativeLanguage === user.nativeLanguage, 'native response language snapshot mismatch');
+          };
   try {
     const result = await submitAssessmentPost(
       user,
@@ -1321,6 +1325,7 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode,
         questionId,
         requestId,
         audioKey: grant.audioKey,
+        retainRecording: true,
         ...(context === 'diagnostic' ? {} : { cycleId }),
       },
       context,
@@ -1339,6 +1344,8 @@ async function performFreshAssessment(user, endpoint, questionId, context, mode,
       requestId,
       context,
       questionId,
+      cycleId: cycleId || null,
+      nativeLanguage: result.body.nativeLanguage ?? null,
       status: 'completed',
       responseDigest: responseDigest(result.body),
       audioKeyHash: object.keyHash,
@@ -1396,6 +1403,7 @@ async function replayAssessment(user, prior, context, validator) {
         questionId: prior.questionId,
         requestId: prior.requestId,
         audioKey: prior.grant.audioKey,
+        retainRecording: true,
         ...(context === 'diagnostic' ? {} : { cycleId: prior.cycleId }),
       },
       context,
@@ -1416,14 +1424,31 @@ function attemptExpectation(context, questionId, attemptNo, body) {
     seq: null,
     context,
     questionId,
+    cycleId: body.cycleId ?? null,
     attemptNo,
     score: body.score ?? null,
     passed: body.passed ?? null,
     transcriptDigest: sha256(body.transcript),
     feedbackDigest: sha256(body.feedback),
+    nativeLanguage: body.nativeLanguage ?? null,
     recordingId: body.recordingId,
     observedAt: new Date().toISOString(),
   };
+}
+
+function trackPracticeCyclePayload(user, payload, status = 'active') {
+  assertCondition(isUuid(payload?.cycleId) && validQuestion(payload?.question), 'practice cycle payload invalid');
+  assertCondition(
+    Number.isInteger(payload.attemptsUsed) && payload.attemptsUsed >= 0 && payload.attemptsUsed <= 3,
+    'practice cycle attempts_used invalid',
+  );
+  user._cycles.set(payload.cycleId, {
+    id: payload.cycleId,
+    questionId: payload.question.id,
+    kind: payload.kind,
+    attemptsUsed: payload.attemptsUsed,
+    status,
+  });
 }
 
 function isoAround(milliseconds, spreadMs = 5_000) {
@@ -1543,6 +1568,7 @@ const users = Array.from({ length: USER_COUNT }, (_, index) => {
     _diagnosticQuestion: null,
     _practiceQuestion: null,
     _progress: new Map(),
+    _cycles: new Map(),
     _nativeAssessment: null,
     _deleted: false,
   };
@@ -1836,6 +1862,7 @@ async function actionPracticeQuestion(user, logicalAction = 'practice-question')
     assertCondition(response.body.kind === 'new' || response.body.kind === 'revision', 'practice kind invalid');
     assertCondition(validProgress(response.body.progress), 'practice progress invalid');
     assertCondition(isUuid(response.body.cycleId), 'practice cycle id invalid');
+    trackPracticeCyclePayload(user, response.body);
     user._practiceQuestion = response.body.question;
     user._practiceCycleId = response.body.cycleId;
     passAction(
@@ -1857,6 +1884,7 @@ async function actionPracticeQuestion(user, logicalAction = 'practice-question')
 
 async function actionSkip(user) {
   const questionId = user._practiceQuestion.id;
+  const cycleId = user._practiceCycleId;
   const action = beginAction(user, 'practice-skip', 'POST', '/practice/skip', { terminalStatus: 204 });
   const startedMs = Date.now();
   try {
@@ -1866,6 +1894,9 @@ async function actionSkip(user) {
     });
     const finishedMs = Date.now();
     assertCondition(!response.networkError && response.status === 204, 'practice skip did not return 204');
+    const skippedCycle = user._cycles.get(cycleId);
+    assertCondition(!!skippedCycle, 'skipped practice cycle was not tracked');
+    user._cycles.set(cycleId, { ...skippedCycle, status: 'closed' });
     setExpectedSkip(user, questionId, startedMs, finishedMs);
     passAction(action, { questionId, parkedDays: 7 });
     await actionPracticeQuestion(user, 'practice-question-after-skip');
@@ -1906,6 +1937,7 @@ async function actionHelp(user) {
 
 async function actionEnglishJourney(user) {
   const questionId = user._practiceQuestion.id;
+  const cycleId = user._practiceCycleId;
   for (let logicalAttempt = 1; logicalAttempt <= 3; logicalAttempt++) {
     const startedMs = Date.now();
     const result = await performFreshAssessment(
@@ -1926,10 +1958,19 @@ async function actionEnglishJourney(user) {
     const expected = attemptExpectation('practice', questionId, body.attemptNo, body);
     expected.seq = user.expectedAttempts.length + 1;
     user.expectedAttempts.push(expected);
+    const trackedCycle = user._cycles.get(cycleId);
+    assertCondition(!!trackedCycle, 'English practice cycle was not tracked');
+    user._cycles.set(cycleId, {
+      ...trackedCycle,
+      kind: !body.passed && body.attemptsLeft > 0 ? 'revision' : trackedCycle.kind,
+      attemptsUsed: body.attemptNo,
+      status: body.passed || body.attemptsLeft === 0 ? 'closed' : 'active',
+    });
     applyExpectedPracticeAttempt(user, questionId, body, startedMs, finishedMs);
     if (body.passed || body.attemptsLeft === 0) {
       user._practiceQuestion = body.next.question;
       user._practiceCycleId = body.next.cycleId;
+      trackPracticeCyclePayload(user, body.next);
       if (body.levelUp) {
         user._level = body.levelUp.to;
         user.expectedFinal.cefrLevel = body.levelUp.to;
@@ -1943,6 +1984,7 @@ async function actionEnglishJourney(user) {
 
 async function actionNativeJourney(user) {
   const questionId = user._practiceQuestion.id;
+  const cycleId = user._practiceCycleId;
   const startedMs = Date.now();
   const result = await performFreshAssessment(
     user,
@@ -1958,10 +2000,19 @@ async function actionNativeJourney(user) {
     const expected = attemptExpectation('practice-native', questionId, result.body.attemptNo, result.body);
     expected.seq = user.expectedAttempts.length + 1;
     user.expectedAttempts.push(expected);
+    const trackedCycle = user._cycles.get(cycleId);
+    assertCondition(!!trackedCycle, 'native practice cycle was not tracked');
+    user._cycles.set(cycleId, {
+      ...trackedCycle,
+      kind: result.body.attemptsLeft > 0 ? 'revision' : trackedCycle.kind,
+      attemptsUsed: result.body.attemptNo,
+      status: result.body.attemptsLeft === 0 ? 'closed' : 'active',
+    });
     applyExpectedNativeAttempt(user, questionId, startedMs, finishedMs);
     if (result.body.attemptsLeft === 0) {
       user._practiceQuestion = result.body.next.question;
       user._practiceCycleId = result.body.next.cycleId;
+      trackPracticeCyclePayload(user, result.body.next);
     }
   }
   user.nativeInvariantExpected = true;
@@ -2682,6 +2733,7 @@ function requiredRateLimitNamespaces() {
 
 function publicUserLedger(user) {
   user.expectedPracticeProgress = [...user._progress.values()].sort((a, b) => a.questionId.localeCompare(b.questionId));
+  const expectedPracticeCycles = [...user._cycles.values()].sort((a, b) => a.id.localeCompare(b.id));
   return {
     index: user.index,
     idHash: user.idHash,
@@ -2692,6 +2744,7 @@ function publicUserLedger(user) {
     expectedAttempts: user.expectedAttempts,
     expectedAssessmentRequests: user.expectedAssessmentRequests,
     expectedPracticeProgress: user.expectedPracticeProgress,
+    expectedPracticeCycles,
     expectedUsageReservations: user.expectedUsageReservations,
     nativeInvariantExpected: user.nativeInvariantExpected,
     actions: user.actions,

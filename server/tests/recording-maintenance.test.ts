@@ -18,7 +18,7 @@ import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { recordingMaintenanceTotal } from '../src/metrics';
 import { insertRetainedRecording, type RecordingCapture } from '../src/recording-store';
-import { runRecordingMaintenance, tryRetainRecording } from '../src/recordings';
+import { recordingBulkCleanupBatchSql, runRecordingMaintenance, tryRetainRecording } from '../src/recordings';
 
 const configuredMaintenanceConcurrency = config.recordings.maintenanceConcurrency;
 
@@ -39,8 +39,9 @@ async function createPendingRecording(storageScope: 'diagnostic' | 'practice' = 
   await pool.query(
     `INSERT INTO recordings (
        id, user_id, request_id, question_id, context, storage_scope, audio_key,
-       s3_version_id, content_type, size_bytes
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'v1', 'audio/mp4', 1000)`,
+       s3_version_id, content_type, size_bytes, recording_retention_epoch
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'v1', 'audio/mp4', 1000,
+               (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
     [
       id,
       userId,
@@ -76,6 +77,80 @@ afterAll(async () => {
 });
 
 describe('recording maintenance leases', () => {
+  it('builds only validated, literal-bounded bulk cleanup statements', () => {
+    expect(recordingBulkCleanupBatchSql(1)).toContain('LIMIT 1');
+    expect(recordingBulkCleanupBatchSql(500)).toContain('LIMIT 500');
+    for (const invalid of [0, 1.5, 501, Number.NaN]) {
+      expect(() => recordingBulkCleanupBatchSql(invalid)).toThrow(
+        'recording cleanup batch size must be an integer between 1 and 500',
+      );
+    }
+  });
+
+  it('never retains a bulk-hidden generation and converts it to a durable deletion job', async () => {
+    const cleanupClient = await pool.connect();
+    let cleanupLockHeld = false;
+    try {
+      await cleanupClient.query('SELECT pg_advisory_lock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = true;
+      const recording = await createPendingRecording();
+      const unqueued = await createPendingRecording();
+      await pool.query(
+        `WITH owner AS (
+           UPDATE users
+           SET recording_retention_epoch = recording_retention_epoch + 1
+           WHERE id = $1
+           RETURNING id, recording_retention_epoch
+         )
+         INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch, enqueued_at)
+         SELECT id, recording_retention_epoch, '-infinity'::timestamptz FROM owner`,
+        [recording.userId],
+      );
+      await pool.query(
+        `UPDATE users
+         SET recording_retention_epoch = recording_retention_epoch + 1
+         WHERE id = $1`,
+        [unqueued.userId],
+      );
+
+      await expect(tryRetainRecording(recording.id)).resolves.toBeUndefined();
+      expect(storage.retain).not.toHaveBeenCalled();
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(1);
+
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(1);
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(0);
+      // Discovery is queue-driven: even a synthetic stale row without a queue
+      // entry is not found through a global recordings-table scan.
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [unqueued.id])).rowCount).toBe(1);
+      expect(
+        (
+          await pool.query(
+            `SELECT known_version_id
+             FROM recording_deletion_jobs
+             WHERE storage_scope = 'diagnostic' AND audio_key = $1`,
+            [recording.audioKey],
+          )
+        ).rows,
+      ).toEqual([{ known_version_id: 'v1' }]);
+      await cleanupClient.query(
+        `UPDATE recording_bulk_cleanup_jobs
+         SET last_processed_at = NULL, enqueued_at = '-infinity'::timestamptz
+         WHERE user_id = $1`,
+        [recording.userId],
+      );
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(0);
+      expect(
+        (await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs WHERE user_id = $1', [recording.userId])).rowCount,
+      ).toBe(0);
+      await pool.query('DELETE FROM users WHERE id = $1', [unqueued.userId]);
+    } finally {
+      if (cleanupLockHeld) {
+        await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      }
+      cleanupClient.release();
+    }
+  });
+
   it('reclaims an expired lease, retags the exact version, and makes it available', async () => {
     const metricBefore = await maintenanceMetric('retention', 'ok');
     const { userId, questionId } = await createUserAndQuestion();
@@ -84,8 +159,9 @@ describe('recording maintenance leases', () => {
     await pool.query(
       `INSERT INTO recordings (
          id, user_id, request_id, question_id, context, storage_scope, audio_key,
-         s3_version_id, content_type, size_bytes
-       ) VALUES ($1, $2, $3, $4, 'diagnostic', 'diagnostic', $5, 'v1', 'audio/mp4', 1000)`,
+         s3_version_id, content_type, size_bytes, recording_retention_epoch
+       ) VALUES ($1, $2, $3, $4, 'diagnostic', 'diagnostic', $5, 'v1', 'audio/mp4', 1000,
+                 (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
       [id, userId, randomUUID(), questionId, audioKey],
     );
     await pool.query(
@@ -131,8 +207,9 @@ describe('recording maintenance leases', () => {
     await pool.query(
       `INSERT INTO recordings (
          id, user_id, request_id, question_id, context, storage_scope, audio_key,
-         s3_version_id, content_type, size_bytes
-       ) VALUES ($1, $2, $3, $4, 'diagnostic', 'diagnostic', $5, 'v1', 'audio/mp4', 1000)`,
+         s3_version_id, content_type, size_bytes, recording_retention_epoch
+       ) VALUES ($1, $2, $3, $4, 'diagnostic', 'diagnostic', $5, 'v1', 'audio/mp4', 1000,
+                 (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
       [id, userId, randomUUID(), questionId, `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`],
     );
     storage.retain.mockRejectedValueOnce(Object.assign(new Error('tagging failed'), { name: 'AccessDenied' }));

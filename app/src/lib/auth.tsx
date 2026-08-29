@@ -65,6 +65,12 @@ interface AuthContextValue {
   retrySessionRestore: () => void;
   /** User-initiated escape from an unreadable store entry: wipe it and continue logged out. */
   resetStoredSession: () => void;
+  /**
+   * Signed-in, local-only sign-out used when the server cannot be reached (for
+   * example behind the forced-upgrade gate). Unlike resetStoredSession, this
+   * fails closed until the readable persisted bearer token is proven absent.
+   */
+  signOutThisDevice?: () => Promise<void>;
   /** Captures the current session identity for guarding an async continuation. */
   captureSessionLease: () => SessionLease;
   /** True only while the captured session identity is still current. */
@@ -101,6 +107,13 @@ export class LogoutCleanupError extends Error {
   constructor() {
     super(translate('auth.logoutCleanupFailed'));
     this.name = 'LogoutCleanupError';
+  }
+}
+
+export class LocalSignOutUnconfirmedError extends Error {
+  constructor() {
+    super(translate('error.internal'));
+    this.name = 'LocalSignOutUnconfirmedError';
   }
 }
 
@@ -313,6 +326,76 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return ++epochRef.current;
   };
 
+  const rearmSessionLeasesAfterFailedTransition = useCallback(
+    (epoch: number, sessionToken: string | null, sessionUserId: string | null) => {
+      // beginTransition fences every continuation immediately. If the operation
+      // then fails while the same signed-in identity remains, publish a render
+      // revision so memoized screen leases recapture that newer epoch instead
+      // of leaving an otherwise-valid visible session permanently inert.
+      if (
+        sessionToken !== null &&
+        epoch === epochRef.current &&
+        sessionToken === tokenRef.current &&
+        sessionUserId === (userRef.current?.id ?? null)
+      ) {
+        setSessionVersion((version) => version + 1);
+      }
+    },
+    [],
+  );
+
+  const signOutThisDevice = useCallback(async () => {
+    // Unlike a server-backed account operation, attempting this local cleanup
+    // is not itself an identity transition. Advancing the epoch up front would
+    // invalidate every screen lease even when SecureStore fails and the same
+    // signed-in UI must remain usable.
+    if (transitionRef.current) {
+      throw new Error('An account operation is already in progress.');
+    }
+    transitionRef.current = true;
+    const epoch = epochRef.current;
+    const sessionToken = tokenRef.current;
+    const artifactOwnerId = userRef.current?.id;
+    const stillOwnsSession = () => epoch === epochRef.current && sessionToken === tokenRef.current;
+    try {
+      if (!sessionToken) return;
+
+      // A signed-in local sign-out is not the unreadable-store escape hatch.
+      // Keep the protected UI and its in-memory identity intact unless the
+      // exact bearer was removed and a serialized read proves no token remains.
+      // This also keeps api.ts's synchronous token snapshot aligned with disk.
+      try {
+        const storedBefore = await getToken();
+        if (!stillOwnsSession()) return;
+        if (storedBefore !== null) {
+          if (storedBefore !== sessionToken || !(await clearToken(sessionToken))) {
+            throw new LocalSignOutUnconfirmedError();
+          }
+          if (!stillOwnsSession()) return;
+        }
+        if ((await getToken()) !== null) {
+          throw new LocalSignOutUnconfirmedError();
+        }
+        if (!stillOwnsSession()) return;
+      } catch (error) {
+        if (error instanceof LocalSignOutUnconfirmedError) throw error;
+        throw new LocalSignOutUnconfirmedError();
+      }
+
+      void cancelDailyReminderQuietly();
+      void cleanupPrivateArtifacts(artifactOwnerId).catch(() => undefined);
+      const pendingCleanup = await Promise.allSettled([schedulePendingCleanup()]);
+      if (!stillOwnsSession()) return;
+      epochRef.current += 1;
+      resetMemorySession();
+      if (pendingCleanup[0]?.status === 'rejected') {
+        throw new LogoutCleanupError();
+      }
+    } finally {
+      transitionRef.current = false;
+    }
+  }, [resetMemorySession, schedulePendingCleanup]);
+
   const establishSession = useCallback(
     async (
       response: unknown,
@@ -351,6 +434,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const login = useCallback(
     async (email: string, password: string) => {
       const epoch = beginTransition();
+      const sessionToken = tokenRef.current;
+      const sessionUserId = userRef.current?.id ?? null;
       try {
         const response = await apiFetch<unknown>('/auth/login', {
           method: 'POST',
@@ -359,11 +444,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           expireSessionOn401: false,
         });
         return await establishSession(response, epoch);
+      } catch (error) {
+        rearmSessionLeasesAfterFailedTransition(epoch, sessionToken, sessionUserId);
+        throw error;
       } finally {
         transitionRef.current = false;
       }
     },
-    [establishSession],
+    [establishSession, rearmSessionLeasesAfterFailedTransition],
   );
 
   const register = useCallback(
@@ -375,6 +463,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       uiLanguage: UiLanguage = 'en',
     ) => {
       const epoch = beginTransition();
+      const sessionToken = tokenRef.current;
+      const sessionUserId = userRef.current?.id ?? null;
       try {
         const response = await apiFetch<unknown>('/auth/register', {
           method: 'POST',
@@ -387,16 +477,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           epoch,
           () => new RegistrationCompletedLoginRequiredError(),
         );
+      } catch (error) {
+        rearmSessionLeasesAfterFailedTransition(epoch, sessionToken, sessionUserId);
+        throw error;
       } finally {
         transitionRef.current = false;
       }
     },
-    [establishSession],
+    [establishSession, rearmSessionLeasesAfterFailedTransition],
   );
 
   const logout = useCallback(async () => {
     const epoch = beginTransition();
     const sessionToken = tokenRef.current;
+    const sessionUserId = userRef.current?.id ?? null;
     const artifactOwnerId = userRef.current?.id;
     try {
       // Revoke the bearer token before removing the local copy. Logout applies
@@ -431,10 +525,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (cleanupError) {
         throw new LogoutCleanupError();
       }
+    } catch (error) {
+      rearmSessionLeasesAfterFailedTransition(epoch, sessionToken, sessionUserId);
+      throw error;
     } finally {
       transitionRef.current = false;
     }
-  }, [resetMemorySession, schedulePendingCleanup]);
+  }, [rearmSessionLeasesAfterFailedTransition, resetMemorySession, schedulePendingCleanup]);
 
   const verifySessionAfterCredentialError = useCallback(async () => {
     try {
@@ -452,6 +549,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     async (currentPassword: string, newPassword: string) => {
       const epoch = beginTransition();
       const sessionToken = tokenRef.current;
+      const sessionUserId = userRef.current?.id ?? null;
       let responseReceived = false;
       try {
         let response: unknown;
@@ -483,22 +581,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         }
         if (responseReceived) {
           expireSession();
+        } else {
+          rearmSessionLeasesAfterFailedTransition(epoch, sessionToken, sessionUserId);
         }
         throw error;
       } finally {
         transitionRef.current = false;
       }
     },
-    [establishSession, expireSession, verifySessionAfterCredentialError],
+    [
+      establishSession,
+      expireSession,
+      rearmSessionLeasesAfterFailedTransition,
+      verifySessionAfterCredentialError,
+    ],
   );
 
   const deleteAccount = useCallback(
     async (password: string) => {
-      beginTransition();
+      const epoch = beginTransition();
       const sessionToken = tokenRef.current;
+      const sessionUserId = userRef.current?.id ?? null;
       const artifactOwnerId = userRef.current?.id;
       try {
-        let deletionConfirmed = false;
         try {
           await apiFetch<void>('/auth/account', {
             method: 'DELETE',
@@ -506,7 +611,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             expireSessionOn401: false,
             expectedStatus: 204,
           });
-          deletionConfirmed = true;
         } catch (error) {
           if (error instanceof ApiError && error.status === 401) {
             await verifySessionAfterCredentialError();
@@ -516,18 +620,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             error instanceof ApiError &&
             (error.status === 0 || error.status === 408 || error.status >= 500)
           ) {
-            try {
-              await apiFetch<unknown>('/auth/me', {
-                expireSessionOn401: false,
-              });
-            } catch (verificationError) {
-              if (verificationError instanceof ApiError && verificationError.status === 401) {
-                deletionConfirmed = true;
-              } else {
-                throw new AccountDeletionUnconfirmedError();
-              }
-            }
-            if (!deletionConfirmed) throw error;
+            // A rejected old bearer is not durable deletion proof: it can also
+            // mean expiry, password rotation, logout on another device, or
+            // administrative revocation while the account and its data remain.
+            // The API has no deletion-receipt endpoint, so an ambiguous DELETE
+            // must stay unconfirmed and preserve the local session for retry.
+            throw new AccountDeletionUnconfirmedError();
           } else {
             throw error;
           }
@@ -549,11 +647,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (cleanupError) {
           throw new AccountDeletedCleanupError();
         }
+      } catch (error) {
+        rearmSessionLeasesAfterFailedTransition(epoch, sessionToken, sessionUserId);
+        throw error;
       } finally {
         transitionRef.current = false;
       }
     },
-    [resetMemorySession, schedulePendingCleanup, verifySessionAfterCredentialError],
+    [
+      rearmSessionLeasesAfterFailedTransition,
+      resetMemorySession,
+      schedulePendingCleanup,
+      verifySessionAfterCredentialError,
+    ],
   );
 
   const value = useMemo(
@@ -565,6 +671,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       restoreError,
       retrySessionRestore,
       resetStoredSession,
+      signOutThisDevice,
       captureSessionLease,
       isSessionLeaseCurrent,
       login,
@@ -582,6 +689,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       restoreError,
       retrySessionRestore,
       resetStoredSession,
+      signOutThisDevice,
       captureSessionLease,
       isSessionLeaseCurrent,
       login,

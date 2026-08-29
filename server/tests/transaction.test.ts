@@ -269,7 +269,10 @@ describe('diagnostic transaction rollback precedence', () => {
       query: vi.fn(async (text: string) => {
         if (text === 'BEGIN') return { rows: [] };
         if (text === 'ROLLBACK') throw rollbackError;
-        if (text === 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE') {
+        if (
+          text ===
+          'SELECT cefr_level, diagnostic_completed, diagnostic_acknowledged FROM users WHERE id = $1 FOR UPDATE'
+        ) {
           return { rows: [user], rowCount: 1 };
         }
         throw primaryError;
@@ -298,7 +301,7 @@ describe('diagnostic transaction rollback precedence', () => {
     // The parent users row is locked before the diagnostic_state child row.
     expect(client.query.mock.calls.map(([text]) => text)).toEqual([
       'BEGIN',
-      'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
+      'SELECT cefr_level, diagnostic_completed, diagnostic_acknowledged FROM users WHERE id = $1 FOR UPDATE',
       expect.stringContaining('SELECT * FROM diagnostic_state'),
       'ROLLBACK',
     ]);

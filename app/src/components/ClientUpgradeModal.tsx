@@ -61,7 +61,11 @@ export function clientUpgradeStoreUrl(
  * A non-dismissible overlay instead of a replacement route. The active screen
  * stays mounted below it, preserving recorder and interrupted-upload state.
  */
-export default function ClientUpgradeModal({ onLocalSignOut }: { onLocalSignOut?: () => void }) {
+export default function ClientUpgradeModal({
+  onLocalSignOut,
+}: {
+  onLocalSignOut?: () => void | Promise<void>;
+}) {
   const t = useT();
   const styles = themedStyles(useTheme());
   const { required } = useSyncExternalStore(
@@ -71,7 +75,10 @@ export default function ClientUpgradeModal({ onLocalSignOut }: { onLocalSignOut?
   );
   const [openingStore, setOpeningStore] = useState(false);
   const [openFailed, setOpenFailed] = useState(false);
+  const [localSignOutBusy, setLocalSignOutBusy] = useState(false);
+  const [localSignOutFailed, setLocalSignOutFailed] = useState(false);
   const openingStoreRef = useRef(false);
+  const localSignOutRef = useRef(false);
 
   const openStore = async () => {
     if (openingStoreRef.current) return;
@@ -85,6 +92,24 @@ export default function ClientUpgradeModal({ onLocalSignOut }: { onLocalSignOut?
     } finally {
       openingStoreRef.current = false;
       setOpeningStore(false);
+    }
+  };
+
+  const signOutLocally = async () => {
+    if (!onLocalSignOut || localSignOutRef.current) return;
+    localSignOutRef.current = true;
+    setLocalSignOutBusy(true);
+    setLocalSignOutFailed(false);
+    try {
+      await onLocalSignOut();
+    } catch {
+      // The auth operation deliberately leaves the signed-in UI intact when
+      // SecureStore cannot prove the bearer is gone. Keep this action visible
+      // and offer an accessible, localized retry instead of claiming success.
+      setLocalSignOutFailed(true);
+    } finally {
+      localSignOutRef.current = false;
+      setLocalSignOutBusy(false);
     }
   };
 
@@ -117,6 +142,15 @@ export default function ClientUpgradeModal({ onLocalSignOut }: { onLocalSignOut?
                 {t('upgrade.openFailed')}
               </Text>
             )}
+            {localSignOutFailed && (
+              <Text
+                accessibilityRole="alert"
+                accessibilityLiveRegion="assertive"
+                style={styles.error}
+              >
+                {t('error.internal')}
+              </Text>
+            )}
             <Button
               accessibilityHint={t('upgrade.actionHint')}
               fullWidth
@@ -128,7 +162,8 @@ export default function ClientUpgradeModal({ onLocalSignOut }: { onLocalSignOut?
             {onLocalSignOut && (
               <Button
                 fullWidth
-                onPress={onLocalSignOut}
+                loading={localSignOutBusy}
+                onPress={() => void signOutLocally()}
                 style={styles.secondaryAction}
                 title={t('logout.thisDevice')}
                 variant="secondary"

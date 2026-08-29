@@ -35,10 +35,35 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
 let memoryValue: PendingAssessment | null = null;
 let memoryLoaded = false;
 let storageQueue: Promise<void> = Promise.resolve();
+let feedbackReplayRevision = 0;
+const feedbackReplayListeners = new Set<() => void>();
 // An unconditional clear is an account/session boundary. Bump this before its
 // queued SecureStore delete begins so a create that was already waiting on a
 // slow read cannot repopulate the slot after logout considers cleanup complete.
 let unconditionalClearGeneration = 0;
+
+/**
+ * In-process bridge from a Recorder that discovers route-mismatched completed
+ * feedback to the root replay provider. The durable SecureStore pointer remains
+ * the authority; this revision only makes the already-mounted provider re-read
+ * it without requiring an app restart or remount.
+ */
+export function getPendingAssessmentReplayRevision(): number {
+  return feedbackReplayRevision;
+}
+
+export function subscribeToPendingAssessmentReplay(listener: () => void): () => void {
+  feedbackReplayListeners.add(listener);
+  return () => feedbackReplayListeners.delete(listener);
+}
+
+export function notifyPendingAssessmentReplayReady(requestId: string): boolean {
+  if (!isUuid(requestId)) throw new TypeError('requestId must be a UUID');
+  feedbackReplayRevision += 1;
+  const hadListeners = feedbackReplayListeners.size > 0;
+  for (const listener of feedbackReplayListeners) listener();
+  return hadListeners;
+}
 
 function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   const result = storageQueue.then(operation, operation);

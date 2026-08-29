@@ -77,10 +77,14 @@ export const upload = multer({
     // exact-cap upload is accepted while the first byte beyond it is rejected.
     fileSize: MAX_AUDIO_BYTES + 1,
     files: 1,
-    // Practice carries questionId + requestId + durable cycleId. Diagnostic
-    // still validates its two-field schema and rejects an unexpected third.
-    fields: 3,
-    parts: 5,
+    // The current practice client carries questionId + requestId + durable
+    // cycleId + the explicit recording-retention choice. Diagnostic still
+    // rejects fields outside its narrower route schema after multipart
+    // parsing. One audio file plus those four text fields is five MIME parts;
+    // Busboy fires its limit event at equality, so the threshold needs one slot
+    // of boundary-counting headroom.
+    fields: 4,
+    parts: 6,
     fieldNameSize: 64,
     fieldSize: 128,
     headerPairs: 50,

@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react-native';
-import { useEffect } from 'react';
+import { useEffect, useMemo } from 'react';
 import { Text } from 'react-native';
 
 import {
@@ -15,6 +15,7 @@ import {
   AccountDeletionUnconfirmedError,
   AccountDeletedCleanupError,
   AuthProvider,
+  LocalSignOutUnconfirmedError,
   LogoutCleanupError,
   RegistrationCompletedLoginRequiredError,
   type SessionLease,
@@ -114,6 +115,7 @@ function deferred<T>() {
 }
 
 let auth: ReturnType<typeof useAuth> | null = null;
+let renderedSessionLease: SessionLease | null = null;
 
 function Capture() {
   const value = useAuth();
@@ -136,6 +138,19 @@ function SessionDisplay() {
   );
 }
 
+/** Mirrors the sessionVersion-keyed lease pattern used by mounted screens. */
+function MemoizedSessionLeaseCapture() {
+  const { sessionVersion, captureSessionLease } = useAuth();
+  const lease = useMemo(() => {
+    void sessionVersion;
+    return captureSessionLease();
+  }, [captureSessionLease, sessionVersion]);
+  useEffect(() => {
+    renderedSessionLease = lease;
+  }, [lease]);
+  return null;
+}
+
 function text(testID: string): string {
   return String(screen.getByTestId(testID).props.children);
 }
@@ -146,6 +161,7 @@ function tree(queryClient: QueryClient) {
       <AuthProvider>
         <Capture />
         <SessionDisplay />
+        <MemoizedSessionLeaseCapture />
       </AuthProvider>
     </QueryClientProvider>
   );
@@ -219,6 +235,7 @@ function registeredUnauthorizedHandler(): (rejectedToken: string) => void {
 beforeEach(() => {
   jest.resetAllMocks();
   auth = null;
+  renderedSessionLease = null;
   mockedGetToken.mockResolvedValue(null);
   mockedSaveToken.mockResolvedValue(undefined);
   mockedClearToken.mockResolvedValue(true);
@@ -622,7 +639,7 @@ describe('logout', () => {
 
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('2');
+    expect(text('sessionVersion')).toBe('3');
 
     mockedApiFetch.mockResolvedValueOnce(undefined);
     await act(async () => {
@@ -697,6 +714,100 @@ describe('logout', () => {
     await expect(logout).resolves.toBeUndefined();
 
     expect(clearSpy).toHaveBeenCalledTimes(clearCountBeforeUnmount);
+  });
+});
+
+describe('verified local sign-out', () => {
+  it('proves the exact persisted token is absent before clearing the signed-in UI', async () => {
+    const { clearSpy } = await renderLoggedIn();
+    mockedGetToken.mockResolvedValueOnce('tok-1').mockResolvedValueOnce(null);
+
+    await act(async () => {
+      await auth!.signOutThisDevice!();
+    });
+
+    expect(mockedApiFetch).toHaveBeenCalledTimes(1); // login only; local sign-out is offline-safe
+    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
+    expect(mockedGetToken).toHaveBeenCalledTimes(3); // launch restore + before/after verification
+    expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(mockedCleanupPrivateArtifacts).toHaveBeenLastCalledWith(USER.id);
+    expect(mockedCancelDailyReminder).toHaveBeenCalledTimes(1);
+    expect(clearSpy).toHaveBeenCalledTimes(3); // mount + login + verified local sign-out
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+  });
+
+  it('keeps a valid session visible when conditional token removal misses', async () => {
+    await renderLoggedIn();
+    mockedGetToken.mockResolvedValueOnce('tok-1');
+    mockedClearToken.mockResolvedValueOnce(false);
+
+    await act(async () => {
+      await expect(auth!.signOutThisDevice!()).rejects.toBeInstanceOf(LocalSignOutUnconfirmedError);
+    });
+
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
+    expect(mockedCancelDailyReminder).not.toHaveBeenCalled();
+  });
+
+  it('keeps existing session leases live after failure and invalidates them only on retry success', async () => {
+    await renderLoggedIn();
+    const lease = auth!.captureSessionLease();
+    mockedGetToken.mockResolvedValueOnce('tok-1');
+    mockedClearToken.mockResolvedValueOnce(false);
+
+    await act(async () => {
+      await expect(auth!.signOutThisDevice!()).rejects.toBeInstanceOf(LocalSignOutUnconfirmedError);
+    });
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
+    expect(text('sessionVersion')).toBe('2');
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+
+    mockedGetToken.mockResolvedValueOnce('tok-1').mockResolvedValueOnce(null);
+    await act(async () => {
+      await auth!.signOutThisDevice!();
+    });
+
+    expect(auth!.isSessionLeaseCurrent(lease)).toBe(false);
+    expect(text('sessionVersion')).toBe('3');
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+  });
+
+  it('keeps a valid session visible when the verification read still finds a token', async () => {
+    await renderLoggedIn();
+    mockedGetToken.mockResolvedValueOnce('tok-1').mockResolvedValueOnce('tok-still-persisted');
+
+    await act(async () => {
+      await expect(auth!.signOutThisDevice!()).rejects.toBeInstanceOf(LocalSignOutUnconfirmedError);
+    });
+
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(mockedClearPendingAssessment).not.toHaveBeenCalled();
+  });
+
+  it('releases the transition guard after a failed local sign-out so it can be retried', async () => {
+    await renderLoggedIn();
+    mockedGetToken
+      .mockResolvedValueOnce('tok-1')
+      .mockResolvedValueOnce('tok-1')
+      .mockResolvedValueOnce(null);
+    mockedClearToken.mockRejectedValueOnce(new Error('keychain unavailable'));
+
+    await act(async () => {
+      await expect(auth!.signOutThisDevice!()).rejects.toBeInstanceOf(LocalSignOutUnconfirmedError);
+    });
+    await act(async () => {
+      await expect(auth!.signOutThisDevice!()).resolves.toBeUndefined();
+    });
+
+    expect(text('token')).toBe('null');
+    expect(mockedClearToken).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -971,7 +1082,7 @@ describe('changePassword', () => {
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('2');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1000,6 +1111,7 @@ describe('changePassword', () => {
 
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + change-password; no /auth/me
 
@@ -1029,7 +1141,7 @@ describe('changePassword', () => {
 
       expect(text('token')).toBe('tok-1');
       expect(text('userEmail')).toBe(USER.email);
-      expect(text('sessionVersion')).toBe('2');
+      expect(text('sessionVersion')).toBe('3');
       expect(mockedClearToken).not.toHaveBeenCalled();
 
       mockedApiFetch.mockReset();
@@ -1211,7 +1323,7 @@ describe('deleteAccount', () => {
 
     expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me');
     expect(text('token')).toBe('tok-1');
-    expect(text('sessionVersion')).toBe('2');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
 
     mockedApiFetch.mockReset();
@@ -1234,6 +1346,7 @@ describe('deleteAccount', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1249,43 +1362,40 @@ describe('deleteAccount', () => {
     expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + delete; no /auth/me
     expect(text('token')).toBe('tok-1');
     expect(text('userEmail')).toBe(USER.email);
-    expect(text('sessionVersion')).toBe('2');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
-  it('reconciles a lost deletion response when the old token is now rejected', async () => {
+  it('does not treat a rejected old token as proof that a lost deletion response succeeded', async () => {
     await renderLoggedIn();
-    mockedApiFetch.mockImplementation((async (path: string) => {
-      if (path === '/auth/account') throw new ApiError(0, 'connection lost');
-      if (path === '/auth/me') throw new ApiError(401, 'account gone');
-      throw new Error(`unexpected apiFetch call: ${path}`);
-    }) as unknown as typeof apiFetch);
+    mockedApiFetch.mockRejectedValueOnce(new ApiError(0, 'connection lost'));
 
     await act(async () => {
-      await expect(auth!.deleteAccount('secret1')).resolves.toBeUndefined();
+      await expect(auth!.deleteAccount('secret1')).rejects.toBeInstanceOf(
+        AccountDeletionUnconfirmedError,
+      );
     });
 
-    expect(mockedApiFetch).toHaveBeenCalledWith('/auth/me', {
-      expireSessionOn401: false,
-    });
-    expect(text('token')).toBe('null');
-    expect(mockedClearToken).toHaveBeenCalledWith('tok-1');
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2); // login + DELETE; no misleading /auth/me probe
+    expect(text('token')).toBe('tok-1');
+    expect(text('userEmail')).toBe(USER.email);
+    expect(text('sessionVersion')).toBe('3');
+    expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
-  it('preserves the original deletion failure when verification proves the account remains', async () => {
+  it('reports a server-failed deletion as unconfirmed without changing the local identity', async () => {
     await renderLoggedIn();
-    const failure = new ApiError(0, 'connection lost');
-    mockedApiFetch.mockImplementation((async (path: string) => {
-      if (path === '/auth/account') throw failure;
-      if (path === '/auth/me') return { user: USER };
-      throw new Error(`unexpected apiFetch call: ${path}`);
-    }) as unknown as typeof apiFetch);
+    mockedApiFetch.mockRejectedValueOnce(new ApiError(503, 'server unavailable'));
 
     await act(async () => {
-      await expect(auth!.deleteAccount('secret1')).rejects.toBe(failure);
+      await expect(auth!.deleteAccount('secret1')).rejects.toBeInstanceOf(
+        AccountDeletionUnconfirmedError,
+      );
     });
 
+    expect(mockedApiFetch).toHaveBeenCalledTimes(2);
     expect(text('token')).toBe('tok-1');
+    expect(text('sessionVersion')).toBe('3');
     expect(mockedClearToken).not.toHaveBeenCalled();
   });
 
@@ -1562,6 +1672,49 @@ describe('session leases', () => {
     expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
     return lease;
   }
+
+  it.each(['logout', 'changePassword', 'deleteAccount'] as const)(
+    'rearms mounted leases after a failed signed-in %s transition',
+    async (operation) => {
+      await renderLoggedIn();
+      const leaseBefore = renderedSessionLease;
+      if (!leaseBefore) throw new Error('memoized session lease was not captured');
+      expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(true);
+      const response = deferred<unknown>();
+      mockedApiFetch.mockReturnValueOnce(response.promise);
+      let transition!: Promise<void>;
+
+      await act(async () => {
+        transition =
+          operation === 'logout'
+            ? auth!.logout()
+            : operation === 'changePassword'
+              ? auth!.changePassword('secret1', 'secret2')
+              : auth!.deleteAccount('secret1');
+        // beginTransition must still fence old screen continuations while the
+        // mutation outcome is unknown.
+        expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(false);
+        await Promise.resolve();
+      });
+
+      const failure = new ApiError(503, 'server unavailable');
+      await act(async () => {
+        response.reject(failure);
+        if (operation === 'deleteAccount') {
+          await expect(transition).rejects.toBeInstanceOf(AccountDeletionUnconfirmedError);
+        } else {
+          await expect(transition).rejects.toBe(failure);
+        }
+      });
+
+      expect(text('token')).toBe('tok-1');
+      expect(text('userEmail')).toBe(USER.email);
+      expect(text('sessionVersion')).toBe('3');
+      expect(renderedSessionLease).not.toBe(leaseBefore);
+      expect(auth!.isSessionLeaseCurrent(renderedSessionLease!)).toBe(true);
+      expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(false);
+    },
+  );
 
   it('keeps a lease current across a same-user profile update', async () => {
     await renderLoggedIn();

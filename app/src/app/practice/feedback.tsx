@@ -75,7 +75,8 @@ export default function FeedbackScreen() {
   const styles = themedStyles(theme);
   const { colors } = theme;
   const queryClient = useQueryClient();
-  const { feedback, clearFeedback, restoreFeedback, setAnswerMode } = usePracticeFlow();
+  const { feedback, clearFeedback, clearRecordingReferences, restoreFeedback, setAnswerMode } =
+    usePracticeFlow();
   // Every exit clears the flow state before the router finishes popping this
   // screen. Latch the outcome so the card slides away as itself instead of
   // flipping to the no-result state for the whole transition; a freshly
@@ -532,16 +533,16 @@ export default function FeedbackScreen() {
           {!!result.transcript && (
             <View style={styles.transcriptSection}>
               <Text style={styles.transcriptLabel}>
-                {isNativeOutcome(result) && user
+                {isNativeOutcome(result)
                   ? t('feedback.originalTranscript', {
-                      language: t(`language.${user.nativeLanguage}`),
+                      language: t(`language.${result.nativeLanguage}`),
                     })
                   : t('feedback.weHeard')}
               </Text>
               <Text
                 accessibilityLanguage={
-                  isNativeOutcome(result) && user
-                    ? NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage]
+                  isNativeOutcome(result)
+                    ? NATIVE_ACCESSIBILITY_LANGUAGES[result.nativeLanguage]
                     : 'en-US'
                 }
                 selectable
@@ -584,7 +585,11 @@ export default function FeedbackScreen() {
           {user && result.recordingId && (
             <>
               <Text style={styles.cardLabel}>{t('recordings.yourRecording')}</Text>
-              <RecordingPlayback ownerId={user.id} recordingId={result.recordingId} />
+              <RecordingPlayback
+                ownerId={user.id}
+                recordingId={result.recordingId}
+                onDeleted={clearRecordingReferences}
+              />
             </>
           )}
         </View>

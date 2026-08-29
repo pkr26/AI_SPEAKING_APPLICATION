@@ -185,8 +185,12 @@ function ReminderLanguageBridge() {
 }
 
 function ClientUpgradeBridge() {
-  const { token, resetStoredSession } = useAuth();
-  return <ClientUpgradeModal onLocalSignOut={token ? resetStoredSession : undefined} />;
+  const { token, signOutThisDevice } = useAuth();
+  return (
+    <ClientUpgradeModal
+      onLocalSignOut={token && signOutThisDevice ? signOutThisDevice : undefined}
+    />
+  );
 }
 
 /**

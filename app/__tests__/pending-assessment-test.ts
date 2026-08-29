@@ -9,10 +9,12 @@ import {
   markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
+  notifyPendingAssessmentReplayReady,
   parsePendingAssessment,
   pendingAssessmentFeedbackIsExpired,
   PENDING_FEEDBACK_RETENTION_MS,
   savePendingAssessment,
+  subscribeToPendingAssessmentReplay,
   type PendingAssessment,
 } from '../src/lib/pending-assessment';
 
@@ -79,6 +81,20 @@ function pendingForEndpoint(endpoint: PendingAssessment['endpoint']): PendingAss
 }
 
 describe('durable assessment handoff', () => {
+  it('notifies only live same-session replay subscribers and validates request identity', () => {
+    const listener = jest.fn();
+    const unsubscribe = subscribeToPendingAssessmentReplay(listener);
+
+    expect(notifyPendingAssessmentReplayReady(pending.requestId)).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+    unsubscribe();
+    expect(notifyPendingAssessmentReplayReady(pending.requestId)).toBe(false);
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(() => notifyPendingAssessmentReplayReady('not-a-uuid')).toThrow(
+      'requestId must be a UUID',
+    );
+  });
+
   // The module keeps an in-memory copy, so reset through the public API:
   // clearing only the SecureStore mock would leave stale cached state behind.
   beforeEach(async () => {

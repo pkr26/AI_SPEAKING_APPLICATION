@@ -32,8 +32,12 @@ export async function insertRetainedRecording(
   const inserted = (await client.query(
     `INSERT INTO recordings (
        id, user_id, request_id, attempt_id, question_id, context, storage_scope,
-       audio_key, s3_version_id, content_type, size_bytes, duration_ms, etag
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+       audio_key, s3_version_id, content_type, size_bytes, duration_ms, etag,
+       recording_retention_epoch
+     ) VALUES (
+       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+       (SELECT recording_retention_epoch FROM users WHERE id = $2)
+     )`,
     [
       capture.id,
       userId,

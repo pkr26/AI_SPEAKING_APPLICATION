@@ -47,6 +47,7 @@ interface RecordingPlaybackProps {
 // decoder that never reports ready cannot leave the UI saying "Preparing"
 // forever.
 const PLAYBACK_PREPARE_TIMEOUT_MS = 30_000;
+const SHARE_PREPARE_TIMEOUT_MS = 30_000;
 
 function abortError(): Error {
   const error = new Error('Aborted');
@@ -71,6 +72,42 @@ export function waitAbortable(milliseconds: number, signal: AbortSignal): Promis
       signal.removeEventListener('abort', rejectAbort);
       resolve();
     }, milliseconds);
+  });
+}
+
+/** Bounds native/network preparation while preserving caller-driven cancellation. */
+export function runWithAbortableTimeout<T>(
+  operation: () => Promise<T>,
+  controller: AbortController,
+  timeoutMs: number,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      controller.signal.removeEventListener('abort', onAbort);
+      callback();
+    };
+    const onAbort = () => {
+      finish(() => reject(controller.signal.reason ?? abortError()));
+    };
+    if (controller.signal.aborted) {
+      onAbort();
+      return;
+    }
+    controller.signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => {
+      controller.abort(new Error('Operation timed out'));
+    }, timeoutMs);
+    void Promise.resolve()
+      .then(operation)
+      .then(
+        (value) => finish(() => resolve(value)),
+        (error: unknown) => finish(() => reject(error)),
+      );
   });
 }
 
@@ -571,45 +608,56 @@ export default function RecordingPlayback({
     shareControllerRef.current = controller;
     setErrorMessage(null);
     setSharing(true);
-    let operationFile: OwnedPrivateFile | null = null;
-    const operationIsCurrent = () =>
+    const operationFile: { current: OwnedPrivateFile | null } = { current: null };
+    const operationOwnsUi = () =>
       committedIdentityRef.current === identityToken &&
       shareOperationRef.current === operation &&
       shareControllerRef.current === controller &&
-      !controller.signal.aborted &&
       contextIsCurrent(lifecycle);
+    const operationIsCurrent = () => operationOwnsUi() && !controller.signal.aborted;
     try {
-      if (!(await Sharing.isAvailableAsync())) {
+      const prepared = await runWithAbortableTimeout(
+        async () => {
+          if (!(await Sharing.isAvailableAsync())) return null;
+          if (!operationIsCurrent()) throw abortError();
+          const grant = await playbackGrant(controller.signal);
+          if (!operationIsCurrent()) throw abortError();
+
+          // The signed capability is consumed only by the app-owned downloader.
+          // The OS share sheet receives a cache-scoped local URI and never sees a
+          // reusable S3 URL or storage coordinate.
+          const claimedFile = claimPrivatePlaybackFile(ownerId, recordingId, grant.contentType);
+          operationFile.current = claimedFile;
+          shareFileRef.current = claimedFile;
+          await downloadPrivatePlaybackFile(grant.playbackUrl, claimedFile, controller.signal);
+          if (!operationIsCurrent() || !claimedFile.isCurrent()) throw abortError();
+          return { grant, file: claimedFile };
+        },
+        controller,
+        SHARE_PREPARE_TIMEOUT_MS,
+      );
+      if (prepared === null) {
         if (operationIsCurrent()) setErrorMessage(t('recordings.shareUnavailable'));
         return;
       }
       if (!operationIsCurrent()) return;
-      const grant = await playbackGrant(controller.signal);
-      if (!operationIsCurrent()) return;
-
-      // The signed capability is consumed only by the app-owned downloader.
-      // The OS share sheet receives a cache-scoped local URI and never sees a
-      // reusable S3 URL or storage coordinate.
-      operationFile = claimPrivatePlaybackFile(ownerId, recordingId, grant.contentType);
-      shareFileRef.current = operationFile;
-      await downloadPrivatePlaybackFile(grant.playbackUrl, operationFile, controller.signal);
-      if (!operationIsCurrent() || !operationFile.isCurrent()) return;
       // Publish ownership before invoking the native method: it is allowed to
       // synchronously background the app before returning its promise.
-      nativeShareFileRef.current = operationFile;
-      await Sharing.shareAsync(operationFile.file.uri, {
-        mimeType: grant.contentType,
+      nativeShareFileRef.current = prepared.file;
+      await Sharing.shareAsync(prepared.file.file.uri, {
+        mimeType: prepared.grant.contentType,
         dialogTitle: t('recordings.shareAction'),
       });
     } catch (error) {
-      if (operationIsCurrent()) {
+      if (operationOwnsUi()) {
         setErrorMessage(userMessageForError(error, t('recordings.shareFailed')));
       }
     } finally {
-      if (operationFile !== null) {
-        if (shareFileRef.current === operationFile) shareFileRef.current = null;
-        if (nativeShareFileRef.current === operationFile) nativeShareFileRef.current = null;
-        if (operationFile.isCurrent()) operationFile.release();
+      const claimedFile = operationFile.current;
+      if (claimedFile !== null) {
+        if (shareFileRef.current === claimedFile) shareFileRef.current = null;
+        if (nativeShareFileRef.current === claimedFile) nativeShareFileRef.current = null;
+        if (claimedFile.isCurrent()) claimedFile.release();
       }
       if (shareControllerRef.current === controller) shareControllerRef.current = null;
       if (shareOperationRef.current === operation) {

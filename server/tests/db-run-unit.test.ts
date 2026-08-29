@@ -35,6 +35,7 @@ import {
   seed,
   setupDatabase,
 } from '../db/run';
+import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
 
 const migrationsDir = path.join(__dirname, '../db/migrations');
 
@@ -48,6 +49,13 @@ function migrationRows(firstChecksum: string | null = 'recorded') {
       const checksum = createHash('sha256').update(sql).digest('hex');
       return { name, checksum: index === 0 && firstChecksum !== 'recorded' ? firstChecksum : checksum };
     });
+}
+
+function appliedMigrationRows(firstChecksum: string | null = 'recorded') {
+  return [
+    ...migrationRows(firstChecksum),
+    { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
+  ];
 }
 
 function provideClient(
@@ -284,7 +292,7 @@ describe('database deployment runner', () => {
   });
 
   it('backfills legacy checksums and reports a no-op migration run', async () => {
-    const rows = migrationRows(null);
+    const rows = appliedMigrationRows(null);
     const log = vi.fn();
     const client = provideClient(async (sql) => {
       if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
@@ -316,7 +324,7 @@ describe('database deployment runner', () => {
 
   it('does not rewrite checksums that are already recorded', async () => {
     const client = provideClient(async (sql) => {
-      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: appliedMigrationRows() };
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
       return { rows: [] };
     });
@@ -326,8 +334,50 @@ describe('database deployment runner', () => {
     expect(client.query.mock.calls.some(([sql]) => String(sql).startsWith('UPDATE schema_migrations'))).toBe(false);
   });
 
+  it('allows an unfenced pre-023 database to apply the cutover migration', async () => {
+    const ordinary = migrationRows();
+    const beforeCutover = ordinary.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration);
+    const client = provideClient(async (sql) => {
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: beforeCutover };
+      if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+      return { rows: [] };
+    });
+
+    await expect(migrate('postgres://localhost/release_test')).resolves.toEqual([
+      RECORDING_PRIVACY_CUTOVER.requiredMigration,
+    ]);
+
+    expect(client.query).toHaveBeenCalledWith(
+      fs.readFileSync(path.join(migrationsDir, RECORDING_PRIVACY_CUTOVER.requiredMigration), 'utf8'),
+    );
+  });
+
+  it('rejects a missing, altered, or out-of-sequence recording-privacy cutover fence', async () => {
+    const ordinary = migrationRows();
+    const cases = [
+      ordinary,
+      [...ordinary, { name: RECORDING_PRIVACY_CUTOVER.name, checksum: '0'.repeat(64) }],
+      [
+        ...ordinary.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration),
+        { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
+      ],
+    ];
+
+    for (const rows of cases) {
+      const client = provideClient(async (sql) => {
+        if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
+        if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
+        return { rows: [] };
+      });
+      await expect(migrate('postgres://localhost/release_test')).rejects.toThrow(
+        'database recording-privacy cutover fence is missing, invalid, or out of sequence',
+      );
+      expect(client.query).not.toHaveBeenCalledWith('BEGIN');
+    }
+  });
+
   it('rejects an altered applied migration checksum before running migration SQL', async () => {
-    const rows = migrationRows();
+    const rows = appliedMigrationRows();
     rows[0] = { ...rows[0]!, checksum: '0'.repeat(64) };
     const client = provideClient(async (sql) => {
       if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows };
@@ -394,7 +444,7 @@ describe('database deployment runner', () => {
 
   it('rejects and identifies every migration record that is absent from the release', async () => {
     const rows = [
-      ...migrationRows(),
+      ...appliedMigrationRows(),
       { name: '998_removed.sql', checksum: '0'.repeat(64) },
       { name: '999_removed.sql', checksum: 'f'.repeat(64) },
     ];
@@ -429,7 +479,7 @@ describe('database deployment runner', () => {
     const unlockError = new Error('migration unlock failed');
     const client = provideClient(async (sql) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: appliedMigrationRows() };
       if (sql.includes('pg_advisory_unlock')) throw unlockError;
       return { rows: [] };
     });
@@ -442,7 +492,7 @@ describe('database deployment runner', () => {
     const disconnectError = new Error('migration disconnect failed');
     const client = provideClient(async (sql) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: appliedMigrationRows() };
       return { rows: [] };
     });
     client.end.mockRejectedValueOnce(disconnectError);
@@ -591,7 +641,7 @@ describe('database deployment runner', () => {
     });
     const migration = provideClient(async (sql) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: appliedMigrationRows() };
       return { rows: [] };
     });
     const seeding = provideClient(async (sql) => {
@@ -636,7 +686,7 @@ describe('database deployment runner', () => {
   it('uses the real default command actions when no dispatch seam is supplied', async () => {
     const client = provideClient(async (sql) => {
       if (sql.includes('pg_try_advisory_lock')) return { rows: [{ locked: true }] };
-      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: migrationRows() };
+      if (sql === 'SELECT name, checksum FROM schema_migrations') return { rows: appliedMigrationRows() };
       return { rows: [] };
     });
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);

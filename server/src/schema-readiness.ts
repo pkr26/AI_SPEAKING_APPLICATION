@@ -2,6 +2,7 @@ import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
 import { pool } from './db';
 import { boundedQuestionInventoryQuery, questionInventoryIssues } from './question-inventory';
 
@@ -95,25 +96,35 @@ export async function assertDatabaseSchemaCurrent(
   // Binary-name ordering, independent of the database's collation, so the
   // row sequence always matches the byte-sorted packaged manifest.
   const migrationResult = await query('SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"');
-  const actual = migrationResult.rows as Array<{
-    name?: unknown;
-    checksum?: unknown;
-  }>;
+  const actualWithFences = migrationResult.rows as Array<
+    | {
+        name?: unknown;
+        checksum?: unknown;
+      }
+    | undefined
+  >;
+  const fenceRows = actualWithFences.filter((row) => row?.name === RECORDING_PRIVACY_CUTOVER.name);
+  const actual = actualWithFences.filter((row) => row?.name !== RECORDING_PRIVACY_CUTOVER.name);
+  const cutoverRequired = expected.some(({ name }) => name === RECORDING_PRIVACY_CUTOVER.requiredMigration);
+  const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === RECORDING_PRIVACY_CUTOVER.checksum;
 
-  // Prefix-subset, not equality: during a rolling deploy the new release's
-  // migration job runs before its replicas boot, so this replica legitimately
-  // sees rows it does not package. Failing those would pull every old replica
-  // out of the load balancer at once for an additive migration. Rows beyond
-  // the packaged manifest come from a newer release; the packaged ones must
-  // still be present, unchanged, and in order. An under-migrated database
-  // still fails, because a packaged entry would then be missing (positional
-  // equality already implies the database has at least as many rows).
+  // Ordinary migration rows use prefix-subset matching: during a rolling
+  // additive deploy, an old replica legitimately sees trailing rows it does
+  // not package. The packaged rows must still be present, unchanged, and in
+  // order. An under-migrated database fails because a packaged entry is then
+  // missing. Explicit incompatible cutover fences are the exception and are
+  // validated separately below.
   const manifestMatches = expected.every((entry, index) => {
     const row = actual[index];
     return row !== undefined && row.name === entry.name && row.checksum === entry.checksum;
   });
 
-  if (!manifestMatches) {
+  // Migration 023 is deliberately non-rolling: it inserts a `000_` manifest
+  // fence that makes old positional-readiness code fail. Current binaries
+  // remove only the exact verified fence before applying the normal additive
+  // prefix rule. A missing, altered, duplicated, or out-of-sequence fence is
+  // never treated as an ordinary newer migration.
+  if (!manifestMatches || (fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
     throw new Error(`Database migrations do not match this release through ${latest.name}`);
   }
 

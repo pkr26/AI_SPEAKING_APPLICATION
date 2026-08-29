@@ -141,6 +141,8 @@ export interface HistoryItem {
   questionText: string;
   cefrLevel: CefrLevel;
   context: HistoryContext;
+  /** Immutable language used for a native answer; null for English/diagnostic rows. */
+  nativeLanguage: NativeLanguage | null;
   cycleId: string | null;
   attemptNo: number;
   score: number | null;
@@ -177,6 +179,8 @@ export interface UserDataPage {
 
 export interface NativeAttemptResult {
   mode: 'native';
+  /** Immutable language snapshot attached to the submitted transcript. */
+  nativeLanguage: NativeLanguage;
   cycleId: string;
   understood: boolean;
   attemptNo: number;
@@ -701,6 +705,7 @@ export function parseNativeAttemptResult(
   if (
     !isRecord(value) ||
     value.mode !== 'native' ||
+    !isNativeLanguage(value.nativeLanguage) ||
     !isUuid(value.cycleId) ||
     (expectedCycleId !== undefined && value.cycleId !== expectedCycleId) ||
     typeof value.understood !== 'boolean' ||
@@ -744,6 +749,7 @@ export function parseNativeAttemptResult(
   }
   const result: NativeAttemptResult = {
     mode: 'native',
+    nativeLanguage: value.nativeLanguage,
     cycleId: value.cycleId,
     understood: value.understood,
     attemptNo: value.attemptNo,
@@ -832,6 +838,7 @@ const DIAGNOSTIC_MAX_ATTEMPTS = 5;
 function parseHistoryItem(value: unknown): HistoryItem {
   if (!isRecord(value)) throw new ContractError();
   const context = value.context;
+  const nativeLanguage = value.nativeLanguage;
   const cycleId = value.cycleId;
   const attemptNo = value.attemptNo;
   const score = value.score;
@@ -866,6 +873,7 @@ function parseHistoryItem(value: unknown): HistoryItem {
   if (context === 'practice-native') {
     if (
       !isUuid(cycleId) ||
+      !isNativeLanguage(nativeLanguage) ||
       score !== null ||
       passed !== null ||
       typeof understood !== 'boolean' ||
@@ -883,6 +891,7 @@ function parseHistoryItem(value: unknown): HistoryItem {
       understood !== null ||
       translatedTranscript !== null ||
       modelAnswer !== null ||
+      nativeLanguage !== null ||
       (context === 'practice' ? !isUuid(cycleId) : cycleId !== null)
     ) {
       throw new ContractError();
@@ -895,6 +904,7 @@ function parseHistoryItem(value: unknown): HistoryItem {
     questionText: value.questionText,
     cefrLevel: value.cefrLevel,
     context,
+    nativeLanguage: nativeLanguage as NativeLanguage | null,
     cycleId: cycleId as string | null,
     attemptNo: attemptNo as number,
     score: score as number | null,

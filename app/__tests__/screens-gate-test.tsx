@@ -110,7 +110,7 @@ jest.mock('../src/components/ClientUpgradeModal', () => {
   const { Text: NativeText } = jest.requireActual<typeof import('react-native')>('react-native');
   return {
     __esModule: true,
-    default: ({ onLocalSignOut }: { onLocalSignOut?: () => void }) =>
+    default: ({ onLocalSignOut }: { onLocalSignOut?: () => void | Promise<void> }) =>
       onLocalSignOut
         ? ReactActual.createElement(
             NativeText,
@@ -185,6 +185,7 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    signOutThisDevice: jest.fn(async () => undefined),
     captureSessionLease: jest.fn(() => ({}) as never),
     isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
@@ -409,13 +410,13 @@ describe('root layout route guards', () => {
   });
 
   it('bridges the signed-in upgrade escape to secure local-session cleanup', async () => {
-    const resetStoredSession = jest.fn();
-    mockAuthValue = makeAuth({ resetStoredSession });
+    const signOutThisDevice = jest.fn(async () => undefined);
+    mockAuthValue = makeAuth({ signOutThisDevice });
     await render(<RootLayout />);
 
     await fireEvent.press(screen.getByTestId('client-upgrade-local-sign-out'));
 
-    expect(resetStoredSession).toHaveBeenCalledTimes(1);
+    expect(signOutThisDevice).toHaveBeenCalledTimes(1);
   });
 
   it('does not expose a local sign-out callback without a stored signed-in session', async () => {

@@ -248,6 +248,50 @@ it('offers local sign-out without dismissing the required-update state', async (
   expect(visibleModalNode().props.visible).toBe(true);
 });
 
+it('awaits local sign-out, blocks repeat taps, and reports a localized failure', async () => {
+  const signOut = deferred<void>();
+  const onLocalSignOut = jest.fn(() => signOut.promise);
+  await render(
+    <I18nProvider accountLanguage="es">
+      <ClientUpgradeModal onLocalSignOut={onLocalSignOut} />
+    </I18nProvider>,
+  );
+  await act(async () => latchClientUpgradeRequired());
+
+  const button = screen.getByRole('button', {
+    name: translateFor('es', 'logout.thisDevice'),
+  });
+  const onPress = committedPressHandler(button);
+  await act(async () => {
+    onPress();
+    onPress();
+    await Promise.resolve();
+  });
+
+  expect(onLocalSignOut).toHaveBeenCalledTimes(1);
+  expect(
+    screen.getByRole('button', { name: translateFor('es', 'logout.thisDevice') }).props
+      .accessibilityState,
+  ).toEqual({ disabled: true, busy: true });
+
+  await act(async () => {
+    signOut.resolve();
+    await signOut.promise;
+  });
+  expect(
+    screen.getByRole('button', { name: translateFor('es', 'logout.thisDevice') }).props
+      .accessibilityState,
+  ).toEqual({ disabled: false, busy: false });
+
+  onLocalSignOut.mockRejectedValueOnce(new Error('secure token remains'));
+  await fireEvent.press(
+    screen.getByRole('button', { name: translateFor('es', 'logout.thisDevice') }),
+  );
+
+  expect(await screen.findByRole('alert')).toHaveTextContent(translateFor('es', 'error.internal'));
+  expect(visibleModalNode().props.visible).toBe(true);
+});
+
 it('keeps the modal latched and reports a localized store-opening failure', async () => {
   openUrlSpy.mockRejectedValueOnce(new Error('native store unavailable'));
   await renderModal('zh');

@@ -298,15 +298,18 @@ expires after 48 hours.
 mother-tongue speech share exactly three tries in that cycle, while silence is
 an explicit free retry. English responses report mastery (score 75+).
 `POST /practice/attempt/native` persists a real non-scored attempt with the
-original transcript, faithful English translation, comprehension feedback, and
-a separate model English answer; it never changes English mastery or SRS.
+original transcript, immutable submission-language snapshot, faithful English
+translation, comprehension feedback, and a separate model English answer; it
+never changes English mastery or SRS.
 
 History and Recordings share `RecordingPlayback`. It downloads each short-lived
 signed audio URL before starting, waits for authoritative loaded status, and
 uses the serialized playback audio mode with full app volume, iOS silent-mode
 playback, and speaker routing rather than the earpiece. Share Audio uses the
 same private download path but gives `expo-sharing` only the temporary local
-file URI; operation ownership removes that copy after success, failure,
-background, unmount, or logout. Settings' count-independent **Delete all
-recordings** confirmation calls the idempotent bulk endpoint and retires both
-recording-library and history caches after success.
+file URI; bounded pre-handoff preparation prevents a stalled download from
+wedging the controls, while operation ownership removes the copy after success,
+failure, background, unmount, or logout. Settings' count-independent **Delete
+all recordings** confirmation calls the idempotent bulk endpoint, synchronously
+removes every cached recording reference, and then refreshes both recording and
+history data.

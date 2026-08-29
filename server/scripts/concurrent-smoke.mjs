@@ -75,20 +75,20 @@ if (!Number.isSafeInteger(REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS < 1_000 || R
 // hard-fails on any mismatch, so a silently skipped phase or per-user block
 // can never report a passing run.
 //
-// Fixed portion, 496 = 4 (health/ready) + 3 (post-register isolation)
+// Fixed portion, 516 = 4 (health/ready) + 3 (post-register isolation)
 //   + 8 (serial mock-AI safety probe: 2 upload grant + 6 diagnostic answer)
 //   + 3 (post-diagnostic invariants) + 3 (final barrier-phase invariants)
 //   + 15 (one dispatch-spread check per fixed barrier phase)
-//   + 46 per user x 10 users (register 4, initial diagnostic 3, practice
+//   + 48 per user x 10 users (register 4, initial diagnostic 3, practice
 //     question 4, localized help 4, English grant 2, English attempt 8,
 //     English progress 3, native grant 2, native attempt 2, native status 2,
-//     native replay 3, post-native progress 2, data export 5, delete 1,
+//     native replay 3, post-native progress 3, data export 6, delete 1,
 //     revoked token 1).
 // The conditional sites stay deterministic because both branches assert
 // exactly once each: submitDiagnosticAnswer (done vs nextQuestion) and the
 // English attempt (passed vs failed). cleanupPlannedRegistration never calls
 // check(), so cleanup contributes zero assertions.
-const EXPECTED_FIXED_ASSERTIONS = 496;
+const EXPECTED_FIXED_ASSERTIONS = 516;
 // Each executed diagnostic wave adds 1 attempts-bound check plus 2 barrier
 // dispatch-spread checks (upload-grant phase + assessment phase)...
 const ASSERTIONS_PER_DIAGNOSTIC_WAVE = 3;
@@ -176,6 +176,7 @@ function audioForm(questionId, requestId = randomUUID(), cycleId) {
   form.append('questionId', questionId);
   form.append('requestId', requestId);
   if (cycleId) form.append('cycleId', cycleId);
+  form.append('retainRecording', 'false');
   return form;
 }
 
@@ -295,11 +296,12 @@ function validateMockAssessment(name, response) {
   );
 }
 
-function validateNativeAssessment(name, response) {
+function validateNativeAssessment(name, response, nativeLanguage) {
   expectResponse(name, response, 200);
   check(
     `${name} response shape`,
     response.body?.mode === 'native' &&
+      response.body.nativeLanguage === nativeLanguage &&
       response.body.understood === true &&
       response.body.transcript === '(mock transcript)' &&
       response.body.translatedTranscript === '(mock English translation)' &&
@@ -682,7 +684,7 @@ async function main() {
       token: user.token,
       form: audioForm(user.nativeQuestionId, user.nativeRequestId, user.practiceCycleId),
     });
-    validateNativeAssessment(`native practice attempt for user ${user.index + 1}`, nativeResponse);
+    validateNativeAssessment(`native practice attempt for user ${user.index + 1}`, nativeResponse, user.nativeLanguage);
     user.nativeResponse = nativeResponse.body;
   });
 
@@ -706,7 +708,11 @@ async function main() {
       token: user.token,
       form: audioForm(user.nativeQuestionId, user.nativeRequestId, user.practiceCycleId),
     });
-    validateNativeAssessment(`native same-request replay for user ${user.index + 1}`, replayResponse);
+    validateNativeAssessment(
+      `native same-request replay for user ${user.index + 1}`,
+      replayResponse,
+      user.nativeLanguage,
+    );
     check(
       `native same-request replay is contract-equivalent for user ${user.index + 1}`,
       isDeepStrictEqual(replayResponse.body, user.nativeResponse),
@@ -760,7 +766,10 @@ async function main() {
       exportResponse.body.attempts.filter((attempt) => attempt.context === 'diagnostic').length ===
         user.diagnosticAttempts &&
         exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice').length === 1 &&
-        exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice-native').length === 1,
+        exportResponse.body.attempts.filter((attempt) => attempt.context === 'practice-native').length === 1 &&
+        exportResponse.body.attempts.some(
+          (attempt) => attempt.context === 'practice-native' && attempt.nativeLanguage === user.nativeLanguage,
+        ),
       safeJson(exportResponse.body),
     );
     const nativeProgress = exportResponse.body.practiceProgress?.find(

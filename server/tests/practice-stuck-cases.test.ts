@@ -342,6 +342,7 @@ describe('practice stuck cases', () => {
       expect(r.status).toBe(200);
       expect(r.body).toEqual({
         mode: 'native',
+        nativeLanguage: 'te',
         understood: true,
         transcript: 'మీరు అర్థం చేసుకున్నారు.',
         translatedTranscript: 'You understood.',
@@ -463,6 +464,7 @@ describe('practice stuck cases', () => {
       expect(r.status).toBe(200);
       expect(r.body).toMatchObject({
         mode: 'native',
+        nativeLanguage: 'te',
         understood: false,
         transcript: '',
         translatedTranscript: '',

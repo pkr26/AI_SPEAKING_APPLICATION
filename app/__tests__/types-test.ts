@@ -156,6 +156,7 @@ describe('recording contracts', () => {
     expect(
       parseNativeAttemptResult({
         mode: 'native',
+        nativeLanguage: 'te',
         cycleId,
         understood: true,
         attemptNo: 1,
@@ -170,6 +171,7 @@ describe('recording contracts', () => {
     expect(
       parseNativeAttemptResult({
         mode: 'native',
+        nativeLanguage: 'te',
         cycleId,
         understood: false,
         attemptNo: 1,
@@ -681,6 +683,7 @@ describe('practice question payload parser', () => {
 describe('native attempt result parser', () => {
   const native = {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId,
     understood: true,
     attemptNo: 1,
@@ -704,6 +707,7 @@ describe('native attempt result parser', () => {
     expect(parseNativeAttemptResult(missed)).toEqual(missed);
     const silent = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId,
       understood: false,
       attemptNo: 1,
@@ -736,6 +740,8 @@ describe('native attempt result parser', () => {
   it.each([
     ['the wrong mode', { ...native, mode: 'english' }],
     ['a missing mode', { understood: true, transcript: '', modelAnswer: '', feedback: 'Good.' }],
+    ['a missing native language', { ...native, nativeLanguage: undefined }],
+    ['an unsupported native language', { ...native, nativeLanguage: 'fr' }],
     ['a non-boolean understood flag', { ...native, understood: 'yes' }],
     ['an empty feedback', { ...native, feedback: '' }],
     ['a blank feedback', { ...native, feedback: '   ' }],
@@ -766,6 +772,7 @@ describe('native attempt result parser', () => {
 describe('practice outcome discriminant', () => {
   const nativeOutcome = {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: '550e8400-e29b-41d4-a716-446655440020',
     understood: true,
     attemptNo: 1,
@@ -2238,6 +2245,7 @@ describe('practice history parser', () => {
     questionText: 'Describe a time you showed courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    nativeLanguage: null,
     cycleId,
     attemptNo: 2,
     score: 59,
@@ -2303,6 +2311,7 @@ describe('practice history parser', () => {
     const nativeItem = {
       ...item,
       context: 'practice-native',
+      nativeLanguage: 'te',
       score: null,
       passed: null,
       understood: true,
@@ -2317,6 +2326,18 @@ describe('practice history parser', () => {
     });
     expectContractError(() =>
       parsePracticeHistory({ items: [{ ...nativeItem, score: 80 }], nextCursor: null }),
+    );
+    expectContractError(() =>
+      parsePracticeHistory({
+        items: [{ ...nativeItem, nativeLanguage: undefined }],
+        nextCursor: null,
+      }),
+    );
+    expectContractError(() =>
+      parsePracticeHistory({ items: [{ ...nativeItem, nativeLanguage: 'fr' }], nextCursor: null }),
+    );
+    expectContractError(() =>
+      parsePracticeHistory({ items: [{ ...item, nativeLanguage: 'te' }], nextCursor: null }),
     );
     expectContractError(() =>
       parsePracticeHistory({
@@ -2620,6 +2641,7 @@ describe('recording contract mutation boundaries', () => {
 
     const native = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId,
       understood: true,
       attemptNo: 1,
@@ -2806,6 +2828,7 @@ describe('history recording-field mutation boundaries', () => {
     questionText: question.questionText,
     cefrLevel: question.cefrLevel,
     context: 'practice' as const,
+    nativeLanguage: null,
     cycleId,
     attemptNo: 1,
     score: 70,

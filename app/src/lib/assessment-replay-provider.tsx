@@ -1,6 +1,14 @@
 import { onlineManager, useQueryClient } from '@tanstack/react-query';
 import { router } from 'expo-router';
-import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react';
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import { ActivityIndicator, AppState, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -11,9 +19,11 @@ import { useAuth } from './auth';
 import { useT } from './i18n';
 import {
   clearPendingAssessment,
+  getPendingAssessmentReplayRevision,
   loadPendingAssessment,
   markPendingAssessmentFeedbackPending,
   pendingAssessmentFeedbackIsExpired,
+  subscribeToPendingAssessmentReplay,
 } from './pending-assessment';
 import { usePracticeFlow } from './practice-flow';
 import { createThemedStyles, useTheme } from './theme';
@@ -74,9 +84,14 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
   const theme = useTheme();
   const styles = themedStyles(theme);
   const [retryVersion, setRetryVersion] = useState(0);
+  const pendingReplayRevision = useSyncExternalStore(
+    subscribeToPendingAssessmentReplay,
+    getPendingAssessmentReplayRevision,
+    getPendingAssessmentReplayRevision,
+  );
   const identity = `${sessionVersion}:${user?.id ?? 'anonymous'}`;
   const shouldCheck = !!token && !!user && !isRestoring && !restoreError;
-  const checkKey = `${identity}:${shouldCheck ? 'check' : 'skip'}:${retryVersion}`;
+  const checkKey = `${identity}:${shouldCheck ? 'check' : 'skip'}:${retryVersion}:${pendingReplayRevision}`;
   const [state, setState] = useState<ReplayState>(() =>
     initialState(identity, checkKey, shouldCheck),
   );

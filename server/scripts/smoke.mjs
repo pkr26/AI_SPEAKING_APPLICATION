@@ -20,7 +20,7 @@ if (typeof CLIENT_VERSION !== 'string' || CLIENT_VERSION.length === 0) {
 // exactly once per successful run (everything outside the diagnostic-answer
 // and practice-attempt loops, excluding the final tally check itself).
 // UPDATE THIS COUNT whenever checks are intentionally added or removed.
-const EXPECTED_DETERMINISTIC_ASSERTIONS = 59;
+const EXPECTED_DETERMINISTIC_ASSERTIONS = 60;
 
 let passed = 0;
 function ok(name, cond, extra = '') {
@@ -61,6 +61,8 @@ function audioForm(questionId, requestId = randomUUID(), cycleId) {
   form.append('questionId', questionId);
   form.append('requestId', requestId);
   if (cycleId) form.append('cycleId', cycleId);
+  // Match the current app's explicit, default-off per-take privacy choice.
+  form.append('retainRecording', 'false');
   return form;
 }
 
@@ -438,6 +440,7 @@ ok(
   'native attempt returns comprehension result',
   r.status === 200 &&
     r.body.mode === 'native' &&
+    r.body.nativeLanguage === 'hi' &&
     typeof r.body.understood === 'boolean' &&
     typeof r.body.transcript === 'string' &&
     typeof r.body.translatedTranscript === 'string' &&
@@ -470,6 +473,7 @@ ok(
         'createdAt',
       ]),
     ) &&
+    r.body.items.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
     (r.body.nextCursor === null || isUuid(r.body.nextCursor)),
   JSON.stringify(r.body).slice(0, 300),
 );
@@ -495,6 +499,7 @@ ok(
     r.body.user?.id === userId &&
     Array.isArray(r.body.attempts) &&
     r.body.attempts.length > 0 &&
+    r.body.attempts.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
     r.body.user.password_hash === undefined,
   JSON.stringify(r.body).slice(0, 200),
 );

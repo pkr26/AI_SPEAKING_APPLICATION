@@ -7,6 +7,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createApp } from '../src/app';
 import { pool } from '../src/db';
+import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
 import {
   assertDatabaseSchemaCurrent,
   expectedMigrationManifest,
@@ -19,7 +20,10 @@ import {
 const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
 
 function successfulMigrationRows() {
-  return expectedMigrationManifest().map(({ name, checksum }) => ({ name, checksum }));
+  return [
+    { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
+    ...expectedMigrationManifest().map(({ name, checksum }) => ({ name, checksum })),
+  ];
 }
 
 function inventoryRow(cefr_level: string) {
@@ -101,7 +105,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('021_recording_retention_epoch.sql');
+    expect(manifest.at(-1)?.name).toBe('023_recording_bulk_cleanup.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -111,7 +115,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '021_recording_retention_epoch.sql',
+      latestMigration: '023_recording_bulk_cleanup.sql',
     });
     expect(query.mock.calls[0]).toEqual(['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"']);
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
@@ -120,6 +124,45 @@ describe('database schema readiness', () => {
     expect(query.mock.calls[2]?.[0]).toContain('ORDER BY cefr_level');
     expect(query.mock.calls[2]?.[0]).toContain('LIMIT $1');
     expect(query.mock.calls[2]?.[1]).toEqual([601]);
+  });
+
+  it('uses the 000 manifest fence to make pre-023 positional readiness fail closed', () => {
+    const oldPackagedManifest = expectedMigrationManifest().filter(
+      ({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration,
+    );
+    const databaseRows = successfulMigrationRows();
+
+    expect(databaseRows[0]).toEqual({
+      name: RECORDING_PRIVACY_CUTOVER.name,
+      checksum: RECORDING_PRIVACY_CUTOVER.checksum,
+    });
+    expect(
+      oldPackagedManifest.every((entry, index) => {
+        const row = databaseRows[index];
+        return row?.name === entry.name && row.checksum === entry.checksum;
+      }),
+    ).toBe(false);
+  });
+
+  it('rejects a missing, altered, duplicated, or out-of-sequence cutover fence', async () => {
+    const current = successfulMigrationRows();
+    const withoutFence = current.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.name);
+    const wrongFence = current.map((row) =>
+      row.name === RECORDING_PRIVACY_CUTOVER.name ? { ...row, checksum: '0'.repeat(64) } : row,
+    );
+    const duplicatedFence = [
+      ...current,
+      { name: RECORDING_PRIVACY_CUTOVER.name, checksum: RECORDING_PRIVACY_CUTOVER.checksum },
+    ];
+    const withoutRequiredMigration = current.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.requiredMigration);
+
+    for (const rows of [withoutFence, wrongFence, duplicatedFence, withoutRequiredMigration]) {
+      const query = vi.fn().mockResolvedValue({ rows });
+      await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
+        'Database migrations do not match this release',
+      );
+      expect(query).toHaveBeenCalledOnce();
+    }
   });
 
   it('rejects a missing or checksum-mismatched migration, even beside newer extra rows', async () => {
@@ -149,7 +192,7 @@ describe('database schema readiness', () => {
 
     // The reported migration is still this release's latest packaged one.
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '021_recording_retention_epoch.sql',
+      latestMigration: '023_recording_bulk_cleanup.sql',
     });
   });
 
@@ -170,7 +213,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '021_recording_retention_epoch.sql',
+      latestMigration: '023_recording_bulk_cleanup.sql',
     });
   });
 
@@ -220,7 +263,7 @@ describe('database schema readiness', () => {
 
     try {
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '021_recording_retention_epoch.sql',
+        latestMigration: '023_recording_bulk_cleanup.sql',
       });
       expect(query.mock.calls).toEqual([
         ['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"', []],
@@ -255,8 +298,8 @@ describe('database schema readiness', () => {
       releaseInventory({ rows: completeQuestionInventory });
 
       await expect(Promise.all([first, second])).resolves.toEqual([
-        { latestMigration: '021_recording_retention_epoch.sql' },
-        { latestMigration: '021_recording_retention_epoch.sql' },
+        { latestMigration: '023_recording_bulk_cleanup.sql' },
+        { latestMigration: '023_recording_bulk_cleanup.sql' },
       ]);
       expect(query.mock.calls.filter(([text]) => String(text).includes('FROM schema_migrations'))).toHaveLength(2);
       expect(query.mock.calls.filter(([text]) => String(text).includes('to_regclass'))).toHaveLength(2);
@@ -311,7 +354,7 @@ describe('database schema readiness', () => {
     try {
       await expect(assertDatabaseSchemaCurrent()).rejects.toThrow('catalog read failed');
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '021_recording_retention_epoch.sql',
+        latestMigration: '023_recording_bulk_cleanup.sql',
       });
       expect(inventoryReads).toBe(2);
     } finally {
@@ -335,7 +378,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: malformedInventory });
 
     await expect(assertDatabaseSchemaCurrent(healthyAdapter as SchemaQuery)).resolves.toEqual({
-      latestMigration: '021_recording_retention_epoch.sql',
+      latestMigration: '023_recording_bulk_cleanup.sql',
     });
     await expect(assertDatabaseSchemaCurrent(malformedAdapter as SchemaQuery)).rejects.toThrow(
       'Question inventory is invalid',

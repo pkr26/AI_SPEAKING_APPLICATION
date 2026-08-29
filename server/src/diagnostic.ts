@@ -59,7 +59,7 @@ function questionJson(question: QuestionRow): QuestionJson {
  * Return only the current placement run. Retakes deliberately preserve older
  * diagnostic history, while diagnostic_state.questions_asked restarts at
  * zero; taking the newest N rows therefore identifies the active/latest run
- * without a schema migration and makes resume/completion screens durable.
+ * and makes resume/completion screens durable.
  */
 async function diagnosticAnswerSummaries(
   client: PoolClient,
@@ -78,6 +78,13 @@ async function diagnosticAnswerSummaries(
     [userId, questionsAsked],
   );
   return rows.reverse();
+}
+
+function hasLegacySilentAnswer(answers: readonly DiagnosticAnswerSummary[]): boolean {
+  // String.prototype.trim uses the same ECMAScript whitespace set enforced by
+  // the mobile parser and migration 022. Current writers never persist
+  // silence, so any blank summary belongs to a legacy counted-silence run.
+  return answers.some(({ transcript }) => transcript.trim() === '');
 }
 
 /** Lock and read the user's diagnostic state, creating it on first use. */
@@ -366,16 +373,62 @@ export function createDiagnosticRouter(limiters: Limiters) {
         // lock waits out a final answer's finalization, which leaves a
         // terminal window (low_idx > high_idx) that would otherwise index
         // LEVELS out of range or serve a question /answer can only reject.
-        const lockedUser = await client.query<{ cefr_level: string | null; diagnostic_completed: boolean }>(
-          'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE',
-          [user.id],
-        );
+        const lockedUser = await client.query<{
+          cefr_level: string | null;
+          diagnostic_completed: boolean;
+          diagnostic_acknowledged: boolean;
+        }>('SELECT cefr_level, diagnostic_completed, diagnostic_acknowledged FROM users WHERE id = $1 FOR UPDATE', [
+          user.id,
+        ]);
         const lockedUserRow = lockedUser.rows[0];
         if (!lockedUserRow) {
           throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
         }
         const state = await lockState(client, user.id);
-        const answers = await diagnosticAnswerSummaries(client, user.id, state.questions_asked);
+        let answers = await diagnosticAnswerSummaries(client, user.id, state.questions_asked);
+        // Migration 022 repairs every row present at deploy time. Keep this
+        // transaction-local guard as rolling-deploy protection in case an old
+        // worker commits a counted silent answer after the migration snapshot.
+        // A just-completed reveal is still pending acknowledgement, so restart
+        // it too; otherwise the 1.1 client cannot parse the blank summary it
+        // must show. Historical placements backfilled as acknowledged remain
+        // complete and simply omit their unavailable legacy summaries.
+        if (hasLegacySilentAnswer(answers)) {
+          if (lockedUserRow.diagnostic_completed && lockedUserRow.diagnostic_acknowledged) {
+            await client.query('COMMIT');
+            return res.json({ done: true, level: lockedUserRow.cefr_level, answers: [] });
+          }
+          await client.query(
+            `UPDATE diagnostic_state
+             SET low_idx = 0, high_idx = 5, questions_asked = 0,
+                 current_question_id = NULL, processing_question_id = NULL,
+                 processing_started_at = NULL, processing_claim_id = NULL
+             WHERE user_id = $1`,
+            [user.id],
+          );
+          await client.query(
+            `UPDATE practice_cycles
+             SET status = 'closed', closed_at = now(), updated_at = now()
+             WHERE user_id = $1 AND status = 'active'`,
+            [user.id],
+          );
+          await client.query(
+            `UPDATE users
+             SET diagnostic_completed = false, diagnostic_acknowledged = false, cefr_level = NULL
+             WHERE id = $1`,
+            [user.id],
+          );
+          lockedUserRow.diagnostic_completed = false;
+          lockedUserRow.diagnostic_acknowledged = false;
+          lockedUserRow.cefr_level = null;
+          state.low_idx = 0;
+          state.high_idx = 5;
+          state.questions_asked = 0;
+          state.current_question_id = null;
+          state.processing_question_id = null;
+          state.processing_claim_id = null;
+          answers = [];
+        }
         if (lockedUserRow.diagnostic_completed) {
           await client.query('COMMIT');
           return res.json({ done: true, level: lockedUserRow.cefr_level, answers });

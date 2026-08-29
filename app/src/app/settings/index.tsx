@@ -1,4 +1,4 @@
-import { useQueryClient } from '@tanstack/react-query';
+import { type InfiniteData, useQueryClient } from '@tanstack/react-query';
 import { router, useFocusEffect, useNavigation } from 'expo-router';
 import * as Sharing from 'expo-sharing';
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
@@ -38,7 +38,7 @@ import { NATIVE_LANGUAGE_OPTIONS, UI_LANGUAGE_OPTIONS } from '../../lib/language
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { claimPrivateExportFile, type OwnedPrivateFile } from '../../lib/private-artifacts';
 import { createThemedStyles, useTheme } from '../../lib/theme';
-import type { NativeLanguage, User } from '../../lib/types';
+import type { HistoryPage, NativeLanguage, RecordingPage, User } from '../../lib/types';
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export function formatReminderHour(hour: number, language: UiLanguage = 'en'): string {
@@ -57,6 +57,35 @@ interface ReminderState {
   hour: number;
 }
 
+/** Makes a successful delete-all immediately authoritative even if refetch fails. */
+export function emptyRecordingPages(
+  data: InfiniteData<RecordingPage> | undefined,
+): InfiniteData<RecordingPage> | undefined {
+  if (!data) return data;
+  return {
+    ...data,
+    pages: data.pages.map((page) => ({ ...page, items: [], nextCursor: null })),
+  };
+}
+
+/** Keeps attempt history while removing every now-invalid audio capability. */
+export function clearHistoryRecordingReferences(
+  data: InfiniteData<HistoryPage> | undefined,
+): InfiniteData<HistoryPage> | undefined {
+  if (!data) return data;
+  return {
+    ...data,
+    pages: data.pages.map((page) => ({
+      ...page,
+      items: page.items.map((item) => ({
+        ...item,
+        recordingId: null,
+        recordingStatus: null,
+      })),
+    })),
+  };
+}
+
 /**
  * Real settings/profile screen replacing the old Alert menus: profile facts,
  * name plus independent app-language and learning-language editing,
@@ -65,10 +94,11 @@ interface ReminderState {
  */
 export default function SettingsScreen() {
   const {
+    token,
     user,
     setUser,
     logout,
-    resetStoredSession,
+    signOutThisDevice,
     sessionVersion,
     captureSessionLease,
     isSessionLeaseCurrent,
@@ -81,13 +111,14 @@ export default function SettingsScreen() {
   const styles = themedStyles(theme);
   const { colors } = theme;
   const queryClient = useQueryClient();
-  const { resetPracticeFlow } = usePracticeFlow();
+  const { clearRecordingReferences, resetPracticeFlow } = usePracticeFlow();
   const navigation = useNavigation();
   // Bind callbacks to the session that rendered them. A stale native event
   // must not be able to call captureSessionLease later and mint authority for
   // whichever account happens to be active by then.
   const renderSessionLease: SessionLease = captureSessionLease();
   const activeIdentity = sessionVersion;
+  const accountUserId = user?.id ?? null;
   const canonicalName = user?.name ?? '';
 
   const [nameDraft, setNameDraft] = useState(canonicalName);
@@ -149,6 +180,7 @@ export default function SettingsScreen() {
   const nameDraftRef = useRef(canonicalName);
   const userRef = useRef(user);
   const activeIdentityRef = useRef<number | null>(activeIdentity);
+  const accountSessionRef = useRef({ token, userId: accountUserId });
 
   const blockingOperationActive = useCallback(
     () =>
@@ -219,6 +251,9 @@ export default function SettingsScreen() {
   useLayoutEffect(() => {
     userRef.current = user;
   }, [user]);
+  useLayoutEffect(() => {
+    accountSessionRef.current = { token, userId: accountUserId };
+  }, [accountUserId, token]);
   // A profile request can finish after logout or another identity transition.
   // Update this guard in the layout phase of every committed identity change,
   // before promise continuations can run, so delayed success cannot restore a
@@ -278,6 +313,17 @@ export default function SettingsScreen() {
     () => activeIdentityRef.current === activeIdentity,
     [activeIdentity],
   );
+  const renderedAccountSessionIsCurrent = useCallback(() => {
+    const current = accountSessionRef.current;
+    return (
+      !navigationStartedRef.current &&
+      activeIdentityRef.current !== null &&
+      token !== null &&
+      accountUserId !== null &&
+      current.token === token &&
+      current.userId === accountUserId
+    );
+  }, [accountUserId, token]);
 
   const navigateOnce = useCallback(
     (
@@ -704,19 +750,18 @@ export default function SettingsScreen() {
         ]);
         if (!operationIsCurrent()) return;
 
-        // Retire inactive pages immediately so navigating back can never flash
-        // an audio action that no longer exists. Active pages stay mounted and
-        // are invalidated below, which lets their observers refetch safely.
-        queryClient.removeQueries({
-          queryKey: ['recordings', user.id],
-          exact: true,
-          type: 'inactive',
-        });
-        queryClient.removeQueries({
-          queryKey: ['practice-history', user.id],
-          exact: true,
-          type: 'inactive',
-        });
+        // Navigation-blurred screens remain active observers. Update both
+        // caches synchronously before refetching so a transient refetch failure
+        // can never resurrect playback/share/delete controls for removed audio.
+        queryClient.setQueryData<InfiniteData<RecordingPage>>(
+          ['recordings', user.id],
+          emptyRecordingPages,
+        );
+        queryClient.setQueryData<InfiniteData<HistoryPage>>(
+          ['practice-history', user.id],
+          clearHistoryRecordingReferences,
+        );
+        clearRecordingReferences();
         await Promise.all([
           queryClient.invalidateQueries({ queryKey: ['recordings', user.id], exact: true }),
           queryClient.invalidateQueries({
@@ -968,23 +1013,48 @@ export default function SettingsScreen() {
     } catch (error) {
       if (error instanceof LogoutCleanupError) {
         Alert.alert(t('logout.cleanupTitle'), error.message);
-      } else if (renderIsMountedIdentity()) {
+      } else if (renderedAccountSessionIsCurrent()) {
         Alert.alert(t('logout.failedTitle'), t('logout.localBody'), [
           { text: t('common.cancel'), style: 'cancel' },
           {
             text: t('logout.thisDevice'),
             style: 'destructive',
             onPress: () => {
-              if (!renderIsMountedIdentity()) return;
-              resetStoredSession();
-              router.replace('/');
+              if (
+                !signOutThisDevice ||
+                !renderedAccountSessionIsCurrent() ||
+                logoutBusyRef.current
+              ) {
+                return;
+              }
+              logoutBusyRef.current = true;
+              publishNavigationLock();
+              setLogoutBusy(true);
+              void signOutThisDevice()
+                .then(() => {
+                  // AuthProvider's session reset owns the route-tree switch;
+                  // avoid using this now-stale signed-in render to navigate a
+                  // different identity that might mount afterward.
+                })
+                .catch(() => {
+                  if (renderedAccountSessionIsCurrent()) {
+                    Alert.alert(t('logout.failedTitle'), t('error.internal'));
+                  }
+                })
+                .finally(() => {
+                  logoutBusyRef.current = false;
+                  if (renderedAccountSessionIsCurrent()) {
+                    publishNavigationLock();
+                    setLogoutBusy(false);
+                  }
+                });
             },
           },
         ]);
       }
     } finally {
       logoutBusyRef.current = false;
-      if (renderIsMountedIdentity()) {
+      if (renderIsMountedIdentity() || renderedAccountSessionIsCurrent()) {
         publishNavigationLock();
         setLogoutBusy(false);
       }

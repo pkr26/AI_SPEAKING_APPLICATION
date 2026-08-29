@@ -81,8 +81,8 @@ describe('upload static security policy', () => {
     expect(options.limits).toEqual({
       fileSize: 25 * 1024 * 1024 + 1,
       files: 1,
-      fields: 3,
-      parts: 5,
+      fields: 4,
+      parts: 6,
       fieldNameSize: 64,
       fieldSize: 128,
       headerPairs: 50,

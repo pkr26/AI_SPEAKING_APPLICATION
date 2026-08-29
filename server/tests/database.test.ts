@@ -6,6 +6,7 @@ import { preflight } from '../db/preflight';
 import { migrate, seed } from '../db/run';
 import { assertSafeDestructiveDatabase } from '../db/database-safety';
 import { renderSeedSql } from '../db/generate-seed';
+import { RECORDING_PRIVACY_CUTOVER } from '../db/schema-cutover';
 import { questions, type QuestionSeed } from '../db/seed-data';
 import { assertDatabaseSchemaCurrent, resetQuestionInventoryReadinessCacheForTests } from '../src/schema-readiness';
 import { assertSafeTestDatabase, destructivePurposeForEnvironment } from './global-setup';
@@ -56,7 +57,7 @@ describe('database content seeding', () => {
   it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
     resetQuestionInventoryReadinessCacheForTests();
     await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-      latestMigration: '021_recording_retention_epoch.sql',
+      latestMigration: '023_recording_bulk_cleanup.sql',
     });
     const expectInventoryRejected = async () => {
       resetQuestionInventoryReadinessCacheForTests();
@@ -700,6 +701,393 @@ describe('migration 021 recording retention epoch', () => {
       await expect(
         client.query('UPDATE assessment_requests SET recording_retention_epoch = -1 WHERE request_id = 1'),
       ).rejects.toMatchObject({ code: '23514' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 023 recording bulk cleanup generation', () => {
+  it('backfills each recording from its owner and requires a nonnegative generation', async () => {
+    const client = await pool.connect();
+    const schema = `recording_bulk_generation_${randomUUID().replace(/-/g, '')}`;
+    const ownerId = randomUUID();
+    const originalRecordingId = randomUUID();
+    const oldWriterRecordingId = randomUUID();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query('CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, checksum TEXT NOT NULL)');
+      await client.query('CREATE TABLE users (id UUID PRIMARY KEY, recording_retention_epoch BIGINT NOT NULL)');
+      await client.query(
+        `CREATE TABLE recordings (
+           id UUID PRIMARY KEY,
+           user_id UUID NOT NULL REFERENCES users(id),
+           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         )`,
+      );
+      await client.query('INSERT INTO users (id, recording_retention_epoch) VALUES ($1, 7)', [ownerId]);
+      await client.query('INSERT INTO recordings (id, user_id) VALUES ($1, $2)', [originalRecordingId, ownerId]);
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/023_recording_bulk_cleanup.sql'), 'utf8');
+      await client.query(sql);
+
+      expect((await client.query('SELECT name, checksum FROM schema_migrations')).rows).toEqual([
+        {
+          name: RECORDING_PRIVACY_CUTOVER.name,
+          checksum: RECORDING_PRIVACY_CUTOVER.checksum,
+        },
+      ]);
+
+      expect(
+        (await client.query('SELECT recording_retention_epoch FROM recordings WHERE id = $1', [originalRecordingId]))
+          .rows,
+      ).toEqual([{ recording_retention_epoch: '7' }]);
+      await client.query('SAVEPOINT before_invalid_recording_epoch');
+      await expect(
+        client.query('UPDATE recordings SET recording_retention_epoch = -1 WHERE id = $1', [originalRecordingId]),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_recording_epoch');
+      await client.query('INSERT INTO recordings (id, user_id) VALUES ($1, $2)', [oldWriterRecordingId, ownerId]);
+      expect(
+        (await client.query('SELECT recording_retention_epoch FROM recordings WHERE id = $1', [oldWriterRecordingId]))
+          .rows,
+      ).toEqual([{ recording_retention_epoch: '7' }]);
+      await client.query(
+        `INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch)
+         VALUES ($1, 7)
+         ON CONFLICT (user_id) DO UPDATE SET cutoff_epoch = EXCLUDED.cutoff_epoch`,
+        [ownerId],
+      );
+      await client.query(
+        `INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch)
+         VALUES ($1, 8)
+         ON CONFLICT (user_id) DO UPDATE SET cutoff_epoch = EXCLUDED.cutoff_epoch`,
+        [ownerId],
+      );
+      expect((await client.query('SELECT user_id, cutoff_epoch FROM recording_bulk_cleanup_jobs')).rows).toEqual([
+        { user_id: ownerId, cutoff_epoch: '8' },
+      ]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 022 learning audit repairs', () => {
+  it('repairs pending silent diagnostic runs and snapshots native-attempt languages', async () => {
+    const client = await pool.connect();
+    const schema = `learning_audit_upgrade_${randomUUID().replace(/-/g, '')}`;
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query(`CREATE TABLE users (
+        id INTEGER PRIMARY KEY,
+        diagnostic_completed BOOLEAN NOT NULL,
+        diagnostic_acknowledged BOOLEAN NOT NULL,
+        cefr_level TEXT,
+        native_language TEXT NOT NULL
+      )`);
+      await client.query(`CREATE TABLE diagnostic_state (
+        user_id INTEGER PRIMARY KEY,
+        low_idx INTEGER NOT NULL,
+        high_idx INTEGER NOT NULL,
+        questions_asked INTEGER NOT NULL,
+        current_question_id INTEGER,
+        processing_question_id INTEGER,
+        processing_started_at TIMESTAMPTZ,
+        processing_claim_id UUID
+      )`);
+      await client.query(`CREATE TABLE attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id INTEGER NOT NULL,
+        question_id INTEGER NOT NULL DEFAULT 1,
+        practice_cycle_id INTEGER DEFAULT 101,
+        context TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL DEFAULT 1,
+        transcript TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+      )`);
+      await client.query(`CREATE TABLE assessment_requests (
+        request_id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        question_id INTEGER NOT NULL DEFAULT 1,
+        practice_cycle_id INTEGER DEFAULT 101,
+        context TEXT NOT NULL,
+        status TEXT NOT NULL,
+        response_version SMALLINT NOT NULL DEFAULT 2,
+        response_body JSONB
+      )`);
+      await client.query(`CREATE TABLE practice_cycles (
+        id INTEGER PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        closed_at TIMESTAMPTZ
+      )`);
+      await client.query(
+        `INSERT INTO users
+           (id, diagnostic_completed, diagnostic_acknowledged, cefr_level, native_language)
+         VALUES
+           (1, false, false, NULL, 'te'),
+           (2, false, false, NULL, 'hi'),
+           (3, false, false, NULL, 'es'),
+           (4, true, true, 'C1', 'zh'),
+           (5, true, false, 'A1', 'te'),
+           (6, false, false, NULL, 'es')`,
+      );
+      await client.query(
+        `INSERT INTO diagnostic_state
+           (user_id, low_idx, high_idx, questions_asked, current_question_id,
+            processing_question_id, processing_started_at, processing_claim_id)
+         VALUES
+           (1, 0, 1, 1, 11, 11, now(), gen_random_uuid()),
+           (2, 1, 4, 2, 12, NULL, NULL, NULL),
+           (3, 1, 4, 2, 13, NULL, NULL, NULL),
+           (4, 4, 3, 1, NULL, NULL, NULL, NULL),
+           (5, 0, -1, 1, NULL, NULL, NULL, NULL)`,
+      );
+      await client.query(
+        `INSERT INTO attempts (user_id, context, attempt_no, transcript, created_at) VALUES
+           (1, 'diagnostic', 1, '', now() - interval '1 minute'),
+           (2, 'diagnostic', 1, 'spoken first answer', now() - interval '2 minutes'),
+           (2, 'diagnostic', 2, $1, now() - interval '1 minute'),
+           (3, 'diagnostic', 1, '', now() - interval '3 minutes'),
+           (3, 'diagnostic', 1, 'active first answer', now() - interval '2 minutes'),
+           (3, 'diagnostic', 2, 'active second answer', now() - interval '1 minute'),
+           (4, 'diagnostic', 1, '', now() - interval '1 minute'),
+           (5, 'diagnostic', 1, '', now() - interval '1 minute'),
+           (1, 'practice-native', 1, 'native answer', now())`,
+        [`\t\u00a0\ufeff`],
+      );
+      await client.query(
+        `INSERT INTO practice_cycles (id, user_id, status)
+         VALUES (1, 5, 'active')`,
+      );
+      await client.query(
+        `INSERT INTO assessment_requests
+           (request_id, user_id, context, status, response_version, response_body)
+         VALUES
+           (1, 1, 'practice-native', 'completed', 2, '{"mode":"native"}'::jsonb),
+           (2, 2, 'practice-native', 'processing', 2, NULL),
+           (3, 5, 'diagnostic', 'completed', 2,
+             '{"transcript":"","passed":false,"score":0}'::jsonb),
+           (4, 5, 'diagnostic', 'processing', 2, NULL)`,
+      );
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/022_learning_audit_repairs.sql'), 'utf8');
+      await client.query(sql);
+
+      const states = await client.query(
+        `SELECT user_id, low_idx, high_idx, questions_asked, current_question_id,
+                processing_question_id, processing_started_at, processing_claim_id
+         FROM diagnostic_state ORDER BY user_id`,
+      );
+      expect(states.rows).toEqual([
+        {
+          user_id: 1,
+          low_idx: 0,
+          high_idx: 5,
+          questions_asked: 0,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 2,
+          low_idx: 0,
+          high_idx: 5,
+          questions_asked: 0,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 3,
+          low_idx: 1,
+          high_idx: 4,
+          questions_asked: 2,
+          current_question_id: 13,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 4,
+          low_idx: 4,
+          high_idx: 3,
+          questions_asked: 1,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+        {
+          user_id: 5,
+          low_idx: 0,
+          high_idx: 5,
+          questions_asked: 0,
+          current_question_id: null,
+          processing_question_id: null,
+          processing_started_at: null,
+          processing_claim_id: null,
+        },
+      ]);
+
+      expect(
+        (
+          await client.query(
+            `SELECT id, diagnostic_completed, diagnostic_acknowledged, cefr_level
+             FROM users WHERE id IN (4, 5) ORDER BY id`,
+          )
+        ).rows,
+      ).toEqual([
+        { id: 4, diagnostic_completed: true, diagnostic_acknowledged: true, cefr_level: 'C1' },
+        { id: 5, diagnostic_completed: false, diagnostic_acknowledged: false, cefr_level: null },
+      ]);
+      expect((await client.query('SELECT status, closed_at FROM practice_cycles WHERE id = 1')).rows).toEqual([
+        { status: 'closed', closed_at: expect.any(Date) },
+      ]);
+
+      const existingNative = await client.query<{ native_language: string }>(
+        `SELECT native_language FROM attempts
+         WHERE user_id = 1 AND context = 'practice-native'`,
+      );
+      expect(existingNative.rows).toEqual([{ native_language: 'te' }]);
+
+      const migratedResponse = await client.query<{ native_language: string }>(
+        `SELECT response_body->>'nativeLanguage' AS native_language
+         FROM assessment_requests WHERE request_id = 1`,
+      );
+      expect(migratedResponse.rows).toEqual([{ native_language: 'te' }]);
+
+      // A request that existed before migration uses the only recoverable
+      // profile fallback. Even an older writer's attempt INSERT can stay NULL
+      // temporarily: completing that exact request synchronizes both durable
+      // artifacts before the deferred commit check runs.
+      const insertedNative = await client.query<{ native_language: string | null }>(
+        `INSERT INTO attempts
+           (user_id, question_id, practice_cycle_id, context, transcript, created_at)
+         VALUES (2, 1, 101, 'practice-native', 'older-writer answer', now())
+         RETURNING native_language`,
+      );
+      expect(insertedNative.rows).toEqual([{ native_language: null }]);
+      const completedByOlderWriter = await client.query<{ native_language: string }>(
+        `UPDATE assessment_requests
+         SET status = 'completed',
+             response_body =
+               '{"mode":"native","transcript":"respuesta","attemptNo":1}'::jsonb
+         WHERE request_id = 2
+         RETURNING response_body->>'nativeLanguage' AS native_language`,
+      );
+      expect(completedByOlderWriter.rows).toEqual([{ native_language: 'hi' }]);
+      expect(
+        (
+          await client.query(
+            `SELECT native_language FROM attempts
+             WHERE user_id = 2 AND context = 'practice-native'`,
+          )
+        ).rows,
+      ).toEqual([{ native_language: 'hi' }]);
+
+      // A post-migration draining writer snapshots at the durable claim. A
+      // later profile change must not relabel its eventual attempt or replay.
+      const oldWriterClaim = await client.query<{ native_language: string }>(
+        `INSERT INTO assessment_requests
+           (request_id, user_id, question_id, practice_cycle_id, context, status, response_body)
+         VALUES (5, 6, 1, 606, 'practice-native', 'processing', NULL)
+         RETURNING native_language`,
+      );
+      expect(oldWriterClaim.rows).toEqual([{ native_language: 'es' }]);
+      await client.query("UPDATE users SET native_language = 'zh' WHERE id = 6");
+      expect(
+        (
+          await client.query(
+            `INSERT INTO attempts
+               (user_id, question_id, practice_cycle_id, context, attempt_no, transcript, created_at)
+             VALUES (6, 1, 606, 'practice-native', 1, 'respuesta original', now())
+             RETURNING native_language`,
+          )
+        ).rows,
+      ).toEqual([{ native_language: null }]);
+      const exactOldWriterCompletion = await client.query<{ native_language: string }>(
+        `UPDATE assessment_requests
+         SET status = 'completed',
+             response_body =
+               '{"mode":"native","transcript":"respuesta original","attemptNo":1}'::jsonb
+         WHERE request_id = 5
+         RETURNING response_body->>'nativeLanguage' AS native_language`,
+      );
+      expect(exactOldWriterCompletion.rows).toEqual([{ native_language: 'es' }]);
+      expect(
+        (
+          await client.query(
+            `SELECT native_language FROM attempts
+             WHERE user_id = 6 AND practice_cycle_id = 606`,
+          )
+        ).rows,
+      ).toEqual([{ native_language: 'es' }]);
+
+      expect(
+        (await client.query('SELECT response_version FROM assessment_requests WHERE request_id = 3')).rows,
+      ).toEqual([{ response_version: 1 }]);
+      const legacySilentCompletion = await client.query<{ response_version: number }>(
+        `UPDATE assessment_requests
+         SET status = 'completed',
+             response_body = '{"transcript":"","passed":false,"score":0}'::jsonb
+         WHERE request_id = 4
+         RETURNING response_version`,
+      );
+      expect(legacySilentCompletion.rows).toEqual([{ response_version: 1 }]);
+      const currentSilenceCompletion = await client.query<{ response_version: number }>(
+        `UPDATE assessment_requests
+         SET response_version = 2,
+             response_body = '{"transcript":"","passed":false,"score":0,"noSpeech":true}'::jsonb
+         WHERE request_id = 4
+         RETURNING response_version`,
+      );
+      expect(currentSilenceCompletion.rows).toEqual([{ response_version: 2 }]);
+
+      await client.query('SAVEPOINT before_invalid_native_snapshot');
+      await expect(
+        client.query(
+          `INSERT INTO attempts (user_id, context, transcript, created_at, native_language)
+           VALUES (1, 'practice-native', 'invalid language', now(), 'fr')`,
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_native_snapshot');
+      await expect(
+        client.query(
+          `INSERT INTO attempts (user_id, context, transcript, created_at, native_language)
+           VALUES (1, 'practice', 'wrong context', now(), 'te')`,
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_native_snapshot');
+      await expect(
+        client.query(
+          `INSERT INTO assessment_requests
+             (request_id, user_id, context, status, response_body, native_language)
+           VALUES (6, 1, 'diagnostic', 'processing', NULL, 'te')`,
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_invalid_native_snapshot');
+
+      await client.query('SAVEPOINT before_missing_native_snapshot');
+      await client.query(
+        `INSERT INTO attempts
+           (user_id, question_id, practice_cycle_id, context, transcript, created_at)
+         VALUES (1, 1, 999, 'practice-native', 'unowned attempt', now())`,
+      );
+      await expect(
+        client.query('SET CONSTRAINTS attempts_native_language_required_trigger IMMEDIATE'),
+      ).rejects.toMatchObject({ code: '23514' });
+      await client.query('ROLLBACK TO SAVEPOINT before_missing_native_snapshot');
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();

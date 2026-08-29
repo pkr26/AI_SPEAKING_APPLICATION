@@ -9,6 +9,7 @@ import fs from 'fs';
 import path from 'path';
 import dotenv from 'dotenv';
 import { Client } from 'pg';
+import { RECORDING_PRIVACY_CUTOVER } from './schema-cutover';
 
 const CONNECTION_TIMEOUT_MS = 10_000;
 
@@ -154,8 +155,16 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
       const { rows } = await client.query<{ name: string; checksum: string | null }>(
         'SELECT name, checksum FROM schema_migrations',
       );
-      const done = new Map(rows.map((r) => [r.name, r.checksum]));
-      const unknown = rows.map((r) => r.name).filter((name) => !files.includes(name));
+      const fenceRows = rows.filter(({ name }) => name === RECORDING_PRIVACY_CUTOVER.name);
+      const ordinaryRows = rows.filter(({ name }) => name !== RECORDING_PRIVACY_CUTOVER.name);
+      const cutoverRequired = ordinaryRows.some(({ name }) => name === RECORDING_PRIVACY_CUTOVER.requiredMigration);
+      const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === RECORDING_PRIVACY_CUTOVER.checksum;
+      if ((fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
+        throw new Error('database recording-privacy cutover fence is missing, invalid, or out of sequence');
+      }
+
+      const done = new Map(ordinaryRows.map((r) => [r.name, r.checksum]));
+      const unknown = ordinaryRows.map((r) => r.name).filter((name) => !files.includes(name));
       if (unknown.length > 0) {
         throw new Error(`database contains migration records missing from this release: ${unknown.join(', ')}`);
       }

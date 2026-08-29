@@ -16,7 +16,12 @@ import {
 } from './audio-upload';
 import { config } from './config';
 import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
-import { abandonAssessmentRequest, AssessmentContext, claimAssessmentRequest } from './idempotency';
+import {
+  abandonAssessmentRequest,
+  type AssessmentContext,
+  type AssessmentNativeLanguage,
+  claimAssessmentRequest,
+} from './idempotency';
 import { AuthedRequest, HttpError, UserRow, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
 import { RecordingCapture } from './recording-store';
@@ -232,6 +237,7 @@ export async function runAssessmentSubmission<Claim, Result>(
       audioKey,
       practiceCycleId,
       retainRecording,
+      hooks.context === 'practice-native' ? (user.native_language as AssessmentNativeLanguage) : undefined,
     );
     if (requestClaim.kind === 'completed') {
       // Completed replays retain their object for the bucket lifecycle: an

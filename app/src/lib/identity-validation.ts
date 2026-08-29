@@ -1,20 +1,16 @@
 import { translate, type Translator } from './i18n';
 import { MAX_EMAIL_LENGTH } from './password-policy';
 
-// Deliberately mirrors the practical subset accepted by the API's zod email
-// validator: one nonblank local part, a DNS-style domain, no whitespace or
-// consecutive dots, and a final alphabetic domain of at least two characters.
-// The API remains the authority; this prevents malformed forms from being sent.
+// Byte-for-byte equivalent to the email regex used by the installed server
+// Zod 3.25.x validator. Keep this pinned to server/package-lock.json upgrades:
+// accepting a stricter "practical" subset can lock an existing learner out,
+// while accepting a broader subset makes signup/reset fail only after a POST.
 const EMAIL_PATTERN =
-  /^(?!.*\.\.)[a-z0-9!#$%&'*+/=?^_`{|}~.-]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$/i;
+  /^(?!\.)(?!.*\.\.)([A-Z0-9_'+\-\.]*)[A-Z0-9_+-]@([A-Z0-9][A-Z0-9\-]*\.)+[A-Z]{2,}$/i;
 
 export function isValidEmailAddress(value: string): boolean {
   const email = value.trim();
   if (email.length === 0 || email.length > MAX_EMAIL_LENGTH) return false;
-  const at = email.indexOf('@');
-  if (at <= 0 || email.lastIndexOf('@') !== at || email[0] === '.' || email[at - 1] === '.') {
-    return false;
-  }
   return EMAIL_PATTERN.test(email);
 }
 

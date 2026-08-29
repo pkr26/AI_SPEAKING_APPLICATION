@@ -10,6 +10,7 @@ import RecordingPlayback, {
   formatPlaybackTime,
   removeRecordingFromHistoryPages,
   removeRecordingFromPages,
+  runWithAbortableTimeout,
   waitAbortable,
 } from '../src/components/RecordingPlayback';
 import { ApiError, apiDeleteRecording, apiGetRecordingPlaybackGrant } from '../src/lib/api';
@@ -288,6 +289,7 @@ function historyItem(id: string, recordingId: string | null): HistoryPage['items
     questionText: 'Describe courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    nativeLanguage: null,
     cycleId: '550e8400-e29b-41d4-a716-446655440020',
     attemptNo: 1,
     score: 80,
@@ -487,6 +489,22 @@ describe('recording playback primitives', () => {
     expect(outcome).toMatchObject({ name: 'AbortError' });
     expect(remove).not.toHaveBeenCalled();
   });
+
+  it('aborts a never-settling operation at its deadline', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const operation = deferred<void>();
+    const result = runWithAbortableTimeout(() => operation.promise, controller, 1_000);
+    const rejection = expect(result).rejects.toThrow('Operation timed out');
+
+    await jest.advanceTimersByTimeAsync(999);
+    expect(controller.signal.aborted).toBe(false);
+    await jest.advanceTimersByTimeAsync(1);
+
+    expect(controller.signal.aborted).toBe(true);
+    await rejection;
+    operation.resolve(undefined);
+  });
 });
 
 describe('RecordingPlayback', () => {
@@ -644,6 +662,41 @@ describe('RecordingPlayback', () => {
 
     await act(async () => available.resolve(true));
     await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+  });
+
+  it('times out stalled foreground share preparation and restores every action', async () => {
+    jest.useFakeTimers();
+    const download = deferred<void>();
+    asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+    await renderPlayback();
+
+    await act(async () => {
+      fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+      await flushMicrotasks();
+    });
+    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    await act(async () => jest.advanceTimersByTimeAsync(29_999));
+    expect(signal.aborted).toBe(false);
+    expect(screen.getByText(t('recordings.sharing'))).toBeTruthy();
+
+    await act(async () => jest.advanceTimersByTimeAsync(1));
+    expect(signal.aborted).toBe(true);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    expect(Sharing.shareAsync).not.toHaveBeenCalled();
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.shareFailed'));
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+    expect(
+      screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+    expect(
+      screen.getByRole('button', { name: t('recordings.deleteAction') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+
+    await act(async () => download.resolve(undefined));
+    await flushMicrotasks();
+    expect(Sharing.shareAsync).not.toHaveBeenCalled();
   });
 
   it('reports unavailable or failed sharing without leaking a temporary artifact', async () => {
@@ -2550,6 +2603,7 @@ describe('RecordingPlayback', () => {
               questionText: 'Describe courage.',
               cefrLevel: 'B1',
               context: 'practice',
+              nativeLanguage: null,
               cycleId: '550e8400-e29b-41d4-a716-446655440020',
               attemptNo: 1,
               score: 80,

@@ -127,6 +127,7 @@ beforeEach(() => {
     setAnswerMode: jest.fn(),
     showFeedback: jest.fn(),
     restoreFeedback: jest.fn(),
+    clearRecordingReferences: jest.fn(),
     clearFeedback: jest.fn(),
     resetSessionTally: jest.fn(),
     resetPracticeFlow: jest.fn(),

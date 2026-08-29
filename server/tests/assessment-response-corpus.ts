@@ -164,6 +164,7 @@ export function practicePromotion(
 export function nativeSpoken(overrides: Record<string, unknown> = {}) {
   return {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: CYCLE_ID,
     attemptNo: 1,
     attemptsLeft: 2,
@@ -179,6 +180,7 @@ export function nativeSpoken(overrides: Record<string, unknown> = {}) {
 export function nativeSilence(overrides: Record<string, unknown> = {}) {
   return {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: CYCLE_ID,
     attemptNo: 1,
     attemptsLeft: 3,
@@ -479,6 +481,9 @@ valid('native additive field', 'practice-native', nativeSpoken({ additiveFutureF
 
 for (const [name, value] of [
   ['missing understood', without(nativeSpoken(), 'understood')],
+  ['missing native language', without(nativeSpoken(), 'nativeLanguage')],
+  ['unsupported native language', nativeSpoken({ nativeLanguage: 'fr' })],
+  ['non-string native language', nativeSpoken({ nativeLanguage: 1 })],
   ['missing cycle id', without(nativeSpoken(), 'cycleId')],
   ['missing attempt number', without(nativeSpoken(), 'attemptNo')],
   ['missing attempts left', without(nativeSpoken(), 'attemptsLeft')],

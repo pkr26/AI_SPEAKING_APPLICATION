@@ -126,6 +126,7 @@ describe('PracticeFlowProvider', () => {
   it('restores mode and retry status without counting a replay twice', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,
@@ -189,6 +190,21 @@ describe('PracticeFlowProvider', () => {
     });
     expect(flow!.feedback).toBeNull();
     expect(feedbackText()).toBe('none');
+  });
+
+  it('removes a deleted recording capability without discarding its feedback card', async () => {
+    await render(tree());
+    await act(async () => {
+      flow!.showFeedback('q-1', { ...RESULT, recordingId: REQUEST_ID }, undefined, REQUEST_ID);
+    });
+
+    await act(async () => flow!.clearRecordingReferences());
+
+    expect(flow!.feedback).toEqual({
+      questionId: 'q-1',
+      result: RESULT,
+      requestId: REQUEST_ID,
+    });
   });
 
   it('resets every practice-flow field before a diagnostic retake', async () => {
@@ -352,6 +368,7 @@ describe('PracticeFlowProvider', () => {
       'a native-mode answer',
       {
         mode: 'native',
+        nativeLanguage: 'te',
         cycleId: CYCLE_ID,
         understood: true,
         attemptNo: 2,
@@ -658,6 +675,7 @@ describe('applyFailedAttemptToQuestionCache', () => {
     const queryClient = seededClient();
     const native: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: false,
       attemptNo: 1,
@@ -719,6 +737,7 @@ describe('session tally', () => {
 
   const nativeResult: NativeAttemptResult = {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: CYCLE_ID,
     understood: true,
     attemptNo: 1,

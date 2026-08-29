@@ -10,6 +10,7 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({ getSignedUrl: getSignedUrlMock
 
 import { config } from '../src/config';
 import { logger } from '../src/logger';
+import { recordingBulkCleanupBatchSql } from '../src/recordings';
 import { app, pool, registerUser } from './helpers';
 
 config.s3.practice.bucket = 'private-practice-recordings';
@@ -27,9 +28,11 @@ async function createRecording(
   await pool.query(
     `INSERT INTO recordings (
        id, user_id, request_id, question_id, context, storage_scope, audio_key,
-       s3_version_id, content_type, size_bytes, duration_ms, status, available_at
+       s3_version_id, content_type, size_bytes, duration_ms, status, available_at,
+       recording_retention_epoch
      ) VALUES ($1, $2, $3, $4, 'practice-native', 'practice', $5, 'version-1',
-               'audio/mp4', 12345, 7200, $6, CASE WHEN $6 = 'available' THEN now() ELSE NULL END)`,
+               'audio/mp4', 12345, 7200, $6, CASE WHEN $6 = 'available' THEN now() ELSE NULL END,
+               (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
     [id, userId, requestId, question.rows[0].id, audioKey, status],
   );
   if (options.createdAt !== undefined || options.attemptId !== undefined) {
@@ -316,56 +319,166 @@ describe('recording owner API', () => {
     expect(jobs.rows).toEqual([{ known_version_id: 'version-1' }]);
   });
 
-  it('bulk-deletes only the owner recordings, queues every object version, and remains idempotent', async () => {
-    const a = app();
-    const owner = await registerUser(a);
-    const stranger = await registerUser(a);
-    const first = await createRecording(owner.res.body.user.id);
-    const second = await createRecording(owner.res.body.user.id, 'retention_pending');
-    const foreign = await createRecording(stranger.res.body.user.id);
-    const authorization = { Authorization: `Bearer ${owner.res.body.token}` };
+  it('bulk-hides only the owner recordings and durably queues bounded cleanup batches', async () => {
+    const cleanupClient = await pool.connect();
+    let cleanupLockHeld = false;
+    try {
+      // Hold the production janitor's advisory key on this session and execute
+      // its exact batch SQL through the same lease. This makes the assertions
+      // deterministic even if another test file/process attempts maintenance.
+      await cleanupClient.query('SELECT pg_advisory_lock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = true;
 
-    const deleted = await request(a).delete('/recordings').set(authorization);
-    expect(deleted.status).toBe(204);
-    expect(deleted.headers['cache-control']).toContain('no-store');
-    expect(
-      (
-        await pool.query<{ recording_retention_epoch: string }>(
-          'SELECT recording_retention_epoch FROM users WHERE id = $1',
+      // Other suites deliberately leave bulk-hidden metadata for maintenance.
+      // Drain that shared-database backlog so the batch-size assertions below
+      // measure this owner's two rows rather than scheduler order across files.
+      for (let pass = 0; pass < 20; pass++) {
+        const queued = await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1');
+        if (queued.rowCount === 0) break;
+        await cleanupClient.query(recordingBulkCleanupBatchSql(50));
+      }
+      expect((await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1')).rowCount).toBe(0);
+
+      const a = app();
+      const owner = await registerUser(a);
+      const stranger = await registerUser(a);
+      const first = await createRecording(owner.res.body.user.id);
+      const second = await createRecording(owner.res.body.user.id, 'retention_pending');
+      const foreign = await createRecording(stranger.res.body.user.id);
+      const authorization = { Authorization: `Bearer ${owner.res.body.token}` };
+
+      const deleted = await request(a).delete('/recordings').set(authorization);
+      expect(deleted.status).toBe(204);
+      expect(deleted.headers['cache-control']).toContain('no-store');
+      expect(
+        (
+          await pool.query<{ recording_retention_epoch: string }>(
+            'SELECT recording_retention_epoch FROM users WHERE id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ recording_retention_epoch: '1' }]);
+      expect(
+        (
+          await pool.query<{ cutoff_epoch: string }>(
+            'SELECT cutoff_epoch FROM recording_bulk_cleanup_jobs WHERE user_id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ cutoff_epoch: '1' }]);
+
+      // Repeating delete-all coalesces into the same durable owner job and moves
+      // only its guarded cutoff; it never creates an unbounded queue per epoch.
+      expect((await request(a).delete('/recordings').set(authorization)).status).toBe(204);
+      expect(
+        (
+          await pool.query<{ recording_retention_epoch: string }>(
+            'SELECT recording_retention_epoch FROM users WHERE id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ recording_retention_epoch: '2' }]);
+      expect(
+        (
+          await pool.query<{ cutoff_epoch: string }>(
+            'SELECT cutoff_epoch FROM recording_bulk_cleanup_jobs WHERE user_id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ cutoff_epoch: '2' }]);
+
+      // Logical deletion is immediate even though physical metadata remains as
+      // the durable source for bounded outbox creation.
+      const hiddenList = await request(a).get('/recordings').set(authorization);
+      const hiddenExport = await request(a).get('/recordings/export').set(authorization);
+      const hiddenPlayback = await request(a).post(`/recordings/${first.id}/playback-url`).set(authorization);
+      expect(hiddenList.body).toEqual({ items: [], nextCursor: null });
+      expect(hiddenExport.body).toEqual({ recordings: [], nextCursor: null });
+      expect(hiddenPlayback.status).toBe(404);
+      expect(
+        (await pool.query('SELECT id FROM recordings WHERE user_id = $1', [owner.res.body.user.id])).rowCount,
+      ).toBe(2);
+      expect(
+        (
+          await pool.query(
+            `SELECT 1
+           FROM recording_deletion_jobs
+           WHERE audio_key = ANY($1::text[])`,
+            [[first.audioKey, second.audioKey]],
+          )
+        ).rowCount,
+      ).toBe(0);
+
+      const prioritizeOwnerCleanup = () =>
+        cleanupClient.query(
+          `UPDATE recording_bulk_cleanup_jobs
+           SET last_processed_at = NULL, enqueued_at = '-infinity'::timestamptz
+           WHERE user_id = $1`,
           [owner.res.body.user.id],
-        )
-      ).rows,
-    ).toEqual([{ recording_retention_epoch: '1' }]);
-    expect((await pool.query('SELECT id FROM recordings WHERE user_id = $1', [owner.res.body.user.id])).rows).toEqual(
-      [],
-    );
-    expect(
-      (
-        await pool.query(
-          `SELECT audio_key, known_version_id
+        );
+      await prioritizeOwnerCleanup();
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(1);
+      expect(
+        (await pool.query('SELECT id FROM recordings WHERE user_id = $1', [owner.res.body.user.id])).rowCount,
+      ).toBe(1);
+      await prioritizeOwnerCleanup();
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(1);
+      await prioritizeOwnerCleanup();
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(0);
+      expect((await pool.query('SELECT id FROM recordings WHERE user_id = $1', [owner.res.body.user.id])).rows).toEqual(
+        [],
+      );
+      expect(
+        (
+          await pool.query(
+            `SELECT audio_key, known_version_id
            FROM recording_deletion_jobs
            WHERE audio_key = ANY($1::text[])
            ORDER BY audio_key`,
-          [[first.audioKey, second.audioKey]],
-        )
-      ).rows,
-    ).toEqual(
-      [first.audioKey, second.audioKey].sort().map((audio_key) => ({ audio_key, known_version_id: 'version-1' })),
-    );
-    expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rows).toEqual([
-      { id: foreign.id },
-    ]);
+            [[first.audioKey, second.audioKey]],
+          )
+        ).rows,
+      ).toEqual(
+        [first.audioKey, second.audioKey].sort().map((audio_key) => ({ audio_key, known_version_id: 'version-1' })),
+      );
+      expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rows).toEqual([
+        { id: foreign.id },
+      ]);
+      expect(
+        (await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs WHERE user_id = $1', [owner.res.body.user.id]))
+          .rowCount,
+      ).toBe(0);
 
-    expect((await request(a).delete('/recordings').set(authorization)).status).toBe(204);
-    expect(
-      (
-        await pool.query<{ recording_retention_epoch: string }>(
-          'SELECT recording_retention_epoch FROM users WHERE id = $1',
-          [owner.res.body.user.id],
-        )
-      ).rows,
-    ).toEqual([{ recording_retention_epoch: '2' }]);
-    expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rowCount).toBe(1);
+      expect((await request(a).delete('/recordings').set(authorization)).status).toBe(204);
+      expect(
+        (
+          await pool.query<{ recording_retention_epoch: string }>(
+            'SELECT recording_retention_epoch FROM users WHERE id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ recording_retention_epoch: '3' }]);
+      expect(
+        (
+          await pool.query<{ cutoff_epoch: string }>(
+            'SELECT cutoff_epoch FROM recording_bulk_cleanup_jobs WHERE user_id = $1',
+            [owner.res.body.user.id],
+          )
+        ).rows,
+      ).toEqual([{ cutoff_epoch: '3' }]);
+      await prioritizeOwnerCleanup();
+      expect((await cleanupClient.query(recordingBulkCleanupBatchSql(1))).rowCount).toBe(0);
+      expect(
+        (await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs WHERE user_id = $1', [owner.res.body.user.id]))
+          .rowCount,
+      ).toBe(0);
+      expect((await pool.query('SELECT id FROM recordings WHERE id = $1', [foreign.id])).rowCount).toBe(1);
+    } finally {
+      if (cleanupLockHeld) {
+        await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      }
+      cleanupClient.release();
+    }
   });
 
   it('requires authentication for bulk recording deletion', async () => {

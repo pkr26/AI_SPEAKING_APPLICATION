@@ -34,19 +34,31 @@ const t = (key: MessageKey, params?: Record<string, string | number>) =>
 const MAX_LENGTH_EMAIL = `${'a'.repeat(64)}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
 
 describe('email validation parity with the API', () => {
-  it.each(['ada@example.c', 'ada@example.12', 'ada@example.c1', 'ada@example.c-m'])(
-    'rejects the server-invalid final domain in %s',
-    (email) => {
-      expect(isValidEmailAddress(email)).toBe(false);
-    },
-  );
+  it.each([
+    'ada@example.c',
+    'ada@example.12',
+    'ada@example.c1',
+    'ada@example.c-m',
+    'learner%tag@example.com',
+    'learner!tag@example.com',
+    'learner/example@example.com',
+    '.learner@example.com',
+    'learner..name@example.com',
+  ])('rejects the server-invalid final domain in %s', (email) => {
+    expect(isValidEmailAddress(email)).toBe(false);
+  });
 
-  it.each(['ada@example.co', 'ada@learn.example.org', 'student+practice@example.museum'])(
-    'accepts the server-valid address %s',
-    (email) => {
-      expect(isValidEmailAddress(email)).toBe(true);
-    },
-  );
+  it.each([
+    'ada@example.co',
+    'ada@learn.example.org',
+    'student+practice@example.museum',
+    'learner@domain-.com',
+    "learner'name@example.com",
+    'LEARNER_NAME@EXAMPLE.COM',
+    ' learner@example.com ',
+  ])('accepts the server-valid address %s', (email) => {
+    expect(isValidEmailAddress(email)).toBe(true);
+  });
 });
 
 // session-notice persists through expo-secure-store, which has no native

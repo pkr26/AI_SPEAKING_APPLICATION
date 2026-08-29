@@ -6,7 +6,11 @@ import React from 'react';
 import { Alert, AppState, type AppStateStatus, StyleSheet } from 'react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 
-import SettingsScreen, { formatReminderHour } from '../src/app/settings/index';
+import SettingsScreen, {
+  clearHistoryRecordingReferences,
+  emptyRecordingPages,
+  formatReminderHour,
+} from '../src/app/settings/index';
 import {
   ApiError,
   apiConsumeAccountExportPages,
@@ -23,7 +27,7 @@ import {
 } from '../src/lib/daily-reminder';
 import { deviceLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
-import type { User, UserDataPage } from '../src/lib/types';
+import type { HistoryPage, RecordingPage, User, UserDataPage } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
   translateFor('en', key, params);
@@ -136,9 +140,13 @@ jest.mock('../src/lib/api', () => ({
 }));
 
 const mockResetPracticeFlow = jest.fn();
+const mockClearRecordingReferences = jest.fn();
 jest.mock('../src/lib/practice-flow', () => ({
   ...jest.requireActual('../src/lib/practice-flow'),
-  usePracticeFlow: () => ({ resetPracticeFlow: mockResetPracticeFlow }),
+  usePracticeFlow: () => ({
+    clearRecordingReferences: mockClearRecordingReferences,
+    resetPracticeFlow: mockResetPracticeFlow,
+  }),
 }));
 
 const mockMirrorAccountLanguage = jest.fn();
@@ -229,6 +237,7 @@ function makeAuth(overrides: Partial<AuthValue> = {}): AuthValue {
     restoreError: null,
     retrySessionRestore: jest.fn(),
     resetStoredSession: jest.fn(),
+    signOutThisDevice: jest.fn().mockResolvedValue(undefined),
     captureSessionLease: jest.fn(() => ({}) as never),
     isSessionLeaseCurrent: jest.fn(() => true),
     login: jest.fn(),
@@ -3201,8 +3210,64 @@ describe('account actions', () => {
     mockDeleteAllRecordings.mockReturnValue(request.promise);
     const client = makeQueryClient();
     const cancel = jest.spyOn(client, 'cancelQueries');
-    const remove = jest.spyOn(client, 'removeQueries');
     const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const recordingId = '550e8400-e29b-41d4-a716-446655440077';
+    const recordingPage: RecordingPage = {
+      items: [
+        {
+          id: recordingId,
+          questionId: '550e8400-e29b-41d4-a716-446655440088',
+          context: 'practice',
+          promptWord: 'practice',
+          questionText: 'How do you practice?',
+          cefrLevel: 'A1',
+          contentType: 'audio/mp4',
+          sizeBytes: 1_024,
+          durationMs: 1_000,
+          status: 'available',
+          createdAt: '2026-08-29T00:00:00.000Z',
+          availableAt: '2026-08-29T00:00:01.000Z',
+        },
+      ],
+      nextCursor: recordingId,
+    };
+    const historyPage: HistoryPage = {
+      items: [
+        {
+          id: '550e8400-e29b-41d4-a716-446655440099',
+          questionId: '550e8400-e29b-41d4-a716-446655440088',
+          promptWord: 'practice',
+          questionText: 'How do you practice?',
+          cefrLevel: 'A1',
+          context: 'practice',
+          nativeLanguage: null,
+          cycleId: '550e8400-e29b-41d4-a716-446655440066',
+          attemptNo: 1,
+          score: 80,
+          passed: true,
+          understood: null,
+          transcript: 'I practice every day.',
+          translatedTranscript: null,
+          modelAnswer: null,
+          feedback: 'Clear answer.',
+          createdAt: '2026-08-29T00:00:00.000Z',
+          recordingId,
+          recordingStatus: 'available',
+        },
+      ],
+      nextCursor: null,
+    };
+    client.setQueryData(['recordings', USER.id], {
+      pages: [recordingPage],
+      pageParams: [undefined],
+    });
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [historyPage],
+      pageParams: [undefined],
+    });
+    // Model a post-DELETE refresh that cannot replace the cache. TanStack's
+    // default invalidation contract resolves rather than throwing here.
+    invalidate.mockResolvedValue(undefined);
     await renderSettings(client);
     const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
     const reopen = committedPressHandler(row());
@@ -3234,16 +3299,26 @@ describe('account actions', () => {
       queryKey: ['practice-history', USER.id],
       exact: true,
     });
-    expect(remove).toHaveBeenCalledWith({
-      queryKey: ['recordings', USER.id],
-      exact: true,
-      type: 'inactive',
+    expect(client.getQueryData(['recordings', USER.id])).toEqual({
+      pages: [{ ...recordingPage, items: [], nextCursor: null }],
+      pageParams: [undefined],
     });
-    expect(remove).toHaveBeenCalledWith({
-      queryKey: ['practice-history', USER.id],
-      exact: true,
-      type: 'inactive',
+    expect(client.getQueryData(['practice-history', USER.id])).toEqual({
+      pages: [
+        {
+          ...historyPage,
+          items: [
+            {
+              ...historyPage.items[0],
+              recordingId: null,
+              recordingStatus: null,
+            },
+          ],
+        },
+      ],
+      pageParams: [undefined],
     });
+    expect(mockClearRecordingReferences).toHaveBeenCalledTimes(1);
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['recordings', USER.id], exact: true });
     expect(invalidate).toHaveBeenCalledWith({
       queryKey: ['practice-history', USER.id],
@@ -3253,6 +3328,11 @@ describe('account actions', () => {
       screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }).props
         .accessibilityState,
     ).toEqual({ disabled: false, busy: false });
+  });
+
+  it('keeps the bulk-recording cache transforms total for absent data', () => {
+    expect(emptyRecordingPages(undefined)).toBeUndefined();
+    expect(clearHistoryRecordingReferences(undefined)).toBeUndefined();
   });
 
   it('shows a localized bulk-delete failure and re-arms the destructive row', async () => {
@@ -3404,8 +3484,10 @@ describe('account actions', () => {
   });
 
   it('offers a local-only sign-out when the server cannot be reached', async () => {
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
     mockAuthValue = makeAuth({
       logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
     });
     await renderSettings();
 
@@ -3425,8 +3507,80 @@ describe('account actions', () => {
     expect(mockRouter.replace).not.toHaveBeenCalled();
 
     await pressAlertButton(t('logout.thisDevice'));
-    expect(mockAuthValue.resetStoredSession).toHaveBeenCalledTimes(1);
-    expect(mockRouter.replace).toHaveBeenCalledWith('/');
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+    expect(mockAuthValue.resetStoredSession).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps the local-only sign-out action authorized across a same-account lease rearm', async () => {
+    const logout = jest.fn().mockRejectedValue(new Error('network down'));
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
+    mockAuthValue = makeAuth({ logout, signOutThisDevice });
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+
+    // AuthProvider fences the failed transition and then increments
+    // sessionVersion so mounted leases are recaptured. Token and user identity
+    // remain unchanged, so the already-visible native Alert must still work.
+    mockAuthValue = makeAuth({
+      token: 'token-abc',
+      user: USER,
+      sessionVersion: 2,
+      logout,
+      signOutThisDevice,
+    });
+    await view.rerenderSettings();
+    await pressAlertButton(t('logout.thisDevice'));
+
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+    expect(screen.getByText(USER.email)).toBeTruthy();
+  });
+
+  it.each([
+    ['token rotation', { token: 'replacement-token', user: USER }],
+    ['account replacement', { token: 'token-abc', user: OTHER_USER }],
+  ] as const)('rejects a local-only sign-out Alert after %s', async (_case, replacement) => {
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+    });
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+
+    mockAuthValue = makeAuth({
+      ...replacement,
+      sessionVersion: 2,
+      signOutThisDevice,
+    });
+    await view.rerenderSettings();
+    await pressAlertButton(t('logout.thisDevice'));
+
+    expect(signOutThisDevice).not.toHaveBeenCalled();
+  });
+
+  it('keeps the signed-in settings screen when local-only sign-out cannot be proven', async () => {
+    const signOutThisDevice = jest.fn().mockRejectedValue(new Error('secure store unavailable'));
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('logout.thisDevice'));
+
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenLastCalledWith(t('logout.failedTitle'), t('error.internal')),
+    );
+    expect(mockAuthValue.resetStoredSession).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(screen.getByText(USER.email)).toBeTruthy();
   });
 
   it('renders nothing without an authenticated user', async () => {

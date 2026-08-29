@@ -149,7 +149,14 @@ export const codeMutationLanes = Object.freeze({
     ],
   ),
   dbTooling: lane(
-    ['db/database-safety.ts', 'db/generate-seed.ts', 'db/mutation-db-guard.ts', 'db/preflight.ts', 'db/run.ts'],
+    [
+      'db/database-safety.ts',
+      'db/generate-seed.ts',
+      'db/mutation-db-guard.ts',
+      'db/preflight.ts',
+      'db/run.ts',
+      'db/schema-cutover.ts',
+    ],
     [
       'tests/database.test.ts',
       'tests/db-cli.test.ts',

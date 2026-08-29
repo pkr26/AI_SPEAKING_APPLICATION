@@ -92,6 +92,7 @@ describe('assessment replay response validation', () => {
 
     const nativeResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,

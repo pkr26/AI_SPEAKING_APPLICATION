@@ -120,6 +120,7 @@ jest.mock('../src/lib/pending-assessment', () => ({
   markPendingAssessmentFeedbackPending: jest.fn(),
   markPendingAssessmentForReconciliation: jest.fn(),
   markPendingAssessmentStage: jest.fn(),
+  notifyPendingAssessmentReplayReady: jest.fn(),
   refundPendingAssessmentRecoveryPost: jest.fn(),
 }));
 

@@ -253,6 +253,7 @@ function audioForm(questionId, requestId, cycleId) {
     `\r\n--${boundary}\r\nContent-Disposition: form-data; name="questionId"\r\n\r\n${questionId}\r\n` +
       `--${boundary}\r\nContent-Disposition: form-data; name="requestId"\r\n\r\n${requestId}\r\n` +
       (cycleId ? `--${boundary}\r\nContent-Disposition: form-data; name="cycleId"\r\n\r\n${cycleId}\r\n` : '') +
+      `--${boundary}\r\nContent-Disposition: form-data; name="retainRecording"\r\n\r\nfalse\r\n` +
       `--${boundary}--\r\n`,
   );
   return { body: Buffer.concat([head, audio, tail]), contentType: `multipart/form-data; boundary=${boundary}` };
@@ -553,6 +554,7 @@ async function actionEnglishJourney(user) {
     }
     user.englishAttempts.push({
       questionId,
+      cycleId,
       requestId: attempt.requestId,
       score: attempt.score,
       passed: attempt.passed,
@@ -635,6 +637,7 @@ async function actionNativeJourney(user) {
   const nativeValid =
     body &&
     body.mode === 'native' &&
+    body.nativeLanguage === user.nativeLanguage &&
     body.understood === true &&
     body.transcript === '(mock transcript)' &&
     body.translatedTranscript === '(mock English translation)' &&
@@ -718,7 +721,8 @@ async function actionExport(user) {
     fail(user, 'export', `expected 200, got ${response.ok ? response.status : 'NETERR'}`);
     return;
   }
-  const expectedAttempts = user.diagnosticAnswers.length + user.englishAttempts.length + 1;
+  const expectedNativeAttempts = user.nativeAttempt ? 1 : 0;
+  const expectedAttempts = user.diagnosticAnswers.length + user.englishAttempts.length + expectedNativeAttempts;
   const attempts = response.body?.attempts;
   if (
     response.body?.user?.id !== user.id ||
@@ -737,7 +741,9 @@ async function actionExport(user) {
   if (
     attempts.filter((a) => a.context === 'diagnostic').length !== user.diagnosticAnswers.length ||
     attempts.filter((a) => a.context === 'practice').length !== user.englishAttempts.length ||
-    attempts.filter((a) => a.context === 'practice-native').length !== 1
+    attempts.filter((a) => a.context === 'practice-native').length !== expectedNativeAttempts ||
+    (user.nativeAttempt &&
+      attempts.find((a) => a.context === 'practice-native')?.nativeLanguage !== user.nativeLanguage)
   ) {
     fail(user, 'export', 'attempt contexts mismatch');
     return;
@@ -1035,6 +1041,7 @@ async function main() {
                 cycleId: u.nativeAttempt.cycleId,
                 requestId: u.nativeAttempt.requestId,
                 attemptNo: u.nativeAttempt.response.attemptNo,
+                nativeLanguage: u.nativeAttempt.response.nativeLanguage,
                 understood: u.nativeAttempt.response.understood,
               }
             : null,

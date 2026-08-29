@@ -85,6 +85,7 @@ describe('GET /practice/history', () => {
       understood: null,
       translatedTranscript: null,
       modelAnswer: null,
+      nativeLanguage: null,
       createdAt: expect.any(String),
       recordingId: null,
       recordingStatus: null,

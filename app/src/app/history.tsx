@@ -87,17 +87,7 @@ function scoreChipStyles(styles: HistoryStyles, score: number) {
   return { chip: styles.scoreChipFailed, text: styles.scoreChipFailedText };
 }
 
-function HistoryRow({
-  item,
-  ownerId,
-  nativeLanguage,
-  t,
-}: {
-  item: HistoryItem;
-  ownerId: string;
-  nativeLanguage: NativeLanguage;
-  t: Translator;
-}) {
+function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; t: Translator }) {
   const styles = themedStyles(useTheme());
   const [expanded, setExpanded] = useState(false);
   const native = item.context === 'practice-native';
@@ -179,13 +169,13 @@ function HistoryRow({
               <Text style={styles.detailLabel}>
                 {native
                   ? t('feedback.originalTranscript', {
-                      language: t(`language.${nativeLanguage}`),
+                      language: t(`language.${item.nativeLanguage!}`),
                     })
                   : t('feedback.weHeard')}
               </Text>
               <Text
                 accessibilityLanguage={
-                  native ? NATIVE_ACCESSIBILITY_LANGUAGES[nativeLanguage] : 'en-US'
+                  native ? NATIVE_ACCESSIBILITY_LANGUAGES[item.nativeLanguage!] : 'en-US'
                 }
                 selectable
                 style={styles.transcript}
@@ -439,7 +429,7 @@ export default function HistoryScreen() {
       keyExtractor={(item) => item.id}
       renderItem={({ item }) => (
         <>
-          <HistoryRow item={item} ownerId={user.id} nativeLanguage={user.nativeLanguage} t={t} />
+          <HistoryRow item={item} ownerId={user.id} t={t} />
           {item.id === historyAdAnchorId ? <HistoryNativeAdCard focused={focused} /> : null}
         </>
       )}

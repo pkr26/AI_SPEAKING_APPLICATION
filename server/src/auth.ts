@@ -544,6 +544,7 @@ export function createAuthRouter(limiters: Limiters) {
                     a.transcript, a.score, a.passed, a.feedback,
                     a.practice_cycle_id AS "cycleId", a.understood,
                     a.translated_transcript AS "translatedTranscript", a.model_answer AS "modelAnswer",
+                    a.native_language AS "nativeLanguage",
                     a.created_at AS "createdAt"
              FROM attempts a
              JOIN questions q ON q.id = a.question_id

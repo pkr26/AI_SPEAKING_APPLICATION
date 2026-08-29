@@ -3468,6 +3468,7 @@ const HISTORY_ITEM = {
   questionText: 'Describe a time you showed courage.',
   cefrLevel: 'B1',
   context: 'practice',
+  nativeLanguage: null,
   cycleId: '550e8400-e29b-41d4-a716-446655440020',
   attemptNo: 1,
   score: 82,

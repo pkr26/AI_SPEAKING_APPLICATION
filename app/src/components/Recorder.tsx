@@ -55,6 +55,7 @@ import {
   markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
+  notifyPendingAssessmentReplayReady,
   refundPendingAssessmentRecoveryPost,
   type AssessmentEndpoint,
   type PendingAssessment,
@@ -185,6 +186,23 @@ function isDefiniteAssessmentServerFailure(error: unknown): error is ApiError {
       error.code === 'CAPACITY_BUSY' ||
       error.code === 'POOL_SATURATED' ||
       error.code === 'INTERNAL')
+  );
+}
+
+/**
+ * Stable state/identity conflicts are emitted before this request can own paid
+ * work. They require a canonical question refresh, but never ambiguity polling.
+ * REQUEST_IN_FLIGHT and uncoded/unknown 409s deliberately stay conservative.
+ */
+export function assessmentRejectionRequiresCanonicalRefresh(error: unknown): error is ApiError {
+  if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 409)) return false;
+  return (
+    error.code === 'PRACTICE_CYCLE_CLOSED' ||
+    error.code === 'STATE_CHANGED' ||
+    error.code === 'QUESTION_MISMATCH' ||
+    error.code === 'REQUEST_ID_REUSED' ||
+    error.code === 'DIAGNOSTIC_DONE' ||
+    error.code === 'ASSESSMENT_IN_PROGRESS'
   );
 }
 
@@ -1961,10 +1979,19 @@ export default function Recorder<T>({
                 return;
               }
               if (!isCurrent()) return;
-              callbacksRef.current.onRecoveryUnresolved();
-              if (!isCurrent()) return;
               discardRecording();
               updatePhase('idle');
+              // The root provider may have completed its launch-time check long
+              // before this Recorder discovered the result. Wake it now so it
+              // owns parsing and navigation exactly once in this same session;
+              // leaving the pointer for another Recorder pass would loop until
+              // the process restarted.
+              if (notifyPendingAssessmentReplayReady(pending.requestId)) return;
+              // Recorder can be embedded without the app's root provider (for
+              // example in an isolated host). Preserve the safe legacy fallback
+              // there instead of silently hiding the durable result.
+              callbacksRef.current.onRecoveryUnresolved();
+              if (!isCurrent()) return;
               callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
               return;
             }
@@ -2097,7 +2124,25 @@ export default function Recorder<T>({
                 });
                 if (!isCurrent()) return;
                 if (!routeMatches) {
-                  await finishUnresolved(translate('recorder.errInterruptedSaved'), false);
+                  try {
+                    if (
+                      !(await markPendingAssessmentFeedbackPending(pending.requestId, Date.now()))
+                    ) {
+                      throw new Error();
+                    }
+                  } catch {
+                    if (isCurrent()) {
+                      failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
+                    }
+                    return;
+                  }
+                  if (!isCurrent()) return;
+                  discardRecording();
+                  updatePhase('idle');
+                  if (notifyPendingAssessmentReplayReady(pending.requestId)) return;
+                  callbacksRef.current.onRecoveryUnresolved();
+                  if (!isCurrent()) return;
+                  callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
                   return;
                 }
                 let data: T;
@@ -2143,6 +2188,14 @@ export default function Recorder<T>({
                 }
                 if (!isCurrent()) return;
                 if (retryError instanceof ApiError && retryError.status === 401) return;
+                if (assessmentRejectionRequiresCanonicalRefresh(retryError)) {
+                  await finishUnresolved(
+                    userMessageForError(retryError, translate('recorder.errAlreadyAnswered')),
+                    true,
+                    retryError,
+                  );
+                  return;
+                }
                 // A 409 here is genuinely ambiguous: either this requestId's
                 // idempotency row appeared between the 404 absence checks and
                 // is still processing (the next status read will answer
@@ -3220,7 +3273,9 @@ export default function Recorder<T>({
       // idempotency claim, so it can never accompany a committed attempt.
       const definitelyRejected =
         error instanceof ApiError &&
-        [400, 403, 404, 413, 415, 422, 426, 429].includes(error.status);
+        ([400, 403, 404, 413, 415, 422, 426, 429].includes(error.status) ||
+          assessmentRejectionRequiresCanonicalRefresh(error));
+      const refreshCanonicalState = assessmentRejectionRequiresCanonicalRefresh(error);
       const definiteServerFailure = isDefiniteAssessmentServerFailure(error);
       // A definite rejection, and any failure raised before the assessment
       // POST was ever issued, both prove nothing can have committed: clear the
@@ -3236,6 +3291,10 @@ export default function Recorder<T>({
           return;
         }
         updatePhase('recorded');
+        if (refreshCanonicalState) {
+          callbacksRef.current.onRecoveryUnresolved();
+          if (!isCurrentSubmission()) return;
+        }
         const message = userMessageForError(
           error,
           definitelyRejected ? translate('recorder.errRejected') : translate('recorder.errNotSent'),

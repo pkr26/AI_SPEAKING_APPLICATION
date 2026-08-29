@@ -9,6 +9,7 @@ import {
 } from './audio-upload';
 import { config } from './config';
 import { pool } from './db';
+import { runExclusiveBatchedDelete } from './janitor';
 import { logger } from './logger';
 import { recordingMaintenanceTotal } from './metrics';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
@@ -30,6 +31,7 @@ interface RecordingRow {
   status: 'retention_pending' | 'available' | 'unavailable';
   retention_attempts: number;
   retention_claim_id: string | null;
+  recording_retention_epoch: string;
   created_at: string;
   available_at: string | null;
   prompt_word: string;
@@ -86,14 +88,16 @@ async function claimPendingRecordings(recordingId?: string): Promise<RecordingRo
   const claimId = randomUUID();
   const { rows } = await pool.query<RecordingRow>(
     `WITH candidates AS (
-       SELECT id
+       SELECT recordings.id
        FROM recordings
-       WHERE status = 'retention_pending'
-         AND next_retention_attempt_at <= now()
-         AND (retention_lease_expires_at IS NULL OR retention_lease_expires_at < now())
-         AND ($1::uuid IS NULL OR id = $1)
-       ORDER BY next_retention_attempt_at, created_at
-       FOR UPDATE SKIP LOCKED
+       JOIN users ON users.id = recordings.user_id
+       WHERE recordings.status = 'retention_pending'
+         AND recordings.recording_retention_epoch = users.recording_retention_epoch
+         AND recordings.next_retention_attempt_at <= now()
+         AND (recordings.retention_lease_expires_at IS NULL OR recordings.retention_lease_expires_at < now())
+         AND ($1::uuid IS NULL OR recordings.id = $1)
+       ORDER BY recordings.next_retention_attempt_at, recordings.created_at
+       FOR UPDATE OF recordings SKIP LOCKED
        LIMIT $2
      )
      UPDATE recordings AS recordings
@@ -106,6 +110,80 @@ async function claimPendingRecordings(recordingId?: string): Promise<RecordingRo
     [recordingId ?? null, recordingId ? 1 : config.recordings.maintenanceBatchSize, claimId],
   );
   return rows;
+}
+
+/**
+ * Remove one bounded batch of metadata hidden by queued delete-all
+ * generations. Looking up only queued owners keeps an idle tick independent
+ * of the size of the recordings table; the owner/epoch index bounds every
+ * stale-row lookup. Work is shared fairly across at most one batch of owners.
+ * The existing recordings AFTER DELETE trigger creates durable exact-key S3
+ * jobs in the same transaction. A queue row is pruned on the first later pass
+ * that observes no stale metadata for its guarded cutoff.
+ */
+export function recordingBulkCleanupBatchSql(batchSize: number): string {
+  if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 500) {
+    throw new Error('recording cleanup batch size must be an integer between 1 and 500');
+  }
+  return `WITH jobs AS MATERIALIZED (
+       SELECT cleanup.user_id, cleanup.cutoff_epoch,
+              least(cleanup.cutoff_epoch, users.recording_retention_epoch) AS effective_cutoff_epoch
+       FROM recording_bulk_cleanup_jobs AS cleanup
+       JOIN users ON users.id = cleanup.user_id
+       ORDER BY cleanup.last_processed_at ASC NULLS FIRST, cleanup.enqueued_at, cleanup.user_id
+       FOR UPDATE OF cleanup SKIP LOCKED
+       LIMIT ${batchSize}
+     ),
+     job_count AS MATERIALIZED (
+       SELECT count(*)::int AS count FROM jobs
+     ),
+     candidates AS MATERIALIZED (
+       SELECT candidate.id, jobs.user_id
+       FROM jobs
+       CROSS JOIN job_count
+       JOIN LATERAL (
+         SELECT recordings.id
+         FROM recordings
+         WHERE recordings.user_id = jobs.user_id
+           AND recordings.recording_retention_epoch < jobs.effective_cutoff_epoch
+         ORDER BY recordings.recording_retention_epoch,
+                  recordings.created_at DESC, recordings.id DESC
+         FOR UPDATE SKIP LOCKED
+         LIMIT greatest(1, ${batchSize} / job_count.count)
+       ) AS candidate ON true
+     ),
+     touched AS (
+       UPDATE recording_bulk_cleanup_jobs AS cleanup
+       SET last_processed_at = clock_timestamp()
+       FROM jobs
+       WHERE cleanup.user_id = jobs.user_id
+         AND cleanup.cutoff_epoch = jobs.cutoff_epoch
+         AND EXISTS (
+           SELECT 1 FROM candidates WHERE candidates.user_id = cleanup.user_id
+         )
+     ),
+     pruned AS (
+       DELETE FROM recording_bulk_cleanup_jobs AS cleanup
+       USING jobs
+       WHERE cleanup.user_id = jobs.user_id
+         AND cleanup.cutoff_epoch = jobs.cutoff_epoch
+         AND NOT EXISTS (
+           SELECT 1
+           FROM recordings
+           WHERE recordings.user_id = jobs.user_id
+             AND recordings.recording_retention_epoch < jobs.effective_cutoff_epoch
+         )
+     )
+     DELETE FROM recordings AS recordings
+     USING candidates
+     WHERE recordings.id = candidates.id`;
+}
+
+export async function cleanupStaleRecordingMetadata(): Promise<number> {
+  return runExclusiveBatchedDelete(
+    'janitor:stale-recordings',
+    recordingBulkCleanupBatchSql(config.recordings.maintenanceBatchSize),
+  );
 }
 
 async function retainClaimedRecording(recording: RecordingRow): Promise<void> {
@@ -217,6 +295,7 @@ async function processDeletionJob(job: DeletionJobRow): Promise<boolean> {
 }
 
 export async function runRecordingMaintenance(): Promise<number> {
+  await cleanupStaleRecordingMetadata();
   const pending = await claimPendingRecordings();
   const deletions = await claimDeletionJobs();
   let completed = 0;
@@ -258,19 +337,29 @@ export function createRecordingsRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, listSchema);
       if (cursor) {
-        const owned = await pool.query('SELECT 1 FROM recordings WHERE id = $1 AND user_id = $2', [
-          cursor,
-          req.user!.id,
-        ]);
+        const owned = await pool.query(
+          `SELECT 1
+           FROM recordings
+           JOIN users ON users.id = recordings.user_id
+           WHERE recordings.id = $1 AND recordings.user_id = $2
+             AND recordings.recording_retention_epoch = users.recording_retention_epoch`,
+          [cursor, req.user!.id],
+        );
         if (!owned.rows[0]) throw new HttpError(400, 'Invalid recording cursor');
       }
       const { rows } = await pool.query<RecordingRow>(
         `SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
          FROM recordings r
+         JOIN users u ON u.id = r.user_id
          JOIN questions q ON q.id = r.question_id
          WHERE r.user_id = $1
+           AND r.recording_retention_epoch = u.recording_retention_epoch
            AND ($2::uuid IS NULL OR (r.created_at, r.id) < (
-             SELECT created_at, id FROM recordings WHERE id = $2 AND user_id = $1
+             SELECT cursor_recording.created_at, cursor_recording.id
+             FROM recordings AS cursor_recording
+             JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
+             WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
+               AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
            ))
          ORDER BY r.created_at DESC, r.id DESC
          LIMIT $3`,
@@ -291,19 +380,29 @@ export function createRecordingsRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, exportSchema);
       if (cursor) {
-        const owned = await pool.query('SELECT 1 FROM recordings WHERE id = $1 AND user_id = $2', [
-          cursor,
-          req.user!.id,
-        ]);
+        const owned = await pool.query(
+          `SELECT 1
+           FROM recordings
+           JOIN users ON users.id = recordings.user_id
+           WHERE recordings.id = $1 AND recordings.user_id = $2
+             AND recordings.recording_retention_epoch = users.recording_retention_epoch`,
+          [cursor, req.user!.id],
+        );
         if (!owned.rows[0]) throw new HttpError(400, 'Invalid recording export cursor');
       }
       const { rows } = await pool.query<RecordingRow>(
         `SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
          FROM recordings r
+         JOIN users u ON u.id = r.user_id
          JOIN questions q ON q.id = r.question_id
          WHERE r.user_id = $1
+           AND r.recording_retention_epoch = u.recording_retention_epoch
            AND ($2::uuid IS NULL OR (r.created_at, r.id) > (
-             SELECT created_at, id FROM recordings WHERE id = $2 AND user_id = $1
+             SELECT cursor_recording.created_at, cursor_recording.id
+             FROM recordings AS cursor_recording
+             JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
+             WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
+               AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
            ))
          ORDER BY r.created_at ASC, r.id ASC
          LIMIT $3`,
@@ -322,19 +421,26 @@ export function createRecordingsRouter(limiters: Limiters) {
     new RegExp('^/$'),
     limiters.recordingBulkDelete,
     h(async (req: AuthedRequest, res) => {
-      // One statement is one transaction: advancing the owner epoch fences
-      // retain=true assessments that are still in provider work, deleting only
-      // this owner's metadata preserves isolation, and the existing per-row
-      // AFTER DELETE trigger commits every exact-version outbox job atomically.
+      // This constant-time generation advance immediately hides every current
+      // recording and fences retain=true provider work that claimed the prior
+      // generation. The maintenance worker later deletes stale metadata in
+      // bounded batches; each batch atomically creates the existing durable S3
+      // all-version deletion jobs through the per-row trigger.
       await pool.query(
         `WITH owner AS (
            UPDATE users
            SET recording_retention_epoch = recording_retention_epoch + 1
            WHERE id = $1
-           RETURNING id
+           RETURNING id, recording_retention_epoch
          )
-         DELETE FROM recordings
-         WHERE user_id IN (SELECT id FROM owner)`,
+         INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch)
+         SELECT id, recording_retention_epoch FROM owner
+         ON CONFLICT (user_id) DO UPDATE
+         SET cutoff_epoch = greatest(
+               recording_bulk_cleanup_jobs.cutoff_epoch,
+               EXCLUDED.cutoff_epoch
+             ),
+             last_processed_at = NULL`,
         [req.user!.id],
       );
       res.status(204).end();
@@ -346,10 +452,14 @@ export function createRecordingsRouter(limiters: Limiters) {
     limiters.playbackGrant,
     validate({ params: paramsSchema }),
     h(async (req: AuthedRequest, res) => {
-      const { rows } = await pool.query<RecordingRow>('SELECT * FROM recordings WHERE id = $1 AND user_id = $2', [
-        req.params.id,
-        req.user!.id,
-      ]);
+      const { rows } = await pool.query<RecordingRow>(
+        `SELECT recordings.*
+         FROM recordings
+         JOIN users ON users.id = recordings.user_id
+         WHERE recordings.id = $1 AND recordings.user_id = $2
+           AND recordings.recording_retention_epoch = users.recording_retention_epoch`,
+        [req.params.id, req.user!.id],
+      );
       const recording = rows[0];
       if (!recording) throw new HttpError(404, 'Recording not found');
       if (recording.status !== 'available') {
@@ -387,10 +497,16 @@ export function createRecordingsRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       await pool.query(
         `WITH owner AS (
-           SELECT id FROM users WHERE id = $1 FOR UPDATE
+           SELECT id, recording_retention_epoch
+           FROM users
+           WHERE id = $1
+           FOR UPDATE
          )
          DELETE FROM recordings
-         WHERE id = $2 AND user_id IN (SELECT id FROM owner)`,
+         USING owner
+         WHERE recordings.id = $2
+           AND recordings.user_id = owner.id
+           AND recordings.recording_retention_epoch = owner.recording_retention_epoch`,
         [req.user!.id, req.params.id],
       );
       res.status(204).end();

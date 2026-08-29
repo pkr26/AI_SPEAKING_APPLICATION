@@ -32,6 +32,7 @@ describe('durable practice serving cycles', () => {
     expect(nativeFirst.body).toMatchObject({
       mode: 'native',
       cycleId,
+      nativeLanguage: 'te',
       attemptNo: 1,
       attemptsLeft: 2,
       translatedTranscript: '(mock English translation)',
@@ -61,15 +62,32 @@ describe('durable practice serving cycles', () => {
       );
     const nativeThird = await sendFinal();
     expect(nativeThird.status, JSON.stringify(nativeThird.body)).toBe(200);
-    expect(nativeThird.body).toMatchObject({ cycleId, attemptNo: 3, attemptsLeft: 0, mode: 'native' });
+    expect(nativeThird.body).toMatchObject({
+      cycleId,
+      attemptNo: 3,
+      attemptsLeft: 0,
+      mode: 'native',
+      nativeLanguage: 'te',
+    });
     expect(nativeThird.body.next).toMatchObject({ attemptsUsed: 0, attemptsLeft: 3 });
     expect(nativeThird.body.next.cycleId).not.toBe(cycleId);
     expect(nativeThird.body.next.question.id).not.toBe(questionId);
 
-    // Completed replay wins over the now-closed cycle and never counts twice.
+    // Completed replay wins over both the now-closed cycle and a later profile
+    // change: it keeps the language that actually produced the transcript.
+    await pool.query("UPDATE users SET native_language = 'hi' WHERE id = $1", [userId]);
     const replay = await sendFinal();
     expect(replay.status).toBe(200);
     expect(replay.body).toEqual(nativeThird.body);
+    expect(
+      (
+        await pool.query<{ native_language: string }>(
+          `SELECT native_language FROM assessment_requests
+           WHERE user_id = $1 AND request_id = $2`,
+          [userId, finalRequestId],
+        )
+      ).rows,
+    ).toEqual([{ native_language: 'te' }]);
 
     const fourth = await answerForm(
       request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
@@ -87,8 +105,9 @@ describe('durable practice serving cycles', () => {
       context: string;
       attempt_no: number;
       translated_transcript: string | null;
+      native_language: string | null;
     }>(
-      `SELECT context, attempt_no, translated_transcript
+      `SELECT context, attempt_no, translated_transcript, native_language
        FROM attempts WHERE user_id = $1 AND practice_cycle_id = $2
        ORDER BY attempt_no`,
       [userId, cycleId],
@@ -99,6 +118,7 @@ describe('durable practice serving cycles', () => {
       ['practice-native', 3],
     ]);
     expect(persisted.rows[0].translated_transcript).toBe('(mock English translation)');
+    expect(persisted.rows.map(({ native_language }) => native_language)).toEqual(['te', null, 'te']);
 
     const progress = await pool.query<{ status: string; attempt_count: number; best_score: number }>(
       `SELECT status, attempt_count, best_score FROM practice_progress
@@ -114,11 +134,14 @@ describe('durable practice serving cycles', () => {
       score: null,
       passed: null,
       understood: true,
+      nativeLanguage: 'te',
       translatedTranscript: '(mock English translation)',
     });
 
     const exported = await request(a).get('/auth/me/data').set('Authorization', `Bearer ${token}`);
-    expect(exported.body.attempts.some((item: { context: string }) => item.context === 'practice-native')).toBe(true);
+    expect(exported.body.attempts.filter((item: { context: string }) => item.context === 'practice-native')).toEqual(
+      expect.arrayContaining([expect.objectContaining({ nativeLanguage: 'te' })]),
+    );
     expect(exported.body.practiceCycles).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: cycleId, questionId, attemptsUsed: 3, status: 'closed' })]),
     );
@@ -203,12 +226,19 @@ describe('durable practice serving cycles', () => {
       error: 'Assessment request identifier was already used',
       code: 'REQUEST_ID_REUSED',
     });
-    const attempts = await pool.query<{ n: number }>(
-      `SELECT count(*)::int AS n FROM attempts
+    const attempts = await pool.query<{ first_cycle: number; second_cycle: number }>(
+      `SELECT
+         count(*) FILTER (
+           WHERE context = 'practice' AND practice_cycle_id = $3
+         )::int AS first_cycle,
+         count(*) FILTER (
+           WHERE context = 'practice' AND practice_cycle_id = $4
+         )::int AS second_cycle
+       FROM attempts
        WHERE user_id = $1 AND question_id = $2`,
-      [userId, questionId],
+      [userId, questionId, firstCycleId, secondCycleId],
     );
-    expect(attempts.rows[0].n).toBe(1);
+    expect(attempts.rows[0]).toEqual({ first_cycle: 1, second_cycle: 0 });
   });
 
   it('paginates empty attempts and skipped cycles without restarting an exhausted stream', async () => {

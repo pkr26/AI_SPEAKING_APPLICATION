@@ -285,6 +285,34 @@ describe('practice', () => {
     expect(claims.rows[0].count).toBe(0);
   });
 
+  it('accepts the current direct-upload practice form with cycle and explicit retention fields', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    await completeDiagnostic(a, token);
+    const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const requestId = randomUUID();
+
+    const response = await request(a)
+      .post('/practice/attempt')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+      .field('questionId', assignment.body.question.id)
+      .field('requestId', requestId)
+      .field('cycleId', assignment.body.cycleId)
+      .field('retainRecording', 'false');
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    expect(
+      (
+        await pool.query<{ retain_recording: boolean }>(
+          'SELECT retain_recording FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+          [userId, requestId],
+        )
+      ).rows,
+    ).toEqual([{ retain_recording: false }]);
+  });
+
   it('POST /attempt with a malformed UUID returns 400', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token;
@@ -764,15 +792,18 @@ describe('practice', () => {
 
     expect(r.status).toBe(200);
     expect(r.body.mode).toBe('native');
+    expect(r.body.nativeLanguage).toBe('te');
     expect(r.body.understood).toBe(true);
     expect(r.body.modelAnswer).toContain('MOCK_AI');
-    const counts = await pool.query<{ attempts: number; progress: number }>(
+    const counts = await pool.query<{ attempts: number; progress: number; native_language: string }>(
       `SELECT
          (SELECT count(*)::int FROM attempts WHERE user_id = $1 AND context = 'practice-native') AS attempts,
-         (SELECT count(*)::int FROM practice_progress WHERE user_id = $1) AS progress`,
+         (SELECT count(*)::int FROM practice_progress WHERE user_id = $1) AS progress,
+         (SELECT native_language FROM attempts
+          WHERE user_id = $1 AND context = 'practice-native') AS native_language`,
       [userId],
     );
-    expect(counts.rows[0]).toEqual({ attempts: 1, progress: 1 });
+    expect(counts.rows[0]).toEqual({ attempts: 1, progress: 1, native_language: 'te' });
   });
 
   it('serializes native attempts per question and clears the in-flight claim on success', async () => {

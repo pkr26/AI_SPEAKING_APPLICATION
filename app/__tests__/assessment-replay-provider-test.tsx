@@ -13,6 +13,7 @@ import {
   clearPendingAssessment,
   loadPendingAssessment,
   markPendingAssessmentFeedbackPending,
+  notifyPendingAssessmentReplayReady,
 } from '../src/lib/pending-assessment';
 import { usePracticeFlow } from '../src/lib/practice-flow';
 import type { User } from '../src/lib/types';
@@ -135,6 +136,46 @@ describe('AssessmentReplayProvider', () => {
     expect(await screen.findByText('protected app')).toBeTruthy();
     expect(loadPendingAssessment).toHaveBeenCalledTimes(1);
     expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('reacts in the same session when Recorder promotes route-mismatched completed feedback', async () => {
+    await render(tree());
+    expect(await screen.findByText('protected app')).toBeTruthy();
+
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockResolvedValue({
+      status: 'completed',
+      context: 'practice',
+      questionId: QUESTION_ID,
+      cycleId: CYCLE_ID,
+      question,
+      response: {
+        cycleId: CYCLE_ID,
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried.',
+        feedback: 'Add detail.',
+      },
+    });
+
+    let providerWasListening = false;
+    await act(async () => {
+      providerWasListening = notifyPendingAssessmentReplayReady(REQUEST_ID);
+    });
+
+    expect(providerWasListening).toBe(true);
+    await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledWith('/practice/feedback');
+    expect(clearPendingAssessment).not.toHaveBeenCalled();
+
+    await act(async () => Promise.resolve());
+    expect(restoreFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1);
   });
 
   it('announces the saved-answer check while secure metadata is loading', async () => {

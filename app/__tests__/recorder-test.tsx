@@ -114,6 +114,7 @@ import {
   markPendingAssessmentFeedbackPending,
   markPendingAssessmentForReconciliation,
   markPendingAssessmentStage,
+  notifyPendingAssessmentReplayReady,
   refundPendingAssessmentRecoveryPost,
   savePendingAssessment,
   type PendingAssessment,
@@ -238,6 +239,7 @@ jest.mock('../src/lib/pending-assessment', () => ({
   markPendingAssessmentFeedbackPending: jest.fn(),
   markPendingAssessmentForReconciliation: jest.fn(),
   markPendingAssessmentStage: jest.fn(),
+  notifyPendingAssessmentReplayReady: jest.fn(),
   refundPendingAssessmentRecoveryPost: jest.fn(),
   savePendingAssessment: jest.fn(),
 }));
@@ -1048,6 +1050,8 @@ beforeEach(() => {
   asMock(clearPendingAssessment).mockResolvedValue(undefined);
   asMock(markPendingAssessmentFeedbackPending).mockReset();
   asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(true);
+  asMock(notifyPendingAssessmentReplayReady).mockReset();
+  asMock(notifyPendingAssessmentReplayReady).mockReturnValue(false);
   asMock(markPendingAssessmentForReconciliation).mockReset();
   asMock(markPendingAssessmentForReconciliation).mockResolvedValue(true);
   asMock(markPendingAssessmentCancelled).mockReset();
@@ -6388,6 +6392,31 @@ describe('Recorder', () => {
       expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
     });
 
+    it.each([
+      ['PRACTICE_CYCLE_CLOSED', 409],
+      ['STATE_CHANGED', 409],
+      ['QUESTION_MISMATCH', 409],
+      ['REQUEST_ID_REUSED', 409],
+      ['DIAGNOSTIC_DONE', 400],
+      ['ASSESSMENT_IN_PROGRESS', 409],
+    ] as const)(
+      'clears and refreshes canonical state immediately after %s without ambiguity polling',
+      async (code, status) => {
+        mockStartedUploadFailure(new ApiError(status, 'stable rejection', undefined, { code }));
+        const { props } = await renderRecorder();
+        await recordAndStop();
+
+        await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+        await waitFor(() => expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1));
+
+        expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+        expect(apiFetch).not.toHaveBeenCalled();
+        expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
+        expect(props.onResult).not.toHaveBeenCalled();
+        expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy();
+      },
+    );
+
     it('uses distinct request ids for sequential completed answers', async () => {
       asMock(Crypto.randomUUID)
         .mockReset()
@@ -9633,9 +9662,10 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(7);
     });
 
-    it('resubmits a pending S3 handoff for another route and refreshes canonical state', async () => {
+    it('hands a resubmitted S3 result for another route to the mounted replay provider', async () => {
       jest.useFakeTimers();
       const pendingEndpoint = '/diagnostic/answer' as const;
+      asMock(notifyPendingAssessmentReplayReady).mockReturnValueOnce(true);
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({
           stage: 's3-granted',
@@ -9666,11 +9696,78 @@ describe('Recorder', () => {
       });
       expect(props.parseResult).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(notifyPendingAssessmentReplayReady).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+    });
+
+    it('keeps a resubmitted result durable when no replay provider is mounted', async () => {
+      jest.useFakeTimers();
+      const pendingEndpoint = '/diagnostic/answer' as const;
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({
+          stage: 's3-granted',
+          endpoint: pendingEndpoint,
+          questionId: OTHER_QUESTION_ID,
+          audioKey: S3_AUDIO_KEY,
+        }),
+      );
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      mockStartedApiFetchResultOnce({ score: 77 });
+      const { props } = await renderRecorder();
+
+      await advancePolls(5);
+
+      expect(notifyPendingAssessmentReplayReady).toHaveBeenCalledWith(REQUEST_ID);
       expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
       expect(props.onError).toHaveBeenCalledWith(t('recorder.errInterruptedSaved'));
-      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
-      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
+      expect(clearPendingAssessment).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });
+
+    it.each(['returns false', 'rejects'] as const)(
+      'keeps a route-mismatched S3 result locked when feedback-pointer persistence %s',
+      async (failureMode) => {
+        jest.useFakeTimers();
+        asMock(loadPendingAssessment).mockResolvedValue(
+          pendingRecord({
+            stage: 's3-granted',
+            endpoint: '/diagnostic/answer',
+            questionId: OTHER_QUESTION_ID,
+            audioKey: S3_AUDIO_KEY,
+          }),
+        );
+        for (let i = 0; i < 6; i++) {
+          asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+        }
+        mockStartedApiFetchResultOnce({ score: 77 });
+        if (failureMode === 'returns false') {
+          asMock(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
+        } else {
+          asMock(markPendingAssessmentFeedbackPending).mockRejectedValue(
+            new Error('keychain unavailable'),
+          );
+        }
+        const { props } = await renderRecorder();
+
+        await advancePolls(5);
+
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate'));
+        expect(notifyPendingAssessmentReplayReady).not.toHaveBeenCalled();
+        expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+        expect(clearPendingAssessment).not.toHaveBeenCalled();
+        expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      },
+    );
 
     it.each([0, 408, 502, 504])(
       'polls for the durable result without repeating an S3 POST after ambiguous status %i',
@@ -10069,6 +10166,31 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(8);
     });
 
+    it('stops a recovery resubmission immediately on a coded stable state conflict', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
+      );
+      for (let i = 0; i < 6; i++) {
+        asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
+      }
+      mockStartedApiFetchFailureOnce(
+        new ApiError(409, 'cycle closed', undefined, { code: 'PRACTICE_CYCLE_CLOSED' }),
+      );
+      const { props } = await renderRecorder();
+
+      await advancePolls(6);
+      await waitFor(() => expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1));
+
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(screen.getByLabelText(START_LABEL)).toBeTruthy();
+
+      await advancePolls(3);
+      expect(apiFetch).toHaveBeenCalledTimes(7);
+    });
+
     it.each([400, 403, 404, 413, 415, 422])(
       'stops S3 recovery on a definite %i rejection without creating a new request',
       async (status) => {
@@ -10354,7 +10476,7 @@ describe('Recorder', () => {
         expect(props.onResult).not.toHaveBeenCalled();
       });
 
-      it('does not re-upload when the rejection names an unrelated failure', async () => {
+      it('does not re-upload and refreshes canonical state for a completed diagnostic', async () => {
         jest.useFakeTimers();
         asMock(apiRequestAudioUpload).mockResolvedValue(S3_GRANT);
         const { props } = await submitIntoDeadKeyRejection(
@@ -10362,9 +10484,7 @@ describe('Recorder', () => {
         );
 
         await advancePolls(6);
-        await waitFor(() =>
-          expect(props.onError).toHaveBeenCalledWith(t('recorder.errUploadGone')),
-        );
+        await waitFor(() => expect(props.onError).toHaveBeenCalledWith(t('error.diagnosticDone')));
 
         // Only the "upload gone" shape earns a fresh object; a genuine domain
         // rejection must not spend another paid grant and S3 POST.
@@ -11030,10 +11150,11 @@ describe('Recorder', () => {
       });
     });
 
-    it('refreshes when the completed assessment belongs to another route', async () => {
+    it('hands completed feedback for another route to the mounted replay provider', async () => {
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ questionId: OTHER_QUESTION_ID }),
       );
+      asMock(notifyPendingAssessmentReplayReady).mockReturnValueOnce(true);
       asMock(apiFetch).mockResolvedValue({
         status: 'completed',
         context: 'practice',
@@ -11043,9 +11164,14 @@ describe('Recorder', () => {
       const { props } = await renderRecorder();
 
       await waitFor(() =>
-        expect(props.onError).toHaveBeenCalledWith(t('recorder.errInterruptedSaved')),
+        expect(notifyPendingAssessmentReplayReady).toHaveBeenCalledWith(REQUEST_ID),
       );
-      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+        REQUEST_ID,
+        expect.any(Number),
+      );
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(props.onError).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
       expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
     });

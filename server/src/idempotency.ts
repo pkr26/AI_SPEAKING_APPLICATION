@@ -8,6 +8,7 @@ import { insertRetainedRecording, RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
+export type AssessmentNativeLanguage = 'te' | 'hi' | 'es' | 'zh';
 
 /**
  * Completed responses must outlive the app's 25-hour recovery window so a
@@ -26,6 +27,7 @@ interface RequestRow {
   response_version: number;
   status: 'processing' | 'completed';
   response_body: Record<string, unknown> | null;
+  recording_visible: boolean;
 }
 
 interface RequestStatusRow extends RequestRow {
@@ -52,6 +54,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const uuid = z.string().regex(UUID_PATTERN);
   const recordingFields = { recordingId: uuid.optional() } as const;
   const cefrLevel = z.enum(CEFR_LEVELS);
+  const nativeLanguage = z.enum(['te', 'hi', 'es', 'zh']);
   const attemptNumber = integer(1, PRACTICE_MAX_ATTEMPTS);
   const failingScore = integer(0, PRACTICE_PASS_SCORE - 1);
   const passingScore = integer(PRACTICE_PASS_SCORE, 100);
@@ -240,6 +243,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const nativeCommonFields = {
     ...recordingFields,
     mode: z.literal('native'),
+    nativeLanguage,
     cycleId: uuid,
     attemptNo: attemptNumber,
     feedback: nonEmptyString(800),
@@ -306,6 +310,22 @@ export function validatedAssessmentResponse(
   return response;
 }
 
+/**
+ * A completed response remains replayable for 48 hours, but a recording
+ * reference is only public while its authoritative metadata still exists in
+ * the owner's current retention generation. Validate the stored JSONB before
+ * sanitizing it so corrupt durable data never becomes acceptable merely
+ * because its recording was deleted.
+ */
+function visibleAssessmentResponse(row: RequestRow): Record<string, unknown> {
+  const response = validatedAssessmentResponse(row.context, row.response_body!);
+  if (response.recordingId === undefined || row.recording_visible) return response;
+
+  const withoutDeletedRecording = { ...response };
+  delete withoutDeletedRecording.recordingId;
+  return validatedAssessmentResponse(row.context, withoutDeletedRecording);
+}
+
 export type AssessmentRequestClaim =
   { kind: 'claimed'; claimId: string } | { kind: 'completed'; response: Record<string, unknown> };
 
@@ -340,12 +360,16 @@ export async function claimAssessmentRequest(
   audioKey?: string,
   practiceCycleId?: string,
   retainRecording = true,
+  nativeLanguage?: AssessmentNativeLanguage,
 ): Promise<AssessmentRequestClaim> {
   if (
     (context === 'diagnostic' && practiceCycleId !== undefined) ||
     (context !== 'diagnostic' && practiceCycleId === undefined)
   ) {
     throw new Error('practice assessment requests require a cycle identity and diagnostic requests must omit it');
+  }
+  if ((context === 'practice-native') !== (nativeLanguage !== undefined)) {
+    throw new Error('practice-native assessment requests require a language snapshot and other contexts must omit it');
   }
   const client = await pool.connect();
   try {
@@ -376,9 +400,9 @@ export async function claimAssessmentRequest(
     const inserted = await client.query(
       `INSERT INTO assessment_requests
          (user_id, request_id, claim_id, context, question_id, status, audio_key, practice_cycle_id,
-          retain_recording, recording_retention_epoch)
+          retain_recording, recording_retention_epoch, native_language)
        VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8,
-               (SELECT recording_retention_epoch FROM users WHERE id = $1))
+               (SELECT recording_retention_epoch FROM users WHERE id = $1), $9)
        ON CONFLICT DO NOTHING`,
       [
         userId,
@@ -389,6 +413,7 @@ export async function claimAssessmentRequest(
         audioKey ?? null,
         practiceCycleId ?? null,
         retainRecording,
+        nativeLanguage ?? null,
       ],
     );
     if (inserted.rowCount === 1) {
@@ -397,10 +422,20 @@ export async function claimAssessmentRequest(
     }
 
     const existing = await client.query<RequestRow>(
-      `SELECT context, question_id, practice_cycle_id, retain_recording, response_version, status, response_body
-       FROM assessment_requests
+      `SELECT context, question_id, practice_cycle_id, retain_recording, response_version, status, response_body,
+              EXISTS (
+                SELECT 1
+                FROM recordings AS replay_recording
+                JOIN users AS replay_owner ON replay_owner.id = replay_recording.user_id
+                WHERE replay_recording.user_id = ar.user_id
+                  AND replay_recording.request_id = ar.request_id
+                  AND replay_recording.context = ar.context
+                  AND replay_recording.id::text = ar.response_body ->> 'recordingId'
+                  AND replay_recording.recording_retention_epoch = replay_owner.recording_retention_epoch
+              ) AS recording_visible
+       FROM assessment_requests AS ar
        WHERE user_id = $1 AND request_id = $2
-       FOR UPDATE`,
+       FOR UPDATE OF ar`,
       [userId, requestId],
     );
     const row = existing.rows[0];
@@ -447,7 +482,7 @@ export async function claimAssessmentRequest(
           'ASSESSMENT_RESULT_INCOMPATIBLE',
         );
       }
-      const response = validatedAssessmentResponse(row.context, row.response_body);
+      const response = visibleAssessmentResponse(row);
       await client.query('COMMIT');
       return { kind: 'completed', response };
     }
@@ -587,6 +622,16 @@ export async function getAssessmentRequestStatus(
 ): Promise<AssessmentRequestStatus | undefined> {
   const { rows } = await pool.query<RequestStatusRow>(
     `SELECT ar.context, ar.question_id, ar.practice_cycle_id, ar.response_version, ar.status, ar.response_body,
+            EXISTS (
+              SELECT 1
+              FROM recordings AS replay_recording
+              JOIN users AS replay_owner ON replay_owner.id = replay_recording.user_id
+              WHERE replay_recording.user_id = ar.user_id
+                AND replay_recording.request_id = ar.request_id
+                AND replay_recording.context = ar.context
+                AND replay_recording.id::text = ar.response_body ->> 'recordingId'
+                AND replay_recording.recording_retention_epoch = replay_owner.recording_retention_epoch
+            ) AS recording_visible,
             q.cefr_level AS question_cefr_level, q.prompt_word AS question_prompt_word,
             q.question_text AS question_text
      FROM assessment_requests ar
@@ -623,7 +668,7 @@ export async function getAssessmentRequestStatus(
     return {
       status: 'completed',
       ...details,
-      response: validatedAssessmentResponse(row.context, row.response_body),
+      response: visibleAssessmentResponse(row),
     };
   }
   return { status: 'processing', ...details };

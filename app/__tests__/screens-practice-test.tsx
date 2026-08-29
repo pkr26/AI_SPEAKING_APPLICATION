@@ -275,6 +275,7 @@ function makePracticeFlow(overrides: Partial<PracticeFlowValue> = {}): PracticeF
     setAnswerMode: jest.fn(),
     showFeedback: jest.fn(),
     restoreFeedback: jest.fn(),
+    clearRecordingReferences: jest.fn(),
     clearFeedback: jest.fn(),
     resetSessionTally: jest.fn(),
     resetPracticeFlow: jest.fn(),
@@ -393,6 +394,7 @@ const PASSED_RESULT: AttemptResult = {
 
 const NATIVE_RESULT_FOR_PARSER: NativeAttemptResult = {
   mode: 'native',
+  nativeLanguage: 'te',
   cycleId: CYCLE_ID,
   understood: true,
   attemptNo: 1,
@@ -2059,6 +2061,7 @@ describe('practice attempt screen', () => {
 
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,
@@ -2958,8 +2961,13 @@ describe('practice feedback screen', () => {
     expect(screen.getByText(t('recordings.yourRecording'))).toBeTruthy();
     expect(screen.getByText(`recording-player:${recordingId}`)).toBeTruthy();
     expect(asMock(RecordingPlayback).mock.calls.map(([props]) => props)).toEqual([
-      { ownerId: USER.id, recordingId },
+      { ownerId: USER.id, recordingId, onDeleted: expect.any(Function) },
     ]);
+    const playbackProps = asMock(RecordingPlayback).mock.calls[0][0] as {
+      onDeleted: (recordingId: string) => void;
+    };
+    playbackProps.onDeleted(recordingId);
+    expect(mockPracticeFlow.clearRecordingReferences).toHaveBeenCalledTimes(1);
   });
 
   it('renders the mastered variant and seeds the next question', async () => {
@@ -3013,6 +3021,7 @@ describe('practice feedback screen', () => {
   it('renders the native variant with the model answer when understood', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,
@@ -3025,6 +3034,9 @@ describe('practice feedback screen', () => {
     mockPracticeFlow = makePracticeFlow({
       feedback: { questionId: QUESTION.id, result: nativeResult },
     });
+    // The transcript keeps its submission-time language even if the profile
+    // preference changed before a durable replay was viewed.
+    mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'hi' } });
     await renderScreen(<FeedbackScreen />);
 
     expect(screen.getByText(t('feedback.nativeUnderstoodTitle'))).toBeTruthy();
@@ -3032,6 +3044,9 @@ describe('practice feedback screen', () => {
     expect(
       screen.getByText(t('feedback.originalTranscript', { language: t('language.te') })),
     ).toBeTruthy();
+    expect(
+      screen.queryByText(t('feedback.originalTranscript', { language: t('language.hi') })),
+    ).toBeNull();
     expect(screen.getByText('“ఆమె పనిలో ధైర్యం చూపింది.”')).toBeTruthy();
     expect(screen.getByText(t('feedback.feedbackLabel'))).toBeTruthy();
     expect(screen.getByText('You understood the question.')).toBeTruthy();
@@ -3072,6 +3087,7 @@ describe('practice feedback screen', () => {
   it('shows a native third try as terminal, keeps translation distinct, and advances', async () => {
     const nativeFinal: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 3,
@@ -3129,6 +3145,7 @@ describe('practice feedback screen', () => {
   it('renders the native variant with a model answer when the answer missed the question', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: false,
       attemptNo: 1,
@@ -3166,6 +3183,7 @@ describe('practice feedback screen', () => {
   it('renders native silence as a free retry that preserves native mode', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: false,
       attemptNo: 1,
@@ -3553,6 +3571,7 @@ describe('practice feedback screen', () => {
   it('treats hardware back as Try in English on the native variant', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,
@@ -3581,6 +3600,7 @@ describe('practice feedback screen', () => {
   it('keeps native mode when hardware back follows native silence', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: false,
       attemptNo: 1,
@@ -3675,6 +3695,7 @@ describe('practice feedback screen', () => {
       [
         {
           mode: 'native',
+          nativeLanguage: 'te',
           cycleId: CYCLE_ID,
           understood: true,
           attemptNo: 1,
@@ -3689,6 +3710,7 @@ describe('practice feedback screen', () => {
       [
         {
           mode: 'native',
+          nativeLanguage: 'te',
           cycleId: CYCLE_ID,
           understood: false,
           attemptNo: 1,
@@ -3703,6 +3725,7 @@ describe('practice feedback screen', () => {
       [
         {
           mode: 'native',
+          nativeLanguage: 'te',
           cycleId: CYCLE_ID,
           understood: false,
           attemptNo: 1,
@@ -4614,6 +4637,7 @@ describe('level-up celebration', () => {
       'native',
       {
         mode: 'native',
+        nativeLanguage: 'te',
         cycleId: CYCLE_ID,
         understood: true,
         attemptNo: 3,
@@ -4682,6 +4706,7 @@ describe('home stats freshness', () => {
   it('refreshes stats for native speech but leaves silence free', async () => {
     const nativeResult: NativeAttemptResult = {
       mode: 'native',
+      nativeLanguage: 'te',
       cycleId: CYCLE_ID,
       understood: true,
       attemptNo: 1,
@@ -6556,6 +6581,7 @@ describe('practice help presentation', () => {
 describe('feedback outcome wiring', () => {
   const NATIVE_RESULT: NativeAttemptResult = {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: CYCLE_ID,
     understood: true,
     attemptNo: 1,
@@ -6594,9 +6620,12 @@ describe('feedback outcome wiring', () => {
     ['es', 'es-ES'],
     ['zh', 'zh-Hans'],
   ] as const)('reads a %s learner’s own answer back in their language', async (language, tag) => {
-    mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: language } });
+    mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'te' } });
     mockPracticeFlow = makePracticeFlow({
-      feedback: { questionId: QUESTION.id, result: NATIVE_RESULT },
+      feedback: {
+        questionId: QUESTION.id,
+        result: { ...NATIVE_RESULT, nativeLanguage: language },
+      },
     });
     await renderScreen(<FeedbackScreen />);
 
@@ -6644,6 +6673,7 @@ describe('feedback outcome wiring', () => {
         questionId: QUESTION.id,
         result: {
           mode: 'native',
+          nativeLanguage: 'te',
           cycleId: CYCLE_ID,
           understood: false,
           attemptNo: 1,
@@ -6963,6 +6993,7 @@ describe('practice feedback presentation', () => {
         questionId: QUESTION.id,
         result: {
           mode: 'native',
+          nativeLanguage: 'te',
           cycleId: CYCLE_ID,
           understood: true,
           attemptNo: 1,

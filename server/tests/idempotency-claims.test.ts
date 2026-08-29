@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
+import request from 'supertest';
 import {
   ASSESSMENT_REQUEST_COMPLETED_RETENTION_HOURS,
   AssessmentRequestInFlightError,
@@ -21,6 +22,7 @@ afterAll(async () => {
 
 describe('claimAssessmentRequest ownership and replay', () => {
   const a = app();
+  let token: string;
   let userId: string;
   let questionId: string;
   let otherQuestionId: string;
@@ -66,6 +68,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
   beforeAll(async () => {
     const { res } = await registerUser(a);
+    token = res.body.token;
     userId = res.body.user.id;
     const { rows } = await pool.query<{
       id: string;
@@ -131,6 +134,7 @@ describe('claimAssessmentRequest ownership and replay', () => {
 
   const nativeResponse = {
     mode: 'native',
+    nativeLanguage: 'te',
     cycleId: '22222222-2222-4222-8222-222222222222',
     attemptNo: 1,
     attemptsLeft: 2,
@@ -389,6 +393,81 @@ describe('claimAssessmentRequest ownership and replay', () => {
       cycleId: cycleIds.get(`${userId}:${questionId}`)!,
       question,
       response: storedResponse,
+    });
+  });
+
+  it('removes deleted recording references from exact POST replays and completed status responses', async () => {
+    async function completedWithRecording() {
+      const requestId = randomUUID();
+      const recordingId = randomUUID();
+      const audioKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
+      const response = completedPracticeResponse(91);
+      const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId, audioKey);
+      if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
+      const completed = await completeAssessmentRequest(pool, userId, requestId, claim.claimId, response, 'practice', {
+        id: recordingId,
+        storageScope: 'practice',
+        audioKey,
+        s3VersionId: `version-${recordingId}`,
+        contentType: 'audio/mp4',
+        sizeBytes: 1234,
+      });
+      expect(completed).toEqual({ ...response, recordingId });
+      return { requestId, recordingId, response };
+    }
+
+    const singlyDeleted = await completedWithRecording();
+    await expect(claimAssessmentRequest(userId, singlyDeleted.requestId, 'practice', questionId)).resolves.toEqual({
+      kind: 'completed',
+      response: { ...singlyDeleted.response, recordingId: singlyDeleted.recordingId },
+    });
+    expect(
+      (await request(a).delete(`/recordings/${singlyDeleted.recordingId}`).set('Authorization', `Bearer ${token}`))
+        .status,
+    ).toBe(204);
+    await expect(claimAssessmentRequest(userId, singlyDeleted.requestId, 'practice', questionId)).resolves.toEqual({
+      kind: 'completed',
+      response: singlyDeleted.response,
+    });
+    const singleStatus = await getAssessmentRequestStatus(userId, singlyDeleted.requestId);
+    expect(singleStatus?.status).toBe('completed');
+    if (singleStatus?.status !== 'completed') throw new Error('expected completed single-delete status');
+    expect(singleStatus.response).toEqual(singlyDeleted.response);
+
+    const bulkDeleted = await completedWithRecording();
+    expect((await request(a).delete('/recordings').set('Authorization', `Bearer ${token}`)).status).toBe(204);
+    // Delete-all is logically immediate and physically batched; replay must
+    // honor the generation fence before maintenance removes the stale row.
+    expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [bulkDeleted.recordingId])).rowCount).toBe(1);
+    await expect(claimAssessmentRequest(userId, bulkDeleted.requestId, 'practice', questionId)).resolves.toEqual({
+      kind: 'completed',
+      response: bulkDeleted.response,
+    });
+    const bulkStatus = await getAssessmentRequestStatus(userId, bulkDeleted.requestId);
+    expect(bulkStatus?.status).toBe('completed');
+    if (bulkStatus?.status !== 'completed') throw new Error('expected completed bulk-delete status');
+    expect(bulkStatus.response).toEqual(bulkDeleted.response);
+  });
+
+  it('still rejects an invalid stored recording reference before applying deletion sanitization', async () => {
+    const requestId = randomUUID();
+    const claim = await claimAssessmentRequest(userId, requestId, 'practice', questionId);
+    if (claim.kind !== 'claimed') throw new Error('expected a fresh claim');
+    await completeAssessmentRequest(pool, userId, requestId, claim.claimId, completedPracticeResponse(), 'practice');
+    await pool.query(
+      `UPDATE assessment_requests
+       SET response_body = response_body || '{"recordingId":"not-a-uuid"}'::jsonb
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+
+    await expect(claimAssessmentRequest(userId, requestId, 'practice', questionId)).rejects.toMatchObject({
+      status: 500,
+      code: 'INTERNAL',
+    });
+    await expect(getAssessmentRequestStatus(userId, requestId)).rejects.toMatchObject({
+      status: 500,
+      code: 'INTERNAL',
     });
   });
 

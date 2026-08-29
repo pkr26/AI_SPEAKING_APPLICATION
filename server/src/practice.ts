@@ -753,6 +753,7 @@ async function storeNativePracticeResult(
   requestId: string,
   requestClaimId: string,
   level: string,
+  nativeLanguage: NativeLanguage,
   recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
   const client = await pool.connect();
@@ -788,8 +789,8 @@ async function storeNativePracticeResult(
     const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts
          (user_id, question_id, context, attempt_no, transcript, score, passed, feedback,
-          practice_cycle_id, understood, translated_transcript, model_answer)
-       VALUES ($1, $2, 'practice-native', $3, $4, NULL, NULL, $5, $6, $7, $8, $9)
+          practice_cycle_id, understood, translated_transcript, model_answer, native_language)
+       VALUES ($1, $2, 'practice-native', $3, $4, NULL, NULL, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
       [
         userId,
@@ -801,6 +802,7 @@ async function storeNativePracticeResult(
         result.understood,
         result.translatedTranscript,
         result.modelAnswer,
+        nativeLanguage,
       ],
     );
     if (recording) recording.attemptId = insertedAttempt.rows[0].id;
@@ -832,6 +834,7 @@ async function storeNativePracticeResult(
     const response: Record<string, unknown> = {
       mode: 'native',
       cycleId: claim.cycleId,
+      nativeLanguage,
       understood: result.understood,
       transcript: result.transcript,
       translatedTranscript: result.translatedTranscript,
@@ -1026,6 +1029,15 @@ export function createPracticeRouter(limiters: Limiters) {
         if (currentCycle.rowCount !== 1) {
           throw new HttpError(409, 'This practice question is no longer active', 'PRACTICE_CYCLE_CLOSED');
         }
+        // Assessment claims are five-minute leases. A crashed provider worker
+        // must not block Skip forever merely because no later assessment came
+        // along to reclaim its stale row.
+        await client.query(
+          `DELETE FROM practice_inflight
+           WHERE user_id = $1 AND question_id = $2
+             AND started_at < now() - interval '5 minutes'`,
+          [user.id, questionId],
+        );
         const inFlight = await client.query('SELECT 1 FROM practice_inflight WHERE user_id = $1 AND question_id = $2', [
           user.id,
           questionId,
@@ -1077,10 +1089,15 @@ export function createPracticeRouter(limiters: Limiters) {
                 a.attempt_no AS "attemptNo", a.score, a.passed, a.transcript, a.feedback,
                 a.practice_cycle_id AS "cycleId", a.understood,
                 a.translated_transcript AS "translatedTranscript", a.model_answer AS "modelAnswer",
+                a.native_language AS "nativeLanguage",
                 a.created_at AS "createdAt", r.id AS "recordingId", r.status AS "recordingStatus"
          FROM attempts a
+         JOIN users u ON u.id = a.user_id
          JOIN questions q ON q.id = a.question_id
-         LEFT JOIN recordings r ON r.attempt_id = a.id AND r.user_id = a.user_id
+         LEFT JOIN recordings r
+           ON r.attempt_id = a.id
+          AND r.user_id = a.user_id
+          AND r.recording_retention_epoch = u.recording_retention_epoch
          WHERE a.user_id = $1
            AND (
              $2::uuid IS NULL
@@ -1332,6 +1349,7 @@ export function createPracticeRouter(limiters: Limiters) {
               {
                 mode: 'native',
                 cycleId: claim.cycleId,
+                nativeLanguage: user.native_language,
                 understood: false,
                 transcript: '',
                 translatedTranscript: '',
@@ -1354,6 +1372,7 @@ export function createPracticeRouter(limiters: Limiters) {
             requestId,
             requestClaimId,
             user.cefr_level!,
+            user.native_language as NativeLanguage,
             recording,
           );
         },

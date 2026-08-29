@@ -203,6 +203,11 @@ function expectedProgressFor(user) {
   return [];
 }
 
+function expectedCyclesFor(user) {
+  if (Array.isArray(user.expectedPracticeCycles)) return user.expectedPracticeCycles;
+  return [];
+}
+
 const ERROR_CONTRACTS = [
   { kind: 'wrong-password', method: 'POST', status: 401, code: 'INVALID_CREDENTIALS' },
   { kind: 'malformed-uuid', method: 'GET', status: 400, code: 'VALIDATION_FAILED' },
@@ -1303,7 +1308,8 @@ async function main() {
     const idArray = aliveDatabaseIds.length > 0 ? aliveDatabaseIds : [UUID_ZERO];
     const attemptsResult = await client.query(
       `SELECT id::text, user_id::text AS "userId", question_id::text AS "questionId",
-              context, attempt_no AS "attemptNo", transcript, score, passed, feedback,
+              context, attempt_no AS "attemptNo", practice_cycle_id::text AS "cycleId",
+              native_language AS "nativeLanguage", transcript, score, passed, feedback,
               created_at AS "createdAt"
        FROM attempts
        WHERE user_id = ANY($1::uuid[])
@@ -1314,7 +1320,9 @@ async function main() {
 
     const requestsResult = await client.query(
       `SELECT user_id::text AS "userId", request_id::text AS "requestId", context,
-              question_id::text AS "questionId", status, response_body AS "responseBody",
+              question_id::text AS "questionId", practice_cycle_id::text AS "cycleId",
+              native_language AS "nativeLanguage",
+              status, response_body AS "responseBody",
               audio_key AS "audioKey", started_at AS "startedAt", completed_at AS "completedAt"
        FROM assessment_requests
        WHERE user_id = ANY($1::uuid[])
@@ -1334,6 +1342,16 @@ async function main() {
       [idArray],
     );
     const progressByUser = groupBy(progressResult.rows, 'userId');
+
+    const cyclesResult = await client.query(
+      `SELECT id::text, user_id::text AS "userId", question_id::text AS "questionId",
+              kind, attempts_used AS "attemptsUsed", status
+       FROM practice_cycles
+       WHERE user_id = ANY($1::uuid[])
+       ORDER BY user_id, id`,
+      [idArray],
+    );
+    const cyclesByUser = groupBy(cyclesResult.rows, 'userId');
 
     const diagnosticResult = await client.query(
       `SELECT user_id::text AS "userId", questions_asked AS "questionsAsked",
@@ -1380,6 +1398,8 @@ async function main() {
           'ordered attempt fields match',
           actual.context === expected.context &&
             actual.questionId === expected.questionId &&
+            actual.cycleId === (expected.cycleId ?? null) &&
+            actual.nativeLanguage === (expected.nativeLanguage ?? null) &&
             actual.attemptNo === expected.attemptNo &&
             actual.score === expected.score &&
             actual.passed === expected.passed,
@@ -1387,6 +1407,8 @@ async function main() {
             actual: {
               context: actual.context,
               questionId: actual.questionId,
+              cycleId: actual.cycleId,
+              nativeLanguage: actual.nativeLanguage,
               attemptNo: actual.attemptNo,
               score: actual.score,
               passed: actual.passed,
@@ -1394,6 +1416,8 @@ async function main() {
             expected: {
               context: expected.context,
               questionId: expected.questionId,
+              cycleId: expected.cycleId ?? null,
+              nativeLanguage: expected.nativeLanguage ?? null,
               attemptNo: expected.attemptNo,
               score: expected.score,
               passed: expected.passed,
@@ -1474,10 +1498,24 @@ async function main() {
           'request context, question, and status match',
           actual.context === expected.context &&
             actual.questionId === expected.questionId &&
+            actual.cycleId === (expected.cycleId ?? null) &&
+            actual.nativeLanguage === (expected.nativeLanguage ?? null) &&
             actual.status === expected.status,
           {
-            actual: { context: actual.context, questionId: actual.questionId, status: actual.status },
-            expected: { context: expected.context, questionId: expected.questionId, status: expected.status },
+            actual: {
+              context: actual.context,
+              questionId: actual.questionId,
+              cycleId: actual.cycleId,
+              nativeLanguage: actual.nativeLanguage,
+              status: actual.status,
+            },
+            expected: {
+              context: expected.context,
+              questionId: expected.questionId,
+              cycleId: expected.cycleId ?? null,
+              nativeLanguage: expected.nativeLanguage ?? null,
+              status: expected.status,
+            },
           },
         );
         const expectedResponseDigest = normalizeDigest(expected.responseDigest);
@@ -1498,6 +1536,36 @@ async function main() {
             !!actual.audioKey && sha256(actual.audioKey) === expectedAudioHash,
           );
         }
+      }
+
+      const expectedCycles = expectedCyclesFor(user);
+      const actualCycles = cyclesByUser.get(databaseId) ?? [];
+      const actualByCycleId = new Map(actualCycles.map((cycle) => [cycle.id, cycle]));
+      check(scope, 'practice cycle row count exactly matches ledger', actualCycles.length === expectedCycles.length, {
+        actual: actualCycles.length,
+        expected: expectedCycles.length,
+      });
+      for (const expected of expectedCycles) {
+        const cycleScope = `${scope}:cycle:${expected.id}`;
+        const actual = actualByCycleId.get(expected.id);
+        check(cycleScope, 'durable practice cycle exists', !!actual);
+        if (!actual) continue;
+        check(
+          cycleScope,
+          'cycle question, kind, attempts_used, and status match',
+          actual.questionId === expected.questionId &&
+            actual.kind === expected.kind &&
+            actual.attemptsUsed === expected.attemptsUsed &&
+            actual.status === expected.status,
+          { actual, expected },
+        );
+        const persistedAttempts = actualAttempts.filter((attempt) => attempt.cycleId === expected.id).length;
+        check(
+          cycleScope,
+          'cycle attempts_used equals the exact persisted attempt count',
+          actual.attemptsUsed === persistedAttempts,
+          { actual: actual.attemptsUsed, expected: persistedAttempts },
+        );
       }
 
       const expectedProgress = expectedProgressFor(user);
@@ -1675,6 +1743,7 @@ async function main() {
     const expectedAliveAttempts = expectedAlive.reduce((total, user) => total + expectedAttemptsFor(user).length, 0);
     const expectedAliveRequests = expectedAlive.reduce((total, user) => total + expectedRequestsFor(user).length, 0);
     const expectedAliveProgress = expectedAlive.reduce((total, user) => total + expectedProgressFor(user).length, 0);
+    const expectedAliveCycles = expectedAlive.reduce((total, user) => total + expectedCyclesFor(user).length, 0);
     check(
       'database',
       'global attempt count equals all surviving ledger attempts',
@@ -1699,6 +1768,10 @@ async function main() {
         expected: expectedAliveProgress,
       },
     );
+    check('database', 'global practice cycle count equals ledger', cyclesResult.rowCount === expectedAliveCycles, {
+      actual: cyclesResult.rowCount,
+      expected: expectedAliveCycles,
+    });
 
     const globalCountsResult = await client.query(
       `SELECT
@@ -1706,6 +1779,7 @@ async function main() {
          (SELECT count(*)::int FROM attempts) AS attempts,
          (SELECT count(*)::int FROM assessment_requests) AS requests,
          (SELECT count(*)::int FROM practice_progress) AS progress,
+         (SELECT count(*)::int FROM practice_cycles) AS cycles,
          (SELECT count(*)::int FROM diagnostic_state) AS diagnostics,
          (SELECT count(*)::int FROM recordings) AS recordings,
          (SELECT count(*)::int FROM recording_deletion_jobs) AS "recordingDeletionJobs",
@@ -1758,6 +1832,12 @@ async function main() {
         actual: globalCounts.progress,
         expected: expectedAliveProgress,
       },
+    );
+    check(
+      'database',
+      'fresh database contains no practice cycles outside this ledger',
+      globalCounts.cycles === expectedAliveCycles,
+      { actual: globalCounts.cycles, expected: expectedAliveCycles },
     );
     check(
       'database',

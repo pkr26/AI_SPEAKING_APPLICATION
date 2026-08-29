@@ -56,6 +56,8 @@ interface PracticeFlowValue {
     question: Question | undefined,
     requestId?: string,
   ) => void;
+  /** Removes deleted audio capabilities without discarding learning feedback. */
+  clearRecordingReferences: () => void;
   clearFeedback: () => void;
   resetSessionTally: () => void;
   resetPracticeFlow: () => void;
@@ -151,6 +153,14 @@ function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) 
     [],
   );
   const clearFeedback = useCallback(() => setFeedback(null), []);
+  const clearRecordingReferences = useCallback(() => {
+    setFeedback((current) => {
+      if (!current?.result.recordingId) return current;
+      const result = { ...current.result };
+      delete result.recordingId;
+      return { ...current, result };
+    });
+  }, []);
   const resetSessionTally = useCallback(() => setSessionTally(EMPTY_TALLY), []);
   const resetPracticeFlow = useCallback(() => {
     setAnswerMode('english');
@@ -168,6 +178,7 @@ function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) 
       setAnswerMode,
       showFeedback,
       restoreFeedback,
+      clearRecordingReferences,
       clearFeedback,
       resetSessionTally,
       resetPracticeFlow,
@@ -179,6 +190,7 @@ function PracticeFlowStateProvider({ children }: { children: React.ReactNode }) 
       sessionTally,
       showFeedback,
       restoreFeedback,
+      clearRecordingReferences,
       clearFeedback,
       resetSessionTally,
       resetPracticeFlow,

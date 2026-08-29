@@ -399,7 +399,13 @@ async function adminDelete(scope, key, includeRunSignal = true) {
 async function submitAssessment(endpoint, questionId, audioKey, label, cycleId) {
   const response = await apiRequest('POST', endpoint, {
     token: account.token,
-    json: { questionId, requestId: randomUUID(), audioKey, ...(cycleId ? { cycleId } : {}) },
+    json: {
+      questionId,
+      requestId: randomUUID(),
+      audioKey,
+      retainRecording: true,
+      ...(cycleId ? { cycleId } : {}),
+    },
   });
   checkStatus(label, response, 200);
   check(`${label} returns a JSON object`, isRecord(response.body));
@@ -482,6 +488,7 @@ async function exerciseSuccessfulAssessment(endpoint, scope, questionId, audioBy
   const deleted = await apiRequest('DELETE', `/recordings/${assessment.recordingId}`, { token: account.token });
   checkStatus(`${label} recording deletion`, deleted, 204);
   await waitForObjectMissing(scope, grant.audioKey, `${label} object is eventually deleted after owner deletion`);
+  return assessment;
 }
 
 async function exerciseRejectedPolicyUpload(label, mutate) {
@@ -613,7 +620,7 @@ try {
 
   const nativeNext = await apiRequest('GET', '/practice/question', { token: account.token });
   const nativeQuestion = questionFrom(nativeNext, 'practice next for native mode');
-  await exerciseSuccessfulAssessment(
+  const nativeAssessment = await exerciseSuccessfulAssessment(
     ENDPOINTS.native,
     'practice',
     nativeQuestion.id,
@@ -621,6 +628,7 @@ try {
     'native practice assessment',
     nativeNext.body.cycleId,
   );
+  check('native practice response snapshots the submitted language', nativeAssessment.nativeLanguage === 'te');
 
   const crossScopeQuestionResponse = await apiRequest('GET', '/practice/question', {
     token: account.token,
@@ -643,6 +651,7 @@ try {
       requestId: randomUUID(),
       cycleId: crossScopeQuestionResponse.body.cycleId,
       audioKey: crossScopeGrant.audioKey,
+      retainRecording: true,
     },
   });
   checkStatus('practice submission with diagnostic key', crossScopeResponse, 400);

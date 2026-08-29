@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import { Client } from 'pg';
 import { boundedQuestionInventoryQuery, questionInventoryIssues } from '../src/question-inventory';
+import { RECORDING_PRIVACY_CUTOVER } from './schema-cutover';
 
 interface IntegrityCheck {
   name: string;
@@ -67,6 +68,20 @@ function integrityChecks(): IntegrityCheck[] {
                  )
                )
              )
+             OR (
+               to_jsonb(attempts) ? 'native_language'
+               AND (
+                 (
+                   context = 'practice-native'
+                   AND coalesce(to_jsonb(attempts)->>'native_language', '')
+                     NOT IN ('te', 'hi', 'es', 'zh')
+                 )
+                 OR (
+                   context IN ('diagnostic', 'practice')
+                   AND to_jsonb(attempts)->>'native_language' IS NOT NULL
+                 )
+               )
+             )
              OR char_length(transcript) > 12000
              OR char_length(feedback) NOT BETWEEN 1 AND 800
              OR btrim(feedback, ${JS_TRIM_CHARACTERS_SQL}) = ''`,
@@ -103,6 +118,59 @@ function integrityChecks(): IntegrityCheck[] {
                 AND (to_jsonb(assessment_requests)->>'response_version')::int = 2
                 AND to_jsonb(assessment_requests)->>'practice_cycle_id' IS NULL
               )
+              OR (
+                to_jsonb(assessment_requests) ? 'native_language'
+                AND (
+                  (
+                    context = 'practice-native'
+                    AND (
+                      coalesce(to_jsonb(assessment_requests)->>'native_language', '')
+                        NOT IN ('te', 'hi', 'es', 'zh')
+                      OR (
+                        status = 'completed'
+                        AND response_body->>'nativeLanguage'
+                          IS DISTINCT FROM to_jsonb(assessment_requests)->>'native_language'
+                      )
+                    )
+                  )
+                  OR (
+                    context IN ('diagnostic', 'practice')
+                    AND to_jsonb(assessment_requests)->>'native_language' IS NOT NULL
+                  )
+                )
+              )
+            )`,
+    },
+    {
+      name: 'invalid pending diagnostic answer summaries',
+      // Migration 022's attempts.native_language column is the rollout-safe
+      // marker that its legacy-silence repair has run. Before that migration,
+      // these rows are intentionally allowed through so the migration can
+      // restart them; afterwards, any recurrence must fail preflight.
+      sql: `SELECT count(*)::int AS n FROM diagnostic_state AS state
+          JOIN users ON users.id = state.user_id
+          WHERE (
+              users.diagnostic_completed = false
+              OR coalesce((to_jsonb(users)->>'diagnostic_acknowledged')::boolean, true) = false
+            )
+            AND state.questions_asked > 0
+            AND EXISTS (
+              SELECT 1 FROM information_schema.columns
+              WHERE table_schema = current_schema()
+                AND table_name = 'attempts'
+                AND column_name = 'native_language'
+            )
+            AND EXISTS (
+              SELECT 1
+              FROM LATERAL (
+                SELECT attempt.transcript
+                FROM attempts AS attempt
+                WHERE attempt.user_id = state.user_id
+                  AND attempt.context = 'diagnostic'
+                ORDER BY attempt.created_at DESC, attempt.id DESC
+                LIMIT state.questions_asked
+              ) AS active_run
+              WHERE btrim(active_run.transcript, ${JS_TRIM_CHARACTERS_SQL}) = ''
             )`,
     },
     {
@@ -110,6 +178,31 @@ function integrityChecks(): IntegrityCheck[] {
       sql: `SELECT count(*)::int AS n FROM diagnostic_state
           WHERE low_idx NOT BETWEEN 0 AND 6 OR high_idx NOT BETWEEN -1 AND 5
              OR questions_asked NOT BETWEEN 0 AND 5 OR low_idx > high_idx + 1`,
+    },
+    {
+      name: 'invalid recording privacy cutover fence',
+      // Pre-upgrade databases legitimately have neither row. Once migration
+      // 023 is recorded, the exact out-of-band fence must exist; the inverse
+      // (a fence without 023) is also an interrupted/manual deployment.
+      sql: `SELECT CASE WHEN
+          (
+            EXISTS (
+              SELECT 1 FROM schema_migrations
+              WHERE name = '${RECORDING_PRIVACY_CUTOVER.requiredMigration}'
+            )
+            IS DISTINCT FROM
+            EXISTS (
+              SELECT 1 FROM schema_migrations
+              WHERE name = '${RECORDING_PRIVACY_CUTOVER.name}'
+                AND checksum = '${RECORDING_PRIVACY_CUTOVER.checksum}'
+            )
+          )
+          OR EXISTS (
+            SELECT 1 FROM schema_migrations
+            WHERE name = '${RECORDING_PRIVACY_CUTOVER.name}'
+              AND checksum IS DISTINCT FROM '${RECORDING_PRIVACY_CUTOVER.checksum}'
+          )
+        THEN 1 ELSE 0 END::int AS n`,
     },
   ];
 }

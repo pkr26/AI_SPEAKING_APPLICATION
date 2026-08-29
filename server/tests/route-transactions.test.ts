@@ -262,7 +262,8 @@ describe('assessment route transaction lifecycles', () => {
     // GET /next that lock is also the authoritative completion check.
     const writerParentLock = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
     const claimParentLock = 'SELECT diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
-    const nextParentLock = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
+    const nextParentLock =
+      'SELECT cefr_level, diagnostic_completed, diagnostic_acknowledged FROM users WHERE id = $1 FOR UPDATE';
     const childLock = 'SELECT * FROM diagnostic_state WHERE user_id = $1 FOR UPDATE';
     const nextLease = leases.find(({ statements }) =>
       statements.some((text) => text.includes('UPDATE diagnostic_state SET current_question_id = $1')),

@@ -189,6 +189,7 @@ function historyItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
     questionText: 'Describe a time you showed courage.',
     cefrLevel: 'B1',
     context: 'practice',
+    nativeLanguage: null,
     cycleId: '550e8400-e29b-41d4-a716-446655440020',
     attemptNo: 2,
     score: 82,
@@ -1116,9 +1117,11 @@ describe('history screen', () => {
   it.each(DATE_TAGS)(
     'shows %s native history with a named transcript language and semantic speech tags',
     async (nativeLanguage, accessibilityLanguage) => {
-      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage } });
+      const currentProfileLanguage = nativeLanguage === 'te' ? 'hi' : 'te';
+      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: currentProfileLanguage } });
       const native = historyItem({
         context: 'practice-native',
+        nativeLanguage,
         attemptNo: 2,
         score: null,
         passed: null,

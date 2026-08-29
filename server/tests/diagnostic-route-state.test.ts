@@ -5,7 +5,8 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 /** The exact parent locks the diagnostic writers take before diagnostic_state. */
-const NEXT_PARENT_LOCK = 'SELECT cefr_level, diagnostic_completed FROM users WHERE id = $1 FOR UPDATE';
+const NEXT_PARENT_LOCK =
+  'SELECT cefr_level, diagnostic_completed, diagnostic_acknowledged FROM users WHERE id = $1 FOR UPDATE';
 const WRITER_PARENT_LOCK = 'SELECT 1 FROM users WHERE id = $1 FOR UPDATE';
 
 afterAll(async () => {

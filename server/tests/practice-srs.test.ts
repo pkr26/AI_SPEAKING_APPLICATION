@@ -315,6 +315,39 @@ describe('practice SRS scheduling and skip', () => {
       expect(rows[0]).toEqual({ skipped_until: null, attempt_count: 1 });
     });
 
+    it('expires a crashed five-minute assessment lease before checking the skip conflict', async () => {
+      const { token, userId } = await freshUserAt();
+      const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+      const questionId = assignment.body.question.id as string;
+      const cycleId = assignment.body.cycleId as string;
+      await pool.query(
+        `INSERT INTO practice_inflight (user_id, question_id, claim_id, started_at)
+         VALUES ($1, $2, $3, now() - interval '6 minutes')`,
+        [userId, questionId, randomUUID()],
+      );
+
+      const skipped = await request(a)
+        .post('/practice/skip')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId, cycleId });
+
+      expect(skipped.status).toBe(204);
+      const rows = await pool.query<{
+        inflight: number;
+        cycle_status: string;
+        parked: boolean;
+      }>(
+        `SELECT
+           (SELECT count(*)::int FROM practice_inflight
+            WHERE user_id = $1 AND question_id = $2) AS inflight,
+           (SELECT status FROM practice_cycles WHERE id = $3) AS cycle_status,
+           (SELECT skipped_until > now() FROM practice_progress
+            WHERE user_id = $1 AND question_id = $2) AS parked`,
+        [userId, questionId, cycleId],
+      );
+      expect(rows.rows[0]).toEqual({ inflight: 0, cycle_status: 'closed', parked: true });
+    });
+
     it('parks a new word for 7 days with a zero-attempt learning row, and the next pick differs', async () => {
       const { token, userId } = await freshUserAt();
       const first = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);

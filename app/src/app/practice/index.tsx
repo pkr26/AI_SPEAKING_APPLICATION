@@ -743,7 +743,14 @@ export default function PracticeScreen() {
                   <Text style={styles.helpButtonText}>?</Text>
                 </Pressable>
               </View>
-              <Text accessibilityLanguage="en-US" style={styles.questionText}>
+              {/* The served card persists across questions, so its live region
+                  announces each replacement to TalkBack; the announcement
+                  effect below covers VoiceOver. */}
+              <Text
+                accessibilityLiveRegion="polite"
+                accessibilityLanguage="en-US"
+                style={styles.questionText}
+              >
                 {question.questionText}
               </Text>
             </View>

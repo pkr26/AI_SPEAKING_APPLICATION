@@ -512,6 +512,8 @@ describe('recordings library', () => {
         showStatus: false,
       },
     ]);
+    // The recordings list exposes container semantics to screen readers.
+    expect(flatListProps().accessibilityRole).toBe('list');
     const onRefresh = flatListProps().onRefresh as () => void;
     await act(async () => {
       onRefresh();

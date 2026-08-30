@@ -58,6 +58,7 @@ export const mutationLanes = Object.freeze({
       '__tests__/types-test.ts',
       '__tests__/diagnostic-contract-updates-test.ts',
       '__tests__/assessment-replay-test.ts',
+      '__tests__/adversarial-parsers-test.ts',
     ],
   ),
   api: lane(['src/lib/api.ts'], ['__tests__/api-test.ts']),
@@ -78,7 +79,11 @@ export const mutationLanes = Object.freeze({
   ),
   assessmentReplay: lane(
     ['src/lib/assessment-replay-provider.tsx', 'src/lib/assessment-replay.ts'],
-    ['__tests__/assessment-replay-provider-test.tsx', '__tests__/assessment-replay-test.ts'],
+    [
+      '__tests__/assessment-replay-provider-test.tsx',
+      '__tests__/assessment-replay-test.ts',
+      '__tests__/adversarial-recovery-test.ts',
+    ],
   ),
   ads: lane(
     [
@@ -101,7 +106,11 @@ export const mutationLanes = Object.freeze({
   authLib: lane(['src/lib/auth.tsx'], ['__tests__/auth-test.tsx']),
   storage: lane(
     ['src/lib/params.ts', 'src/lib/pending-assessment.ts'],
-    ['__tests__/params-test.ts', '__tests__/pending-assessment-test.ts'],
+    [
+      '__tests__/params-test.ts',
+      '__tests__/pending-assessment-test.ts',
+      '__tests__/adversarial-recovery-test.ts',
+    ],
   ),
   privateArtifacts: lane(['src/lib/private-artifacts.ts'], ['__tests__/private-artifacts-test.ts']),
   libs: lane(
@@ -147,10 +156,18 @@ export const mutationLanes = Object.freeze({
   authScreens: lane(
     ['src/app/(auth)/login.tsx', 'src/app/(auth)/signup.tsx', 'src/lib/identity-validation.ts'],
     // login.tsx is also rendered by the reset-password journey.
-    ['__tests__/screens-auth-test.tsx', '__tests__/screens-reset-password-test.tsx'],
+    [
+      '__tests__/screens-auth-test.tsx',
+      '__tests__/screens-reset-password-test.tsx',
+      '__tests__/adversarial-input-storm-test.tsx',
+    ],
   ),
   passwordReset: lane(
     ['src/app/(auth)/forgot-password.tsx', 'src/app/(auth)/reset-password.tsx'],
+    // The input-storm suite owns no reset-password behavior (its storms cover
+    // login/signup/change-password/delete-account/settings); Stryker's jest
+    // runner also deterministically fails to register that file inside this
+    // lane's two-file testMatch, so it is not listed here.
     ['__tests__/screens-reset-password-test.tsx'],
   ),
   home: lane(
@@ -172,7 +189,7 @@ export const mutationLanes = Object.freeze({
   // control and its recordings/history cache retirement contract.
   settingsProfile: lane(
     ['src/app/settings/index.tsx'],
-    ['__tests__/screens-settings-profile-test.tsx'],
+    ['__tests__/screens-settings-profile-test.tsx', '__tests__/adversarial-input-storm-test.tsx'],
   ),
   settingsOther: lane(
     [
@@ -181,7 +198,7 @@ export const mutationLanes = Object.freeze({
       'src/app/settings/privacy.tsx',
       'src/app/settings/terms.tsx',
     ],
-    ['__tests__/screens-settings-test.tsx'],
+    ['__tests__/screens-settings-test.tsx', '__tests__/adversarial-input-storm-test.tsx'],
   ),
 });
 

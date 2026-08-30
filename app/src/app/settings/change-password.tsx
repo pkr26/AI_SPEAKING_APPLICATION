@@ -136,7 +136,8 @@ export default function ChangePasswordScreen() {
         accessibilityRole="button"
         accessibilityLabel={`${fieldLabel}: ${actionLabel}`}
         onPress={() => toggleVisibility(field)}
-        style={styles.inputAction}
+        disabled={busy}
+        style={[styles.inputAction, busy && styles.controlDisabled]}
       >
         <Text style={styles.inputActionText}>{visible ? t('common.hide') : t('common.show')}</Text>
       </Pressable>
@@ -182,6 +183,7 @@ export default function ChangePasswordScreen() {
               returnKeyType="next"
               onSubmitEditing={() => newPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             {visibilityToggle('current', visibleFields.current)}
           </View>
@@ -215,6 +217,7 @@ export default function ChangePasswordScreen() {
               returnKeyType="next"
               onSubmitEditing={() => confirmPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             {visibilityToggle('next', visibleFields.next)}
           </View>
@@ -253,6 +256,7 @@ export default function ChangePasswordScreen() {
               returnKeyType="done"
               onSubmitEditing={() => void handleSubmit()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             {visibilityToggle('confirm', visibleFields.confirm)}
           </View>
@@ -345,6 +349,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  controlDisabled: {
+    opacity: 0.5,
   },
   fieldError: {
     marginTop: 6,

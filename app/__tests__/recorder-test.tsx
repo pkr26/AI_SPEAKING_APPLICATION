@@ -783,8 +783,11 @@ function RecoveryModeHarness({
 
 async function startRecording(): Promise<void> {
   expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
-  await fireEvent.press(screen.getByLabelText(START_LABEL));
-  expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
+  const startControl = screen.getByLabelText(START_LABEL);
+  expect(startControl.props.accessibilityHint).toBe(t('recorder.startHint'));
+  await fireEvent.press(startControl);
+  const stopControl = screen.getByLabelText(STOP_LABEL);
+  expect(stopControl.props.accessibilityHint).toBe(t('recorder.stopHint'));
 }
 
 async function recordAndStop(durationMillis = 5000): Promise<void> {

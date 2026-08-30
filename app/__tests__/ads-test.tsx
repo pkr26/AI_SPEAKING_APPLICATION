@@ -1829,7 +1829,8 @@ describe('ad surfaces', () => {
     expect(screen.getByText('Open').props.accessibilityRole).toBe('button');
     expect(screen.getByText('Open').props.numberOfLines).toBe(2);
     expect(StyleSheet.flatten(screen.getByText('Open').props.style)).toEqual({
-      minHeight: 44,
+      // Meets the app's shared 48dp minimum touch target.
+      minHeight: 48,
       textAlign: 'center',
       textAlignVertical: 'center',
       borderRadius: 8,

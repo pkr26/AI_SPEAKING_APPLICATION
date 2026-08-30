@@ -898,17 +898,6 @@ describe('home screen presentation', () => {
     textAlign: 'center',
   };
 
-  const SUMMARY_DISMISS = {
-    marginTop: spacing.md,
-    minHeight: layout.minimumTarget,
-    justifyContent: 'center',
-    alignSelf: 'flex-start',
-    paddingHorizontal: spacing.lg,
-    borderRadius: radii.input,
-    borderWidth: 1,
-    borderColor: colors.success,
-  };
-
   async function renderLoadedHome(stats: PracticeStats = STATS) {
     mockGetStats.mockResolvedValue(stats);
     await renderHome();
@@ -1120,20 +1109,21 @@ describe('home screen presentation', () => {
       lineHeight: 22,
       color: colors.text,
     });
-    expect(flattenedStyle(screen.getByText(t('summary.dismiss')))).toEqual({
-      color: colors.success,
-      fontSize: 15,
-      fontWeight: '700',
-    });
-
+    // The dismiss control is the shared quiet Button: primary text, no fill.
     const dismiss = () => screen.getByRole('button', { name: t('summary.dismiss') });
-    // At rest the dismiss control is an unfilled, touch-sized outline button.
-    expect(flattenedStyle(dismiss())).toEqual(SUMMARY_DISMISS);
-    await fireEvent(dismiss(), 'responderGrant', responderEvent());
-    expect(flattenedStyle(dismiss())).toEqual({
-      ...SUMMARY_DISMISS,
-      backgroundColor: colors.card,
+    expect(flattenedStyle(screen.getByText(t('summary.dismiss')))).toEqual({
+      flexShrink: 1,
+      fontWeight: '600',
+      textAlign: 'center',
+      fontSize: 15,
+      color: colors.primary,
     });
+    expect(flattenedStyle(dismiss())).toMatchObject({
+      marginTop: spacing.md,
+      alignSelf: 'flex-start',
+    });
+    await fireEvent(dismiss(), 'responderGrant', responderEvent());
+    expect(flattenedStyle(dismiss())).toMatchObject({ backgroundColor: colors.primaryLight });
     await fireEvent(dismiss(), 'responderTerminate', responderEvent());
     await waitFor(() => expect(flattenedStyle(dismiss()).backgroundColor).toBeUndefined());
   });

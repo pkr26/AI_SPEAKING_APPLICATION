@@ -466,6 +466,10 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen();
     expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    // The wait is announced to screen readers through both the labelled
+    // spinner and the polite live region on the text.
+    expect(screen.getByLabelText(t('diag.preparing'))).toBeTruthy();
+    expect(screen.getByText(t('diag.preparing')).props.accessibilityLiveRegion).toBe('polite');
     expect(mockRecorderProps).toBeNull();
     expect(
       screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
@@ -627,6 +631,8 @@ describe('diagnostic screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
     expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    // TalkBack learns about the level reveal through this live region.
+    expect(screen.getByText(t('diag.completeTitle')).props.accessibilityLiveRegion).toBe('polite');
     expect(screen.getByText(ANSWER_1.transcript).props.accessibilityLanguage).toBe('en-US');
     expect(screen.getByText(ANSWER_1.feedback)).toBeTruthy();
     expect(mockAssessmentReplayValue.clearDiagnosticReplay).toHaveBeenCalledWith(
@@ -740,6 +746,10 @@ describe('diagnostic screen', () => {
 
     expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    // A newly served question announces itself to TalkBack via this region.
+    expect(
+      screen.getByText('Describe a time you showed courage.').props.accessibilityLiveRegion,
+    ).toBe('polite');
     expect(recorderProps().questionId).toBe(QUESTION_1.id);
   });
 

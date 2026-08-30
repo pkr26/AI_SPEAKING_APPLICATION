@@ -1164,7 +1164,11 @@ export default function SettingsScreen() {
 
         <Text style={styles.label}>{t('settings.appLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.appLanguageHelp')}</Text>
-        <View style={styles.languageGrid}>
+        <View
+          accessibilityRole="radiogroup"
+          accessibilityLabel={t('settings.appLanguageLabel')}
+          style={styles.languageGrid}
+        >
           {UI_LANGUAGE_OPTIONS.map((lang) => {
             const selected = user.uiLanguage === lang.code;
             const saving =
@@ -1172,9 +1176,9 @@ export default function SettingsScreen() {
             return (
               <Pressable
                 key={lang.code}
-                accessibilityRole="button"
+                accessibilityRole="radio"
                 accessibilityLabel={`${t('settings.appLanguageLabel')}: ${lang.english}, ${lang.native}`}
-                accessibilityState={{ selected, busy: saving }}
+                accessibilityState={{ checked: selected, selected, busy: saving }}
                 disabled={languageBusy || logoutBusy}
                 onPress={() => void chooseUiLanguage(lang.code)}
                 style={[
@@ -1211,7 +1215,11 @@ export default function SettingsScreen() {
 
         <Text style={styles.label}>{t('settings.learningLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.learningLanguageHelp')}</Text>
-        <View style={styles.languageGrid}>
+        <View
+          accessibilityRole="radiogroup"
+          accessibilityLabel={t('settings.learningLanguageLabel')}
+          style={styles.languageGrid}
+        >
           {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
             const selected = user.nativeLanguage === lang.code;
             const saving =
@@ -1221,9 +1229,9 @@ export default function SettingsScreen() {
             return (
               <Pressable
                 key={lang.code}
-                accessibilityRole="button"
+                accessibilityRole="radio"
                 accessibilityLabel={`${lang.english}, ${lang.native}`}
-                accessibilityState={{ selected, busy: saving }}
+                accessibilityState={{ checked: selected, selected, busy: saving }}
                 disabled={languageBusy || logoutBusy}
                 onPress={() => void chooseNativeLanguage(lang.code)}
                 style={[

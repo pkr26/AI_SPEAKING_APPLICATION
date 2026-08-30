@@ -160,6 +160,7 @@ export default function ResetPasswordScreen() {
             returnKeyType="next"
             onSubmitEditing={() => codeRef.current?.focus()}
             maxLength={MAX_EMAIL_LENGTH}
+            editable={!busy}
           />
           {emailError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
@@ -185,6 +186,7 @@ export default function ResetPasswordScreen() {
             returnKeyType="next"
             onSubmitEditing={() => passwordRef.current?.focus()}
             maxLength={MAX_RESET_CODE_LENGTH}
+            editable={!busy}
           />
 
           <Text style={styles.label}>{t('cp.newLabel')}</Text>
@@ -215,6 +217,7 @@ export default function ResetPasswordScreen() {
               returnKeyType="next"
               onSubmitEditing={() => confirmPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             <Pressable
               accessibilityRole="button"
@@ -222,7 +225,8 @@ export default function ResetPasswordScreen() {
                 passwordVisible ? t('common.hidePassword') : t('common.showPassword')
               }
               onPress={() => setPasswordVisible((visible) => !visible)}
-              style={styles.inputAction}
+              disabled={busy}
+              style={[styles.inputAction, busy && styles.controlDisabled]}
             >
               <Text style={styles.inputActionText}>
                 {passwordVisible ? t('common.hide') : t('common.show')}
@@ -259,6 +263,7 @@ export default function ResetPasswordScreen() {
               returnKeyType="go"
               onSubmitEditing={() => void handleSubmit()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             <Pressable
               accessibilityRole="button"
@@ -268,7 +273,8 @@ export default function ResetPasswordScreen() {
                   : t('password.showConfirmation')
               }
               onPress={() => setConfirmPasswordVisible((visible) => !visible)}
-              style={styles.inputAction}
+              disabled={busy}
+              style={[styles.inputAction, busy && styles.controlDisabled]}
             >
               <Text style={styles.inputActionText}>
                 {confirmPasswordVisible ? t('common.hide') : t('common.show')}
@@ -372,6 +378,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  controlDisabled: {
+    opacity: 0.5,
   },
   fieldError: {
     marginTop: 6,

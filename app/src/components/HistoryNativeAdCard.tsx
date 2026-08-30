@@ -196,7 +196,7 @@ const styles = StyleSheet.create({
   headline: { fontSize: 17, lineHeight: 22, fontWeight: '700' },
   body: { fontSize: 14, lineHeight: 20 },
   cta: {
-    minHeight: 44,
+    minHeight: 48,
     textAlign: 'center',
     textAlignVertical: 'center',
     borderRadius: 8,

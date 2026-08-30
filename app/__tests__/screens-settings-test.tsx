@@ -858,6 +858,23 @@ describe('change password screen', () => {
         disabled: true,
         busy: true,
       });
+      // All three credential fields and their shared visibility toggles lock
+      // while the rotation is in flight (matching the login/signup contract).
+      expect(screen.getByLabelText(t('cp.currentLabel')).props.editable).toBe(false);
+      expect(screen.getByLabelText(t('cp.newLabel')).props.editable).toBe(false);
+      expect(screen.getByLabelText(t('cp.confirmLabel')).props.editable).toBe(false);
+      expect(
+        screen.getByRole('button', {
+          name: `${t('cp.currentLabel')}: ${t('common.showPassword')}`,
+        }).props.accessibilityState,
+      ).toEqual({ disabled: true });
+      expect(
+        flattenedStyle(
+          screen.getByRole('button', {
+            name: `${t('cp.currentLabel')}: ${t('common.showPassword')}`,
+          }),
+        ),
+      ).toEqual(expect.objectContaining({ opacity: 0.5 }));
     } finally {
       try {
         await act(async () => change.resolve(undefined));
@@ -1507,6 +1524,14 @@ describe('delete account screen', () => {
     try {
       const busyButton = await screen.findByRole('button', { name: t('da.submitBusy') });
       expect(busyButton.props.accessibilityState).toEqual({ disabled: true, busy: true });
+      // The credential field and its visibility toggle lock while deleting.
+      expect(screen.getByLabelText(t('da.passwordLabel')).props.editable).toBe(false);
+      expect(
+        screen.getByRole('button', { name: t('common.showPassword') }).props.accessibilityState,
+      ).toEqual({ disabled: true });
+      expect(
+        flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') })),
+      ).toEqual(expect.objectContaining({ opacity: 0.5 }));
     } finally {
       try {
         await pressPromise;

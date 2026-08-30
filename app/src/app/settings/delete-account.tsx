@@ -190,6 +190,7 @@ export default function DeleteAccountScreen() {
               returnKeyType="done"
               onSubmitEditing={handleSubmit}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
+              editable={!busy}
             />
             <Pressable
               accessibilityRole="button"
@@ -197,7 +198,8 @@ export default function DeleteAccountScreen() {
                 passwordVisible ? t('common.hidePassword') : t('common.showPassword')
               }
               onPress={() => setPasswordVisible((visible) => !visible)}
-              style={styles.inputAction}
+              disabled={busy}
+              style={[styles.inputAction, busy && styles.controlDisabled]}
             >
               <Text style={styles.inputActionText}>
                 {passwordVisible ? t('common.hide') : t('common.show')}
@@ -316,6 +318,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  controlDisabled: {
+    opacity: 0.5,
   },
   error: {
     marginTop: 14,

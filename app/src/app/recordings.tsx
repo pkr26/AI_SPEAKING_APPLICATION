@@ -264,6 +264,7 @@ export default function RecordingsScreen() {
 
   return (
     <FlatList
+      accessibilityRole="list"
       style={styles.list}
       contentContainerStyle={styles.listContent}
       contentInsetAdjustmentBehavior="automatic"

@@ -344,8 +344,9 @@ export default function DiagnosticScreen() {
     if (hadPreviousStep) {
       questionScrollRef.current?.scrollTo({ y: 0, animated: false });
     }
-    // Android receives the authored live-region updates in the result card.
-    // VoiceOver does not implement live regions, so queue the same transition.
+    // Android receives the authored live-region updates in the result card,
+    // the question card, and the completion reveal. VoiceOver does not
+    // implement live regions, so queue the same transition.
     if (Platform.OS === 'ios') {
       AccessibilityInfo.announceForAccessibilityWithOptions(accessibleStepAnnouncement, {
         queue: true,
@@ -700,8 +701,14 @@ export default function DiagnosticScreen() {
             <OfflineState />
           ) : (
             <>
-              <ActivityIndicator size="large" color={theme.colors.primary} />
-              <Text style={styles.muted}>{t('diag.preparing')}</Text>
+              <ActivityIndicator
+                accessibilityLabel={t('diag.preparing')}
+                size="large"
+                color={theme.colors.primary}
+              />
+              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                {t('diag.preparing')}
+              </Text>
             </>
           )}
           {renderAccountActions()}
@@ -747,7 +754,13 @@ export default function DiagnosticScreen() {
         >
           🎉
         </Text>
-        <Text accessibilityRole="header" style={styles.congratsTitle}>
+        {/* Live region gives TalkBack the same level-reveal transition iOS
+            receives through the queued step announcement below. */}
+        <Text
+          accessibilityLiveRegion="polite"
+          accessibilityRole="header"
+          style={styles.congratsTitle}
+        >
           {t('diag.completeTitle')}
         </Text>
         <Text style={styles.congratsText}>{t('diag.levelIntro')}</Text>
@@ -859,7 +872,14 @@ export default function DiagnosticScreen() {
               {currentQuestion.promptWord}
             </Text>
             <Text style={styles.cardLabel}>{t('label.question')}</Text>
-            <Text accessibilityLanguage="en-US" style={styles.questionText}>
+            {/* TalkBack learns a new question was served through this live
+                region; the announcement effect below covers VoiceOver, which
+                does not implement live regions. */}
+            <Text
+              accessibilityLiveRegion="polite"
+              accessibilityLanguage="en-US"
+              style={styles.questionText}
+            >
               {currentQuestion.questionText}
             </Text>
           </View>

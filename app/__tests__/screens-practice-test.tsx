@@ -766,6 +766,10 @@ describe('practice home screen', () => {
     expect(
       (await screen.findByText('Describe a time you showed courage.')).props.accessibilityLanguage,
     ).toBe('en-US');
+    // A newly served question announces itself to TalkBack via this region.
+    expect(
+      screen.getByText('Describe a time you showed courage.').props.accessibilityLiveRegion,
+    ).toBe('polite');
     expect(screen.getByRole('header', { name: 'courage' }).props.accessibilityLanguage).toBe(
       'en-US',
     );

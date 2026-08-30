@@ -3,7 +3,6 @@ import { router, useFocusEffect, useIsFocused } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
 import {
   ActivityIndicator,
-  Pressable,
   RefreshControl,
   ScrollView,
   Text,
@@ -186,13 +185,13 @@ export default function HomeScreen() {
               {t('summary.levelUps', { count: sessionTally.levelUps })}
             </Text>
           )}
-          <Pressable
-            accessibilityRole="button"
-            style={({ pressed }) => [styles.summaryDismiss, pressed && styles.summaryDismissed]}
+          <Button
+            title={t('summary.dismiss')}
+            variant="quiet"
+            size="sm"
             onPress={resetSessionTally}
-          >
-            <Text style={styles.summaryDismissText}>{t('summary.dismiss')}</Text>
-          </Pressable>
+            style={styles.summaryDismissAction}
+          />
         </View>
       )}
 
@@ -407,23 +406,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     lineHeight: 22,
     color: colors.text,
   },
-  summaryDismiss: {
+  summaryDismissAction: {
     marginTop: spacing.md,
-    minHeight: layout.minimumTarget,
-    justifyContent: 'center',
     alignSelf: 'flex-start',
-    paddingHorizontal: spacing.lg,
-    borderRadius: radii.input,
-    borderWidth: 1,
-    borderColor: colors.success,
-  },
-  summaryDismissed: {
-    backgroundColor: colors.card,
-  },
-  summaryDismissText: {
-    color: colors.success,
-    fontSize: 15,
-    fontWeight: '700',
   },
   card: {
     backgroundColor: colors.card,

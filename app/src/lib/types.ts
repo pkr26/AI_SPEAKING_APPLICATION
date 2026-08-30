@@ -438,7 +438,12 @@ export function parseDiagnosticNext(value: unknown): DiagnosticNext {
     !Number.isInteger(maxQuestions) ||
     maxQuestions < 1 ||
     maxQuestions > 100 ||
-    asked >= maxQuestions
+    // Current servers finalize at attemptNo >= maxQuestions, so asked can at
+    // most equal it. Equality stays accepted for one legacy shape: a run
+    // abandoned under the pre-MAX_QUESTIONS server with 3+ non-silent answers
+    // (the DB allows questions_asked up to 5) would otherwise hard-fail this
+    // parser and block the resumed test until a manual Settings restart.
+    asked > maxQuestions
   ) {
     throw new ContractError();
   }
@@ -991,7 +996,9 @@ export function parseRecordingPage(value: unknown): RecordingPage {
   if (
     !isRecord(value) ||
     !Array.isArray(value.items) ||
-    value.items.length > 50 ||
+    // Shares the history page ceiling: the server accepts limit <= 50 for
+    // both list endpoints and only ever issues 20.
+    value.items.length > HISTORY_MAX_PAGE_ITEMS ||
     (value.nextCursor !== null && !isUuid(value.nextCursor)) ||
     (value.items.length === 0 && value.nextCursor !== null)
   ) {

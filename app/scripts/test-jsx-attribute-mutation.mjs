@@ -213,7 +213,10 @@ test('checked-in discovery is exhaustive and lane-owned for both JSX modes', asy
     mode: 'accessibility',
   });
   assert.equal(eventSites.length, 221);
-  assert.equal(accessibilitySites.length, 334);
+  // +12 sites from the first-frontend-audit a11y fixes: live regions on the
+  // diagnostic preparing/done/question views and the practice question card,
+  // list roles on history/recordings, and the signup/settings radiogroups.
+  assert.equal(accessibilitySites.length, 346);
   for (const sites of [eventSites, accessibilitySites]) {
     assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
     assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));

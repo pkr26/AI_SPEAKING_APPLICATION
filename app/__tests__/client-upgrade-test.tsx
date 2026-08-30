@@ -288,7 +288,10 @@ it('awaits local sign-out, blocks repeat taps, and reports a localized failure',
     screen.getByRole('button', { name: translateFor('es', 'logout.thisDevice') }),
   );
 
-  expect(await screen.findByRole('alert')).toHaveTextContent(translateFor('es', 'error.internal'));
+  const localFailure = await screen.findByRole('alert');
+  expect(localFailure).toHaveTextContent(translateFor('es', 'error.internal'));
+  // The retry explanation announces itself assertively, like the store error.
+  expect(localFailure.props.accessibilityLiveRegion).toBe('assertive');
   expect(visibleModalNode().props.visible).toBe(true);
 });
 

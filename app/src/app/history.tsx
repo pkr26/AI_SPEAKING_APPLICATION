@@ -434,6 +434,7 @@ export default function HistoryScreen() {
 
   return (
     <SectionList
+      accessibilityRole="list"
       style={styles.list}
       contentContainerStyle={styles.listContent}
       contentInsetAdjustmentBehavior="automatic"

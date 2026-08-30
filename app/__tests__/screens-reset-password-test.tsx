@@ -1368,6 +1368,24 @@ describe('reset-password screen', () => {
 
     const saving = screen.getByRole('button', { name: t('reset.submitNewBusy') });
     expect(saving.props.accessibilityState).toEqual({ disabled: true, busy: true });
+    // The form locks while the one-shot code is being spent: no field edits,
+    // no visibility toggles (matching the login/signup busy contract).
+    expect(screen.getByLabelText(t('login.emailLabel')).props.editable).toBe(false);
+    expect(screen.getByLabelText(t('reset.codeLabel')).props.editable).toBe(false);
+    expect(screen.getByLabelText(t('cp.newLabel')).props.editable).toBe(false);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.editable).toBe(false);
+    expect(
+      screen.getByRole('button', { name: t('common.showPassword') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+    expect(
+      screen.getByRole('button', { name: t('password.showConfirmation') }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+    expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual(
+      expect.objectContaining({ opacity: 0.5 }),
+    );
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('password.showConfirmation') })),
+    ).toEqual(expect.objectContaining({ opacity: 0.5 }));
     // A one-shot code must not be spent twice by an impatient second tap.
     expect(screen.queryByText(t('reset.submitNew'))).toBeNull();
 

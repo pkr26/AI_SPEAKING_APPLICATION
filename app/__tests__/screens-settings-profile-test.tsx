@@ -386,18 +386,18 @@ function languageSpinners(): TestInstance[] {
 }
 
 function languageChip(index: number): TestInstance {
-  return screen.getByRole('button', { name: chipLabel(index) });
+  return screen.getByRole('radio', { name: chipLabel(index) });
 }
 
 function appLanguageChip(index: number): TestInstance {
-  return screen.getByRole('button', {
+  return screen.getByRole('radio', {
     name: `${t('settings.appLanguageLabel')}: ${chipLabel(index)}`,
   });
 }
 
 function uiLanguageChip(index: number): TestInstance {
   const language = UI_LANGUAGE_CHIPS[index];
-  return screen.getByRole('button', {
+  return screen.getByRole('radio', {
     name: `${t('settings.appLanguageLabel')}: ${language.english}, ${language.native}`,
   });
 }
@@ -525,10 +525,18 @@ describe('settings profile card', () => {
     // Nothing has been saved yet, so no confirmation is showing.
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
 
-    const telugu = screen.getByRole('button', { name: 'Telugu, తెలుగు' });
-    expect(telugu.props.accessibilityState).toMatchObject({ selected: true });
-    const hindi = screen.getByRole('button', { name: 'Hindi, हिन्दी' });
-    expect(hindi.props.accessibilityState).toMatchObject({ selected: false });
+    const telugu = screen.getByRole('radio', { name: 'Telugu, తెలుగు' });
+    expect(telugu.props.accessibilityState).toMatchObject({ checked: true, selected: true });
+    const hindi = screen.getByRole('radio', { name: 'Hindi, हिन्दी' });
+    expect(hindi.props.accessibilityState).toMatchObject({ checked: false, selected: false });
+    // Both single-choice controls are grouped radiogroups for screen readers.
+    const groupLabels = screen.container
+      .queryAll((node) => node.props.accessibilityRole === 'radiogroup')
+      .map((node) => node.props.accessibilityLabel);
+    expect(groupLabels).toEqual([
+      t('settings.appLanguageLabel'),
+      t('settings.learningLanguageLabel'),
+    ]);
   });
 
   it('names every card, field label, and control on the screen', async () => {
@@ -1124,7 +1132,7 @@ describe('settings profile card', () => {
     await renderSettings(queryClient);
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(screen.getByRole('radio', { name: 'Hindi, हिन्दी' }));
     });
 
     expect(mockUpdateProfile).toHaveBeenCalledWith({ nativeLanguage: 'hi' });
@@ -1701,7 +1709,7 @@ describe('settings profile card', () => {
 
   it('does not PATCH when tapping the already-selected language', async () => {
     await renderSettings();
-    await fireEvent.press(screen.getByRole('button', { name: 'Telugu, తెలుగు' }));
+    await fireEvent.press(screen.getByRole('radio', { name: 'Telugu, తెలుగు' }));
     expect(mockUpdateProfile).not.toHaveBeenCalled();
   });
 
@@ -1786,7 +1794,7 @@ describe('settings profile card', () => {
     await renderSettings();
 
     await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: 'Hindi, हिन्दी' }));
+      await fireEvent.press(screen.getByRole('radio', { name: 'Hindi, हिन्दी' }));
     });
 
     expect(await screen.findByRole('alert')).toHaveTextContent(t('error.serverBusy'));

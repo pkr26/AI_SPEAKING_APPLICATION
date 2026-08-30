@@ -1,4 +1,4 @@
-import React, { type PropsWithChildren, useEffect, useMemo } from 'react';
+import React, { type PropsWithChildren, useEffect, useMemo, useRef } from 'react';
 import { ActivityIndicator, ScrollView, Text, View } from 'react-native';
 import { Redirect } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
@@ -77,6 +77,9 @@ export default function Gate() {
     return captureSessionLease();
   }, [captureSessionLease, sessionVersion, token]);
 
+  // The bounded profile fallback below must fire at most once per mount.
+  const fallbackFiredRef = useRef(false);
+
   const meQuery = useQuery({
     queryKey: ['me', sessionVersion],
     queryFn: async ({ signal }) =>
@@ -105,7 +108,14 @@ export default function Gate() {
   // Gate degrades to its own request instead of hanging silently.
   useEffect(() => {
     if (!token || user || meQuery.data || meQuery.fetchStatus !== 'idle') return;
+    // One direct fallback request per mounted gate. Without the latch this
+    // effect re-arms after every failed attempt (fetchStatus returns to
+    // 'idle' with still no data), polling /auth/me every ten seconds forever
+    // behind a failing server; the explicit Try Again button already covers
+    // deliberate retries.
+    if (fallbackFiredRef.current) return;
     const fallback = setTimeout(() => {
+      fallbackFiredRef.current = true;
       void meQuery.refetch();
     }, GATE_PROFILE_FALLBACK_MS);
     return () => clearTimeout(fallback);

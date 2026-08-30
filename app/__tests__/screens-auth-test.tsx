@@ -1399,10 +1399,24 @@ describe('signup screen', () => {
     const telugu = screen.getByLabelText('Telugu, తెలుగు');
     const spanish = screen.getByLabelText('Spanish, Español');
 
-    expect(telugu.props.accessibilityRole).toBe('button');
-    expect(spanish.props.accessibilityRole).toBe('button');
-    expect(telugu.props.accessibilityState).toEqual({ selected: false, disabled: false });
-    expect(spanish.props.accessibilityState).toEqual({ selected: false, disabled: false });
+    expect(telugu.props.accessibilityRole).toBe('radio');
+    expect(spanish.props.accessibilityRole).toBe('radio');
+    expect(telugu.props.accessibilityState).toEqual({
+      checked: false,
+      selected: false,
+      disabled: false,
+    });
+    expect(spanish.props.accessibilityState).toEqual({
+      checked: false,
+      selected: false,
+      disabled: false,
+    });
+    // The single-choice control is grouped for screen readers (the picker at
+    // the top of the form carries its own app-language radiogroup).
+    const nativeLanguageGroups = screen.container
+      .queryAll((node) => node.props.accessibilityRole === 'radiogroup')
+      .filter((node) => node.props.accessibilityLabel === t('signup.languageLabel'));
+    expect(nativeLanguageGroups).toHaveLength(1);
     expect(screen.queryByTestId('signup-language-check-te')).toBeNull();
     expect(flattenedStyle(telugu)).toMatchObject({
       alignItems: 'center',
@@ -1426,6 +1440,7 @@ describe('signup screen', () => {
     await fireEvent.press(telugu);
     const selectedTelugu = screen.getByLabelText('Telugu, తెలుగు');
     expect(selectedTelugu.props.accessibilityState).toEqual({
+      checked: true,
       selected: true,
       disabled: false,
     });
@@ -1446,16 +1461,19 @@ describe('signup screen', () => {
       color: colors.primary,
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
+      checked: false,
       selected: false,
       disabled: false,
     });
 
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+      checked: false,
       selected: false,
       disabled: false,
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
+      checked: true,
       selected: true,
       disabled: false,
     });
@@ -1816,6 +1834,7 @@ describe('signup screen', () => {
       expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
       expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(true);
       expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
+        checked: true,
         selected: true,
         disabled: true,
       });

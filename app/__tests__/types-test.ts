@@ -270,6 +270,20 @@ describe('question and diagnostic contract parsers', () => {
       done: true,
       level: 'B1',
     });
+    // A run abandoned under the pre-MAX_QUESTIONS server can legitimately
+    // resume with asked === maxQuestions (the DB allowed up to 5); only a
+    // count beyond the cap is contract drift.
+    expect(
+      parseDiagnosticNext({
+        done: false,
+        question,
+        progress: { asked: 6, maxQuestions: 6 },
+      }),
+    ).toEqual({
+      done: false,
+      question,
+      progress: { asked: 6, maxQuestions: 6 },
+    });
   });
 
   it('rejects missing, non-finite, and wrong-type diagnostic fields', () => {
@@ -296,7 +310,7 @@ describe('question and diagnostic contract parsers', () => {
       parseDiagnosticNext({
         done: false,
         question,
-        progress: { asked: 6, maxQuestions: 6 },
+        progress: { asked: 7, maxQuestions: 6 },
       }),
     );
     expectContractError(() => parseDiagnosticNext({ done: true, level: 'B9' }));

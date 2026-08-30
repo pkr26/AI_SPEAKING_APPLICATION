@@ -357,6 +357,11 @@ function rowHeader(promptWord: string, score: number): TestInstance {
   });
 }
 
+/** The expand/collapse hint every row header carries for screen readers. */
+function expectRowHint(promptWord: string, score: number): void {
+  expect(rowHeader(promptWord, score).props.accessibilityHint).toBe(t('history.detailsHint'));
+}
+
 function responderEvent() {
   return {
     currentTarget: { measure: () => undefined },
@@ -828,6 +833,7 @@ describe('history screen', () => {
     });
     const listProps = sectionListProps();
     expect(listProps).toMatchObject({
+      accessibilityRole: 'list',
       contentInsetAdjustmentBehavior: 'automatic',
       initialNumToRender: 12,
       onEndReachedThreshold: 0.4,
@@ -905,6 +911,7 @@ describe('history screen', () => {
     await renderHistory();
     await screen.findByText('courage');
 
+    expectRowHint('courage', 82);
     expect(flattenedStyle(parentOf(rowHeader('courage', 82)))).toEqual({
       backgroundColor: colors.card,
       borderRadius: radii.card,

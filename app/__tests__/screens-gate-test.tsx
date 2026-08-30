@@ -1025,6 +1025,43 @@ describe('index gate', () => {
     }
   });
 
+  it('fires the bounded profile fallback only once while the request keeps failing', async () => {
+    jest.useFakeTimers();
+    try {
+      mockAuthValue = makeAuth({ token: 'stored-bearer', user: null });
+      const client = makeQueryClient();
+      // Every direct attempt fails; the disabled observer must not turn the
+      // bounded fallback into an indefinite ten-second poll.
+      mockApiFetch.mockRejectedValue(new Error('server unreachable'));
+      const rendered = await render(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 0, left: 0, right: 0, bottom: 0 },
+          }}
+        >
+          <QueryClientProvider client={client}>
+            <Gate />
+          </QueryClientProvider>
+        </SafeAreaProvider>,
+      );
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(10_000);
+      });
+      await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(60_000);
+      });
+      // The one-shot latch holds: no second automatic request even after the
+      // failed attempt settles and fetchStatus returns to 'idle'.
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      rendered.unmount();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('keeps the current route visible while the persistent profile refresh is in flight', async () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderGate();

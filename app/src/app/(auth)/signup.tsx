@@ -307,15 +307,19 @@ export default function SignupScreen() {
 
             <Text style={styles.label}>{t('signup.languageLabel')}</Text>
             <Text style={styles.languageHelp}>{t('signup.languageHelp')}</Text>
-            <View style={styles.languageGrid}>
+            <View
+              accessibilityRole="radiogroup"
+              accessibilityLabel={t('signup.languageLabel')}
+              style={styles.languageGrid}
+            >
               {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
                 const selected = nativeLanguage === lang.code;
                 return (
                   <Pressable
                     key={lang.code}
-                    accessibilityRole="button"
+                    accessibilityRole="radio"
                     accessibilityLabel={`${lang.english}, ${lang.native}`}
-                    accessibilityState={{ selected, disabled: busy }}
+                    accessibilityState={{ checked: selected, selected, disabled: busy }}
                     disabled={busy}
                     onPress={() => chooseLanguage(lang.code)}
                     style={[

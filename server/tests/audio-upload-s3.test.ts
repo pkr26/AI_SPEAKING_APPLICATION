@@ -2319,6 +2319,16 @@ describe('POST /diagnostic/answer (S3 mode)', () => {
       VersionId: 'mock-unversioned-object',
       Tagging: { TagSet: [{ Key: 'retention', Value: 'retained' }] },
     });
+    // The available flip commits only after the tag send resolves, so the row
+    // can still read retention_pending here; wait for the terminal status
+    // before snapshotting the complete row.
+    await vi.waitFor(async () => {
+      const retained = await pool.query<{ status: string }>(
+        'SELECT status FROM recordings WHERE user_id = $1 AND request_id = $2',
+        [userId, requestId],
+      );
+      expect(retained.rows).toEqual([{ status: 'available' }]);
+    });
     const recording = await pool.query(
       `SELECT id, request_id, audio_key, status
        FROM recordings WHERE user_id = $1 AND request_id = $2`,

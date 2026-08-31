@@ -4,7 +4,7 @@ import { pool, type CefrLevel } from './db';
 import { JANITOR_BATCH_SIZE, runExclusiveBatchedDelete } from './janitor';
 import { logger } from './logger';
 import { ApiErrorCode, HttpError } from './middleware';
-import { insertRetainedRecording, RecordingCapture } from './recording-store';
+import { insertRetainedRecording, RecordingCapture, RecordingStorageScope } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
 export type AssessmentContext = 'diagnostic' | 'practice' | 'practice-native';
@@ -37,6 +37,20 @@ function createAssessmentQuestionSnapshotSchema() {
         .refine((value) => value.trim().length > 0),
     })
     .strict();
+}
+
+/**
+ * Validate the exact in-memory question used for grading before its wording is
+ * snapshot onto an attempts row (migration 026). Same strict contract as the
+ * claim-time snapshot, so a corrupt in-memory catalog row fails closed as a
+ * 500 instead of dying on the attempts CHECK constraints mid-transaction.
+ */
+export function validatedAttemptQuestionSnapshot(snapshot: AssessmentQuestionSnapshot): AssessmentQuestionSnapshot {
+  const parsed = createAssessmentQuestionSnapshotSchema().safeParse(snapshot);
+  if (!parsed.success) {
+    throw new HttpError(500, 'Attempt question snapshot is invalid', 'INTERNAL');
+  }
+  return parsed.data;
 }
 
 /**
@@ -380,6 +394,24 @@ export type AssessmentRequestClaim =
   { kind: 'claimed'; claimId: string } | { kind: 'completed'; response: Record<string, unknown> };
 
 /**
+ * Snapshot fields a fresh claim exposes to its owning submission pipeline.
+ * Delivered through the optional `onClaimed` observer so the public claim
+ * result shape stays exactly `{ kind: 'claimed', claimId }`.
+ */
+export interface ClaimedAssessmentRequest {
+  claimId: string;
+  /**
+   * The claim row's native-language snapshot (migration 022): non-NULL only
+   * for practice-native claims. Committed under the claim's users FOR UPDATE
+   * lock and read back through the INSERT's RETURNING, so it is the
+   * authoritative language for grading and persistence of that request — not
+   * the requireAuth-time profile copy, which a concurrent PATCH /auth/me can
+   * strand mid-flight.
+   */
+  nativeLanguage: AssessmentNativeLanguage | null;
+}
+
+/**
  * Internal signal that another worker still owns this request UUID. Routes use
  * it to preserve a possibly shared S3 object until that owner finishes. The
  * public status/message remain the normal HttpError contract.
@@ -407,6 +439,18 @@ function retiredDiagnosticRunError(): HttpError {
 }
 
 /**
+ * Storage scope owning a claim's audio object, mirroring audio-upload.ts's
+ * storageScopeForAssessmentEndpoint (diagnostic endpoint → diagnostic bucket,
+ * both practice endpoints → practice bucket) at the claim's context level —
+ * the same pairing migration 017's recordings_context_scope_check enforces.
+ * Mirrored rather than imported because audio-upload.ts already imports from
+ * this module; the two mappings must stay aligned.
+ */
+function storageScopeForContext(context: AssessmentContext): RecordingStorageScope {
+  return context === 'diagnostic' ? 'diagnostic' : 'practice';
+}
+
+/**
  * Claim a client request UUID before any quota/provider work. Completed rows
  * replay their exact response; concurrent processing returns 409 with a short
  * retry hint. The same UUID can never be reused for another question,
@@ -415,7 +459,12 @@ function retiredDiagnosticRunError(): HttpError {
  * 409 prevents both invalid JSON and duplicate paid work until normal expiry.
  * In S3 ingress mode the submitted audioKey is recorded with the processing
  * claim so submitted-object cleanup can tell which object a live worker is
- * reading (see finalizeSubmittedPresignedAudio).
+ * reading (see finalizeSubmittedPresignedAudio), and a key already bound to
+ * permanent recording metadata is refused up front with the audio-reuse 409
+ * before any paid work. A fresh claim reports its row's committed
+ * native-language snapshot through the optional onClaimed observer so
+ * practice-native grading and persistence use the claim's authoritative
+ * language, not a stale requireAuth-time copy.
  */
 export async function claimAssessmentRequest(
   userId: string,
@@ -427,6 +476,7 @@ export async function claimAssessmentRequest(
   retainRecording = true,
   nativeLanguage?: AssessmentNativeLanguage,
   questionSnapshot?: AssessmentQuestionSnapshot,
+  onClaimed?: (claim: ClaimedAssessmentRequest) => void,
 ): Promise<AssessmentRequestClaim> {
   if (
     (context === 'diagnostic' && practiceCycleId !== undefined) ||
@@ -482,14 +532,15 @@ export async function claimAssessmentRequest(
       [userId, requestId, audioKey ?? null],
     );
     const requestClaimId = randomUUID();
-    const inserted = await client.query(
+    const inserted = await client.query<{ native_language: AssessmentNativeLanguage | null }>(
       `INSERT INTO assessment_requests
          (user_id, request_id, claim_id, context, question_id, status, audio_key, practice_cycle_id,
           retain_recording, recording_retention_epoch, native_language, diagnostic_run_id,
           question_cefr_level, question_prompt_word, question_text)
        VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8,
                (SELECT recording_retention_epoch FROM users WHERE id = $1), $9, $10, $11, $12, $13)
-       ON CONFLICT DO NOTHING`,
+       ON CONFLICT DO NOTHING
+       RETURNING native_language`,
       [
         userId,
         requestId,
@@ -514,7 +565,33 @@ export async function claimAssessmentRequest(
       ],
     );
     if (inserted.rowCount === 1) {
+      // The request UUID was free, so this claim would commit. One last gate
+      // for S3 ingress: a presigned object already bound to PERMANENT
+      // recording metadata can never be reassessed. Its completed
+      // assessment_requests tombstone is janitored at 48h — the expiry DELETE
+      // above frees the (user_id, audio_key) binding — while the recording
+      // itself lives until explicit deletion (or, after delete-all, until
+      // bounded maintenance removes the stale-generation row that still holds
+      // migration 017's UNIQUE (storage_scope, audio_key, s3_version_id)).
+      // Admitting the claim would spend paid work and die on that unique
+      // constraint at completion, so reject here with the same stable 409 the
+      // live-binding branch below uses. One indexed lookup on the unique
+      // index's (storage_scope, audio_key) prefix.
+      if (audioKey) {
+        const retained = await client.query(
+          `SELECT 1 FROM recordings
+           WHERE user_id = $1 AND storage_scope = $2 AND audio_key = $3`,
+          [userId, storageScopeForContext(context), audioKey],
+        );
+        if (retained.rows.length > 0) {
+          throw new HttpError(409, 'Audio upload was already submitted', 'REQUEST_ID_REUSED');
+        }
+      }
       await client.query('COMMIT');
+      // The row's committed snapshot (not the caller's in-memory copy) is the
+      // claim's authoritative language: migration 022's trigger resolves it
+      // under the users FOR UPDATE lock this transaction already held.
+      onClaimed?.({ claimId: requestClaimId, nativeLanguage: inserted.rows[0].native_language });
       return { kind: 'claimed', claimId: requestClaimId };
     }
 
@@ -686,7 +763,21 @@ export async function completeAssessmentRequest(
   }
   if (recording && owner.recording_retained) {
     if (!owner.audio_key) throw new Error('recording completion has no authoritative S3 audio key');
-    await insertRetainedRecording(client, userId, requestId, owner.question_id, context, owner.audio_key, recording);
+    try {
+      await insertRetainedRecording(client, userId, requestId, owner.question_id, context, owner.audio_key, recording);
+    } catch (err) {
+      // Defensive twin of the claim-time pre-check: permanent metadata for
+      // this exact object can commit between the claim's lookup and this
+      // insert (a rival worker's late completion, or stale-generation
+      // metadata the pre-check raced). Migration 017's unique violation must
+      // surface as the same stable audio-reuse 409 the claim path answers —
+      // unwinding the caller's transaction — instead of an unhandled 500
+      // after paid work; every other failure propagates unchanged.
+      if ((err as { code?: string }).code === '23505') {
+        throw new HttpError(409, 'Audio upload was already submitted', 'REQUEST_ID_REUSED');
+      }
+      throw err;
+    }
   }
   return recording && owner.recording_retained ? responseWithRecording : validatedResponseWithoutRecording;
 }
@@ -828,30 +919,12 @@ export async function getAssessmentRequestStatus(
 }
 
 /**
- * Cleanup guard used by pre-route S3 middleware. A live processing row means
- * some worker may still need the request's shared audio object, even if this
- * duplicate was rejected by validation, eligibility, or a limiter before it
- * reached claimAssessmentRequest.
- */
-export async function isAssessmentRequestProcessing(userId: string, requestId: string): Promise<boolean> {
-  const { rows } = await pool.query(
-    `SELECT 1
-     FROM assessment_requests
-     WHERE user_id = $1 AND request_id = $2
-       AND status = 'processing'
-       AND started_at >= now() - interval '5 minutes'`,
-    [userId, requestId],
-  );
-  return rows.length > 0;
-}
-
-/**
- * Companion cleanup guard keyed by the submitted object instead of the
- * request: true while ANY non-expired processing claim for this user
- * references this audioKey. Catches the duplicates a per-requestId check
- * cannot see — same object resubmitted under a different or malformed
- * requestId, or a blind same-key retry that re-claimed in the gap between a
- * failed request's claim abandon and its post-response delete.
+ * Cleanup guard used by pre-route S3 middleware: true while ANY non-expired
+ * processing claim for this user references this audioKey. Keyed by the
+ * submitted object rather than the request, it catches the duplicates a
+ * per-requestId check cannot see — same object resubmitted under a different
+ * or malformed requestId, or a blind same-key retry that re-claimed in the
+ * gap between a failed request's claim abandon and its post-response delete.
  */
 export async function isAudioKeyClaimedForProcessing(userId: string, audioKey: string): Promise<boolean> {
   const { rows } = await pool.query(

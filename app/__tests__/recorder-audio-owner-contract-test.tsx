@@ -8,6 +8,10 @@ import { createRoot, type Root as TestRendererRoot } from 'test-renderer';
 
 import Recorder from '../src/components/Recorder';
 import {
+  AUDIO_MODE_OPERATION_TIMEOUT_MS,
+  configurePlaybackAudioMode,
+} from '../src/lib/audio-session';
+import {
   apiFetch,
   apiPostPresignedAudio,
   apiRequestAudioUpload,
@@ -144,6 +148,9 @@ const QUESTION_ID = '550e8400-e29b-41d4-a716-446655440001';
 const REQUEST_ID = '550e8400-e29b-41d4-a716-446655440002';
 const ENDPOINT = '/practice/attempt' as const;
 const START_LABEL = 'Start recording';
+const STOP_LABEL = 'Stop recording';
+const SAVE_RECORDING_LABEL = 'Save this recording';
+const START_FAILED_ERROR = translateFor('en', 'recorder.errStartFailed');
 const RESET_ERROR = translateFor('en', 'recorder.errAudioReset');
 const originalPlatform = Object.getOwnPropertyDescriptor(Platform, 'OS');
 
@@ -210,6 +217,27 @@ function rawPressHandlers(renderer: TestRendererRoot, label: string): (() => unk
       }
       return fiber.memoizedProps.onPress as () => unknown;
     });
+}
+
+/** Disabled flags of every committed record-button instance, in tree order. */
+function startButtonsDisabled(renderer: TestRendererRoot): boolean[] {
+  return renderer.container
+    .queryAll(
+      (node) =>
+        node.props.accessibilityRole === 'button' && node.props.accessibilityLabel === START_LABEL,
+    )
+    .map((node) => node.props.accessibilityState?.disabled === true);
+}
+
+/** Count of committed nodes carrying an exact accessibility label. */
+function nodesWithAccessibilityLabel(renderer: TestRendererRoot, label: string): number {
+  return renderer.container.queryAll((node) => node.props.accessibilityLabel === label).length;
+}
+
+function playbackModeRestoreCalls(): number {
+  return asMock(setAudioModeAsync).mock.calls.filter(
+    ([options]) => (options as { allowsRecording?: boolean }).allowsRecording === false,
+  ).length;
 }
 
 function installIsolatedRecorders(count: number): IsolatedRecorder[] {
@@ -504,5 +532,158 @@ describe('Recorder audio-owner mutation contract', () => {
       resetErrorReported: true,
       lateStartSettled: true,
     });
+  });
+
+  it('fails a hung recording-mode start closed and leaves the audio session acquirable', async () => {
+    const hungRecordingMode = deferred<void>();
+    asMock(setAudioModeAsync).mockImplementation(
+      ({ allowsRecording }: { allowsRecording: boolean }) =>
+        allowsRecording ? hungRecordingMode.promise : Promise.resolve(),
+    );
+    const recorders = installIsolatedRecorders(2);
+    const ownerOnError = jest.fn();
+    const renderer = createRoot({
+      textComponentTypes: ['Text'],
+      publicTextComponentTypes: ['Text'],
+    });
+    const actEnvironment = globalThis as typeof globalThis & {
+      IS_REACT_ACT_ENVIRONMENT?: boolean;
+    };
+    const previousActEnvironment = actEnvironment.IS_REACT_ACT_ENVIRONMENT;
+    let ownerStart: Promise<unknown> | null = null;
+    let contenderStart: Promise<unknown> | null = null;
+    try {
+      await act(() => {
+        renderer.render(
+          <>
+            <Recorder key="owner" {...recorderProps(ownerOnError)} />
+            <Recorder key="contender" {...recorderProps(jest.fn())} />
+          </>,
+        );
+      });
+      const starts = rawPressHandlers(renderer, START_LABEL);
+      expect(starts).toHaveLength(2);
+
+      actEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
+      ownerStart = Promise.resolve(starts[0]!());
+      await flushMicrotasks(30);
+      // The native recording-mode call never settles: the audio-session
+      // deadline must reject it so the start fails closed — localized start
+      // failure, phase reset, controls unlatched — instead of holding the
+      // operation token with every control locked forever.
+      await jest.advanceTimersByTimeAsync(AUDIO_MODE_OPERATION_TIMEOUT_MS);
+      await flushMicrotasks(50);
+
+      expect(recorders[0].record).not.toHaveBeenCalled();
+      expect(ownerOnError.mock.calls.some(([message]) => message === START_FAILED_ERROR)).toBe(
+        true,
+      );
+      expect(startButtonsDisabled(renderer)).toEqual([false, false]);
+
+      // The failed start released the owner, so a later instance acquires the
+      // session and records once the native call settles again.
+      asMock(setAudioModeAsync).mockImplementation(() => Promise.resolve());
+      contenderStart = Promise.resolve(starts[1]!());
+      await flushMicrotasks(50);
+      expect(recorders[1].record).toHaveBeenCalledTimes(1);
+    } finally {
+      hungRecordingMode.resolve();
+      actEnvironment.IS_REACT_ACT_ENVIRONMENT = previousActEnvironment;
+      await act(() => {
+        renderer.unmount();
+      });
+      await flushMicrotasks(50);
+      await Promise.allSettled([ownerStart, contenderStart].filter(Boolean));
+    }
+  });
+
+  it('completes stop and lifecycle bookkeeping with a hung native restore and unpoisons the queue', async () => {
+    const hungRestore = deferred<void>();
+    asMock(setAudioModeAsync).mockImplementation(
+      ({ allowsRecording }: { allowsRecording: boolean }) =>
+        allowsRecording ? Promise.resolve() : hungRestore.promise,
+    );
+    const recorders = installIsolatedRecorders(1);
+    const ownerOnError = jest.fn();
+    const renderer = createRoot({
+      textComponentTypes: ['Text'],
+      publicTextComponentTypes: ['Text'],
+    });
+    const operations: Promise<unknown>[] = [];
+    const press = (label: string) => () => {
+      const handler = rawPressHandlers(renderer, label)[0];
+      if (typeof handler !== 'function') throw new Error(`No committed press handler for ${label}`);
+      operations.push(Promise.resolve(handler()));
+    };
+    try {
+      await act(() => {
+        renderer.render(<Recorder {...recorderProps(ownerOnError)} />);
+      });
+
+      // A successful take: the recording mode settles, so only the restore hangs.
+      await act(async () => {
+        press(START_LABEL)();
+        await flushMicrotasks(30);
+      });
+      expect(recorders[0].record).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        press(STOP_LABEL)();
+        await flushMicrotasks(30);
+      });
+      // The take is adopted before the finally's restore await, so the review
+      // actions are already visible while the native reset hangs.
+      expect(nodesWithAccessibilityLabel(renderer, SAVE_RECORDING_LABEL)).toBe(1);
+
+      // Both bounded restore attempts (the first plus restoreAudioMode's single
+      // retry) hit the deadline; the stop still completes, reports the reset
+      // failure once, releases the audio-session owner, and clears the
+      // operation token — no latched controls.
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(2 * AUDIO_MODE_OPERATION_TIMEOUT_MS + 1);
+        await flushMicrotasks(50);
+      });
+      expect(ownerOnError.mock.calls.filter(([message]) => message === RESET_ERROR)).toHaveLength(
+        1,
+      );
+      expect(startButtonsDisabled(renderer)).toEqual([false]);
+
+      // A lifecycle stop (blur) while a NEW take records must also finish: the
+      // take is discarded, the phase lands at idle, and the operation token is
+      // released even though the native restore never settles.
+      await act(async () => {
+        press(START_LABEL)();
+        await flushMicrotasks(30);
+      });
+      expect(recorders[0].record).toHaveBeenCalledTimes(2);
+      const focus = mockAudioOwnerFocusRegistrations[0];
+      const focusCleanup = focus?.cleanup;
+      if (typeof focusCleanup !== 'function') {
+        throw new Error('Focus cleanup was not registered');
+      }
+      await act(async () => {
+        focusCleanup();
+        await flushMicrotasks(30);
+      });
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(2 * AUDIO_MODE_OPERATION_TIMEOUT_MS + 1);
+        await flushMicrotasks(50);
+      });
+      expect(nodesWithAccessibilityLabel(renderer, SAVE_RECORDING_LABEL)).toBe(0);
+      expect(startButtonsDisabled(renderer)).toEqual([false]);
+
+      // The timed-out entries never poisoned the serialized queue: a later
+      // playback-mode mutation is accepted and settles immediately.
+      const restoreCallsBefore = playbackModeRestoreCalls();
+      asMock(setAudioModeAsync).mockImplementation(() => Promise.resolve());
+      await configurePlaybackAudioMode();
+      expect(playbackModeRestoreCalls()).toBe(restoreCallsBefore + 1);
+    } finally {
+      hungRestore.resolve();
+      await act(() => {
+        renderer.unmount();
+      });
+      await flushMicrotasks(50);
+      await Promise.allSettled(operations);
+    }
   });
 });

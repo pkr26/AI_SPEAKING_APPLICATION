@@ -209,6 +209,43 @@ describe('app wiring', () => {
     }
   });
 
+  it('still answers /ready for dependency-ok and dependency-failed checks after the h() wrap', async () => {
+    const ok = await request(
+      createApp({
+        schemaCheck: async () => undefined,
+        audioInspectorCheck: async () => undefined,
+        recordingStorageCheck: async () => undefined,
+      }),
+    ).get('/ready');
+    expect(ok.status).toBe(200);
+    expect(ok.body).toEqual({ ok: true });
+    expect(ok.headers['cache-control']).toBe('no-store');
+
+    const failure = new Error('retained audio storage unavailable');
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    try {
+      const failed = await request(
+        createApp({
+          schemaCheck: async () => undefined,
+          audioInspectorCheck: async () => undefined,
+          recordingStorageCheck: async () => {
+            throw failure;
+          },
+        }),
+      ).get('/ready');
+
+      expect(failed.status).toBe(503);
+      expect(failed.body).toEqual({
+        ok: false,
+        error: 'required service dependency unavailable',
+        code: 'INTERNAL',
+      });
+      expect(error).toHaveBeenCalledWith({ err: failure }, 'readiness dependency check failed');
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it('returns only the authenticated learner assessment status and disables caching', async () => {
     const a = createApp();
     const { res: first } = await registerUser(a);
@@ -291,5 +328,65 @@ describe('app wiring', () => {
       .set('Authorization', `Bearer ${first.body.token}`);
     expect(malformed.status).toBe(400);
     expect(malformed.body.error).toContain('requestId must be a valid UUID');
+  });
+});
+
+describe('metrics bearer gate', () => {
+  // Meets the 32-character config floor.
+  const TOKEN = 'metrics-scrape-bearer-token-0123456789abcdef';
+
+  afterEach(() => {
+    config.metricsEnabled = false;
+    config.metricsBearerToken = '';
+  });
+
+  it('stays a plain 404 while metrics are disabled, whatever the bearer', async () => {
+    config.metricsEnabled = false;
+    config.metricsBearerToken = TOKEN;
+
+    const withBearer = await request(createApp()).get('/metrics').set('Authorization', `Bearer ${TOKEN}`);
+    expect(withBearer.status).toBe(404);
+    expect(withBearer.body).toEqual({ error: 'Not found', code: 'NOT_FOUND' });
+
+    // The 404 must not confirm or deny that the endpoint exists.
+    const withoutBearer = await request(createApp()).get('/metrics');
+    expect(withoutBearer.status).toBe(404);
+    expect(withoutBearer.body).toEqual({ error: 'Not found', code: 'NOT_FOUND' });
+  });
+
+  it('serves metrics without any bearer when no token is configured', async () => {
+    config.metricsEnabled = true;
+    config.metricsBearerToken = '';
+
+    const res = await request(createApp()).get('/metrics');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/plain');
+    expect(res.text.length).toBeGreaterThan(0);
+  });
+
+  it('requires exactly the configured bearer when a token is set', async () => {
+    config.metricsEnabled = true;
+    config.metricsBearerToken = TOKEN;
+    const a = createApp();
+
+    const missing = await request(a).get('/metrics');
+    expect(missing.status).toBe(401);
+    expect(missing.body).toEqual({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
+
+    const wrong = await request(a)
+      .get('/metrics')
+      .set('Authorization', `Bearer ${'y'.repeat(TOKEN.length)}`);
+    expect(wrong.status).toBe(401);
+    expect(wrong.body).toEqual({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
+
+    // Two credentials in one header value must not authenticate either.
+    const malformed = await request(a).get('/metrics').set('Authorization', `Bearer ${TOKEN} extra`);
+    expect(malformed.status).toBe(401);
+    expect(malformed.body).toEqual({ error: 'Missing or invalid Authorization header', code: 'UNAUTHENTICATED' });
+
+    const ok = await request(a).get('/metrics').set('Authorization', `Bearer ${TOKEN}`);
+    expect(ok.status).toBe(200);
+    expect(ok.headers['cache-control']).toBe('no-store');
+    expect(ok.headers['content-type']).toContain('text/plain');
   });
 });

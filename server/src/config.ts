@@ -147,6 +147,18 @@ const envSchema = z
     // operational detail (routes, latencies, provider error rates) and must
     // only be scraped from a private network when enabled (404 when off).
     METRICS_ENABLED: bool,
+    // Optional bearer token guarding GET /metrics when METRICS_ENABLED=true.
+    // Empty (default) keeps the private-network posture; when set, every
+    // scrape must send exactly `Authorization: Bearer <token>` (401
+    // otherwise). Floor of 32 characters so the credential is not trivially
+    // brute-forceable.
+    METRICS_BEARER_TOKEN: z
+      .string()
+      .trim()
+      .default('')
+      .refine((value) => value === '' || value.length >= 32, {
+        message: 'METRICS_BEARER_TOKEN must be at least 32 characters (or empty to keep /metrics private-network only)',
+      }),
     ADS_ENABLED: bool,
     ADS_AUDIENCE_MODE: z.enum(['unknown', 'adult-only', 'child']).default('unknown'),
     ADS_HOME_BANNER_ENABLED: bool,
@@ -522,6 +534,7 @@ export const config = {
   gradingModel: env.GRADING_MODEL,
   shutdownDrainMs: env.SHUTDOWN_DRAIN_MS,
   metricsEnabled: env.METRICS_ENABLED,
+  metricsBearerToken: env.METRICS_BEARER_TOKEN,
   ads: {
     enabled: env.ADS_ENABLED,
     audienceMode: env.ADS_AUDIENCE_MODE,

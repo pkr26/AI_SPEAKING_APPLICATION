@@ -17,13 +17,81 @@ import {
 } from './helpers';
 import { uploadsDir } from '../src/upload';
 
+// Optional parked-native-assess seam (same shape as
+// tests/practice-route-state.test.ts): disabled by default so every other
+// test in this file keeps the real MOCK_AI pipeline, and enabled only inside
+// the bodies of the tests that need to observe the native provider call.
+const nativeAssessSeam = vi.hoisted(() => ({ useMock: false, assess: vi.fn() }));
+
+vi.mock('../src/assess', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/assess')>();
+  return {
+    ...actual,
+    assessNativeComprehension: (...args: Parameters<typeof actual.assessNativeComprehension>) =>
+      nativeAssessSeam.useMock ? nativeAssessSeam.assess(...args) : actual.assessNativeComprehension(...args),
+  };
+});
+
 afterAll(async () => {
   await pool.end();
 });
 
 afterEach(() => {
+  nativeAssessSeam.useMock = false;
+  nativeAssessSeam.assess.mockReset();
   vi.restoreAllMocks();
 });
+
+/**
+ * Commit a user-profile mutation between the durable assessment request claim
+ * and the provider call (the same seam shape as
+ * withMutationAfterRequestClaim in tests/practice-route-state.test.ts): the
+ * mutation runs right after the claim's transaction COMMITs, so the claim row
+ * and requireAuth's copy still hold the pre-mutation profile while the live
+ * users row has moved on.
+ */
+async function withMutationAfterRequestClaim<T>(mutate: () => Promise<unknown>, run: () => PromiseLike<T>): Promise<T> {
+  const originalConnect = pool.connect.bind(pool);
+  let mutated = false;
+  const connect = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+    if (typeof callback === 'function') return originalConnect(callback as never);
+    return originalConnect().then((client: PoolClient) => {
+      const mutable = client as unknown as {
+        query: (...args: unknown[]) => unknown;
+        release: (error?: Error | boolean) => void;
+      };
+      const actualQuery = mutable.query;
+      const actualRelease = mutable.release;
+      let insertedRequestClaim = false;
+      mutable.query = async (...args: unknown[]) => {
+        const text = typeof args[0] === 'string' ? args[0] : (args[0] as { text?: unknown } | null)?.text;
+        const result = (await actualQuery.call(client, ...args)) as { rowCount?: number | null };
+        if (typeof text === 'string' && text.includes('INSERT INTO assessment_requests') && result.rowCount === 1) {
+          insertedRequestClaim = true;
+        }
+        if (text === 'COMMIT' && insertedRequestClaim && !mutated) {
+          mutated = true;
+          await mutate();
+        }
+        return result;
+      };
+      mutable.release = (error?: Error | boolean) => {
+        mutable.query = actualQuery;
+        mutable.release = actualRelease;
+        actualRelease.call(client, error);
+      };
+      return client;
+    });
+  }) as typeof pool.connect);
+
+  try {
+    const result = await Promise.resolve(run());
+    expect(mutated).toBe(true);
+    return result;
+  } finally {
+    connect.mockRestore();
+  }
+}
 
 let a: ReturnType<typeof app>;
 
@@ -454,7 +522,7 @@ describe('practice', () => {
       const expectRefunded = () =>
         vi.waitFor(async () => {
           const { rows } = await pool.query<{ hits: number }>(
-            "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace IN ('assess:60000:1', 'assess-ip-daily:1')",
+            "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace IN ('assess', 'assess-ip-daily')",
           );
           expect(rows[0].hits).toBe(0);
         });
@@ -865,6 +933,119 @@ describe('practice', () => {
       [userId],
     );
     expect(remaining.rows[0].count).toBe(0);
+  });
+
+  it('grades and labels one native attempt with the claim snapshot, not a mid-flight profile change', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    await completeDiagnostic(a, token);
+    const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = assignment.body.question.id as string;
+    const cycleId = assignment.body.cycleId as string;
+
+    nativeAssessSeam.useMock = true;
+    nativeAssessSeam.assess.mockResolvedValue({
+      understood: true,
+      transcript: 'mother-tongue answer',
+      translatedTranscript: 'an English translation of the answer',
+      modelAnswer: 'A model English answer.',
+      feedback: 'The answer shows understanding.',
+    });
+
+    const response = await withMutationAfterRequestClaim(
+      // PATCH /auth/me equivalent: the profile flips to Hindi AFTER the
+      // durable claim committed its users-FOR-UPDATE snapshot ('te'), while
+      // the provider call has not run yet.
+      () => pool.query('UPDATE users SET native_language = $2 WHERE id = $1', [userId, 'hi']),
+      () =>
+        answerForm(
+          request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`),
+          questionId,
+          undefined,
+          cycleId,
+        ),
+    );
+
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    // The provider call received the CLAIM's committed language ('te'), never
+    // the mid-flight profile value ('hi').
+    expect(nativeAssessSeam.assess).toHaveBeenCalledTimes(1);
+    expect(nativeAssessSeam.assess.mock.calls[0][2]).toBe('te');
+    // Response, claim, and attempt all carry the same claim-time language;
+    // only the mutable profile has moved on.
+    expect(response.body.nativeLanguage).toBe('te');
+    const stored = await pool.query<{ claim: string | null; attempt: string | null; profile: string }>(
+      `SELECT
+         (SELECT native_language FROM assessment_requests
+          WHERE user_id = $1 AND context = 'practice-native') AS claim,
+         (SELECT native_language FROM attempts
+          WHERE user_id = $1 AND context = 'practice-native') AS attempt,
+         (SELECT native_language FROM users WHERE id = $1) AS profile`,
+      [userId],
+    );
+    expect(stored.rows[0]).toEqual({ claim: 'te', attempt: 'te', profile: 'hi' });
+  });
+
+  it('serves history and export attempt wording from the snapshot, not the mutated catalog', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    await completeDiagnostic(a, token);
+    const assignment = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    const questionId = assignment.body.question.id as string;
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+      undefined,
+      assignment.body.cycleId,
+    );
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+
+    const original = await pool.query<{ prompt_word: string; question_text: string }>(
+      'SELECT prompt_word, question_text FROM questions WHERE id = $1',
+      [questionId],
+    );
+    const mutatedPromptWord = `mutated-${randomUUID().slice(0, 8)}`;
+    const mutatedQuestionText = 'Catalog wording published after this attempt was graded.';
+    try {
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        mutatedPromptWord,
+        mutatedQuestionText,
+      ]);
+
+      const history = await request(a).get('/practice/history').set('Authorization', `Bearer ${token}`);
+      expect(history.status).toBe(200);
+      const practiceItems = history.body.items.filter((item: { context: string }) => item.context === 'practice');
+      expect(practiceItems).toHaveLength(1);
+      expect(practiceItems[0]).toMatchObject({
+        questionId,
+        promptWord: original.rows[0].prompt_word,
+        questionText: original.rows[0].question_text,
+      });
+      expect(history.body.items.some((item: { promptWord: string }) => item.promptWord === mutatedPromptWord)).toBe(
+        false,
+      );
+
+      const exportPage = await request(a).get('/auth/me/data').set('Authorization', `Bearer ${token}`);
+      expect(exportPage.status).toBe(200);
+      const exportedPractice = exportPage.body.attempts.filter(
+        (item: { context: string }) => item.context === 'practice',
+      );
+      expect(exportedPractice).toHaveLength(1);
+      expect(exportedPractice[0]).toMatchObject({
+        questionId,
+        promptWord: original.rows[0].prompt_word,
+        questionText: original.rows[0].question_text,
+      });
+    } finally {
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        original.rows[0].prompt_word,
+        original.rows[0].question_text,
+      ]);
+    }
   });
 
   it('sheds saturated AI capacity as 503 with Retry-After and the capacity code', async () => {

@@ -1,5 +1,6 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest';
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
+import { logger } from '../src/logger';
 import { app, createClosedPracticeCycle, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -268,5 +269,39 @@ describe('GET /practice/stats', () => {
     const r = await request(a).get('/practice/stats').set('Authorization', `Bearer ${token}`);
 
     expect(r.body.progress).toMatchObject({ masteredCount: 1, learningCount: 1, dueCount: 1 });
+  });
+
+  it('falls back to UTC day buckets with a warn for a zone unknown to the server tzdata', async () => {
+    const { token, userId } = await freshUser();
+    const [q] = await someQuestions(1);
+    await insertAttempt(userId, q.id, 0); // practiced today under UTC bucketing
+
+    // Self-check the fixture: the zone name must genuinely be absent from
+    // this server's pg_timezone_names, or the fallback path is not what runs.
+    const known = await pool.query('SELECT 1 FROM pg_timezone_names WHERE name = $1', ['America/Not_A_Real_Zone']);
+    expect(known.rowCount).toBe(0);
+
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    try {
+      const r = await request(a)
+        .get('/practice/stats?timeZone=America%2FNot_A_Real_Zone')
+        .set('Authorization', `Bearer ${token}`);
+
+      // The zone is a bucketing hint, not a security input: stats are still
+      // served, computed over UTC days, and the response names the zone used.
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      expect(r.body).toMatchObject({
+        timeZone: 'UTC',
+        practicedToday: 1,
+        totalAttempts: 1,
+        streakDays: 1,
+      });
+      expect(warn).toHaveBeenCalledWith(
+        { userId, timeZone: 'America/Not_A_Real_Zone' },
+        'unknown time zone for practice stats; using UTC day buckets',
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 });

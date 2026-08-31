@@ -230,10 +230,24 @@ export default (
     production,
   );
   const base = appJson.expo as ExpoConfig;
-  const plugins = (base.plugins ?? []).filter((plugin) => {
-    const name = Array.isArray(plugin) ? plugin[0] : plugin;
-    return name !== 'react-native-google-mobile-ads' && name !== 'expo-build-properties';
-  });
+  const plugins = (base.plugins ?? [])
+    .filter((plugin) => {
+      const name = Array.isArray(plugin) ? plugin[0] : plugin;
+      return name !== 'react-native-google-mobile-ads' && name !== 'expo-build-properties';
+    })
+    .map((plugin) => {
+      // The app schedules only local notifications (the daily reminder), but
+      // every iOS prebuild still embeds an aps-environment entitlement, and
+      // expo-notifications defaults it to 'development' when no mode is
+      // configured. A locally prebuilt archive that escapes the pipeline's
+      // entitlement rewrite then fails App Store distribution validation, so
+      // pin the plugin's supported `mode` prop to 'production' for every
+      // prebuild; it is inert for local notifications.
+      if (Array.isArray(plugin) && plugin[0] === 'expo-notifications') {
+        return [plugin[0], { ...plugin[1], mode: 'production' }] as typeof plugin;
+      }
+      return plugin;
+    });
 
   return {
     ...config,

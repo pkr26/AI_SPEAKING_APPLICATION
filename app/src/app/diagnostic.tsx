@@ -929,6 +929,12 @@ export default function DiagnosticScreen() {
             <Recorder
               ownerId={user.id}
               questionId={currentQuestion.id}
+              // Mirror the practice screen: a logout already in flight must not
+              // admit a new take while the auth epoch is being torn down. The
+              // state prop disables the visible controls and the ref-backed
+              // guard blocks event-time starts inside the same commit.
+              disabled={logoutBusy}
+              isStartBlocked={() => logoutBusyRef.current}
               endpoint="/diagnostic/answer"
               parseResult={parseDiagnosticAnswerResult}
               onResultWithMetadata={handleResult}

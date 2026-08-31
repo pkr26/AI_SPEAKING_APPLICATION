@@ -201,9 +201,14 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
         const replay = parseAssessmentReplayStatus(raw, pending);
         if (replay.status === 'processing') {
           // A known-delivered answer remains this provider's responsibility:
-          // keep a visible same-session path back to the GET-only check instead
-          // of requiring a remount. Legacy reconcile work still belongs to
-          // Recorder, whose bounded recovery may need to resume the POST.
+          // keep a visible same-session path back to the GET-only check
+          // instead of requiring a remount. This check is one bounded read
+          // per checkKey — it never resumes the assessment POST, and
+          // Recorder's reconcile branch likewise only reports
+          // onRecoveryUnresolved or discards its take. A crash between the
+          // durable mark and its clear simply leaves the pointer for the
+          // next mount's single read; the delivered feedback also stays
+          // reachable through History and the canonical refresh.
           setState({
             ...initialState(identity, checkKey, false),
             phase: pending.stage === 'feedback-pending' ? 'deferred' : 'ready',

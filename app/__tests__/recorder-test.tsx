@@ -58,6 +58,7 @@ import Recorder, {
   nextRecordingTakeGeneration,
   operationCanPublish,
   operationShouldUnlock,
+  operationShouldReleaseExitLock,
   pendingAssessmentCanUpload,
   preparedRecorderNeedsWebStart,
   previewCanPlayAfterRewind,
@@ -1282,6 +1283,24 @@ describe('Recorder pure behavior contracts', () => {
     'balances the operation lock only when %s',
     (_case, mounted, unmounting, active, phase, locked, expected) => {
       expect(operationShouldUnlock(mounted, unmounting, active, phase, locked)).toBe(expected);
+    },
+  );
+
+  it.each([
+    ['idle', true, false, false, 'idle', true, true],
+    ['parked recovery', true, false, false, 'parked', true, true],
+    ['unmounted', false, false, false, 'idle', true, false],
+    ['unmounting', true, true, false, 'idle', true, false],
+    ['work remains', true, false, true, 'idle', true, false],
+    ['exit-locked phase', true, false, false, 'recovering', true, false],
+    ['recorded review', true, false, false, 'recorded', true, false],
+    ['already unlocked', true, false, false, 'idle', false, false],
+  ] as const)(
+    'balances the exit lock only when %s',
+    (_case, mounted, unmounting, active, phase, locked, expected) => {
+      expect(operationShouldReleaseExitLock(mounted, unmounting, active, phase, locked)).toBe(
+        expected,
+      );
     },
   );
 
@@ -7148,6 +7167,33 @@ describe('Recorder', () => {
       expect(props.onResult).not.toHaveBeenCalled();
     });
 
+    it('releases the controls even when the nothing-to-confirm error callback itself throws', async () => {
+      const parserFailure = new Error('unexpected parser defect');
+      const hostileError = jest.fn((message: string) => {
+        if (message === t('recorder.errNothingToConfirm'))
+          throw new Error('hostile screen callback');
+      });
+      await renderRecorder({
+        parseResult: () => {
+          throw parserFailure;
+        },
+        onError: hostileError,
+      });
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(hostileError).toHaveBeenCalledWith(t('recorder.errNothingToConfirm')),
+      );
+
+      // The throwing callback must not strand the operation token before the
+      // loading release: the recorder returns to idle and a fresh recording
+      // can still start instead of latching the loading/recovering phase.
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      await fireEvent.press(screen.getByRole('button', { name: START_LABEL }));
+      await waitFor(() => expect(screen.getByRole('button', { name: STOP_LABEL })).toBeTruthy());
+    });
+
     it('keeps the recording when retry metadata cannot be saved', async () => {
       asMock(savePendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
       const { props } = await renderRecorder();
@@ -10375,12 +10421,12 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(7);
     });
 
-    it('stops S3 resubmission immediately when authentication expires', async () => {
+    it('finishes an authenticated-out S3 resubmission terminally like a 429', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(
         pendingRecord({ stage: 's3-granted', audioKey: S3_AUDIO_KEY }),
       );
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 6; i += 1) {
         asMock(apiFetch).mockRejectedValueOnce(new ApiError(404, 'not submitted'));
       }
       mockStartedApiFetchFailureOnce(new ApiError(401, 'signed out'));
@@ -10388,13 +10434,21 @@ describe('Recorder', () => {
 
       await advancePolls(5);
       expect(apiFetch).toHaveBeenCalledTimes(7);
-      await advancePolls(5);
 
-      expect(apiFetch).toHaveBeenCalledTimes(7);
-      expect(clearPendingAssessment).not.toHaveBeenCalled();
-      expect(markPendingAssessmentForReconciliation).not.toHaveBeenCalled();
-      expect(props.onError).not.toHaveBeenCalled();
+      // Auth rejects ahead of the idempotency claim — the same pre-claim proof
+      // documented for 429 — so the resubmission committed nothing and the
+      // loop must not park in a silent bare return that leaves 'recovering'
+      // latched with no polling behind it.
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errRejected'));
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(markPendingAssessmentForReconciliation).toHaveBeenCalledWith(REQUEST_ID);
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
       expect(props.onResult).not.toHaveBeenCalled();
+      expect(claimPendingAssessmentRecoveryPost).toHaveBeenCalledTimes(1);
+
+      // Resolved: no further polling for the rest of the five-minute lease.
+      await advancePolls(5);
+      expect(apiFetch).toHaveBeenCalledTimes(7);
     });
 
     it('honors REQUEST_IN_FLIGHT Retry-After before polling the same S3 handoff', async () => {
@@ -11116,6 +11170,91 @@ describe('Recorder', () => {
       expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
     });
 
+    it('completes a terminal recovery even when the host onRecoveryUnresolved throws', async () => {
+      // Host-screen callbacks are boundaries, not collaborators: a throwing
+      // onRecoveryUnresolved must not skip the phase write that unlocks the
+      // recorder or the durable tracking cleanup after it.
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({});
+      const onExitLockChange = jest.fn();
+      const onRecoveryUnresolved = jest.fn(() => {
+        throw new Error('screen callback failed');
+      });
+      const { props } = await renderRecorder({ onExitLockChange, onRecoveryUnresolved });
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errBadRecoveryResponse')),
+      );
+      // The operation token is released one commit after onError (recovery's
+      // finally), so await the unlock instead of sampling mid-transition.
+      await waitFor(() => expect(onExitLockChange).toHaveBeenLastCalledWith(false));
+      expect(onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
+      expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toEqual({
+        disabled: false,
+      });
+    });
+
+    it('finishes terminal recovery cleanup even when the host onError throws', async () => {
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockResolvedValue({});
+      const onError = jest.fn(() => {
+        throw new Error('screen error callback failed');
+      });
+      const { props } = await renderRecorder({ onError });
+
+      await waitFor(() =>
+        expect(onError).toHaveBeenCalledWith(t('recorder.errBadRecoveryResponse')),
+      );
+      expect(props.onRecoveryUnresolved).toHaveBeenCalledTimes(1);
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
+    });
+
+    it('arms Try Again when the recovery flow itself throws unexpectedly', async () => {
+      // Belt-and-suspenders for any unexpected throw inside recoverPending
+      // (here: a hostile error object whose classification read throws inside
+      // the poll loop's own catch, so nothing else can absorb it). The learner
+      // must still land on the retryable terminal phase with Try Again armed
+      // instead of an unhandled rejection over a dead 'recovering' phase.
+      const hostileError = new ApiError(503, 'unclassifiable failure');
+      Object.defineProperty(hostileError, 'status', {
+        get() {
+          throw new Error('hostile status read');
+        },
+      });
+      asMock(loadPendingAssessment).mockResolvedValue(
+        pendingRecord({ questionId: OTHER_QUESTION_ID }),
+      );
+      asMock(apiFetch).mockRejectedValue(hostileError);
+      const { props } = await renderRecorder();
+
+      await waitFor(() =>
+        expect(props.onError).toHaveBeenCalledWith(t('recorder.errRetryInfoUpdate')),
+      );
+      expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy();
+      const tryAgain = screen.getByRole('button', { name: t('common.tryAgain') });
+
+      // The boundary recovers, so the retried recovery resolves the durable
+      // result through the mounted replay provider exactly as before.
+      asMock(apiFetch).mockResolvedValue({
+        status: 'completed',
+        context: 'practice',
+        questionId: OTHER_QUESTION_ID,
+        response: { score: 5 },
+      });
+      asMock(notifyPendingAssessmentReplayReady).mockReturnValue(true);
+      await fireEvent.press(tryAgain);
+
+      await waitFor(() => expect(notifyPendingAssessmentReplayReady).toHaveBeenCalledTimes(1));
+      expect(props.onResult).not.toHaveBeenCalled();
+      expect(screen.getByText(IDLE_TEXT)).toBeTruthy();
+      expect(screen.queryByRole('button', { name: t('common.tryAgain') })).toBeNull();
+    });
+
     it('polls a processing assessment until the durable result arrives', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
@@ -11400,11 +11539,12 @@ describe('Recorder', () => {
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
     });
 
-    it('stops polling silently on a 401', async () => {
+    it('stops polling silently on a 401 and parks with an escape instead of wedging', async () => {
       jest.useFakeTimers();
       asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
       asMock(apiFetch).mockRejectedValue(new ApiError(401, 'Request failed with status 401'));
-      const { props } = await renderRecorder();
+      const onExitLockChange = jest.fn();
+      const { props } = await renderRecorder({ onExitLockChange });
 
       expect(apiFetch).toHaveBeenCalledTimes(1);
 
@@ -11413,25 +11553,34 @@ describe('Recorder', () => {
       expect(apiFetch).toHaveBeenCalledTimes(1);
       expect(props.onError).not.toHaveBeenCalled();
       expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      // A 401 on the status read proves only that auth currently rejects every
+      // route, so polling cannot progress; the loop parks (Try Again armed,
+      // route exits released) while keeping the durable pointer and take for a
+      // later mount after the session is re-established.
+      expect(screen.getByRole('button', { name: t('common.tryAgain') })).toBeTruthy();
+      expect(onExitLockChange).toHaveBeenLastCalledWith(false);
       expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toEqual({
         disabled: true,
       });
 
-      // Presses are guarded while the component is still in the recovering
-      // phase. The disabled Pressable blocks event dispatch, so invoke the
-      // handler directly to prove the runtime guard itself.
+      // Presses are guarded while the component is still parked. The disabled
+      // Pressable blocks event dispatch, so invoke the handler directly to
+      // prove the runtime guard itself.
       asMock(AudioModule.getRecordingPermissionsAsync).mockClear();
       await invokePressHandler(screen, START_LABEL);
       expect(AudioModule.getRecordingPermissionsAsync).not.toHaveBeenCalled();
     });
 
-    it('keeps controls locked without error copy when the initial submission is rejected with 401', async () => {
-      // A mid-submit 401 is not a definite rejection: the attempt may have
-      // committed, so the recorder enters recovery and lets the session-expiry
-      // flow unmount the screen rather than surfacing a misleading error.
+    it('returns the take without spending recovery budget when the posted submission is rejected with 401', async () => {
+      // A received 401 proves auth rejected this POST ahead of the idempotency
+      // claim (password rotation on another device mid-POST), so the handoff is
+      // cleared and the take returned for an explicit retry — mirroring the
+      // pre-claim reasoning the recovery loop documents for 429 — instead of
+      // spending the one durable recovery-POST budget on polls that can only
+      // 401 again. The session-expiry handler reacts to the same 401 on its
+      // own; these local transitions coexist with it exactly like the 426/429
+      // terminal handling.
       mockStartedUploadFailure(new ApiError(401, 'Request failed with status 401'));
-      // No tombstone at mount or at submit's pre-upload check; it exists by
-      // the time recovery looks for it, so the 401 stops the poll silently.
       asMock(loadPendingAssessment)
         .mockResolvedValueOnce(null)
         .mockResolvedValueOnce(null)
@@ -11442,11 +11591,15 @@ describe('Recorder', () => {
 
       await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
 
-      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
-      expect(props.onError).not.toHaveBeenCalled();
+      await waitFor(() => expect(screen.getByRole('button', { name: SUBMIT_TEXT })).toBeTruthy());
+      expect(clearPendingAssessment).toHaveBeenCalledWith(REQUEST_ID);
+      expect(claimPendingAssessmentRecoveryPost).not.toHaveBeenCalled();
       expect(props.onResult).not.toHaveBeenCalled();
+      expect(props.onRecoveryUnresolved).not.toHaveBeenCalled();
+      expect(props.onError).toHaveBeenCalledWith(t('recorder.errRejected'));
+      expect(deletedRecordingUris()).toEqual([]);
       expect(screen.getByLabelText(START_LABEL).props.accessibilityState).toEqual({
-        disabled: true,
+        disabled: false,
       });
     });
 

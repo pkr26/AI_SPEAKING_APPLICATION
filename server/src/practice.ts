@@ -11,7 +11,7 @@ import {
 import { buildAssessmentSubmissionChain, runAssessmentSubmission } from './assessment-pipeline';
 import { pool, QUESTION_ROW_COLUMNS, QuestionRow } from './db';
 import { logger } from './logger';
-import { completeAssessmentRequest } from './idempotency';
+import { completeAssessmentRequest, validatedAttemptQuestionSnapshot } from './idempotency';
 import { AuthedRequest, h, HttpError, requireAuth, validate, validated } from './middleware';
 import { Limiters } from './rate-limit';
 import { RecordingCapture } from './recording-store';
@@ -498,7 +498,8 @@ async function clearPracticeClaim(userId: string, questionId: string, claimId: s
 }
 
 /**
- * Persist a scored attempt: insert the attempts row, upsert the word's
+ * Persist a scored attempt: insert the attempts row (snapshotting the exact
+ * graded question wording per migration 026), upsert the word's
  * practice_progress with its SRS schedule (mastery at >= MASTER_SCORE; a
  * mastered word demotes back to learning only when a scored attempt on it
  * fails below PASS_SCORE), evaluate CEFR promotion when the attempt just
@@ -507,7 +508,7 @@ async function clearPracticeClaim(userId: string, questionId: string, claimId: s
  */
 async function storePracticeResult(
   userId: string,
-  questionId: string,
+  question: QuestionRow,
   claim: PracticeClaim,
   result: AssessResult,
   mastered: boolean,
@@ -518,6 +519,15 @@ async function storePracticeResult(
   finalFeedback: string,
   recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
+  // Migration 026 snapshot: history and export read these columns instead of
+  // rejoining the mutable catalog, so the row must carry the exact in-memory
+  // question this result was graded against.
+  const snapshot = validatedAttemptQuestionSnapshot({
+    cefrLevel: question.cefr_level,
+    promptWord: question.prompt_word,
+    questionText: question.question_text,
+  });
+  const questionId = question.id;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -554,8 +564,9 @@ async function storePracticeResult(
     }
     const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts
-         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
-       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7, $8)
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id,
+          cefr_level, prompt_word, question_text)
+       VALUES ($1, $2, 'practice', $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id`,
       [
         userId,
@@ -566,6 +577,9 @@ async function storePracticeResult(
         result.passed,
         result.feedback,
         claim.cycleId,
+        snapshot.cefrLevel,
+        snapshot.promptWord,
+        snapshot.questionText,
       ],
     );
     if (recording) recording.attemptId = insertedAttempt.rows[0].id;
@@ -785,11 +799,13 @@ async function storeSilenceResult(
 /**
  * Persist one spoken native-language try. It participates in the same durable
  * three-attempt cycle and activity/history counters as English, while leaving
- * English mastery, best score, status and SRS schedule unchanged.
+ * English mastery, best score, status and SRS schedule unchanged. The
+ * language label always comes from the durable request claim's snapshot, so
+ * the attempt, response, and replay can never disagree after a profile change.
  */
 async function storeNativePracticeResult(
   userId: string,
-  questionId: string,
+  question: QuestionRow,
   claim: PracticeClaim,
   result: NativeAssessResult,
   feedback: string,
@@ -799,6 +815,13 @@ async function storeNativePracticeResult(
   nativeLanguage: NativeLanguage,
   recording?: RecordingCapture,
 ): Promise<Record<string, unknown>> {
+  // Migration 026 snapshot: same immutable-wording contract as scored practice.
+  const snapshot = validatedAttemptQuestionSnapshot({
+    cefrLevel: question.cefr_level,
+    promptWord: question.prompt_word,
+    questionText: question.question_text,
+  });
+  const questionId = question.id;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -832,8 +855,9 @@ async function storeNativePracticeResult(
     const insertedAttempt = await client.query<{ id: string }>(
       `INSERT INTO attempts
          (user_id, question_id, context, attempt_no, transcript, score, passed, feedback,
-          practice_cycle_id, understood, translated_transcript, model_answer, native_language)
-       VALUES ($1, $2, 'practice-native', $3, $4, NULL, NULL, $5, $6, $7, $8, $9, $10)
+          practice_cycle_id, understood, translated_transcript, model_answer, native_language,
+          cefr_level, prompt_word, question_text)
+       VALUES ($1, $2, 'practice-native', $3, $4, NULL, NULL, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING id`,
       [
         userId,
@@ -846,6 +870,9 @@ async function storeNativePracticeResult(
         result.translatedTranscript,
         result.modelAnswer,
         nativeLanguage,
+        snapshot.cefrLevel,
+        snapshot.promptWord,
+        snapshot.questionText,
       ],
     );
     if (recording) recording.attemptId = insertedAttempt.rows[0].id;
@@ -1153,10 +1180,12 @@ export function createPracticeRouter(limiters: Limiters) {
       }
 
       // Newest first with a (created_at, id) keyset cursor, mirroring the
-      // ascending export pagination in auth.ts.
+      // ascending export pagination in auth.ts. Question wording comes from
+      // the attempt's own migration-026 snapshot, never a live catalog join,
+      // so editing catalog wording cannot rewrite history.
       const { rows } = await pool.query(
-        `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
-                q.question_text AS "questionText", q.cefr_level AS "cefrLevel", a.context,
+        `SELECT a.id, a.question_id AS "questionId", a.prompt_word AS "promptWord",
+                a.question_text AS "questionText", a.cefr_level AS "cefrLevel", a.context,
                 a.attempt_no AS "attemptNo", a.score, a.passed, a.transcript, a.feedback,
                 a.practice_cycle_id AS "cycleId", a.understood,
                 a.translated_transcript AS "translatedTranscript", a.model_answer AS "modelAnswer",
@@ -1164,7 +1193,6 @@ export function createPracticeRouter(limiters: Limiters) {
                 a.created_at AS "createdAt", r.id AS "recordingId", r.status AS "recordingStatus"
          FROM attempts a
          JOIN users u ON u.id = a.user_id
-         JOIN questions q ON q.id = a.question_id
          LEFT JOIN recordings r
            ON r.attempt_id = a.id
           AND r.user_id = a.user_id
@@ -1196,7 +1224,16 @@ export function createPracticeRouter(limiters: Limiters) {
       const { timeZone } = validated(req, statsQuerySchema);
       const body = await withCurrentPracticeUser(user.id, async (client, currentUser) => {
         const knownTimeZone = await client.query('SELECT 1 FROM pg_timezone_names WHERE name = $1 LIMIT 1', [timeZone]);
-        if (!knownTimeZone.rows[0]) throw new HttpError(400, 'timeZone must be a valid IANA time zone');
+        // The zone only picks learner-local day buckets; it is not a security
+        // input. A syntactically valid name the server's tzdata does not know
+        // (stale catalog, exotic alias) must not 400 the whole Home screen:
+        // warn with the rejected name and bucket in UTC instead. The response
+        // echoes the zone actually used, so known zones are unchanged.
+        let zone = timeZone;
+        if (!knownTimeZone.rows[0]) {
+          logger.warn({ userId: user.id, timeZone }, 'unknown time zone for practice stats; using UTC day buckets');
+          zone = 'UTC';
+        }
         const level = currentUser.cefr_level;
         const progress = level
           ? await practiceProgressSnapshot(user.id, level, client)
@@ -1235,7 +1272,7 @@ export function createPracticeRouter(limiters: Limiters) {
               WHERE user_id = $1 AND context IN ('practice', 'practice-native')) AS "totalAttempts",
              (SELECT max(created_at) FROM attempts
               WHERE user_id = $1 AND context IN ('practice', 'practice-native')) AS "lastPracticedAt"`,
-          [user.id, timeZone],
+          [user.id, zone],
         );
         const stats = rows[0];
         return {
@@ -1245,7 +1282,7 @@ export function createPracticeRouter(limiters: Limiters) {
           practicedToday: stats.practicedToday,
           totalAttempts: stats.totalAttempts,
           lastPracticedAt: stats.lastPracticedAt,
-          timeZone,
+          timeZone: zone,
         };
       });
       res.json(body);
@@ -1370,7 +1407,7 @@ export function createPracticeRouter(limiters: Limiters) {
           const finalFeedback = buildFinalFeedback(result.feedback, hint);
           return storePracticeResult(
             user.id,
-            question.id,
+            question,
             claim,
             result,
             mastered,
@@ -1394,14 +1431,30 @@ export function createPracticeRouter(limiters: Limiters) {
   router.post(
     '/attempt/native',
     ...submission.middleware,
-    h(async (req: AuthedRequest, res) =>
-      runAssessmentSubmission<PracticeClaim, NativeAssessResult>(req, res, {
+    h(async (req: AuthedRequest, res) => {
+      // The durable request claim owns this submission's native language
+      // (migration 022's snapshot, committed under users FOR UPDATE). Today
+      // the claim INSERT passes the requireAuth copy, so the two agree on
+      // every fresh claim this pipeline writes — but the claim row is the
+      // authoritative surface (migration 022's completion trigger rewrites
+      // response and attempt to its value, and a draining older writer can
+      // still insert a claim without the copy). Resolve the language from
+      // the claim snapshot so the provider call, the response, and the
+      // attempt can never disagree with what the claim durably records.
+      const claimNativeLanguage: { value?: NativeLanguage } = {};
+      /** Claim snapshot first; the requireAuth copy only covers a legacy row with no snapshot. */
+      const nativeLanguageFor = (user: AuthedRequest['user']): NativeLanguage =>
+        claimNativeLanguage.value ?? (user!.native_language as NativeLanguage);
+      return runAssessmentSubmission<PracticeClaim, NativeAssessResult>(req, res, {
         storageScope: submission.storageScope,
         context: 'practice-native',
         bodySchema: submission.bodySchema,
         respendAssessmentBudget: submission.respendAssessmentBudget,
         questionMissingError: () => new HttpError(404, 'Question not found'),
         requireQuestionAtUserLevel: true,
+        onFreshRequestClaim: (requestClaim) => {
+          if (requestClaim.nativeLanguage) claimNativeLanguage.value = requestClaim.nativeLanguage;
+        },
         // Same per-question serialization as English practice: without a
         // claim, concurrent native submissions with distinct requestIds each
         // trigger their own paid provider calls for one question.
@@ -1411,15 +1464,16 @@ export function createPracticeRouter(limiters: Limiters) {
           assessNativeComprehension(
             audioPath,
             assessQuestionContext(question),
-            user.native_language as NativeLanguage,
+            nativeLanguageFor(user),
             user.id,
             options,
           ),
         persist: (user, question, claim, result, requestId, requestClaimId, recording) => {
+          const nativeLanguage = nativeLanguageFor(user);
           const feedback =
             result.understood || result.transcript === ''
               ? result.feedback
-              : buildNativeFallbackFeedback(result.feedback, authoredNativeExample(question, user.native_language));
+              : buildNativeFallbackFeedback(result.feedback, authoredNativeExample(question, nativeLanguage));
           if (result.transcript === '') {
             return storeSilenceResult(
               user.id,
@@ -1430,7 +1484,7 @@ export function createPracticeRouter(limiters: Limiters) {
               {
                 mode: 'native',
                 cycleId: claim.cycleId,
-                nativeLanguage: user.native_language,
+                nativeLanguage,
                 understood: false,
                 transcript: '',
                 translatedTranscript: '',
@@ -1446,20 +1500,20 @@ export function createPracticeRouter(limiters: Limiters) {
           }
           return storeNativePracticeResult(
             user.id,
-            question.id,
+            question,
             claim,
             result,
             feedback,
             requestId,
             requestClaimId,
             user.cefr_level!,
-            user.native_language as NativeLanguage,
+            nativeLanguage,
             recording,
           );
         },
         clearClaim: (user, question, claim) => clearPracticeClaim(user.id, question.id, claim.claimId),
-      }),
-    ),
+      });
+    }),
   );
 
   return router;

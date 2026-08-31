@@ -8,7 +8,6 @@ import {
   cleanupAssessmentRequests,
   completeAssessmentRequest,
   getAssessmentRequestStatus,
-  isAssessmentRequestProcessing,
   validatedAssessmentResponse,
 } from '../src/idempotency';
 import { logger } from '../src/logger';
@@ -456,7 +455,7 @@ describe('assessment request recovery', () => {
     ]);
   });
 
-  it('identifies only live processing ownership and removes exactly expired requests', async () => {
+  it('removes exactly the expired requests while keeping live processing and fresh completions', async () => {
     await pool.query('DELETE FROM assessment_requests');
     const liveProcessingId = randomUUID();
     const staleProcessingId = randomUUID();
@@ -477,11 +476,6 @@ describe('assessment request recovery', () => {
       completedAt: new Date(Date.now() - 49 * 60 * 60 * 1000).toISOString(),
       response: { passed: false, score: 40 },
     });
-
-    await expect(isAssessmentRequestProcessing(ownerId, liveProcessingId)).resolves.toBe(true);
-    await expect(isAssessmentRequestProcessing(ownerId, staleProcessingId)).resolves.toBe(false);
-    await expect(isAssessmentRequestProcessing(ownerId, recentCompletedId)).resolves.toBe(false);
-    await expect(isAssessmentRequestProcessing(randomUUID(), liveProcessingId)).resolves.toBe(false);
 
     await expect(cleanupAssessmentRequests()).resolves.toBe(2);
     const remaining = await pool.query<{ request_id: string }>(

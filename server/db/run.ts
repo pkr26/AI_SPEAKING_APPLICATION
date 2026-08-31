@@ -308,6 +308,29 @@ function defaultCommandActions(): DatabaseCommandActions {
   };
 }
 
+/**
+ * Destructive bootstrap commands treat an ambiguous environment (NODE_ENV
+ * unset or empty) as safe only for loopback hosts, mirroring the host
+ * canonicalization of the destructive-database guard. WHATWG URLs serialize
+ * IPv6 hosts with brackets and keep non-special postgres hosts opaque, so a
+ * plain hostname comparison suffices; an unparseable URL proves nothing and
+ * stays non-loopback. A URL carrying a query string or fragment proves
+ * nothing either — pg-connection-string lets query parameters such as
+ * `?host=` override the authority host — so any search/hash fails closed
+ * exactly like the destructive-database guard.
+ */
+function isLoopbackDatabaseHost(databaseUrl: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(databaseUrl);
+  } catch {
+    return false;
+  }
+  if (parsed.search || parsed.hash) return false;
+  const host = parsed.hostname.toLowerCase().replace(/\.+$/, '');
+  return host === 'localhost' || host === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+}
+
 export async function runDatabaseCommand(
   databaseUrl: string | undefined,
   command = 'setup',
@@ -332,6 +355,17 @@ export async function runDatabaseCommand(
     if (process.env.NODE_ENV === 'production') {
       throw new Error(
         `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"`,
+      );
+    }
+    // NODE_ENV defaults to development when omitted, so a production host
+    // that forgets the variable would otherwise bootstrap destructively
+    // with no refusal: with no explicit environment, only a proven loopback
+    // host may run.
+    if (!process.env.NODE_ENV && !isLoopbackDatabaseHost(databaseUrl)) {
+      throw new Error(
+        `refusing to run "${command}" with NODE_ENV unset against a non-loopback database host; set NODE_ENV explicitly - ` +
+          `"production" to keep a production host refusing destructive commands (use "npm run db:migrate:prod" and "npm run db:catalog:prod" there) ` +
+          `or "development" to confirm non-production intent`,
       );
     }
     if (command === 'seed') {

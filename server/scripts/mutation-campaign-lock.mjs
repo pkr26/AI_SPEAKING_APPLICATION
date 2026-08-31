@@ -30,6 +30,12 @@ async function readMutationCampaignLock(lockPath) {
   return owner;
 }
 
+// When an exclusive create fails with EEXIST but the lock file has vanished
+// by the time we read it, the previous owner released inside that race window.
+// Retry the acquisition with bounded backoff instead of surfacing a raw ENOENT
+// (which callers would mistake for corruption or a missing-lock bug).
+const ACQUIRE_RACE_RETRY_DELAYS_MS = [25, 50, 100, 200, 400];
+
 /**
  * Exclusively own the server workspace for one mutation campaign. Stryker's
  * temp directories and canonical reports are workspace-scoped, so distinct
@@ -41,17 +47,31 @@ export async function acquireMutationCampaignLock({ serverDir, reportDir, campai
   const lockPath = path.join(serverDir, mutationCampaignLockFileName);
   const token = randomUUID();
   let handle;
-  try {
-    handle = await fs.open(lockPath, 'wx');
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
-    const owner = await readMutationCampaignLock(lockPath);
-    throw new Error(
-      `Another backend mutation campaign (pid ${owner.pid}, ${owner.campaign ?? 'unknown campaign'}, ` +
-        `report directory ${owner.reportDir ?? 'unknown'}) already owns ${lockPath}. ` +
-        `Verify that neither its parent nor any Stryker child is alive before removing the lock manually.`,
-      { cause: error },
-    );
+  for (let attempt = 0; ; attempt++) {
+    try {
+      handle = await fs.open(lockPath, 'wx');
+      break;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      let owner;
+      try {
+        owner = await readMutationCampaignLock(lockPath);
+      } catch (readError) {
+        if (readError?.code === 'ENOENT' && attempt < ACQUIRE_RACE_RETRY_DELAYS_MS.length) {
+          await new Promise((resolve) => setTimeout(resolve, ACQUIRE_RACE_RETRY_DELAYS_MS[attempt]));
+          continue;
+        }
+        // A persistent ENOENT (or genuine corruption) still fails loudly; only
+        // the bounded release-race window above is retried.
+        throw readError;
+      }
+      throw new Error(
+        `Another backend mutation campaign (pid ${owner.pid}, ${owner.campaign ?? 'unknown campaign'}, ` +
+          `report directory ${owner.reportDir ?? 'unknown'}) already owns ${lockPath}. ` +
+          `Verify that neither its parent nor any Stryker child is alive before removing the lock manually.`,
+        { cause: error },
+      );
+    }
   }
 
   try {

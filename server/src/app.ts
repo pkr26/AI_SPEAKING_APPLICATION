@@ -86,27 +86,48 @@ export function createApp({
   // Readiness re-runs the exact startup dependency assertions (schema
   // cutover fences, ffmpeg/ffprobe inspector, retained-audio storage) on
   // every probe, so post-start drift pulls this replica out of rotation;
-  // routing health must target /ready, never liveness-only /health.
-  app.get('/ready', limiters.readiness, async (_req, res) => {
-    res.set('Cache-Control', 'no-store');
-    try {
-      await Promise.all([schemaCheck(), audioInspectorCheck(), recordingStorageCheck()]);
-      res.json({ ok: true });
-    } catch (err) {
-      logger.error({ err }, 'readiness dependency check failed');
-      res.status(503).json({ ok: false, error: 'required service dependency unavailable', code: 'INTERNAL' });
-    }
-  });
+  // routing health must target /ready, never liveness-only /health. Wrapped
+  // in h() so any rejection outside the handler's own catch still reaches the
+  // central error middleware instead of becoming an unhandled rejection.
+  app.get(
+    '/ready',
+    limiters.readiness,
+    h(async (_req, res) => {
+      res.set('Cache-Control', 'no-store');
+      try {
+        await Promise.all([schemaCheck(), audioInspectorCheck(), recordingStorageCheck()]);
+        res.json({ ok: true });
+      } catch (err) {
+        logger.error({ err }, 'readiness dependency check failed');
+        res.status(503).json({ ok: false, error: 'required service dependency unavailable', code: 'INTERNAL' });
+      }
+    }),
+  );
 
   // Prometheus scrape endpoint, resolved at app build time (tests flip
   // config.metricsEnabled before creating the app). Disabled deployments fall
-  // through to the terminal JSON 404 below. Mounted with /health and /ready,
-  // before the global limiter, so a private scraper cannot be starved by a
-  // saturated per-IP budget; METRICS_ENABLED deployments must only expose the
-  // route to a private scrape network.
+  // through to the terminal JSON 404 below — including with any bearer token
+  // attached, so the 404 never confirms or denies that metrics exist. Mounted
+  // with /health and /ready, before the global limiter, so a private scraper
+  // cannot be starved by a saturated per-IP budget; METRICS_ENABLED
+  // deployments must only expose the route to a private scrape network, and a
+  // configured METRICS_BEARER_TOKEN additionally requires exactly
+  // `Authorization: Bearer <token>` on every scrape.
   if (config.metricsEnabled) {
     app.get(
       '/metrics',
+      (req, _res, next) => {
+        const expected = config.metricsBearerToken;
+        if (!expected) return next();
+        // Same single-credential shape requireAuth enforces: RFC-compatible
+        // scheme whitespace, exactly one bearer token, exact string match.
+        const authorization = req.headers.authorization;
+        const token = typeof authorization === 'string' ? /^Bearer[ \t]+([^\s]+)$/.exec(authorization)?.[1] : undefined;
+        if (token !== expected) {
+          throw new HttpError(401, 'Missing or invalid Authorization header', 'UNAUTHENTICATED');
+        }
+        return next();
+      },
       h(async (_req, res) => {
         res.set('Cache-Control', 'no-store');
         res.set('Content-Type', registry.contentType);

@@ -101,6 +101,32 @@ describe('httpLogger', () => {
     expect(entries().some((e) => e.req?.url === '/health')).toBe(false);
   });
 
+  it('suppresses every /health spelling: query string, one trailing slash, and case', async () => {
+    const a = buildApp();
+    lines.length = 0;
+    for (const url of ['/health?x=1', '/health/', '/HEALTH', '/Health?probe=1']) {
+      const res = await request(a).get(url);
+      expect(res.status).toBe(200);
+    }
+    // None of the probe spellings may write a log line — an exact-match
+    // predicate would let all four through unthrottled.
+    expect(entries().filter((e) => (e.req?.url ?? '').toLowerCase().startsWith('/health'))).toHaveLength(0);
+  });
+
+  it('still logs /healthz and /ready spellings that are not the liveness probe', async () => {
+    const a = buildApp();
+    lines.length = 0;
+    // buildApp defines no /ready route: the request 404s, and pino-http still
+    // logs it — suppression is scoped to the exact /health liveness path.
+    await request(a).get('/healthz');
+    await request(a).get('/ready?x=1');
+    await request(a).get('/ready');
+    const urls = entries().map((e) => e.req?.url);
+    expect(urls).toContain('/healthz');
+    expect(urls).toContain('/ready?x=1');
+    expect(urls).toContain('/ready');
+  });
+
   it('redacts credentials from direct application logs as well as HTTP logs', () => {
     logger.info(
       {
@@ -298,8 +324,15 @@ describe('logger initialization', () => {
     });
     expect(serializers.res({ statusCode: 204, headers: { 'set-cookie': 'secret' } })).toEqual({ statusCode: 204 });
 
-    const autoLogging = httpOptions.autoLogging as { ignore: (req: { url: string }) => boolean };
+    const autoLogging = httpOptions.autoLogging as { ignore: (req: { url?: string }) => boolean };
     expect(autoLogging.ignore({ url: '/health' })).toBe(true);
+    expect(autoLogging.ignore({ url: '/health?x=1' })).toBe(true);
+    expect(autoLogging.ignore({ url: '/health/' })).toBe(true);
+    expect(autoLogging.ignore({ url: '/HEALTH' })).toBe(true);
+    expect(autoLogging.ignore({ url: undefined })).toBe(false);
+    expect(autoLogging.ignore({ url: '/healthz' })).toBe(false);
+    expect(autoLogging.ignore({ url: '/health//' })).toBe(false);
     expect(autoLogging.ignore({ url: '/ready' })).toBe(false);
+    expect(autoLogging.ignore({ url: '/ready?x=1' })).toBe(false);
   });
 });

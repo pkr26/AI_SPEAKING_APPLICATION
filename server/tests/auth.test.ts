@@ -1,4 +1,4 @@
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import bcrypt from 'bcrypt';
@@ -14,6 +14,25 @@ import { app, createClosedPracticeCycle, pool, registerUser, STRONG_PASSWORD, un
 afterAll(async () => {
   await pool.end();
 });
+
+/**
+ * Mirror PostgresRateLimitStore's HMAC derivation so a rate-limit row
+ * assertion can be scoped to one exact counter key. Namespaces are static
+ * semantic names shared by every limiter and test, so a namespace-only query
+ * would also observe unrelated tests' rows.
+ */
+function counterKeyHash(namespace: string, key: string): string {
+  return createHmac(
+    'sha256',
+    createHmac('sha256', config.rateLimitHashSecret || config.jwtSecret)
+      .update('postgres-rate-limit-store/v1')
+      .digest(),
+  )
+    .update(namespace)
+    .update('\0')
+    .update(key)
+    .digest('hex');
+}
 
 /**
  * Hold a user's row until the request has authenticated, verified its password,
@@ -284,6 +303,10 @@ describe('auth: login', () => {
     const prev = config.rateLimit.authMax;
     config.rateLimit.authMax = 3;
     try {
+      // Namespaces are config-independent, so this tightened app shares the
+      // 'auth' per-IP window with every earlier login in the file: clear it so
+      // the test observes exactly its own three failures then the block.
+      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', ['auth']);
       const limited = app(); // limiters are built per app instance
       const email = uniqueEmail('rl');
       for (let i = 0; i < 3; i++) {
@@ -292,6 +315,7 @@ describe('auth: login', () => {
       }
       const blocked = await request(limited).post('/auth/login').send({ email, password: 'x' });
       expect(blocked.status).toBe(429);
+      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', ['auth']);
     } finally {
       config.rateLimit.authMax = prev;
     }
@@ -305,12 +329,16 @@ describe('auth: login', () => {
     const savedMax = config.rateLimit.loginAccountMax;
     const windowMs = 73_000;
     const max = 2;
-    const namespace = `login-account:${windowMs}:${max}`;
+    // Namespaces are config-independent semantic names, so isolate this test's
+    // counter by its exact (HMACed) normalized-email key instead of by a
+    // config-suffixed namespace.
+    const namespace = 'login-account';
+    const keyHash = counterKeyHash(namespace, `email:${body.email}`);
 
     config.trustProxy = 1;
     config.rateLimit.loginAccountWindowMs = windowMs;
     config.rateLimit.loginAccountMax = max;
-    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [namespace, keyHash]);
 
     try {
       const firstReplica = app();
@@ -325,9 +353,10 @@ describe('auth: login', () => {
       );
       expect((await login(secondReplica, '203.0.113.2', body.email, STRONG_PASSWORD)).status).toBe(200);
       await vi.waitFor(async () => {
-        const result = await pool.query<{ hits: number }>('SELECT hits FROM rate_limit_windows WHERE namespace = $1', [
-          namespace,
-        ]);
+        const result = await pool.query<{ hits: number }>(
+          'SELECT hits FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2',
+          [namespace, keyHash],
+        );
         expect(Number(result.rows[0]?.hits)).toBe(0);
       });
 
@@ -350,17 +379,18 @@ describe('auth: login', () => {
       expect((await login(firstReplica, '203.0.113.14', body.email, STRONG_PASSWORD)).status).toBe(200);
 
       const stored = await pool.query<{ key_hash: string }>(
-        'SELECT key_hash FROM rate_limit_windows WHERE namespace = $1',
-        [namespace],
+        'SELECT key_hash FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2',
+        [namespace, keyHash],
       );
       expect(stored.rows).toHaveLength(1);
+      expect(stored.rows[0].key_hash).toBe(keyHash);
       expect(stored.rows[0].key_hash).toMatch(/^[0-9a-f]{64}$/);
       expect(stored.rows[0].key_hash).not.toContain(body.email);
     } finally {
       config.trustProxy = savedTrustProxy;
       config.rateLimit.loginAccountWindowMs = savedWindow;
       config.rateLimit.loginAccountMax = savedMax;
-      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+      await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [namespace, keyHash]);
     }
   });
 });
@@ -811,7 +841,9 @@ describe('auth: delete account', () => {
 describe('auth: password-confirmation throttling', () => {
   const windowMs = 74_000;
   const max = 2;
-  const namespace = `password-account:${windowMs}:${max}`;
+  // Static semantic namespace: the budget is isolated per test through the
+  // per-user keys and the beforeEach/afterEach namespace wipe below.
+  const namespace = 'password-account';
   let savedWindow: number;
   let savedMax: number;
 
@@ -1119,12 +1151,12 @@ describe('auth: per-target-email registration budget', () => {
     config.rateLimit.registerMax = 100;
     config.rateLimit.registerEmailWindowMs = 60_000;
     config.rateLimit.registerEmailMax = 2;
-    await pool.query('DELETE FROM rate_limit_windows WHERE namespace LIKE $1', ['register-email:%']);
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', ['register-email']);
   });
 
   afterEach(async () => {
     Object.assign(config.rateLimit, saved);
-    await pool.query('DELETE FROM rate_limit_windows WHERE namespace LIKE $1', ['register-email:%']);
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', ['register-email']);
   });
 
   it('bounds repeated EMAIL_TAKEN probes of one address without touching other registrations', async () => {

@@ -155,7 +155,7 @@ describe('database schema readiness', () => {
 
   it('matches the packaged migration names/checksums and required runtime table', async () => {
     const manifest = expectedMigrationManifest();
-    expect(manifest.at(-1)?.name).toBe('024_diagnostic_runs_and_question_snapshots.sql');
+    expect(manifest.at(-1)?.name).toBe('026_attempts_question_snapshots.sql');
     expect(manifest.every(({ checksum }) => /^[0-9a-f]{64}$/.test(checksum))).toBe(true);
 
     const query = vi
@@ -165,7 +165,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+      latestMigration: '026_attempts_question_snapshots.sql',
     });
     expect(query.mock.calls[0]).toEqual(['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"']);
     expect(query.mock.calls[1]).toEqual(['SELECT to_regclass($1)::text AS table_name', ['public.rate_limit_windows']]);
@@ -235,7 +235,7 @@ describe('database schema readiness', () => {
 
     // The reported migration is still this release's latest packaged one.
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+      latestMigration: '026_attempts_question_snapshots.sql',
     });
   });
 
@@ -347,7 +347,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: completeQuestionInventory });
 
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
-      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+      latestMigration: '026_attempts_question_snapshots.sql',
     });
   });
 
@@ -397,7 +397,7 @@ describe('database schema readiness', () => {
 
     try {
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+        latestMigration: '026_attempts_question_snapshots.sql',
       });
       expect(query.mock.calls).toEqual([
         ['SELECT name, checksum FROM schema_migrations ORDER BY name COLLATE "C"', []],
@@ -432,8 +432,8 @@ describe('database schema readiness', () => {
       releaseInventory({ rows: completeQuestionInventory });
 
       await expect(Promise.all([first, second])).resolves.toEqual([
-        { latestMigration: '024_diagnostic_runs_and_question_snapshots.sql' },
-        { latestMigration: '024_diagnostic_runs_and_question_snapshots.sql' },
+        { latestMigration: '026_attempts_question_snapshots.sql' },
+        { latestMigration: '026_attempts_question_snapshots.sql' },
       ]);
       expect(query.mock.calls.filter(([text]) => String(text).includes('FROM schema_migrations'))).toHaveLength(2);
       expect(query.mock.calls.filter(([text]) => String(text).includes('to_regclass'))).toHaveLength(2);
@@ -488,7 +488,7 @@ describe('database schema readiness', () => {
     try {
       await expect(assertDatabaseSchemaCurrent()).rejects.toThrow('catalog read failed');
       await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-        latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+        latestMigration: '026_attempts_question_snapshots.sql',
       });
       expect(inventoryReads).toBe(2);
     } finally {
@@ -512,7 +512,7 @@ describe('database schema readiness', () => {
       .mockResolvedValueOnce({ rows: malformedInventory });
 
     await expect(assertDatabaseSchemaCurrent(healthyAdapter as SchemaQuery)).resolves.toEqual({
-      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+      latestMigration: '026_attempts_question_snapshots.sql',
     });
     await expect(assertDatabaseSchemaCurrent(malformedAdapter as SchemaQuery)).rejects.toThrow(
       'Question inventory is invalid',

@@ -172,9 +172,13 @@ const RECORDING_EVENT_WAIT_MS = 500;
 /**
  * Ceiling for waiting on the module-level serialized audio-session queue
  * (another instance's restore can hang if both of its bounded retries fail to
- * settle natively). Every other wait in this file is deadline-bounded; this
- * one must be too, or `startRecording` holds its operation token with all
- * controls locked forever.
+ * settle natively). Every wait in this file is deadline-bounded — including
+ * the native audio-mode mutations themselves: AUDIO_MODE_OPERATION_TIMEOUT_MS
+ * in lib/audio-session bounds every queued setAudioModeAsync call, so the
+ * configure/restore awaits in start, stop, and lifecycle cleanup can reject
+ * (and their owners fail closed) but can never hang. This release wait must
+ * be too, or `startRecording` holds its operation token with all controls
+ * locked forever.
  */
 const AUDIO_SESSION_RELEASE_WAIT_MS = 10_000;
 const MAX_TERMINAL_EVENT_QUARANTINES = 4;
@@ -751,6 +755,24 @@ function useScopedAudioRecorderState(
   return state;
 }
 
+/**
+ * Host-screen callbacks (onError, onRateLimited, onRecoveryUnresolved,
+ * onResult/onResultWithMetadata) are re-entrancy boundaries this component
+ * cannot trust: a callback may navigate, blur, or itself throw. Inside the
+ * recovery flow a throw must never skip the bookkeeping that follows the
+ * callback — the phase write that unlocks controls (or arms Try Again) and
+ * the durable tracking cleanup — or the recorder stays latched in
+ * 'recovering' with the exit lock held and no UI escape. Report the failure
+ * and continue.
+ */
+function runHostCallback(callback: () => void): void {
+  try {
+    callback();
+  } catch (error) {
+    console.error('Recorder host callback failed', error);
+  }
+}
+
 async function restoreAudioMode(): Promise<void> {
   const restore = () => configurePlaybackAudioMode();
   try {
@@ -809,6 +831,27 @@ export function operationShouldUnlock(
   locked: boolean,
 ): boolean {
   return mounted && !unmounting && !stillActive && phase === 'idle' && locked;
+}
+
+/**
+ * Exit-lock twin of operationShouldUnlock. A fast operation (e.g. a terminal
+ * recovery that resolves entirely within one scheduler window) can publish
+ * both locks and return the phase to idle before React commits anything: the
+ * final state then equals the last committed state, the layout effect never
+ * re-runs, and the exit lock stays announced as held. endOperation must
+ * balance the synchronous begin notification for the exit lock exactly as it
+ * already does for the interaction lock.
+ */
+export function operationShouldReleaseExitLock(
+  mounted: boolean,
+  unmounting: boolean,
+  stillActive: boolean,
+  phase: Phase,
+  locked: boolean,
+): boolean {
+  return (
+    mounted && !unmounting && !stillActive && (phase === 'idle' || phase === 'parked') && locked
+  );
 }
 
 export function nextRecordingTakeGeneration(current: number): number {
@@ -1152,7 +1195,10 @@ export default function Recorder<T>({
           notify &&
           recorderContextIsActive(mountedRef.current, focusedRef.current, AppState.currentState)
         ) {
-          callbacksRef.current.onError(translate('recorder.errAudioReset'));
+          // The owning stop/lifecycle bookkeeping below must complete even when
+          // the host error report itself throws; log-and-continue keeps this
+          // cleanup promise settling so its awaiters can never stall.
+          runHostCallback(() => callbacksRef.current.onError(translate('recorder.errAudioReset')));
         }
       } finally {
         if (audioSessionIsOwnedBy(activeAudioSessionOwner, instanceId)) {
@@ -1295,6 +1341,22 @@ export default function Recorder<T>({
       lockedRef.current = false;
       callbacksRef.current.onInteractionLockChange?.(false);
     }
+    // Same one-batch hazard for the exit lock: publishOperation announces it
+    // synchronously, and a terminal recovery that resolves before React
+    // commits would otherwise leave route exits announced as locked while the
+    // recorder is already idle (or parked, which also releases exits).
+    if (
+      operationShouldReleaseExitLock(
+        mountedRef.current,
+        unmountingRef.current,
+        stillActive,
+        phaseRef.current,
+        exitLockedRef.current === true,
+      )
+    ) {
+      exitLockedRef.current = false;
+      callbacksRef.current.onExitLockChange?.(false);
+    }
     if (!stillActive && deferredRecoveryRequestedRef.current) {
       deferredRecoveryRequestedRef.current = false;
       // A foreground/focus request can arrive while a lifecycle-invalidated
@@ -1407,7 +1469,9 @@ export default function Recorder<T>({
     (message: string) => {
       updatePhase('recovering');
       if (mountedRef.current) setRecoveryRetryNeeded(true);
-      callbacksRef.current.onError(message);
+      // The retry state is already armed above, so even a throwing onError
+      // cannot re-latch this terminal failure path into a locked phase.
+      runHostCallback(() => callbacksRef.current.onError(message));
     },
     [updatePhase],
   );
@@ -1481,9 +1545,11 @@ export default function Recorder<T>({
       }
       discardRecording();
       updatePhase('idle');
-      callbacksRef.current.onRecoveryUnresolved();
+      runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
       if (!contextIsCurrent()) return;
-      callbacksRef.current.onError(translate('error.assessmentResultIncompatible'));
+      runHostCallback(() =>
+        callbacksRef.current.onError(translate('error.assessmentResultIncompatible')),
+      );
     },
     [clearRequestTracking, discardRecording, failRecoveryAwaitingRetry, updatePhase],
   );
@@ -1653,6 +1719,12 @@ export default function Recorder<T>({
       hasObservedRecordingRef.current = false;
       autoStoppedAtRef.current = null;
       updatePhase('idle');
+      // A restore that never settles natively rejects at the audio-session
+      // deadline and is absorbed by restoreOwnedAudioMode itself (owner
+      // release still happens in its finally), so this promise — and with it
+      // lifecycleStopPromiseRef and endOperation below — always completes and
+      // the foreground/focus handlers awaiting the lifecycle stop can never
+      // stall on a wedged audio mode.
       await restoreOwnedAudioMode();
     })().finally(() => {
       endOperation(operationToken);
@@ -1769,7 +1841,9 @@ export default function Recorder<T>({
         )
       ) {
         updatePhase('idle');
-        callbacksRef.current.onError(translate('recorder.errNothingToConfirm'));
+        runHostCallback(() =>
+          callbacksRef.current.onError(translate('recorder.errNothingToConfirm')),
+        );
       }
       const leaseHeldElsewhere = pending !== null && anotherRecoveryOwner;
       finishLoading();
@@ -1877,7 +1951,7 @@ export default function Recorder<T>({
 
       if (pending.stage === 'reconcile') {
         if (!isCurrent()) return;
-        callbacksRef.current.onRecoveryUnresolved();
+        runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
         if (!isCurrent()) return;
         discardRecording();
         updatePhase('idle');
@@ -1935,7 +2009,10 @@ export default function Recorder<T>({
           return;
         }
         if (!isCurrent()) return;
-        callbacksRef.current.onRecoveryUnresolved();
+        // Host-screen callbacks are boundaries, not collaborators: a throwing
+        // onRecoveryUnresolved must not skip the phase write below (which
+        // unlocks the controls or restores the take) or the tracking cleanup.
+        runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
         if (!isCurrent()) return;
         if (!allowRecordedRetry || !activeUriRef.current || !routeMatches) {
           discardRecording();
@@ -1947,9 +2024,10 @@ export default function Recorder<T>({
         // again" line; screens that render it inline deserve it there, exactly
         // as the submit path routes its own 429.
         if (rejection?.status === 429 && callbacksRef.current.onRateLimited) {
-          callbacksRef.current.onRateLimited(message);
+          const onRateLimited = callbacksRef.current.onRateLimited;
+          runHostCallback(() => onRateLimited(message));
         } else {
-          callbacksRef.current.onError(message);
+          runHostCallback(() => callbacksRef.current.onError(message));
         }
         void clearRequestTracking(pending.requestId);
       };
@@ -2073,9 +2151,11 @@ export default function Recorder<T>({
               // Recorder can be embedded without the app's root provider (for
               // example in an isolated host). Preserve the safe legacy fallback
               // there instead of silently hiding the durable result.
-              callbacksRef.current.onRecoveryUnresolved();
+              runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
               if (!isCurrent()) return;
-              callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
+              runHostCallback(() =>
+                callbacksRef.current.onError(translate('recorder.errInterruptedSaved')),
+              );
               return;
             }
             let data: T;
@@ -2093,11 +2173,13 @@ export default function Recorder<T>({
                 return;
               }
               if (!isCurrent()) return;
-              callbacksRef.current.onRecoveryUnresolved();
+              runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
               if (!isCurrent()) return;
               discardRecording();
               updatePhase('idle');
-              callbacksRef.current.onError(translate('recorder.errCannotDisplay'));
+              runHostCallback(() =>
+                callbacksRef.current.onError(translate('recorder.errCannotDisplay')),
+              );
               void clearRequestTracking(pending.requestId);
               return;
             }
@@ -2117,7 +2199,7 @@ export default function Recorder<T>({
             }
             discardRecording();
             updatePhase('idle');
-            deliverResult(data, pending.requestId);
+            runHostCallback(() => deliverResult(data, pending.requestId));
             return;
           } else {
             await finishUnresolved(translate('recorder.errRecoveryMismatch'), false);
@@ -2232,9 +2314,11 @@ export default function Recorder<T>({
                   discardRecording();
                   updatePhase('idle');
                   if (notifyPendingAssessmentReplayReady(pending.requestId)) return;
-                  callbacksRef.current.onRecoveryUnresolved();
+                  runHostCallback(() => callbacksRef.current.onRecoveryUnresolved());
                   if (!isCurrent()) return;
-                  callbacksRef.current.onError(translate('recorder.errInterruptedSaved'));
+                  runHostCallback(() =>
+                    callbacksRef.current.onError(translate('recorder.errInterruptedSaved')),
+                  );
                   return;
                 }
                 let data: T;
@@ -2259,7 +2343,7 @@ export default function Recorder<T>({
                 if (!isCurrent()) return;
                 discardRecording();
                 updatePhase('idle');
-                deliverResult(data, pending.requestId);
+                runHostCallback(() => deliverResult(data, pending.requestId));
                 return;
               } catch (retryError) {
                 if (isIncompatibleSavedAssessment(retryError)) {
@@ -2279,7 +2363,21 @@ export default function Recorder<T>({
                   return;
                 }
                 if (!isCurrent()) return;
-                if (retryError instanceof ApiError && retryError.status === 401) return;
+                // Auth middleware rejects before the idempotency claim — the
+                // same pre-claim proof the 429 branch below documents — so this
+                // resubmission provably committed nothing (absence was already
+                // confirmed before it was sent). Finish with the message the
+                // submit path would have shown instead of returning silently
+                // and stranding the recorder in a 'recovering' phase whose
+                // every future read can only 401 again.
+                if (retryError instanceof ApiError && retryError.status === 401) {
+                  await finishUnresolved(
+                    userMessageForError(retryError, translate('recorder.errRejected')),
+                    true,
+                    retryError,
+                  );
+                  return;
+                }
                 if (assessmentRejectionRequiresCanonicalRefresh(retryError)) {
                   await finishUnresolved(
                     userMessageForError(retryError, translate('recorder.errAlreadyAnswered')),
@@ -2386,6 +2484,15 @@ export default function Recorder<T>({
               return;
             }
           } else if (error instanceof ApiError && error.status === 401) {
+            // Auth rejects every route before any claim or state read can
+            // happen, so this poll loop cannot make progress until the session
+            // is re-established (the api layer's session-expiry handler reacts
+            // independently on the same 401). Park instead of returning
+            // silently: the durable pointer and the surviving take stay intact
+            // for a later mount to replay a committed result, while route
+            // exits reopen and the Try Again affordance replaces a 'recovering'
+            // phase that no loop was still driving.
+            updatePhase('parked');
             return;
           } else if (error instanceof ApiError && error.code === 'CLIENT_UPGRADE_REQUIRED') {
             // The version gate rejects every route before any claim is made,
@@ -2408,6 +2515,18 @@ export default function Recorder<T>({
         if (!isCurrent()) return;
       }
       await finishUnresolved(translate('recorder.errRecoveryExpired'), false);
+    } catch (error) {
+      // Every caller invokes this as `void recoverPending()`, so without this
+      // catch one unexpected throw (a hostile module boundary, a bookkeeping
+      // bug) becomes an unhandled rejection that parks the recorder in
+      // 'recovering': the finally clears the operation token, but no polling
+      // loop is left running and no Try Again affordance is armed. Route any
+      // survivor to the shared retryable terminal phase instead, mirroring how
+      // failRecoveryAwaitingRetry already escapes every handled failure.
+      console.error('Recorder recovery failed unexpectedly', error);
+      if (isCurrent() && recoveryPhaseIsEligible(phaseRef.current)) {
+        failRecoveryAwaitingRetry(translate('recorder.errRetryInfoUpdate'));
+      }
     } finally {
       recoveryAttemptRef.current = null;
       recoveringRef.current = false;
@@ -2954,6 +3073,11 @@ export default function Recorder<T>({
       }
       if (!isCurrentLifecycle()) return;
       acquireAudioSession();
+      // A native recording-mode call that never settles rejects here at the
+      // audio-session deadline; the shared catch below then fails the start
+      // closed exactly like every other start failure (audio-session owner
+      // released via restoreOwnedAudioMode(false), phase reset, localized
+      // start-failure copy) instead of latching the controls forever.
       await configureRecordingAudioMode();
       if (!isCurrentLifecycle()) {
         await restoreOwnedAudioMode(false);
@@ -3136,6 +3260,10 @@ export default function Recorder<T>({
         }
       }
     } finally {
+      // Deadline-bounded restore: a never-settling native reset rejects inside
+      // restoreOwnedAudioMode (owner release still runs, failure logged or
+      // reported there), so the stop always completes and releases the
+      // operation token instead of wedging the recorded take mid-stop.
       await restoreOwnedAudioMode();
       endOperation(operationToken);
     }
@@ -3447,11 +3575,17 @@ export default function Recorder<T>({
         }
         return;
       }
-      // 426 belongs here: the client-version gate rejects ahead of the
-      // idempotency claim, so it can never accompany a committed attempt.
+      // 426 and 401 belong here: the client-version gate and the auth
+      // middleware both reject ahead of the idempotency claim — the same
+      // pre-claim proof the recovery loop documents for 429 — so a received
+      // 401 can never accompany a committed attempt. (Password rotation on
+      // another device mid-POST must return the take, not strand it in
+      // recovery polling that can only ever 401 again.) The session-expiry
+      // handler fires independently on every 401; this local cleanup coexists
+      // with it exactly as the 426/429 terminal handling does.
       const definitelyRejected =
         error instanceof ApiError &&
-        ([400, 403, 404, 413, 415, 422, 426, 429].includes(error.status) ||
+        ([400, 401, 403, 404, 413, 415, 422, 426, 429].includes(error.status) ||
           assessmentRejectionRequiresCanonicalRefresh(error));
       const refreshCanonicalState = assessmentRejectionRequiresCanonicalRefresh(error);
       const definiteServerFailure = isDefiniteAssessmentServerFailure(error);

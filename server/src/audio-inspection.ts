@@ -334,8 +334,33 @@ async function inspectDecodedAudio(filePath: string): Promise<DecodedAudioInspec
 // collection state: every host-fault branch stays directly executable and
 // independently testable, while unknown/missing codes still fail closed as
 // unusable input.
-function isTransientOpenErrorCode(code: unknown): boolean {
-  return code === 'EAGAIN' || code === 'EIO' || code === 'EMFILE' || code === 'ENFILE';
+//
+// Errnos the private-upload open (or its lstat/fstat pair) can raise because
+// the HOST is unhealthy, never because of the learner's media: EAGAIN (the
+// open refused to block), EIO (storage I/O fault), EMFILE/ENFILE (process or
+// system descriptor exhaustion), EACCES (permissions on the server-owned 0700
+// uploads tree were revoked — this process wrote the upload itself moments
+// earlier, so no client input can cause it), and ENOMEM (kernel allocation
+// failure). This follows the sibling S3 download path's local-disk intent
+// (audio-upload.ts classifies operator-side faults as host errors with its
+// own errno set): an operator-side fault must surface as a retryable host
+// error, never as the terminal 415 that discards a good take.
+//
+// Write-side errnos (ENOSPC, EROFS, EDQUOT, EFBIG) are deliberately absent: a
+// read-only open and the stat calls never raise them, so listing them here
+// would be dead classification. ENOENT, ELOOP, ENXIO, ENOTDIR, and
+// ENAMETOOLONG genuinely describe unusable input (a vanished or swapped
+// object, a symlink refused by O_NOFOLLOW, a malformed path) and stay invalid
+// verdicts; every unrecognized or missing code keeps failing closed.
+function isHostFaultOpenErrorCode(code: unknown): boolean {
+  return (
+    code === 'EAGAIN' ||
+    code === 'EIO' ||
+    code === 'EMFILE' ||
+    code === 'ENFILE' ||
+    code === 'EACCES' ||
+    code === 'ENOMEM'
+  );
 }
 
 /**
@@ -369,11 +394,12 @@ function openPrivateInput(filePath: string): number {
       }
     }
     const { code } = error as NodeJS.ErrnoException;
-    if (isTransientOpenErrorCode(code)) {
+    if (isHostFaultOpenErrorCode(code)) {
       throw new InspectionError('unavailable');
     }
     // Everything else (a non-regular object, ELOOP from the O_NOFOLLOW open,
-    // ENXIO, a missing file) really is an unusable input.
+    // ENXIO, a missing file, an unrecognized errno) really is an unusable
+    // input — the classifier above owns the host-fault carve-outs.
     throw new InvalidInspectionError();
   }
 }

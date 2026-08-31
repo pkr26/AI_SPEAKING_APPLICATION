@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { AssessResult, assessSpeaking } from './assess';
 import { buildAssessmentSubmissionChain, runAssessmentSubmission } from './assessment-pipeline';
 import { pool, QuestionRow } from './db';
-import { completeAssessmentRequest } from './idempotency';
+import { completeAssessmentRequest, validatedAttemptQuestionSnapshot } from './idempotency';
 import { logger } from './logger';
 import { AuthedRequest, h, HttpError, requireAuth, validate } from './middleware';
 import { Limiters } from './rate-limit';
@@ -70,10 +70,9 @@ async function diagnosticAnswerSummaries(
 ): Promise<DiagnosticAnswerSummary[]> {
   if (questionsAsked === 0) return [];
   const { rows } = await client.query<DiagnosticAnswerSummary>(
-    `SELECT a.attempt_no AS "attemptNo", q.prompt_word AS "promptWord",
-            q.question_text AS "questionText", a.transcript, a.score, a.passed, a.feedback
+    `SELECT a.attempt_no AS "attemptNo", a.prompt_word AS "promptWord",
+            a.question_text AS "questionText", a.transcript, a.score, a.passed, a.feedback
      FROM attempts a
-     JOIN questions q ON q.id = a.question_id
      WHERE a.user_id = $1 AND a.context = 'diagnostic'
      ORDER BY a.created_at DESC, a.id DESC
      LIMIT $2`,
@@ -294,11 +293,32 @@ async function finalizeDiagnosticAnswer(
     }
 
     const attemptNo = state.questions_asked + 1;
+    // Migration 026 snapshot: the run summaries read these columns instead of
+    // rejoining the mutable catalog, so the row must carry the exact in-memory
+    // question this answer was graded against.
+    const snapshot = validatedAttemptQuestionSnapshot({
+      cefrLevel: question.cefr_level,
+      promptWord: question.prompt_word,
+      questionText: question.question_text,
+    });
     const insertedAttempt = await client.query<{ id: string }>(
-      `INSERT INTO attempts (user_id, question_id, context, attempt_no, transcript, score, passed, feedback)
-       VALUES ($1, $2, 'diagnostic', $3, $4, $5, $6, $7)
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback,
+          cefr_level, prompt_word, question_text)
+       VALUES ($1, $2, 'diagnostic', $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
-      [userId, question.id, attemptNo, result.transcript, result.score, result.passed, result.feedback],
+      [
+        userId,
+        question.id,
+        attemptNo,
+        result.transcript,
+        result.score,
+        result.passed,
+        result.feedback,
+        snapshot.cefrLevel,
+        snapshot.promptWord,
+        snapshot.questionText,
+      ],
     );
     if (recording) recording.attemptId = insertedAttempt.rows[0].id;
 
@@ -307,12 +327,14 @@ async function finalizeDiagnosticAnswer(
     let high = state.high_idx;
     if (result.passed) low = mid + 1;
     else high = mid - 1;
-    // Stryker disable next-line EqualityOperator: two suite tests pin this exact outcome
-    // (attempt 3 completing with the window still open: pass B1, pass C1, fail C2 —
-    // tests/diagnostic.test.ts 'finishes the placement at the three-question bound while
-    // the window stays open' and the mirrored scenario in diagnostic-silence-and-resume).
-    // The >= → > mutant fails both in the ordinary suite, but Stryker's per-test coverage
-    // attribution has never selected either test for this mutant across three campaigns.
+    // Every fresh run collapses the window by the third scored answer (a
+    // six-level binary search converges in <= 3), so the window disjunct alone
+    // finishes fresh journeys. attemptNo == MAX_QUESTIONS is the SOLE
+    // terminator only for an interrupted run resumed at exactly the bound with
+    // the window still open — pinned by diagnostic-search.test.ts's seeded
+    // [3,5]/asked=2 pass case, which kills the >= → > boundary mutant (a pass
+    // that leaves the window [5,5] must complete the run, not serve a fourth
+    // question).
     const done = low > high || attemptNo >= MAX_QUESTIONS;
 
     let body: Record<string, unknown> = {

@@ -21,6 +21,7 @@ import {
   abandonAssessmentRequest,
   type AssessmentContext,
   type AssessmentNativeLanguage,
+  type ClaimedAssessmentRequest,
   claimAssessmentRequest,
 } from './idempotency';
 import { AuthedRequest, AuthUser, HttpError, validate, validated } from './middleware';
@@ -166,6 +167,15 @@ export interface AssessmentSubmissionHooks<Claim, Result> {
   ) => Promise<Record<string, unknown>>;
   /** Best-effort release of the per-question claim (never throws). */
   clearClaim: (user: AuthUser, question: QuestionRow, claim: Claim) => Promise<void>;
+  /**
+   * Optional receiver for the durable request claim's committed snapshot,
+   * invoked exactly once for a fresh claim and before claimAttempt/assess/
+   * persist run (completed replays return early and never invoke it). The
+   * practice-native route uses the claim's native-language snapshot so the
+   * provider call and persistence cannot drift from the durable label after a
+   * concurrent profile change.
+   */
+  onFreshRequestClaim?: (claim: ClaimedAssessmentRequest) => void;
 }
 
 /**
@@ -251,6 +261,9 @@ export async function runAssessmentSubmission<Claim, Result>(
         promptWord: question.prompt_word,
         questionText: question.question_text,
       },
+      // Fresh claims only: hand the route the committed snapshot (including
+      // the claim's native language) before any provider work runs.
+      hooks.onFreshRequestClaim,
     );
     if (requestClaim.kind === 'completed') {
       // Completed replays retain their object for the bucket lifecycle: an
@@ -264,7 +277,9 @@ export async function runAssessmentSubmission<Claim, Result>(
     try {
       // A completed idempotent response takes precedence over mutable level
       // eligibility: the original request may itself have promoted the user,
-      // and its retry must still replay byte-for-byte without new paid work.
+      // and its retry must still replay the same stored response — semantically
+      // equal JSON (JSONB does not preserve byte order), which is what the
+      // additive JSON contract promises clients — without new paid work.
       if (hooks.requireQuestionAtUserLevel && question.cefr_level !== user.cefr_level) {
         throw new HttpError(403, 'Question is not available at your level', 'FORBIDDEN');
       }
@@ -298,6 +313,18 @@ export async function runAssessmentSubmission<Claim, Result>(
           ) {
             hooks.respendAssessmentBudget(req, res);
           }
+        },
+        // The provider skeleton undoes a just-committed reservation when the
+        // request aborts before any provider work (drain start or a missing
+        // API key). Clear the latch synchronously — before the abort's error
+        // unwinds into the error handler — so the ≥400 finish predicate sees
+        // an unreserved response and refunds both assessment hits. Invoked
+        // only after the usage row was actually deleted; a failed undo keeps
+        // the latch, so its hits stay spent with the retained reservation.
+        // (If a transport close already re-spent this budget, the wrapper's
+        // one-shot refund flag keeps this clear from double-refunding.)
+        onCapacityReservationUndone: () => {
+          res.locals.assessmentCapacityReserved = false;
         },
       });
       const recording: RecordingCapture | undefined =

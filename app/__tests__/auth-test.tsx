@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, render, screen, waitFor } from '@testing-library/react-native';
 import { useEffect, useMemo, useState } from 'react';
 import { Text } from 'react-native';
+import * as SecureStore from 'expo-secure-store';
 
 import {
   ApiError,
@@ -23,7 +24,11 @@ import {
 } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { cancelDailyReminderQuietly } from '../src/lib/daily-reminder';
-import { clearPendingAssessment } from '../src/lib/pending-assessment';
+import {
+  capturePendingAssessmentGeneration,
+  clearPendingAssessment,
+  ensurePendingAssessment,
+} from '../src/lib/pending-assessment';
 import { cleanupPrivateArtifacts } from '../src/lib/private-artifacts';
 import { PracticeFlowProvider, usePracticeFlow } from '../src/lib/practice-flow';
 import { markSessionExpiredNotice } from '../src/lib/session-notice';
@@ -61,7 +66,24 @@ jest.mock('../src/lib/api', () => {
 });
 
 jest.mock('../src/lib/pending-assessment', () => ({
+  // The generation fence (advance/capture/ensure) stays REAL so auth's
+  // scheduling can be tested against the actual refusal contract; only the
+  // SecureStore delete is stubbed so a test can hang one cleanup tail.
+  ...jest.requireActual('../src/lib/pending-assessment'),
   clearPendingAssessment: jest.fn(),
+}));
+
+const mockPendingStorage = new Map<string, string>();
+
+jest.mock('expo-secure-store', () => ({
+  WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'device-only',
+  getItemAsync: jest.fn(async (key: string) => mockPendingStorage.get(key) ?? null),
+  setItemAsync: jest.fn(async (key: string, value: string) => {
+    mockPendingStorage.set(key, value);
+  }),
+  deleteItemAsync: jest.fn(async (key: string) => {
+    mockPendingStorage.delete(key);
+  }),
 }));
 
 jest.mock('../src/lib/private-artifacts', () => ({
@@ -299,6 +321,19 @@ beforeEach(() => {
   mockedMarkSessionExpiredNotice.mockResolvedValue(undefined);
   mockedCancelDailyReminder.mockResolvedValue(undefined);
   mockMirrorAccountLanguage.mockReset();
+  // resetAllMocks strips the SecureStore mock implementations that back the
+  // real pending-assessment module this suite keeps loaded.
+  mockPendingStorage.clear();
+  jest.mocked(SecureStore.getItemAsync).mockImplementation(async (key: string) => {
+    const value = mockPendingStorage.get(key);
+    return value === undefined ? null : value;
+  });
+  jest.mocked(SecureStore.setItemAsync).mockImplementation(async (key: string, value: string) => {
+    mockPendingStorage.set(key, value);
+  });
+  jest.mocked(SecureStore.deleteItemAsync).mockImplementation(async (key: string) => {
+    mockPendingStorage.delete(key);
+  });
 });
 
 describe('AuthProvider session restore', () => {
@@ -1798,6 +1833,80 @@ describe('session leases', () => {
       expect(auth!.isSessionLeaseCurrent(leaseBefore, { identityOnly: true })).toBe(true);
     },
   );
+
+  it('rearms signed-out leases after a failed login transition', async () => {
+    await renderAuth(null);
+    const leaseBefore = renderedSessionLease;
+    if (!leaseBefore) throw new Error('memoized session lease was not captured');
+    expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(true);
+    const failure = new ApiError(401, 'wrong credentials');
+    mockedApiFetch.mockRejectedValueOnce(failure);
+
+    await act(async () => {
+      await expect(auth!.login('a@example.com', 'secret1')).rejects.toBe(failure);
+    });
+
+    // The failed attempt left the logged-out identity untouched; consumers'
+    // newly captured leases must be valid while the old capture stays stale.
+    expect(text('token')).toBe('null');
+    expect(text('userEmail')).toBe('null');
+    expect(text('sessionVersion')).toBe('1');
+    expect(renderedSessionLease).not.toBe(leaseBefore);
+    expect(auth!.isSessionLeaseCurrent(renderedSessionLease!)).toBe(true);
+    expect(auth!.isSessionLeaseCurrent(leaseBefore)).toBe(false);
+  });
+
+  it('closes the pending-assessment generation fence synchronously even while a cleanup tail hangs', async () => {
+    await renderLoggedIn();
+    // The FIRST unconditional clear never settles: every later scheduled clear
+    // stays queued behind it, so only the synchronous advance can close the
+    // fence.
+    mockedClearPendingAssessment.mockReturnValueOnce(new Promise(() => undefined));
+    const generationBefore = capturePendingAssessmentGeneration();
+
+    await act(async () => {
+      auth!.resetStoredSession();
+      // Scheduling the cleanup — not running its deferred delete — advanced
+      // the fence immediately.
+      expect(capturePendingAssessmentGeneration()).toBe(generationBefore + 1);
+    });
+
+    mockedApiFetch.mockResolvedValueOnce(undefined);
+    const generationBeforeLogout = capturePendingAssessmentGeneration();
+    let logout!: Promise<void>;
+    await act(async () => {
+      logout = auth!.logout();
+      // Let the logout pass its (immediately resolving) server call so the
+      // cleanup is actually scheduled — it stays deferred behind the hung
+      // tail afterwards.
+      for (let turn = 0; turn < 5; turn += 1) {
+        await Promise.resolve();
+      }
+      expect(capturePendingAssessmentGeneration()).toBe(generationBeforeLogout + 1);
+      // The logout's own clear is still queued behind the hung tail.
+      expect(mockedClearPendingAssessment).toHaveBeenCalledTimes(1);
+    });
+
+    // A creator holding the pre-logout generation is refused by the REAL
+    // fence while the durable delete has not run yet.
+    await expect(
+      ensurePendingAssessment(
+        {
+          ownerId: USER.id,
+          endpoint: '/practice/attempt',
+          questionId: '550e8400-e29b-41d4-a716-446655440001',
+          cycleId: '550e8400-e29b-41d4-a716-446655440020',
+          requestId: '550e8400-e29b-41d4-a716-446655440002',
+          createdAt: 1_700_000_000_000,
+          retainRecording: false,
+          stage: 'prepared',
+        },
+        generationBeforeLogout,
+      ),
+    ).resolves.toBeNull();
+    // Deliberately never awaited: the hung tail keeps the logout pending.
+    void logout;
+  });
 
   it('reports a failed logout without remounting real root practice state', async () => {
     await renderAuthPracticeComposition();

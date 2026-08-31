@@ -271,6 +271,24 @@ function drainPoolAfterFatal(poolFailureMessage: string): void {
 }
 
 /**
+ * The one fatal exit path every non-signal failure funnels through (HTTP
+ * server error, startup dependency failure, unhandled rejection/exception):
+ * latch the one-shot shutdown state so re-entrant or late callers cannot
+ * double-drain, freeze the janitor schedule, latch the provider gate before
+ * touching the pool so no in-flight assessment escapes the abort sweep or
+ * starts new paid work on a failed process, then drain the pool on the same
+ * bounded force-exit budget as graceful shutdown and log the fatal reason.
+ */
+function fatalShutdown(err: unknown, message: string, poolFailureMessage: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearJanitors();
+  abortInFlightAssessments({ preventNew: true });
+  drainPoolAfterFatal(poolFailureMessage);
+  logLifecycleFatal({ err }, message);
+}
+
+/**
  * One-shot graceful shutdown for SIGTERM/SIGINT (repeat signals are ignored).
  * Ordering is load-bearing: freeze the janitor schedule, latch the provider
  * gate before touching sockets or the pool so no in-flight assessment escapes
@@ -333,9 +351,9 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
 
 // A listen failure (EADDRINUSE, a refused bind) would otherwise crash with a
-// raw uncaught exception. Route it through the same fatal log + pool drain as
-// every other startup failure; the shuttingDown guard keeps a shutdown-time
-// socket error from double-exiting.
+// raw uncaught exception. Route it through the shared fatal path; the
+// shuttingDown guard inside keeps a shutdown-time socket error from
+// double-exiting.
 server.on('error', (err) => {
   if (shuttingDown) return;
   // Node emits this same event for a single failed accept() (EMFILE/ENFILE
@@ -348,11 +366,21 @@ server.on('error', (err) => {
     logShutdownError({ err }, 'accept failed; dropped one incoming connection');
     return;
   }
-  shuttingDown = true;
-  clearJanitors();
-  abortInFlightAssessments({ preventNew: true });
-  drainPoolAfterFatal('error closing pg pool after HTTP server failure');
-  logLifecycleFatal({ err }, 'HTTP server failed');
+  fatalShutdown(err, 'HTTP server failed', 'error closing pg pool after HTTP server failure');
+});
+
+// Node's default for an unhandled rejection or uncaught exception is a raw
+// crash with no drain at all. Route both through the same fatal path as a
+// server 'error' — janitors stop, in-flight paid assessments abort, the pool
+// drains on the bounded budget, the failure reaches the pino log, and the
+// process exits with failure once the drain settles — instead of a divergent
+// shutdown path. The one-shot latch inside fatalShutdown keeps double-calls
+// and races with an already-draining shutdown safe.
+process.on('unhandledRejection', (reason) => {
+  fatalShutdown(reason, 'unhandled promise rejection', 'error closing pg pool after unhandled promise rejection');
+});
+process.on('uncaughtException', (err) => {
+  fatalShutdown(err, 'uncaught exception', 'error closing pg pool after uncaught exception');
 });
 
 /**
@@ -397,10 +425,9 @@ Promise.all([
     });
   })
   .catch((err) => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    clearJanitors();
-    abortInFlightAssessments({ preventNew: true });
-    drainPoolAfterFatal('error closing pg pool after dependency startup failure');
-    logLifecycleFatal({ err }, 'required service dependency is unavailable; refusing to start');
+    fatalShutdown(
+      err,
+      'required service dependency is unavailable; refusing to start',
+      'error closing pg pool after dependency startup failure',
+    );
   });

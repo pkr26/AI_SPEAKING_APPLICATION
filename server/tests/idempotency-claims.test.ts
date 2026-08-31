@@ -273,6 +273,49 @@ describe('claimAssessmentRequest ownership and replay', () => {
     expect(client.query).toHaveBeenCalledOnce();
   });
 
+  it('maps a retained-recording unique violation to the stable audio-reuse 409, others propagate', async () => {
+    const capture = {
+      id: randomUUID(),
+      storageScope: 'practice' as const,
+      audioKey: `audio-uploads/practice/${userId}/${randomUUID()}.m4a`,
+      s3VersionId: 'version-1',
+      contentType: 'audio/mp4',
+      sizeBytes: 1234,
+    };
+    const ownerUpdate = {
+      rowCount: 1,
+      rows: [{ question_id: questionId, audio_key: capture.audioKey, recording_retained: true }],
+    };
+    // Fabricated migration-017 race: permanent metadata for this exact
+    // (storage_scope, audio_key, s3_version_id) committed after the claim's
+    // pre-check, so the metadata INSERT answers pg 23505.
+    const uniqueViolation = Object.assign(new Error('duplicate key value violates unique constraint'), {
+      code: '23505',
+    });
+    const client = {
+      query: vi.fn().mockResolvedValueOnce(ownerUpdate).mockRejectedValueOnce(uniqueViolation),
+    };
+
+    await expect(
+      completeAssessmentRequest(client, userId, randomUUID(), randomUUID(), retryPracticeResponse, 'practice', capture),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Audio upload was already submitted',
+      code: 'REQUEST_ID_REUSED',
+    });
+    expect(client.query).toHaveBeenCalledTimes(2);
+
+    // Only the unique violation is mapped; any other constraint failure keeps
+    // its original error instead of masquerading as audio reuse.
+    const foreignKeyViolation = Object.assign(new Error('insert violates foreign key constraint'), {
+      code: '23503',
+    });
+    client.query.mockReset().mockResolvedValueOnce(ownerUpdate).mockRejectedValueOnce(foreignKeyViolation);
+    await expect(
+      completeAssessmentRequest(client, userId, randomUUID(), randomUUID(), retryPracticeResponse, 'practice', capture),
+    ).rejects.toBe(foreignKeyViolation);
+  });
+
   it('preserves the in-flight subtype name for diagnostics', () => {
     const error = new AssessmentRequestInFlightError('Assessment is still processing', 'REQUEST_IN_FLIGHT', {
       retryAfterSeconds: 2,
@@ -820,6 +863,70 @@ describe('claimAssessmentRequest ownership and replay', () => {
       message: 'Audio upload was already submitted',
       code: 'REQUEST_ID_REUSED',
     });
+  });
+
+  it('refuses an audioKey already bound to permanent recording metadata before any paid work', async () => {
+    // Reproduce the 48h hole end to end: a retained recording outlives its
+    // completed claim, the janitor horizon frees the (user_id, audio_key)
+    // binding, and a fresh requestId submits the same still-live key.
+    const audioKey = `audio-uploads/practice/${userId}/${randomUUID()}.m4a`;
+    const retainedRequestId = randomUUID();
+    const retainedClaim = await claimAssessmentRequest(userId, retainedRequestId, 'practice', questionId, audioKey);
+    if (retainedClaim.kind !== 'claimed') throw new Error('expected a fresh retained claim');
+    await completeAssessmentRequest(
+      pool,
+      userId,
+      retainedRequestId,
+      retainedClaim.claimId,
+      completedPracticeResponse(91),
+      'practice',
+      {
+        id: randomUUID(),
+        storageScope: 'practice',
+        audioKey,
+        s3VersionId: 'version-retained',
+        contentType: 'audio/mp4',
+        sizeBytes: 1234,
+      },
+    );
+    await pool.query(
+      `UPDATE assessment_requests
+       SET completed_at = now() - interval '49 hours'
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, retainedRequestId],
+    );
+
+    const freshRequestId = randomUUID();
+    const usageBefore = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [userId],
+    );
+    await expect(
+      claimAssessmentRequest(userId, freshRequestId, 'practice', questionId, audioKey, true),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Audio upload was already submitted',
+      code: 'REQUEST_ID_REUSED',
+    });
+
+    // The rejection rolled back atomically: no claim row exists for the fresh
+    // request UUID (so no pipeline could spend provider work or capacity),
+    // the usage count is untouched, and the aged tombstone is restored.
+    const freshRow = await pool.query('SELECT 1 FROM assessment_requests WHERE user_id = $1 AND request_id = $2', [
+      userId,
+      freshRequestId,
+    ]);
+    expect(freshRow.rowCount).toBe(0);
+    const usageAfter = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [userId],
+    );
+    expect(usageAfter.rows[0].n).toBe(usageBefore.rows[0].n);
+    const tombstone = await pool.query<{ status: string }>(
+      'SELECT status FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, retainedRequestId],
+    );
+    expect(tombstone.rows).toEqual([{ status: 'completed' }]);
   });
 
   it('releases an abandoned audio binding and replaces a stale binding without touching another key', async () => {

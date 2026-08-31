@@ -3,8 +3,34 @@ import * as SecureStore from 'expo-secure-store';
 import { isUuid } from './params';
 import { audioKeyBelongsToOwner, audioKeyMatchesAssessmentEndpoint } from './types';
 
-export type AssessmentEndpoint =
-  '/diagnostic/answer' | '/practice/attempt' | '/practice/attempt/native';
+/**
+ * Every assessment endpoint a durable handoff may target. Adding a member is a
+ * schema change: `PENDING_ASSESSMENT_SCHEMA_VERSION` (and therefore the storage
+ * key) must be bumped in the same commit so an older, still-supported binary
+ * never reads a newer-format record from the old key.
+ */
+export const PENDING_ASSESSMENT_ENDPOINTS = [
+  '/diagnostic/answer',
+  '/practice/attempt',
+  '/practice/attempt/native',
+] as const;
+
+/**
+ * Every lifecycle stage a durable handoff may occupy. Adding a member is a
+ * schema change: `PENDING_ASSESSMENT_SCHEMA_VERSION` (and therefore the storage
+ * key) must be bumped in the same commit so an older, still-supported binary
+ * never reads a newer-format record from the old key.
+ */
+export const PENDING_ASSESSMENT_STAGES = [
+  'prepared',
+  'direct-posting',
+  's3-granted',
+  'reconcile',
+  'feedback-pending',
+] as const;
+
+export type AssessmentEndpoint = (typeof PENDING_ASSESSMENT_ENDPOINTS)[number];
+export type PendingAssessmentStage = (typeof PENDING_ASSESSMENT_STAGES)[number];
 
 export interface PendingAssessment {
   ownerId: string;
@@ -16,7 +42,7 @@ export interface PendingAssessment {
   createdAt: number;
   /** Explicit per-submission choice; legacy saved handoffs normalize to true. */
   retainRecording: boolean;
-  stage: 'prepared' | 'direct-posting' | 's3-granted' | 'reconcile' | 'feedback-pending';
+  stage: PendingAssessmentStage;
   /** When the server result became ready; present only until feedback is acknowledged. */
   feedbackReadyAt?: number;
   audioKey?: string;
@@ -24,7 +50,16 @@ export interface PendingAssessment {
   recoveryPostAttempts?: number;
 }
 
-const STORAGE_KEY = 'pending_assessment_v1';
+/**
+ * Runtime schema version of the durable handoff record. Bump it whenever either
+ * enum list gains a member: the storage key is derived from this number, so a
+ * new enum value lands under a new key and older binaries cannot parse (and
+ * then delete) a newer-format handoff — including a pointer to an
+ * already-paid assessment result.
+ */
+export const PENDING_ASSESSMENT_SCHEMA_VERSION = 1;
+
+const STORAGE_KEY = `pending_assessment_v${PENDING_ASSESSMENT_SCHEMA_VERSION}`;
 const MAX_STORED_RECOVERY_POST_ATTEMPTS = 3;
 export const PENDING_FEEDBACK_RETENTION_MS = 48 * 60 * 60 * 1_000;
 const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
@@ -32,7 +67,7 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: 'ai-english-coach.pending-assessment',
 };
 
-let memoryValue: PendingAssessment | null = null;
+let memoryValue: PendingAssessment | ForwardIncompatiblePendingAssessment | null = null;
 let memoryLoaded = false;
 let storageQueue: Promise<void> = Promise.resolve();
 let feedbackReplayRevision = 0;
@@ -74,39 +109,71 @@ function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
-export function parsePendingAssessment(value: unknown): PendingAssessment | null {
+const ENDPOINT_SET: ReadonlySet<string> = new Set<string>(PENDING_ASSESSMENT_ENDPOINTS);
+const STAGE_SET: ReadonlySet<string> = new Set<string>(PENDING_ASSESSMENT_STAGES);
+
+/**
+ * Parse outcome for a structurally valid record whose stage/endpoint enum was
+ * authored by a NEWER schema version under this storage key. Such a record may
+ * point at an already-paid assessment result, so this binary must never delete
+ * or overwrite it — only an explicit user-driven clear may remove the slot.
+ */
+export interface ForwardIncompatiblePendingAssessment {
+  readonly forwardIncompatible: true;
+}
+
+const FORWARD_INCOMPATIBLE: ForwardIncompatiblePendingAssessment = { forwardIncompatible: true };
+
+function isForwardIncompatible(value: unknown): value is ForwardIncompatiblePendingAssessment {
+  return value === FORWARD_INCOMPATIBLE;
+}
+
+/**
+ * True when `value` is structurally valid but carries a stage/endpoint this
+ * binary does not know. Callers can use this to distinguish "forward
+ * incompatible" from "corrupt" without relying on the null-mapping public
+ * parser.
+ */
+export function pendingAssessmentIsForwardIncompatible(value: unknown): boolean {
+  return isForwardIncompatible(parsePendingAssessmentOutcome(value));
+}
+
+/** Full parse outcome: a record, a newer-schema record, or structural failure. */
+function parsePendingAssessmentOutcome(
+  value: unknown,
+): PendingAssessment | ForwardIncompatiblePendingAssessment | null {
   if (!value || typeof value !== 'object') return null;
   const candidate = value as Partial<PendingAssessment>;
   if (
     !isUuid(candidate.ownerId) ||
     !isUuid(candidate.questionId) ||
     !isUuid(candidate.requestId) ||
-    (candidate.endpoint !== '/diagnostic/answer' &&
-      candidate.endpoint !== '/practice/attempt' &&
-      candidate.endpoint !== '/practice/attempt/native') ||
     typeof candidate.createdAt !== 'number' ||
     !Number.isFinite(candidate.createdAt) ||
     candidate.createdAt <= 0
   ) {
     return null;
   }
-  const isPracticeEndpoint = candidate.endpoint !== '/diagnostic/answer';
-  if (
-    (isPracticeEndpoint && !isUuid(candidate.cycleId)) ||
-    (!isPracticeEndpoint && candidate.cycleId !== undefined)
-  ) {
+  // A non-string endpoint/stage is structural corruption; an unknown STRING is
+  // a newer enum member and is deferred to the forward-incompatible outcome
+  // below so every other field is validated first.
+  if (typeof candidate.endpoint !== 'string') return null;
+  const endpointKnown = ENDPOINT_SET.has(candidate.endpoint);
+  const isPracticeEndpoint = endpointKnown && candidate.endpoint !== '/diagnostic/answer';
+  if (isPracticeEndpoint && !isUuid(candidate.cycleId)) {
     return null;
   }
-  if (
-    candidate.stage !== undefined &&
-    candidate.stage !== 'prepared' &&
-    candidate.stage !== 'direct-posting' &&
-    candidate.stage !== 's3-granted' &&
-    candidate.stage !== 'reconcile' &&
-    candidate.stage !== 'feedback-pending'
-  ) {
+  if (endpointKnown && !isPracticeEndpoint && candidate.cycleId !== undefined) {
     return null;
   }
+  if (!endpointKnown && candidate.cycleId !== undefined && !isUuid(candidate.cycleId)) {
+    return null;
+  }
+  const stageRaw = candidate.stage;
+  if (stageRaw !== undefined && typeof stageRaw !== 'string') {
+    return null;
+  }
+  const stageKnown = stageRaw !== undefined && STAGE_SET.has(stageRaw);
   if (candidate.cancelRequested !== undefined && typeof candidate.cancelRequested !== 'boolean') {
     return null;
   }
@@ -128,6 +195,13 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
     legacyDelivery !== 'reconcile'
   ) {
     return null;
+  }
+  // Every field this binary can validate on its own is structurally sound, so
+  // an unrecognized enum member means the record was authored by a newer
+  // schema. Return the sentinel instead of null: the caller must preserve the
+  // slot rather than healing it away.
+  if (!endpointKnown || (stageRaw !== undefined && !stageKnown)) {
+    return FORWARD_INCOMPATIBLE;
   }
   const stage =
     candidate.stage ?? (legacyDelivery === 'reconcile' ? 'reconcile' : 'direct-posting');
@@ -170,7 +244,14 @@ export function parsePendingAssessment(value: unknown): PendingAssessment | null
   };
 }
 
-async function loadPendingUnsafe(): Promise<PendingAssessment | null> {
+export function parsePendingAssessment(value: unknown): PendingAssessment | null {
+  const parsed = parsePendingAssessmentOutcome(value);
+  return isForwardIncompatible(parsed) ? null : parsed;
+}
+
+async function loadPendingUnsafe(): Promise<
+  PendingAssessment | ForwardIncompatiblePendingAssessment | null
+> {
   if (memoryLoaded) return memoryValue;
   let stored: string | null;
   try {
@@ -183,7 +264,15 @@ async function loadPendingUnsafe(): Promise<PendingAssessment | null> {
   memoryLoaded = true;
   if (!stored) return null;
   try {
-    const parsed = parsePendingAssessment(JSON.parse(stored) as unknown);
+    const parsed = parsePendingAssessmentOutcome(JSON.parse(stored) as unknown);
+    if (isForwardIncompatible(parsed)) {
+      // A structurally valid record with a newer-schema enum may point at an
+      // already-paid assessment result. Preserve it: this binary must never
+      // delete it, and a later load must not re-read the store to rediscover
+      // that same forward incompatibility.
+      memoryValue = parsed;
+      return parsed;
+    }
     if (parsed) {
       memoryValue = parsed;
       return parsed;
@@ -194,6 +283,17 @@ async function loadPendingUnsafe(): Promise<PendingAssessment | null> {
   await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS).catch(() => undefined);
   memoryValue = null;
   return null;
+}
+
+/**
+ * Loads the current record for request-matching consumers, collapsing a
+ * forward-incompatible (newer-schema) record to null WITHOUT deleting it: no
+ * stage write, conditional clear, or claim may match a record this binary
+ * cannot understand.
+ */
+async function loadParseableUnsafe(): Promise<PendingAssessment | null> {
+  const current = await loadPendingUnsafe();
+  return isForwardIncompatible(current) ? null : current;
 }
 
 async function savePendingUnsafe(pending: PendingAssessment): Promise<void> {
@@ -216,12 +316,27 @@ export function capturePendingAssessmentGeneration(): number {
 }
 
 /**
+ * Synchronously advances the unconditional-clear generation without touching
+ * storage. Auth's account/session boundaries call this at the moment they
+ * SCHEDULE their deferred `clearPendingAssessment()` delete — which may sit
+ * behind an earlier, potentially hung cleanup tail — so the generation fence is
+ * closed synchronously and a creator that already captured the old generation
+ * is refused even while the durable delete has not run yet. A plain number
+ * bump, therefore trivially safe alongside the serialized storage queue; the
+ * deferred clear itself still runs exactly as before.
+ */
+export function advanceUnconditionalClearGeneration(): void {
+  unconditionalClearGeneration += 1;
+}
+
+/**
  * Atomically installs `candidate` only when no handoff already exists.
  *
  * The returned record is authoritative: concurrent creators all observe the
  * first record, rather than separately reading `null` and overwriting one
  * another. `null` means an unconditional account/session clear began after the
- * caller captured `expectedGeneration`; no older submission may write or send.
+ * caller captured `expectedGeneration` — or the slot holds a forward-incompatible
+ * newer-schema handoff — so no older submission may write or send.
  */
 export async function ensurePendingAssessment(
   candidate: PendingAssessment,
@@ -233,6 +348,9 @@ export async function ensurePendingAssessment(
     if (expectedGeneration !== unconditionalClearGeneration) return null;
     const current = await loadPendingUnsafe();
     if (expectedGeneration !== unconditionalClearGeneration) return null;
+    // An older binary must never destroy a newer-format handoff (which may
+    // point at an already-paid result): refuse instead of overwriting it.
+    if (isForwardIncompatible(current)) return null;
     if (current) return current;
     await savePendingUnsafe(parsed);
     // A clear invoked while SecureStore was writing is already queued behind
@@ -244,7 +362,8 @@ export async function ensurePendingAssessment(
 }
 
 export async function loadPendingAssessment(): Promise<PendingAssessment | null> {
-  return serializeStorage(loadPendingUnsafe);
+  const loaded = await serializeStorage(loadPendingUnsafe);
+  return isForwardIncompatible(loaded) ? null : loaded;
 }
 
 /**
@@ -257,7 +376,7 @@ export async function clearPendingAssessment(expectedRequestId?: string): Promis
   if (expectedRequestId === undefined) unconditionalClearGeneration += 1;
   await serializeStorage(async () => {
     if (expectedRequestId !== undefined) {
-      const current = await loadPendingUnsafe();
+      const current = await loadParseableUnsafe();
       if (current?.requestId !== expectedRequestId) return;
     }
     await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
@@ -276,7 +395,7 @@ export async function clearPendingAssessmentIfRequestMatches(
 ): Promise<boolean> {
   if (!isUuid(expectedRequestId)) return false;
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (current?.requestId !== expectedRequestId) return false;
     await SecureStore.deleteItemAsync(STORAGE_KEY, STORAGE_OPTIONS);
     memoryValue = null;
@@ -292,7 +411,7 @@ export async function clearPendingAssessmentIfRequestMatches(
  */
 export async function markPendingAssessmentForReconciliation(requestId: string): Promise<boolean> {
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     // A delivered result is monotonic. A stale reconciliation callback must
     // never downgrade it and re-enable recovery POST logic.
@@ -320,7 +439,7 @@ export async function markPendingAssessmentFeedbackPending(
     throw new RangeError('feedbackReadyAt must be a positive safe integer');
   }
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     if (current.stage === 'feedback-pending') return true;
     // Date.now() can move backwards while an assessment is in flight (manual
@@ -347,7 +466,7 @@ export async function acknowledgePendingAssessmentFeedback(
 ): Promise<boolean> {
   if (!isUuid(ownerId) || !isUuid(requestId)) return false;
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (
       !current ||
       current.ownerId !== ownerId ||
@@ -391,7 +510,7 @@ export function pendingAssessmentFeedbackIsExpired(
  */
 export async function markPendingAssessmentCancelled(requestId: string): Promise<boolean> {
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     if (current.cancelRequested === true) return true;
     await savePendingUnsafe({
@@ -417,7 +536,7 @@ export async function claimPendingAssessmentRecoveryPost(
     );
   }
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     if (current.stage === 'feedback-pending') return false;
     const attempts = current.recoveryPostAttempts ?? 0;
@@ -436,7 +555,7 @@ export async function claimPendingAssessmentRecoveryPost(
  */
 export async function refundPendingAssessmentRecoveryPost(requestId: string): Promise<boolean> {
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     const attempts = current.recoveryPostAttempts ?? 0;
     if (attempts === 0) return true;
@@ -455,7 +574,7 @@ export async function markPendingAssessmentStage(
   audioKey?: string,
 ): Promise<boolean> {
   return serializeStorage(async () => {
-    const current = await loadPendingUnsafe();
+    const current = await loadParseableUnsafe();
     if (!current || current.requestId !== requestId) return false;
     if (current.stage === 'feedback-pending') return false;
     const next = parsePendingAssessment({

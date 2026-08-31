@@ -190,3 +190,34 @@ export const recordingMaintenanceTotal = new Counter({
   labelNames: ['operation', 'outcome'] as const,
   registers: [registry],
 });
+
+// --- mailer failure counter -----------------------------------------------------
+/**
+ * The fixed set of mail delivery failure reasons — the counter's only label.
+ * 'network' (transport failure), 'timeout' (deadline/abort), 'status'
+ * (non-2xx relay answer), 'refused' (private-address policy), 'exception'
+ * (anything unexpected, including an impaired logging/metric path).
+ */
+export const MAILER_FAILURE_REASONS = ['network', 'timeout', 'status', 'refused', 'exception'] as const;
+
+/** One of the fixed mail failure reason slugs. */
+export type MailerFailureReason = (typeof MAILER_FAILURE_REASONS)[number];
+
+/**
+ * Mail delivery failures by reason. Delivery is silent to callers by contract
+ * (password-reset responses stay 204 regardless of outcome), so this counter
+ * is the operator-visible failure signal. The reason label is bounded to the
+ * five fixed slugs above — never hosts, recipients, or subjects — so label
+ * cardinality cannot grow with operator config or attacker input.
+ */
+export const mailerFailuresTotal = new Counter({
+  name: 'mailer_failures_total',
+  help: 'Mail delivery failures by reason',
+  labelNames: ['reason'] as const,
+  registers: [registry],
+});
+
+/** Records one mail delivery failure under its bounded reason slug. */
+export function recordMailerFailure(reason: MailerFailureReason): void {
+  mailerFailuresTotal.inc({ reason });
+}

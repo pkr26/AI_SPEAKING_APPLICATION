@@ -116,7 +116,11 @@ export default function Gate() {
     if (fallbackFiredRef.current) return;
     const fallback = setTimeout(() => {
       fallbackFiredRef.current = true;
-      void meQuery.refetch();
+      // Join the shared ['me'] request if the bridge started one after this
+      // timer was armed. A default refetch cancels in-flight work for the same
+      // query key — exactly the slow-network request this fallback exists to
+      // back up — so opt into joining like every other retry site in the app.
+      void meQuery.refetch({ cancelRefetch: false });
     }, GATE_PROFILE_FALLBACK_MS);
     return () => clearTimeout(fallback);
     // eslint-disable-next-line react-hooks/exhaustive-deps

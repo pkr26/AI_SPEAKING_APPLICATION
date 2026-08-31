@@ -41,6 +41,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
@@ -89,6 +90,14 @@ if (
 }
 const BASE = baseUrl.origin;
 
+// The app advertises its version on every API request; mirror that handshake
+// so the client-version gate treats this harness like a real first-party app.
+const appConfig = JSON.parse(await readFile(new URL('../../app/app.json', import.meta.url), 'utf8'));
+const CLIENT_VERSION = appConfig?.expo?.version;
+if (typeof CLIENT_VERSION !== 'string' || CLIENT_VERSION.length === 0) {
+  throw new Error('app/app.json must provide expo.version for the API compatibility handshake');
+}
+
 if (!Number.isSafeInteger(USER_COUNT) || USER_COUNT < 20 || USER_COUNT > 20_000) {
   throw new Error('LOAD_USERS must be an integer from 20 to 20000');
 }
@@ -131,7 +140,7 @@ function recordStats(method, pathName, status, durationMs) {
 function rawHttpRequest(method, pathName, { token, json, form, timeoutMs, extraHeaders }) {
   return new Promise((resolve) => {
     const started = performance.now();
-    const headers = { ...(extraHeaders || {}) };
+    const headers = { 'X-Client-Version': CLIENT_VERSION, ...(extraHeaders || {}) };
     let body;
     if (json !== undefined) {
       headers['Content-Type'] = 'application/json';
@@ -325,7 +334,11 @@ async function concurrentPhase(name, participants, action) {
   releaseGate();
   await Promise.all(tasks);
   const durationMs = Math.round(performance.now() - startedAt);
-  const spread = dispatchTimes[dispatchTimes.length - 1] - dispatchTimes[0];
+  // Dispatch spread is the widest gap between any two participants' gate
+  // releases, not last-minus-first: the array is filled in participant order,
+  // but the spread must not silently shrink if a later participant is ever
+  // released before an earlier one (mirroring concurrent-smoke.mjs).
+  const spread = dispatchTimes.length > 1 ? Math.max(...dispatchTimes) - Math.min(...dispatchTimes) : 0;
   phaseStats.push({
     name,
     participants: participants.length,
@@ -452,7 +465,7 @@ async function actionDiagnosticJourney(user) {
     }
   }
   if (!user.level) {
-    fail(user, 'diagnostic', 'not completed after 5 answers');
+    fail(user, 'diagnostic', 'not completed after 3 answers');
   }
 }
 
@@ -1080,8 +1093,15 @@ async function main() {
     console.log('\nbarrier violations (overlap/spread):');
     for (const p of barrierViolations) console.log(`  ${p.name}: ${JSON.stringify(p)}`);
   }
-  if (failedUsers.length > 0) {
+  if (failedUsers.length > 0 || barrierViolations.length > 0) {
+    // Barrier integrity is part of the run's evidence: a phase that never
+    // genuinely dispatched its full participant set at once invalidates the
+    // concurrency claim even when every logical action happened to succeed,
+    // so the run must exit nonzero (mirroring concurrent-smoke.mjs).
     process.exitCode = 1;
+    if (barrierViolations.length > 0 && failedUsers.length === 0) {
+      console.log('\nfailing the run for barrier violations despite successful logical actions.');
+    }
   } else {
     console.log('\nAll logical actions succeeded. Ledger ready for DB reconciliation.');
   }

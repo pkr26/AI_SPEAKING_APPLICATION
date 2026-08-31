@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 
 // Barrier-dispatched 10-user API smoke test for the complete practice journey.
-// The server must be started separately in direct-upload + mock-AI mode. The
-// high limits use distinct PostgreSQL rate-limit namespaces, so this scenario
-// can run immediately after scripts/smoke.mjs without inheriting its counters:
+// The server must be started separately in direct-upload + mock-AI mode.
+// Rate-limit namespaces are config-independent, so this server shares the
+// smoke.mjs counters when both point at one database — run it against the
+// separate :4100 server (own database) or rely on the relaxed limits below:
 //
 //   MOCK_AI=true S3_DIAGNOSTIC_BUCKET= S3_PRACTICE_BUCKET= \
 //   PORT=4100 AI_MAX_CONCURRENCY=10 \
@@ -21,6 +22,7 @@
 // launches concurrent assessment waves. No OpenAI or AWS service is used.
 
 import { randomUUID } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { isDeepStrictEqual } from 'node:util';
 
@@ -62,6 +64,15 @@ if (
   throw new Error('BASE_URL must not contain credentials, a path, query parameters, or a fragment');
 }
 const BASE = baseUrl.origin;
+
+// The app advertises its version on every API request; mirror that handshake
+// so the client-version gate treats this harness like a real first-party app
+// (same mechanism as scripts/smoke.mjs).
+const appConfig = JSON.parse(await readFile(new URL('../../app/app.json', import.meta.url), 'utf8'));
+const CLIENT_VERSION = appConfig?.expo?.version;
+if (typeof CLIENT_VERSION !== 'string' || CLIENT_VERSION.length === 0) {
+  throw new Error('app/app.json must provide expo.version for the API compatibility handshake');
+}
 
 if (!Number.isSafeInteger(REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS < 1_000 || REQUEST_TIMEOUT_MS > 120_000) {
   throw new Error('REQUEST_TIMEOUT_MS must be an integer from 1000 to 120000');
@@ -131,7 +142,7 @@ function requestSignal(cleanupRequest = false) {
 }
 
 async function req(method, path, { token, json, form, cleanupRequest = false } = {}) {
-  const headers = {};
+  const headers = { 'X-Client-Version': CLIENT_VERSION };
   if (token) headers.Authorization = `Bearer ${token}`;
 
   let body;
@@ -604,7 +615,7 @@ async function main() {
     const etag = helpResponse.headers.get('etag');
     check(`localized help ETag for user ${user.index + 1}`, typeof etag === 'string' && etag.length > 0);
     const cachedResponse = await fetch(`${BASE}${path}`, {
-      headers: { Authorization: `Bearer ${user.token}`, 'If-None-Match': etag },
+      headers: { Authorization: `Bearer ${user.token}`, 'If-None-Match': etag, 'X-Client-Version': CLIENT_VERSION },
       redirect: 'manual',
       signal: requestSignal(),
     });

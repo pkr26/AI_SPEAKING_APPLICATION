@@ -8,7 +8,39 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 
-const BASE = process.env.BASE_URL || 'http://localhost:4000';
+// Target-safety gate (mirrors concurrent-smoke.mjs / load-1000.mjs): the
+// default loopback target needs no opt-in, while any non-loopback target is
+// refused unless it is HTTPS, origin-only, and explicitly authorized.
+const BASE_INPUT = process.env.BASE_URL || 'http://localhost:4000';
+let baseUrl;
+try {
+  baseUrl = new URL(BASE_INPUT);
+} catch {
+  throw new Error('BASE_URL must be a valid absolute URL');
+}
+if (baseUrl.protocol !== 'http:' && baseUrl.protocol !== 'https:') {
+  throw new Error('BASE_URL must use http or https');
+}
+const loopbackHost =
+  baseUrl.hostname === 'localhost' || baseUrl.hostname === '127.0.0.1' || baseUrl.hostname === '[::1]';
+if (!loopbackHost && process.env.ALLOW_NON_LOOPBACK_LOAD !== 'true') {
+  throw new Error(
+    'refusing to run the smoke journey against a non-loopback host; set ALLOW_NON_LOOPBACK_LOAD=true only for an authorized test environment',
+  );
+}
+if (!loopbackHost && baseUrl.protocol !== 'https:') {
+  throw new Error('non-loopback BASE_URL targets must use https');
+}
+if (
+  baseUrl.username ||
+  baseUrl.password ||
+  baseUrl.search ||
+  baseUrl.hash ||
+  (baseUrl.pathname !== '/' && baseUrl.pathname !== '')
+) {
+  throw new Error('BASE_URL must not contain credentials, a path, query parameters, or a fragment');
+}
+const BASE = baseUrl.origin;
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
 const appConfig = JSON.parse(await readFile(new URL('../../app/app.json', import.meta.url), 'utf8'));
 const CLIENT_VERSION = appConfig?.expo?.version;
@@ -20,7 +52,14 @@ if (typeof CLIENT_VERSION !== 'string' || CLIENT_VERSION.length === 0) {
 // exactly once per successful run (everything outside the diagnostic-answer
 // and practice-attempt loops, excluding the final tally check itself).
 // UPDATE THIS COUNT whenever checks are intentionally added or removed.
-const EXPECTED_DETERMINISTIC_ASSERTIONS = 60;
+// Derivation: 82 authored ok() call sites − 3 diagnostic-answer loop sites
+// (per-iteration score fields + exactly one done/nextQuestion branch site each)
+// − 7 practice-attempt loop sites (per-iteration base + 2 pass-branch sites
+// + 3 final-fail-branch sites + 1 ordinary-fail-branch site) − 1 tally site
+// = 71. The two export-walker loops run a run-varying page count but assert
+// only through loop-aggregated booleans after the loops, so every export
+// assertion stays deterministic.
+const EXPECTED_DETERMINISTIC_ASSERTIONS = 71;
 
 let passed = 0;
 function ok(name, cond, extra = '') {
@@ -494,34 +533,199 @@ ok(
 );
 
 // ---------- data export ----------
-// Attempts are exported oldest-first in bounded pages, and the randomized mock
-// scoring can stretch this journey well past one page (one CI leg needed 115
-// attempts before its first pass), so the late practice-native attempts are not
-// guaranteed to be on page one. Walk the attempts cursor chain until the server
-// reports attemptsDone, mirroring the app's export walker.
+// The export walks TWO collections with independent cursors, mirroring the
+// app's walker (app/src/lib/api.ts): phase 1 pins practiceCyclesDone=true and
+// walks the attempts cursor chain until attemptsDone=true with a null cursor;
+// phase 2 pins attemptsDone=true and walks the practice-cycle cursor chain
+// until practiceCyclesDone=true with a null cursor. The randomized mock
+// scoring can stretch this journey well past one attempts page (one CI leg
+// needed 115 attempts before its first pass), so the late practice-native
+// attempts are not guaranteed to be on page one. Each phase sends only its own
+// cursor parameter: the server 400s a cursor paired with its own done flag,
+// and the two probes at the end pin that trap deliberately.
+const EXPORT_PAGE_LIMIT = 100; // rows per page (the server maximum is 500)
+const EXPORT_MAX_PAGES = 100; // sane bound for this journey; the app allows 10,000
+
 const exportedAttempts = [];
+const exportedCycles = [];
 let exportUser = null;
-let exportCursor = null;
-let exportPages = 0;
-while (exportPages < 12) {
-  r = await req('GET', exportCursor ? `/auth/me/data?cursor=${exportCursor}` : '/auth/me/data', { token });
-  if (r.status !== 200 || !Array.isArray(r.body.attempts)) break;
-  exportUser = r.body.user;
-  exportedAttempts.push(...r.body.attempts);
-  exportPages += 1;
-  if (r.body.nextCursor === null) break;
-  exportCursor = r.body.nextCursor;
+let attemptsCursor = null;
+let attemptsPages = 0;
+let attemptsCompleted = false;
+let attemptsPhaseHonoredPinnedCycles = true;
+let attemptsCursorChainSound = true;
+{
+  const seenCursors = new Set();
+  while (attemptsPages < EXPORT_MAX_PAGES) {
+    const cursorParam = attemptsCursor ? `&cursor=${attemptsCursor}` : '';
+    r = await req(
+      'GET',
+      `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&attemptsDone=false&practiceCyclesDone=true${cursorParam}`,
+      { token },
+    );
+    if (r.status !== 200 || !Array.isArray(r.body.attempts)) break;
+    attemptsPages += 1;
+    exportUser = r.body.user;
+    // Every attempts page must honor the pinned opposite-collection flags:
+    // no cycle rows and no cycle cursor may leak into the attempts stream.
+    if (
+      r.body.practiceCyclesDone !== true ||
+      (Array.isArray(r.body.practiceCycles) ? r.body.practiceCycles.length : 1) !== 0 ||
+      r.body.nextPracticeCycleCursor !== null
+    ) {
+      attemptsPhaseHonoredPinnedCycles = false;
+    }
+    exportedAttempts.push(...r.body.attempts);
+    if (r.body.attemptsDone === true) {
+      if (r.body.nextCursor !== null) attemptsCursorChainSound = false;
+      attemptsCompleted = true;
+      break;
+    }
+    const nextCursor = r.body.nextCursor;
+    if (nextCursor === null || seenCursors.has(nextCursor)) {
+      attemptsCursorChainSound = false;
+      break;
+    }
+    seenCursors.add(nextCursor);
+    attemptsCursor = nextCursor;
+  }
 }
 ok(
-  'data export returns user + attempts, no password_hash',
-  r.status === 200 &&
-    exportUser?.id === userId &&
-    exportUser.password_hash === undefined &&
-    exportedAttempts.length > 0 &&
-    exportedAttempts.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
-    r.body.nextCursor === null,
-  `pages=${exportPages} attempts=${exportedAttempts.length} last=${JSON.stringify(r.body).slice(0, 200)}`,
+  'attempts export phase completes with attemptsDone=true within the page bound',
+  attemptsCompleted === true,
+  `pages=${attemptsPages}/${EXPORT_MAX_PAGES} last=${JSON.stringify(r.body).slice(0, 200)}`,
 );
+ok(
+  'attempts export terminates with a null cursor and never repeats or dead-ends a cursor',
+  attemptsCursorChainSound === true,
+  `pages=${attemptsPages}`,
+);
+ok(
+  'every attempts page honors the pinned practiceCyclesDone=true with no cycle rows or cursor',
+  attemptsPhaseHonoredPinnedCycles === true,
+  `pages=${attemptsPages}`,
+);
+
+let cycleCursor = null;
+let cyclePages = 0;
+let cyclesCompleted = false;
+let cyclesPhaseHonoredPinnedAttempts = true;
+let cyclesCursorChainSound = true;
+{
+  const seenCursors = new Set();
+  while (cyclePages < EXPORT_MAX_PAGES) {
+    const cursorParam = cycleCursor ? `&practiceCycleCursor=${cycleCursor}` : '';
+    r = await req(
+      'GET',
+      `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&attemptsDone=true&practiceCyclesDone=false${cursorParam}`,
+      { token },
+    );
+    if (r.status !== 200 || !Array.isArray(r.body.practiceCycles)) break;
+    cyclePages += 1;
+    exportUser = r.body.user;
+    // Every cycle page must honor the pinned opposite-collection flags: no
+    // attempt rows and no attempt cursor may leak into the cycle stream.
+    if (
+      r.body.attemptsDone !== true ||
+      (Array.isArray(r.body.attempts) ? r.body.attempts.length : 1) !== 0 ||
+      r.body.nextCursor !== null
+    ) {
+      cyclesPhaseHonoredPinnedAttempts = false;
+    }
+    exportedCycles.push(...r.body.practiceCycles);
+    if (r.body.practiceCyclesDone === true) {
+      if (r.body.nextPracticeCycleCursor !== null) cyclesCursorChainSound = false;
+      cyclesCompleted = true;
+      break;
+    }
+    const nextCursor = r.body.nextPracticeCycleCursor;
+    if (nextCursor === null || seenCursors.has(nextCursor)) {
+      cyclesCursorChainSound = false;
+      break;
+    }
+    seenCursors.add(nextCursor);
+    cycleCursor = nextCursor;
+  }
+}
+ok(
+  'practice-cycle export phase completes with practiceCyclesDone=true within the page bound',
+  cyclesCompleted === true,
+  `pages=${cyclePages}/${EXPORT_MAX_PAGES} last=${JSON.stringify(r.body).slice(0, 200)}`,
+);
+ok(
+  'practice-cycle export terminates with a null cursor and never repeats or dead-ends a cursor',
+  cyclesCursorChainSound === true,
+  `pages=${cyclePages}`,
+);
+ok(
+  'every cycle page honors the pinned attemptsDone=true with no attempt rows or cursor',
+  cyclesPhaseHonoredPinnedAttempts === true,
+  `pages=${cyclePages}`,
+);
+ok(
+  'export termination requires both done flags with null cursors',
+  cyclesCompleted === true &&
+    r.body.attemptsDone === true &&
+    r.body.practiceCyclesDone === true &&
+    r.body.nextCursor === null &&
+    r.body.nextPracticeCycleCursor === null,
+  JSON.stringify(r.body).slice(0, 200),
+);
+ok(
+  'data export returns user + attempts, no password_hash',
+  exportUser?.id === userId && exportUser.password_hash === undefined && exportedAttempts.length > 0,
+  `pages=${attemptsPages}+${cyclePages} attempts=${exportedAttempts.length} cycles=${exportedCycles.length}`,
+);
+ok(
+  'exported attempts keep the camelCase row contract including the native snapshot',
+  exportedAttempts.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
+    exportedAttempts.every((item) =>
+      hasKeys(item, [
+        'id',
+        'questionId',
+        'promptWord',
+        'questionText',
+        'cefrLevel',
+        'context',
+        'attemptNo',
+        'transcript',
+        'score',
+        'passed',
+        'feedback',
+        'cycleId',
+        'understood',
+        'translatedTranscript',
+        'modelAnswer',
+        'nativeLanguage',
+        'createdAt',
+      ]),
+    ),
+  JSON.stringify(exportedAttempts.at(0)).slice(0, 200),
+);
+ok(
+  'export walks at least one practice cycle row with the camelCase cycle contract',
+  exportedCycles.length > 0 &&
+    exportedCycles.every((cycle) =>
+      hasKeys(cycle, ['id', 'questionId', 'kind', 'attemptsUsed', 'status', 'createdAt', 'updatedAt', 'closedAt']),
+    ),
+  JSON.stringify(exportedCycles.at(0)).slice(0, 200),
+);
+
+// The 400 traps are a deliberate part of the two-cursor contract: pairing a
+// cursor with its own done flag is a client bug the server must reject, which
+// is exactly why each phase above only ever sends its own cursor parameter.
+r = await req(
+  'GET',
+  `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&attemptsDone=true&cursor=${exportedAttempts.at(-1).id}`,
+  { token },
+);
+ok('export rejects a cursor paired with attemptsDone=true', r.status === 400, `got ${r.status}`);
+r = await req(
+  'GET',
+  `/auth/me/data?limit=${EXPORT_PAGE_LIMIT}&practiceCyclesDone=true&practiceCycleCursor=${exportedCycles.at(-1).id}`,
+  { token },
+);
+ok('export rejects a practiceCycleCursor paired with practiceCyclesDone=true', r.status === 400, `got ${r.status}`);
 
 // ---------- change password (token revocation) ----------
 const newPassword = 'newsecret456';

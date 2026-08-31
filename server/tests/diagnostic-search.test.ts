@@ -94,9 +94,12 @@ describe('diagnostic adaptive binary search', () => {
     expect(r3).toMatchObject({ done: true, level: 'A2' });
   });
 
-  it('stops at MAX_QUESTIONS even while the search window is still open', async () => {
+  it('completes a seeded third answer whose pass also collapses the window', async () => {
     // The 6-level binary search converges in <=3 answers from a fresh state, so
-    // seed a nearly-finished state where low <= high still holds.
+    // seed a nearly-finished state where low <= high holds before the answer.
+    // Seeding [1,1] with A2: a PASS moves the window to [2,1], so the window
+    // disjunct fires alongside the bound — this pins the seeded-resume
+    // completion, not the bound itself (see the [5,5] test below).
     const { res } = await registerUser(a);
     const token = res.body.token;
     const userId = res.body.user.id;
@@ -110,13 +113,43 @@ describe('diagnostic adaptive binary search', () => {
     );
 
     const r = await answer(token, q.rows[0].id);
-    // attemptNo 3 >= MAX_QUESTIONS ends the diagnostic even though low <= high.
+    // attemptNo 3 ends the diagnostic; the pass has just collapsed low past high.
     expect(r).toMatchObject({ done: true, level: 'A2' });
     const { rows } = await pool.query<{ low_idx: number; high_idx: number; questions_asked: number }>(
       'SELECT low_idx, high_idx, questions_asked FROM diagnostic_state WHERE user_id = $1',
       [userId],
     );
     expect(rows[0]).toEqual({ low_idx: 2, high_idx: 1, questions_asked: 3 });
+  });
+
+  it('ends at the three-question bound alone when the window stays exactly one level wide', async () => {
+    // The ONLY state where attemptNo == MAX_QUESTIONS is the sole terminator:
+    // [3,5] serves C1 (mid 4) and a PASS leaves the window [5,5] — still open
+    // (low is NOT greater than high) — so only the bound can complete the run.
+    // This is the discriminating boundary for the >= → > EqualityOperator
+    // mutant: under the mutant the run would not complete and would instead
+    // serve a fourth question (C2).
+    const { res } = await registerUser(a);
+    const token = res.body.token;
+    const userId = res.body.user.id;
+    vi.spyOn(Math, 'random').mockReturnValue(PASS);
+
+    const q = await pool.query<{ id: string }>(`SELECT id FROM questions WHERE cefr_level = 'C1' LIMIT 1`);
+    await pool.query(
+      `UPDATE diagnostic_state SET low_idx = 3, high_idx = 5, questions_asked = 2, current_question_id = $1
+       WHERE user_id = $2`,
+      [q.rows[0].id, userId],
+    );
+
+    const r = await answer(token, q.rows[0].id);
+    expect(r).toMatchObject({ done: true, level: 'C2' });
+    expect(r.nextQuestion).toBeUndefined();
+    const { rows } = await pool.query<{ low_idx: number; high_idx: number; questions_asked: number }>(
+      'SELECT low_idx, high_idx, questions_asked FROM diagnostic_state WHERE user_id = $1',
+      [userId],
+    );
+    // The persisted window proves the bound — not a collapse — ended the run.
+    expect(rows[0]).toEqual({ low_idx: 5, high_idx: 5, questions_asked: 3 });
   });
 
   it('rejects answers after completion', async () => {

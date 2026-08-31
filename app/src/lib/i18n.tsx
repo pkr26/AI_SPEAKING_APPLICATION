@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useMemo } from 'react';
+import React, { createContext, useContext, useMemo } from 'react';
 
 import type { UiLanguage } from './types';
 export type { UiLanguage } from './types';
@@ -3154,9 +3154,11 @@ export function getActiveLanguage(): UiLanguage {
 }
 
 /**
- * Updates the module-level language. Owned by the root language providers'
- * restore and choice paths; components must use `useI18n()` instead so they
- * re-render with the change.
+ * Updates the module-level language. Written by the root language providers
+ * both on restore/choice and synchronously during the provider's render, so
+ * event-time `translate()` calls already observe the language being
+ * committed; components must still use `useI18n()` so they re-render with
+ * the change.
  */
 export function setActiveLanguage(language: UiLanguage): void {
   activeLanguage = language;
@@ -3203,10 +3205,14 @@ export function I18nProvider({
   const language: UiLanguage = accountLanguage ?? guestLanguage;
 
   // Alerts and API errors are built outside React at event time; keep the
-  // module-level language they read in sync with the rendered language.
-  useEffect(() => {
-    setActiveLanguage(language);
-  }, [language]);
+  // module-level language they read in sync with the rendered language. Sync
+  // during render instead of in a post-commit effect so a layout effect or
+  // event handler firing in the same commit as a language change already
+  // translates with the new language — a one-commit tear otherwise shows one
+  // message in the previous language. The sync is an idempotent assignment
+  // (including under StrictMode double renders and superseded renders), and a
+  // ref-guarded variant would trip react-hooks/refs by design.
+  setActiveLanguage(language);
 
   const value = useMemo<I18nContextValue>(
     () => ({

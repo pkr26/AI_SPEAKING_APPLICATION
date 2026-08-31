@@ -457,6 +457,11 @@ export default function RecordingPlayback({
         return;
       }
       releaseOwnerRef.current = releaseOwner;
+      // Deadline-bounded by lib/audio-session: a native audio-mode call that
+      // never settles rejects here instead of hanging, falls into the catch
+      // below, and behaves exactly like the prepare-failure path — message,
+      // 'error' phase, and releasePlayer() reclaiming the file/player/owner —
+      // so preparation can never wedge on a wedged audio mode.
       await configurePlaybackAudioMode();
       if (!operationIsCurrent()) {
         releaseStaleOperationResources();

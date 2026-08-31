@@ -107,6 +107,12 @@ describe('metrics initialization', () => {
         labelNames: ['operation', 'outcome'],
         registers: [registry],
       },
+      {
+        name: 'mailer_failures_total',
+        help: 'Mail delivery failures by reason',
+        labelNames: ['reason'],
+        registers: [registry],
+      },
     ]);
 
     for (const [name, help] of [

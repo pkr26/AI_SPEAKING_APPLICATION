@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import {
   createPresignedRecordingPlaybackUrl,
+  isS3VersionGoneError,
   retainPresignedAudioVersion,
   sweepPresignedAudioVersions,
   AudioStorageScope,
@@ -31,9 +32,10 @@ interface RecordingRow {
   status: 'retention_pending' | 'available' | 'unavailable';
   retention_attempts: number;
   retention_claim_id: string | null;
+  // node-postgres returns BIGINT as string and TIMESTAMPTZ as Date.
   recording_retention_epoch: string;
-  created_at: string;
-  available_at: string | null;
+  created_at: Date;
+  available_at: Date | null;
   prompt_word: string;
   question_text: string;
   cefr_level: string;
@@ -43,7 +45,7 @@ interface DeletionJobRow {
   storage_scope: AudioStorageScope;
   audio_key: string;
   known_version_id: string;
-  finalize_after: string;
+  finalize_after: Date;
   attempt_count: number;
   claim_id: string;
 }
@@ -212,11 +214,27 @@ export async function cleanupStaleRecordingMetadata(): Promise<number> {
 }
 
 /**
+ * Terminal retention budget. Every claim increments retention_attempts, and
+ * the backoff below saturates at attempt 9 (5 × 2⁹ = 2560s ≈ 43 minutes), so
+ * by claim 12 a recording has already retried through roughly three hours of
+ * scheduled backoff — far beyond any transient S3 blip or deploy drain, while
+ * a genuinely lifecycle-expired version terminalizes immediately through the
+ * version-gone check instead. A recording still failing generic errors past
+ * this budget flips to the terminal 'unavailable' state (migration 017's
+ * CHECK) rather than cycling at the capped backoff forever.
+ */
+export const RETENTION_MAX_ATTEMPTS = 12;
+
+/**
  * Finish one leased retention: tag the exact processed S3 version as
  * retained, then flip the row to available — both guarded by the lease owner's
- * claimId. On failure the lease is released onto a capped exponential retry
- * (max 1 hour), the error code is persisted for operators, that release is
- * itself best-effort, and the error is rethrown so the caller observes it.
+ * claimId. On a terminal failure — the exact S3 version is provably gone, or
+ * the RETENTION_MAX_ATTEMPTS budget is exhausted — the row flips to
+ * 'unavailable' with the error code persisted and no retry scheduled, because
+ * retry claiming only selects status = 'retention_pending'. Every other
+ * failure releases the lease onto a capped exponential retry (max 1 hour);
+ * that release is itself best-effort, and the error is rethrown either way so
+ * the caller observes it.
  */
 async function retainClaimedRecording(recording: RecordingRow): Promise<void> {
   try {
@@ -236,17 +254,43 @@ async function retainClaimedRecording(recording: RecordingRow): Promise<void> {
     recordingMaintenanceTotal.inc({ operation: 'retention', outcome: 'ok' });
   } catch (err) {
     recordingMaintenanceTotal.inc({ operation: 'retention', outcome: 'error' });
-    const delaySeconds = Math.min(3600, 5 * 2 ** Math.min(recording.retention_attempts, 9));
-    await pool
-      .query(
-        `UPDATE recordings
-         SET retention_claim_id = NULL, retention_lease_expires_at = NULL,
-             next_retention_attempt_at = now() + $3 * interval '1 second',
-             last_retention_error_code = $4
-         WHERE id = $1 AND retention_claim_id = $2 AND status = 'retention_pending'`,
-        [recording.id, recording.retention_claim_id, delaySeconds, (err as { name?: string }).name ?? 'S3_ERROR'],
-      )
-      .catch(() => undefined);
+    const errorCode = (err as { name?: string }).name ?? 'S3_ERROR';
+    if (isS3VersionGoneError(err) || recording.retention_attempts >= RETENTION_MAX_ATTEMPTS) {
+      // Terminal: the exact version expired through the transient lifecycle
+      // (or the retry budget ran out), so no later attempt can ever succeed.
+      // The claim/lease pair is cleared together to satisfy migration 017's
+      // recordings_retention_claim_check, and available_at stays NULL as the
+      // status CHECK requires for everything except 'available'.
+      await pool
+        .query(
+          `UPDATE recordings
+           SET status = 'unavailable', retention_claim_id = NULL, retention_lease_expires_at = NULL,
+               last_retention_error_code = $3
+           WHERE id = $1 AND retention_claim_id = $2 AND status = 'retention_pending'`,
+          [recording.id, recording.retention_claim_id, errorCode],
+        )
+        .catch(() => undefined);
+      try {
+        logger.warn(
+          { err, recordingId: recording.id, errorCode },
+          'recording retention can never succeed; metadata marked unavailable',
+        );
+      } catch {
+        // The terminal unavailable row is itself durable operator evidence.
+      }
+    } else {
+      const delaySeconds = Math.min(3600, 5 * 2 ** Math.min(recording.retention_attempts, 9));
+      await pool
+        .query(
+          `UPDATE recordings
+           SET retention_claim_id = NULL, retention_lease_expires_at = NULL,
+               next_retention_attempt_at = now() + $3 * interval '1 second',
+               last_retention_error_code = $4
+           WHERE id = $1 AND retention_claim_id = $2 AND status = 'retention_pending'`,
+          [recording.id, recording.retention_claim_id, delaySeconds, errorCode],
+        )
+        .catch(() => undefined);
+    }
     throw err;
   }
 }
@@ -413,6 +457,12 @@ export function createRecordingsRouter(limiters: Limiters) {
       // recording deleted (or generation-fenced by delete-all) between the two
       // reads can never silently truncate the walk into an empty page: the
       // validity row is always present, the page side is empty when invalid.
+      // Terminally unavailable rows are excluded from the page exactly like
+      // deleted/fenced rows — 'unavailable' has never been emitted to clients,
+      // and the additive-only contract forbids introducing an enum value old
+      // parsers reject. Their rows remain valid cursor anchors: the sort key
+      // is still readable, so a mid-walk terminalization keeps paging without
+      // gaps instead of failing the cursor.
       const { rows } = await pool.query<RecordingRow & { cursorValid: boolean }>(
         `WITH marker AS (
            SELECT EXISTS (
@@ -432,6 +482,7 @@ export function createRecordingsRouter(limiters: Limiters) {
            JOIN questions q ON q.id = r.question_id
            WHERE r.user_id = $1
              AND r.recording_retention_epoch = u.recording_retention_epoch
+             AND r.status <> 'unavailable'
              AND ($2::uuid IS NULL OR (r.created_at, r.id) < (
                SELECT cursor_recording.created_at, cursor_recording.id
                FROM recordings AS cursor_recording
@@ -461,7 +512,8 @@ export function createRecordingsRouter(limiters: Limiters) {
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, exportSchema);
       // Same single-statement validity contract as the list route, mirrored
-      // for the ascending export walk.
+      // for the ascending export walk — including the unavailable-row page
+      // exclusion (never emit an enum value old parsers reject).
       const { rows } = await pool.query<RecordingRow & { cursorValid: boolean }>(
         `WITH marker AS (
            SELECT EXISTS (
@@ -481,6 +533,7 @@ export function createRecordingsRouter(limiters: Limiters) {
            JOIN questions q ON q.id = r.question_id
            WHERE r.user_id = $1
              AND r.recording_retention_epoch = u.recording_retention_epoch
+             AND r.status <> 'unavailable'
              AND ($2::uuid IS NULL OR (r.created_at, r.id) > (
                SELECT cursor_recording.created_at, cursor_recording.id
                FROM recordings AS cursor_recording
@@ -548,7 +601,13 @@ export function createRecordingsRouter(limiters: Limiters) {
         [req.params.id, req.user!.id],
       );
       const recording = rows[0];
-      if (!recording) throw new HttpError(404, 'Recording not found');
+      // A terminally unavailable recording can never produce a playback URL,
+      // so it answers the exact stable not-found body the route already uses —
+      // not the retryable 409, which would mis-signal "try again later" for a
+      // state that can never succeed.
+      if (!recording || recording.status === 'unavailable') {
+        throw new HttpError(404, 'Recording not found');
+      }
       if (recording.status !== 'available') {
         throw new HttpError(409, 'Recording is not ready yet', { retryAfterSeconds: 5 }, 'REQUEST_IN_FLIGHT');
       }

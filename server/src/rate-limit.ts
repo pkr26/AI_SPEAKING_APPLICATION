@@ -185,6 +185,17 @@ export function withAssessmentExactWindowRefund(options: ExactWindowRefundOption
  * Security-sensitive limiters use PostgreSQL counters so every API replica
  * enforces one shared budget. Built per app so tests can vary configuration;
  * stable namespaces still make independently built replicas share counters.
+ *
+ * Every store namespace below is the limiter's SEMANTIC NAME ONLY — it must
+ * never embed window/max knob values. The namespace is part of the HMAC key
+ * material, so a config-suffixed namespace would silently abandon every
+ * in-flight window the moment an operator changes a knob (handing an attacker
+ * mid-brute-force a fresh budget when a limit is TIGHTENED) and would make
+ * divergent-env replicas during a rolling deploy enforce disjoint budgets
+ * against the same database. Window and max still flow through the constructor
+ * and limiter options. Consequence, accepted once: the deploy that moves an
+ * existing deployment onto config-independent namespaces resets all
+ * distributed counter windows exactly one time.
  */
 export function buildLimiters() {
   const common = {
@@ -221,12 +232,7 @@ export function buildLimiters() {
     windowMs: config.rateLimit.globalWindowMs,
     limit: config.rateLimit.globalMax,
     ...(config.rateLimit.globalStore === 'postgres'
-      ? {
-          store: new PostgresRateLimitStore(
-            `global:${config.rateLimit.globalWindowMs}:${config.rateLimit.globalMax}`,
-            config.rateLimit.globalWindowMs,
-          ),
-        }
+      ? { store: new PostgresRateLimitStore('global', config.rateLimit.globalWindowMs) }
       : {}),
   });
 
@@ -234,10 +240,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.authWindowMs,
     limit: config.rateLimit.authMax,
-    store: new PostgresRateLimitStore(
-      `auth:${config.rateLimit.authWindowMs}:${config.rateLimit.authMax}`,
-      config.rateLimit.authWindowMs,
-    ),
+    store: new PostgresRateLimitStore('auth', config.rateLimit.authWindowMs),
     message: { error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' },
   });
 
@@ -249,10 +252,7 @@ export function buildLimiters() {
   // attacker saturating the account budget cannot lock out the real owner;
   // only failures are throttled. The per-IP auth limiter above still bounds
   // the bcrypt work this always-verify policy pays per source.
-  const loginAccountStore = new PostgresRateLimitStore(
-    `login-account:${config.rateLimit.loginAccountWindowMs}:${config.rateLimit.loginAccountMax}`,
-    config.rateLimit.loginAccountWindowMs,
-  );
+  const loginAccountStore = new PostgresRateLimitStore('login-account', config.rateLimit.loginAccountWindowMs);
   const loginAccountRequestProperty = 'loginAccountRateLimit';
   const loginAccountLimiter = rateLimit({
     ...common,
@@ -280,10 +280,7 @@ export function buildLimiters() {
   // distributed IPs could otherwise brute-force the account password online.
   // Same always-verify shape as loginAccount: over-budget requests still check
   // the password, and only failures are throttled.
-  const passwordAccountStore = new PostgresRateLimitStore(
-    `password-account:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
-    config.rateLimit.passwordWindowMs,
-  );
+  const passwordAccountStore = new PostgresRateLimitStore('password-account', config.rateLimit.passwordWindowMs);
   const passwordAccountRequestProperty = 'passwordAccountRateLimit';
   const passwordAccountLimiter = rateLimit({
     ...common,
@@ -319,10 +316,7 @@ export function buildLimiters() {
     ...silentBudgetHeaders,
     windowMs: config.rateLimit.forgotEmailWindowMs,
     limit: config.rateLimit.forgotEmailMax,
-    store: new PostgresRateLimitStore(
-      `forgot-email:${config.rateLimit.forgotEmailWindowMs}:${config.rateLimit.forgotEmailMax}`,
-      config.rateLimit.forgotEmailWindowMs,
-    ),
+    store: new PostgresRateLimitStore('forgot-email', config.rateLimit.forgotEmailWindowMs),
     skip: skipInvalidEmail,
     keyGenerator: validEmailRateLimitKey,
     handler: (_req, res, next) => {
@@ -343,10 +337,7 @@ export function buildLimiters() {
   // 429s themselves. The explicit requestPropertyName keeps this limiter's
   // window info distinct from the per-IP auth limiter mounted on the same
   // route, whose default property name it would otherwise overwrite.
-  const registerStore = new PostgresRateLimitStore(
-    `register:${config.rateLimit.registerWindowMs}:${config.rateLimit.registerMax}`,
-    config.rateLimit.registerWindowMs,
-  );
+  const registerStore = new PostgresRateLimitStore('register', config.rateLimit.registerWindowMs);
   const registerRequestProperty = 'registerIpRateLimit';
   const register = withExactWindowFinishRefund({
     limiter: rateLimit({
@@ -372,10 +363,7 @@ export function buildLimiters() {
   // a prober cannot read a third party's counter state, and a successful
   // registration refunds its hit so the legitimate registrant is not the one
   // who exhausts it.
-  const registerEmailStore = new PostgresRateLimitStore(
-    `register-email:${config.rateLimit.registerEmailWindowMs}:${config.rateLimit.registerEmailMax}`,
-    config.rateLimit.registerEmailWindowMs,
-  );
+  const registerEmailStore = new PostgresRateLimitStore('register-email', config.rateLimit.registerEmailWindowMs);
   const registerEmailRequestProperty = 'registerEmailRateLimit';
   const registerEmailLimiter = rateLimit({
     ...common,
@@ -404,10 +392,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.passwordWindowMs,
     limit: config.rateLimit.passwordMax,
-    store: new PostgresRateLimitStore(
-      `diagnostic-restart:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
-      config.rateLimit.passwordWindowMs,
-    ),
+    store: new PostgresRateLimitStore('diagnostic-restart', config.rateLimit.passwordWindowMs),
     // Mounted after requireAuth; the user is always present. The IP fallback
     // only protects against a future route that forgets that ordering.
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
@@ -424,10 +409,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.passwordWindowMs,
     limit: config.rateLimit.passwordMax,
-    store: new PostgresRateLimitStore(
-      `recording-bulk-delete:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
-      config.rateLimit.passwordWindowMs,
-    ),
+    store: new PostgresRateLimitStore('recording-bulk-delete', config.rateLimit.passwordWindowMs),
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Too many recording deletion requests, please try again later', code: 'RATE_LIMITED' },
   });
@@ -442,10 +424,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.passwordWindowMs,
     limit: config.rateLimit.passwordMax,
-    store: new PostgresRateLimitStore(
-      `recording-delete:${config.rateLimit.passwordWindowMs}:${config.rateLimit.passwordMax}`,
-      config.rateLimit.passwordWindowMs,
-    ),
+    store: new PostgresRateLimitStore('recording-delete', config.rateLimit.passwordWindowMs),
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Too many recording deletion requests, please try again later', code: 'RATE_LIMITED' },
   });
@@ -481,10 +460,7 @@ export function buildLimiters() {
   // (empty-transcript) response deliberately keeps its hit even though the
   // practice attempt counter treats it as a free retry: the Whisper
   // transcription that detected the silence already spent real provider money.
-  const assessStore = new PostgresRateLimitStore(
-    `assess:${config.rateLimit.assessWindowMs}:${config.rateLimit.assessMax}`,
-    config.rateLimit.assessWindowMs,
-  );
+  const assessStore = new PostgresRateLimitStore('assess', config.rateLimit.assessWindowMs);
   const assessLimiter = rateLimit({
     ...common,
     windowMs: config.rateLimit.assessWindowMs,
@@ -510,10 +486,7 @@ export function buildLimiters() {
   // that never reached paid work are refunded so one account's rejected
   // submissions cannot deny the shared network budget to every other account
   // behind the same NAT.
-  const assessIpDailyStore = new PostgresRateLimitStore(
-    `assess-ip-daily:${config.assessIpDailyCap}`,
-    24 * 60 * 60 * 1000,
-  );
+  const assessIpDailyStore = new PostgresRateLimitStore('assess-ip-daily', 24 * 60 * 60 * 1000);
   const assessIpDailyLimiter = rateLimit({
     ...common,
     windowMs: 24 * 60 * 60 * 1000,
@@ -602,10 +575,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.uploadGrantWindowMs,
     limit: config.rateLimit.uploadGrantMax,
-    store: new PostgresRateLimitStore(
-      `upload-grant:${config.rateLimit.uploadGrantWindowMs}:${config.rateLimit.uploadGrantMax}`,
-      config.rateLimit.uploadGrantWindowMs,
-    ),
+    store: new PostgresRateLimitStore('upload-grant', config.rateLimit.uploadGrantWindowMs),
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Audio upload grant rate limit reached, please try again later', code: 'RATE_LIMITED' },
   });
@@ -614,10 +584,7 @@ export function buildLimiters() {
     ...common,
     windowMs: config.rateLimit.playbackGrantWindowMs,
     limit: config.rateLimit.playbackGrantMax,
-    store: new PostgresRateLimitStore(
-      `playback-grant:${config.rateLimit.playbackGrantWindowMs}:${config.rateLimit.playbackGrantMax}`,
-      config.rateLimit.playbackGrantWindowMs,
-    ),
+    store: new PostgresRateLimitStore('playback-grant', config.rateLimit.playbackGrantWindowMs),
     keyGenerator: (req) => userOrIpRateLimitKey(req as AuthedRequest),
     message: { error: 'Recording playback rate limit reached, please try again later', code: 'RATE_LIMITED' },
   });

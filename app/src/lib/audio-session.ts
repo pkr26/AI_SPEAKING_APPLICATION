@@ -37,9 +37,55 @@ export function subscribeSubmittedRecordingPlaybackActive(listener: () => void):
   return () => playbackActiveListeners.delete(listener);
 }
 
+/**
+ * Ceiling for a single native `setAudioModeAsync` call. One never-settling
+ * native mutation must never poison this process-wide queue (Recorder start,
+ * stop/lifecycle restore, and submitted-recording playback all chain onto it),
+ * so every queued operation races this deadline and rejects when it expires.
+ */
+export const AUDIO_MODE_OPERATION_TIMEOUT_MS = 10_000;
+
+/**
+ * Races one native audio-mode mutation against `AUDIO_MODE_OPERATION_TIMEOUT_MS`.
+ * On expiry the caller's promise rejects while the native call may still be in
+ * flight: the `settled` latch ignores its eventual late settlement, and the
+ * serialized queue (which only chains onto the race result) moves on to the
+ * next entry regardless — the same late-arrival guard the Recorder's own
+ * deadline helpers use.
+ */
+function withAudioModeDeadline(operation: () => Promise<void>): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error('audio mode operation did not settle in time'));
+    }, AUDIO_MODE_OPERATION_TIMEOUT_MS);
+    void Promise.resolve()
+      .then(operation)
+      .then(
+        () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve();
+        },
+        (error: unknown) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+  });
+}
+
 /** Serializes every process-wide audio-mode mutation, including Recorder. */
 export function serializeAudioMode(operation: () => Promise<void>): Promise<void> {
-  const result = audioModeQueue.then(operation, operation);
+  const result = audioModeQueue.then(
+    () => withAudioModeDeadline(operation),
+    () => withAudioModeDeadline(operation),
+  );
   audioModeQueue = result.catch(() => undefined);
   return result;
 }

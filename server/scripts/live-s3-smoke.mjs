@@ -29,7 +29,25 @@ const { Client } = pg;
 const DEFAULT_BASE_URL = 'http://127.0.0.1:4000';
 const REQUEST_TIMEOUT_MS = 180_000;
 const S3_OPERATION_TIMEOUT_MS = 15_000;
-const DELETE_POLL_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 4_000, 8_000, 15_000, 45_000];
+// The server's recording-deletion outbox deliberately waits through the
+// maximum grant-reuse quiet period (about an hour) before sweeping every
+// exact S3 version of a deleted recording, so a slow-but-correct backend
+// needs a far larger wait budget than a fixed ~76 s poll ladder. The default
+// safely covers that ~65-minute quiet period plus sweep margin; operators can
+// tune it with LIVE_S3_DELETE_WAIT_MS (integer milliseconds, 1 minute to
+// 6 hours). Healthy checks still return on their first immediate poll — the
+// budget only bounds the worst-case wait before declaring failure.
+const DEFAULT_DELETE_WAIT_MS = 70 * 60_000;
+const DELETE_WAIT_MS_INPUT = Number(process.env.LIVE_S3_DELETE_WAIT_MS || DEFAULT_DELETE_WAIT_MS);
+if (
+  !Number.isSafeInteger(DELETE_WAIT_MS_INPUT) ||
+  DELETE_WAIT_MS_INPUT < 60_000 ||
+  DELETE_WAIT_MS_INPUT > 6 * 60 * 60_000
+) {
+  throw new Error('LIVE_S3_DELETE_WAIT_MS must be an integer number of milliseconds from 60000 to 21600000');
+}
+const DELETE_WAIT_MS = DELETE_WAIT_MS_INPUT;
+const DELETE_POLL_INTERVAL_MS = 15_000;
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 const ENDPOINTS = {
   diagnostic: '/diagnostic/answer',
@@ -161,6 +179,12 @@ function publicObjectUrl(uploadUrl, audioKey) {
 const baseUrl = parseBaseUrl();
 const audioFile = requiredEnv('AUDIO_FILE');
 const databaseUrl = requiredEnv('DATABASE_URL');
+// Run banner: make the effective deletion-wait budget visible so operators
+// see up front how long the retained-deletion polls may legitimately run.
+console.log(
+  `live S3 acceptance against ${baseUrl.origin}: deletion wait budget ${(DELETE_WAIT_MS / 60_000).toFixed(1)} minutes ` +
+    `(LIVE_S3_DELETE_WAIT_MS), poll interval ${DELETE_POLL_INTERVAL_MS / 1_000} s`,
+);
 const audioContentType = (process.env.AUDIO_CONTENT_TYPE || 'audio/mp4').trim().toLowerCase();
 const accessKeyId = requiredEnv('S3_ACCESS_KEY_ID');
 const secretAccessKey = requiredEnv('S3_SECRET_ACCESS_KEY');
@@ -348,12 +372,15 @@ async function objectExists(scope, key, includeRunSignal = true) {
 }
 
 async function waitForObjectMissing(scope, key, label) {
-  for (const delayMs of DELETE_POLL_DELAYS_MS) {
-    if (delayMs > 0) await delay(delayMs);
+  const deadline = Date.now() + DELETE_WAIT_MS;
+  for (;;) {
     if ((await listExactVersions(scope, key)).length === 0) {
       check(label, true);
       return;
     }
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    await delay(Math.min(DELETE_POLL_INTERVAL_MS, remainingMs));
   }
   check(label, false);
 }

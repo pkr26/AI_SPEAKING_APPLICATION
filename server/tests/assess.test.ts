@@ -394,6 +394,51 @@ describe('assessSpeaking (OpenAI path)', () => {
     }
   });
 
+  it('undoes the reservation and releases the limiter latch when the API key is missing', async () => {
+    const key = config.openaiApiKey;
+    config.openaiApiKey = '';
+    await pool.query('DELETE FROM assessment_usage WHERE user_id = $1', [userId]);
+    try {
+      const onCapacityReserved = vi.fn();
+      const onCapacityReservationUndone = vi.fn();
+      await expect(
+        assessSpeaking(audioPath, QUESTION, userId, { onCapacityReserved, onCapacityReservationUndone }),
+      ).rejects.toMatchObject({ status: 503, message: 'AI assessment not configured' });
+      expect(onCapacityReserved).toHaveBeenCalledOnce();
+      // The abort precedes every provider call, so the just-committed usage
+      // row must be gone and the undo hook (the pipeline's limiter-latch
+      // clear) must run before the 503 reaches the response.
+      expect(onCapacityReservationUndone).toHaveBeenCalledOnce();
+      const { rows } = await pool.query<{ n: number }>(
+        'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+        [userId],
+      );
+      expect(rows[0].n).toBe(0);
+      expect(openaiMocks.transcribe).not.toHaveBeenCalled();
+    } finally {
+      config.openaiApiKey = key;
+    }
+  });
+
+  it('keeps the reservation and the latch when provider work has started and failed', async () => {
+    await pool.query('DELETE FROM assessment_usage WHERE user_id = $1', [userId]);
+    const onCapacityReserved = vi.fn();
+    const onCapacityReservationUndone = vi.fn();
+    openaiMocks.transcribe.mockRejectedValue(new Error('provider down'));
+    await expect(
+      assessSpeaking(audioPath, QUESTION, userId, { onCapacityReserved, onCapacityReservationUndone }),
+    ).rejects.toMatchObject({ status: 502, code: 'PROVIDER_FAILED' });
+    expect(onCapacityReserved).toHaveBeenCalledOnce();
+    // A provider failure happens after paid spend: the allowance unit stays
+    // consumed and the limiter latch stays set, so the hits are not refunded.
+    expect(onCapacityReservationUndone).not.toHaveBeenCalled();
+    const { rows } = await pool.query<{ n: number }>(
+      'SELECT count(*)::int AS n FROM assessment_usage WHERE user_id = $1',
+      [userId],
+    );
+    expect(rows[0].n).toBe(1);
+  });
+
   it('transcribes with whisper-1, grades with the pinned model, rounds the score', async () => {
     mockProviderSuccess();
     const result = await assessSpeaking(audioPath, QUESTION, userId);
@@ -955,13 +1000,13 @@ describe('assessment shutdown gate', () => {
     const commit = new Promise<void>((resolve) => {
       finishCommit = resolve;
     });
+    const usageId = randomUUID();
     const client = {
       query: vi.fn(async (text: string) => {
         if (
           text === 'BEGIN' ||
           text === "SELECT pg_advisory_xact_lock(hashtext('assessment-global-cap'))" ||
-          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))" ||
-          text === 'INSERT INTO assessment_usage (user_id) VALUES ($1)'
+          text === "SELECT pg_advisory_xact_lock(hashtext('assessment-cap'), hashtext($1))"
         ) {
           return { rows: [], rowCount: 1 };
         }
@@ -974,6 +1019,9 @@ describe('assessment shutdown gate', () => {
             rowCount: 1,
           };
         }
+        if (text === 'INSERT INTO assessment_usage (user_id) VALUES ($1) RETURNING id') {
+          return { rows: [{ id: usageId }], rowCount: 1 };
+        }
         if (text === 'COMMIT') return commit;
         if (text === 'ROLLBACK') return { rows: [], rowCount: null };
         throw new Error(`unexpected capacity query: ${text}`);
@@ -981,8 +1029,17 @@ describe('assessment shutdown gate', () => {
       release: vi.fn(),
     };
     const connect = vi.spyOn(pool, 'connect').mockResolvedValue(client as never);
+    const undoStatements: Array<[string, unknown[]]> = [];
+    const query = vi.spyOn(pool, 'query').mockImplementation(((text: string, values?: unknown[]) => {
+      undoStatements.push([text, values ?? []]);
+      return Promise.resolve({ rowCount: 1 });
+    }) as never);
     const onCapacityReserved = vi.fn();
-    const assessment = assessSpeaking(audioPath, QUESTION, userId, { onCapacityReserved });
+    const onCapacityReservationUndone = vi.fn();
+    const assessment = assessSpeaking(audioPath, QUESTION, userId, {
+      onCapacityReserved,
+      onCapacityReservationUndone,
+    });
 
     try {
       await vi.waitFor(() => expect(client.query).toHaveBeenCalledWith('COMMIT'));
@@ -997,6 +1054,13 @@ describe('assessment shutdown gate', () => {
         code: 'PROVIDER_FAILED',
       });
       expect(onCapacityReserved).toHaveBeenCalledOnce();
+      // The abort predates every provider call, so the just-committed
+      // reservation is deleted (exactly the row this call inserted) and the
+      // limiter-latch undo hook runs before the error reaches the response.
+      expect(undoStatements).toEqual([
+        ['DELETE FROM assessment_usage WHERE id = $1 AND user_id = $2', [usageId, userId]],
+      ]);
+      expect(onCapacityReservationUndone).toHaveBeenCalledOnce();
       expect(openaiMocks.transcribe).not.toHaveBeenCalled();
       expect(openaiMocks.parse).not.toHaveBeenCalled();
       expect(client.release).toHaveBeenCalledOnce();
@@ -1009,9 +1073,11 @@ describe('assessment shutdown gate', () => {
         code: 'PROVIDER_FAILED',
       });
       expect(connect).not.toHaveBeenCalled();
+      expect(undoStatements).toHaveLength(1); // the pre-reservation rejection undoes nothing
     } finally {
       finishCommit();
       restoreConfig(snap);
+      query.mockRestore();
       connect.mockRestore();
     }
   });

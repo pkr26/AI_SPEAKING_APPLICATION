@@ -73,6 +73,8 @@ jest.mock('expo-router', () => {
 interface CapturedRecorderProps {
   ownerId: string;
   questionId: string;
+  disabled?: boolean;
+  isStartBlocked?: () => boolean;
   endpoint: string;
   parseResult: (data: unknown) => DiagnosticAnswerResult;
   onResult: (data: DiagnosticAnswerResult, metadata?: RecorderResultMetadata) => void;
@@ -2322,6 +2324,39 @@ describe('diagnostic screen', () => {
     expect(logout).not.toHaveBeenCalled();
     expect(mockRouter.replace).not.toHaveBeenCalled();
     expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('does not start a recorder take while logout is in flight', async () => {
+    const logoutRequest = deferred<void>();
+    const logout = jest.fn(() => logoutRequest.promise);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const logOut = capturedPressHandler(t('common.logOut'));
+    const startBlocked = recorderProps().isStartBlocked;
+    expect(startBlocked?.()).toBe(false);
+    let blockedDuringLogout = false;
+
+    await act(async () => {
+      void logOut();
+      blockedDuringLogout = startBlocked?.() ?? false;
+      await Promise.resolve();
+    });
+    expect(logout).toHaveBeenCalledTimes(1);
+    // The ref-backed guard flips in the same frame as the tap, before React
+    // commits the busy state — the exact event-time race the practice screen
+    // fences the same way.
+    expect(blockedDuringLogout).toBe(true);
+    expect(recorderProps().disabled).toBe(true);
+
+    await act(async () => {
+      logoutRequest.resolve(undefined);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(startBlocked?.()).toBe(false));
+    expect(recorderProps().disabled).toBe(false);
   });
 
   it('logs out from the dedicated account action and returns to the gate', async () => {

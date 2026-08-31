@@ -249,6 +249,11 @@ export function contentTypeToExt(contentType: string): string | undefined {
   return undefined;
 }
 
+/** Escape every regex metacharacter so an interpolated segment can only match itself. */
+function escapeRegExpLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /**
  * An audio key is only ever resolved for the user it was issued to, so one
  * learner can never have the API fetch another learner's object — or an
@@ -262,8 +267,13 @@ export function isOwnedAudioKey(scope: AudioStorageScope, userId: string, key: u
   // come from a tampered/buggy client. Rejecting it here routes the submission
   // to the terminal generic 400 instead of a refundable AUDIO_UPLOAD_MISSING
   // download retry, matching the "no fresh upload for a generic 400" contract.
+  // userId is a DB-enforced UUID today, but it is interpolated, so it is
+  // escaped anyway: a hypothetical metacharacter-bearing id (`a.b+c(d)`) must
+  // neither widen the anchored match to other learners' keys (`a.b` matching
+  // an `aXb` key) nor break RegExp compilation. scope needs no escaping — its
+  // type is the fixed 'diagnostic' | 'practice' union.
   return new RegExp(
-    `^${KEY_PREFIX}/${scope}/${userId}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
+    `^${KEY_PREFIX}/${scope}/${escapeRegExpLiteral(userId)}/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.(${exts})$`,
   ).test(key);
 }
 
@@ -472,6 +482,19 @@ export async function retainPresignedAudioVersion(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * True when an S3 failure proves the addressed object version no longer
+ * exists: `NoSuchVersion` is the exact-VersionId variant a pinned call raises,
+ * and `NoSuchKey`/`NotFound`/`404` are the same gone-object family the
+ * download path in resolvePresignedAudio already classifies. Retention
+ * callers use this to stop retrying retags that can never succeed — once the
+ * transient lifecycle expired the exact version, no retry can bring it back.
+ */
+export function isS3VersionGoneError(err: unknown): boolean {
+  const name = (err as { name?: string } | null | undefined)?.name;
+  return name === 'NoSuchVersion' || name === 'NoSuchKey' || name === 'NotFound' || name === '404';
 }
 
 /**

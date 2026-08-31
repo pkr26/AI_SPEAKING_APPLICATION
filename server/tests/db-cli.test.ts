@@ -164,7 +164,7 @@ describe('database CLI entrypoints', () => {
       );
       expect(migrated.error).toBeUndefined();
       expect(migrated.status).toBe(0);
-      expect(migrated.stdout).toContain('applied migration 024_diagnostic_runs_and_question_snapshots.sql');
+      expect(migrated.stdout).toContain('applied migration 026_attempts_question_snapshots.sql');
 
       const corrupt = new Client({ connectionString: suiteDatabaseUrl(databaseName) });
       await corrupt.connect();

@@ -18,7 +18,7 @@ config.s3.practice.region = 'us-east-1';
 
 async function createRecording(
   userId: string,
-  status: 'retention_pending' | 'available' = 'available',
+  status: 'retention_pending' | 'available' | 'unavailable' = 'available',
   options: { createdAt?: Date; attemptId?: string } = {},
 ) {
   const question = await pool.query<{ id: string }>("SELECT id FROM questions WHERE cefr_level = 'A1' LIMIT 1");
@@ -297,6 +297,55 @@ describe('recording owner API', () => {
       error: 'Recording storage unavailable; please try again',
       code: 'PROVIDER_FAILED',
     });
+  });
+
+  it('answers the exact stable not-found body for a terminally unavailable recording', async () => {
+    const a = app();
+    const owner = await registerUser(a);
+    const unavailable = await createRecording(owner.res.body.user.id, 'unavailable');
+
+    const response = await request(a)
+      .post(`/recordings/${unavailable.id}/playback-url`)
+      .set('Authorization', `Bearer ${owner.res.body.token}`);
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({ error: 'Recording not found', code: 'NOT_FOUND' });
+  });
+
+  it('keeps terminally unavailable metadata out of list and export pages', async () => {
+    const a = app();
+    const owner = await registerUser(a);
+    const available = await createRecording(owner.res.body.user.id);
+    const unavailable = await createRecording(owner.res.body.user.id, 'unavailable');
+    const authorization = { Authorization: `Bearer ${owner.res.body.token}` };
+
+    const list = await request(a).get('/recordings').set(authorization);
+    expect(list.status).toBe(200);
+    expect(list.body.items.map(({ id }: { id: string }) => id)).toEqual([available.id]);
+
+    const exported = await request(a).get('/recordings/export').set(authorization);
+    expect(exported.status).toBe(200);
+    expect(exported.body.recordings.map(({ id }: { id: string }) => id)).toEqual([available.id]);
+    expect(JSON.stringify([list.body, exported.body])).not.toContain(unavailable.id);
+  });
+
+  it('still enqueues the durable S3 deletion job when deleting unavailable metadata', async () => {
+    const a = app();
+    const { res: registered } = await registerUser(a);
+    const recording = await createRecording(registered.body.user.id, 'unavailable');
+
+    const deleted = await request(a)
+      .delete(`/recordings/${recording.id}`)
+      .set('Authorization', `Bearer ${registered.body.token}`);
+    expect(deleted.status).toBe(204);
+    expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(0);
+    expect(
+      (
+        await pool.query(
+          'SELECT known_version_id FROM recording_deletion_jobs WHERE storage_scope = $1 AND audio_key = $2',
+          ['practice', recording.audioKey],
+        )
+      ).rows,
+    ).toEqual([{ known_version_id: 'version-1' }]);
   });
 
   it('deletes idempotently and transactionally leaves a durable S3 deletion job', async () => {

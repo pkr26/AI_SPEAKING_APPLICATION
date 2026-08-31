@@ -203,12 +203,14 @@ function getOpenAI(): OpenAI {
 }
 
 /**
- * Atomically reserve one assessment from the user's rolling 24-hour allowance.
- * A reservation is intentionally retained when provider work fails: the call
- * still consumed capacity/cost, and concurrent requests must not all pass a
- * count-then-act check before any attempt row exists.
+ * Atomically reserve one assessment from the user's rolling 24-hour allowance
+ * and return the inserted row's id so a caller that aborts before any provider
+ * work can undo exactly this reservation. A reservation is intentionally
+ * retained when provider work fails: the call still consumed capacity/cost,
+ * and concurrent requests must not all pass a count-then-act check before any
+ * attempt row exists.
  */
-export async function assertDailyAssessmentCapacity(userId: string): Promise<void> {
+export async function assertDailyAssessmentCapacity(userId: string): Promise<string> {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -254,12 +256,36 @@ export async function assertDailyAssessmentCapacity(userId: string): Promise<voi
       const retryAfterHours = Math.max(1, Math.ceil((oldestMs + 24 * 60 * 60 * 1000 - Date.now()) / (60 * 60 * 1000)));
       throw new HttpError(429, 'Daily assessment limit reached', { retryAfterHours }, 'DAILY_LIMIT');
     }
-    await client.query('INSERT INTO assessment_usage (user_id) VALUES ($1)', [userId]);
+    const inserted = await client.query<{ id: string }>(
+      'INSERT INTO assessment_usage (user_id) VALUES ($1) RETURNING id',
+      [userId],
+    );
     await client.query('COMMIT');
+    return inserted.rows[0].id;
   } catch (err) {
     return await rollbackTransaction(client, { value: err });
   } finally {
     releaseTransactionClient(client);
+  }
+}
+
+/**
+ * Best-effort undo of a reservation whose request aborted before any provider
+ * work could start (shutdown drain began mid-transaction, or no API key is
+ * configured): the learner must not permanently lose a 24-hour allowance unit
+ * to an abort that spent no provider money. Deletes exactly the row this
+ * call's reservation inserted (primary-key predicate), so it can never touch
+ * another request's reservation. A failed delete keeps the fail-safe status
+ * quo — the reservation stays retained and the caller keeps its limiter
+ * latch, matching the pre-undo abort semantics.
+ */
+async function undoDailyAssessmentCapacity(userId: string, usageId: string): Promise<boolean> {
+  try {
+    await pool.query('DELETE FROM assessment_usage WHERE id = $1 AND user_id = $2', [usageId, userId]);
+    return true;
+  } catch (err) {
+    logger.warn({ err, userId }, 'failed to undo daily assessment capacity reservation');
+    return false;
   }
 }
 
@@ -288,6 +314,16 @@ export interface AssessOptions {
    * limiters from refunding responses that already spent that budget.
    */
   onCapacityReserved?: () => void;
+  /**
+   * Invoked when a reservation committed by this same call is undone because
+   * the request aborted before any provider work could start (the shutdown
+   * drain began while the quota transaction committed, or no API key is
+   * configured). Routes use it to clear the latch set by onCapacityReserved
+   * BEFORE the abort's error reaches the response, so the limiter finish
+   * predicate refunds this request's hits. Not invoked when the undo itself
+   * fails: a retained reservation keeps its latch (fail-safe retention).
+   */
+  onCapacityReservationUndone?: () => void;
 }
 
 /** Route-specific pieces of the shared paid-provider skeleton below. */
@@ -340,17 +376,39 @@ async function callProvider<T>(
     // Reserve quota only after an AI slot is available. Capacity rejections do
     // not consume a learner's daily allowance, while every provider attempt
     // still receives an atomic, cross-instance reservation before it starts.
-    await assertDailyAssessmentCapacity(userId);
+    const usageId = await assertDailyAssessmentCapacity(userId);
     options.onCapacityReserved?.();
+    // Undo the reservation only at the two aborts below. Both sit strictly
+    // before the first provider call — no OpenAI client exists yet, no
+    // controller is registered, and mock mode has simulated nothing — so no
+    // paid work can have started. Every later failure (transcription or
+    // grading errors, and the empty-transcript early return that follows a
+    // paid transcription) happens after provider spend and keeps the
+    // reservation and the latch set above.
+    const undoReservationBeforeProviderWork = async (): Promise<void> => {
+      if (await undoDailyAssessmentCapacity(userId, usageId)) options.onCapacityReservationUndone?.();
+    };
     // Shutdown can start while the quota transaction is awaiting PostgreSQL.
-    // The reservation has committed, so notify the limiter hook above, but do
-    // not begin fresh paid provider work during the drain.
-    if (assessmentShutdownStarted) throw assessmentShutdownError();
+    // The reservation has committed, so notify the limiter hook above — but
+    // the drain must not begin fresh paid provider work, so hand the
+    // just-committed reservation back before failing the request.
+    if (assessmentShutdownStarted) {
+      await undoReservationBeforeProviderWork();
+      throw assessmentShutdownError();
+    }
     if (config.mockAi) {
       observeMockProviderCalls();
       return spec.mockResult();
     }
-    const client = getOpenAI();
+    let client: OpenAI;
+    try {
+      client = getOpenAI();
+    } catch (err) {
+      // An unprovisioned deployment fails closed before the provider; the
+      // reservation bought nothing, so undo it before surfacing the 503.
+      await undoReservationBeforeProviderWork();
+      throw err;
+    }
     const controller = new AbortController();
     inFlightAssessmentControllers.add(controller);
     // No await separates the shutdown check above from registration. A signal

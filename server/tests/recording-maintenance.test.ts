@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import request from 'supertest';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const storage = vi.hoisted(() => ({
@@ -7,7 +8,10 @@ const storage = vi.hoisted(() => ({
   playback: vi.fn(async () => 'https://example.invalid/playback'),
 }));
 
-vi.mock('../src/audio-upload', () => ({
+vi.mock('../src/audio-upload', async (importOriginal) => ({
+  // Spread the real module so app wiring (e.g. the /ready storage probe) keeps
+  // its imports, then stub only the storage primitives these tests drive.
+  ...(await importOriginal<typeof import('../src/audio-upload')>()),
   retainPresignedAudioVersion: storage.retain,
   sweepPresignedAudioVersions: storage.sweep,
   createPresignedRecordingPlaybackUrl: storage.playback,
@@ -18,7 +22,13 @@ import { pool } from '../src/db';
 import { logger } from '../src/logger';
 import { recordingMaintenanceTotal } from '../src/metrics';
 import { insertRetainedRecording, type RecordingCapture } from '../src/recording-store';
-import { recordingBulkCleanupBatchSql, runRecordingMaintenance, tryRetainRecording } from '../src/recordings';
+import {
+  RETENTION_MAX_ATTEMPTS,
+  recordingBulkCleanupBatchSql,
+  runRecordingMaintenance,
+  tryRetainRecording,
+} from '../src/recordings';
+import { app, registerUser } from './helpers';
 
 const configuredMaintenanceConcurrency = config.recordings.maintenanceConcurrency;
 
@@ -470,6 +480,143 @@ describe('recording maintenance leases', () => {
         )
       ).rows,
     ).toEqual([{ last_error_code: 'S3_ERROR' }]);
+  });
+});
+
+describe('terminal retention transitions', () => {
+  it('marks a recording unavailable once the exact S3 version is provably gone', async () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const a = app();
+    const { res: registered } = await registerUser(a);
+    const userId = registered.body.user.id as string;
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    const id = randomUUID();
+    const audioKey = `audio-uploads/diagnostic/${userId}/${randomUUID()}.m4a`;
+    await pool.query(
+      `INSERT INTO recordings (
+         id, user_id, request_id, question_id, context, storage_scope, audio_key,
+         s3_version_id, content_type, size_bytes, recording_retention_epoch
+       ) VALUES ($1, $2, $3, $4, 'diagnostic', 'diagnostic', $5, 'v1', 'audio/mp4', 1000,
+                 (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
+      [id, userId, randomUUID(), question.rows[0].id, audioKey],
+    );
+    storage.retain.mockRejectedValueOnce(Object.assign(new Error('version expired'), { name: 'NoSuchVersion' }));
+
+    await expect(tryRetainRecording(id)).resolves.toBeUndefined();
+
+    expect(storage.retain).toHaveBeenCalledWith('diagnostic', userId, audioKey, 'v1');
+    const row = await pool.query(
+      `SELECT status, last_retention_error_code, retention_claim_id, retention_lease_expires_at,
+              retention_attempts
+       FROM recordings WHERE id = $1`,
+      [id],
+    );
+    expect(row.rows[0]).toMatchObject({
+      status: 'unavailable',
+      last_retention_error_code: 'NoSuchVersion',
+      retention_claim_id: null,
+      retention_lease_expires_at: null,
+      retention_attempts: 1,
+    });
+    expect(warn).toHaveBeenCalledWith(
+      expect.objectContaining({ recordingId: id, errorCode: 'NoSuchVersion' }),
+      'recording retention can never succeed; metadata marked unavailable',
+    );
+
+    // No further retry is scheduled: neither a targeted attempt nor a full
+    // maintenance tick can claim a row that has left retention_pending.
+    storage.retain.mockClear();
+    await expect(tryRetainRecording(id)).resolves.toBeUndefined();
+    await expect(runRecordingMaintenance()).resolves.toBeGreaterThanOrEqual(0);
+    expect(storage.retain).not.toHaveBeenCalledWith('diagnostic', userId, audioKey, 'v1');
+
+    const playback = await request(a)
+      .post(`/recordings/${id}/playback-url`)
+      .set('Authorization', `Bearer ${registered.body.token as string}`);
+    expect(playback.status).toBe(404);
+    expect(playback.body).toEqual({ error: 'Recording not found', code: 'NOT_FOUND' });
+  });
+
+  it('marks a recording unavailable when persistent generic failures exhaust the retry budget', async () => {
+    const recording = await createPendingRecording();
+    // One claim below the terminal budget: this attempt's claim increments the
+    // counter onto exactly RETENTION_MAX_ATTEMPTS.
+    await pool.query('UPDATE recordings SET retention_attempts = $2 WHERE id = $1', [
+      recording.id,
+      RETENTION_MAX_ATTEMPTS - 1,
+    ]);
+    storage.retain.mockRejectedValue(Object.assign(new Error('still denied'), { name: 'AccessDenied' }));
+
+    await expect(tryRetainRecording(recording.id)).resolves.toBeUndefined();
+
+    expect(
+      (await pool.query('SELECT status, last_retention_error_code FROM recordings WHERE id = $1', [recording.id])).rows,
+    ).toEqual([{ status: 'unavailable', last_retention_error_code: 'AccessDenied' }]);
+  });
+
+  it('still schedules capped backoff one attempt below the terminal budget', async () => {
+    const recording = await createPendingRecording();
+    await pool.query('UPDATE recordings SET retention_attempts = $2 WHERE id = $1', [
+      recording.id,
+      RETENTION_MAX_ATTEMPTS - 2,
+    ]);
+    storage.retain.mockRejectedValueOnce(Object.assign(new Error('still denied'), { name: 'AccessDenied' }));
+
+    await expect(tryRetainRecording(recording.id)).resolves.toBeUndefined();
+
+    const row = await pool.query(
+      `SELECT status, retention_attempts, retention_claim_id,
+              EXTRACT(EPOCH FROM next_retention_attempt_at - now()) AS retry_in_seconds
+       FROM recordings WHERE id = $1`,
+      [recording.id],
+    );
+    expect(row.rows[0]).toMatchObject({
+      status: 'retention_pending',
+      retention_attempts: RETENTION_MAX_ATTEMPTS - 1,
+      retention_claim_id: null,
+    });
+    expect(Number(row.rows[0].retry_in_seconds)).toBeGreaterThan(0);
+  });
+
+  it('hides terminally unavailable metadata from the list and export pages', async () => {
+    const a = app();
+    const { res: registered } = await registerUser(a);
+    const userId = registered.body.user.id as string;
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    const insertForOwner = async (status: 'available' | 'retention_pending' | 'unavailable') => {
+      const id = randomUUID();
+      await pool.query(
+        `INSERT INTO recordings (
+           id, user_id, request_id, question_id, context, storage_scope, audio_key,
+           s3_version_id, content_type, size_bytes, duration_ms, status, available_at,
+           recording_retention_epoch
+         ) VALUES ($1, $2, $3, $4, 'practice-native', 'practice', $5, 'version-1',
+                   'audio/mp4', 12345, 7200, $6, CASE WHEN $6 = 'available' THEN now() ELSE NULL END,
+                   (SELECT recording_retention_epoch FROM users WHERE id = $2))`,
+        [id, userId, randomUUID(), question.rows[0].id, `audio-uploads/practice/${userId}/${randomUUID()}.m4a`, status],
+      );
+      return id;
+    };
+    const availableId = await insertForOwner('available');
+    const pendingId = await insertForOwner('retention_pending');
+    const unavailableId = await insertForOwner('unavailable');
+    const authorization = { Authorization: `Bearer ${registered.body.token as string}` };
+
+    const list = await request(a).get('/recordings?limit=50').set(authorization);
+    expect(list.status).toBe(200);
+    expect(list.body.items.map((item: { id: string }) => item.id)).not.toContain(unavailableId);
+    // retention_pending rows stay exposed exactly as before; only the enum
+    // value no old client has ever received is held back.
+    expect(list.body.items.map((item: { id: string }) => item.id)).toEqual(
+      expect.arrayContaining([availableId, pendingId]),
+    );
+
+    const exported = await request(a).get('/recordings/export?limit=500').set(authorization);
+    expect(exported.status).toBe(200);
+    expect(exported.body.recordings.map((item: { id: string }) => item.id)).not.toContain(unavailableId);
+    expect(exported.body.recordings.map((item: { id: string }) => item.id)).toEqual(
+      expect.arrayContaining([availableId, pendingId]),
+    );
   });
 });
 

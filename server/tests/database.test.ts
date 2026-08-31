@@ -57,7 +57,7 @@ describe('database content seeding', () => {
   it('executes shared preflight/readiness validation and rejects malformed or overfilled catalog data', async () => {
     resetQuestionInventoryReadinessCacheForTests();
     await expect(assertDatabaseSchemaCurrent()).resolves.toEqual({
-      latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
+      latestMigration: '026_attempts_question_snapshots.sql',
     });
     const expectInventoryRejected = async () => {
       resetQuestionInventoryReadinessCacheForTests();
@@ -1280,6 +1280,122 @@ describe('migration 022 learning audit repairs', () => {
         client.query('SET CONSTRAINTS attempts_native_language_required_trigger IMMEDIATE'),
       ).rejects.toMatchObject({ code: '23514' });
       await client.query('ROLLBACK TO SAVEPOINT before_missing_native_snapshot');
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+  });
+});
+
+describe('migration 025 trigger function search paths', () => {
+  it('pins a search_path setting on both recording trigger functions', async () => {
+    const { rows } = await pool.query<{ proname: string; proconfig: string[] | null }>(
+      `SELECT proname, proconfig
+       FROM pg_proc
+       WHERE pronamespace = 'public'::regnamespace
+         AND proname IN ('enqueue_recording_s3_deletion', 'assign_recording_retention_epoch')
+       ORDER BY proname`,
+    );
+    expect(rows).toHaveLength(2);
+    for (const fn of rows) {
+      // A pinned search_path is exactly what migrations 022/024 establish for
+      // their trigger functions; 025 brings the two older recording triggers
+      // up to the same posture. Any proconfig entry must pin the path.
+      expect(fn.proconfig, fn.proname).toEqual([expect.stringMatching(/^search_path=/)]);
+    }
+  });
+});
+
+describe('migration 026 attempts question snapshots', () => {
+  it('backfills every attempt from the catalog, snapshots draining writers, and enforces the snapshot contract', async () => {
+    const client = await pool.connect();
+    const schema = `attempt_snapshots_${randomUUID().replace(/-/g, '')}`;
+    const questionId = randomUUID();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE SCHEMA "${schema}"`);
+      await client.query(`SET LOCAL search_path TO "${schema}", public`);
+      await client.query(`CREATE TABLE questions (
+        id UUID PRIMARY KEY,
+        cefr_level TEXT NOT NULL,
+        prompt_word TEXT NOT NULL,
+        question_text TEXT NOT NULL
+      )`);
+      await client.query(`CREATE TABLE attempts (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        question_id UUID NOT NULL
+      )`);
+      // Production attempts carries migration 022's DEFERRABLE INITIALLY
+      // DEFERRED constraint trigger; reproduce it so this replay proves the
+      // migration's disable/enable bracket survives a populated backfill
+      // (without the bracket the same-transaction ALTERs fail with 55006).
+      await client.query(`CREATE FUNCTION noop_attempt_snapshot_trigger() RETURNS trigger
+        LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$`);
+      await client.query(`CREATE CONSTRAINT TRIGGER attempts_native_language_required_trigger
+        AFTER INSERT OR UPDATE ON attempts
+        DEFERRABLE INITIALLY DEFERRED
+        FOR EACH ROW EXECUTE FUNCTION noop_attempt_snapshot_trigger()`);
+      await client.query(
+        `INSERT INTO questions (id, cefr_level, prompt_word, question_text)
+         VALUES ($1, 'B1', 'snapshot', 'Describe an immutable snapshot.')`,
+        [questionId],
+      );
+      // A pre-026 row: no snapshot columns exist on its INSERT path.
+      await client.query('INSERT INTO attempts (question_id) VALUES ($1)', [questionId]);
+      // Fire the deferred event queued by that INSERT and restore deferral so
+      // the migration starts from the same pending-events state as a real run.
+      await client.query('SET CONSTRAINTS attempts_native_language_required_trigger IMMEDIATE');
+      await client.query('SET CONSTRAINTS attempts_native_language_required_trigger DEFERRED');
+
+      const sql = fs.readFileSync(path.join(__dirname, '../db/migrations/026_attempts_question_snapshots.sql'), 'utf8');
+      await client.query(sql);
+
+      // The backfill matched the exact questions join.
+      expect((await client.query('SELECT cefr_level, prompt_word, question_text FROM attempts')).rows).toEqual([
+        { cefr_level: 'B1', prompt_word: 'snapshot', question_text: 'Describe an immutable snapshot.' },
+      ]);
+
+      // A draining pre-026 writer omits the columns; the INSERT trigger fills
+      // them from the catalog row.
+      await client.query('INSERT INTO attempts (question_id) VALUES ($1)', [questionId]);
+      expect((await client.query('SELECT count(*)::int AS n FROM attempts')).rows).toEqual([{ n: 2 }]);
+
+      // A current writer's in-memory grading copy is preserved verbatim.
+      await client.query(
+        `INSERT INTO attempts (question_id, cefr_level, prompt_word, question_text)
+         VALUES ($1, 'C2', 'graded-word', 'Exact wording used for grading.')`,
+        [questionId],
+      );
+      expect(
+        (
+          await client.query(
+            `SELECT cefr_level, prompt_word, question_text FROM attempts
+             WHERE prompt_word = 'graded-word'`,
+          )
+        ).rows,
+      ).toEqual([{ cefr_level: 'C2', prompt_word: 'graded-word', question_text: 'Exact wording used for grading.' }]);
+
+      // NOT NULL is enforced against post-migration writes.
+      await client.query('SAVEPOINT before_null_snapshot');
+      await expect(
+        client.query(`UPDATE attempts SET cefr_level = NULL WHERE prompt_word = 'snapshot'`),
+      ).rejects.toMatchObject({ code: '23502' });
+      await client.query('ROLLBACK TO SAVEPOINT before_null_snapshot');
+
+      // CHECK rejects blank, oversized, and off-enum snapshots.
+      for (const [column, value] of [
+        ['prompt_word', '\t\n '],
+        ['question_text', '\t\n '],
+        ['prompt_word', 'a'.repeat(101)],
+        ['question_text', 'b'.repeat(1_001)],
+        ['cefr_level', 'D1'],
+      ] as const) {
+        await client.query('SAVEPOINT before_invalid_snapshot');
+        await expect(
+          client.query(`UPDATE attempts SET ${column} = $1 WHERE prompt_word = 'graded-word'`, [value]),
+        ).rejects.toMatchObject({ code: '23514' });
+        await client.query('ROLLBACK TO SAVEPOINT before_invalid_snapshot');
+      }
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();

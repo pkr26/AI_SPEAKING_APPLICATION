@@ -269,4 +269,35 @@ describe('isOwnedAudioKey', () => {
       expect(isOwnedAudioKey('diagnostic', userId, key)).toBe(false);
     }
   });
+
+  it('escapes regex metacharacters in the user id so ownership cannot widen', () => {
+    // userId is a DB-enforced UUID today, but the interpolated segment must
+    // stay literal even for a fabricated metacharacter-bearing id: unescaped,
+    // `.` matches any character (`a.b` accepting an `aXb` key), `+` widens
+    // repetition (`ab+c` accepting an `abbc` key), and an unbalanced
+    // metacharacter id would not even compile as a RegExp.
+    const hostile = 'a.b+c(d)';
+    expect(
+      isOwnedAudioKey(
+        'diagnostic',
+        hostile,
+        `audio-uploads/diagnostic/aXbXcXd/123e4567-e89b-42d3-a456-426614174001.m4a`,
+      ),
+    ).toBe(false);
+    expect(
+      isOwnedAudioKey('diagnostic', 'a.b', `audio-uploads/diagnostic/aXb/123e4567-e89b-42d3-a456-426614174001.m4a`),
+    ).toBe(false);
+    expect(
+      isOwnedAudioKey('practice', 'ab+c', `audio-uploads/practice/abbc/123e4567-e89b-42d3-a456-426614174001.m4a`),
+    ).toBe(false);
+    // Escaping must not over-reject: a key genuinely issued to the exact
+    // metacharacter-bearing id still matches literally.
+    expect(
+      isOwnedAudioKey(
+        'diagnostic',
+        hostile,
+        `audio-uploads/diagnostic/${hostile}/123e4567-e89b-42d3-a456-426614174001.m4a`,
+      ),
+    ).toBe(true);
+  });
 });

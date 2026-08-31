@@ -60,19 +60,20 @@ const lastQuery = (texts: string[]) => texts[texts.length - 1];
 describe('diagnostic', () => {
   const a = app();
 
-  it('finishes the placement at the three-question bound while the window stays open', async () => {
+  it('finishes the placement on the third answer when the final failure collapses the window', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const first = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
     expect(first.body.question.cefrLevel).toBe('B1');
 
-    // B1 pass -> [3,5] (C1), C1 pass -> [5,5] (C2), C2 fail -> [3,4]: the
-    // window is still open after the third answer, so only the attemptNo
-    // bound can complete the run (duplicating the equivalent scenario in
-    // diagnostic-silence-and-resume.test.ts, whose per-test coverage
-    // attribution has proven unreliable under Stryker). This file drives the
-    // real mock-AI scorer, so the score sequence is pinned through the
-    // Math.random seed the scorer reads.
+    // B1 pass -> [3,5] (C1), C1 pass -> [5,5] (C2), C2 fail -> [5,4]: the
+    // third failure COLLAPSES the window (5 > 4), so this fresh journey ends
+    // via the window disjunct. No fresh-run path reaches the attemptNo bound
+    // as its sole terminator — every fresh path collapses the window by the
+    // third scored answer — so the bound-only boundary is pinned separately
+    // by the seeded [3,5]/asked=2 test in diagnostic-search.test.ts. This
+    // file drives the real mock-AI scorer, so the score sequence is pinned
+    // through the Math.random seed the scorer reads.
     const random = vi.spyOn(Math, 'random');
     try {
       random.mockReturnValue(0.9); // mock score 90: pass B1
@@ -93,7 +94,7 @@ describe('diagnostic', () => {
       expect(secondAnswer.body.done).toBe(false);
       expect(secondAnswer.body.nextQuestion.cefrLevel).toBe('C2');
 
-      random.mockReturnValue(0); // mock score 40: fail C2, window stays [3,4]
+      random.mockReturnValue(0); // mock score 40: fail C2, window collapses to [5,4]
       const thirdAnswer = await answerForm(
         request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
         secondAnswer.body.nextQuestion.id,
@@ -119,6 +120,51 @@ describe('diagnostic', () => {
 
     const { rows } = await pool.query('SELECT current_question_id FROM diagnostic_state WHERE user_id = $1', [userId]);
     expect(rows[0].current_question_id).toBe(next.body.question.id);
+  });
+
+  it('serves run summaries from the attempt snapshot after catalog wording changes', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const first = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    const questionId = first.body.question.id as string;
+
+    // The first answer can never finish a fresh run (pass -> [3,5], fail ->
+    // [0,1]; both stay open), so a resume with one summary is deterministic.
+    const answered = await answerForm(
+      request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+      questionId,
+    );
+    expect(answered.status, JSON.stringify(answered.body)).toBe(200);
+    expect(answered.body.done).toBe(false);
+
+    const original = await pool.query<{ prompt_word: string; question_text: string }>(
+      'SELECT prompt_word, question_text FROM questions WHERE id = $1',
+      [questionId],
+    );
+    const mutatedPromptWord = `mutated-${randomUUID().slice(0, 8)}`;
+    const mutatedQuestionText = 'Catalog wording published after this answer was graded.';
+    try {
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        mutatedPromptWord,
+        mutatedQuestionText,
+      ]);
+
+      const resumed = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+      expect(resumed.status).toBe(200);
+      expect(resumed.body.answers).toHaveLength(1);
+      expect(resumed.body.answers[0]).toMatchObject({
+        attemptNo: 1,
+        promptWord: original.rows[0].prompt_word,
+        questionText: original.rows[0].question_text,
+      });
+    } finally {
+      await pool.query('UPDATE questions SET prompt_word = $2, question_text = $3 WHERE id = $1', [
+        questionId,
+        original.rows[0].prompt_word,
+        original.rows[0].question_text,
+      ]);
+    }
   });
 
   it('recreates first-use state atomically and reports exact initial progress', async () => {

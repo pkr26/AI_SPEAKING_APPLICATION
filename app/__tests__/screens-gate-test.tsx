@@ -6,7 +6,15 @@ import {
   QueryClientProvider,
   useQueryClient,
 } from '@tanstack/react-query';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { AppState, type AppStateStatus, StyleSheet, Text, useColorScheme } from 'react-native';
@@ -1058,6 +1066,101 @@ describe('index gate', () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(1);
       rendered.unmount();
     } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('joins the shared in-flight profile request instead of cancelling it when the bounded fallback fires', async () => {
+    jest.useFakeTimers();
+    // Park observer notifications: the production batched scheduler would
+    // otherwise re-render Gate (and re-run the effect that owns the timeout)
+    // as soon as the shared query updates, hiding the exact scheduling race
+    // the fallback must survive. They are flushed manually once the fallback
+    // has fired.
+    const parkedNotifications: (() => void)[] = [];
+    notifyManager.setScheduler((notify) => {
+      parkedNotifications.push(notify);
+    });
+    try {
+      mockAuthValue = makeAuth({ token: 'stored-bearer', user: null });
+      const client = makeQueryClient();
+      // Gate alone: no bridge observer shares the ['me'] entry yet, so the
+      // bounded fallback timer is armed while fetchStatus is still 'idle'.
+      const rendered = await render(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 0, left: 0, right: 0, bottom: 0 },
+          }}
+        >
+          <QueryClientProvider client={client}>
+            <Gate />
+          </QueryClientProvider>
+        </SafeAreaProvider>,
+      );
+      expect(mockApiFetch).not.toHaveBeenCalled();
+
+      // The bridge observer appears after scheduling and populates the shared
+      // cache entry with committed data...
+      mockApiFetch.mockResolvedValueOnce({ user: USER });
+      // ...then a foreground transition starts its always-refetch refresh,
+      // which is still in flight when the fallback fires.
+      const refreshRequest = deferred<unknown>();
+      mockApiFetch.mockReturnValueOnce(refreshRequest.promise);
+      await render(
+        <SafeAreaProvider
+          initialMetrics={{
+            frame: { x: 0, y: 0, width: 390, height: 844 },
+            insets: { top: 0, left: 0, right: 0, bottom: 0 },
+          }}
+        >
+          <QueryClientProvider client={client}>
+            <ProfileRefreshBridge />
+          </QueryClientProvider>
+        </SafeAreaProvider>,
+      );
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(mockApiFetch).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        focusManager.setFocused(false);
+        focusManager.setFocused(true);
+        await Promise.resolve();
+      });
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      const refreshSignal = mockApiFetch.mock.calls[1]?.[1]?.signal as AbortSignal;
+
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(10_000);
+      });
+
+      // The fallback joins the in-flight refresh: the bridge's transport is
+      // neither aborted nor replaced by a third profile request. (A default
+      // cancelRefetch refetch cancels the in-flight work for the same key —
+      // TanStack only cancels once the query holds data, i.e. exactly this
+      // background-refresh shape — and re-issues the call.)
+      expect(mockApiFetch).toHaveBeenCalledTimes(2);
+      expect(refreshSignal.aborted).toBe(false);
+
+      // Deliver the parked notifications and the shared response; the gate
+      // still commits the profile and routes from it.
+      notifyManager.setScheduler((notify) => notify());
+      await act(async () => {
+        for (const notify of parkedNotifications.splice(0)) notify();
+        refreshRequest.resolve({ user: USER });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      await waitFor(() => expect(asMock(mockAuthValue.setUser)).toHaveBeenCalledWith(USER));
+      // `screen` is bound to the later bridge render's root, so query the
+      // gate's own container for its redirect.
+      expect(within(rendered.container).getByTestId('redirect')).toHaveTextContent('/home');
+      rendered.unmount();
+    } finally {
+      notifyManager.setScheduler((notify) => notify());
       jest.useRealTimers();
     }
   });

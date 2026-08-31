@@ -15,6 +15,7 @@ import RecordingPlayback, {
 } from '../src/components/RecordingPlayback';
 import { ApiError, apiDeleteRecording, apiGetRecordingPlaybackGrant } from '../src/lib/api';
 import {
+  AUDIO_MODE_OPERATION_TIMEOUT_MS,
   claimPlaybackOwner,
   configurePlaybackAudioMode,
   configureRecordingAudioMode,
@@ -659,6 +660,14 @@ describe('RecordingPlayback', () => {
     expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1);
     expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
     expect(screen.getByText(t('recordings.sharing'))).toBeTruthy();
+    // While the share owns the recording's native resources, Play reports the
+    // cross-operation busy state instead of a silent startPlayback no-op.
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: false });
+    expect(
+      screen.getByRole('button', { name: t('recordings.deleteAction') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: false });
 
     await act(async () => available.resolve(true));
     await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
@@ -1091,6 +1100,35 @@ describe('RecordingPlayback', () => {
     expect(players[0].remove).toHaveBeenCalledTimes(1);
     expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
     expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(getSubmittedRecordingPlaybackActive()).toBe(false);
+  });
+
+  it('fails preparation at the audio-mode deadline when the native audio mode never settles', async () => {
+    jest.useFakeTimers();
+    // The serialized audio-mode queue never settles, so the configure await
+    // inside preparation can only end through its deadline. One-shot so the
+    // shared mock keeps its resolving default for later tests.
+    mockSetAudioModeAsync.mockReturnValueOnce(new Promise<void>(() => undefined));
+    await renderPlayback();
+    const retainedPlay = rawButtonHandler(t('recordings.playLabel'));
+
+    await act(async () => {
+      retainedPlay();
+      await flushMicrotasks();
+    });
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => jest.advanceTimersByTimeAsync(AUDIO_MODE_OPERATION_TIMEOUT_MS - 1));
+    expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+    await act(async () => jest.advanceTimersByTimeAsync(1));
+    // Behaves exactly like the prepare-failure path: message, error phase, and
+    // every claimed resource released; no private file was claimed and no
+    // player was ever created because the configure await precedes both.
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+    expect(screen.getByText(t('common.tryAgain'))).toBeTruthy();
+    expect(players).toHaveLength(0);
+    expect(claimPrivatePlaybackFile).not.toHaveBeenCalled();
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
   });
 

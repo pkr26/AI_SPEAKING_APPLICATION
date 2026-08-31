@@ -1,11 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Express } from 'express';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { validatedAssessmentResponse } from '../src/idempotency';
 import { logger } from '../src/logger';
 import { assessmentResponseCases, type ResponseContext } from './assessment-response-corpus';
-import { answerForm, app, completeDiagnostic, pool, registerUser } from './helpers';
+import { answerForm, app, completeDiagnostic, createClosedPracticeCycle, pool, registerUser } from './helpers';
 
 const providerMocks = vi.hoisted(() => ({
   speaking: vi.fn(),
@@ -36,13 +38,25 @@ interface FrontendParsers {
   parseUserResponse(value: unknown): unknown;
 }
 
+interface FrontendReplayParser {
+  /** Structural subset of PendingAssessment the recovery parser actually reads. */
+  parseAssessmentReplayStatus(
+    value: unknown,
+    pending: { endpoint: string; questionId: string; cycleId?: string },
+  ): unknown;
+}
+
 let frontend: FrontendParsers;
+let frontendReplay: FrontendReplayParser;
 
 beforeAll(async () => {
-  // Keep this as a runtime import: the contract test intentionally executes the
+  // Keep these as runtime imports: the contract test intentionally executes the
   // app's real, pure response parsers without making the server TypeScript build
-  // own or compile frontend source.
+  // own or compile frontend source. assessment-replay.ts is importable the same
+  // way because its runtime graph (params/types) is pure — unlike api.ts, whose
+  // expo/react-native module graph only executes under the app's own test runner.
   frontend = (await vi.importActual('../../app/src/lib/types')) as FrontendParsers;
+  frontendReplay = (await vi.importActual('../../app/src/lib/assessment-replay')) as FrontendReplayParser;
 });
 
 beforeEach(() => {
@@ -105,6 +119,24 @@ function parseAppAssessment(context: ResponseContext, value: unknown): unknown {
     case 'practice-native':
       return frontend.parseNativeAttemptResult(value);
   }
+}
+
+/**
+ * Extract the quoted members of one authored literal (`what` names it for
+ * failures). Used where a definition is compile-time-only or lives in app
+ * source whose module graph cannot execute outside the app's own test runner;
+ * the literal text is exactly what each side ships, so reading it from source
+ * binds the same artifact an import would.
+ */
+function quotedLiterals(source: string, startMarker: string, endMarker: string, what: string): string[] {
+  const start = source.indexOf(startMarker);
+  expect(
+    start,
+    `${what}: start marker not found; update this contract test's extraction markers`,
+  ).toBeGreaterThanOrEqual(0);
+  const end = source.indexOf(endMarker, start);
+  expect(end, `${what}: end marker not found; update this contract test's extraction markers`).toBeGreaterThan(start);
+  return [...source.slice(start, end).matchAll(/'([^']+)'/g)].map((match) => match[1]);
 }
 
 describe('real API responses satisfy the mobile app parsers', () => {
@@ -380,5 +412,189 @@ describe('real API responses satisfy the mobile app parsers', () => {
     const exported = await request(a).get('/auth/me/data').set(bearer(user.token));
     expect(exported.status).toBe(200);
     expect(() => frontend.parseUserDataPage(exported.body)).not.toThrow();
+  });
+
+  it('keeps the server ApiErrorCode union and the app API_ERROR_CODES list in exact set parity', () => {
+    // Executing app/src/lib/api.ts here is impossible outside the app's own test
+    // runner: it module-loads expo-constants/expo-file-system/expo-secure-store/
+    // react-native and evaluates resolveBaseUrl() at import time, and those
+    // packages cannot execute under plain Node (Flow syntax in react-native,
+    // untransformed expo-modules-core TypeScript). The two authored literals
+    // below are the shipped artifacts — the server union exists only at compile
+    // time and the app array is what its bundler freezes — so reading them from
+    // source binds exactly what each side ships.
+    const serverCodes = quotedLiterals(
+      readFileSync(join(__dirname, '../src/middleware.ts'), 'utf8'),
+      'export type ApiErrorCode =',
+      ';',
+      'server ApiErrorCode union',
+    );
+    const appCodes = quotedLiterals(
+      readFileSync(join(__dirname, '../../app/src/lib/api.ts'), 'utf8'),
+      'export const API_ERROR_CODES = [',
+      '] as const;',
+      'app API_ERROR_CODES list',
+    );
+
+    expect(serverCodes.length, 'server ApiErrorCode extraction unexpectedly found no codes').toBeGreaterThan(0);
+    expect(appCodes.length, 'app API_ERROR_CODES extraction unexpectedly found no codes').toBeGreaterThan(0);
+    expect(new Set(serverCodes).size, 'server ApiErrorCode union has duplicate members').toBe(serverCodes.length);
+    expect(new Set(appCodes).size, 'app API_ERROR_CODES list has duplicate members').toBe(appCodes.length);
+
+    const appSet = new Set(appCodes);
+    const serverSet = new Set(serverCodes);
+    const onlyServer = serverCodes.filter((code) => !appSet.has(code));
+    const onlyApp = appCodes.filter((code) => !serverSet.has(code));
+
+    const explanation = [
+      'server/src/middleware.ts ApiErrorCode and app/src/lib/api.ts API_ERROR_CODES drifted.',
+      'Unknown NEW server codes degrade gracefully (the additive contract lets the app fall back to',
+      'status-based copy), but a rename or retype is silently breaking on both sides: the app keys',
+      'CAPACITY_BUSY 503 auto-retry, the AUDIO_UPLOAD_MISSING recovery refund/re-upload,',
+      'ASSESSMENT_RESULT_INCOMPATIBLE result retirement, and the CLIENT_UPGRADE_REQUIRED 426',
+      'forced-upgrade latch on exact code strings, while the server emits its union through every',
+      'error body. An intentional change must update both sides in one commit; a genuinely',
+      'non-additive shift must raise MIN_CLIENT_VERSION so older clients get 426 instead of misparsing.',
+    ].join(' ');
+
+    expect(onlyServer, `${explanation} Codes only the server defines: ${JSON.stringify(onlyServer)}.`).toEqual([]);
+    expect(onlyApp, `${explanation} Codes only the app recognizes: ${JSON.stringify(onlyApp)}.`).toEqual([]);
+  });
+
+  it('binds the explicit retainRecording string encoding to the durable per-request choice', async () => {
+    const a = app();
+    const user = await registerAndParse(a);
+    await completeDiagnostic(a, user.token);
+
+    const questionResponse = await request(a).get('/practice/question').set(bearer(user.token));
+    expect(questionResponse.status).toBe(200);
+    const practice = frontend.parsePracticeQuestion(questionResponse.body) as {
+      question: { id: string };
+      cycleId: string;
+    };
+
+    // Scored failures keep the serving cycle open, so both explicit choices ride
+    // the same three-try budget the way two real takes would.
+    providerMocks.speaking.mockReset().mockResolvedValue({
+      transcript: 'A deliberately short try.',
+      score: 50,
+      passed: false,
+      feedback: 'Add more relevant detail.',
+    });
+
+    const explicitTrueRequestId = randomUUID();
+    const explicitTrue = await answerForm(
+      request(a).post('/practice/attempt').set(bearer(user.token)),
+      practice.question.id,
+      explicitTrueRequestId,
+      practice.cycleId,
+      true,
+    );
+    expect(explicitTrue.status, JSON.stringify(explicitTrue.body)).toBe(200);
+    // Direct multipart mode has no retained object, so neither explicit choice
+    // may surface recordingId; only the durable claim records the learner's pick.
+    expect(explicitTrue.body.recordingId).toBeUndefined();
+    expect(() => frontend.parseAttemptResult(explicitTrue.body)).not.toThrow();
+
+    const explicitFalseRequestId = randomUUID();
+    const explicitFalse = await answerForm(
+      request(a).post('/practice/attempt').set(bearer(user.token)),
+      practice.question.id,
+      explicitFalseRequestId,
+      practice.cycleId,
+      false,
+    );
+    expect(explicitFalse.status, JSON.stringify(explicitFalse.body)).toBe(200);
+    expect(explicitFalse.body.recordingId).toBeUndefined();
+    expect(frontend.parseAttemptResult(explicitFalse.body)).toMatchObject({ passed: false });
+
+    for (const [requestId, expected] of [
+      [explicitTrueRequestId, true],
+      [explicitFalseRequestId, false],
+    ] as const) {
+      const claim = await pool.query<{ retain_recording: boolean }>(
+        'SELECT retain_recording FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+        [user.id, requestId],
+      );
+      expect(claim.rows, `durable retain_recording choice for ${requestId}`).toEqual([{ retain_recording: expected }]);
+      const retained = await pool.query<{ count: number }>(
+        'SELECT count(*)::int AS count FROM recordings WHERE user_id = $1 AND request_id = $2',
+        [user.id, requestId],
+      );
+      expect(retained.rows[0].count, `retained metadata rows for ${requestId}`).toBe(0);
+    }
+  });
+
+  it('parses the processing status-replay shape and keeps its ownership boundary', async () => {
+    const a = app();
+    const user = await registerAndParse(a);
+
+    const { rows: questions } = await pool.query<{
+      id: string;
+      cefrLevel: string;
+      promptWord: string;
+      questionText: string;
+    }>(
+      `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
+       FROM questions ORDER BY id LIMIT 1`,
+    );
+    const question = questions[0];
+    const cycleId = await createClosedPracticeCycle(user.id, question.id);
+    const requestId = randomUUID();
+    // Migration 024 requires every claim to snapshot the exact public question
+    // wording (migrations 005/006 fix the durable identity columns), so the
+    // fixture insert carries the full snapshot a live claim would persist.
+    await pool.query(
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, started_at, practice_cycle_id,
+          question_cefr_level, question_prompt_word, question_text)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', now(), $5, $6, $7, $8)`,
+      [
+        user.id,
+        requestId,
+        randomUUID(),
+        question.id,
+        cycleId,
+        question.cefrLevel,
+        question.promptWord,
+        question.questionText,
+      ],
+    );
+
+    const processing = await request(a).get(`/assessments/${requestId}`).set(bearer(user.token));
+    expect(processing.status).toBe(200);
+    expect(processing.body).toEqual({
+      status: 'processing',
+      context: 'practice',
+      questionId: question.id,
+      cycleId,
+      question: {
+        id: question.id,
+        cefrLevel: question.cefrLevel,
+        promptWord: question.promptWord,
+        questionText: question.questionText,
+      },
+    });
+
+    // The app's recovery validator must accept the exact route payload for the
+    // same durable handoff identity (endpoint/question/cycle) — what a polling
+    // client runs on every tick after a lost response.
+    const parsed = frontendReplay.parseAssessmentReplayStatus(processing.body, {
+      endpoint: '/practice/attempt',
+      questionId: question.id,
+      cycleId,
+    }) as { status: string; context: string; questionId: string; cycleId: string | null };
+    expect(parsed).toMatchObject({ status: 'processing', context: 'practice', questionId: question.id, cycleId });
+
+    // Owner-scoped: a foreign token receives the route's uniform 404, identical
+    // to a requestId that never existed — no cross-owner existence oracle.
+    const stranger = await registerAndParse(a);
+    const foreign = await request(a).get(`/assessments/${requestId}`).set(bearer(stranger.token));
+    expect(foreign.status).toBe(404);
+    expect(foreign.body).toEqual({ error: 'Assessment request not found', code: 'NOT_FOUND' });
+
+    const missing = await request(a).get(`/assessments/${randomUUID()}`).set(bearer(user.token));
+    expect(missing.status).toBe(404);
+    expect(missing.body).toEqual({ error: 'Assessment request not found', code: 'NOT_FOUND' });
   });
 });

@@ -13,6 +13,9 @@ import {
   notifyPendingAssessmentReplayReady,
   parsePendingAssessment,
   pendingAssessmentFeedbackIsExpired,
+  PENDING_ASSESSMENT_ENDPOINTS,
+  PENDING_ASSESSMENT_STAGES,
+  PENDING_ASSESSMENT_SCHEMA_VERSION,
   PENDING_FEEDBACK_RETENTION_MS,
   savePendingAssessment,
   subscribeToPendingAssessmentReplay,
@@ -1388,5 +1391,182 @@ describe('pending assessment edge cases', () => {
     await expect(saving).rejects.toBe(storageFailure);
     await expect(loadingAfterFailure).resolves.toEqual(pending);
     expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(pending);
+  });
+
+  it('pins the enum-list plus schema-version digest: adding a stage/endpoint enum requires bumping PENDING_ASSESSMENT_SCHEMA_VERSION (storage key) and updating this pinned digest — an older binary must never parse-and-delete a newer-format handoff', () => {
+    // Deterministic FNV-1a over the canonical JSON of the runtime enum lists
+    // and the schema version that derives the storage key. Any enum addition
+    // that skips the version bump fails here instead of silently letting an
+    // older supported binary destroy a newer-format handoff.
+    function fnv1a32(input: string): string {
+      let hash = 0x811c9dc5;
+      for (let index = 0; index < input.length; index += 1) {
+        hash ^= input.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+      }
+      return `0x${(hash >>> 0).toString(16).padStart(8, '0')}`;
+    }
+
+    const canonical = JSON.stringify({
+      schemaVersion: PENDING_ASSESSMENT_SCHEMA_VERSION,
+      stages: PENDING_ASSESSMENT_STAGES,
+      endpoints: PENDING_ASSESSMENT_ENDPOINTS,
+    });
+
+    expect(fnv1a32(canonical)).toBe('0xe24761b5');
+  });
+
+  describe('forward-incompatible (newer-schema) stored handoffs', () => {
+    it('does not delete a stored handoff whose stage enum is newer than this binary', async () => {
+      const { secureStore, mod } = loadFresh();
+      const newerStage = { ...pending, stage: 'handed-off-v2' };
+      mockStorage.set(STORAGE_KEY, JSON.stringify(newerStage));
+      jest.mocked(secureStore.getItemAsync).mockClear();
+      jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+      expect(await mod.loadPendingAssessment()).toBeNull();
+      expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+      expect(mockStorage.has(STORAGE_KEY)).toBe(true);
+
+      // The cached forward-incompatible outcome keeps later loads from both
+      // deleting the newer-format record and re-reading the store for it.
+      expect(await mod.loadPendingAssessment()).toBeNull();
+      expect(secureStore.getItemAsync).toHaveBeenCalledTimes(1);
+      expect(mockStorage.has(STORAGE_KEY)).toBe(true);
+    });
+
+    it('does not delete a stored handoff whose endpoint enum is newer than this binary', async () => {
+      const { secureStore, mod } = loadFresh();
+      mockStorage.set(
+        STORAGE_KEY,
+        JSON.stringify({ ...pending, endpoint: '/practice/attempt/mnemonic' }),
+      );
+
+      expect(await mod.loadPendingAssessment()).toBeNull();
+      expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+      expect(mockStorage.has(STORAGE_KEY)).toBe(true);
+    });
+
+    it('refuses to overwrite a forward-incompatible handoff instead of installing a candidate', async () => {
+      const { secureStore, mod } = loadFresh();
+      const newerRecord = { ...pending, stage: 'graded-v2' };
+      mockStorage.set(STORAGE_KEY, JSON.stringify(newerRecord));
+      const generation = mod.capturePendingAssessmentGeneration();
+      jest.mocked(secureStore.setItemAsync).mockClear();
+
+      await expect(
+        mod.ensurePendingAssessment(
+          {
+            ...pending,
+            requestId: '550e8400-e29b-41d4-a716-446655440044',
+            stage: 'prepared',
+          },
+          generation,
+        ),
+      ).resolves.toBeNull();
+      expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+      expect(JSON.parse(mockStorage.get(STORAGE_KEY) ?? '{}')).toEqual(newerRecord);
+    });
+
+    it('still deletes a structurally invalid record even when its stage enum is unknown', async () => {
+      const { secureStore, mod } = loadFresh();
+      mockStorage.set(
+        STORAGE_KEY,
+        JSON.stringify({ ...pending, stage: 'graded-v2', createdAt: 0 }),
+      );
+
+      expect(await mod.loadPendingAssessment()).toBeNull();
+      expect(secureStore.deleteItemAsync).toHaveBeenCalled();
+      expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+    });
+
+    it('still deletes a record whose endpoint is not a string at all', async () => {
+      const { secureStore, mod } = loadFresh();
+      mockStorage.set(STORAGE_KEY, JSON.stringify({ ...pending, endpoint: 7 }));
+
+      expect(await mod.loadPendingAssessment()).toBeNull();
+      expect(secureStore.deleteItemAsync).toHaveBeenCalled();
+      expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+    });
+
+    it('still lets an explicit unconditional clear remove a forward-incompatible handoff', async () => {
+      const { secureStore, mod } = loadFresh();
+      mockStorage.set(STORAGE_KEY, JSON.stringify({ ...pending, stage: 'graded-v2' }));
+      jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+      await mod.clearPendingAssessment();
+
+      expect(secureStore.deleteItemAsync).toHaveBeenCalledTimes(1);
+      expect(mockStorage.has(STORAGE_KEY)).toBe(false);
+    });
+
+    it('keeps a forward-incompatible handoff through a request-conditional clear', async () => {
+      const { secureStore, mod } = loadFresh();
+      mockStorage.set(STORAGE_KEY, JSON.stringify({ ...pending, stage: 'graded-v2' }));
+      jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+      await expect(mod.clearPendingAssessmentIfRequestMatches(pending.requestId)).resolves.toBe(
+        false,
+      );
+      await expect(mod.clearPendingAssessment(pending.requestId)).resolves.toBeUndefined();
+
+      expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+      expect(mockStorage.has(STORAGE_KEY)).toBe(true);
+    });
+
+    it('identifies forward-incompatible records without exposing a parse result', () => {
+      const { mod } = loadFresh();
+
+      expect(mod.pendingAssessmentIsForwardIncompatible({ ...pending, stage: 'graded-v2' })).toBe(
+        true,
+      );
+      expect(
+        mod.pendingAssessmentIsForwardIncompatible({
+          ...pending,
+          endpoint: '/practice/attempt/mnemonic',
+        }),
+      ).toBe(true);
+      expect(mod.pendingAssessmentIsForwardIncompatible(pending)).toBe(false);
+      expect(
+        mod.pendingAssessmentIsForwardIncompatible({
+          ...pending,
+          stage: 'graded-v2',
+          createdAt: 0,
+        }),
+      ).toBe(false);
+      expect(mod.pendingAssessmentIsForwardIncompatible('{not-json')).toBe(false);
+      expect(mod.pendingAssessmentIsForwardIncompatible(null)).toBe(false);
+    });
+  });
+
+  describe('synchronous unconditional-clear generation advance', () => {
+    it('advances the generation synchronously without any storage access', async () => {
+      const { secureStore, mod } = loadFresh();
+      const generation = mod.capturePendingAssessmentGeneration();
+      jest.mocked(secureStore.getItemAsync).mockClear();
+      jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+      mod.advanceUnconditionalClearGeneration();
+
+      expect(mod.capturePendingAssessmentGeneration()).toBe(generation + 1);
+      expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+      expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+    });
+
+    it('refuses an old-generation creator once the generation advanced synchronously', async () => {
+      const { secureStore, mod } = loadFresh();
+      const staleGeneration = mod.capturePendingAssessmentGeneration();
+      mod.advanceUnconditionalClearGeneration();
+      const getItem = jest.mocked(secureStore.getItemAsync);
+      const setItem = jest.mocked(secureStore.setItemAsync);
+      getItem.mockClear();
+      setItem.mockClear();
+
+      await expect(
+        mod.ensurePendingAssessment({ ...pending, stage: 'prepared' }, staleGeneration),
+      ).resolves.toBeNull();
+      expect(getItem).not.toHaveBeenCalled();
+      expect(setItem).not.toHaveBeenCalled();
+    });
   });
 });

@@ -30,6 +30,7 @@ const MANAGED_KEYS = [
   'GRADING_MODEL',
   'SHUTDOWN_DRAIN_MS',
   'METRICS_ENABLED',
+  'METRICS_BEARER_TOKEN',
   'ADS_ENABLED',
   'ADS_AUDIENCE_MODE',
   'ADS_HOME_BANNER_ENABLED',
@@ -179,6 +180,7 @@ describe('config env validation', () => {
     expect(config.gradingModel).toBe('gpt-4o-mini-2024-07-18');
     expect(config.shutdownDrainMs).toBe(140_000);
     expect(config.metricsEnabled).toBe(false);
+    expect(config.metricsBearerToken).toBe('');
     expect(config.ads).toEqual({
       enabled: false,
       audienceMode: 'unknown',
@@ -418,6 +420,33 @@ describe('config env validation', () => {
     expect((await loadConfig(baseEnv({ METRICS_ENABLED: '1' }))).metricsEnabled).toBe(true);
     expect((await loadConfig(baseEnv({ METRICS_ENABLED: '0' }))).metricsEnabled).toBe(false);
     await expectInvalid(baseEnv({ METRICS_ENABLED: 'on' }), "must be one of 'true', 'false', '1', or '0'");
+  });
+
+  it('validates the optional metrics scrape bearer token', async () => {
+    const message =
+      'METRICS_BEARER_TOKEN must be at least 32 characters (or empty to keep /metrics private-network only)';
+    const token = 'metrics-scrape-bearer-token-0123456789abcdef';
+
+    // Empty default and whitespace-only input keep the unauthenticated
+    // private-network posture.
+    expect((await loadConfig(baseEnv({}))).metricsBearerToken).toBe('');
+    expect((await loadConfig(baseEnv({ METRICS_BEARER_TOKEN: '   ' }))).metricsBearerToken).toBe('');
+
+    // A real token survives verbatim after trimming.
+    expect((await loadConfig(baseEnv({ METRICS_BEARER_TOKEN: ` ${token} ` }))).metricsBearerToken).toBe(token);
+    expect((await loadConfig(baseEnv({ METRICS_BEARER_TOKEN: 'b'.repeat(32) }))).metricsBearerToken).toBe(
+      'b'.repeat(32),
+    );
+
+    // Anything non-empty but shorter than 32 characters fails boot with the
+    // operator-facing reason — including padding that cannot rescue it.
+    await expectSingleInvalidIssue(baseEnv({ METRICS_BEARER_TOKEN: 'short' }), 'METRICS_BEARER_TOKEN', message);
+    await expectSingleInvalidIssue(baseEnv({ METRICS_BEARER_TOKEN: 'c'.repeat(31) }), 'METRICS_BEARER_TOKEN', message);
+    await expectSingleInvalidIssue(
+      baseEnv({ METRICS_BEARER_TOKEN: ` ${'c'.repeat(31)} ` }),
+      'METRICS_BEARER_TOKEN',
+      message,
+    );
   });
 
   it('parses the fail-closed ads policy and rejects unsupported audience modes', async () => {

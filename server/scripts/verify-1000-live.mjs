@@ -352,6 +352,18 @@ function successfulS3Outcome(outcome) {
   ]).has(outcome);
 }
 
+// The complete set of object lifecycle states load-1000-live.mjs actually
+// writes (auditAndCleanupS3 / the per-object upload/assessment helpers). An
+// outcome outside this set means the producer schema drifted and the verifier
+// must fail loudly instead of misreading the row.
+const KNOWN_S3_OUTCOMES = new Set([
+  'granted',
+  'uploaded',
+  'upload-failed',
+  'assessment-completed',
+  'assessment-failed',
+]);
+
 function forbiddenLedgerPaths(value, currentPath = '$', found = []) {
   if (typeof value === 'string') {
     const sensitiveValue =
@@ -1964,10 +1976,20 @@ async function main() {
       },
     );
     const catalogDigest = jsonDigest(actualCatalog);
-    const expectedCatalogDigest = normalizeDigest(run.expectedCatalogDigest ?? run.catalogDigest);
-    if (expectedCatalogDigest) {
-      check('catalog', 'catalog content digest is unchanged', catalogDigest === expectedCatalogDigest);
-    }
+    // The producer records the packaged catalog digest of the generation this
+    // campaign ran against (ledger.run.catalogDigest). Fail loudly when the
+    // field is absent or malformed — silently skipping would let a catalog
+    // swap between load run and reconciliation go unnoticed.
+    const ledgerCatalogDigest = normalizeDigest(run.catalogDigest);
+    check('catalog', 'ledger records the run catalog digest', ledgerCatalogDigest !== undefined, {
+      missingField: 'run.catalogDigest',
+      actualDigest: catalogDigest,
+      ledgerCatalogDigest: run.catalogDigest ?? null,
+    });
+    check('catalog', 'catalog content digest is unchanged', ledgerCatalogDigest === catalogDigest, {
+      actualDigest: catalogDigest,
+      ledgerCatalogDigest: run.catalogDigest ?? null,
+    });
 
     const rateLimitsResult = await client.query(
       `SELECT split_part(namespace, ':', 1) AS namespace, sum(hits)::bigint AS hits
@@ -2196,14 +2218,31 @@ async function main() {
       if (object.cleanupAttempted === true) {
         check(scope, 'explicit cleanup left no object', object.absentAfterCleanup === true);
       }
+      // Fail loudly on producer-schema drift instead of silently skipping an
+      // audit row the verifier no longer understands.
+      const missingObjectFields = ['outcome', 'absentAfterCleanup', 'allVersionsAbsentFinal'].filter(
+        (field) => object[field] === undefined,
+      );
+      check(scope, 'object audit row is complete', missingObjectFields.length === 0, {
+        missingFields: missingObjectFields.map((field) => `s3Audit.objects[].${field}`),
+      });
+      check(scope, 'object outcome is a known S3 lifecycle state', KNOWN_S3_OUTCOMES.has(object.outcome), {
+        actualOutcome: object.outcome ?? null,
+        knownOutcomes: [...KNOWN_S3_OUTCOMES].sort(),
+      });
+      // The audit force-cleans every load-owned key, so the only explained
+      // final state is proven absence (absentAfterCleanup and its recorded
+      // projection allVersionsAbsentFinal); there is no retained-or-rejected
+      // terminal state to fall back to.
       check(
         scope,
-        'object has an explained final state',
-        object.allVersionsAbsentFinal === true ||
-          object.absentAfterCleanup === true ||
-          object.retainedExpected === true ||
-          object.uploaded === false ||
-          object.outcome === 'policy-rejected',
+        'object reaches an explained final state',
+        object.absentAfterCleanup === true && object.allVersionsAbsentFinal === true,
+        {
+          absentAfterCleanup: object.absentAfterCleanup ?? null,
+          allVersionsAbsentFinal: object.allVersionsAbsentFinal ?? null,
+          outcome: object.outcome ?? null,
+        },
       );
     }
     const successfulObjectCount = s3Objects.filter((object) => successfulS3Outcome(object.outcome)).length;
@@ -2227,49 +2266,72 @@ async function main() {
       successfulObjectCount === expectedCompletedRequestsFromUsers,
       { actual: successfulObjectCount, expected: expectedCompletedRequestsFromUsers },
     );
+    // The producer emits exactly these counts (load-1000-live.mjs
+    // auditAndCleanupS3): total, uploaded, successfulAssessments,
+    // successfulRetainedAndPlayed, backendDeletedAllVersions,
+    // cleanupAttempted, absentAfterCleanup, auditFailures — there is no
+    // cleanupFailures field. Every declared count must be present (a missing
+    // or non-integer field fails loudly naming the field) and exact; absent
+    // counts previously let this whole summary verify silently as skipped.
     const s3Counts = ledger.s3Audit?.counts;
-    if (s3Counts && typeof s3Counts === 'object') {
-      if (asInteger(s3Counts.total) !== undefined) {
-        check('s3', 'declared object audit total is exact', s3Counts.total === s3Objects.length, {
-          actual: s3Objects.length,
-          expected: s3Counts.total,
-        });
-      }
-      if (asInteger(s3Counts.successfulAssessments) !== undefined) {
-        check(
-          's3',
-          'declared successful-assessment count is exact',
-          s3Counts.successfulAssessments === successfulObjectCount,
-          { actual: successfulObjectCount, expected: s3Counts.successfulAssessments },
-        );
-      }
-      if (asInteger(s3Counts.successfulRetainedAndPlayed) !== undefined) {
-        check(
-          's3',
-          'retained playback count is exact',
-          s3Counts.successfulRetainedAndPlayed ===
-            s3Objects.filter((object) => object.expectedRetainedAfterSuccess && object.retainedAfterSuccess).length,
-        );
-      }
-      if (asInteger(s3Counts.backendDeletedAllVersions) !== undefined) {
-        check(
-          's3',
-          'backend all-version deletion count is exact',
-          s3Counts.backendDeletedAllVersions ===
-            s3Objects.filter((object) => object.deletionRequested && object.allVersionsAbsentAfterDeletion).length,
-        );
-      }
-      if (asInteger(s3Counts.cleanupFailures) !== undefined) {
-        check('s3', 'declared cleanup failures are zero', s3Counts.cleanupFailures === 0, {
-          actual: s3Counts.cleanupFailures,
-        });
-      }
-      if (asInteger(s3Counts.auditFailures) !== undefined) {
-        check('s3', 'S3 audit reports zero failures', s3Counts.auditFailures === 0, {
-          actual: s3Counts.auditFailures,
-        });
-      }
-    }
+    check('s3', 'ledger declares the S3 audit count summary', s3Counts !== null && typeof s3Counts === 'object', {
+      missingField: 's3Audit.counts',
+      actualType: s3Counts === null ? 'null' : typeof s3Counts,
+    });
+    const requiredS3Count = (name) => {
+      const value = s3Counts?.[name];
+      check('s3', `S3 audit count "${name}" is a present integer`, asInteger(value) !== undefined, {
+        missingField: `s3Audit.counts.${name}`,
+        actual: value ?? null,
+      });
+      return value;
+    };
+    check('s3', 'declared object audit total is exact', requiredS3Count('total') === s3Objects.length, {
+      actual: s3Objects.length,
+      expected: s3Counts?.total ?? null,
+    });
+    check(
+      's3',
+      'declared successful-assessment count is exact',
+      requiredS3Count('successfulAssessments') === successfulObjectCount,
+      { actual: successfulObjectCount, expected: s3Counts?.successfulAssessments ?? null },
+    );
+    check(
+      's3',
+      'retained playback count is exact',
+      requiredS3Count('successfulRetainedAndPlayed') ===
+        s3Objects.filter((object) => object.expectedRetainedAfterSuccess && object.retainedAfterSuccess).length,
+      { expected: s3Counts?.successfulRetainedAndPlayed ?? null },
+    );
+    check(
+      's3',
+      'backend all-version deletion count is exact',
+      requiredS3Count('backendDeletedAllVersions') ===
+        s3Objects.filter((object) => object.deletionRequested && object.allVersionsAbsentAfterDeletion).length,
+      { expected: s3Counts?.backendDeletedAllVersions ?? null },
+    );
+    check(
+      's3',
+      'declared harness cleanup count is exact',
+      requiredS3Count('cleanupAttempted') === s3Objects.filter((object) => object.cleanupAttempted === true).length,
+      { expected: s3Counts?.cleanupAttempted ?? null },
+    );
+    const declaredAbsentAfterCleanup = requiredS3Count('absentAfterCleanup');
+    check(
+      's3',
+      'declared absent-after-cleanup count is exact',
+      declaredAbsentAfterCleanup === s3Objects.filter((object) => object.absentAfterCleanup === true).length,
+      { expected: declaredAbsentAfterCleanup ?? null },
+    );
+    check(
+      's3',
+      'S3 cleanup fully verified: every audited key ended absent',
+      declaredAbsentAfterCleanup === s3Counts?.total && declaredAbsentAfterCleanup === s3Objects.length,
+      { total: s3Counts?.total ?? null, absentAfterCleanup: declaredAbsentAfterCleanup ?? null },
+    );
+    check('s3', 'S3 audit reports zero failures', requiredS3Count('auditFailures') === 0, {
+      actual: s3Counts?.auditFailures ?? null,
+    });
 
     const globalFailures = Array.isArray(ledger.failures) ? ledger.failures : [];
     check('ledger', 'run contains no global failures', globalFailures.length === 0, {

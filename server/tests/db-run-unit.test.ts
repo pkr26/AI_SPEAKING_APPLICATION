@@ -70,6 +70,12 @@ function provideClient(
   return client;
 }
 
+/** Assigning undefined to process.env stores the string "undefined", so unset means delete. */
+function restoreNodeEnv(previous: string | undefined): void {
+  if (previous === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = previous;
+}
+
 beforeEach(() => {
   pgMock.clients.length = 0;
   pgMock.options.length = 0;
@@ -779,6 +785,155 @@ describe('database deployment runner', () => {
       expect(actions.catalog).toHaveBeenCalledWith('postgres://localhost:5432/command_test');
     } finally {
       process.env.NODE_ENV = previousNodeEnv;
+    }
+  });
+
+  it('allows setup and seed with NODE_ENV unset against loopback hosts', async () => {
+    const actions = {
+      migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
+      seed: vi.fn(async () => undefined),
+      setup: vi.fn(async () => undefined),
+    } as unknown as DatabaseCommandActions;
+    const previousNodeEnv = process.env.NODE_ENV;
+    delete process.env.NODE_ENV;
+
+    try {
+      for (const databaseUrl of [
+        'postgres://localhost:5432/command_test',
+        'postgres://LOCALHOST:5432/command_test',
+        'postgres://localhost.:5432/command_test',
+        'postgres://127.0.0.1:5432/command_test',
+        'postgres://127.20.30.40:5432/command_test',
+        'postgres://[::1]:5432/command_test',
+      ]) {
+        for (const command of ['setup', 'seed'] as const) {
+          await expect(runDatabaseCommand(databaseUrl, command, actions)).resolves.toBeUndefined();
+          expect(actions[command]).toHaveBeenCalledWith(databaseUrl);
+        }
+      }
+
+      expect(actions.setup).toHaveBeenCalledTimes(6);
+      expect(actions.seed).toHaveBeenCalledTimes(6);
+      expect(actions.migrate).not.toHaveBeenCalled();
+      expect(actions.catalog).not.toHaveBeenCalled();
+    } finally {
+      restoreNodeEnv(previousNodeEnv);
+    }
+  });
+
+  it('refuses setup and seed with NODE_ENV unset against non-loopback hosts', async () => {
+    const actions = {
+      migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
+      seed: vi.fn(async () => undefined),
+      setup: vi.fn(async () => undefined),
+    } as unknown as DatabaseCommandActions;
+    const previousNodeEnv = process.env.NODE_ENV;
+    delete process.env.NODE_ENV;
+
+    try {
+      // A bare ::1 authority is not a parseable WHATWG URL host, so the
+      // guard refuses instead of guessing it to be loopback. Query strings
+      // and fragments fail closed too: pg-connection-string lets ?host=
+      // override the authority host, so a loopback-looking URL with a
+      // search/hash component must not be trusted as loopback.
+      for (const databaseUrl of [
+        'postgres://db.example.internal:5432/command_test',
+        'postgres://10.0.0.5:5432/command_test',
+        'postgres://::1:5432/command_test',
+        'postgres://localhost:5432/command_test?host=10.0.0.5',
+        'postgres://localhost:5432/command_test?sslmode=require',
+        'postgres://localhost:5432/command_test#fragment',
+      ]) {
+        await expect(runDatabaseCommand(databaseUrl, 'setup', actions)).rejects.toThrow(
+          `refusing to run "setup" with NODE_ENV unset against a non-loopback database host; set NODE_ENV explicitly - ` +
+            `"production" to keep a production host refusing destructive commands (use "npm run db:migrate:prod" and "npm run db:catalog:prod" there) ` +
+            `or "development" to confirm non-production intent`,
+        );
+        await expect(runDatabaseCommand(databaseUrl, 'seed', actions)).rejects.toThrow(
+          'refusing to run "seed" with NODE_ENV unset against a non-loopback database host',
+        );
+      }
+
+      expect(actions.setup).not.toHaveBeenCalled();
+      expect(actions.seed).not.toHaveBeenCalled();
+    } finally {
+      restoreNodeEnv(previousNodeEnv);
+    }
+  });
+
+  it('treats an empty NODE_ENV like an unset one against non-loopback hosts', async () => {
+    const actions = {
+      migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
+      seed: vi.fn(async () => undefined),
+      setup: vi.fn(async () => undefined),
+    } as unknown as DatabaseCommandActions;
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = '';
+
+    try {
+      await expect(
+        runDatabaseCommand('postgres://db.example.internal:5432/command_test', 'setup', actions),
+      ).rejects.toThrow('refusing to run "setup" with NODE_ENV unset against a non-loopback database host');
+      expect(actions.setup).not.toHaveBeenCalled();
+    } finally {
+      restoreNodeEnv(previousNodeEnv);
+    }
+  });
+
+  it.each(['development', 'staging', 'test'] as const)(
+    'allows setup and seed with an explicit NODE_ENV=%s against non-loopback hosts',
+    async (nodeEnv) => {
+      const actions = {
+        migrate: vi.fn(async () => []),
+        catalog: vi.fn(async () => undefined),
+        seed: vi.fn(async () => undefined),
+        setup: vi.fn(async () => undefined),
+      } as unknown as DatabaseCommandActions;
+      const previousNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = nodeEnv;
+
+      try {
+        await expect(
+          runDatabaseCommand('postgres://db.example.internal:5432/command_test', 'setup', actions),
+        ).resolves.toBeUndefined();
+        await expect(
+          runDatabaseCommand('postgres://db.example.internal:5432/command_test', 'seed', actions),
+        ).resolves.toBeUndefined();
+
+        expect(actions.setup).toHaveBeenCalledOnce();
+        expect(actions.seed).toHaveBeenCalledOnce();
+      } finally {
+        restoreNodeEnv(previousNodeEnv);
+      }
+    },
+  );
+
+  it('keeps the production refusal in charge for non-loopback hosts', async () => {
+    const actions = {
+      migrate: vi.fn(async () => []),
+      catalog: vi.fn(async () => undefined),
+      seed: vi.fn(async () => undefined),
+      setup: vi.fn(async () => undefined),
+    } as unknown as DatabaseCommandActions;
+    const previousNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+
+    try {
+      for (const command of ['setup', 'seed'] as const) {
+        await expect(
+          runDatabaseCommand('postgres://db.example.internal:5432/command_test', command, actions),
+        ).rejects.toThrow(
+          `refusing to run "${command}" with NODE_ENV=production; production deploys must use "npm run db:migrate:prod" and "npm run db:catalog:prod"`,
+        );
+      }
+
+      expect(actions.setup).not.toHaveBeenCalled();
+      expect(actions.seed).not.toHaveBeenCalled();
+    } finally {
+      restoreNodeEnv(previousNodeEnv);
     }
   });
 });

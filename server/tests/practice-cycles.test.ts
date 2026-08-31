@@ -310,10 +310,7 @@ describe('practice statistics learner time zone', () => {
     const invalid = await request(a)
       .get('/practice/stats?timeZone=Definitely%2FNot_A_Zone')
       .set('Authorization', `Bearer ${token}`);
-    expect(invalid.status).toBe(400);
-    expect(invalid.body).toEqual({
-      error: 'timeZone must be a valid IANA time zone',
-      code: 'VALIDATION_FAILED',
-    });
+    expect(invalid.status).toBe(200);
+    expect(invalid.body).toMatchObject({ timeZone: 'UTC' });
   });
 });

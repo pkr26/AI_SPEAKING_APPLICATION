@@ -1483,7 +1483,8 @@ describe('error response parsing', () => {
     expect(error).toMatchObject({ status: 400, code: 'VALIDATION_FAILED' });
   });
 
-  it('preserves a timeout while reading a non-ok response body', async () => {
+  it('preserves the real status when a non-ok error body outlives its read budget', async () => {
+    jest.useFakeTimers();
     const cancel = jest.fn(async () => undefined);
     fetchMock.mockResolvedValueOnce({
       ...fakeResponse({
@@ -1494,11 +1495,166 @@ describe('error response parsing', () => {
       body: { cancel },
     } as unknown as Response);
 
-    await expect(api.apiFetch('/stalled-error', { timeoutMs: 10 })).rejects.toMatchObject({
-      status: 408,
-      message: 'The response timed out. Please check your connection and try again.',
+    try {
+      const request = catchAsync(api.apiFetch('/stalled-error', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+      await expect(request).resolves.toMatchObject({
+        status: 500,
+        message: 'Request failed with status 500',
+        retryAfterSeconds: undefined,
+      });
+      expect(cancel).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('preserves a 429 status and its header retry hint when the error body hangs', async () => {
+    jest.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 429,
+        headers: { 'Retry-After': '3600' },
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    try {
+      const request = catchAsync(api.apiFetch('/slow-limited', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+      const error = (await request) as ApiErrorInstance;
+      expect(error).toBeInstanceOf(api.ApiError);
+      expect(error).not.toMatchObject({ status: 408 });
+      expect(error).toMatchObject({
+        status: 429,
+        message: 'Request failed with status 429',
+        retryAfterSeconds: 3600,
+        code: undefined,
+        retryAfterHours: undefined,
+      });
+      // No code survived the unreadable body, so status-based copy applies.
+      expect(api.userMessageForError(error, 'Fallback')).toBe(
+        `${t('error.tooMany')} ${t('wait.hour')}`,
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('preserves a 409 status and its bounded header retry hint when the error body hangs', async () => {
+    jest.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 409,
+        headers: { 'Retry-After': '45' },
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    try {
+      const request = catchAsync(api.apiFetch('/slow-conflict', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+      const error = (await request) as ApiErrorInstance;
+      expect(error).toBeInstanceOf(api.ApiError);
+      expect(error).not.toMatchObject({ status: 408 });
+      expect(error).toMatchObject({
+        status: 409,
+        message: 'Request failed with status 409',
+        retryAfterSeconds: 45,
+        code: undefined,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('drops an unparseable 429 Retry-After header when the error body hangs', async () => {
+    jest.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 429,
+        headers: { 'Retry-After': 'Wed, 21 Oct 2015 07:28:00 GMT' },
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    try {
+      const request = catchAsync(api.apiFetch('/slow-limited-date', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+      await expect(request).resolves.toMatchObject({
+        status: 429,
+        retryAfterSeconds: undefined,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the ok-response body timeout on the whole-request remainder', async () => {
+    // A SUCCESSFUL response whose body stalls still becomes the local 408: no
+    // real error outcome exists to preserve, and the request budget governs.
+    jest.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: true,
+        status: 200,
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    try {
+      const request = catchAsync(api.apiFetch('/slow-success', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(10);
+
+      await expect(request).resolves.toMatchObject({
+        status: 408,
+        message: 'The response timed out. Please check your connection and try again.',
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('uses the dedicated error-body budget even when the request budget is nearly exhausted', async () => {
+    jest.useFakeTimers();
+    const response = deferred<Response>();
+    const fetchStarted = deferred<void>();
+    const timeoutSpy = jest.spyOn(globalThis, 'setTimeout');
+    fetchMock.mockImplementationOnce(async () => {
+      fetchStarted.resolve();
+      return response.promise;
     });
-    expect(cancel).toHaveBeenCalledTimes(1);
+
+    try {
+      const request = catchAsync(api.apiFetch('/late-headers-error', { timeoutMs: 100 }));
+      await expectBarrierBeforeSettlement(fetchStarted.promise, request);
+      // Headers land 99ms into a 100ms budget; the error-body read must still
+      // receive the full dedicated budget, not a 1ms remainder.
+      jest.advanceTimersByTime(99);
+      response.resolve(
+        fakeResponse({
+          ok: false,
+          status: 429,
+          headers: { 'Retry-After': '60' },
+          json: async () => ({ code: 'RATE_LIMITED' }),
+        }),
+      );
+      await request;
+
+      const bodyReadDelay = timeoutSpy.mock.calls[1]?.[1];
+      expect(bodyReadDelay).toBe(api.ERROR_BODY_READ_BUDGET_MS);
+      timeoutSpy.mockRestore();
+    } finally {
+      timeoutSpy.mockRestore();
+      jest.useRealTimers();
+    }
   });
 
   it('ignores codes outside the allowlist and falls back to the status mapping', async () => {

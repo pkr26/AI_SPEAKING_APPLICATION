@@ -61,6 +61,12 @@ const deletedIds = new Set(deleted.map((u) => u.id));
 const aliveIds = alive.map((u) => u.id);
 
 const sum = (list, fn) => list.reduce((total, item) => total + fn(item), 0);
+// The orphan-email scan matches a literal prefix whose run ids contain `_`
+// (runId is `<timestamp>_<uuid8>`); LIKE must treat those as literal
+// characters, not single-character wildcards (mirrors verify-1000-live.mjs).
+function escapeLikePrefix(value) {
+  return value.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_');
+}
 const expectedProgressForUser = (user) => {
   const byQuestion = new Map();
   for (const attempt of user.englishAttempts) {
@@ -162,8 +168,8 @@ try {
   check('users: every alive user completed the diagnostic', diagnosed.n === expected.aliveUsers, `db=${diagnosed.n}`);
 
   const orphanUsers = await scalar(
-    'SELECT count(*)::int AS n FROM users WHERE email LIKE $1 AND id <> ALL($2::uuid[])',
-    [`load1000_${ledger.runId}_%`, registered.map((u) => u.id)],
+    "SELECT count(*)::int AS n FROM users WHERE email LIKE $1 ESCAPE '\\' AND id <> ALL($2::uuid[])",
+    [`${escapeLikePrefix(`load1000_${ledger.runId}_`)}%`, registered.map((u) => u.id)],
   );
   check('users: no rows outside the ledger for this run', orphanUsers.n === 0, `db=${orphanUsers.n}`);
 

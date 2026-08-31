@@ -117,6 +117,74 @@ describe('counter HMAC key derivation', () => {
   });
 });
 
+describe('limiter namespace stability', () => {
+  // Namespaces are the semantic limiter names only — never window/max config.
+  // The namespace is HMAC key material, so a config-suffixed namespace would
+  // abandon every in-flight window the moment a knob changes (an attacker
+  // mid-brute-force receives a fresh budget exactly when an operator TIGHTENS
+  // a limit) and would make divergent-env replicas during a rolling deploy
+  // enforce disjoint budgets against the same database. Pin the invariant this
+  // design exists for: the same semantic name under DIFFERENT config values
+  // maps to the SAME key material, so one shared budget survives knob changes.
+  it('keeps per-user assessment namespaces independent of the window/max knobs', async () => {
+    config.rateLimit.assessWindowMs = 60_000;
+    config.rateLimit.assessMax = 2;
+    const userId = 'namespace-stability-user';
+    const beforeTightening = userApp(userId, buildLimiters().assess);
+
+    expect((await request(beforeTightening).get('/x')).status).toBe(200);
+    expect((await request(beforeTightening).get('/x')).status).toBe(200);
+    expect(await storedHits('assess')).toBe(2);
+
+    // The operator tightens the budget mid-window and a rebuilt app (the
+    // rolling-deploy shape) must inherit the already-spent hits: with the old
+    // config-suffixed namespace this request saw a disjoint, empty counter and
+    // answered 200.
+    config.rateLimit.assessWindowMs = 120_000;
+    config.rateLimit.assessMax = 1;
+    const afterTightening = userApp(userId, buildLimiters().assess);
+    expect((await request(afterTightening).get('/x')).status).toBe(429);
+
+    // Both apps counted into ONE namespace and key: the limiter-refunded 429
+    // settles back to the two spent hits, and no config-suffixed fragment row
+    // may exist.
+    await vi.waitFor(async () => {
+      expect(await storedHits('assess')).toBe(2);
+    });
+    const rows = await pool.query<{ namespace: string; n: number }>(
+      "SELECT namespace, count(*)::int AS n FROM rate_limit_windows WHERE namespace LIKE 'assess%' GROUP BY 1",
+    );
+    expect(rows.rows).toEqual([{ namespace: 'assess', n: 1 }]);
+  });
+
+  it('keeps the per-network daily namespace free of its embedded cap', async () => {
+    const savedCap = config.assessIpDailyCap;
+    try {
+      config.assessIpDailyCap = 2;
+      const a = userApp('namespace-stability-ip-user', buildLimiters().assessIpDaily).set('trust proxy', 1);
+      const hit = () => request(a).get('/x').set('X-Forwarded-For', '203.0.113.77');
+      expect((await hit()).status).toBe(200);
+      expect((await hit()).status).toBe(200);
+      expect(await storedHits('assess-ip-daily')).toBe(2);
+
+      // Tightening the cap must not hand this network a fresh daily budget.
+      config.assessIpDailyCap = 1;
+      const tightened = userApp('namespace-stability-ip-user', buildLimiters().assessIpDaily).set('trust proxy', 1);
+      expect((await request(tightened).get('/x').set('X-Forwarded-For', '203.0.113.77')).status).toBe(429);
+
+      await vi.waitFor(async () => {
+        expect(await storedHits('assess-ip-daily')).toBe(2);
+      });
+      const rows = await pool.query<{ namespace: string; n: number }>(
+        "SELECT namespace, count(*)::int AS n FROM rate_limit_windows WHERE namespace LIKE 'assess-ip-daily%' GROUP BY 1",
+      );
+      expect(rows.rows).toEqual([{ namespace: 'assess-ip-daily', n: 1 }]);
+    } finally {
+      config.assessIpDailyCap = savedCap;
+    }
+  });
+});
+
 describe('rate limiters', () => {
   it('runs the cheap global flood brake before PostgreSQL credential counters', async () => {
     config.rateLimit.globalStore = 'memory';
@@ -136,7 +204,7 @@ describe('rate limiters', () => {
       `SELECT coalesce(sum(hits), 0)::int AS hits
        FROM rate_limit_windows
        WHERE namespace = $1`,
-      [`auth:${config.rateLimit.authWindowMs}:${config.rateLimit.authMax}`],
+      ['auth'],
     );
     expect(rows[0].hits).toBe(1);
     // Probes are intentionally mounted before the global budget.
@@ -163,7 +231,7 @@ describe('rate limiters', () => {
   it('skips the email-keyed limiter when JSON parsing leaves the request body undefined', async () => {
     config.rateLimit.loginAccountWindowMs = 60_000;
     config.rateLimit.loginAccountMax = 1;
-    const namespace = 'login-account:60000:1';
+    const namespace = 'login-account';
     const a = express();
     a.use(express.json());
     a.use((req, _res, next) => {
@@ -182,7 +250,7 @@ describe('rate limiters', () => {
   it('skips unusable forgot-password identifiers and isolates each valid normalized email key', async () => {
     config.rateLimit.forgotEmailWindowMs = 60_000;
     config.rateLimit.forgotEmailMax = 1;
-    const namespace = 'forgot-email:60000:1';
+    const namespace = 'forgot-email';
     const a = express();
     a.use(express.json());
     a.use(buildLimiters().forgotPasswordEmail);
@@ -238,7 +306,7 @@ describe('rate limiters', () => {
     expect(overBudget.status).toBe(204);
     // The second request is over the per-target-email budget: its mail is
     // being dropped silently...
-    expect(await storedHits('forgot-email:60000:1')).toBe(2);
+    expect(await storedHits('forgot-email')).toBe(2);
     // ...and both 204s stay indistinguishable: no Retry-After announcing the
     // drop, and no RateLimit-* publishing a counter keyed by someone else's
     // mailbox to whoever probes it.
@@ -300,7 +368,7 @@ describe('rate limiters', () => {
     expect((await request(firstReplica).get('/x')).status).toBe(429);
 
     const { rows } = await pool.query<{ n: number }>(
-      "SELECT count(*)::int AS n FROM rate_limit_windows WHERE namespace LIKE 'global:%'",
+      "SELECT count(*)::int AS n FROM rate_limit_windows WHERE namespace LIKE 'global%'",
     );
     expect(rows[0].n).toBe(0);
   });
@@ -363,7 +431,7 @@ describe('rate limiters', () => {
     // (enumeration), 201s (bulk creation), 413s (flooding), and 429s.
     config.rateLimit.registerWindowMs = 60_000;
     config.rateLimit.registerMax = 2;
-    const namespace = 'register:60000:2';
+    const namespace = 'register';
     await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
     const limiters = buildLimiters();
     const a = express();
@@ -435,7 +503,7 @@ describe('rate limiters', () => {
     // A successful registration refunds its hit: the legitimate registrant
     // keeps their budget for retries.
     expect((await register('fresh@example.com')).status).toBe(201);
-    await expectRefunded('register-email:60000:1');
+    await expectRefunded('register-email');
 
     // Probing one existing address now saturates its shared budget...
     expect((await register('taken@example.com')).status).toBe(409);
@@ -584,7 +652,7 @@ describe('rate limiters', () => {
     // next request for the assertion to stay deterministic.
     for (let i = 0; i < 5; i++) {
       expect((await request(a).get('/rejected')).status).toBe(400);
-      await expectRefunded('assess:60000:1');
+      await expectRefunded('assess');
     }
 
     // Successful requests still consume the budget exactly as before.
@@ -616,7 +684,7 @@ describe('rate limiters', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
       expect(decrement).not.toHaveBeenCalled();
       const { rows } = await pool.query<{ hits: number }>(
-        "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = 'assess:60000:5'",
+        "SELECT coalesce(sum(hits), 0)::int AS hits FROM rate_limit_windows WHERE namespace = 'assess'",
       );
       expect(rows[0].hits).toBe(1);
     } finally {
@@ -659,7 +727,7 @@ describe('rate limiters', () => {
 
       for (let i = 0; i < 5; i++) {
         expect((await request(first).get('/rejected').set('X-Forwarded-For', '203.0.113.61')).status).toBe(400);
-        await expectRefunded('assess-ip-daily:1');
+        await expectRefunded('assess-ip-daily');
       }
 
       // A second account behind the same NAT keeps its full paid budget...
@@ -1427,8 +1495,8 @@ describe('rate limiters', () => {
         clientRequest.destroy();
         await clientDone;
         await vi.waitFor(async () => {
-          expect(await storedHits('assess:62345:9')).toBe(1);
-          expect(await storedHits('assess-ip-daily:87654')).toBe(1);
+          expect(await storedHits('assess')).toBe(1);
+          expect(await storedHits('assess-ip-daily')).toBe(1);
         });
       } finally {
         clientRequest?.destroy();
@@ -1467,8 +1535,8 @@ describe('rate limiters', () => {
         // One counted hit plus one re-spent hit on each budget; a lost window
         // observation would silently leave either at 1.
         await vi.waitFor(async () => {
-          expect(await storedHits('assess:60000:5')).toBe(2);
-          expect(await storedHits('assess-ip-daily:5')).toBe(2);
+          expect(await storedHits('assess')).toBe(2);
+          expect(await storedHits('assess-ip-daily')).toBe(2);
         });
       } finally {
         config.assessIpDailyCap = savedCap;

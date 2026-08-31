@@ -279,15 +279,17 @@ describe('diagnostic silence and durable result summaries', () => {
     ]);
   });
 
-  it('completes the placement at the three-question bound with the window still open', async () => {
+  it('completes the placement on the third answer when the final failure collapses the window', async () => {
     const { res } = await registerUser(a);
     const token = res.body.token as string;
     const first = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
     expect(first.body.question.cefrLevel).toBe('B1');
 
-    // B1 pass -> [3,5] (C1), C1 pass -> [5,5] (C2), C2 fail -> [3,4]: the
-    // window REMAINS open after the third answer, so only the attemptNo
-    // bound can finish the run here.
+    // B1 pass -> [3,5] (C1), C1 pass -> [5,5] (C2), C2 fail -> [5,4]: the
+    // third failure COLLAPSES the window (5 > 4), so the run finishes via the
+    // window disjunct — never the attemptNo bound alone on a fresh journey
+    // (the bound-only boundary is pinned by the seeded [3,5]/asked=2 test in
+    // diagnostic-search.test.ts).
     speakMock.mockResolvedValueOnce({ transcript: 'passed b1', score: 80, passed: true, feedback: 'good' });
     const firstAnswer = await answerForm(
       request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),

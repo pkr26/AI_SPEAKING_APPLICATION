@@ -101,12 +101,27 @@ vi.mock('../src/audio-inspection', () => ({ assertAudioInspectorAvailable: runti
 
 let originalSigtermListeners: Set<NodeJS.SignalsListener>;
 let originalSigintListeners: Set<NodeJS.SignalsListener>;
+let originalUnhandledRejectionListeners: Set<NodeJS.UnhandledRejectionListener>;
+let originalUncaughtExceptionListeners: Set<NodeJS.UncaughtExceptionListener>;
 
 function addedSignalListener(signal: 'SIGTERM' | 'SIGINT'): NodeJS.SignalsListener {
   const original = signal === 'SIGTERM' ? originalSigtermListeners : originalSigintListeners;
   const listener = process.listeners(signal).find((candidate) => !original.has(candidate));
   if (!listener) throw new Error(`index did not register ${signal}`);
   return listener;
+}
+
+/** The process-level fatal handler index registered for `event`, if any. */
+function addedProcessListener(
+  event: 'unhandledRejection' | 'uncaughtException',
+): (reason: unknown, promise?: Promise<unknown>) => void {
+  const original =
+    event === 'unhandledRejection' ? originalUnhandledRejectionListeners : originalUncaughtExceptionListeners;
+  const listener = (
+    process.listeners(event as NodeJS.Signals) as Array<(reason: unknown, promise?: Promise<unknown>) => void>
+  ).find((candidate) => !original.has(candidate as never));
+  if (!listener) throw new Error(`index did not register ${event}`);
+  return listener as (reason: unknown, promise?: Promise<unknown>) => void;
 }
 
 beforeEach(() => {
@@ -147,6 +162,8 @@ beforeEach(() => {
   runtime.assertStorage.mockResolvedValue(undefined);
   originalSigtermListeners = new Set(process.listeners('SIGTERM'));
   originalSigintListeners = new Set(process.listeners('SIGINT'));
+  originalUnhandledRejectionListeners = new Set(process.listeners('unhandledRejection'));
+  originalUncaughtExceptionListeners = new Set(process.listeners('uncaughtException'));
 });
 
 afterEach(() => {
@@ -155,6 +172,12 @@ afterEach(() => {
   }
   for (const listener of process.listeners('SIGINT')) {
     if (!originalSigintListeners.has(listener)) process.removeListener('SIGINT', listener);
+  }
+  for (const listener of process.listeners('unhandledRejection')) {
+    if (!originalUnhandledRejectionListeners.has(listener)) process.removeListener('unhandledRejection', listener);
+  }
+  for (const listener of process.listeners('uncaughtException')) {
+    if (!originalUncaughtExceptionListeners.has(listener)) process.removeListener('uncaughtException', listener);
   }
   vi.useRealTimers();
   vi.restoreAllMocks();
@@ -1034,5 +1057,63 @@ describe('server lifecycle failure handling', () => {
     expect(runtime.logger.fatal).not.toHaveBeenCalled();
     expect(runtime.poolEnd).toHaveBeenCalledOnce();
     expect(exit).toHaveBeenCalledOnce();
+  });
+
+  it('routes an unhandled promise rejection through the same fatal drain as a server error', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    const rejection = new Error('stray promise rejected');
+    addedProcessListener('unhandledRejection')(rejection, new Promise(() => {}));
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: rejection }, 'unhandled promise rejection');
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+
+    // A late signal must not re-enter the already-latched fatal path.
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(runtime.logger.info).not.toHaveBeenCalledWith({ signal: 'SIGTERM' }, 'shutting down');
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('routes an uncaught exception through the same fatal drain', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+
+    const failure = new Error('uncaught exception escaped a handler');
+    addedProcessListener('uncaughtException')(failure);
+
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.logger.fatal).toHaveBeenCalledWith({ err: failure }, 'uncaught exception');
+    expect(runtime.abortAssessments).toHaveBeenCalledWith({ preventNew: true });
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('ignores an unhandled rejection after the fatal path has already latched', async () => {
+    const dependencyError = new Error('schema unavailable');
+    runtime.assertSchema.mockRejectedValueOnce(dependencyError);
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(1));
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+
+    addedProcessListener('unhandledRejection')(new Error('late rejection'), new Promise(() => {}));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // One latch, one drain, one fatal log — the late rejection adds none.
+    expect(runtime.poolEnd).toHaveBeenCalledOnce();
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(runtime.logger.fatal.mock.calls.filter(([, message]) => String(message).includes('unhandled'))).toHaveLength(
+      0,
+    );
   });
 });

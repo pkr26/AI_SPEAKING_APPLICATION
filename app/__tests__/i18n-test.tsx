@@ -509,6 +509,42 @@ describe('I18nProvider language selection', () => {
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.en['login.submit']);
     expect(getActiveLanguage()).toBe('en');
   });
+
+  it('translates same-commit layout-effect and event-time copy with the new language', async () => {
+    // Child layout effects run before the provider's own effects, so a
+    // post-commit sync leaves exactly one commit where event-time translate()
+    // still answers in the previous language. The provider must mirror the
+    // language during render instead.
+    const sameCommitTranslations: string[] = [];
+    function CommitProbe() {
+      React.useLayoutEffect(() => {
+        sameCommitTranslations.push(translate('login.submit'));
+      });
+      return null;
+    }
+
+    const view = await render(
+      <I18nProvider accountLanguage="en">
+        <CommitProbe />
+      </I18nProvider>,
+    );
+    expect(sameCommitTranslations).toEqual([dictionaries.en['login.submit']]);
+
+    await view.rerender(
+      <I18nProvider accountLanguage="es">
+        <CommitProbe />
+      </I18nProvider>,
+    );
+
+    // The second observation is captured inside the language-change commit
+    // itself and must already use the new language.
+    expect(sameCommitTranslations).toEqual([
+      dictionaries.en['login.submit'],
+      dictionaries.es['login.submit'],
+    ]);
+    expect(getActiveLanguage()).toBe('es');
+    expect(translate('login.submit')).toBe(dictionaries.es['login.submit']);
+  });
 });
 
 describe('useI18n / useT without a provider', () => {

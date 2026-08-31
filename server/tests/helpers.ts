@@ -47,15 +47,27 @@ export async function createClosedPracticeCycle(userId: string, questionId: stri
   return rows[0].id;
 }
 
-/** Attach a valid-audio multipart form with the given questionId/requestId. */
-export function answerForm(req: request.Test, questionId: string, requestId = randomUUID(), cycleId?: string | null) {
+/**
+ * Attach a valid-audio multipart form with the given questionId/requestId.
+ * `retainRecording` is omitted entirely when undefined (the legacy default
+ * branch every pre-existing call site exercises); passing a boolean sends the
+ * exact multipart string encoding ('true'/'false') the current app submits.
+ */
+export function answerForm(
+  req: request.Test,
+  questionId: string,
+  requestId = randomUUID(),
+  cycleId?: string | null,
+  retainRecording?: boolean,
+) {
   const form = req
     .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
     .field('questionId', questionId)
     .field('requestId', requestId);
   const resolvedCycleId =
     cycleId === undefined && new URL(req.url).pathname.startsWith('/practice/') ? randomUUID() : cycleId;
-  return resolvedCycleId == null ? form : form.field('cycleId', resolvedCycleId);
+  const withCycle = resolvedCycleId == null ? form : form.field('cycleId', resolvedCycleId);
+  return retainRecording === undefined ? withCycle : withCycle.field('retainRecording', String(retainRecording));
 }
 
 /**

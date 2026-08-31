@@ -36,9 +36,12 @@ import { logger } from '../src/logger';
 import {
   httpMetricsMiddleware,
   httpRequestDuration,
+  MAILER_FAILURE_REASONS,
+  mailerFailuresTotal,
   metricMethod,
   providerCallDuration,
   providerCallErrors,
+  recordMailerFailure,
   registry,
   shedRequestsTotal,
 } from '../src/metrics';
@@ -118,6 +121,7 @@ describe('GET /metrics gating', () => {
       expect(res.text).toContain('pg_pool_total_connections');
       expect(res.text).toContain('ai_slots_in_use');
       expect(res.text).toContain('audio_inspection_slots_in_use');
+      expect(res.text).toContain('mailer_failures_total');
       expect(res.text).toContain('process_cpu_user_seconds_total');
     } finally {
       config.metricsEnabled = false;
@@ -433,5 +437,29 @@ describe('provider call metrics', () => {
     expect(await histogramCount(providerCallDuration, { kind: 'transcription', outcome: 'timeout' })).toBeGreaterThan(
       0,
     );
+  });
+});
+
+describe('mailer_failures_total', () => {
+  it('registers with the documented name, help, type, and a single bounded reason label', async () => {
+    const family = (await registry.getMetricsAsJSON()).find((entry) => entry.name === 'mailer_failures_total');
+    expect(family).toBeDefined();
+    expect(family?.help).toBe('Mail delivery failures by reason');
+    expect(family?.type).toBe('counter');
+    // The only label is the fixed reason dimension — no host/recipient/subject
+    // labels that operator config or attacker input could inflate.
+    const metric = registry.getSingleMetric('mailer_failures_total');
+    expect((metric as unknown as { labelNames: string[] } | undefined)?.labelNames).toEqual(['reason']);
+  });
+
+  it('bounds the reason domain to the five fixed failure slugs', () => {
+    expect([...MAILER_FAILURE_REASONS]).toEqual(['network', 'timeout', 'status', 'refused', 'exception']);
+  });
+
+  it('increments per reason through recordMailerFailure', async () => {
+    const before = await counterValue(mailerFailuresTotal, { reason: 'network' });
+    recordMailerFailure('network');
+    recordMailerFailure('network');
+    expect(await counterValue(mailerFailuresTotal, { reason: 'network' })).toBe(before + 2);
   });
 });

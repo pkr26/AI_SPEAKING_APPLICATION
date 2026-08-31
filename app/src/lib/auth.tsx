@@ -20,7 +20,7 @@ import {
   type UiLanguage,
   type User,
 } from './types';
-import { clearPendingAssessment } from './pending-assessment';
+import { advanceUnconditionalClearGeneration, clearPendingAssessment } from './pending-assessment';
 import { cleanupPrivateArtifacts } from './private-artifacts';
 import { markSessionExpiredNotice } from './session-notice';
 export {
@@ -191,6 +191,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   );
 
   const schedulePendingCleanup = useCallback(() => {
+    // Close the generation fence SYNCHRONOUSLY, before chaining the delete
+    // onto the cleanup tail: a prior tail that hangs in the OS credential
+    // store would otherwise leave the fence open (the bump used to happen only
+    // when clearPendingAssessment actually ran), letting an in-flight creator
+    // repopulate the slot after logout already considered cleanup complete.
+    // The queued delete itself keeps its exact previous scheduling.
+    advanceUnconditionalClearGeneration();
     const cleanup = pendingCleanupTailRef.current.then(async () => {
       try {
         await clearPendingAssessment();
@@ -343,17 +350,26 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const rearmSessionLeasesAfterFailedTransition = useCallback(
     (epoch: number, sessionToken: string | null, sessionUserId: string | null) => {
-      // beginTransition fences every continuation immediately. If the operation
-      // then fails while the same signed-in identity remains, republish the
-      // lease factory so memoized screen leases recapture that newer epoch.
-      // sessionVersion must stay stable: it keys the navigator and practice
-      // state and therefore represents identity, not an internal lease rearm.
-      if (
+      // beginTransition fences every continuation immediately, regardless of
+      // whether a session exists. If the operation then fails while the same
+      // identity remains — signed-in OR signed-out (a failed login from the
+      // logged-out screen must not strand every pre-attempt lease) —
+      // republish the lease factory so memoized screen leases recapture that
+      // newer epoch. sessionVersion must stay stable: it keys the navigator
+      // and practice state and therefore represents identity, not an internal
+      // lease rearm.
+      const sameSignedInIdentity =
         sessionToken !== null &&
         epoch === epochRef.current &&
         sessionToken === tokenRef.current &&
-        sessionUserId === (userRef.current?.id ?? null)
-      ) {
+        sessionUserId === (userRef.current?.id ?? null);
+      const sameSignedOutIdentity =
+        sessionToken === null &&
+        sessionUserId === null &&
+        epoch === epochRef.current &&
+        tokenRef.current === null &&
+        (userRef.current?.id ?? null) === null;
+      if (sameSignedInIdentity || sameSignedOutIdentity) {
         setLeaseRevision((revision) => revision + 1);
       }
     },

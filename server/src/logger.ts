@@ -62,6 +62,16 @@ export const httpLogger = pinoHttp({
     res: (res) => ({ statusCode: res.statusCode }),
   },
   autoLogging: {
-    ignore: (req) => req.url === '/health',
+    // Successful health probes are noise; suppress them in every spelling a
+    // prober actually sends. Normalize exactly like the client-version gate
+    // exemption in middleware.ts: strip the query string, trim at most one
+    // trailing slash, compare case-insensitively — so '/health?x', '/health/',
+    // and '/HEALTH' stay silent too, instead of writing unthrottled full log
+    // lines for each probe spelling.
+    ignore: (req) => {
+      const path = (req.url ?? '').split('?')[0];
+      const routePath = path.length > 1 && path.endsWith('/') ? path.slice(0, -1) : path;
+      return routePath.toLowerCase() === '/health';
+    },
   },
 });

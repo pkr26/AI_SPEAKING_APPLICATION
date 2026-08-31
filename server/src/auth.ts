@@ -635,8 +635,11 @@ export function createAuthRouter(limiters: Limiters) {
       const { rows } = attemptsDone
         ? { rows: [] }
         : await pool.query(
-            `SELECT a.id, a.question_id AS "questionId", q.prompt_word AS "promptWord",
-                    q.question_text AS "questionText", q.cefr_level AS "cefrLevel",
+            // Question wording comes from the attempt's own migration-026
+            // snapshot, never a live catalog join, so editing catalog wording
+            // cannot rewrite a learner's exported history.
+            `SELECT a.id, a.question_id AS "questionId", a.prompt_word AS "promptWord",
+                    a.question_text AS "questionText", a.cefr_level AS "cefrLevel",
                     a.context, a.attempt_no AS "attemptNo",
                     a.transcript, a.score, a.passed, a.feedback,
                     a.practice_cycle_id AS "cycleId", a.understood,
@@ -644,7 +647,6 @@ export function createAuthRouter(limiters: Limiters) {
                     a.native_language AS "nativeLanguage",
                     a.created_at AS "createdAt"
              FROM attempts a
-             JOIN questions q ON q.id = a.question_id
              WHERE a.user_id = $1
                AND (
                  $2::uuid IS NULL

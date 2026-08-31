@@ -27,6 +27,7 @@ if (process.env.ALLOW_LIVE_PROVIDER_LOAD !== 'true') {
 const execFileAsync = promisify(execFile);
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPORTS_DIR = path.join(SCRIPT_DIR, '..', 'reports', 'load1000-live');
+const SEED_SQL_PATH = path.join(SCRIPT_DIR, '..', 'db', 'seed.sql');
 const LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'];
 const NATIVE_LANGUAGES = ['te', 'hi', 'es', 'zh'];
 const ENDPOINTS = {
@@ -239,6 +240,47 @@ function canonicalJson(value) {
 
 function responseDigest(value) {
   return sha256(canonicalJson(value));
+}
+
+function decodeGeneratedSqlLiteral(literal) {
+  const escapeLiteral = literal.startsWith("E'");
+  const body = literal.slice(escapeLiteral ? 2 : 1, -1);
+  if (!escapeLiteral) return body.replaceAll("''", "'");
+  let decoded = '';
+  for (let index = 0; index < body.length; index++) {
+    if (body[index] === '\\' && index + 1 < body.length) index++;
+    decoded += body[index];
+  }
+  return decoded;
+}
+
+// Digest of the reviewed packaged question catalog generation this campaign
+// runs against, derived from the generated db/seed.sql exactly the way
+// verify-1000-live.mjs reconstructs it. Recorded on every ledger so the
+// verifier can prove the live database catalog is unchanged between the load
+// run and reconciliation.
+async function packagedCatalogDigest() {
+  const sqlLiteral = "((?:E)?'(?:''|\\\\.|[^'])*')";
+  const insertPattern = new RegExp(
+    `VALUES \\(${sqlLiteral}, ${sqlLiteral}, ${sqlLiteral}, ${sqlLiteral}::jsonb\\) ON CONFLICT`,
+  );
+  const rows = [];
+  for (const line of (await readFile(SEED_SQL_PATH, 'utf8')).split('\n')) {
+    if (!line.startsWith('INSERT INTO questions')) continue;
+    const match = insertPattern.exec(line);
+    if (!match) throw new Error('packaged seed.sql contains an unparseable question row');
+    rows.push({
+      cefrLevel: decodeGeneratedSqlLiteral(match[1]),
+      promptWord: decodeGeneratedSqlLiteral(match[2]),
+      questionText: decodeGeneratedSqlLiteral(match[3]),
+      translations: JSON.parse(decodeGeneratedSqlLiteral(match[4])),
+    });
+  }
+  if (rows.length !== 600) throw new Error(`packaged seed.sql contains ${rows.length} questions instead of 600`);
+  rows.sort(
+    (left, right) => left.cefrLevel.localeCompare(right.cefrLevel) || left.promptWord.localeCompare(right.promptWord),
+  );
+  return sha256(canonicalJson(rows));
 }
 
 function safeFailureMessage(value) {
@@ -729,7 +771,32 @@ async function requestOnce(target, action, method, route, { token, json, headers
     });
     return { networkError: true };
   }
-  const text = await response.text();
+  // The fetch resolved: durably record the attempt before reading the body so
+  // a mid-stream body failure still leaves per-attempt evidence behind instead
+  // of throwing with no record (the attempt ledger must describe every HTTP
+  // exchange that reached the server, and a body that dies mid-stream is a
+  // network ambiguity the caller reconciles through status polling).
+  const attempt = {
+    attempt: attemptNumber,
+    method,
+    route: routeTemplate(route),
+    xRequestId,
+    status: response.status,
+    code: null,
+    latencyMs: Math.round(performance.now() - started),
+    retryReason: retryReason || null,
+    networkError: null,
+  };
+  counters.httpAttempts++;
+  action.attempts.push(attempt);
+  let text;
+  try {
+    text = await response.text();
+  } catch (error) {
+    counters.networkErrors++;
+    attempt.networkError = error instanceof Error ? error.name : 'BodyReadError';
+    return { networkError: true };
+  }
   let body = null;
   if (text) {
     try {
@@ -738,19 +805,8 @@ async function requestOnce(target, action, method, route, { token, json, headers
       body = null;
     }
   }
-  const latencyMs = Math.round(performance.now() - started);
-  counters.httpAttempts++;
-  action.attempts.push({
-    attempt: attemptNumber,
-    method,
-    route: routeTemplate(route),
-    xRequestId,
-    status: response.status,
-    code: typeof body?.code === 'string' ? body.code : null,
-    latencyMs,
-    retryReason: retryReason || null,
-    networkError: null,
-  });
+  attempt.latencyMs = Math.round(performance.now() - started);
+  attempt.code = typeof body?.code === 'string' ? body.code : null;
   return { networkError: false, status: response.status, body, text, headers: response.headers };
 }
 
@@ -1231,8 +1287,19 @@ async function submitAssessmentPost(user, action, endpoint, payload, context, va
         throw new Error('assessment exhausted exact CAPACITY_BUSY retry budget');
       }
       capacityRetry++;
-      const hinted = Number(response.body?.retryAfterSeconds || response.headers.get('retry-after') || 2);
-      await delay(Math.min(Math.max(hinted, 1), 10) * 1_000 + Math.floor(Math.random() * 250));
+      // Guard the hint before clamping: `0` in the body, an HTTP-date header,
+      // or any other non-numeric value must not collapse to NaN —
+      // Math.min/max propagate NaN straight into setTimeout as an immediate
+      // retry. Prefer the body's numeric seconds, then a numeric header, then
+      // the 2-second default, and keep the existing 1..10 second clamp.
+      const bodyHintSeconds = Number(response.body?.retryAfterSeconds);
+      const headerHintSeconds = Number(response.headers.get('retry-after'));
+      const hintedSeconds = Number.isFinite(bodyHintSeconds)
+        ? bodyHintSeconds
+        : Number.isFinite(headerHintSeconds)
+          ? headerHintSeconds
+          : 2;
+      await delay(Math.min(Math.max(hintedSeconds, 1), 10) * 1_000 + Math.floor(Math.random() * 250));
       retryReason = 'exact-capacity-busy-retry';
       continue;
     }
@@ -2796,6 +2863,7 @@ async function writeLedger(s3Audit, fatalError) {
         transcription: LIVE_TRANSCRIPTION_MODEL,
         grading: LIVE_GRADING_MODEL,
       },
+      catalogDigest: await packagedCatalogDigest(),
       pricingManifest,
       freshAssessmentCeiling: FRESH_ASSESSMENT_CEILING,
       freshAssessmentsPlanned: counters.freshAssessmentsPlanned,

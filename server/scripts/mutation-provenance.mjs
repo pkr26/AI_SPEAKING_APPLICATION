@@ -33,6 +33,7 @@ export const mutationEnvironmentVariableNames = Object.freeze([
   'MAIL_MODE',
   'MAIL_WEBHOOK_ALLOW_PRIVATE_ADDRESS',
   'MAIL_WEBHOOK_URL',
+  'METRICS_BEARER_TOKEN',
   'METRICS_ENABLED',
   'MIN_CLIENT_VERSION',
   'MOCK_AI',

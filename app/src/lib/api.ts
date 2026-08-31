@@ -38,6 +38,16 @@ const TOKEN_STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: TOKEN_KEYCHAIN_SERVICE,
 };
 const JSON_TIMEOUT_MS = 20_000;
+/**
+ * Dedicated budget for reading a NON-OK response's error body. On a slow link
+ * the response headers can consume nearly the whole request budget; flooring
+ * the error-body read at the ~0ms remainder would relabel a delivered 429/409
+ * as a local 408 and discard its real status and retry hint. This small extra
+ * budget (instead of the whole-request remainder) keeps that read bounded
+ * while letting the real outcome survive. Ok-response body reads keep the
+ * whole-request remainder semantics.
+ */
+export const ERROR_BODY_READ_BUDGET_MS = 2_500;
 export const AUDIO_TIMEOUT_MS = 150_000;
 
 type UnauthorizedHandler = (rejectedToken: string) => void;
@@ -376,6 +386,21 @@ const MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT = 120;
 const MAX_RETRY_AFTER_HOURS = 48;
 
 /**
+ * Bounded Retry-After header hint for a non-ok response, parsed before its
+ * error body is read. Reuses the per-status contract bounds and the same
+ * number coercion (HTTP-dates and non-finite values coerce to NaN and are
+ * ignored) as the body-driven path.
+ */
+function headerRetryAfterSecondsFor(status: number, header: string | null): number | undefined {
+  if (status === 429) return parseRetryAfterSecondsHeader(header, MAX_RETRY_AFTER_SECONDS_429);
+  if (status === 503) return parseRetryAfterSecondsHeader(header, MAX_RETRY_AFTER_SECONDS_503);
+  if (status === 409) {
+    return parseRetryAfterSecondsHeader(header, MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT);
+  }
+  return undefined;
+}
+
+/**
  * `fetch()` resolves once response headers arrive, so its timeout does not
  * protect a server that holds a JSON/blob body open forever. Bound body reads
  * separately and cancel the stream where the platform exposes one. This also
@@ -456,15 +481,32 @@ async function throwForStatus(
   // only fields read are the machine-readable `code` (mapped to localized
   // copy by userMessageForError) and the bounded, non-sensitive retry delays
   // that drive the 409/429/503 "please wait" contracts.
+  const status = res.status;
+  // Capture the bounded header hint before the body read: on a slow link the
+  // error body may outlive its read budget, and the real status plus retry
+  // hint must survive that failure instead of degrading to a generic 408.
+  const headerRetryAfterSeconds = headerRetryAfterSecondsFor(
+    status,
+    res.headers.get('Retry-After'),
+  );
   let body: unknown;
+  let bodyReadTimedOut = false;
   try {
     body = await readJsonBody(res, timeoutMs, externalSignal);
   } catch (error) {
-    // A malformed error body is deliberately ignored, but a timed-out or
-    // cancelled body must retain its transport meaning instead of becoming an
-    // arbitrary HTTP error.
-    if (error instanceof ApiError || externalSignal?.aborted) throw error;
-    body = undefined;
+    // A cancelled body read keeps its transport meaning.
+    if (externalSignal?.aborted) throw error;
+    if (error instanceof ApiError) {
+      // The bounded error-body read timed out. The response itself already
+      // arrived, so preserve its real status and the header retry hint
+      // instead of relabeling a delivered 429/409 as a local 408. No code is
+      // attached: unknown/undefined codes degrade to the status-based copy.
+      bodyReadTimedOut = true;
+    }
+    // A malformed error body is deliberately ignored.
+  }
+  if (bodyReadTimedOut) {
+    throw new ApiError(status, `Request failed with status ${status}`, headerRetryAfterSeconds);
   }
   const record = body && typeof body === 'object' ? (body as Record<string, unknown>) : undefined;
   const code = isApiErrorCode(record?.code) ? record.code : undefined;
@@ -472,21 +514,17 @@ async function throwForStatus(
   // Only our own API contract can retire this build. A blob URL, signed S3
   // upload, captive portal, or other external response must never be able to
   // display the non-dismissible update UI, even if it returns look-alike JSON.
-  if (source === 'first-party-api' && res.status === 426 && code === 'CLIENT_UPGRADE_REQUIRED') {
+  if (source === 'first-party-api' && status === 426 && code === 'CLIENT_UPGRADE_REQUIRED') {
     latchClientUpgradeRequired();
   }
 
   let retryAfterSeconds: number | undefined;
   let retryAfterHours: number | undefined;
-  if (
-    res.status === 503 ||
-    res.status === 429 ||
-    (res.status === 409 && code === 'REQUEST_IN_FLIGHT')
-  ) {
+  if (status === 503 || status === 429 || (status === 409 && code === 'REQUEST_IN_FLIGHT')) {
     const maxSeconds =
-      res.status === 429
+      status === 429
         ? MAX_RETRY_AFTER_SECONDS_429
-        : res.status === 503
+        : status === 503
           ? MAX_RETRY_AFTER_SECONDS_503
           : MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT;
     retryAfterSeconds =
@@ -496,7 +534,7 @@ async function throwForStatus(
   // Only rate/daily-limit responses define an hours-scale retry contract.
   // REQUEST_IN_FLIGHT is deliberately seconds-only even if a malformed peer
   // attaches both fields.
-  if (res.status === 429) {
+  if (status === 429) {
     const hours = record?.retryAfterHours;
     if (
       typeof hours === 'number' &&
@@ -507,7 +545,7 @@ async function throwForStatus(
       retryAfterHours = hours;
     }
   }
-  throw new ApiError(res.status, `Request failed with status ${res.status}`, retryAfterSeconds, {
+  throw new ApiError(status, `Request failed with status ${status}`, retryAfterSeconds, {
     code,
     retryAfterHours,
   });
@@ -638,12 +676,10 @@ async function apiFetchWithToken<T>(
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, options.expireSessionOn401 !== false);
-    await throwForStatus(
-      res,
-      remainingTimeoutMs(startedAt, timeoutMs),
-      options.signal,
-      'first-party-api',
-    );
+    // A non-ok response's error body gets its own small budget: headers that
+    // arrive near the end of the request budget must not floor this read at
+    // ~0ms, or the real status/retry hint would be relabeled as a 408.
+    await throwForStatus(res, ERROR_BODY_READ_BUDGET_MS, options.signal, 'first-party-api');
   }
   if (options.expectedStatus !== undefined && res.status !== options.expectedStatus) {
     throw new ApiError(502, 'The server returned an invalid response');
@@ -813,12 +849,9 @@ export async function apiUploadAudio<T>(
   );
   if (!res.ok) {
     handleUnauthorized(res.status, token, true);
-    await throwForStatus(
-      res,
-      remainingTimeoutMs(startedAt, timeoutMs),
-      options.signal,
-      'first-party-api',
-    );
+    // Same dedicated error-body budget as JSON calls: the multipart request
+    // may have spent nearly all of AUDIO_TIMEOUT_MS before these headers.
+    await throwForStatus(res, ERROR_BODY_READ_BUDGET_MS, options.signal, 'first-party-api');
   }
   try {
     return (await readJsonBody(res, remainingTimeoutMs(startedAt, timeoutMs), options.signal)) as T;

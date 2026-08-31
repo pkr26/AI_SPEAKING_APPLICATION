@@ -11,12 +11,20 @@ import type { Server, Socket } from 'net';
  * descriptor with no completed request, which the global rate limiter can
  * never see. A fronting proxy with its own header-read timeout remains the
  * primary defense (see AGENTS.md); these guards bound direct exposure.
+ *
+ * Installing the guards also assigns a deliberate no-op server-level
+ * 'timeout' listener. Node's own `socketOnTimeout` destroys a socket
+ * UNCONDITIONALLY when no 'timeout' listener exists on the request, response,
+ * or server, and until a connection's first response finishes Node leaves
+ * this module's connect-time socket timeout armed — so that default destroy
+ * would kill legitimate in-flight requests (see the listener comment below).
  */
 export const HEADER_ASSEMBLY_TIMEOUT_MS = 35_000;
 export const IDLE_SOCKET_GUARD_MS = 75_000;
 
 interface GuardedServerLike {
   on(event: 'connection', listener: (socket: Socket) => void): unknown;
+  on(event: 'timeout', listener: () => void): unknown;
   on(event: 'request', listener: (req: IncomingMessage, res: ServerResponse) => void): unknown;
 }
 
@@ -36,14 +44,25 @@ export interface SlowClientGuardTiming {
 }
 
 /**
- * Install the two per-connection guards. Must be called before `listen()` so
- * no accepted connection can miss the listeners.
+ * Install the two per-connection guards plus the server-level 'timeout'
+ * suppression. Must be called before `listen()` so no accepted connection can
+ * miss the listeners.
  *
+ * - Server 'timeout' listener (deliberate no-op): without one, Node's own
+ *   `socketOnTimeout` destroys a socket UNCONDITIONALLY whenever ANY socket
+ *   timeout fires — including a request legitimately in flight on the
+ *   connection's first request (see the inline comment for the exact Node
+ *   mechanics). Assigning the listener makes socket timeouts this module's
+ *   explicit responsibility; the per-socket handler below stays the sole
+ *   destroy decision point, and Node's requestTimeout/headersTimeout budgets
+ *   (enforced by a separate connections-checking interval) are unaffected.
  * - Idle guard: an idle-socket timeout that destroys the socket only while no
  *   request is being served on it. Idle keep-alive sockets are unaffected in
  *   practice because Node's own keepAliveTimeout (65s) is shorter than this
- *   guard; in-flight requests (whose whole-request budget reaches 130s) are
- *   exempt so a legitimate slow assessment is never cut mid-flight.
+ *   guard — when that keep-alive timer fires instead, the per-socket handler
+ *   below still destroys the non-serving socket; in-flight requests (whose
+ *   whole-request budget reaches 130s) are exempt so a legitimate slow
+ *   assessment is never cut mid-flight.
  * - Header-assembly deadline: destroyed `headerAssemblyTimeoutMs` after the
  *   first byte of a request whose headers never complete. Cleared the moment
  *   the parser emits 'request' (headers complete), so body transfer time is
@@ -77,6 +96,31 @@ export function installSlowClientGuards(
       timer.unref();
       return timer;
     });
+
+  // Node's http connection listener registers its own socketOnTimeout on every
+  // socket, and socketOnTimeout destroys the socket UNCONDITIONALLY when no
+  // 'timeout' listener exists on the request, response, or server (verified on
+  // Node 26: `server.emit('timeout')` returning false is the only thing that
+  // gates the destroy — Node's own comment in connectionListenerInternal says
+  // assigning any listener makes the timeout "their responsibility").
+  // Crucially, until a connection's FIRST response finishes, Node never
+  // replaces this module's connect-time socket.setTimeout(idleSocketGuardMs)
+  // (resetSocketTimeout only re-arms once keepAliveTimeoutSet is true, which
+  // resOnFinish sets), so that 75s timer governs the whole first request and
+  // its default destroy would kill legitimate in-flight work at 75s — while a
+  // full assessment chain legitimately spans ~100s (S3 download + inspection
+  // + provider deadline) inside the 130s requestTimeout. Registering this
+  // no-op listener suppresses Node's unconditional destroy so the per-socket
+  // handler below remains the sole decision point: idle sockets are still
+  // destroyed at the guard window, idle keep-alive sockets are still severed
+  // when Node's shorter keepAliveTimeout fires (the handler destroys the
+  // then-non-serving socket), and in-flight requests keep their requestTimeout
+  // budget — which Node enforces through a separate connections-checking
+  // interval, unaffected by any 'timeout' listener.
+  server.on('timeout', () => {
+    // Deliberate no-op: its existence alone suppresses Node's default
+    // socket destroy on timeout; the per-socket handlers own every decision.
+  });
 
   server.on('connection', (socket) => {
     socket.setTimeout(idleSocketGuardMs);

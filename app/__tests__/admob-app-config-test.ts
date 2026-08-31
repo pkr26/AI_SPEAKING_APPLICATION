@@ -3,6 +3,7 @@ import buildConfig, {
   SAMPLE_ADMOB_ANDROID_APP_ID,
   SAMPLE_ADMOB_IOS_APP_ID,
 } from '../app.config';
+import appJson from '../app.json';
 import type { ConfigContext } from 'expo/config';
 
 const ORIGINAL_ENV = { ...process.env };
@@ -199,5 +200,112 @@ describe('dynamic AdMob Expo configuration', () => {
         }),
       }),
     );
+  });
+
+  it('pins the expo-notifications iOS aps-environment entitlement to production', () => {
+    // The plugin defaults aps-environment to 'development'; a locally
+    // prebuilt archive that escapes the pipeline's entitlement rewrite then
+    // fails App Store distribution validation. See app.config.ts.
+    process.env.NODE_ENV = 'development';
+    const config = buildConfig(CONFIG_CONTEXT, process.env);
+    expect(plugin(config, 'expo-notifications')[1]).toEqual(
+      expect.objectContaining({
+        icon: './assets/notification-icon.png',
+        color: '#4F46E5',
+        mode: 'production',
+      }),
+    );
+  });
+});
+
+describe('production EXPO_PUBLIC_API_URL rejection', () => {
+  // Mirrors the runtime resolveBaseUrl contract in api-test.ts: a plaintext
+  // API URL would broadcast bearer tokens, and credentials/query/fragment
+  // suffixes would leak into every request path. A locally built environment
+  // object is passed instead of mutating process.env so each case starts from
+  // the same valid baseline regardless of test ordering.
+  function productionEnv(apiUrl: string | undefined): NodeJS.ProcessEnv {
+    return {
+      NODE_ENV: 'production',
+      EXPO_PUBLIC_API_URL: apiUrl,
+      ADMOB_ANDROID_APP_ID: 'ca-app-pub-1111111111111111~1111111111',
+      ADMOB_IOS_APP_ID: 'ca-app-pub-2222222222222222~2222222222',
+      EXPO_PUBLIC_ADMOB_ANDROID_HOME_BANNER_ID: 'ca-app-pub-1111111111111111/1111111111',
+      EXPO_PUBLIC_ADMOB_IOS_HOME_BANNER_ID: 'ca-app-pub-2222222222222222/2222222222',
+      EXPO_PUBLIC_ADMOB_ANDROID_HISTORY_NATIVE_ID: 'ca-app-pub-1111111111111111/3333333333',
+      EXPO_PUBLIC_ADMOB_IOS_HISTORY_NATIVE_ID: 'ca-app-pub-2222222222222222/4444444444',
+      EXPO_PUBLIC_IOS_APP_STORE_URL: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
+      EXPO_PUBLIC_ANDROID_PLAY_STORE_URL:
+        'https://play.google.com/store/apps/details?id=com.aienglish.coach',
+    };
+  }
+
+  it.each([
+    ['a plain HTTP URL', 'http://api.example.invalid', /must be an https URL in production/],
+    [
+      'a URL with a query string',
+      'https://api.example.invalid?token=1',
+      /cannot contain credentials, a query, or a fragment/,
+    ],
+    [
+      'a URL with a fragment',
+      'https://api.example.invalid#reset',
+      /cannot contain credentials, a query, or a fragment/,
+    ],
+    [
+      'a URL with credentials',
+      'https://user:secret@api.example.invalid',
+      /cannot contain credentials, a query, or a fragment/,
+    ],
+    [
+      'a URL with only a username',
+      'https://user@api.example.invalid',
+      /cannot contain credentials, a query, or a fragment/,
+    ],
+    ['a non-URL string', 'not-a-url', /must be a valid https URL in production/],
+    ['a missing value', undefined, /EXPO_PUBLIC_API_URL is required in production/],
+  ])('fails production for %s', (_label, value, expected) => {
+    expect(() => buildConfig(CONFIG_CONTEXT, productionEnv(value))).toThrow(expected);
+  });
+});
+
+describe('client version floor', () => {
+  // The server's production MIN_CLIENT_VERSION is a hard 1.1.1 floor: a lower
+  // app version is rejected with 426 CLIENT_UPGRADE_REQUIRED on every product
+  // route, so a release built below it can never talk to production.
+  const SERVER_PRODUCTION_MIN_CLIENT_VERSION = '1.1.1';
+  const SEMVER = /^\d+\.\d+\.\d+$/;
+
+  /** Segment-wise semver comparison; both inputs must match SEMVER. */
+  function compareSemver(a: string, b: string): number {
+    const [aMajor, aMinor, aPatch] = a.split('.').map(Number);
+    const [bMajor, bMinor, bPatch] = b.split('.').map(Number);
+    if (aMajor !== bMajor) return aMajor - bMajor;
+    if (aMinor !== bMinor) return aMinor - bMinor;
+    return aPatch - bPatch;
+  }
+
+  it('ships a non-empty semver version at or above the server production floor', () => {
+    const declared = appJson.expo.version;
+    if (typeof declared !== 'string' || !SEMVER.test(declared)) {
+      throw new Error(
+        `expo.version must be a non-empty semver string (major.minor.patch); got ${JSON.stringify(
+          declared,
+        )}`,
+      );
+    }
+    if (compareSemver(declared, SERVER_PRODUCTION_MIN_CLIENT_VERSION) < 0) {
+      throw new Error(
+        `expo.version ${declared} is below ${SERVER_PRODUCTION_MIN_CLIENT_VERSION}: the server's production MIN_CLIENT_VERSION hard floor rejects any lower client with 426 CLIENT_UPGRADE_REQUIRED, so this version could never talk to production`,
+      );
+    }
+
+    // The built ExpoConfig keeps carrying that version, so a missing version
+    // can never ship through the dynamic config either.
+    process.env.NODE_ENV = 'development';
+    const config = buildConfig(CONFIG_CONTEXT, process.env);
+    expect(config.version).toBe(declared);
+    expect(typeof config.version).toBe('string');
+    expect(SEMVER.test(config.version ?? '')).toBe(true);
   });
 });

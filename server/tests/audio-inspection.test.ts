@@ -1,8 +1,9 @@
 import { execFile } from 'node:child_process';
+import nodeFs from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   accumulatePcmS16LeSignal,
   assertAudioInspectorAvailable,
@@ -21,6 +22,11 @@ const files: string[] = [];
 const runFile = promisify(execFile);
 const configuredFfmpegPath = config.ffmpegPath;
 const configuredFfprobePath = config.ffprobePath;
+// Root bypasses file permission checks, so chmod-based EACCES injection could
+// not produce the errno under that user (for example inside a root container);
+// the mocked-open host-fault tests below keep that classification covered
+// regardless of the executing user.
+const bypassesFilePermissions = typeof process.getuid === 'function' && process.getuid() === 0;
 const supportedAudioFixtures = [
   ['M4A', 'supported.m4a', 'aac', undefined],
   ['MP4', 'supported.mp4', 'aac', undefined],
@@ -337,6 +343,85 @@ describe('verifyAudioDuration', () => {
       message: 'Audio inspection is temporarily unavailable',
       code: 'PROVIDER_FAILED',
     });
+  });
+
+  it.skipIf(bypassesFilePermissions)(
+    'maps a permission-revoked uploads directory to a host fault, not invalid media',
+    async () => {
+      // EACCES reaching lstat/open means the server-private uploads tree itself
+      // became unreadable (operator mode/ownership change, sandbox denial). The
+      // take is fine, so the answer must stay a retryable host error exactly
+      // like a missing inspector — never the 415 that discards the recording.
+      const privateDir = path.join(uploadsDir, `${process.pid}-eacces-dir`);
+      await fs.mkdir(privateDir, { mode: 0o700 });
+      const filePath = path.join(privateDir, 'unreachable.wav');
+      await fs.writeFile(filePath, pcmWav(1), { mode: 0o600 });
+      try {
+        await fs.chmod(privateDir, 0o000);
+        await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+          status: 503,
+          message: 'Audio inspection is temporarily unavailable',
+          code: 'PROVIDER_FAILED',
+        });
+      } finally {
+        await fs.chmod(privateDir, 0o700).catch(() => undefined);
+        await fs.rm(privateDir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // EACCES (permissions revoked on a server-owned upload) and ENOMEM (kernel
+  // allocation failure) are host faults like descriptor exhaustion: the take
+  // must stay retryable instead of being blamed with the terminal 415.
+  it.each(['EACCES', 'ENOMEM'])(
+    'maps the host-side open failure %s to unavailable instead of invalid media',
+    async (code) => {
+      const filePath = await fixture(`valid-for-${code.toLowerCase()}-open.wav`, pcmWav(1));
+      const open = vi.spyOn(nodeFs, 'openSync').mockImplementationOnce(() => {
+        throw Object.assign(new Error(`open failed: ${code}`), { code });
+      });
+      try {
+        await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+          status: 503,
+          message: 'Audio inspection is temporarily unavailable',
+          code: 'PROVIDER_FAILED',
+        });
+      } finally {
+        open.mockRestore();
+      }
+    },
+  );
+
+  it('still rejects a vanished upload as unusable media instead of a host fault', async () => {
+    // ENOENT is deliberately not a host-fault errno: an upload that vanished
+    // under the process-private tree is genuinely unusable input, and treating
+    // it as retryable would let an already-cleaned take retry forever.
+    const filePath = await fixture('vanished.wav', pcmWav(1));
+    await fs.rm(filePath);
+    await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+      status: 415,
+      message: 'Invalid or unsupported audio file',
+      code: 'AUDIO_UNREADABLE',
+    });
+  });
+
+  it('fails closed on an unrecognized open errno instead of guessing a host fault', async () => {
+    // EPERM is a real errno this classifier does not enumerate, so an unknown
+    // code must keep the fail-closed invalid-media verdict rather than
+    // masquerading as a retryable host fault.
+    const filePath = await fixture('valid-for-eperm-open.wav', pcmWav(1));
+    const open = vi.spyOn(nodeFs, 'openSync').mockImplementationOnce(() => {
+      throw Object.assign(new Error('open failed: EPERM'), { code: 'EPERM' });
+    });
+    try {
+      await expect(verifyAudioDuration(filePath)).rejects.toMatchObject({
+        status: 415,
+        message: 'Invalid or unsupported audio file',
+        code: 'AUDIO_UNREADABLE',
+      });
+    } finally {
+      open.mockRestore();
+    }
   });
 
   it('maps an exhausted inspection wall clock to a retryable 503, never a file-blaming 415', async () => {

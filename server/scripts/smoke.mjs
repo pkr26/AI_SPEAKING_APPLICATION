@@ -180,7 +180,9 @@ r = await req('POST', '/uploads/audio-url', {
 ok(
   'uploads/audio-url returns endpoint-bound direct mode without split S3 buckets',
   r.status === 200 && r.body.mode === 'direct' && r.body.assessmentEndpoint === '/diagnostic/answer',
-  JSON.stringify(r.body),
+  r.body && r.body.mode === 's3'
+    ? 'server answered in S3 ingress mode: this journey needs the direct-upload server from the AGENTS.md smoke recipe (start it with S3_DIAGNOSTIC_BUCKET= and S3_PRACTICE_BUCKET= blanked)'
+    : JSON.stringify(r.body),
 );
 r = await req('POST', '/uploads/audio-url', {
   token,

@@ -47,24 +47,86 @@ describe('webhook target address policy', () => {
   it('refuses private, link-local, CGNAT, unique-local, and unspecified targets', () => {
     for (const address of [
       '10.1.2.3',
+      '10.255.255.255',
       '172.16.0.1',
       '172.31.255.254',
       '192.168.1.1',
       '169.254.169.254',
       '100.64.0.1',
+      '100.127.255.255',
       '0.0.0.0',
+      '0.1.2.3',
       'fe80::1',
+      'febf::1',
       'fc00::1',
       'fd12:3456::1',
+      'fdff::1',
       '::',
+      '0:1::9',
       '::ffff:10.0.0.1',
       '::ffff:192.168.0.1',
+      '::ffff:10.20.30.40',
       '64:ff9b::10.0.0.1',
+      '64:ff9b::172.16.5.5',
       'ff02::1',
+      'ff00::1',
       'not-an-address',
     ]) {
       expect(addressIsPublicOrLoopback(address), address).toBe(false);
     }
+  });
+
+  it('treats the octet just outside every refused IPv4/IPv6 range as public', () => {
+    // Boundary-exterior probes pin each range edge; a mutant that widens,
+    // narrows, drops, or always-hits any range fails exactly one probe here.
+    for (const address of [
+      '172.15.255.255',
+      '172.32.0.1',
+      '192.167.1.1',
+      '192.169.1.1',
+      '169.253.1.1',
+      '169.255.1.1',
+      '100.63.255.255',
+      '100.128.0.1',
+      '11.0.0.1',
+      '1.0.0.0',
+      // Foreign first octets with a refused-range SECOND octet pin each range's
+      // own class arm (a === 172/192/169/100): the arm must not fire for a
+      // public class even when the second octet lands inside another range.
+      '203.17.0.1',
+      '203.168.0.1',
+      '203.254.0.1',
+      '203.64.0.1',
+      'fbff::1',
+      'fe00::1',
+      'fe7f::1',
+      'fec0::1',
+      'feff::1',
+      '::ffff:123.45.67.89',
+      '64:ff9b::123.45.67.89',
+      // Embedded-IPv6 literals carrying the mapped/NAT64 marker mid-address
+      // must NOT be treated as embedded: the marker is start-anchored.
+      '1::ffff:10.0.0.1',
+      '1:64:ff9b::10.0.0.1',
+    ]) {
+      expect(addressIsPublicOrLoopback(address), address).toBe(true);
+    }
+  });
+
+  it('refuses embedded literals whose extracted quad is private even with multi-digit octets', () => {
+    expect(addressIsPublicOrLoopback('64:ff9b::10.20.30.40')).toBe(false);
+    expect(addressIsPublicOrLoopback('::ffff:172.16.5.5')).toBe(false);
+  });
+
+  it('delivers to a bracketed public IPv6 webhook literal', async () => {
+    Object.assign(config.mail, {
+      mode: 'webhook',
+      webhookUrl: 'https://[2606:4700::1111]/send',
+      webhookAllowPrivateAddress: false,
+    });
+    vi.mocked(lookup).mockImplementation(async (host) => ({ address: host, family: 6 }) as never);
+    await sendMail({ to: 'learner@example.com', subject: 'reset', text: 'code 123456' });
+    expect(fetchSpy).toHaveBeenCalledOnce();
   });
 
   it('never POSTs a reset code to a webhook host resolving to a private address', async () => {

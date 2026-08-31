@@ -43,13 +43,17 @@ export const codeMutationLanes = Object.freeze({
     ['tests/question-inventory.test.ts', 'tests/schema-readiness.test.ts'],
   ),
   metrics: lane(['src/metrics.ts'], ['tests/metrics-initialization.test.ts', 'tests/metrics.test.ts']),
-  index: lane(['src/index.ts'], ['tests/index-lifecycle.test.ts']),
+  index: lane(
+    ['src/index.ts', 'src/slow-client-guard.ts'],
+    ['tests/index-lifecycle.test.ts', 'tests/slow-client-guard.test.ts'],
+  ),
   auth: lane(
     ['src/auth.ts', 'src/mailer.ts'],
     [
       'tests/auth.test.ts',
       'tests/auth-boundaries.test.ts',
       'tests/auth-janitor-unit.test.ts',
+      'tests/mailer.test.ts',
       'tests/password-reset.test.ts',
       'tests/practice-cycles.test.ts',
       'tests/profile.test.ts',

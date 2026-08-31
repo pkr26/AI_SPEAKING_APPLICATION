@@ -48,6 +48,9 @@ const runtime = vi.hoisted(() => {
     assertStorage: vi.fn(async (): Promise<void> => undefined),
     trustProxy: false as false | number,
     dbPoolMax: 20,
+    isProduction: false,
+    s3DiagnosticBucket: '',
+    s3PracticeBucket: '',
   };
 });
 
@@ -60,7 +63,18 @@ vi.mock('../src/config', () => ({
     nodeEnv: 'test',
     openaiTimeoutMs: 60_000,
     shutdownDrainMs: 140_000,
-    s3: { operationTimeoutMs: 30_000 },
+    get isProduction() {
+      return runtime.isProduction;
+    },
+    s3: {
+      operationTimeoutMs: 30_000,
+      get diagnostic() {
+        return { bucket: runtime.s3DiagnosticBucket };
+      },
+      get practice() {
+        return { bucket: runtime.s3PracticeBucket };
+      },
+    },
     recordings: { maintenanceIntervalMs: 60_000 },
     get trustProxy() {
       return runtime.trustProxy;
@@ -104,6 +118,9 @@ beforeEach(() => {
   runtime.logger.fatal.mockImplementation(() => undefined);
   runtime.trustProxy = false;
   runtime.dbPoolMax = 20;
+  runtime.isProduction = false;
+  runtime.s3DiagnosticBucket = '';
+  runtime.s3PracticeBucket = '';
   runtime.poolQuery.mockResolvedValue({ rows: [{ max_connections: '100' }] });
   runtime.server.listening = false;
   runtime.server.errorListeners.length = 0;
@@ -192,6 +209,44 @@ describe('server lifecycle failure handling', () => {
     expect(
       runtime.logger.warn.mock.calls.filter(([, message]) => String(message).includes('TRUST_PROXY')),
     ).toHaveLength(0);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it('warns at boot when S3 ingress is enabled on a non-production server, and stays silent otherwise', async () => {
+    runtime.s3DiagnosticBucket = 'dev-diagnostic-bucket';
+    runtime.s3PracticeBucket = 'dev-practice-bucket';
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(runtime.logger.warn).toHaveBeenCalledWith(
+      { diagnosticBucket: 'dev-diagnostic-bucket', practiceBucket: 'dev-practice-bucket' },
+      'S3 audio ingress is enabled on a non-production server: submissions will use presigned uploads against those buckets, and the documented smoke recipe needs them blanked',
+    );
+
+    // Production deployments expect S3 buckets and must not warn.
+    runtime.isProduction = true;
+    runtime.logger.warn.mockClear();
+    runtime.server.listen.mockClear();
+    vi.resetModules();
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    expect(
+      runtime.logger.warn.mock.calls.filter(([, message]) => String(message).includes('S3 audio ingress')),
+    ).toHaveLength(0);
+
+    addedSignalListener('SIGTERM')('SIGTERM');
+    await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));
+  });
+
+  it('installs the slow-client guards on the HTTP server before listening', async () => {
+    const exit = vi.spyOn(process, 'exit').mockImplementation((() => undefined) as never);
+    await import('../src/index');
+    await vi.waitFor(() => expect(runtime.server.listen).toHaveBeenCalledWith(43210, expect.any(Function)));
+    const registered = runtime.server.on.mock.calls.filter(([event]) => event === 'connection' || event === 'request');
+    expect(registered.map(([event]) => event).sort()).toEqual(['connection', 'request']);
 
     addedSignalListener('SIGTERM')('SIGTERM');
     await vi.waitFor(() => expect(exit).toHaveBeenCalledWith(0));

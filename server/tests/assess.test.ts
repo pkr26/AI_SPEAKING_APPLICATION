@@ -119,6 +119,24 @@ describe('assessSpeaking (mock mode)', () => {
   });
 });
 
+describe('assessNativeComprehension (mock mode)', () => {
+  it('returns the exact simulated native comprehension payload with its mock English translation', async () => {
+    const snap = snapshotConfig();
+    config.mockAi = true;
+    try {
+      await expect(assessNativeComprehension(audioPath, QUESTION, 'te', userId)).resolves.toEqual({
+        understood: true,
+        transcript: '(mock transcript)',
+        translatedTranscript: '(mock English translation)',
+        modelAnswer: 'This is a mocked model answer about "hometown" (MOCK_AI=true).',
+        feedback: 'This is a mocked comprehension check (MOCK_AI=true): simulated understood=true.',
+      });
+    } finally {
+      restoreConfig(snap);
+    }
+  });
+});
+
 describe('assertDailyAssessmentCapacity', () => {
   it('returns a state-change rejection for a deleted account before writing a reservation', async () => {
     const missingUserId = randomUUID();

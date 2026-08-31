@@ -10,7 +10,7 @@ vi.mock('@aws-sdk/s3-request-presigner', () => ({ getSignedUrl: getSignedUrlMock
 
 import { config } from '../src/config';
 import { logger } from '../src/logger';
-import { recordingBulkCleanupBatchSql } from '../src/recordings';
+import { cleanupStaleRecordingMetadata, recordingBulkCleanupBatchSql } from '../src/recordings';
 import { app, pool, registerUser } from './helpers';
 
 config.s3.practice.bucket = 'private-practice-recordings';
@@ -488,6 +488,159 @@ describe('recording owner API', () => {
       error: 'Missing or invalid Authorization header',
       code: 'UNAUTHENTICATED',
     });
+  });
+
+  it('serves the owner list on both /recordings and /recordings/', async () => {
+    const a = app();
+    const { res: registered } = await registerUser(a);
+    const authorization = { Authorization: `Bearer ${registered.body.token as string}` };
+
+    const bare = await request(a).get('/recordings').set(authorization);
+    const slashed = await request(a).get('/recordings/').set(authorization);
+
+    expect(bare.status).toBe(200);
+    expect(slashed.status).toBe(200);
+    expect(bare.body).toEqual({ items: [], nextCursor: null });
+    expect(slashed.body).toEqual({ items: [], nextCursor: null });
+  });
+
+  it('deletes exactly one stale-epoch recording through the exclusive cleanup janitor, then reports no work', async () => {
+    const cleanupClient = await pool.connect();
+    let cleanupLockHeld = false;
+    try {
+      // Drain any backlog other suites left on the shared database while
+      // holding the janitor's advisory key, so the returned counts below
+      // measure exactly this owner's single stale row.
+      await cleanupClient.query('SELECT pg_advisory_lock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = true;
+      for (let pass = 0; pass < 20; pass++) {
+        const queued = await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1');
+        if (queued.rowCount === 0) break;
+        await cleanupClient.query(recordingBulkCleanupBatchSql(50));
+      }
+      expect((await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1')).rowCount).toBe(0);
+      await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = false;
+
+      const a = app();
+      const { res: registered } = await registerUser(a);
+      const userId = registered.body.user.id as string;
+      const recording = await createRecording(userId);
+
+      // A bulk delete-all style generation advance: the existing metadata is
+      // now stale and one durable queue row guards its bounded removal.
+      await pool.query(`UPDATE users SET recording_retention_epoch = recording_retention_epoch + 1 WHERE id = $1`, [
+        userId,
+      ]);
+      await pool.query(
+        `INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch)
+         SELECT id, recording_retention_epoch FROM users WHERE id = $1`,
+        [userId],
+      );
+
+      await expect(cleanupStaleRecordingMetadata()).resolves.toBe(1);
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(0);
+      // The queue row survives its own deleting pass (all WITH sub-statements
+      // share one snapshot) and is pruned by the first later pass that
+      // observes no stale metadata left for its guarded cutoff.
+      await expect(cleanupStaleRecordingMetadata()).resolves.toBe(0);
+      expect(
+        (await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs WHERE user_id = $1', [userId])).rowCount,
+      ).toBe(0);
+
+      await expect(cleanupStaleRecordingMetadata()).resolves.toBe(0);
+    } finally {
+      if (cleanupLockHeld) {
+        await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      }
+      cleanupClient.release();
+    }
+  });
+
+  it('skips the stale-metadata janitor tick while another session holds its exact advisory lock', async () => {
+    const cleanupClient = await pool.connect();
+    let cleanupLockHeld = false;
+    try {
+      // Drain any backlog other suites left on the shared database while
+      // holding the janitor's advisory key, so the counts below measure only
+      // this owner's single stale row.
+      await cleanupClient.query('SELECT pg_advisory_lock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = true;
+      for (let pass = 0; pass < 20; pass++) {
+        const queued = await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1');
+        if (queued.rowCount === 0) break;
+        await cleanupClient.query(recordingBulkCleanupBatchSql(50));
+      }
+      expect((await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs LIMIT 1')).rowCount).toBe(0);
+
+      const a = app();
+      const { res: registered } = await registerUser(a);
+      const userId = registered.body.user.id as string;
+      const recording = await createRecording(userId);
+      await pool.query(`UPDATE users SET recording_retention_epoch = recording_retention_epoch + 1 WHERE id = $1`, [
+        userId,
+      ]);
+      await pool.query(
+        `INSERT INTO recording_bulk_cleanup_jobs (user_id, cutoff_epoch)
+         SELECT id, recording_retention_epoch FROM users WHERE id = $1`,
+        [userId],
+      );
+
+      // While the production lock name is held by another session, the janitor
+      // must report no work; a different lock name would run the batch anyway.
+      await expect(cleanupStaleRecordingMetadata()).resolves.toBe(0);
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(1);
+
+      await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      cleanupLockHeld = false;
+      await expect(cleanupStaleRecordingMetadata()).resolves.toBe(1);
+      expect((await pool.query('SELECT 1 FROM recordings WHERE id = $1', [recording.id])).rowCount).toBe(0);
+    } finally {
+      if (cleanupLockHeld) {
+        await cleanupClient.query('SELECT pg_advisory_unlock(hashtext($1))', ['janitor:stale-recordings']);
+      }
+      cleanupClient.release();
+    }
+  });
+
+  it('binds bulk deletion to the exact recordings root and never to a deeper trailing path', async () => {
+    const a = app();
+    const owner = await registerUser(a);
+    const token = owner.res.body.token as string;
+    const userId = owner.res.body.user.id as string;
+    await createRecording(userId);
+    const authorization = { Authorization: `Bearer ${token}` };
+
+    const bare = await request(a).delete('/recordings').set(authorization);
+    expect(bare.status).toBe(204);
+    const slashed = await request(a).delete('/recordings/').set(authorization);
+    expect(slashed.status).toBe(204);
+    expect(
+      (
+        await pool.query<{ recording_retention_epoch: string }>(
+          'SELECT recording_retention_epoch FROM users WHERE id = $1',
+          [userId],
+        )
+      ).rows,
+    ).toEqual([{ recording_retention_epoch: '2' }]);
+
+    // A deeper path with a trailing slash must fall through to the UUID route
+    // (and fail its validation), never match the bulk root and advance the
+    // retention generation.
+    const deep = await request(a).delete('/recordings/not-a-uuid/').set(authorization);
+    expect(deep.status).toBe(400);
+    expect(deep.body).toEqual({ error: 'id: recording id must be a valid UUID', code: 'VALIDATION_FAILED' });
+    expect(
+      (
+        await pool.query<{ recording_retention_epoch: string }>(
+          'SELECT recording_retention_epoch FROM users WHERE id = $1',
+          [userId],
+        )
+      ).rows,
+    ).toEqual([{ recording_retention_epoch: '2' }]);
+    expect((await pool.query('SELECT 1 FROM recording_bulk_cleanup_jobs WHERE user_id = $1', [userId])).rowCount).toBe(
+      1,
+    );
   });
 
   it('account deletion cascades metadata but preserves a durable object-deletion tombstone', async () => {

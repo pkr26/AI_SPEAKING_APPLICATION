@@ -445,6 +445,9 @@ export function formatConfigProblems(issues: ReadonlyArray<{ path: Array<string 
 function compareDottedVersions(left: string, right: string): number {
   const leftParts = left.split('.').map(Number);
   const rightParts = right.split('.').map(Number);
+  // Stryker disable next-line EqualityOperator: every input is capped at three segments by the
+  // MIN_CLIENT_VERSION refine regex (and the only literal operand is '1.1.1'), so index 3 always
+  // compares undefined??0 against undefined??0 — the <= mutant is behaviorally identical.
   for (let index = 0; index < 3; index++) {
     const difference = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
     if (difference !== 0) return difference;
@@ -493,7 +496,10 @@ export const config = {
   // pre-1.1.1 builds even when the deploy forgot to set the explicit knob.
   minClientVersion:
     env.NODE_ENV === 'production'
-      ? compareDottedVersions(env.MIN_CLIENT_VERSION || '1.1.1', '1.1.1') < 0
+      ? // Stryker disable next-line StringLiteral: the || '1.1.1' fallback is only reached with an
+        // empty knob, where compareDottedVersions('', '1.1.1') already returns -1 (Number('') === 0),
+        // so the comparison still selects the '1.1.1' floor consequent — identical output.
+        compareDottedVersions(env.MIN_CLIENT_VERSION || '1.1.1', '1.1.1') < 0
         ? '1.1.1'
         : env.MIN_CLIENT_VERSION || '1.1.1'
       : env.MIN_CLIENT_VERSION || undefined,

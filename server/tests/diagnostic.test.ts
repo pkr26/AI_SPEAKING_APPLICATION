@@ -1,7 +1,8 @@
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { randomUUID } from 'crypto';
 import request from 'supertest';
 import fs from 'fs/promises';
+import type { PoolClient } from 'pg';
 import { config } from '../src/config';
 import { answerForm, app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 import { uploadsDir } from '../src/upload';
@@ -10,8 +11,101 @@ afterAll(async () => {
   await pool.end();
 });
 
+/**
+ * Wrap every explicit pool lease for the duration of one action, recording
+ * each leased client's query texts as their own segment (the segment ends
+ * when the lease is released). Mirrors level-progression's
+ * observeExplicitLeaseQueries, segmented per lease so a write transaction can
+ * be asserted from its BEGIN through its final statement.
+ */
+async function observeLeaseQueries<T>(action: () => PromiseLike<T>): Promise<{ result: T; leases: string[][] }> {
+  const originalConnect = pool.connect.bind(pool);
+  const leases: string[][] = [];
+  let current: string[] | null = null;
+  const connect = vi.spyOn(pool, 'connect').mockImplementation(((callback?: unknown) => {
+    if (typeof callback === 'function') return originalConnect(callback as never);
+    return originalConnect().then((client: PoolClient) => {
+      const mutable = client as unknown as {
+        query: (...args: unknown[]) => unknown;
+        release: (error?: Error | boolean) => void;
+      };
+      const actualQuery = mutable.query;
+      const actualRelease = mutable.release;
+      mutable.query = (query: unknown, ...args: unknown[]) => {
+        const text = typeof query === 'string' ? query : (query as { text?: unknown } | null)?.text;
+        if (typeof text === 'string' && current) current.push(text);
+        return actualQuery.call(client, query, ...args);
+      };
+      mutable.release = (error?: Error | boolean) => {
+        mutable.query = actualQuery;
+        mutable.release = actualRelease;
+        if (current) leases.push(current);
+        current = null;
+        actualRelease.call(client, error);
+      };
+      current = [];
+      return client;
+    });
+  }) as typeof pool.connect);
+
+  try {
+    return { result: await action(), leases };
+  } finally {
+    connect.mockRestore();
+  }
+}
+
+const lastQuery = (texts: string[]) => texts[texts.length - 1];
+
 describe('diagnostic', () => {
   const a = app();
+
+  it('finishes the placement at the three-question bound while the window stays open', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const first = await request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`);
+    expect(first.body.question.cefrLevel).toBe('B1');
+
+    // B1 pass -> [3,5] (C1), C1 pass -> [5,5] (C2), C2 fail -> [3,4]: the
+    // window is still open after the third answer, so only the attemptNo
+    // bound can complete the run (duplicating the equivalent scenario in
+    // diagnostic-silence-and-resume.test.ts, whose per-test coverage
+    // attribution has proven unreliable under Stryker). This file drives the
+    // real mock-AI scorer, so the score sequence is pinned through the
+    // Math.random seed the scorer reads.
+    const random = vi.spyOn(Math, 'random');
+    try {
+      random.mockReturnValue(0.9); // mock score 90: pass B1
+      const firstAnswer = await answerForm(
+        request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+        first.body.question.id,
+      );
+      expect(firstAnswer.status, JSON.stringify(firstAnswer.body)).toBe(200);
+      expect(firstAnswer.body.done).toBe(false);
+      expect(firstAnswer.body.nextQuestion.cefrLevel).toBe('C1');
+
+      random.mockReturnValue(0.9); // mock score 90: pass C1
+      const secondAnswer = await answerForm(
+        request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+        firstAnswer.body.nextQuestion.id,
+      );
+      expect(secondAnswer.status).toBe(200);
+      expect(secondAnswer.body.done).toBe(false);
+      expect(secondAnswer.body.nextQuestion.cefrLevel).toBe('C2');
+
+      random.mockReturnValue(0); // mock score 40: fail C2, window stays [3,4]
+      const thirdAnswer = await answerForm(
+        request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+        secondAnswer.body.nextQuestion.id,
+      );
+      expect(thirdAnswer.status).toBe(200);
+      expect(thirdAnswer.body.done).toBe(true);
+      expect(thirdAnswer.body.level).toBe('C1');
+      expect(thirdAnswer.body.nextQuestion).toBeUndefined();
+    } finally {
+      random.mockRestore();
+    }
+  });
 
   it('GET /next stores the served question as current_question_id', async () => {
     const { res } = await registerUser(a);
@@ -481,5 +575,36 @@ describe('diagnostic', () => {
       config.assessDailyCap = previousUserCap;
       config.assessGlobalDailyCap = previousGlobalCap;
     }
+  });
+
+  it('ends its question-assignment and answer-finalization transactions with an explicit COMMIT', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+
+    const { result: served, leases: nextLeases } = await observeLeaseQueries(() =>
+      request(a).get('/diagnostic/next').set('Authorization', `Bearer ${token}`),
+    );
+    expect(served.status).toBe(200);
+    expect(served.body.done).toBe(false);
+    const assignment = nextLeases.find((texts) =>
+      texts.some((text) => text.includes('UPDATE diagnostic_state SET current_question_id')),
+    );
+    expect(assignment).toBeDefined();
+    expect(assignment).toContain('BEGIN');
+    expect(lastQuery(assignment!)).toBe('COMMIT');
+
+    const { result: answered, leases: answerLeases } = await observeLeaseQueries(() =>
+      answerForm(
+        request(a).post('/diagnostic/answer').set('Authorization', `Bearer ${token}`),
+        served.body.question.id,
+      ),
+    );
+    expect(answered.status).toBe(200);
+    // MOCK_AI always returns speech, so this pins the scored finalize path.
+    expect(answered.body.transcript).toBe('(mock transcript)');
+    const finalize = answerLeases.find((texts) => texts.some((text) => text.includes('INSERT INTO attempts')));
+    expect(finalize).toBeDefined();
+    expect(finalize).toContain('BEGIN');
+    expect(lastQuery(finalize!)).toBe('COMMIT');
   });
 });

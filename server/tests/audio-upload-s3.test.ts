@@ -1508,6 +1508,163 @@ describe('submitted S3 cleanup lifecycle', () => {
       vi.useRealTimers();
     }
   });
+
+  it('resolves completion without finalizing an unregistered response, then settles a registered one', async () => {
+    // A plain response-like object that never passed through the submission
+    // middleware carries no cleanup state: completing it must be a fulfilled
+    // no-op rather than a crash or a finalize attempt.
+    const bare = {} as Parameters<typeof completeSubmittedPresignedAudio>[0];
+    await expect(completeSubmittedPresignedAudio(bare)).resolves.toBeUndefined();
+
+    const ownershipQuery = vi.spyOn(pool, 'query');
+    try {
+      const userId = randomUUID();
+      const req = directS3Request(userId);
+      const res = {
+        statusCode: 200,
+        writableFinished: true,
+        once: vi.fn().mockReturnThis(),
+      } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+      sendMock.mockResolvedValue({});
+
+      discardSubmittedPresignedAudio(req, res, vi.fn());
+      ownSubmittedPresignedAudio(res);
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+
+      // Completion is itself the settle signal: the registered owner must see
+      // exactly one ownership check and one DeleteObject through this call.
+      expect(ownershipQuery).toHaveBeenCalledTimes(1);
+      expect(sendMock).toHaveBeenCalledOnce();
+      expect((sendMock.mock.calls[0][0] as { kind: string }).kind).toBe('delete');
+    } finally {
+      ownershipQuery.mockRestore();
+    }
+  });
+
+  it('clears the in-flight finalize latch so a later completion can retry after the processing claim disappears', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const userId = registration.body.user.id as string;
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    const question = await pool.query<{ id: string }>('SELECT id FROM questions LIMIT 1');
+    await pool.query(
+      `INSERT INTO assessment_requests
+         (user_id, request_id, claim_id, context, question_id, status, audio_key, response_version)
+       VALUES ($1, $2, $3, 'practice', $4, 'processing', $5, 1)`,
+      [userId, requestId, randomUUID(), question.rows[0].id, audioKey],
+    );
+    const req = {
+      body: { audioKey, requestId },
+      user: { id: userId },
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[0];
+    const res = {
+      statusCode: 200,
+      writableFinished: true,
+      once: vi.fn().mockReturnThis(),
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+
+    try {
+      discardSubmittedPresignedAudio(req, res, vi.fn());
+      ownSubmittedPresignedAudio(res);
+      sendMock.mockResolvedValue({});
+
+      // First completion observes the live processing claim, retains the
+      // object, and must NOT memoize that early return.
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      expect(sendMock).not.toHaveBeenCalled();
+
+      // The worker finished: no row references the key anymore, so a second
+      // completion must be able to run the whole check-and-delete again.
+      await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
+      await expect(completeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      expect(sendMock).toHaveBeenCalledOnce();
+      expect((sendMock.mock.calls[0][0] as { kind: string }).kind).toBe('delete');
+    } finally {
+      await pool.query('DELETE FROM assessment_requests WHERE user_id = $1', [userId]);
+    }
+  });
+
+  it('keeps the default preservation for a submission nobody owned even after finish settles it', async () => {
+    const userId = randomUUID();
+    const req = directS3Request(userId);
+    const listeners = new Map<string, Array<() => void>>();
+    const res = {
+      statusCode: 200,
+      writableFinished: true,
+      once: vi.fn((event: string, listener: () => void) => {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+        return res;
+      }),
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+    const ownershipQuery = vi.spyOn(pool, 'query');
+
+    try {
+      discardSubmittedPresignedAudio(req, res, vi.fn());
+      // No ownSubmittedPresignedAudio() call: a replayed or limiter-rejected
+      // submission stays preserved even though `finish` settles the decision.
+      for (const listener of listeners.get('finish') ?? []) listener();
+
+      await expect(finalizeSubmittedPresignedAudio(res)).resolves.toBeUndefined();
+      expect(ownershipQuery).not.toHaveBeenCalled();
+      expect(sendMock).not.toHaveBeenCalled();
+    } finally {
+      ownershipQuery.mockRestore();
+    }
+  });
+
+  it('settles and deletes through the finish listener alone even before the transport reports writableFinished', async () => {
+    const userId = randomUUID();
+    const req = directS3Request(userId);
+    const res = Object.assign(new EventEmitter(), { statusCode: 200, writableFinished: false });
+    sendMock.mockResolvedValue({});
+
+    discardSubmittedPresignedAudio(req, res as never, vi.fn());
+    ownSubmittedPresignedAudio(res as never);
+    // `finish` is the terminal proof for a normally completed response; the
+    // close fallback must not be required for the deletion to land.
+    res.emit('finish');
+
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledOnce());
+    expect((sendMock.mock.calls[0][0] as { kind: string }).kind).toBe('delete');
+    await finalizeSubmittedPresignedAudio(res as never);
+  });
+
+  it('settles on close only when the transport actually finished the response', async () => {
+    const settledUserId = randomUUID();
+    const settledRes = Object.assign(new EventEmitter(), { statusCode: 200, writableFinished: true });
+    sendMock.mockResolvedValue({});
+
+    discardSubmittedPresignedAudio(directS3Request(settledUserId), settledRes as never, vi.fn());
+    ownSubmittedPresignedAudio(settledRes as never);
+    settledRes.emit('close');
+    await vi.waitFor(() => expect(sendMock).toHaveBeenCalledOnce());
+    expect((sendMock.mock.calls[0][0] as { kind: string }).kind).toBe('delete');
+
+    // An aborted transport (writableFinished false) must NOT settle through
+    // close: the route's explicit completion is the only later delete path.
+    const abortedUserId = randomUUID();
+    const listeners = new Map<string, Array<() => void>>();
+    const abortedRes = {
+      statusCode: 200,
+      writableFinished: false,
+      once: vi.fn((event: string, listener: () => void) => {
+        listeners.set(event, [...(listeners.get(event) ?? []), listener]);
+        return abortedRes;
+      }),
+    } as unknown as Parameters<typeof discardSubmittedPresignedAudio>[1];
+
+    discardSubmittedPresignedAudio(directS3Request(abortedUserId), abortedRes, vi.fn());
+    ownSubmittedPresignedAudio(abortedRes);
+    for (const listener of listeners.get('close') ?? []) listener();
+
+    await expect(finalizeSubmittedPresignedAudio(abortedRes)).resolves.toBeUndefined();
+    expect(sendMock).toHaveBeenCalledOnce();
+
+    await expect(completeSubmittedPresignedAudio(abortedRes)).resolves.toBeUndefined();
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect((sendMock.mock.calls[1][0] as { kind: string }).kind).toBe('delete');
+  });
 });
 
 describe('S3 object download boundaries', () => {
@@ -3457,6 +3614,55 @@ describe('POST /practice/attempt (S3 mode)', () => {
       [userId, next.body.question.id],
     );
     expect(insertedAttempt.rows).toEqual([{ id: recording.rows[0].attempt_id }]);
+  });
+
+  it('binds a retained native submission to its own native attempt row', async () => {
+    const a = app();
+    const { res: registration } = await registerUser(a);
+    const token = registration.body.token as string;
+    const userId = registration.body.user.id as string;
+    await pool.query("UPDATE users SET cefr_level = 'A1', diagnostic_completed = true WHERE id = $1", [userId]);
+    sendMock.mockClear();
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(next.status).toBe(200);
+    const audioKey = ownedKey(userId);
+    const requestId = randomUUID();
+    sendMock.mockImplementation((command: { kind: string }) => {
+      if (command.kind === 'get') return Promise.resolve({ Body: Readable.from(fakeM4aBuffer()) });
+      return Promise.resolve({});
+    });
+
+    const response = await request(a).post('/practice/attempt/native').set('Authorization', `Bearer ${token}`).send({
+      questionId: next.body.question.id,
+      requestId,
+      cycleId: next.body.cycleId,
+      audioKey,
+      retainRecording: true,
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ mode: 'native', recordingId: expect.stringMatching(/^[0-9a-f-]{36}$/i) });
+    await vi.waitFor(() => {
+      expect(sendMock.mock.calls.map(([command]) => command.kind)).toEqual(['get', 'tag-retained']);
+    });
+    const recording = await pool.query<{ attempt_id: string | null }>(
+      `SELECT attempt_id
+       FROM recordings
+       WHERE user_id = $1 AND request_id = $2`,
+      [userId, requestId],
+    );
+    // The retained metadata must reference the native attempt itself, not stay
+    // unbound from the history row it exists to replay.
+    expect(recording.rows).toEqual([{ attempt_id: expect.stringMatching(/^[0-9a-f-]{36}$/i) }]);
+    const insertedNativeAttempt = await pool.query<{ id: string }>(
+      `SELECT id
+       FROM attempts
+       WHERE user_id = $1 AND question_id = $2 AND context = 'practice-native'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [userId, next.body.question.id],
+    );
+    expect(insertedNativeAttempt.rows).toEqual([{ id: recording.rows[0].attempt_id }]);
   });
 
   it('keeps the submitted object through 503 backpressure so the contracted same-key retry succeeds', async () => {

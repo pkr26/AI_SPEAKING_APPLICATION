@@ -13,9 +13,14 @@ import { runRecordingMaintenance } from './recordings';
 import { assertDatabaseSchemaCurrent } from './schema-readiness';
 import { assertAudioInspectorAvailable } from './audio-inspection';
 import { assertRetainedAudioStorageAvailable } from './audio-upload';
+import { installSlowClientGuards } from './slow-client-guard';
 
 const app = createApp();
 const server = createServer(app);
+// Bound two slow-client stall shapes Node's own HTTP timeouts miss (a socket
+// parked mid-header-line fires neither headersTimeout nor requestTimeout).
+// Registered before listen() so no accepted connection can miss the guards.
+installSlowClientGuards(server);
 
 // A nonzero hop count is only safe behind a proxy chain that strips
 // client-supplied forwarding headers on exactly this many hops.
@@ -23,6 +28,15 @@ if (config.trustProxy) {
   logLifecycleWarning(
     { trustProxy: config.trustProxy },
     'TRUST_PROXY is set: the hop count must exactly match the deployment proxy chain; if this port is reachable directly, clients can spoof X-Forwarded-For to reset per-IP rate-limit budgets',
+  );
+}
+
+// A developer .env with real S3 buckets silently flips local smoke/test runs
+// into S3 ingress mode (the smoke journey expects the direct-upload flow).
+if (!config.isProduction && config.s3.diagnostic.bucket && config.s3.practice.bucket) {
+  logLifecycleWarning(
+    { diagnosticBucket: config.s3.diagnostic.bucket, practiceBucket: config.s3.practice.bucket },
+    'S3 audio ingress is enabled on a non-production server: submissions will use presigned uploads against those buckets, and the documented smoke recipe needs them blanked',
   );
 }
 

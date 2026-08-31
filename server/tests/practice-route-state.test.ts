@@ -2,6 +2,24 @@ import { randomUUID } from 'crypto';
 import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest';
+
+// Optional parked-assess seam (same shape as tests/assessment-route-state.test.ts):
+// disabled by default so every other test in this file keeps the real
+// MOCK_AI pipeline, and enabled only inside the bodies of the tests that need
+// to hold the provider call open mid-flight.
+const routeAssess = vi.hoisted(() => ({ useMock: false, assess: vi.fn(), nativeAssess: vi.fn() }));
+
+vi.mock('../src/assess', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/assess')>();
+  return {
+    ...actual,
+    assessSpeaking: (...args: Parameters<typeof actual.assessSpeaking>) =>
+      routeAssess.useMock ? routeAssess.assess(...args) : actual.assessSpeaking(...args),
+    assessNativeComprehension: (...args: Parameters<typeof actual.assessNativeComprehension>) =>
+      routeAssess.useMock ? routeAssess.nativeAssess(...args) : actual.assessNativeComprehension(...args),
+  };
+});
+
 import { app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
 
 afterAll(async () => {
@@ -481,5 +499,151 @@ describe('practice finalization and cleanup', () => {
         expect(inflight.rows[0].count).toBe(0);
       },
     );
+  });
+});
+
+describe('practice persistence race with a parked provider call', () => {
+  function fixedNativePracticeRequest(token: string, questionId: string, requestId: string, cycleId: string) {
+    return request(a)
+      .post('/practice/attempt/native')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', fakeM4aBuffer(), {
+        filename: 'answer.m4a',
+        contentType: 'audio/mp4',
+      })
+      .field('questionId', questionId)
+      .field('requestId', requestId)
+      .field('cycleId', cycleId);
+  }
+
+  it('answers the exact cycle-closed contract when the serving cycle closes before an English persist', async () => {
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
+    const requestId = randomUUID();
+    routeAssess.assess.mockClear();
+    const passing = { transcript: 'passed', score: 65, passed: true, feedback: 'pass' };
+    let releaseAssessment!: (result: typeof passing) => void;
+    routeAssess.assess.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    routeAssess.useMock = true;
+    let response: Awaited<ReturnType<typeof fixedPracticeRequest>>;
+    const attemptPromise = Promise.resolve(fixedPracticeRequest(token, questionId, requestId, cycleId));
+    try {
+      await vi.waitFor(() => expect(routeAssess.assess).toHaveBeenCalledOnce());
+      // The parked worker still owns its claim; closing the serving row behind
+      // it must surface the stable public 409, never an undefined-row crash.
+      await pool.query(`UPDATE practice_cycles SET status = 'closed', closed_at = now() WHERE id = $1`, [cycleId]);
+      releaseAssessment(passing);
+      response = await attemptPromise;
+    } finally {
+      routeAssess.useMock = false;
+      releaseAssessment(passing);
+      await attemptPromise.catch(() => undefined);
+    }
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+    expect(await routeArtifacts(userId, requestId)).toEqual({ attempts: 0, requests: 0 });
+    expect(
+      (await pool.query('SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1', [userId])).rows[0]
+        .count,
+    ).toBe(0);
+  });
+
+  it('answers the exact cycle-closed contract when the serving cycle closes before a native persist', async () => {
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
+    const requestId = randomUUID();
+    routeAssess.nativeAssess.mockClear();
+    const understood = {
+      understood: true,
+      transcript: 'una respuesta nativa',
+      translatedTranscript: 'a native answer',
+      modelAnswer: 'A model answer.',
+      feedback: 'Understood.',
+    };
+    let releaseAssessment!: (result: typeof understood) => void;
+    routeAssess.nativeAssess.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    routeAssess.useMock = true;
+    let response: Awaited<ReturnType<typeof fixedNativePracticeRequest>>;
+    const attemptPromise = Promise.resolve(fixedNativePracticeRequest(token, questionId, requestId, cycleId));
+    try {
+      await vi.waitFor(() => expect(routeAssess.nativeAssess).toHaveBeenCalledOnce());
+      await pool.query(`UPDATE practice_cycles SET status = 'closed', closed_at = now() WHERE id = $1`, [cycleId]);
+      releaseAssessment(understood);
+      response = await attemptPromise;
+    } finally {
+      routeAssess.useMock = false;
+      releaseAssessment(understood);
+      await attemptPromise.catch(() => undefined);
+    }
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+    expect(await routeArtifacts(userId, requestId)).toEqual({ attempts: 0, requests: 0 });
+    expect(
+      (await pool.query('SELECT count(*)::int AS count FROM practice_inflight WHERE user_id = $1', [userId])).rows[0]
+        .count,
+    ).toBe(0);
+  });
+
+  it('rejects a skip of the in-flight question with the exact in-progress contract', async () => {
+    const { token, userId, questionId, cycleId } = await registerPlacedPracticeUser();
+    const requestId = randomUUID();
+    routeAssess.assess.mockClear();
+    const passing = { transcript: 'passed', score: 65, passed: true, feedback: 'pass' };
+    let releaseAssessment!: (result: typeof passing) => void;
+    routeAssess.assess.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    routeAssess.useMock = true;
+    const attemptPromise = Promise.resolve(fixedPracticeRequest(token, questionId, requestId, cycleId));
+    try {
+      await vi.waitFor(() => expect(routeAssess.assess).toHaveBeenCalledOnce());
+
+      const skipped = await request(a)
+        .post('/practice/skip')
+        .set('Authorization', `Bearer ${token}`)
+        .send({ questionId, cycleId });
+
+      expect(skipped.status).toBe(409);
+      expect(skipped.body).toEqual({
+        error: 'An assessment is already in progress for this question',
+        code: 'ASSESSMENT_IN_PROGRESS',
+      });
+      // The rejected skip must not park the word or close the cycle.
+      expect(
+        (await pool.query('SELECT count(*)::int AS count FROM practice_progress WHERE user_id = $1', [userId])).rows[0]
+          .count,
+      ).toBe(0);
+      expect(
+        (await pool.query<{ status: string }>('SELECT status FROM practice_cycles WHERE id = $1', [cycleId])).rows[0]
+          .status,
+      ).toBe('active');
+
+      releaseAssessment(passing);
+      const completed = await attemptPromise;
+      expect(completed.status).toBe(200);
+    } finally {
+      routeAssess.useMock = false;
+      releaseAssessment(passing);
+      await attemptPromise.catch(() => undefined);
+    }
   });
 });

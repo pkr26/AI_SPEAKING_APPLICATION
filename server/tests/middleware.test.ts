@@ -456,6 +456,13 @@ describe('clientVersionGate', () => {
     }
   });
 
+  it('refuses traffic when the configured minimum client version is unparseable', async () => {
+    config.minClientVersion = 'not.a.version';
+    const res = await request(a).get('/client-config');
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+  });
+
   it('keeps operational probes usable regardless of version header', async () => {
     config.minClientVersion = '9.0.0';
     for (const path of ['/health', '/health/']) {
@@ -688,6 +695,167 @@ describe('errorHandler', () => {
     } finally {
       increment.mockRestore();
       warn.mockRestore();
+    }
+  });
+
+  it('sheds a PostgreSQL lock-timeout error as retryable 503 instead of a 500', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const increment = vi.spyOn(shedRequestsTotal, 'inc').mockImplementation(() => undefined as never);
+    const req = { id: 'lock-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+    const lockTimeout = new Error('canceling statement due to lock timeout') as Error & { code: string };
+    lockTimeout.code = '55P03';
+
+    try {
+      errorHandler(lockTimeout, req, res, vi.fn());
+      expect(warn).toHaveBeenCalledWith(
+        { requestId: 'lock-request', err: expect.anything() },
+        'database lock wait or statement timed out; shedding request',
+      );
+      expect(increment).toHaveBeenCalledWith({ reason: 'db_lock_timeout' });
+      expect(res.set).toHaveBeenCalledWith('Retry-After', '5');
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
+    } finally {
+      increment.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('sheds a PostgreSQL statement timeout as retryable 503', () => {
+    const warn = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
+    const increment = vi.spyOn(shedRequestsTotal, 'inc').mockImplementation(() => undefined as never);
+    const req = { id: 'stmt-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+    const statementTimeout = new Error('canceling statement due to statement timeout') as Error & { code: string };
+    statementTimeout.code = '57014';
+
+    try {
+      errorHandler(statementTimeout, req, res, vi.fn());
+      expect(increment).toHaveBeenCalledWith({ reason: 'db_lock_timeout' });
+      expect(res.status).toHaveBeenCalledWith(503);
+      expect(res.json).toHaveBeenCalledWith({
+        error: 'Server is busy, please try again shortly',
+        code: 'POOL_SATURATED',
+        retryAfterSeconds: 5,
+      });
+    } finally {
+      increment.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('anchored pool-timeout matching: prefixed or suffixed driver messages stay 500', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const req = { id: 'anchor-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = () =>
+      ({
+        writableEnded: false,
+        destroyed: false,
+        set: vi.fn().mockReturnThis(),
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn().mockReturnThis(),
+      }) as unknown as express.Response;
+    const statusOf = (err: Error) => {
+      const r = res();
+      errorHandler(err, req, r, vi.fn());
+      return (r.status as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as number;
+    };
+    try {
+      expect(statusOf(new Error('x timeout exceeded when trying to connect'))).toBe(500);
+      expect(statusOf(new Error('timeout exceeded when trying to connectx'))).toBe(500);
+      expect(statusOf(new Error('timeout exceeded when trying to connect'))).toBe(503);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('requires the statement-timeout message even when the SQLSTATE arm is widened', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const req = { id: 'widened-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = () =>
+      ({
+        writableEnded: false,
+        destroyed: false,
+        set: vi.fn().mockReturnThis(),
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn().mockReturnThis(),
+      }) as unknown as express.Response;
+    try {
+      const foreignCode = new Error('canceling statement due to statement timeout') as Error & { code: string };
+      foreignCode.code = '58000';
+      const r1 = res();
+      errorHandler(foreignCode, req, r1, vi.fn());
+      expect((r1.status as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0]).toBe(500);
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('forwards the exact invalid-configuration error from the standalone gate', () => {
+    config.minClientVersion = 'garbage!';
+    const next = vi.fn();
+    clientVersionGate({ headers: {} } as never, {} as never, next);
+    expect(next).toHaveBeenCalledOnce();
+    const forwarded = next.mock.calls[0][0] as Error;
+    expect(forwarded).toBeInstanceOf(Error);
+    expect(forwarded.message).toBe('configured minimum client version is invalid');
+  });
+
+  it('keeps a non-Error object with a lock-timeout shape on the generic 500 path', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const req = { id: 'shape-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+    try {
+      errorHandler({ code: '55P03', message: 'canceling statement due to lock timeout' }, req, res, vi.fn());
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Internal server error', code: 'INTERNAL' });
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('keeps a user-initiated query cancellation on the generic 500 path', () => {
+    const error = vi.spyOn(logger, 'error').mockImplementation(() => undefined);
+    const req = { id: 'cancel-request', socket: { destroyed: false } } as unknown as express.Request;
+    const res = {
+      writableEnded: false,
+      destroyed: false,
+      set: vi.fn().mockReturnThis(),
+      status: vi.fn().mockReturnThis(),
+      json: vi.fn().mockReturnThis(),
+    } as unknown as express.Response;
+    const userCancel = new Error('canceling statement due to user request') as Error & { code: string };
+    userCancel.code = '57014';
+
+    try {
+      errorHandler(userCancel, req, res, vi.fn());
+      expect(res.status).toHaveBeenCalledWith(500);
+      expect(res.json).toHaveBeenCalledWith({ error: 'Internal server error', code: 'INTERNAL' });
+    } finally {
+      error.mockRestore();
     }
   });
 

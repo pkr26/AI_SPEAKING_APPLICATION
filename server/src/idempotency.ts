@@ -15,19 +15,23 @@ export interface AssessmentQuestionSnapshot {
   questionText: string;
 }
 
-const assessmentQuestionSnapshotSchema = z
-  .object({
-    cefrLevel: z.enum(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']),
-    promptWord: z
-      .string()
-      .max(100)
-      .refine((value) => value.trim().length > 0),
-    questionText: z
-      .string()
-      .max(1_000)
-      .refine((value) => value.trim().length > 0),
-  })
-  .strict();
+// Constructed per claim (like the response schemas in createResponseSchemas)
+// so every schema mutant executes inside the tests that exercise claims.
+function createAssessmentQuestionSnapshotSchema() {
+  return z
+    .object({
+      cefrLevel: z.enum(['A1', 'A2', 'B1', 'B2', 'C1', 'C2']),
+      promptWord: z
+        .string()
+        .max(100)
+        .refine((value) => value.trim().length > 0),
+      questionText: z
+        .string()
+        .max(1_000)
+        .refine((value) => value.trim().length > 0),
+    })
+    .strict();
+}
 
 /**
  * Completed responses must outlive the app's 25-hour recovery window so a
@@ -76,6 +80,9 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const recordingFields = { recordingId: uuid.optional() } as const;
   const cefrLevel = z.enum(CEFR_LEVELS);
   const nativeLanguage = z.enum(['te', 'hi', 'es', 'zh']);
+  // Stryker disable next-line ArithmeticOperator: attemptsLeft's own min(1) plus the === refine
+  // force attemptsLeft to 3-attemptsUsed within 1..3, so attemptsUsed>=3 is rejected by the
+  // refine regardless of this bound — the accepted-body set is identical under the mutant.
   const attemptNumber = integer(1, PRACTICE_MAX_ATTEMPTS);
   const failingScore = integer(0, PRACTICE_PASS_SCORE - 1);
   const passingScore = integer(PRACTICE_PASS_SCORE, 100);
@@ -106,6 +113,9 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const practiceQuestionPayload = z
     .object({
       cycleId: uuid,
+      // Stryker disable next-line ArithmeticOperator: widening the upper bound admits only
+      // attemptsUsed>=3, which the attemptsLeft===3-attemptsUsed refine with min(1) already
+      // rejects — behaviorally identical.
       attemptsUsed: integer(0, PRACTICE_MAX_ATTEMPTS - 1),
       attemptsLeft: integer(1, PRACTICE_MAX_ATTEMPTS),
       question,
@@ -340,6 +350,9 @@ export function validatedAssessmentResponse(
  */
 function visibleAssessmentResponse(row: RequestRow): Record<string, unknown> {
   const response = validatedAssessmentResponse(row.context, row.response_body!);
+  // Stryker disable next-line ConditionalExpression: the false-mutant strips an ABSENT key
+  // (no-op delete) and revalidates the identical object; present recordingIds are decided by
+  // recording_visible in both versions. Byte-identical outputs on every input.
   if (response.recordingId === undefined || row.recording_visible) return response;
 
   const withoutDeletedRecording = { ...response };
@@ -401,7 +414,7 @@ export async function claimAssessmentRequest(
   if ((context === 'practice-native') !== (nativeLanguage !== undefined)) {
     throw new Error('practice-native assessment requests require a language snapshot and other contexts must omit it');
   }
-  const parsedQuestionSnapshot = assessmentQuestionSnapshotSchema.safeParse(questionSnapshot);
+  const parsedQuestionSnapshot = createAssessmentQuestionSnapshotSchema().safeParse(questionSnapshot);
   if (!parsedQuestionSnapshot.success) {
     throw new Error('assessment requests require a valid claim-time question snapshot');
   }
@@ -463,7 +476,14 @@ export async function claimAssessmentRequest(
         audioKey ?? null,
         practiceCycleId ?? null,
         retainRecording,
+        // Stryker disable next-line LogicalOperator: a NULL native_language on a practice-native
+        // INSERT is backfilled by migration 022's claim trigger from the same users row the
+        // claim locked; the profile cannot change under that lock, so the mutant's NULL is
+        // always rewritten to the identical claimed value.
         nativeLanguage ?? null,
+        // Stryker disable next-line LogicalOperator: a NULL diagnostic_run_id is backfilled by
+        // migration 024's snapshot trigger from the same diagnostic_state row the claim read
+        // under users FOR UPDATE — restart rotates the run only through that parent lock.
         diagnosticRunId ?? null,
         parsedQuestionSnapshot.data.cefrLevel,
         parsedQuestionSnapshot.data.promptWord,
@@ -729,6 +749,9 @@ export async function getAssessmentRequestStatus(
   );
   const row = rows[0];
   if (!row) return undefined;
+  // Stryker disable next-line ConditionalExpression: for non-diagnostic rows both run columns
+  // and the context-restricted LEFT JOIN are NULL (null !== null is false), so the conjunct is
+  // false either way; diagnostic rows compare the same runs in both versions.
   if (row.context === 'diagnostic' && row.diagnostic_run_id !== row.current_diagnostic_run_id) {
     throw retiredDiagnosticRunError();
   }

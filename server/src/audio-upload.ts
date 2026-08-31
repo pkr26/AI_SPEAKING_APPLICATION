@@ -605,6 +605,9 @@ export function discardSubmittedPresignedAudio(scope: AudioStorageScope): Reques
     // lifecycle bounds it.
     res.once('finish', () => {
       const cleanup = (res as AudioCleanupResponse)[SUBMITTED_AUDIO_CLEANUP];
+      // Stryker disable next-line ConditionalExpression: this listener is registered in the same
+      // synchronous block that assigns the Symbol property exactly once (and nothing ever deletes
+      // it), so cleanup is always defined here.
       if (cleanup) cleanup.settled = true;
       queueMicrotask(() => void finalizeSubmittedPresignedAudio(res));
     });

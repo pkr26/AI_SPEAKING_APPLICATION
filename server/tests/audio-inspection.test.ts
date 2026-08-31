@@ -10,6 +10,7 @@ import {
   hasAssessableAudioSignal,
   MAX_AUDIO_DURATION_SECONDS,
   MIN_AUDIO_PEAK_AMPLITUDE,
+  MIN_AUDIO_RMS_AMPLITUDE,
   summarizePcmS16LeSignal,
   verifyAudioDuration,
 } from '../src/audio-inspection';
@@ -353,6 +354,64 @@ describe('verifyAudioDuration', () => {
     });
   }, 25_000);
 
+  it('rejects a decoder that exits nonzero after emitting decodable bytes', async () => {
+    // The probe stage succeeds on a genuine WAV, while a fake decoder emits one
+    // even sample (0xffff = -1) and then exits 1. The close handler must blame
+    // the file with 415 on the nonzero exit; skipping that branch would fall
+    // through to the duration gates and answer 422 "too short" instead.
+    const failingDecoder = path.join(uploadsDir, `${process.pid}-failing-ffmpeg`);
+    files.push(failingDecoder);
+    await fs.writeFile(failingDecoder, "#!/bin/sh\nprintf '\\377\\377'\nexit 1\n", { mode: 0o700 });
+    config.ffmpegPath = failingDecoder;
+    await expect(verifyAudioDuration(await fixture('valid-for-failing-decoder.wav', pcmWav(1)))).rejects.toMatchObject({
+      status: 415,
+      code: 'AUDIO_UNREADABLE',
+    });
+  });
+
+  it('rejects a decoder that exits zero without decoding any samples', async () => {
+    // Zero decoded bytes with a successful exit code is still an unusable
+    // decode (415), not an empty recording that reaches the duration gate.
+    const emptyDecoder = path.join(uploadsDir, `${process.pid}-empty-ffmpeg`);
+    files.push(emptyDecoder);
+    await fs.writeFile(emptyDecoder, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    config.ffmpegPath = emptyDecoder;
+    await expect(verifyAudioDuration(await fixture('valid-for-empty-decoder.wav', pcmWav(1)))).rejects.toMatchObject({
+      status: 415,
+      code: 'AUDIO_UNREADABLE',
+    });
+  });
+
+  it('rejects a successful decode that ends on an odd trailing byte', async () => {
+    // One complete sample plus one dangling byte: the byte-count parity check
+    // rejects it, and the signal-consistency settle is the second, independent
+    // defense (the accumulator holds the pending low byte), so both layers of
+    // the close handler must agree on the same stable 415.
+    const oddDecoder = path.join(uploadsDir, `${process.pid}-odd-ffmpeg`);
+    files.push(oddDecoder);
+    await fs.writeFile(oddDecoder, "#!/bin/sh\nprintf '\\377\\377\\001'\nexit 0\n", { mode: 0o700 });
+    config.ffmpegPath = oddDecoder;
+    await expect(verifyAudioDuration(await fixture('valid-for-odd-decoder.wav', pcmWav(1)))).rejects.toMatchObject({
+      status: 415,
+      code: 'AUDIO_UNREADABLE',
+    });
+  });
+
+  it('rejects a failing decode that ends on an odd trailing byte', async () => {
+    // The nonzero exit owns the rejection regardless of the byte count, so an
+    // odd trailing byte must never soften the failure into a duration answer.
+    const oddFailingDecoder = path.join(uploadsDir, `${process.pid}-odd-failing-ffmpeg`);
+    files.push(oddFailingDecoder);
+    await fs.writeFile(oddFailingDecoder, "#!/bin/sh\nprintf '\\377\\377\\001'\nexit 1\n", { mode: 0o700 });
+    config.ffmpegPath = oddFailingDecoder;
+    await expect(
+      verifyAudioDuration(await fixture('valid-for-odd-failing-decoder.wav', pcmWav(1))),
+    ).rejects.toMatchObject({
+      status: 415,
+      code: 'AUDIO_UNREADABLE',
+    });
+  });
+
   it('rejects extensions outside the fixed demuxer allowlist', async () => {
     await expect(verifyAudioDuration(await fixture('valid-audio.bin', pcmWav(1)))).rejects.toMatchObject({
       status: 415,
@@ -362,5 +421,102 @@ describe('verifyAudioDuration', () => {
 
   it('verifies that the configured executable is FFmpeg', async () => {
     await expect(assertAudioInspectorAvailable()).resolves.toBeUndefined();
+  });
+});
+
+describe('PCM signal accumulator mutation boundaries', () => {
+  it('creates the exact zeroed accumulator shape', () => {
+    expect(createPcmS16LeSignalAccumulator()).toStrictEqual({
+      sampleCount: 0,
+      sumSquares: 0,
+      peakAmplitude: 0,
+    });
+  });
+
+  it('decodes the negative full-scale sample 0x8000 as amplitude 32768', () => {
+    // Bytes 0x00 (low) + 0x80 (high) are the signed value -32768; its
+    // amplitude, square (32768^2 = 1073741824, float64 exact), and RMS are
+    // all exactly 32768, and it alone satisfies the signal gate.
+    const summary = summarizePcmS16LeSignal(
+      accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), Buffer.from([0x00, 0x80])),
+    );
+    expect(summary).toStrictEqual({
+      sampleCount: 1,
+      peakAmplitude: 32_768,
+      rmsAmplitude: 32_768,
+      hasPartialSample: false,
+    });
+    expect(hasAssessableAudioSignal(summary)).toBe(true);
+  });
+
+  it('computes exact RMS for zero samples and for a known multi-sample buffer', () => {
+    expect(summarizePcmS16LeSignal(createPcmS16LeSignalAccumulator()).rmsAmplitude).toBe(0);
+    const samples = [3, -4, 0, 12];
+    const pcm = Buffer.alloc(samples.length * 2);
+    samples.forEach((sample, index) => pcm.writeInt16LE(sample, index * 2));
+    // (9 + 16 + 0 + 144) / 4 = 42.25 and sqrt(42.25) is exactly 6.5.
+    expect(summarizePcmS16LeSignal(accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), pcm))).toStrictEqual({
+      sampleCount: 4,
+      peakAmplitude: 12,
+      rmsAmplitude: 6.5,
+      hasPartialSample: false,
+    });
+  });
+
+  it('carries an odd trailing low byte across an intervening empty chunk', () => {
+    let state = accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), Buffer.from([0x7f]));
+    expect(state).toStrictEqual({ sampleCount: 0, sumSquares: 0, peakAmplitude: 0, pendingLowByte: 0x7f });
+
+    // An empty chunk must neither consume the pending low byte nor count.
+    state = accumulatePcmS16LeSignal(state, Buffer.alloc(0));
+    expect(state).toStrictEqual({ sampleCount: 0, sumSquares: 0, peakAmplitude: 0, pendingLowByte: 0x7f });
+
+    // 0x7f (low) + 0x01 (high) close out the single sample 383 (146689 = 383^2).
+    state = accumulatePcmS16LeSignal(state, Buffer.from([0x01]));
+    expect(state).toStrictEqual({ sampleCount: 1, sumSquares: 146_689, peakAmplitude: 383 });
+    expect(summarizePcmS16LeSignal(state).hasPartialSample).toBe(false);
+  });
+
+  it('accepts exactly the minimum peak and RMS amplitudes and rejects one step below each gate', () => {
+    const passing = {
+      sampleCount: 2,
+      peakAmplitude: MIN_AUDIO_PEAK_AMPLITUDE,
+      rmsAmplitude: MIN_AUDIO_RMS_AMPLITUDE,
+      hasPartialSample: false,
+    };
+    expect(hasAssessableAudioSignal(passing)).toBe(true);
+    expect(hasAssessableAudioSignal({ ...passing, peakAmplitude: MIN_AUDIO_PEAK_AMPLITUDE - 1 })).toBe(false);
+    expect(hasAssessableAudioSignal({ ...passing, rmsAmplitude: 0.9 })).toBe(false);
+    expect(hasAssessableAudioSignal({ ...passing, sampleCount: 0 })).toBe(false);
+    expect(hasAssessableAudioSignal({ ...passing, hasPartialSample: true })).toBe(false);
+  });
+
+  it('derives an RMS of exactly one from samples 1 and -1 and accepts it end to end', () => {
+    // sqrt((1 + 1) / 2) === 1, so the raw RMS boundary is met by real samples.
+    const summary = summarizePcmS16LeSignal(
+      accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), Buffer.from([0x01, 0x00, 0xff, 0xff])),
+    );
+    expect(summary).toStrictEqual({
+      sampleCount: 2,
+      peakAmplitude: 1,
+      rmsAmplitude: 1,
+      hasPartialSample: false,
+    });
+    expect(hasAssessableAudioSignal({ ...summary, peakAmplitude: MIN_AUDIO_PEAK_AMPLITUDE })).toBe(true);
+  });
+
+  it('accepts a decoded buffer whose peak lands exactly on the minimum', () => {
+    // Samples 16 and -16: peak exactly MIN_AUDIO_PEAK_AMPLITUDE and
+    // sqrt((256 + 256) / 2) === 16, so the peak boundary is met by real samples.
+    const summary = summarizePcmS16LeSignal(
+      accumulatePcmS16LeSignal(createPcmS16LeSignalAccumulator(), Buffer.from([0x10, 0x00, 0xf0, 0xff])),
+    );
+    expect(summary).toStrictEqual({
+      sampleCount: 2,
+      peakAmplitude: MIN_AUDIO_PEAK_AMPLITUDE,
+      rmsAmplitude: 16,
+      hasPartialSample: false,
+    });
+    expect(hasAssessableAudioSignal(summary)).toBe(true);
   });
 });

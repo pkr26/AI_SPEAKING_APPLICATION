@@ -75,6 +75,15 @@ describe('assessment submission schema', () => {
     });
     expect(bodySchema.safeParse({ ...ids, audioKey: 'x'.repeat(513) }).success).toBe(false);
     expect(storageScope).toBe('practice');
+
+    // Practice submissions carry the durable cycle binding: pin the exact
+    // UUID failure message the multipart 400 surfaces to clients.
+    const badCycle = bodySchema.safeParse({ ...ids, cycleId: 'not-a-uuid', audioKey: 'x'.repeat(512) });
+    expect(badCycle.success).toBe(false);
+    if (badCycle.success) throw new Error('invalid cycleId unexpectedly passed validation');
+    expect(badCycle.error.issues).toEqual([
+      expect.objectContaining({ path: ['cycleId'], message: 'cycleId must be a valid UUID' }),
+    ]);
   });
 
   it('registers S3 submission cleanup before eligibility and paid limiters', () => {

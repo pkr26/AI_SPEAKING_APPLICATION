@@ -316,16 +316,34 @@ export function buildLimiters() {
 
   // Registration gets its own tighter per-IP budget: bulk account creation is
   // the entry point for both account-cycling spend and email enumeration.
-  const register = rateLimit({
-    ...common,
-    windowMs: config.rateLimit.registerWindowMs,
-    limit: config.rateLimit.registerMax,
-    store: new PostgresRateLimitStore(
-      `register:${config.rateLimit.registerWindowMs}:${config.rateLimit.registerMax}`,
-      config.rateLimit.registerWindowMs,
-    ),
-    keyGenerator: requestIpRateLimitKey,
-    message: { error: 'Too many accounts created from this network, please try again later', code: 'RATE_LIMITED' },
+  // A pure validation 400 (zod rejection or unparseable JSON) creates no
+  // account and never reaches the EMAIL_TAKEN oracle, so it refunds its hit
+  // through the same exact-window mechanism the email-keyed budget uses for
+  // successes — one buggy or impatient client behind a shared NAT cannot burn
+  // the whole network's signup budget on form errors. Every answer that could
+  // be part of an attack still counts: 201 successes (bulk creation), 409
+  // EMAIL_TAKEN probes (enumeration), 413 oversized bodies (flooding), and
+  // 429s themselves. The explicit requestPropertyName keeps this limiter's
+  // window info distinct from the per-IP auth limiter mounted on the same
+  // route, whose default property name it would otherwise overwrite.
+  const registerStore = new PostgresRateLimitStore(
+    `register:${config.rateLimit.registerWindowMs}:${config.rateLimit.registerMax}`,
+    config.rateLimit.registerWindowMs,
+  );
+  const registerRequestProperty = 'registerIpRateLimit';
+  const register = withExactWindowFinishRefund({
+    limiter: rateLimit({
+      ...common,
+      windowMs: config.rateLimit.registerWindowMs,
+      limit: config.rateLimit.registerMax,
+      store: registerStore,
+      requestPropertyName: registerRequestProperty,
+      keyGenerator: requestIpRateLimitKey,
+      message: { error: 'Too many accounts created from this network, please try again later', code: 'RATE_LIMITED' },
+    }),
+    store: registerStore,
+    requestPropertyName: registerRequestProperty,
+    refundFinished: (_req, res) => res.statusCode === 400,
   });
 
   // The per-IP register budget above cannot bound enumeration of ONE address

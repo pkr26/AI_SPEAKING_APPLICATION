@@ -428,6 +428,351 @@ describe('CEFR level progression', () => {
       code: 'STATE_CHANGED',
     });
   });
+
+  it('closes and replaces an active cycle left at a stale level on the next assignment', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const first = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(first.status).toBe(200);
+    const staleCycleId = first.body.cycleId as string;
+
+    // A diagnostic re-placement between releases can leave the served cycle at
+    // the previous level; the next assignment must repair that durably.
+    await pool.query("UPDATE users SET cefr_level = 'A2' WHERE id = $1", [userId]);
+    const second = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(second.status).toBe(200);
+    expect(second.body.cycleId).not.toBe(staleCycleId);
+    expect(second.body.question.cefrLevel).toBe('A2');
+    const stale = await pool.query<{ status: string }>('SELECT status FROM practice_cycles WHERE id = $1', [
+      staleCycleId,
+    ]);
+    expect(stale.rows[0].status).toBe('closed');
+  });
+
+  it('rejects a scored persist whose cycle advanced while the provider ran', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[0];
+    const cycleId = await assignedCycle(token, target);
+    let releaseAssessment!: (result: { transcript: string; score: number; passed: boolean; feedback: string }) => void;
+    speakMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    const pending = fixedAttempt(token, target, randomUUID(), cycleId);
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    await pool.query('UPDATE practice_cycles SET attempts_used = attempts_used + 1 WHERE id = $1', [cycleId]);
+    releaseAssessment({ transcript: 'passed', score: 65, passed: true, feedback: 'pass' });
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+    const persisted = await pool.query<{ attempts: number }>(
+      'SELECT count(*)::int AS attempts FROM attempts WHERE user_id = $1 AND question_id = $2',
+      [userId, target],
+    );
+    expect(persisted.rows[0].attempts).toBe(0);
+  });
+
+  it('rejects a silence persist whose cycle closed while the provider ran', async () => {
+    const { token } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[1];
+    const cycleId = await assignedCycle(token, target);
+    let releaseAssessment!: (result: { transcript: string; score: number; passed: boolean; feedback: string }) => void;
+    speakMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    const pending = fixedAttempt(token, target, randomUUID(), cycleId);
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    await pool.query("UPDATE practice_cycles SET status = 'closed', closed_at = now() WHERE id = $1", [cycleId]);
+    releaseAssessment({ transcript: '', score: 0, passed: false, feedback: 'silence' });
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+  });
+
+  it('rejects a native persist whose cycle advanced while the provider ran', async () => {
+    const { token } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[2];
+    const cycleId = await assignedCycle(token, target);
+    nativeMock.mockResolvedValue({
+      understood: true,
+      transcript: 'native answer',
+      translatedTranscript: 'translation',
+      modelAnswer: 'model answer text',
+      feedback: 'good content',
+    });
+    let releaseAssessment!: (result: {
+      understood: boolean;
+      transcript: string;
+      translatedTranscript: string;
+      modelAnswer: string;
+      feedback: string;
+    }) => void;
+    nativeMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    const pending = Promise.resolve(
+      request(a)
+        .post('/practice/attempt/native')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+        .field('questionId', target)
+        .field('requestId', randomUUID())
+        .field('cycleId', cycleId),
+    );
+    await vi.waitFor(() => expect(nativeMock).toHaveBeenCalledOnce());
+    await pool.query('UPDATE practice_cycles SET attempts_used = attempts_used + 1 WHERE id = $1', [cycleId]);
+    releaseAssessment({
+      understood: true,
+      transcript: 'native answer',
+      translatedTranscript: 'translation',
+      modelAnswer: 'model',
+      feedback: 'good',
+    });
+    const response = await pending;
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+  });
+
+  it('never attaches levelUp to a mastery that landed after the level already moved', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[8];
+    const cycleId = await assignedCycle(token, target);
+    let releaseAssessment!: (result: { transcript: string; score: number; passed: boolean; feedback: string }) => void;
+    speakMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    const pending = fixedAttempt(token, target, randomUUID(), cycleId);
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    // A rival promotion moved the learner off A1 while this mastering attempt
+    // was in flight: the guard's level-equality arm must keep levelUp off the
+    // response even though this attempt itself mastered a word.
+    await pool.query("UPDATE users SET cefr_level = 'A2' WHERE id = $1", [userId]);
+    releaseAssessment({ transcript: 'mastered', score: 95, passed: true, feedback: 'excellent' });
+    const response = await pending;
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ passed: true, mastered: true });
+    expect(response.body.levelUp).toBeUndefined();
+    expect(response.body.next.question.cefrLevel).toBe('A2');
+    expect(await userLevel(userId)).toBe('A2');
+  });
+
+  it('closes a stale-level run instead of offering a doomed retry, in both modes', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const englishTarget = ids[3];
+    const englishCycle = await assignedCycle(token, englishTarget);
+    let releaseEnglish!: (result: { transcript: string; score: number; passed: boolean; feedback: string }) => void;
+    speakMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseEnglish = resolve;
+        }),
+    );
+    const englishPending = fixedAttempt(token, englishTarget, randomUUID(), englishCycle);
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    await pool.query("UPDATE users SET cefr_level = 'A2' WHERE id = $1", [userId]);
+    releaseEnglish({ transcript: 'fail', score: 41, passed: false, feedback: 'fail' });
+    const english = await englishPending;
+    expect(english.status).toBe(200);
+    // A failing first try would normally retry; a stale level must close the
+    // run and serve the next question from the learner's CURRENT level, with
+    // no levelUp this attempt did not earn.
+    expect(english.body.attemptsLeft).toBe(0);
+    expect(english.body.levelUp).toBeUndefined();
+    expect(english.body.next.question.cefrLevel).toBe('A2');
+
+    const a2Ids = await levelQuestionIds('A2');
+    const nativeTarget = a2Ids[0];
+    const nativeCycle = await assignedCycle(token, nativeTarget);
+    nativeMock.mockResolvedValue({
+      understood: true,
+      transcript: 'native answer',
+      translatedTranscript: 'translation',
+      modelAnswer: 'model answer text',
+      feedback: 'good content',
+    });
+    let releaseNative!: (result: {
+      understood: boolean;
+      transcript: string;
+      translatedTranscript: string;
+      modelAnswer: string;
+      feedback: string;
+    }) => void;
+    nativeMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseNative = resolve;
+        }),
+    );
+    const nativePending = Promise.resolve(
+      request(a)
+        .post('/practice/attempt/native')
+        .set('Authorization', `Bearer ${token}`)
+        .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+        .field('questionId', nativeTarget)
+        .field('requestId', randomUUID())
+        .field('cycleId', nativeCycle),
+    );
+    await vi.waitFor(() => expect(nativeMock).toHaveBeenCalledOnce());
+    await pool.query("UPDATE users SET cefr_level = 'B1' WHERE id = $1", [userId]);
+    releaseNative({
+      understood: true,
+      transcript: 'native answer',
+      translatedTranscript: 'translation',
+      modelAnswer: 'model',
+      feedback: 'good',
+    });
+    const native = await nativePending;
+    expect(native.status).toBe(200);
+    expect(native.body.attemptsLeft).toBe(0);
+    expect(native.body.next.question.cefrLevel).toBe('B1');
+  });
+
+  it('counts native silence attempts without consuming the shared try budget arithmetic', async () => {
+    const { token } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[5];
+    const cycleId = await assignedCycle(token, target);
+    nativeMock.mockResolvedValue({
+      understood: true,
+      transcript: 'native answer',
+      translatedTranscript: 'translation',
+      modelAnswer: 'model answer text',
+      feedback: 'good content',
+    });
+    const nativeFirst = await request(a)
+      .post('/practice/attempt/native')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+      .field('questionId', target)
+      .field('requestId', randomUUID())
+      .field('cycleId', cycleId);
+    expect(nativeFirst.status).toBe(200);
+    expect(nativeFirst.body.attemptNo).toBe(1);
+
+    nativeMock.mockResolvedValueOnce({
+      understood: false,
+      transcript: '',
+      translatedTranscript: '',
+      modelAnswer: '',
+      feedback: 'I could not hear enough speech to understand your answer. Please speak clearly and try again.',
+    });
+    const silence = await request(a)
+      .post('/practice/attempt/native')
+      .set('Authorization', `Bearer ${token}`)
+      .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+      .field('questionId', target)
+      .field('requestId', randomUUID())
+      .field('cycleId', cycleId);
+    expect(silence.status).toBe(200);
+    expect(silence.body).toMatchObject({ noSpeech: true, attemptNo: 2, attemptsLeft: 2 });
+  });
+
+  it('keeps a retention pass at threshold free of levelUp', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const threshold = Math.ceil(0.85 * ids.length);
+    await seedMastered(userId, ids.slice(0, threshold));
+    // A 60-74 retention pass on an already-mastered word does not master a new
+    // word, so even a fully-threshold level must not attach levelUp here.
+    const target = ids[0];
+    const cycleId = await assignedCycle(token, target);
+    mockScore(70);
+    const response = await fixedAttempt(token, target, randomUUID(), cycleId);
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ passed: true, mastered: false });
+    expect(response.body.levelUp).toBeUndefined();
+    expect(await userLevel(userId)).toBe('A1');
+  });
+
+  it('serves revision first only when the latest attempt repeated an earlier word', async () => {
+    const { token, userId } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    // Seed one due revision word with no attempt history of a repeat, and no
+    // other progress: the session opens on the revision bucket.
+    const revisionTarget = ids[6];
+    await pool.query(
+      `INSERT INTO practice_progress (user_id, question_id, status, best_score, attempt_count, due_at)
+       VALUES ($1, $2, 'learning', 50, 1, now() - interval '1 hour')`,
+      [userId, revisionTarget],
+    );
+    const opened = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(opened.status).toBe(200);
+    expect(opened.body.kind).toBe('revision');
+    expect(opened.body.question.id).toBe(revisionTarget);
+  });
+
+  it('rejects skip for a closed cycle and while an assessment holds the question', async () => {
+    const { token } = await freshUserAt('A1');
+    const ids = await levelQuestionIds('A1');
+    const target = ids[7];
+    const cycleId = await assignedCycle(token, target);
+
+    let releaseAssessment!: (result: { transcript: string; score: number; passed: boolean; feedback: string }) => void;
+    speakMock.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releaseAssessment = resolve;
+        }),
+    );
+    const pending = fixedAttempt(token, target, randomUUID(), cycleId);
+    await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+    const inFlightSkip = await request(a)
+      .post('/practice/skip')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId: target, cycleId });
+    expect(inFlightSkip.status).toBe(409);
+    expect(inFlightSkip.body).toMatchObject({ code: 'ASSESSMENT_IN_PROGRESS' });
+    releaseAssessment({ transcript: 'done', score: 80, passed: true, feedback: 'good' });
+    expect((await pending).status).toBe(200);
+
+    const closedSkip = await request(a)
+      .post('/practice/skip')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId: target, cycleId });
+    expect(closedSkip.status).toBe(409);
+    expect(closedSkip.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
+  });
+
+  it('answers schema drift with the exact field messages', async () => {
+    const { token } = await freshUserAt('A1');
+    const badCycle = await request(a)
+      .post('/practice/skip')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId: randomUUID(), cycleId: 'not-a-uuid' });
+    expect(badCycle.status).toBe(400);
+    expect(badCycle.body).toEqual({ error: 'cycleId: cycleId must be a valid UUID', code: 'VALIDATION_FAILED' });
+
+    const stats = await request(a).get('/practice/stats').set('Authorization', `Bearer ${token}`);
+    expect(stats.status).toBe(200);
+    expect(stats.body.timeZone).toBe('UTC');
+  });
 });
 
 describe('POST /diagnostic/restart', () => {

@@ -49,6 +49,56 @@ const completeQuestionInventory = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'].flatMap((
 // — what an old replica sees once the next release's migration job has run.
 const NEWER_RELEASE_MIGRATION = { name: '999_from_a_newer_release.sql', checksum: 'f'.repeat(64) };
 
+// A release that packages only ordinary migrations: neither runtime cutover's
+// required migration (023/024) is in its manifest, so both fences are "not
+// required" for it. Exercised by re-importing schema-readiness against a
+// mocked migrations directory.
+const LEGACY_RELEASE_MIGRATIONS: Record<string, string> = {
+  '001_base.sql': 'SELECT 1;\n',
+  '002_next.sql': 'SELECT 2;\n',
+};
+
+function legacyReleaseManifest(): Array<{ name: string; checksum: string }> {
+  return Object.entries(LEGACY_RELEASE_MIGRATIONS).map(([name, sql]) => ({
+    name,
+    checksum: createHash('sha256').update(sql).digest('hex'),
+  }));
+}
+
+function sortMigrationRows<T extends { name: string }>(rows: readonly T[]): T[] {
+  return [...rows].sort(({ name: left }, { name: right }) => (left < right ? -1 : left > right ? 1 : 0));
+}
+
+async function importSchemaReadinessWithMigrations(files: Record<string, string>) {
+  const realReaddirSync = fs.readdirSync as unknown as (target: unknown) => string[];
+  const realReadFileSync = fs.readFileSync as unknown as (target: unknown) => string | Buffer;
+  const isMigrationsDirectory = (target: unknown) => String(target).includes(path.join('db', 'migrations'));
+  const readdir = vi.spyOn(fs, 'readdirSync').mockImplementation(((target: unknown) => {
+    if (isMigrationsDirectory(target)) return Object.keys(files).sort();
+    return realReaddirSync(target);
+  }) as never);
+  const readFile = vi.spyOn(fs, 'readFileSync').mockImplementation(((target: unknown) => {
+    if (isMigrationsDirectory(target)) return Buffer.from(files[path.basename(String(target))], 'utf8');
+    return realReadFileSync(target);
+  }) as never);
+  try {
+    vi.resetModules();
+    return await import('../src/schema-readiness');
+  } finally {
+    readdir.mockRestore();
+    readFile.mockRestore();
+  }
+}
+
+function readinessQuery(migrationRows: unknown[]) {
+  return vi.fn().mockImplementation(((text: string) => {
+    if (text.includes('schema_migrations')) return Promise.resolve({ rows: migrationRows });
+    if (text.includes('to_regclass')) return Promise.resolve({ rows: [{ table_name: 'rate_limit_windows' }] });
+    if (text.includes('FROM questions')) return Promise.resolve({ rows: completeQuestionInventory });
+    return Promise.reject(new Error(`unexpected readiness query: ${text}`));
+  }) as never);
+}
+
 beforeEach(() => {
   resetQuestionInventoryReadinessCacheForTests();
 });
@@ -187,6 +237,97 @@ describe('database schema readiness', () => {
     await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).resolves.toEqual({
       latestMigration: '024_diagnostic_runs_and_question_snapshots.sql',
     });
+  });
+
+  // The packaged manifest is fixed per release, so the "cutover required" side
+  // of the fence truth table is only controllable by re-importing the module
+  // against a mocked migrations directory that omits the required migration.
+  it('rejects a verified fence whose required migration this release does not package', async () => {
+    const { assertDatabaseSchemaCurrent: assertForLegacyRelease } =
+      await importSchemaReadinessWithMigrations(LEGACY_RELEASE_MIGRATIONS);
+    const rows = sortMigrationRows([
+      ...legacyReleaseManifest(),
+      ...RUNTIME_SCHEMA_CUTOVERS.map(({ name, checksum }) => ({ name, checksum })),
+    ]);
+    const query = readinessQuery(rows);
+
+    await expect(assertForLegacyRelease(query as SchemaQuery)).rejects.toThrow(
+      'Database migrations do not match this release through 002_next.sql',
+    );
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('stays ready without cutover fences when this release predates the cutover migrations', async () => {
+    const { assertDatabaseSchemaCurrent: assertForLegacyRelease } =
+      await importSchemaReadinessWithMigrations(LEGACY_RELEASE_MIGRATIONS);
+    // The trailing newer-release row must stay tolerated (rolling additive
+    // deploy) alongside the absent, not-required fences.
+    const rows = sortMigrationRows([...legacyReleaseManifest(), NEWER_RELEASE_MIGRATION]);
+    const query = readinessQuery(rows);
+
+    await expect(assertForLegacyRelease(query as SchemaQuery)).resolves.toEqual({
+      latestMigration: '002_next.sql',
+    });
+    expect(query).toHaveBeenCalledTimes(3);
+  });
+
+  it('rejects a lone wrong-checksum fence even when the cutover is not required', async () => {
+    const { assertDatabaseSchemaCurrent: assertForLegacyRelease } =
+      await importSchemaReadinessWithMigrations(LEGACY_RELEASE_MIGRATIONS);
+    const [cutover] = RUNTIME_SCHEMA_CUTOVERS;
+    const rows = sortMigrationRows([...legacyReleaseManifest(), { name: cutover.name, checksum: '0'.repeat(64) }]);
+    const query = readinessQuery(rows);
+
+    await expect(assertForLegacyRelease(query as SchemaQuery)).rejects.toThrow(
+      'Database migrations do not match this release through 002_next.sql',
+    );
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a duplicated fence even when the cutover is not required', async () => {
+    const { assertDatabaseSchemaCurrent: assertForLegacyRelease } =
+      await importSchemaReadinessWithMigrations(LEGACY_RELEASE_MIGRATIONS);
+    const [cutover] = RUNTIME_SCHEMA_CUTOVERS;
+    const fence = { name: cutover.name, checksum: cutover.checksum };
+    const rows = sortMigrationRows([...legacyReleaseManifest(), fence, fence]);
+    const query = readinessQuery(rows);
+
+    await expect(assertForLegacyRelease(query as SchemaQuery)).rejects.toThrow(
+      'Database migrations do not match this release through 002_next.sql',
+    );
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('treats a lone undefined fence row as an invalid cutover instead of dereferencing it', async () => {
+    // The migration rows are a hostile not-quite-array whose filter yields a
+    // single undefined entry: the checksum access must stay optional-chained
+    // so readiness fails closed rather than crashing.
+    const rows = { filter: () => [undefined] } as unknown as unknown[];
+    const query = vi.fn().mockResolvedValue({ rows });
+
+    await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
+      'Database migrations do not match this release',
+    );
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('rejects an ordinary migration row whose name or checksum differs, at any manifest position', async () => {
+    const current = successfulMigrationRows();
+    const firstOrdinaryIndex = RUNTIME_SCHEMA_CUTOVERS.length;
+    const lastIndex = current.length - 1;
+    for (const index of [firstOrdinaryIndex, Math.floor((firstOrdinaryIndex + lastIndex) / 2), lastIndex]) {
+      // The renamed row keeps its packaged checksum, and the altered row keeps
+      // its packaged name, so each mismatch exercises exactly one comparison.
+      const renamed = current.map((row, position) => (position === index ? { ...row, name: '999_renamed.sql' } : row));
+      const altered = current.map((row, position) => (position === index ? { ...row, checksum: '0'.repeat(64) } : row));
+      for (const rows of [renamed, altered]) {
+        const query = vi.fn().mockResolvedValue({ rows });
+        await expect(assertDatabaseSchemaCurrent(query as SchemaQuery)).rejects.toThrow(
+          'Database migrations do not match this release',
+        );
+        expect(query).toHaveBeenCalledOnce();
+      }
+    }
   });
 
   it('rejects a missing latest runtime table', async () => {

@@ -366,6 +366,26 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
       .status(503)
       .json({ error: 'Server is busy, please try again shortly', code: 'POOL_SATURATED', retryAfterSeconds: 5 });
   }
+  // PostgreSQL lock waits (55P03 lock_not_available, e.g. a wedged hot-path
+  // advisory/row lock) and statement timeouts (57014 with the statement-
+  // timeout message) are database backpressure, not application faults — a
+  // client retry after the Retry-After window is the productive outcome, and
+  // a 500 here would only turn a wedged session into a 5xx alarm storm.
+  // User-initiated cancellations and every other query_canceled wording keep
+  // the generic 500 path.
+  if (
+    err instanceof Error &&
+    ((err as { code?: string }).code === '55P03' ||
+      ((err as { code?: string }).code === '57014' &&
+        /canceling statement due to statement timeout/i.test(err.message)))
+  ) {
+    logger.warn({ requestId: req.id, err }, 'database lock wait or statement timed out; shedding request');
+    shedRequestsTotal.inc({ reason: 'db_lock_timeout' });
+    res.set('Retry-After', '5');
+    return res
+      .status(503)
+      .json({ error: 'Server is busy, please try again shortly', code: 'POOL_SATURATED', retryAfterSeconds: 5 });
+  }
   if (err instanceof multer.MulterError) {
     if (err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: 'File too large (max 25MB)', code: 'AUDIO_TOO_LARGE' });

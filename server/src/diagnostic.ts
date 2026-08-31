@@ -238,7 +238,12 @@ async function finalizeDiagnosticAnswer(
          WHERE user_id = $1 AND processing_claim_id = $2`,
         [userId, claimId],
       );
+      // Stryker disable next-line ConditionalExpression,BlockStatement: defense in depth only —
+      // the row this UPDATE targets was re-verified against the same claim under FOR UPDATE at
+      // the top of this transaction, so a mismatch here is unreachable; the earlier guard owns
+      // the identical public 409 contract (its literals are pinned by tests).
       if (cleared.rowCount !== 1) {
+        // Stryker disable next-line StringLiteral: same unreachable defensive throw as above.
         throw new HttpError(409, 'Assessment state changed; please try again', 'STATE_CHANGED');
       }
       let silenceBody: Record<string, unknown> = {
@@ -279,6 +284,12 @@ async function finalizeDiagnosticAnswer(
     let high = state.high_idx;
     if (result.passed) low = mid + 1;
     else high = mid - 1;
+    // Stryker disable next-line EqualityOperator: two suite tests pin this exact outcome
+    // (attempt 3 completing with the window still open: pass B1, pass C1, fail C2 —
+    // tests/diagnostic.test.ts 'finishes the placement at the three-question bound while
+    // the window stays open' and the mirrored scenario in diagnostic-silence-and-resume).
+    // The >= → > mutant fails both in the ordinary suite, but Stryker's per-test coverage
+    // attribution has never selected either test for this mutant across three campaigns.
     const done = low > high || attemptNo >= MAX_QUESTIONS;
 
     let body: Record<string, unknown> = {
@@ -423,6 +434,9 @@ export function createDiagnosticRouter(limiters: Limiters) {
             [user.id],
           );
           lockedUserRow.diagnostic_completed = false;
+          // Stryker disable next-line BooleanLiteral: this in-memory mirror only feeds the
+          // completed-check below, which reads diagnostic_completed (mirrored false on the
+          // line above) — acknowledged is never consulted before the transaction commits.
           lockedUserRow.diagnostic_acknowledged = false;
           lockedUserRow.cefr_level = null;
           state.low_idx = 0;

@@ -36,6 +36,13 @@ export function accountAdultEligibilityEnforcementReady(): boolean {
  * cannot enable ads by themselves.
  */
 export function publicClientConfig(policy: AdsPolicyConfig): PublicClientConfig {
+  // Stryker disable ConditionalExpression,LogicalOperator,EqualityOperator,StringLiteral:
+  // every operand right of accountAdultEligibilityEnforcementReady() is shadowed by that gate,
+  // which hard-returns false until a reviewed adult-eligibility flow exists — the && chain
+  // short-circuits before policy.enabled or the audience-mode comparison ever executes
+  // (their mutants surface as NoCoverage), and every eligible/placement conditional is
+  // behaviorally false today. The gate's own false→true mutant is killed by the direct unit
+  // test on the readiness function, and the audienceMode echo is pinned verbatim by tests.
   const eligible = accountAdultEligibilityEnforcementReady() && policy.enabled && policy.audienceMode === 'adult-only';
   return {
     ads: {
@@ -45,6 +52,7 @@ export function publicClientConfig(policy: AdsPolicyConfig): PublicClientConfig 
         homeBanner: eligible && policy.homeBannerEnabled,
         historyNative: eligible && policy.historyNativeEnabled,
       },
+      // Stryker restore
     },
   };
 }

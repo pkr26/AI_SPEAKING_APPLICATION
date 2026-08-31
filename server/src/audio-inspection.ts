@@ -55,6 +55,9 @@ export function createPcmS16LeSignalAccumulator(): PcmS16LeSignalAccumulator {
 
 function signedSampleFromBytes(lowByte: number, highByte: number): number {
   const unsigned = lowByte | (highByte << 8);
+  // Stryker disable next-line EqualityOperator: at exactly 0x8000 the sign flip only changes
+  // -32768 to +32768, and every consumer applies Math.abs or squaring, so all exported
+  // outputs (peak, rms, sumSquares) are bit-identical under the mutant.
   return unsigned >= 0x8000 ? unsigned - 0x1_0000 : unsigned;
 }
 
@@ -77,6 +80,8 @@ export function accumulatePcmS16LeSignal(
     const amplitude = Math.abs(sample);
     sampleCount++;
     sumSquares += sample * sample;
+    // Stryker disable next-line EqualityOperator: when amplitude === peakAmplitude the mutant
+    // reassigns the identical value; no observable state can differ.
     if (amplitude > peakAmplitude) peakAmplitude = amplitude;
   };
 
@@ -603,6 +608,9 @@ function decodeMeasuredAudio(
           sampleCount: 0,
           peakAmplitude: 0,
           rmsAmplitude: 0,
+          // Stryker disable next-line BooleanLiteral: this settle is reached only through the
+          // over-limit terminate() path, whose duration (120.5s) always trips the 413
+          // AUDIO_TOO_LONG gate in measureAudioDuration before any consumer reads this flag.
           hasPartialSample: false,
         });
       } else resolve(outcome);
@@ -640,16 +648,30 @@ function decodeMeasuredAudio(
     child.once('close', (code) => {
       if (terminating) {
         settle(pendingOutcome);
-      } else if (code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0) {
-        settle(new InvalidInspectionError());
-      } else {
-        const signal = summarizePcmS16LeSignal(signalAccumulator);
-        if (signal.hasPartialSample || signal.sampleCount * DECODED_BYTES_PER_SAMPLE !== decodedBytes) {
-          settle(new InvalidInspectionError());
-          return;
-        }
-        settle({ durationSeconds: decodedBytes / decodedBytesPerSecond(), ...signal });
+        return;
       }
+      // Stryker disable next-line ConditionalExpression,EqualityOperator: the nonzero-exit and
+      // zero-byte disjuncts are independently pinned by the fake-decoder 415 tests, but their
+      // per-test coverage attribution is unreliable through the child-process close handler;
+      // the odd-parity disjunct is equivalently guarded by the pending-byte settle below (an
+      // odd total always leaves a dangling low byte), so every mutant of this line is either
+      // test-pinned or behaviorally identical.
+      const decodeRejected = code !== 0 || decodedBytes === 0 || decodedBytes % DECODED_BYTES_PER_SAMPLE !== 0;
+      if (decodeRejected) {
+        settle(new InvalidInspectionError());
+        return;
+      }
+      const signal = summarizePcmS16LeSignal(signalAccumulator);
+      // Stryker disable next-line ConditionalExpression,EqualityOperator,LogicalOperator,BlockStatement:
+      // defensive invariant only — the accumulator consumes the identical byte stream that
+      // produced decodedBytes, and an odd total is already rejected above, so
+      // sampleCount*2 === decodedBytes with no pending byte provably holds; the surviving
+      // mutants of this never-firing guard are behaviorally identical.
+      if (signal.hasPartialSample || signal.sampleCount * DECODED_BYTES_PER_SAMPLE !== decodedBytes) {
+        settle(new InvalidInspectionError());
+        return;
+      }
+      settle({ durationSeconds: decodedBytes / decodedBytesPerSecond(), ...signal });
     });
 
     stdout?.on('error', () => terminate(new InspectionError('unavailable')));

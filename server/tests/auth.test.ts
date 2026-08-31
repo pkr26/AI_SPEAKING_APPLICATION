@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express from 'express';
 import bcrypt from 'bcrypt';
@@ -57,6 +58,29 @@ async function runAuthenticationWriteRace<T>(options: {
     querySpy?.mockRestore();
     if (transactionOpen) await blocker.query('ROLLBACK');
     blocker.release();
+  }
+}
+
+/**
+ * Make only the in-route credential snapshot (SELECT password_hash,
+ * token_version FROM users WHERE id = $1) observe a vanished user while
+ * requireAuth's earlier lookup still succeeds: the deterministic shape of a
+ * self-delete landing between those two reads. Deleting the row before the
+ * request cannot produce this state — requireAuth answers 401 for a missing
+ * user — so the snapshot read is the only observable point of this race.
+ */
+async function runWithVanishedCredentialSnapshot<T>(startRequest: () => PromiseLike<T>): Promise<T> {
+  const original = pool.query.bind(pool);
+  const query = vi.spyOn(pool, 'query').mockImplementation(((text: unknown, ...rest: unknown[]) => {
+    if (typeof text === 'string' && text.includes('SELECT password_hash, token_version FROM users WHERE id')) {
+      return Promise.resolve({ rows: [] });
+    }
+    return (original as (...args: unknown[]) => unknown)(text, ...rest);
+  }) as never);
+  try {
+    return await startRequest();
+  } finally {
+    query.mockRestore();
   }
 }
 
@@ -311,7 +335,15 @@ describe('auth: login', () => {
       expect((await login(secondReplica, '203.0.113.12', ` ${body.email} `, 'wrong-2')).status).toBe(401);
       const blocked = await login(firstReplica, '203.0.113.13', body.email, 'wrong-3');
       expect(blocked.status).toBe(429);
-      expect(blocked.body).toEqual({ error: 'Too many login attempts, please try again later', code: 'RATE_LIMITED' });
+      // The credential-budget hint is the CONSTANT window length (never the
+      // remaining time) so it cannot pace retries: a fixed value leaks only
+      // deployment config while honest users still learn their maximum wait.
+      expect(blocked.body).toEqual({
+        error: 'Too many login attempts, please try again later',
+        code: 'RATE_LIMITED',
+        retryAfterSeconds: Math.ceil(windowMs / 1000),
+      });
+      expect(blocked.headers['retry-after']).toBe(String(Math.ceil(windowMs / 1000)));
 
       // The budget blocks only failures: the real owner's correct password
       // still authenticates while an attacker holds the window saturated.
@@ -600,6 +632,27 @@ describe('auth: change-password token revocation', () => {
       );
     }
   });
+
+  it('reports STATE_CHANGED when the user row vanishes between requireAuth and the credential snapshot', async () => {
+    const { res } = await registerUser(a);
+    const userId = res.body.user.id as string;
+
+    const changed = await runWithVanishedCredentialSnapshot(() =>
+      request(a)
+        .post('/auth/change-password')
+        .set('Authorization', `Bearer ${res.body.token}`)
+        .send({ currentPassword: STRONG_PASSWORD, newPassword: 'replacement-pass1' }),
+    );
+
+    expect(changed.status).toBe(409);
+    expect(changed.body).toEqual({
+      error: 'Authentication state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+    // The vanished snapshot must not rotate anything the survivor still owns.
+    const survivor = await pool.query('SELECT count(*)::int AS n FROM users WHERE id = $1', [userId]);
+    expect(survivor.rows[0].n).toBe(1);
+  });
 });
 
 describe('auth: logout token revocation', () => {
@@ -732,6 +785,27 @@ describe('auth: delete account', () => {
       config.assessGlobalDailyCap = previousGlobalCap;
     }
   });
+
+  it('reports STATE_CHANGED when the user row vanishes between requireAuth and the credential snapshot', async () => {
+    const { res } = await registerUser(a);
+    const userId = res.body.user.id as string;
+
+    const deleted = await runWithVanishedCredentialSnapshot(() =>
+      request(a)
+        .delete('/auth/account')
+        .set('Authorization', `Bearer ${res.body.token}`)
+        .send({ password: STRONG_PASSWORD }),
+    );
+
+    expect(deleted.status).toBe(409);
+    expect(deleted.body).toEqual({
+      error: 'Authentication state changed; please try again',
+      code: 'STATE_CHANGED',
+    });
+    // The already-deleted account cannot be deleted again through this path.
+    const survivor = await pool.query('SELECT count(*)::int AS n FROM users WHERE id = $1', [userId]);
+    expect(survivor.rows[0].n).toBe(1);
+  });
 });
 
 describe('auth: password-confirmation throttling', () => {
@@ -774,7 +848,12 @@ describe('auth: password-confirmation throttling', () => {
     expect((await attempt('wrong-pass-2')).status).toBe(401);
     const blocked = await attempt('wrong-pass-3');
     expect(blocked.status).toBe(429);
-    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
+    expect(blocked.body).toEqual({
+      error: 'Too many attempts, please try again later',
+      code: 'RATE_LIMITED',
+      retryAfterSeconds: Math.ceil(windowMs / 1000),
+    });
+    expect(blocked.headers['retry-after']).toBe(String(Math.ceil(windowMs / 1000)));
 
     // Exhausting one learner's password-confirmation budget must not throttle
     // a different authenticated account.
@@ -804,7 +883,12 @@ describe('auth: password-confirmation throttling', () => {
     expect((await attempt(secondReplica, 'wrong-pass-2')).status).toBe(401);
     const blocked = await attempt(firstReplica, 'wrong-pass-3');
     expect(blocked.status).toBe(429);
-    expect(blocked.body).toEqual({ error: 'Too many attempts, please try again later', code: 'RATE_LIMITED' });
+    expect(blocked.body).toEqual({
+      error: 'Too many attempts, please try again later',
+      code: 'RATE_LIMITED',
+      retryAfterSeconds: Math.ceil(windowMs / 1000),
+    });
+    expect(blocked.headers['retry-after']).toBe(String(Math.ceil(windowMs / 1000)));
     expect((await attempt(secondReplica, STRONG_PASSWORD)).status).toBe(204);
   });
 });
@@ -881,6 +965,140 @@ describe('auth: data export', () => {
       .set('Authorization', `Bearer ${firstToken}`);
     expect(foreignCursor.status).toBe(400);
     expect(foreignCursor.body).toEqual({ error: 'Invalid export cursor', code: 'VALIDATION_FAILED' });
+  });
+
+  it('rejects pairing practiceCyclesDone=true with a practice-cycle cursor and validates cursor ownership', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const q = await pool.query('SELECT id FROM questions LIMIT 1');
+    const insertCycle = (minutes: number) =>
+      pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles
+           (user_id, question_id, kind, attempts_used, status, closed_at, created_at)
+         VALUES ($1, $2, 'revision', 1, 'closed', now(), now() - interval '${minutes} minutes')
+         RETURNING id`,
+        [userId, q.rows[0].id],
+      );
+    const olderCycle = await insertCycle(3);
+    const newerCycle = await insertCycle(1);
+
+    const both = await request(a)
+      .get(`/auth/me/data?practiceCyclesDone=true&practiceCycleCursor=${olderCycle.rows[0].id}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(both.status).toBe(400);
+    expect(both.body).toEqual({
+      error: 'practiceCycleCursor: must be omitted when practiceCyclesDone=true',
+      code: 'VALIDATION_FAILED',
+    });
+
+    const unknown = await request(a)
+      .get(`/auth/me/data?practiceCycleCursor=${randomUUID()}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(unknown.status).toBe(400);
+    expect(unknown.body).toEqual({ error: 'Invalid practice cycle export cursor', code: 'VALIDATION_FAILED' });
+
+    // A cycle owned by a different account is equally invalid as a cursor.
+    const { res: otherRes } = await registerUser(a);
+    const foreignCycle = await pool.query<{ id: string }>(
+      `INSERT INTO practice_cycles
+         (user_id, question_id, kind, attempts_used, status, closed_at)
+       VALUES ($1, $2, 'revision', 1, 'closed', now())
+       RETURNING id`,
+      [otherRes.body.user.id, q.rows[0].id],
+    );
+    const foreign = await request(a)
+      .get(`/auth/me/data?practiceCycleCursor=${foreignCycle.rows[0].id}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(foreign.status).toBe(400);
+    expect(foreign.body).toEqual({ error: 'Invalid practice cycle export cursor', code: 'VALIDATION_FAILED' });
+
+    // The learner's own cursor pages from that row onward and ends the feed.
+    const page = await request(a)
+      .get(`/auth/me/data?practiceCycleCursor=${olderCycle.rows[0].id}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(page.status).toBe(200);
+    expect(page.body.practiceCycles).toHaveLength(1);
+    expect(page.body.practiceCycles[0].id).toBe(newerCycle.rows[0].id);
+    expect(page.body.nextPracticeCycleCursor).toBeNull();
+    expect(page.body.practiceCyclesDone).toBe(true);
+  });
+
+  it('skips the practice-cycle feed when practiceCyclesDone=true while attempts still export', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const q = await pool.query('SELECT id FROM questions LIMIT 1');
+    const cycleId = await createClosedPracticeCycle(userId, q.rows[0].id);
+    await pool.query(
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id)
+       VALUES ($1, $2, 'practice', 1, 'hello again', 80, true, 'nice', $3)`,
+      [userId, q.rows[0].id, cycleId],
+    );
+
+    const r = await request(a).get('/auth/me/data?practiceCyclesDone=true').set('Authorization', `Bearer ${token}`);
+    expect(r.status).toBe(200);
+    expect(r.body.attempts).toHaveLength(1);
+    expect(r.body.attemptsDone).toBe(true);
+    expect(r.body.nextCursor).toBeNull();
+    expect(r.body.practiceCycles).toEqual([]);
+    expect(r.body.nextPracticeCycleCursor).toBeNull();
+    expect(r.body.practiceCyclesDone).toBe(true);
+  });
+
+  it('walks attempts pages to attemptsDone and stops exactly at the boundary', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const q = await pool.query('SELECT id FROM questions LIMIT 1');
+    const insertCycle = (minutes: number) =>
+      pool.query<{ id: string }>(
+        `INSERT INTO practice_cycles
+           (user_id, question_id, kind, attempts_used, status, closed_at, created_at)
+         VALUES ($1, $2, 'revision', 1, 'closed', now(), now() - interval '${minutes} minutes')
+         RETURNING id`,
+        [userId, q.rows[0].id],
+      );
+    const insertAttempt = (transcript: string, cycleId: string, minutes: number) =>
+      pool.query<{ id: string }>(
+        `INSERT INTO attempts
+           (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id, created_at)
+         VALUES ($1, $2, 'practice', 1, $3, 60, true, 'f', $4, now() - interval '${minutes} minutes')
+         RETURNING id`,
+        [userId, q.rows[0].id, transcript, cycleId],
+      );
+    const olderCycle = await insertCycle(4);
+    const newerCycle = await insertCycle(2);
+    const olderAttempt = await insertAttempt('first page', olderCycle.rows[0].id, 3);
+    const newerAttempt = await insertAttempt('second page', newerCycle.rows[0].id, 1);
+
+    const pageOne = await request(a).get('/auth/me/data?limit=1').set('Authorization', `Bearer ${token}`);
+    expect(pageOne.status).toBe(200);
+    expect(pageOne.body.attempts.map((row: { id: string }) => row.id)).toEqual([olderAttempt.rows[0].id]);
+    expect(pageOne.body.attemptsDone).toBe(false);
+    expect(pageOne.body.nextCursor).toBe(olderAttempt.rows[0].id);
+    expect(pageOne.body.practiceCycles.map((row: { id: string }) => row.id)).toEqual([olderCycle.rows[0].id]);
+    expect(pageOne.body.practiceCyclesDone).toBe(false);
+    expect(pageOne.body.nextPracticeCycleCursor).toBe(olderCycle.rows[0].id);
+
+    const pageTwo = await request(a)
+      .get(`/auth/me/data?limit=1&cursor=${pageOne.body.nextCursor}`)
+      .set('Authorization', `Bearer ${token}`);
+    expect(pageTwo.status).toBe(200);
+    expect(pageTwo.body.attempts.map((row: { id: string }) => row.id)).toEqual([newerAttempt.rows[0].id]);
+    expect(pageTwo.body.attemptsDone).toBe(true);
+    expect(pageTwo.body.nextCursor).toBeNull();
+
+    // Exactly `limit` remaining rows must not mint a phantom next cursor.
+    const exact = await request(a).get('/auth/me/data?limit=2').set('Authorization', `Bearer ${token}`);
+    expect(exact.status).toBe(200);
+    expect(exact.body.attempts).toHaveLength(2);
+    expect(exact.body.attemptsDone).toBe(true);
+    expect(exact.body.nextCursor).toBeNull();
+    expect(exact.body.practiceCycles).toHaveLength(2);
+    expect(exact.body.practiceCyclesDone).toBe(true);
+    expect(exact.body.nextPracticeCycleCursor).toBeNull();
   });
 });
 

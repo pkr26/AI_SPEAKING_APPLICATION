@@ -151,6 +151,53 @@ describe('practice stuck cases', () => {
     return rows[0].id;
   }
 
+  describe('promotion guard', () => {
+    it('keeps levelUp off a mastery whose level moved while the provider ran', async () => {
+      const { token, userId, level } = await freshUser();
+      speakMock.mockClear(); // discount the diagnostic answers
+      const questionId = await someQuestion(level);
+      const cycleId = await assignCycle(userId, questionId);
+      let releaseAssessment!: (result: {
+        transcript: string;
+        score: number;
+        passed: boolean;
+        feedback: string;
+      }) => void;
+      speakMock.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            releaseAssessment = resolve;
+          }),
+      );
+      const pending = Promise.resolve(
+        request(a)
+          .post('/practice/attempt')
+          .set('Authorization', `Bearer ${token}`)
+          .attach('audio', fakeM4aBuffer(), { filename: 'answer.m4a', contentType: 'audio/mp4' })
+          .field('questionId', questionId)
+          .field('requestId', randomUUID())
+          .field('cycleId', cycleId),
+      );
+      await vi.waitFor(() => expect(speakMock).toHaveBeenCalledOnce());
+      // A rival promotion moved the learner off the cycle's level mid-flight:
+      // the guard's level-equality arm must keep levelUp off the response even
+      // though this attempt itself masters its word (mirrors the level-
+      // progression test whose per-test coverage attribution proved flaky).
+      const nextLevel = level === 'C2' ? 'C1' : String.fromCharCode(level.charCodeAt(0) + 1) + level.slice(1);
+      await pool.query('UPDATE users SET cefr_level = $2 WHERE id = $1', [userId, nextLevel]);
+      releaseAssessment({ transcript: 'mastered', score: 95, passed: true, feedback: 'excellent' });
+      const response = await pending;
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ passed: true, mastered: true });
+      expect(response.body.levelUp).toBeUndefined();
+      expect(response.body.next.question.cefrLevel).toBe(nextLevel);
+      const persisted = await pool.query<{ cefr_level: string }>('SELECT cefr_level FROM users WHERE id = $1', [
+        userId,
+      ]);
+      expect(persisted.rows[0].cefr_level).toBe(nextLevel);
+    });
+  });
+
   describe('silence (case 04)', () => {
     it('is a free retry: no attempt row, no progress, counter unmoved', async () => {
       const { token, userId, level } = await freshUser();

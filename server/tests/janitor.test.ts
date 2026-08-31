@@ -16,6 +16,7 @@ vi.mock('../src/logger', () => ({
 }));
 
 import { JANITOR_BATCH_SIZE, JANITOR_MAX_BATCHES_PER_TICK, runExclusiveBatchedDelete } from '../src/janitor';
+import { janitorSkippedTotal } from '../src/metrics';
 
 function mockFullBatchesWithCapTripwire() {
   let deleteCount = 0;
@@ -52,6 +53,36 @@ describe('runExclusiveBatchedDelete', () => {
     expect(runtime.query).toHaveBeenCalledWith('SELECT pg_try_advisory_lock(hashtext($1)) AS locked', ['janitor:test']);
     expect(runtime.release).toHaveBeenCalledOnce();
     expect(runtime.release).toHaveBeenCalledWith(undefined);
+  });
+
+  it('records the skipped tick on the janitor metrics counter when another replica owns the advisory lock', async () => {
+    runtime.query.mockResolvedValueOnce({ rows: [{ locked: false }] });
+    const skippedInc = vi.spyOn(janitorSkippedTotal, 'inc');
+
+    try {
+      await expect(runExclusiveBatchedDelete('janitor:metrics-skip', 'DELETE BATCH')).resolves.toBe(0);
+
+      expect(skippedInc).toHaveBeenCalledTimes(1);
+      expect(skippedInc).toHaveBeenCalledWith({ janitor: 'janitor:metrics-skip' });
+    } finally {
+      skippedInc.mockRestore();
+    }
+  });
+
+  it('does not record a skipped tick when this replica acquires the advisory lock', async () => {
+    runtime.query
+      .mockResolvedValueOnce({ rows: [{ locked: true }] })
+      .mockResolvedValueOnce({ rowCount: 0 })
+      .mockResolvedValueOnce({ rows: [{ pg_advisory_unlock: true }] });
+    const skippedInc = vi.spyOn(janitorSkippedTotal, 'inc');
+
+    try {
+      await expect(runExclusiveBatchedDelete('janitor:metrics-skip', 'DELETE BATCH')).resolves.toBe(0);
+
+      expect(skippedInc).not.toHaveBeenCalled();
+    } finally {
+      skippedInc.mockRestore();
+    }
   });
 
   it('skips cleanly when the advisory-lock query returns no row', async () => {

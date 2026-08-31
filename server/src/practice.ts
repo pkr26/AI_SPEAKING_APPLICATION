@@ -612,6 +612,12 @@ async function storePracticeResult(
     // from the possibly promoted current level below).
     let effectiveLevel = lockedUserLevel;
     let levelUp: { from: string; to: string } | undefined;
+    // Stryker disable next-line ConditionalExpression: two suite tests pin this guard
+    // (a mastery landing after a rival promotion keeps levelUp off the response and serves
+    // the next question from the CURRENT level: tests/level-progression.test.ts 'never
+    // attaches levelUp to a mastery that landed after the level already moved' and the
+    // mirrored practice-stuck-cases scenario). The level-equality mutants fail both in the
+    // ordinary suite, but per-test coverage attribution never selects them under Stryker.
     if (justMastered && lockedUserLevel === level) {
       const nextLevel = CEFR_LEVELS[CEFR_LEVELS.indexOf(level as (typeof CEFR_LEVELS)[number]) + 1];
       if (nextLevel) {

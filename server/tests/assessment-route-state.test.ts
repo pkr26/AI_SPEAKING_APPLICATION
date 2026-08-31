@@ -4,7 +4,22 @@ import type { PoolClient } from 'pg';
 import request from 'supertest';
 import { afterAll, describe, expect, it, vi } from 'vitest';
 import { logger } from '../src/logger';
-import { app, fakeM4aBuffer, pool, registerUser } from './helpers';
+import { answerForm, app, fakeM4aBuffer, pool, registerUser, completeDiagnostic } from './helpers';
+
+// Optional parked-assess seam (same shape as tests/audio-upload-s3.test.ts):
+// disabled by default so every other test in this file keeps the real
+// MOCK_AI pipeline, and enabled only inside the body of the test that needs
+// the provider call to reject.
+const routeAssess = vi.hoisted(() => ({ useMock: false, assess: vi.fn() }));
+
+vi.mock('../src/assess', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/assess')>();
+  return {
+    ...actual,
+    assessSpeaking: (...args: Parameters<typeof actual.assessSpeaking>) =>
+      routeAssess.useMock ? routeAssess.assess(...args) : actual.assessSpeaking(...args),
+  };
+});
 
 afterAll(async () => {
   await pool.end();
@@ -403,7 +418,9 @@ describe('diagnostic failure cleanup', () => {
           text: `
             CREATE TRIGGER ${auditTrigger}
             AFTER UPDATE ON diagnostic_state
-            FOR EACH STATEMENT EXECUTE FUNCTION ${auditFunction}()
+            FOR EACH ROW
+            WHEN (OLD.user_id = '${userId}'::uuid)
+            EXECUTE FUNCTION ${auditFunction}()
           `,
         },
       ],
@@ -454,7 +471,9 @@ describe('diagnostic failure cleanup', () => {
             text: `
               CREATE TRIGGER ${auditTrigger}
               AFTER DELETE ON assessment_requests
-              FOR EACH STATEMENT EXECUTE FUNCTION ${auditFunction}()
+              FOR EACH ROW
+              WHEN (OLD.user_id = '${userId}'::uuid AND OLD.request_id = '${requestId}'::uuid)
+              EXECUTE FUNCTION ${auditFunction}()
             `,
           },
         ],
@@ -473,14 +492,114 @@ describe('diagnostic failure cleanup', () => {
           // would have executed.
           await vi.waitFor(() => expect(unlink).toHaveBeenCalledOnce());
           const audit = await pool.query<{ calls: number }>(`SELECT calls FROM ${auditTable}`);
-          // claimAssessmentRequest performs one stale-row cleanup. A successful
-          // route must not run abandonAssessmentRequest as a second DELETE.
-          expect(audit.rows[0].calls).toBe(1);
+          // The trigger is scoped to exactly this (user, request) row so
+          // parallel vitest workers deleting their own assessment requests on
+          // the shared database can never perturb the count. Nothing may
+          // delete this completed request: claimAssessmentRequest's stale-row
+          // cleanup removes no live row, so a redundant
+          // abandonAssessmentRequest (a mutant) is the only way to reach 1.
+          expect(audit.rows[0].calls).toBe(0);
           expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 1, requests: 1 });
         },
       );
     } finally {
       unlink.mockRestore();
     }
+  });
+});
+
+describe('assessment request completion flag', () => {
+  it('abandons the durable request when the assess call rejects, keeping the requestId retryable', async () => {
+    const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
+    const requestId = randomUUID();
+    routeAssess.assess.mockRejectedValueOnce(new Error('forced provider failure'));
+    routeAssess.useMock = true;
+    let failed: Awaited<ReturnType<typeof fixedRequestForm>>;
+    try {
+      failed = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
+    } finally {
+      routeAssess.useMock = false;
+    }
+
+    expect(failed.status).toBe(500);
+    expect(failed.body).toEqual({ error: 'Internal server error', code: 'INTERNAL' });
+    // The not-completed submission must abandon its durable request claim so
+    // the same logical requestId stays retryable instead of parking a lease.
+    expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 0, requests: 0 });
+
+    const retried = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
+    expect(retried.status).toBe(200);
+    expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 1, requests: 1 });
+    const status = await pool.query<{ status: string }>(
+      'SELECT status FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(status.rows).toEqual([{ status: 'completed' }]);
+  });
+
+  it('keeps a successful submission as the single completed durable request', async () => {
+    const { token, userId, questionId } = await registerInitialDiagnosticQuestion();
+    const requestId = randomUUID();
+
+    const response = await fixedRequestForm('/diagnostic/answer', token, questionId, requestId);
+
+    expect(response.status).toBe(200);
+    expect(await routeArtifacts(userId, requestId, 'diagnostic')).toEqual({ attempts: 1, requests: 1 });
+    const status = await pool.query<{ status: string }>(
+      'SELECT status FROM assessment_requests WHERE user_id = $1 AND request_id = $2',
+      [userId, requestId],
+    );
+    expect(status.rows).toEqual([{ status: 'completed' }]);
+  });
+});
+
+describe('practice submission cycle binding', () => {
+  async function practiceQuestionAtLearnerLevel(token: string): Promise<{ questionId: string; cycleId: string }> {
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+    expect(next.status).toBe(200);
+    return { questionId: next.body.question.id as string, cycleId: next.body.cycleId as string };
+  }
+
+  async function completedDiagnosticLearner(): Promise<string> {
+    const { res: registered } = await registerUser(a);
+    expect(registered.status).toBe(201);
+    const token = registered.body.token as string;
+    await completeDiagnostic(a, token);
+    return token;
+  }
+
+  it('rejects a malformed multipart cycleId with the exact schema message', async () => {
+    const token = await completedDiagnosticLearner();
+    const { questionId } = await practiceQuestionAtLearnerLevel(token);
+    const requestId = randomUUID();
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+      requestId,
+      'not-a-uuid',
+    );
+
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'cycleId: cycleId must be a valid UUID', code: 'VALIDATION_FAILED' });
+  });
+
+  it('rejects a well-formed foreign cycleId with PRACTICE_CYCLE_CLOSED even at the learner level', async () => {
+    const token = await completedDiagnosticLearner();
+    const { questionId } = await practiceQuestionAtLearnerLevel(token);
+    const requestId = randomUUID();
+
+    const response = await answerForm(
+      request(a).post('/practice/attempt').set('Authorization', `Bearer ${token}`),
+      questionId,
+      requestId,
+      randomUUID(),
+    );
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: 'This practice question is no longer active',
+      code: 'PRACTICE_CYCLE_CLOSED',
+    });
   });
 });

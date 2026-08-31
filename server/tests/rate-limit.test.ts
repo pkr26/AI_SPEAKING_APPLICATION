@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { randomUUID } from 'crypto';
+import { createHmac, randomUUID } from 'crypto';
 import { EventEmitter } from 'node:events';
 import fsSync from 'node:fs';
 import fs from 'fs/promises';
@@ -83,6 +83,39 @@ async function shedCounterValue(reason: string): Promise<number> {
   const { values } = await shedRequestsTotal.get();
   return values.find((entry) => entry.labels.reason === reason)?.value ?? 0;
 }
+
+describe('counter HMAC key derivation', () => {
+  // Runs before any limiter in this file touches the store so the module's
+  // once-computed counter key derives from the configuration under test.
+  it('derives persisted counter hashes from the dedicated secret before the JWT fallback', async () => {
+    const dedicatedSecret = `dedicated-counter-secret-${randomUUID().replaceAll('-', '')}`;
+    const originalSecret = config.rateLimitHashSecret;
+    const namespace = 'hash-secret-derivation';
+    const counterKey = '203.0.113.7';
+    const domainSeparatedKey = (secret: string) =>
+      createHmac('sha256', secret).update('postgres-rate-limit-store/v1').digest();
+    const expectedHash = (secret: string) =>
+      createHmac('sha256', domainSeparatedKey(secret)).update(namespace).update('\0').update(counterKey).digest('hex');
+
+    config.rateLimitHashSecret = dedicatedSecret;
+    try {
+      const store = new PostgresRateLimitStore(namespace, 60_000);
+      await store.increment(counterKey);
+
+      const { rows } = await pool.query<{ key_hash: string }>(
+        'SELECT key_hash FROM rate_limit_windows WHERE namespace = $1',
+        [namespace],
+      );
+      expect(rows).toHaveLength(1);
+      // The dedicated secret owns the key when configured...
+      expect(rows[0].key_hash).toBe(expectedHash(dedicatedSecret));
+      // ...and the JWT fallback key is observably a different derivation.
+      expect(rows[0].key_hash).not.toBe(expectedHash(config.jwtSecret));
+    } finally {
+      config.rateLimitHashSecret = originalSecret;
+    }
+  });
+});
 
 describe('rate limiters', () => {
   it('runs the cheap global flood brake before PostgreSQL credential counters', async () => {
@@ -320,6 +353,47 @@ describe('rate limiters', () => {
       error: 'Too many accounts created from this network, please try again later',
       code: 'RATE_LIMITED',
     });
+  });
+
+  it('refunds a per-IP register hit only for pure validation 400s (shared-NAT form-bug guard)', async () => {
+    // A zod/JSON 400 creates no account and never reaches the EMAIL_TAKEN
+    // oracle, so it must not consume the network's signup budget — otherwise
+    // one impatient client behind a school/office NAT locks out everyone.
+    // Answers that could be part of an attack still count: 409 probes
+    // (enumeration), 201s (bulk creation), 413s (flooding), and 429s.
+    config.rateLimit.registerWindowMs = 60_000;
+    config.rateLimit.registerMax = 2;
+    const namespace = 'register:60000:2';
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
+    const limiters = buildLimiters();
+    const a = express();
+    a.use(express.json());
+    a.use(limiters.register);
+    a.post('/register', (req, res) => {
+      res.status(req.body.outcome ?? 400).end();
+    });
+    const post = (outcome?: number) =>
+      request(a)
+        .post('/register')
+        .send(outcome === undefined ? {} : { outcome });
+
+    expect((await post()).status).toBe(400);
+    await expectRefunded(namespace);
+    expect((await post()).status).toBe(400);
+    await expectRefunded(namespace);
+
+    // Enumeration probes and successes keep consuming the budget.
+    expect((await post(409)).status).toBe(409);
+    expect(await storedHits(namespace)).toBe(1);
+    expect((await post(201)).status).toBe(201);
+    expect(await storedHits(namespace)).toBe(2);
+    const limited = await post(400);
+    expect(limited.status).toBe(429);
+    expect(limited.body).toEqual({
+      error: 'Too many accounts created from this network, please try again later',
+      code: 'RATE_LIMITED',
+    });
+    await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1', [namespace]);
   });
 
   it('advertising Retry-After on every rejecting limiter 429 (express-rate-limit 8 pin)', async () => {

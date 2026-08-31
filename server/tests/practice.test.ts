@@ -5,7 +5,16 @@ import request from 'supertest';
 import fs from 'fs/promises';
 import { config } from '../src/config';
 import { logger } from '../src/logger';
-import { answerForm, app, completeDiagnostic, fakeM4aBuffer, pool, registerUser } from './helpers';
+import { pickPracticeNext } from '../src/practice';
+import {
+  answerForm,
+  app,
+  completeDiagnostic,
+  createClosedPracticeCycle,
+  fakeM4aBuffer,
+  pool,
+  registerUser,
+} from './helpers';
 import { uploadsDir } from '../src/upload';
 
 afterAll(async () => {
@@ -942,6 +951,85 @@ describe('practice', () => {
     } finally {
       config.assessDailyCap = previousCap;
     }
+  });
+});
+
+describe('practice selection polarity and query contracts', () => {
+  it('picks a fresh-level assignment directly for a learner with no history', async () => {
+    const { res } = await registerUser(a);
+    const userId = res.body.user.id as string;
+
+    const pick = await pickPracticeNext(userId, 'B1', pool);
+
+    expect(pick).toBeDefined();
+    // No history means no due revision word: the interleave serves a new word
+    // and the direct call must resolve (not reject) with a real catalog row.
+    expect(pick?.kind).toBe('new');
+    expect(pick?.question.cefrLevel).toBe('B1');
+    expect(pick?.question.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+    expect(typeof pick?.question.promptWord).toBe('string');
+    expect(typeof pick?.question.questionText).toBe('string');
+  });
+
+  it('serves a new word when the most recent attempt repeated an earlier word', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const userId = res.body.user.id as string;
+    const level = await completeDiagnostic(a, token);
+    const revisionQuestionId = (
+      await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 ORDER BY id LIMIT 1', [level])
+    ).rows[0].id;
+    const cycleId = await createClosedPracticeCycle(userId, revisionQuestionId);
+    await pool.query(
+      `INSERT INTO practice_progress
+         (user_id, question_id, status, best_score, attempt_count, srs_interval_index, due_at)
+       VALUES ($1, $2, 'learning', 40, 2, 0, now() - interval '1 hour')`,
+      [userId, revisionQuestionId],
+    );
+    await pool.query(
+      `INSERT INTO attempts
+         (user_id, question_id, context, attempt_no, transcript, score, passed, feedback, practice_cycle_id, created_at)
+       VALUES
+         ($1, $2, 'practice', 1, 'first try', 40, false, 'try again', $3, now() - interval '2 minutes'),
+         ($1, $2, 'practice', 2, 'second try', 40, false, 'try again', $3, now() - interval '1 minute')`,
+      [userId, revisionQuestionId, cycleId],
+    );
+
+    const next = await request(a).get('/practice/question').set('Authorization', `Bearer ${token}`);
+
+    expect(next.status).toBe(200);
+    // The latest attempt repeated an earlier word, so the session alternates to
+    // a new word even though the revision word is due right now.
+    expect(next.body.kind).toBe('new');
+    expect(next.body.question.id).not.toBe(revisionQuestionId);
+    expect(next.body.progress.dueCount).toBe(1);
+  });
+
+  it('rejects a malformed skip cycleId with the exact schema message', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+    const level = await completeDiagnostic(a, token);
+    const questionId = (
+      await pool.query<{ id: string }>('SELECT id FROM questions WHERE cefr_level = $1 LIMIT 1', [level])
+    ).rows[0].id;
+
+    const skipped = await request(a)
+      .post('/practice/skip')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ questionId, cycleId: 'not-a-uuid' });
+
+    expect(skipped.status).toBe(400);
+    expect(skipped.body).toEqual({ error: 'cycleId: cycleId must be a valid UUID', code: 'VALIDATION_FAILED' });
+  });
+
+  it('trims the stats timeZone query parameter before validating and echoing it', async () => {
+    const { res } = await registerUser(a);
+    const token = res.body.token as string;
+
+    const stats = await request(a).get('/practice/stats?timeZone=%20UTC%20').set('Authorization', `Bearer ${token}`);
+
+    expect(stats.status).toBe(200);
+    expect(stats.body.timeZone).toBe('UTC');
   });
 });
 

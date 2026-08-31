@@ -344,37 +344,45 @@ export function createRecordingsRouter(limiters: Limiters) {
     validate({ query: listSchema }),
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, listSchema);
-      if (cursor) {
-        const owned = await pool.query(
-          `SELECT 1
-           FROM recordings
-           JOIN users ON users.id = recordings.user_id
-           WHERE recordings.id = $1 AND recordings.user_id = $2
-             AND recordings.recording_retention_epoch = users.recording_retention_epoch`,
-          [cursor, req.user!.id],
-        );
-        if (!owned.rows[0]) throw new HttpError(400, 'Invalid recording cursor');
-      }
-      const { rows } = await pool.query<RecordingRow>(
-        `SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
-         FROM recordings r
-         JOIN users u ON u.id = r.user_id
-         JOIN questions q ON q.id = r.question_id
-         WHERE r.user_id = $1
-           AND r.recording_retention_epoch = u.recording_retention_epoch
-           AND ($2::uuid IS NULL OR (r.created_at, r.id) < (
-             SELECT cursor_recording.created_at, cursor_recording.id
+      // One statement decides cursor validity and fetches the page, so a
+      // recording deleted (or generation-fenced by delete-all) between the two
+      // reads can never silently truncate the walk into an empty page: the
+      // validity row is always present, the page side is empty when invalid.
+      const { rows } = await pool.query<RecordingRow & { cursorValid: boolean }>(
+        `WITH marker AS (
+           SELECT EXISTS (
+             SELECT 1
              FROM recordings AS cursor_recording
              JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
              WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
                AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
-           ))
-         ORDER BY r.created_at DESC, r.id DESC
-         LIMIT $3`,
+           ) AS valid
+         )
+         SELECT page.*, marker.valid AS "cursorValid"
+         FROM marker
+         LEFT JOIN (
+           SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
+           FROM recordings r
+           JOIN users u ON u.id = r.user_id
+           JOIN questions q ON q.id = r.question_id
+           WHERE r.user_id = $1
+             AND r.recording_retention_epoch = u.recording_retention_epoch
+             AND ($2::uuid IS NULL OR (r.created_at, r.id) < (
+               SELECT cursor_recording.created_at, cursor_recording.id
+               FROM recordings AS cursor_recording
+               JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
+               WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
+                 AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
+             ))
+           ORDER BY r.created_at DESC, r.id DESC
+           LIMIT $3
+         ) AS page ON true`,
         [req.user!.id, cursor ?? null, limit + 1],
       );
-      const hasMore = rows.length > limit;
-      const items = hasMore ? rows.slice(0, limit) : rows;
+      if (cursor && !rows[0].cursorValid) throw new HttpError(400, 'Invalid recording cursor');
+      const pageRows = rows.filter((row) => row.id !== null);
+      const hasMore = pageRows.length > limit;
+      const items = hasMore ? pageRows.slice(0, limit) : pageRows;
       res.json({
         items: items.map(toPublicRecording),
         nextCursor: hasMore ? items[items.length - 1].id : null,
@@ -387,37 +395,43 @@ export function createRecordingsRouter(limiters: Limiters) {
     validate({ query: exportSchema }),
     h(async (req: AuthedRequest, res) => {
       const { limit, cursor } = validated(req, exportSchema);
-      if (cursor) {
-        const owned = await pool.query(
-          `SELECT 1
-           FROM recordings
-           JOIN users ON users.id = recordings.user_id
-           WHERE recordings.id = $1 AND recordings.user_id = $2
-             AND recordings.recording_retention_epoch = users.recording_retention_epoch`,
-          [cursor, req.user!.id],
-        );
-        if (!owned.rows[0]) throw new HttpError(400, 'Invalid recording export cursor');
-      }
-      const { rows } = await pool.query<RecordingRow>(
-        `SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
-         FROM recordings r
-         JOIN users u ON u.id = r.user_id
-         JOIN questions q ON q.id = r.question_id
-         WHERE r.user_id = $1
-           AND r.recording_retention_epoch = u.recording_retention_epoch
-           AND ($2::uuid IS NULL OR (r.created_at, r.id) > (
-             SELECT cursor_recording.created_at, cursor_recording.id
+      // Same single-statement validity contract as the list route, mirrored
+      // for the ascending export walk.
+      const { rows } = await pool.query<RecordingRow & { cursorValid: boolean }>(
+        `WITH marker AS (
+           SELECT EXISTS (
+             SELECT 1
              FROM recordings AS cursor_recording
              JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
              WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
                AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
-           ))
-         ORDER BY r.created_at ASC, r.id ASC
-         LIMIT $3`,
+           ) AS valid
+         )
+         SELECT page.*, marker.valid AS "cursorValid"
+         FROM marker
+         LEFT JOIN (
+           SELECT r.*, q.prompt_word, q.question_text, q.cefr_level
+           FROM recordings r
+           JOIN users u ON u.id = r.user_id
+           JOIN questions q ON q.id = r.question_id
+           WHERE r.user_id = $1
+             AND r.recording_retention_epoch = u.recording_retention_epoch
+             AND ($2::uuid IS NULL OR (r.created_at, r.id) > (
+               SELECT cursor_recording.created_at, cursor_recording.id
+               FROM recordings AS cursor_recording
+               JOIN users AS cursor_owner ON cursor_owner.id = cursor_recording.user_id
+               WHERE cursor_recording.id = $2 AND cursor_recording.user_id = $1
+                 AND cursor_recording.recording_retention_epoch = cursor_owner.recording_retention_epoch
+             ))
+           ORDER BY r.created_at ASC, r.id ASC
+           LIMIT $3
+         ) AS page ON true`,
         [req.user!.id, cursor ?? null, limit + 1],
       );
-      const hasMore = rows.length > limit;
-      const recordings = hasMore ? rows.slice(0, limit) : rows;
+      if (cursor && !rows[0].cursorValid) throw new HttpError(400, 'Invalid recording export cursor');
+      const pageRows = rows.filter((row) => row.id !== null);
+      const hasMore = pageRows.length > limit;
+      const recordings = hasMore ? pageRows.slice(0, limit) : pageRows;
       res.json({
         recordings: recordings.map(toExportRecording),
         nextCursor: hasMore ? recordings[recordings.length - 1].id : null,

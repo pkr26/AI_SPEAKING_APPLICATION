@@ -200,6 +200,18 @@ const updateProfileSchema = z
   );
 
 /**
+ * Route-thrown credential-budget 429. The hint is the CONSTANT window length,
+ * never the remaining time: a fixed value leaks only deployment config and
+ * cannot pace retries, while honest users still learn their maximum wait.
+ * (Middleware-rejected limiter 429s keep express-rate-limit's own
+ * remaining-time Retry-After — those budgets are per-IP/per-user, not
+ * per-credential, so pacing them reveals nothing about a victim's account.)
+ */
+function credentialBudgetThrottled(windowMs: number, message: string): HttpError {
+  return new HttpError(429, message, { retryAfterSeconds: Math.ceil(windowMs / 1000) });
+}
+
+/**
  * Janitor: remove expired password-reset tokens. Expiry is already enforced by
  * predicate on the read path, so this only bounds table growth.
  */
@@ -273,7 +285,10 @@ export function createAuthRouter(limiters: Limiters) {
       const validPassword = await bcrypt.compare(password, user ? user.password_hash : dummyBcryptHash());
       if (!user || !validPassword) {
         if (res.locals.loginAccountThrottled) {
-          throw new HttpError(429, 'Too many login attempts, please try again later');
+          throw credentialBudgetThrottled(
+            config.rateLimit.loginAccountWindowMs,
+            'Too many login attempts, please try again later',
+          );
         }
         throw new HttpError(401, 'Invalid email or password', 'INVALID_CREDENTIALS');
       }
@@ -464,7 +479,10 @@ export function createAuthRouter(limiters: Limiters) {
       if (!credential) throw authenticationStateChanged();
       if (!(await bcrypt.compare(currentPassword, credential.password_hash))) {
         if (res.locals.passwordAccountThrottled) {
-          throw new HttpError(429, 'Too many attempts, please try again later');
+          throw credentialBudgetThrottled(
+            config.rateLimit.passwordWindowMs,
+            'Too many attempts, please try again later',
+          );
         }
         throw new HttpError(401, 'Current password is incorrect', 'INVALID_CREDENTIALS');
       }
@@ -513,7 +531,10 @@ export function createAuthRouter(limiters: Limiters) {
       if (!credential) throw authenticationStateChanged();
       if (!(await bcrypt.compare(password, credential.password_hash))) {
         if (res.locals.passwordAccountThrottled) {
-          throw new HttpError(429, 'Too many attempts, please try again later');
+          throw credentialBudgetThrottled(
+            config.rateLimit.passwordWindowMs,
+            'Too many attempts, please try again later',
+          );
         }
         throw new HttpError(401, 'Password is incorrect', 'INVALID_CREDENTIALS');
       }

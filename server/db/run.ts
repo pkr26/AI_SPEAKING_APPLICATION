@@ -160,7 +160,13 @@ export async function migrate(dbUrl: string, log: (msg: string) => void = consol
       for (const cutover of RUNTIME_SCHEMA_CUTOVERS) {
         const fenceRows = rows.filter(({ name }) => name === cutover.name);
         const cutoverRequired = ordinaryRows.some(({ name }) => name === cutover.requiredMigration);
+        // Stryker disable next-line OptionalChaining: the length === 1 conjunct short-circuits
+        // before rows[0] is dereferenced, so the optional chain never sees a missing row.
         const cutoverValid = fenceRows.length === 1 && fenceRows[0]?.checksum === cutover.checksum;
+        // Stryker disable next-line ConditionalExpression: the left disjunct is subsumed by the
+        // right for every reachable invocation — this CLI validates against the packaged
+        // manifest, which always contains each cutover's requiredMigration, so an invalid
+        // fence makes cutoverRequired(true) !== cutoverValid(false) fire identically.
         if ((fenceRows.length > 0 && !cutoverValid) || cutoverRequired !== cutoverValid) {
           throw new Error(`database runtime cutover fence ${cutover.name} is missing, invalid, or out of sequence`);
         }

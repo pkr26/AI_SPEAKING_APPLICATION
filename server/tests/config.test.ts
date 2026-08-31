@@ -347,6 +347,30 @@ describe('config env validation', () => {
     expect(config.rateLimitHashSecret).toBe('a-dedicated-counter-hmac-key-32-chars');
   });
 
+  it('trims the dedicated rate-limit hash secret before enforcing its length boundary', async () => {
+    const message = 'RATE_LIMIT_HASH_SECRET must be at least 32 characters (or empty to derive from JWT_SECRET)';
+    await expectSingleInvalidIssue(
+      baseEnv({ RATE_LIMIT_HASH_SECRET: 'a'.repeat(31) }),
+      'RATE_LIMIT_HASH_SECRET',
+      message,
+    );
+    // Padding never rescues a secret that is too short after trimming.
+    await expectSingleInvalidIssue(
+      baseEnv({ RATE_LIMIT_HASH_SECRET: ` ${'a'.repeat(31)} ` }),
+      'RATE_LIMIT_HASH_SECRET',
+      message,
+    );
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_HASH_SECRET: 'b'.repeat(32) }))).rateLimitHashSecret).toBe(
+      'b'.repeat(32),
+    );
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_HASH_SECRET: ` ${'b'.repeat(32)} ` }))).rateLimitHashSecret).toBe(
+      'b'.repeat(32),
+    );
+    // Whitespace-only input trims to the documented empty derive-from-JWT default.
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_HASH_SECRET: '   ' }))).rateLimitHashSecret).toBe('');
+    expect((await loadConfig(baseEnv({ RATE_LIMIT_HASH_SECRET: '\t'.repeat(41) }))).rateLimitHashSecret).toBe('');
+  });
+
   it('parses the mail webhook private-address opt-in and register-email budget knobs', async () => {
     const config = await loadConfig(
       baseEnv({
@@ -514,6 +538,35 @@ describe('config env validation', () => {
       }),
     );
     expect(higherConfiguredFloor.minClientVersion).toBe('1.2');
+  });
+
+  it('enforces the hard 1.1.1 production client floor and preserves equal-or-newer operator pins', async () => {
+    const production = {
+      NODE_ENV: 'production',
+      MOCK_AI: 'false',
+      OPENAI_API_KEY: 'sk-real',
+      ...TEST_S3_BUCKETS,
+      DATABASE_URL: 'postgres://db.example/ai_english?sslmode=verify-full',
+      ...PRODUCTION_MAIL,
+    };
+
+    // Unset and below-floor pins (including a major-, minor-, or patch-only
+    // shortfall and a two-segment pin padded against the floor) all land on
+    // the hard 1.1.1 floor.
+    expect((await loadConfig(baseEnv({ ...production }))).minClientVersion).toBe('1.1.1');
+    for (const pinned of ['0.9.9', '1.0.0', '1.1.0', '1.1']) {
+      expect((await loadConfig(baseEnv({ ...production, MIN_CLIENT_VERSION: pinned }))).minClientVersion).toBe('1.1.1');
+    }
+
+    // The exact floor, a patch-only raise, a minor-only raise, and a major
+    // raise survive verbatim; so does a spelling that merely compares equal
+    // to the floor, which must keep the operator's exact string.
+    for (const pinned of ['1.1.1', '1.1.2', '1.2', '2.0.0', '01.1.1']) {
+      expect((await loadConfig(baseEnv({ ...production, MIN_CLIENT_VERSION: pinned }))).minClientVersion).toBe(pinned);
+    }
+
+    // Outside production the operator pin passes through with no floor at all.
+    expect((await loadConfig(baseEnv({ MIN_CLIENT_VERSION: '0.0.1' }))).minClientVersion).toBe('0.0.1');
   });
 
   it('requires a structured database URL and verified TLS in production', async () => {

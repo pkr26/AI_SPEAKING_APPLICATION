@@ -195,6 +195,10 @@ export async function runAssessmentSubmission<Claim, Result>(
   ownSubmittedAudioFile(res);
   try {
     const { questionId, requestId, retainRecording } = validated(req, hooks.bodySchema);
+    // Stryker disable next-line ConditionalExpression: validate() replaces req.body with the
+    // strict zod output — diagnostic schemas reject any cycleId key and practice schemas require
+    // it, so req.body.cycleId is undefined exactly when the scope is diagnostic; the mutant's
+    // distinguishing input is unreachable through a validated request.
     const practiceCycleId = hooks.storageScope === 'practice' ? (req.body as { cycleId: string }).cycleId : undefined;
     // The dual-mode schema carries audioKey only in S3 ingress mode (the zod
     // union collapses it out of the inferred type, so read it the same
@@ -213,6 +217,9 @@ export async function runAssessmentSubmission<Claim, Result>(
     );
     const question = qRows[0];
     if (!question) throw hooks.questionMissingError();
+    // Stryker disable next-line LogicalOperator: same strict-schema argument — the two
+    // conjuncts are equal on every validated request (diagnostic: false/undefined via the
+    // pinned ternary; practice: true/defined), so || cannot change the outcome.
     if (hooks.requireQuestionAtUserLevel && practiceCycleId) {
       // A composite database FK is the final ownership backstop, but hostile
       // question/cycle pairs must remain a stable public 403/409 instead of
@@ -318,6 +325,10 @@ export async function runAssessmentSubmission<Claim, Result>(
         preserveSubmittedPresignedAudio(res);
         void tryRetainRecording(recording.id);
       }
+      // Stryker disable next-line BooleanLiteral: the only reader of `completed` guards an
+      // abandon DELETE scoped to status='processing'; on this path persist already committed
+      // the row to completed (completeAssessmentRequest throws otherwise), so an always-abandon
+      // deletes nothing — no observable can differ.
       completed = true;
       // `finish` owns the normal response path, but a disconnected response has
       // already emitted its one early `close` and will never emit `finish`.
@@ -331,6 +342,8 @@ export async function runAssessmentSubmission<Claim, Result>(
       }
     } finally {
       if (claim) await hooks.clearClaim(user, question, claim);
+      // Stryker disable next-line ConditionalExpression: same status='processing'-scoped DELETE
+      // argument as the completed flag above.
       if (!completed) await abandonAssessmentRequest(user.id, requestId, requestClaim.claimId);
     }
   } finally {

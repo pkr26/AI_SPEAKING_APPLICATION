@@ -494,16 +494,33 @@ ok(
 );
 
 // ---------- data export ----------
-r = await req('GET', '/auth/me/data', { token });
+// Attempts are exported oldest-first in bounded pages, and the randomized mock
+// scoring can stretch this journey well past one page (one CI leg needed 115
+// attempts before its first pass), so the late practice-native attempts are not
+// guaranteed to be on page one. Walk the attempts cursor chain until the server
+// reports attemptsDone, mirroring the app's export walker.
+const exportedAttempts = [];
+let exportUser = null;
+let exportCursor = null;
+let exportPages = 0;
+while (exportPages < 12) {
+  r = await req('GET', exportCursor ? `/auth/me/data?cursor=${exportCursor}` : '/auth/me/data', { token });
+  if (r.status !== 200 || !Array.isArray(r.body.attempts)) break;
+  exportUser = r.body.user;
+  exportedAttempts.push(...r.body.attempts);
+  exportPages += 1;
+  if (r.body.nextCursor === null) break;
+  exportCursor = r.body.nextCursor;
+}
 ok(
   'data export returns user + attempts, no password_hash',
   r.status === 200 &&
-    r.body.user?.id === userId &&
-    Array.isArray(r.body.attempts) &&
-    r.body.attempts.length > 0 &&
-    r.body.attempts.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
-    r.body.user.password_hash === undefined,
-  JSON.stringify(r.body).slice(0, 200),
+    exportUser?.id === userId &&
+    exportUser.password_hash === undefined &&
+    exportedAttempts.length > 0 &&
+    exportedAttempts.some((item) => item.context === 'practice-native' && item.nativeLanguage === 'hi') &&
+    r.body.nextCursor === null,
+  `pages=${exportPages} attempts=${exportedAttempts.length} last=${JSON.stringify(r.body).slice(0, 200)}`,
 );
 
 // ---------- change password (token revocation) ----------

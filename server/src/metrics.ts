@@ -12,6 +12,7 @@ import { pool } from './db';
  */
 export const registry = new Registry();
 
+// Node runtime metrics (event loop lag, memory, GC) share the same registry.
 collectDefaultMetrics({ register: registry });
 
 /**
@@ -31,6 +32,7 @@ export const httpRequestDuration = new Histogram({
   registers: [registry],
 });
 
+/** Label allowlist for the method dimension; extension methods collapse to 'OTHER'. */
 const METRIC_METHODS = new Set(['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']);
 
 /** Keep attacker-chosen HTTP extension methods from minting metric series. */
@@ -39,6 +41,12 @@ export function metricMethod(method: string): string {
   return METRIC_METHODS.has(normalized) ? normalized : 'OTHER';
 }
 
+/**
+ * Time every request — limiter and version-gate rejections included — by
+ * starting the histogram timer at the top of the pipeline and ending it on
+ * res 'close', the single event that also observes aborted and socket-killed
+ * requests (rationale at the listener below).
+ */
 export const httpMetricsMiddleware: RequestHandler = (req, res, next) => {
   const endTimer = httpRequestDuration.startTimer({ method: metricMethod(req.method) });
   // 'close', not 'finish': a client abort or a requestTimeout socket kill only
@@ -66,6 +74,7 @@ new Gauge({
   name: 'pg_pool_total_connections',
   help: 'PostgreSQL clients currently owned by this process pool (idle + checked out)',
   registers: [registry],
+  /** Read live from pg-pool's counters on each scrape; nothing polls between scrapes. */
   collect() {
     this.set(pool.totalCount ?? 0);
   },
@@ -75,6 +84,7 @@ new Gauge({
   name: 'pg_pool_idle_connections',
   help: 'PostgreSQL clients sitting idle in this process pool',
   registers: [registry],
+  /** Read live from pg-pool's counters on each scrape; nothing polls between scrapes. */
   collect() {
     this.set(pool.idleCount ?? 0);
   },
@@ -84,6 +94,7 @@ new Gauge({
   name: 'pg_pool_waiting_requests',
   help: 'Checkout requests queued because every pool client is busy',
   registers: [registry],
+  /** Read live from pg-pool's counters on each scrape; nothing polls between scrapes. */
   collect() {
     this.set(pool.waitingCount ?? 0);
   },
@@ -96,6 +107,7 @@ new Gauge({
   name: 'ai_slots_in_use',
   help: 'Paid AI assessments currently holding a concurrency slot on this process (cap: AI_MAX_CONCURRENCY)',
   registers: [registry],
+  /** Reads the accessor assess.ts exports so the semaphore count stays private. */
   collect() {
     this.set(getAiSlotsInUse());
   },
@@ -105,12 +117,14 @@ new Gauge({
   name: 'audio_inspection_slots_in_use',
   help: 'Native audio inspections currently holding a decoder slot on this process (cap: AUDIO_INSPECTION_MAX_CONCURRENCY)',
   registers: [registry],
+  /** Reads the accessor audio-inspection.ts exports so the slot count stays private. */
   collect() {
     this.set(getAudioInspectionSlotsInUse());
   },
 });
 
 // --- provider call metrics ---------------------------------------------------
+/** The two paid provider call shapes: Whisper transcription and transcript grading. */
 export type ProviderCallKind = 'transcription' | 'grading';
 
 /**
@@ -126,6 +140,7 @@ export const providerCallDuration = new Histogram({
   registers: [registry],
 });
 
+/** Failed provider calls per kind/outcome — the numerator for error-rate ratios. */
 export const providerCallErrors = new Counter({
   name: 'provider_call_errors_total',
   help: 'Failed OpenAI provider calls by call kind and outcome',
@@ -168,6 +183,7 @@ export const janitorSkippedTotal = new Counter({
   registers: [registry],
 });
 
+/** Retention/deletion outcomes of the durable recording maintenance worker, by operation. */
 export const recordingMaintenanceTotal = new Counter({
   name: 'recording_maintenance_total',
   help: 'Durable recording retention/deletion maintenance outcomes',

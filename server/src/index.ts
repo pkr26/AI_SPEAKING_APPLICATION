@@ -15,6 +15,9 @@ import { assertAudioInspectorAvailable } from './audio-inspection';
 import { assertRetainedAudioStorageAvailable } from './audio-upload';
 import { installSlowClientGuards } from './slow-client-guard';
 
+// Build the express app and HTTP server eagerly, but listen() only runs after
+// the startup dependency checks below pass: a process whose schema, media
+// inspector, or storage gate failed must never accept a single request.
 const app = createApp();
 const server = createServer(app);
 // Bound two slow-client stall shapes Node's own HTTP timeouts miss (a socket
@@ -55,9 +58,13 @@ server.headersTimeout = 30_000;
 // (closeIdleConnections) so a longer keep-alive cannot pin the drain open.
 server.keepAliveTimeout = 65_000;
 
+// Uploads sweep the local disk four times as often as the database janitors:
+// orphaned multipart files are pure disk waste, while DB cleanups are bounded
+// batched deletes that tolerate the slower cadence.
 const UPLOAD_JANITOR_INTERVAL_MS = 900_000;
 const DATABASE_JANITOR_INTERVAL_MS = 3_600_000;
 
+/** One periodic cleanup job: what to run, how often, and how to log either outcome. */
 interface JanitorDefinition {
   /** Stable metric label for janitor_removed_total (metrics.ts). */
   janitor: string;
@@ -67,6 +74,12 @@ interface JanitorDefinition {
   failureMessage: string;
 }
 
+/**
+ * The complete janitor schedule — every periodic cleanup must be registered
+ * here so shutdown clears its timer and its removals reach the
+ * janitor_removed_total metric. `cleanup` resolves the number of rows/files
+ * removed; a 0 (quiet tick) is counted but never logged.
+ */
 const janitorDefinitions: JanitorDefinition[] = [
   {
     janitor: 'uploads',
@@ -112,12 +125,20 @@ const janitorDefinitions: JanitorDefinition[] = [
   },
 ];
 
+// Janitor scheduler state. `shuttingDown` is the one-shot latch every exit
+// path (signal, server error, dependency failure) sets before clearing
+// timers; `runningJanitors` is runJanitor's per-job overlap guard.
 let janitorTimers: NodeJS.Timeout[] | undefined;
 const runningJanitors = new Set<JanitorDefinition>();
 let shuttingDown = false;
 
+/** A lifecycle log's payload: a structured pino object or a bare message string. */
 type LifecycleLogPayload = Record<string, unknown> | string;
 
+/**
+ * Info-level lifecycle log that never throws: logging is observational and
+ * must not become startup/shutdown control flow when the logger itself fails.
+ */
 function logLifecycleInfo(payload: LifecycleLogPayload, message?: string): void {
   try {
     if (message === undefined) logger.info(payload);
@@ -127,6 +148,10 @@ function logLifecycleInfo(payload: LifecycleLogPayload, message?: string): void 
   }
 }
 
+/**
+ * Warning-level lifecycle log with the same swallow rule: startup advisories
+ * (trust proxy, non-production S3) must never crash the process they warn.
+ */
 function logLifecycleWarning(payload: LifecycleLogPayload, message: string): void {
   try {
     logger.warn(payload, message);
@@ -135,6 +160,10 @@ function logLifecycleWarning(payload: LifecycleLogPayload, message: string): voi
   }
 }
 
+/**
+ * Fatal-level lifecycle log. The caller's exit/drain sequencing stays
+ * authoritative even when the logger is the component that broke.
+ */
 function logLifecycleFatal(payload: LifecycleLogPayload, message: string): void {
   try {
     logger.fatal(payload, message);
@@ -143,10 +172,16 @@ function logLifecycleFatal(payload: LifecycleLogPayload, message: string): void 
   }
 }
 
+/** Report one failed janitor tick at warn level; janitors never crash the process. */
 function logJanitorFailure(definition: JanitorDefinition, err: unknown): void {
   logLifecycleWarning({ err }, definition.failureMessage);
 }
 
+/**
+ * Error-level shutdown-path log. Swallowing logger failures here is what
+ * keeps the forced exit reachable and a contained pool rejection from
+ * becoming an unhandled rejection during teardown.
+ */
 function logShutdownError(payload: LifecycleLogPayload, message?: string): void {
   try {
     if (message === undefined) logger.error(payload);
@@ -157,6 +192,13 @@ function logShutdownError(payload: LifecycleLogPayload, message?: string): void 
   }
 }
 
+/**
+ * Run a single janitor tick without ever overlapping the same janitor or
+ * starting new work after shutdown has begun (entry-guard rationale inline).
+ * The resolved removal count feeds janitor_removed_total; only non-zero
+ * sweeps are logged, and a synchronous throw from `cleanup` is caught so the
+ * interval keeps firing.
+ */
 function runJanitor(definition: JanitorDefinition): void {
   // setInterval does not wait for an async callback. Keep one local invocation
   // per janitor so a slow filesystem sweep cannot overlap itself, and so a
@@ -180,6 +222,11 @@ function runJanitor(definition: JanitorDefinition): void {
     .finally(() => runningJanitors.delete(definition));
 }
 
+/**
+ * Schedule every janitor: one immediate tick right after the startup
+ * dependency checks pass (rationale inline), then an unref'd interval per
+ * definition so no janitor timer can hold the event loop open by itself.
+ */
 function startJanitors(): void {
   janitorTimers = janitorDefinitions.map((definition) => {
     // The first cleanup happens only after startup dependencies pass. Failed
@@ -191,6 +238,7 @@ function startJanitors(): void {
   });
 }
 
+/** Idempotently stop every janitor timer; safe on any exit path, even pre-start. */
 function clearJanitors() {
   const timers = janitorTimers;
   janitorTimers = undefined;
@@ -206,6 +254,7 @@ function clearJanitors() {
  */
 function drainPoolAfterFatal(poolFailureMessage: string): void {
   let exited = false;
+  /** Exit exactly once — whichever of force timer or pool completion fires first. */
   function exitOnce(timedOut: boolean): void {
     if (exited) return;
     exited = true;
@@ -221,6 +270,15 @@ function drainPoolAfterFatal(poolFailureMessage: string): void {
     .finally(() => exitOnce(false));
 }
 
+/**
+ * One-shot graceful shutdown for SIGTERM/SIGINT (repeat signals are ignored).
+ * Ordering is load-bearing: freeze the janitor schedule, latch the provider
+ * gate before touching sockets or the pool so no in-flight assessment escapes
+ * the abort sweep, then close the HTTP server — severing idle keep-alives so
+ * they cannot pin the drain — and finally the pg pool. A force timer bounds
+ * the whole drain at SHUTDOWN_DRAIN_MS (kept above the worst-case request
+ * budget by config), and the exit status is 0 unless a close itself failed.
+ */
 function shutdown(signal: string) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -240,6 +298,7 @@ function shutdown(signal: string) {
   forceTimer.unref();
   logLifecycleInfo({ signal }, 'shutting down');
 
+  /** Last drain step: close the pool, then exit with the server-close outcome. */
   const finishShutdown = (err?: Error) => {
     if (err) logShutdownError({ err }, 'error closing HTTP server');
     pool

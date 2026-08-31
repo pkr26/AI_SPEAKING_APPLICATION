@@ -17,6 +17,12 @@ export interface AssessmentQuestionSnapshot {
 
 // Constructed per claim (like the response schemas in createResponseSchemas)
 // so every schema mutant executes inside the tests that exercise claims.
+/**
+ * Strict shape of the claim-time question snapshot (migration 024): the CEFR
+ * level, prompt word, and question text taken from the exact in-memory
+ * question used for grading. Rejecting bad snapshots at claim time guarantees
+ * recovery reads immutable columns and never rejoins mutable catalog wording.
+ */
 function createAssessmentQuestionSnapshotSchema() {
   return z
     .object({
@@ -61,6 +67,14 @@ interface RequestStatusRow extends RequestRow {
   question_text: string;
 }
 
+/**
+ * Build the per-context zod validators for durable assessment JSONB. Each
+ * entry encodes one context's full additive public contract — diagnostic
+ * scored/silence shapes, the six practice outcomes, and the native
+ * comprehension shapes — including cross-field attemptsLeft refinements that
+ * per-field schemas cannot express. Rebuilt on every validation on purpose so
+ * each schema mutant runs inside tests that exercise stored responses.
+ */
 function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const CEFR_LEVELS = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2'] as const;
   const PRACTICE_MAX_ATTEMPTS = 3;
@@ -69,11 +83,13 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
   const absent = z.undefined().optional();
+  /** Bounded string that must be non-blank under JavaScript trim, like every persisted public scalar. */
   const nonEmptyString = (maximum: number) =>
     z
       .string()
       .max(maximum)
       .refine((value) => value.trim().length > 0);
+  /** Bounded finite integer schema; callers pick the inclusive limits. */
   const integer = (minimum: number, maximum: number) => z.number().finite().int().min(minimum).max(maximum);
 
   const uuid = z.string().regex(UUID_PATTERN);
@@ -369,12 +385,19 @@ export type AssessmentRequestClaim =
  * public status/message remain the normal HttpError contract.
  */
 export class AssessmentRequestInFlightError extends HttpError {
+  /** Status is fixed at 409; message, code, and extras come from the throwing site. */
   constructor(message: string, code: ApiErrorCode, extra?: Record<string, unknown>) {
     super(409, message, extra, code);
     this.name = 'AssessmentRequestInFlightError';
   }
 }
 
+/**
+ * Stable 409 ASSESSMENT_RESULT_INCOMPATIBLE for work bound to a diagnostic
+ * run the learner has since restarted. Shared by the claim and status paths
+ * so an old POST and an old recovery GET answer identically without any new
+ * provider work.
+ */
 function retiredDiagnosticRunError(): HttpError {
   return new HttpError(
     409,
@@ -668,6 +691,13 @@ export async function completeAssessmentRequest(
   return recording && owner.recording_retained ? responseWithRecording : validatedResponseWithoutRecording;
 }
 
+/**
+ * Drop this worker's own processing claim after a failure. Keyed by the exact
+ * claimId so it can never delete a lease-expired replacement worker's row.
+ * Best-effort by design: if the delete fails, the 5-minute lease expiry still
+ * frees the UUID, so the error is swallowed instead of masking the original
+ * failure.
+ */
 export async function abandonAssessmentRequest(userId: string, requestId: string, claimId: string): Promise<void> {
   await pool
     .query(
@@ -678,6 +708,12 @@ export async function abandonAssessmentRequest(userId: string, requestId: string
     .catch(() => undefined);
 }
 
+/**
+ * Janitor for assessment_requests: expire dead processing leases (older than
+ * 5 minutes) and completed replays past the 48-hour retention window in
+ * bounded batches under the shared advisory lock, keeping expiry sweeps off
+ * the hot claim path.
+ */
 export async function cleanupAssessmentRequests(): Promise<number> {
   return runExclusiveBatchedDelete(
     'janitor:assessment-requests',
@@ -716,6 +752,14 @@ export type AssessmentRequestStatus =
       response: Record<string, unknown>;
     };
 
+/**
+ * Read one request UUID's durable status for recovery polling. Only live rows
+ * are visible — a processing row past its 5-minute lease or a completion past
+ * the 48-hour retention reads as undefined, which clients treat as terminal.
+ * Completed v2 rows replay their sanitized response; v1 rows answer the same
+ * stable ASSESSMENT_RESULT_INCOMPATIBLE 409 as the claim path, and a restarted
+ * diagnostic run retires both reads and replays through the shared helper.
+ */
 export async function getAssessmentRequestStatus(
   userId: string,
   requestId: string,

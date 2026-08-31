@@ -8,6 +8,12 @@ import { PostgresRateLimitStore } from './postgres-rate-limit-store';
 const MAX_EMAIL_LENGTH = 254;
 const emailShape = z.string().email();
 
+/**
+ * Normalize an identifier for email-keyed budgeting: trim, lowercase, and
+ * return it only when it could still name an account (non-empty, within the
+ * 254-character bound, zod-email shaped). Malformed input returns undefined
+ * so it is skipped rather than minting a durable counter row for garbage.
+ */
 export function normalizeLoginEmail(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
   const normalized = value.trim().toLowerCase();
@@ -30,6 +36,10 @@ export function requestIpRateLimitKey(req: { ip?: string }): string {
   return ipKeyGenerator(req.ip ?? '');
 }
 
+/**
+ * Key authenticated-user budgets by user id and anonymous traffic by IP, so
+ * one signed-in learner keeps a single budget even behind a shared NAT.
+ */
 function userOrIpRateLimitKey(req: AuthedRequest): string {
   const user = req.user;
   return user ? `user:${user.id}` : rateLimitIpKey(req.ip);
@@ -41,6 +51,7 @@ type ParsedEmailRequest = { body?: { email?: unknown } };
 // body as an invalid identifier too: Express deliberately leaves req.body
 // undefined for requests with no JSON content type, and a malformed request
 // must not turn that defensive limiter into a TypeError/500.
+/** Skip (do not count) any request whose body.email cannot name an account. */
 function skipInvalidEmail(req: ParsedEmailRequest): boolean {
   return normalizeLoginEmail(req.body?.email) === undefined;
 }
@@ -100,6 +111,12 @@ function createExactWindowRefundController(
   };
 }
 
+/**
+ * Invoke the wrapped limiter and observe the refund window on every path that
+ * can complete it: synchronously inside next() (the limiter has published its
+ * window info by then) and again on promise settlement for implementations
+ * that return a promise. The controller's one-shot guard makes both safe.
+ */
 function invokeLimiterWithRefundObservation(
   limiter: RequestHandler,
   req: AuthedRequest,
@@ -447,6 +464,11 @@ export function buildLimiters() {
   // outside mock mode, after paid provider calls) must keep its hit — without
   // this, a client stuck in a provider-failure loop is never rate-limited.
   // Routes set the flag via assessSpeaking's onCapacityReserved hook.
+  /**
+   * True when this response must keep its assessment hits: it succeeded, or the
+   * daily-capacity reservation committed and later provider failures still spent
+   * real money. The assess wrappers refund exactly the negation of this.
+   */
   const assessmentSpentPaidWork = (_req: unknown, res: { statusCode: number; locals: Record<string, unknown> }) =>
     res.statusCode < 400 || res.locals.assessmentCapacityReserved === true;
 
@@ -528,6 +550,12 @@ export function buildLimiters() {
   // fired by then and will not fire again). The res.locals sentinel makes the
   // pair of paths idempotent: whichever re-spends first wins, and the other
   // becomes a no-op.
+  /**
+   * Take both assessment hits back after an aborted transport that had already
+   * committed paid capacity, re-spending each only within the exact window its
+   * limiter observed for this request. The res.locals sentinel makes this
+   * idempotent across the abort guard and the reservation hook.
+   */
   const respendAssessmentBudget = (req: AuthedRequest, res: Response): void => {
     if (res.locals.assessmentBudgetRespent) return;
     res.locals.assessmentBudgetRespent = true;
@@ -547,6 +575,12 @@ export function buildLimiters() {
   // event on which the exact-window wrapper can refund. The durable locals markers
   // close the event-before-reservation race without relying on Node's response
   // flags having updated by the time the provider reservation callback runs.
+  /**
+   * Mounted after both assessment limiters: mirror every transport event the
+   * exact-window wrapper can refund with a re-spend, but only once capacity was
+   * reserved. Durable res.locals markers close the event-before-reservation
+   * race without trusting Node's response flags at callback time.
+   */
   const assessAbortGuard: RequestHandler = (req, res, next) => {
     res.once('error', () => {
       res.locals.assessmentTransportFailed = true;

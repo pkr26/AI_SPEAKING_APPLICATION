@@ -17,6 +17,7 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
 // in invocation order and leave the queue usable after a keychain failure.
 let storageQueue: Promise<void> = Promise.resolve();
 
+/** One-at-a-time keychain access that preserves invocation order after failures. */
 function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   const result = storageQueue.then(operation, operation);
   storageQueue = result.then(

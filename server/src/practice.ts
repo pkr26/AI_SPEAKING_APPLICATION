@@ -17,6 +17,7 @@ import { Limiters } from './rate-limit';
 import { RecordingCapture } from './recording-store';
 import { releaseTransactionClient, rollbackTransaction } from './transaction';
 
+/** Hard per-cycle try budget: one assigned question, three tries shared by English and native speech. */
 const MAX_ATTEMPTS = 3;
 export const MAX_FINAL_FEEDBACK_LENGTH = 4000;
 /** One practice attempt at or above this score masters the word. */
@@ -106,6 +107,10 @@ async function withCurrentPracticeUser<T>(
   }
 }
 
+/**
+ * Shared SELECT projection for the questions table: aliases the snake_case columns into the
+ * exact camelCase keys of QuestionJson so every question-fetch query returns one wire shape.
+ */
 function questionColumns(): string {
   return `q.id, q.cefr_level AS "cefrLevel", q.prompt_word AS "promptWord", q.question_text AS "questionText"`;
 }
@@ -139,6 +144,7 @@ async function pickRevisionQuestion(
 // A skipped word already has a practice_progress row (the skip upsert creates
 // one), so the row-existence filter below is also what keeps skipped words out
 // of the "new" bucket until their skip expires into the revision bucket.
+/** Pick a uniformly random question at this level that has no practice_progress row yet. */
 async function pickNewQuestion(
   userId: string,
   level: string,
@@ -267,6 +273,12 @@ export async function pickPracticeNext(
   return undefined;
 }
 
+/**
+ * Aggregate progress counters for one level: mastered and learning word counts (progress
+ * rows joined to that level's questions), the level's full bank size, and how many words are
+ * due now (due_at passed and not parked by a skip). Read-only, so callers pass their own
+ * transaction client when the snapshot must agree with their locks.
+ */
 async function practiceProgressSnapshot(
   userId: string,
   level: string,
@@ -294,6 +306,12 @@ interface ActivePracticeCycleRow extends QuestionJson {
   attemptsUsed: number;
 }
 
+/**
+ * Load the learner's one active practice cycle with its assigned question, locking only the
+ * practice_cycles row (FOR UPDATE OF pc, never the joined questions row) so the resume-vs-
+ * reassign decision serializes against concurrent attempts, skips, and closures. Returns
+ * undefined when nothing is being served.
+ */
 async function activePracticeCycle(userId: string, db: Queryable): Promise<ActivePracticeCycleRow | undefined> {
   const { rows } = await db.query<ActivePracticeCycleRow>(
     `SELECT pc.id AS "cycleId", pc.kind, pc.attempts_used AS "attemptsUsed",
@@ -307,6 +325,12 @@ async function activePracticeCycle(userId: string, db: Queryable): Promise<Activ
   return rows[0];
 }
 
+/**
+ * Pick the next question and INSERT the fresh active practice_cycles row for it, returning
+ * the complete GET /practice/question payload with zero attempts used. Runs inside the
+ * caller's transaction so the at-most-one-active-cycle invariant and the embedded progress
+ * snapshot commit atomically; returns undefined only when every selection bucket is empty.
+ */
 async function createPracticeCyclePayload(
   userId: string,
   level: string,
@@ -450,6 +474,12 @@ async function claimPracticeAttempt(
   }
 }
 
+/**
+ * Best-effort release of the per-question in-flight claim after a failed or aborted
+ * submission. Deliberately never throws — the pipeline must still abandon its request claim
+ * after this hook — and a claim that cannot be cleared self-expires through the five-minute
+ * steal window in claimPracticeAttempt.
+ */
 async function clearPracticeClaim(userId: string, questionId: string, claimId: string): Promise<void> {
   try {
     await pool.query('DELETE FROM practice_inflight WHERE user_id = $1 AND question_id = $2 AND claim_id = $3', [
@@ -883,6 +913,11 @@ async function storeNativePracticeResult(
   }
 }
 
+/**
+ * Build the "a good answer could be" hint from the catalog's first English example authored
+ * for the learner's native language, falling back to a generic prompt-word phrase when that
+ * language has no usable examples. Deterministic and free: no provider call is involved.
+ */
 export function authoredAnswerHint(question: QuestionRow, language: string): string {
   const translation = question.translations[language];
   if (!translation || !Array.isArray(translation.examples)) {
@@ -893,6 +928,7 @@ export function authoredAnswerHint(question: QuestionRow, language: string): str
   return example || `a few clear, on-topic sentences about "${question.prompt_word}"`;
 }
 
+/** The catalog's first native-language example sentence for this question, or undefined when none is authored. */
 export function authoredNativeExample(question: QuestionRow, language: string): string | undefined {
   const translation = question.translations[language];
   if (!translation || !Array.isArray(translation.examples)) return undefined;
@@ -901,6 +937,11 @@ export function authoredNativeExample(question: QuestionRow, language: string): 
   return firstExample.native.trim() || undefined;
 }
 
+/**
+ * Assemble the final (third-strike) failure feedback: provider verdict plus the authored
+ * answer hint, with the hint budgeted against the fixed prefix/suffix so the result stays
+ * within MAX_FINAL_FEEDBACK_LENGTH; the trailing slice is only a defensive backstop.
+ */
 export function buildFinalFeedback(providerFeedback: string, hint: string): string {
   const prefix = `Don't worry — here's the final feedback for this question: ${providerFeedback} A good answer could be: `;
   const suffix = ". Let's move on!";
@@ -936,6 +977,11 @@ function assessQuestionContext(question: QuestionRow) {
   };
 }
 
+/**
+ * Weak If-None-Match comparison: accepts exact validators, W/-prefixed weak validators,
+ * comma-separated lists, and '*'. Evaluated by hand because Express's req.fresh reports
+ * false when a revalidating client also sends Cache-Control: no-cache.
+ */
 function matchesIfNoneMatch(header: string | undefined, etag: string): boolean {
   if (!header) return false;
   return header.split(',').some((value) => {
@@ -945,6 +991,11 @@ function matchesIfNoneMatch(header: string | undefined, etag: string): boolean {
   });
 }
 
+/**
+ * Build the practice router: assignment (GET /question), skip, attempt history, home stats,
+ * mother-tongue help, and the two paid assessment submissions — all behind requireAuth and
+ * no-store, with the diagnostic-completed gate layered onto the submission chain.
+ */
 export function createPracticeRouter(limiters: Limiters) {
   const router = Router();
   const helpParamsSchema = z.object({
@@ -961,12 +1012,14 @@ export function createPracticeRouter(limiters: Limiters) {
   const statsQuerySchema = z.object({
     timeZone: z.string().trim().min(1).max(128).default('UTC'),
   });
+  /** Practice responses are learner-specific and must never be cached. */
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
   });
   router.use(requireAuth);
 
+  /** Submission-chain eligibility gate: paid practice requires a completed placement with a level. */
   const requireCompletedDiagnostic = (req: AuthedRequest, _res: Response, next: NextFunction) => {
     if (!req.user!.diagnostic_completed || !req.user!.cefr_level) {
       return next(new HttpError(403, 'Diagnostic not completed'));
@@ -978,6 +1031,11 @@ export function createPracticeRouter(limiters: Limiters) {
   // paid limiters + dual-mode validation); see assessment-pipeline.ts.
   const submission = buildAssessmentSubmissionChain(limiters, 'practice', [requireCompletedDiagnostic]);
 
+  /**
+   * Serve the learner's current assignment: resumes the durable active cycle after a remount
+   * or atomically assigns a new one, under the user-row FOR UPDATE lock (not the default
+   * SHARE) because assignment writes — so concurrent GETs can never mint two active cycles.
+   */
   router.get(
     '/question',
     h(async (req: AuthedRequest, res) => {
@@ -1194,6 +1252,11 @@ export function createPracticeRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Mother-tongue help for one question at the learner's current level. The language comes
+   * from the profile rather than the URL, so the payload is ETag-revalidated per
+   * authorization instead of being stored by any cache.
+   */
   router.get(
     '/question/:id/help',
     validate({ params: helpParamsSchema }),
@@ -1244,6 +1307,11 @@ export function createPracticeRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Scored English attempt through the shared paid pipeline: the options below supply the
+   * practice-specific claim/assess/persist hooks, silence stays a free retry, and a failed
+   * third try closes the cycle with final feedback plus the next assignment.
+   */
   router.post(
     '/attempt',
     ...submission.middleware,

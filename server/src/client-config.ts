@@ -1,7 +1,9 @@
 import { Router } from 'express';
 
+/** Who ads may target once eligibility exists; 'unknown' means unverified. */
 export type AdsAudienceMode = 'unknown' | 'adult-only' | 'child';
 
+/** Operator-side ad switches (config.ads); none of them can enable ads alone. */
 export interface AdsPolicyConfig {
   enabled: boolean;
   audienceMode: AdsAudienceMode;
@@ -9,6 +11,7 @@ export interface AdsPolicyConfig {
   historyNativeEnabled: boolean;
 }
 
+/** The additive /client-config response body the mobile app parses. */
 export interface PublicClientConfig {
   ads: {
     enabled: boolean;
@@ -57,6 +60,13 @@ export function publicClientConfig(policy: AdsPolicyConfig): PublicClientConfig 
   };
 }
 
+/**
+ * Mount GET /client-config. Unauthenticated on purpose (pre-login clients
+ * fetch it), served no-store so a rollout flip reaches the app on its next
+ * launch rather than from an intermediary cache, and answered from the
+ * policy captured at app-build time — a config change needs a process
+ * restart to take effect.
+ */
 export function createClientConfigRouter(policy: AdsPolicyConfig): Router {
   const router = Router();
   // Stryker disable next-line StringLiteral: Express intentionally aliases an

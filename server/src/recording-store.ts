@@ -1,6 +1,7 @@
 export type RecordingContext = 'diagnostic' | 'practice' | 'practice-native';
 export type RecordingStorageScope = 'diagnostic' | 'practice';
 
+/** Object facts captured at download time (SubmittedAudioFile.retainedSource in audio-upload.ts). */
 export interface RecordingCapture {
   id: string;
   storageScope: RecordingStorageScope;
@@ -13,10 +14,22 @@ export interface RecordingCapture {
   attemptId?: string;
 }
 
+/** Structural query minimum shared by the pg Pool and a transaction-scoped PoolClient. */
 interface Queryable {
   query(text: string, values?: unknown[]): Promise<unknown>;
 }
 
+/**
+ * Insert permanent recording metadata inside the caller's own transaction, so
+ * the row commits or rolls back atomically with the assessment result it
+ * describes. The capture must describe the exact object the assessment
+ * consumed: a key disagreement with the authoritative owner throws rather
+ * than persisting metadata for a different object. The statement itself
+ * snapshots the owner's current recording-retention epoch, binding the row to
+ * the generation that exists at commit so a later bulk delete-all fence hides
+ * it immediately. Anything but exactly one inserted row also throws, aborting
+ * the caller's transaction instead of silently dropping the recording.
+ */
 export async function insertRetainedRecording(
   client: Queryable,
   userId: string,

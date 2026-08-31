@@ -27,24 +27,33 @@ export function boundedQuestionInventoryQuery(): QuestionInventoryQuery {
   };
 }
 
+/** Type guard for a plain JSON object; excludes null and arrays. */
 function isJsonRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
+/** Type guard against the six required CEFR level literals. */
 function isRequiredCefrLevel(value: unknown): value is RequiredCefrLevel {
   return REQUIRED_CEFR_LEVELS.some((level) => value === level);
 }
 
+/**
+ * Mirrors the mobile parser's string rule exactly: non-blank under JavaScript
+ * trim with a UTF-16 `.length` bound, the same semantics migration 015
+ * enforces on persisted public strings.
+ */
 function isBoundedNonEmptyString(value: unknown, maximum: number): value is string {
   return typeof value === 'string' && value.trim().length > 0 && value.length <= maximum;
 }
 
+/** One translation example: bounded non-empty English and native sentences. */
 function isExample(value: unknown): boolean {
   return (
     isJsonRecord(value) && isBoundedNonEmptyString(value.en, 4_000) && isBoundedNonEmptyString(value.native, 4_000)
   );
 }
 
+/** One language's translation payload: word, question, and exactly three examples. */
 function isTranslation(value: unknown): boolean {
   return (
     isJsonRecord(value) &&
@@ -56,6 +65,12 @@ function isTranslation(value: unknown): boolean {
   );
 }
 
+/**
+ * Full row contract for a runtime catalog question: strict UUID id, bounded
+ * non-empty prompt/question text, and a well-formed translation for every
+ * required language. Any single deviation marks the whole row malformed so
+ * readiness fails closed instead of serving a partially valid question.
+ */
 function isWellFormedQuestionRow(row: Record<string, unknown>): boolean {
   const translations = row.translations;
   if (

@@ -47,6 +47,7 @@ interface DiagnosticAnswerSummary {
   feedback: string;
 }
 
+/** Project a full catalog row into the camelCase question payload sent to clients. */
 function questionJson(question: QuestionRow): QuestionJson {
   return {
     id: question.id,
@@ -81,6 +82,11 @@ async function diagnosticAnswerSummaries(
   return rows.reverse();
 }
 
+/**
+ * Detect a blank transcript among the current run's answer summaries. Current writers never
+ * persist silence (it is a free retry), so any blank row marks a legacy counted-silence run
+ * that GET /next must repair before a current client can render its summaries.
+ */
 function hasLegacySilentAnswer(answers: readonly DiagnosticAnswerSummary[]): boolean {
   // String.prototype.trim uses the same ECMAScript whitespace set enforced by
   // the mobile parser and migration 022. Current writers never persist
@@ -105,6 +111,7 @@ async function lockState(client: PoolClient, userId: string): Promise<Diagnostic
   return again.rows[0];
 }
 
+/** Pick one uniformly random question at a CEFR level, or undefined when the level has none. */
 async function randomQuestionAt(client: PoolClient, level: string): Promise<QuestionJson | undefined> {
   const { rows } = await client.query<QuestionJson>(
     `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
@@ -114,6 +121,7 @@ async function randomQuestionAt(client: PoolClient, level: string): Promise<Ques
   return rows[0];
 }
 
+/** Load one question by id — used to resume the exact question the run already served. */
 async function questionById(client: PoolClient, questionId: string): Promise<QuestionJson | undefined> {
   const { rows } = await client.query<QuestionJson>(
     `SELECT id, cefr_level AS "cefrLevel", prompt_word AS "promptWord", question_text AS "questionText"
@@ -177,6 +185,11 @@ async function claimDiagnosticAnswer(userId: string, question: QuestionRow): Pro
   }
 }
 
+/**
+ * Best-effort release of the diagnostic processing claim after a failed or aborted
+ * submission. Never throws — the pipeline still has to abandon its request claim — and a
+ * claim left behind by a failed cleanup simply expires through the five-minute steal window.
+ */
 async function clearDiagnosticClaim(userId: string, claimId: string): Promise<void> {
   try {
     await pool.query(
@@ -197,6 +210,16 @@ async function clearDiagnosticClaim(userId: string, claimId: string): Promise<vo
   }
 }
 
+/**
+ * Persist one scored diagnostic answer and advance the placement binary search in a single
+ * transaction: lock the user row parent-first, re-verify the processing claim under that
+ * lock, insert the attempt, narrow [low, high] by pass/fail, then either commit the final
+ * placement (users.cefr_level + diagnostic_completed, pending acknowledgement) or store the
+ * next mid-level question as current. The idempotency request completes inside the same
+ * transaction so a retry replays this exact response. A blank transcript takes the silence
+ * branch instead: the request completes for replay, but no attempt row, window move, or
+ * placement change happens. Any lost claim or moved question surfaces as 409 STATE_CHANGED.
+ */
 async function finalizeDiagnosticAnswer(
   userId: string,
   question: QuestionRow,
@@ -343,6 +366,11 @@ async function finalizeDiagnosticAnswer(
   }
 }
 
+/**
+ * Build the diagnostic router: adaptive serving (GET /next), confirmed restart, durable
+ * acknowledgement of the completed placement, and the paid /answer submission — all behind
+ * requireAuth and no-store.
+ */
 export function createDiagnosticRouter(limiters: Limiters) {
   // Restart resets the learner's level, so the client must confirm explicitly.
   // Construct this with the router so every freshly built app gets the exact
@@ -353,6 +381,7 @@ export function createDiagnosticRouter(limiters: Limiters) {
     }),
   });
   const router = Router();
+  /** Placement state is per-learner and must never be cached. */
   router.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
@@ -365,6 +394,12 @@ export function createDiagnosticRouter(limiters: Limiters) {
   // the pipeline after the request UUID is owned, so it abandons the claim.
   const submission = buildAssessmentSubmissionChain(limiters, 'diagnostic');
 
+  /**
+   * Serve or resume the adaptive placement run in one serialized transaction: the user-row
+   * lock waits out a concurrent finalization, legacy counted-silence runs are repaired, a
+   * completed placement returns its reveal, and otherwise the mid-level question is stored
+   * as current so a crash resumes the same run instead of re-asking another level.
+   */
   router.get(
     '/next',
     h(async (req: AuthedRequest, res) => {
@@ -557,6 +592,11 @@ export function createDiagnosticRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Scored placement answer through the shared paid pipeline. The claim's served question is
+   * authoritative for grading, and finalization advances the binary search or commits the
+   * final level atomically inside one transaction.
+   */
   router.post(
     '/answer',
     ...submission.middleware,

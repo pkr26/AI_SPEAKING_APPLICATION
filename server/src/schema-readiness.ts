@@ -13,6 +13,12 @@ export interface MigrationManifestEntry {
 
 export type SchemaQuery = (text: string, values?: readonly unknown[]) => Promise<{ rows: unknown[] }>;
 
+/**
+ * Read the packaged migrations directory into name+sha256 entries sorted by
+ * name. An empty directory throws: a release with no migrations cannot
+ * validate any database, so packaging mistakes are boot errors, not readiness
+ * drift.
+ */
 export function migrationManifestFromDirectory(migrationsDirectory: string): readonly MigrationManifestEntry[] {
   const entries = fs
     .readdirSync(migrationsDirectory)
@@ -50,14 +56,24 @@ export const QUESTION_INVENTORY_READINESS_TTL_MS = 60_000;
 let questionInventoryReadyUntil = 0;
 let questionInventoryValidationInFlight: Promise<void> | undefined;
 
+/** The frozen packaged manifest; readiness compares the database against exactly this list. */
 export function expectedMigrationManifest(): readonly MigrationManifestEntry[] {
   return PACKAGED_MIGRATION_MANIFEST;
 }
 
+/**
+ * Default SchemaQuery over the shared pool. Identity is load-bearing:
+ * assertDatabaseSchemaCurrent applies the process-wide inventory cache only to
+ * this exact adapter, so test/deployment seams can never bless production.
+ */
 async function queryPool(text: string, values: readonly unknown[] = []): Promise<{ rows: unknown[] }> {
   return pool.query(text, [...values]);
 }
 
+/**
+ * Run the bounded inventory scan through one adapter and throw unless the
+ * catalog holds exactly 100 well-formed questions per CEFR level.
+ */
 async function validateQuestionInventory(query: SchemaQuery): Promise<void> {
   const inventoryQuery = boundedQuestionInventoryQuery();
   const questionResult = await query(inventoryQuery.text, inventoryQuery.values);
@@ -66,6 +82,12 @@ async function validateQuestionInventory(query: SchemaQuery): Promise<void> {
   }
 }
 
+/**
+ * Single-flight, TTL-bounded inventory validation. Concurrent probes join the
+ * one in-flight promise instead of stacking duplicate multi-megabyte scans,
+ * and the flight slot is cleared in finally so a failed validation is retried
+ * on the next probe rather than latched.
+ */
 async function validateCachedQuestionInventory(query: SchemaQuery): Promise<void> {
   if (questionInventoryReadyUntil > Date.now()) return;
   if (questionInventoryValidationInFlight) return questionInventoryValidationInFlight;
@@ -86,6 +108,20 @@ export function resetQuestionInventoryReadinessCacheForTests(): void {
   questionInventoryReadyUntil = 0;
 }
 
+/**
+ * Runtime readiness gate over schema state. Verifies, in order:
+ * 1. applied ordinary migrations are an exact name+checksum prefix of the
+ *    packaged manifest (byte-ordered via COLLATE "C") — trailing rows a
+ *    rolling additive deploy added are fine, missing or altered rows are not;
+ * 2. each non-rolling cutover fence row appears exactly once with its exact
+ *    checksum precisely when its guarded migration is packaged — a fence is
+ *    never treated as an ordinary newer migration;
+ * 3. the shared runtime rate_limit_windows table exists;
+ * 4. the question inventory is exactly 100 well-formed questions per level,
+ *    cached only for the default pool adapter.
+ * Returns the latest packaged migration name. Any mismatch throws so /ready
+ * reports this replica out of service instead of serving degraded traffic.
+ */
 export async function assertDatabaseSchemaCurrent(
   query: SchemaQuery = queryPool,
 ): Promise<{ latestMigration: string }> {

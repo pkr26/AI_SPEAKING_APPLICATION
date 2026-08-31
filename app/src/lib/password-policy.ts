@@ -1,7 +1,13 @@
 import { translate, type Translator } from './i18n';
 
+/** Longest profile name the server's Zod validator accepts. */
 export const MAX_NAME_LENGTH = 100;
+/** Longest email the server's Zod validator accepts. */
 export const MAX_EMAIL_LENGTH = 254;
+/**
+ * bcrypt's hard 72-UTF-8-byte input ceiling. The server rejects (never
+ * truncates) longer input, so the client must refuse it before the POST.
+ */
 export const MAX_PASSWORD_UTF8_BYTES = 72;
 
 /** UTF-8 byte count matching Node's Buffer.byteLength for user-entered text. */
@@ -28,6 +34,12 @@ export function utf8ByteLength(value: string): number {
   return bytes;
 }
 
+/**
+ * Length-only check for fields re-entering an EXISTING password (login,
+ * current-password, delete-account). Those values may predate today's policy,
+ * so only the bcrypt byte ceiling applies — never min-length or character
+ * class rules.
+ */
 export function comparablePasswordError(
   password: string,
   t: Translator = translate,

@@ -8,6 +8,12 @@ import { MAX_EMAIL_LENGTH } from './password-policy';
 const EMAIL_PATTERN =
   /^(?!\.)(?!.*\.\.)([A-Z0-9_'+\-\.]*)[A-Z0-9_+-]@([A-Z0-9][A-Z0-9\-]*\.)+[A-Z]{2,}$/i;
 
+/**
+ * Accepts exactly the emails the server's Zod validator accepts: the pinned
+ * regex plus the shared length bound, applied after one trim. Drift in either
+ * direction is a compatibility break — stricter locks out an existing learner,
+ * looser defers the rejection to a failed POST.
+ */
 export function isValidEmailAddress(value: string): boolean {
   const email = value.trim();
   if (email.length === 0 || email.length > MAX_EMAIL_LENGTH) return false;

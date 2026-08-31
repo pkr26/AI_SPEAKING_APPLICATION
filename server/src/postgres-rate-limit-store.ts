@@ -17,6 +17,7 @@ const HASH_KEY_INFO = 'postgres-rate-limit-store/v1';
 // `config` is frozen at boot, so the derived key is computed once and reused.
 let cachedHashKeySecret: Buffer | undefined;
 
+/** Derive the counter-key HMAC secret once per process (config is frozen at boot). */
 function hashKeySecret(): Buffer {
   if (!cachedHashKeySecret) {
     cachedHashKeySecret = createHmac('sha256', config.rateLimitHashSecret || config.jwtSecret)
@@ -29,6 +30,7 @@ function hashKeySecret(): Buffer {
 // Refund/reset/re-spend callbacks are deliberately fire-and-forget. A broken
 // logging transport must not turn the catch path itself into an unhandled
 // rejection (or replace increment's contracted retryable 503).
+/** Report a swallowed counter-operation failure; itself guaranteed never to throw. */
 function warnStoreFailure(payload: Record<string, unknown>, message: string): void {
   try {
     logger.warn(payload, message);
@@ -46,6 +48,7 @@ export class PostgresRateLimitStore implements Store {
   readonly localKeys = false;
   readonly prefix: string;
 
+  /** One store per budget: the namespace keeps hashed keys disjoint across limiters and replicas. */
   constructor(
     private readonly namespace: string,
     private readonly windowMs: number,
@@ -59,10 +62,18 @@ export class PostgresRateLimitStore implements Store {
   // store its own rotation lifecycle. With the derived default, rotating
   // JWT_SECRET still invalidates every persisted window once — set the
   // dedicated secret to decouple the two.
+  /** HMAC over namespace + key, so the same raw key in two namespaces can never collide. */
   private hash(key: string): string {
     return createHmac('sha256', hashKeySecret()).update(this.namespace).update('\0').update(key).digest('hex');
   }
 
+  /**
+   * Count one hit, opening or renewing the fixed window atomically. Fails
+   * closed: a store brownout throws the contracted retryable 503
+   * POOL_SATURATED instead of admitting the request without its counter, and
+   * the single clock sample inside the upsert keeps hits and reset_at from
+   * splitting across a rollover.
+   */
   async increment(key: string): Promise<ClientRateLimitInfo> {
     let rows: CounterRow[];
     try {
@@ -114,6 +125,7 @@ export class PostgresRateLimitStore implements Store {
   // would otherwise surface as an unhandled rejection and terminate the
   // process. A lost refund only leaves the budget slightly consumed until the
   // window expires.
+  /** Liveness-only refund for Store-interface callers without the observed window. */
   async decrement(key: string): Promise<void> {
     try {
       await pool.query(
@@ -165,6 +177,7 @@ export class PostgresRateLimitStore implements Store {
   // microsecond remainder when it parses timestamptz into a Date. Same
   // fail-safe contract as decrement: callers fire-and-forget, so errors are
   // logged, never thrown.
+  /** Window-guarded re-spend: adds back one hit only inside the exact observed window. */
   async incrementWithinWindow(key: string, observedResetAt: Date | undefined): Promise<void> {
     try {
       await pool.query(
@@ -181,6 +194,11 @@ export class PostgresRateLimitStore implements Store {
     }
   }
 
+  /**
+   * Delete one counter row outright. Fail-safe like every other mutation here:
+   * errors are logged and swallowed (callers invoke this fire-and-forget), and
+   * a lost reset only leaves the window to expire naturally.
+   */
   async resetKey(key: string): Promise<void> {
     try {
       await pool.query('DELETE FROM rate_limit_windows WHERE namespace = $1 AND key_hash = $2', [
@@ -193,6 +211,11 @@ export class PostgresRateLimitStore implements Store {
   }
 }
 
+/**
+ * Janitor for counter rows: every window op is liveness-guarded, so a row past
+ * reset_at by an hour is unreachable state and is batched away under the
+ * advisory-locked delete helper instead of accumulating forever.
+ */
 export async function cleanupRateLimitWindows(): Promise<number> {
   return runExclusiveBatchedDelete(
     'janitor:rate-limit-windows',

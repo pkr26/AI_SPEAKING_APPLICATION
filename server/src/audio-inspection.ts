@@ -4,6 +4,7 @@ import path from 'node:path';
 import { config } from './config';
 import { HttpError } from './middleware';
 
+/** Measured-duration floor: a decode shorter than half a second is rejected as too short to assess. */
 const MIN_AUDIO_DURATION_SECONDS = 0.5;
 // Native encoders may add a fraction of a second of AAC/MP3/WebM padding to a
 // take stopped at exactly 120 seconds. This is container tolerance, not extra
@@ -49,10 +50,12 @@ export interface PcmS16LeSignalSummary {
   readonly hasPartialSample: boolean;
 }
 
+/** Seed accumulator for a new decode stream: zero samples, zero energy, no pending byte. */
 export function createPcmS16LeSignalAccumulator(): PcmS16LeSignalAccumulator {
   return { sampleCount: 0, sumSquares: 0, peakAmplitude: 0 };
 }
 
+/** Reinterpret one little-endian byte pair as a signed 16-bit PCM sample. */
 function signedSampleFromBytes(lowByte: number, highByte: number): number {
   const unsigned = lowByte | (highByte << 8);
   // Stryker disable next-line EqualityOperator: at exactly 0x8000 the sign flip only changes
@@ -103,6 +106,12 @@ export function accumulatePcmS16LeSignal(
   };
 }
 
+/**
+ * Freeze an accumulator into its final summary. RMS is the quadratic mean of
+ * the decoded samples (0 when nothing was decoded), and `hasPartialSample`
+ * reports a dangling low byte so callers can reject an odd-length stream
+ * instead of silently measuring a truncated final sample.
+ */
 export function summarizePcmS16LeSignal(state: PcmS16LeSignalAccumulator): PcmS16LeSignalSummary {
   return {
     sampleCount: state.sampleCount,
@@ -112,6 +121,12 @@ export function summarizePcmS16LeSignal(state: PcmS16LeSignalAccumulator): PcmS1
   };
 }
 
+/**
+ * Decide whether a decoded summary carries speech-like signal at all. A
+ * dangling partial sample, zero samples, or peak/RMS below the digital-silence
+ * thresholds all fail — this predicate is what turns silent or near-zero audio
+ * into AUDIO_SILENT before any paid provider work or retention decision.
+ */
 export function hasAssessableAudioSignal(summary: PcmS16LeSignalSummary): boolean {
   return (
     !summary.hasPartialSample &&
@@ -121,10 +136,12 @@ export function hasAssessableAudioSignal(summary: PcmS16LeSignalSummary): boolea
   );
 }
 
+/** Fixed decode-target byte rate: 8 kHz mono, 16-bit samples. */
 function decodedBytesPerSecond(): number {
   return DECODED_SAMPLE_RATE * DECODED_BYTES_PER_SAMPLE;
 }
 
+/** Decoded-byte ceiling for the maximum tolerated duration; crossing it kills the decode as overlong. */
 function maxDecodedBytes(): number {
   return Math.floor(MAX_AUDIO_DURATION_SECONDS * decodedBytesPerSecond());
 }
@@ -223,14 +240,21 @@ interface AvailabilityCache {
 let availabilityCache: AvailabilityCache | undefined;
 let availabilityInFlight: Promise<void> | undefined;
 
+/** Native-stage host failure (tool lost, deadline, descriptor exhaustion) — surfaces as a retryable 503. */
 class InspectionError extends Error {
   constructor(readonly kind: InspectionFailure) {
     super(kind);
   }
 }
 
+/** Unusable input media (bad container, non-regular file, runaway output) — surfaces as 415 AUDIO_UNREADABLE. */
 class InvalidInspectionError extends Error {}
 
+/**
+ * Translate an internal failure kind into its stable public 503 shape — the
+ * single place where the host-fault vs backpressure distinction becomes
+ * client-visible (per-kind rationale in the cases below).
+ */
 function inspectionFailureHttpError(kind: InspectionFailure): HttpError {
   switch (kind) {
     case 'unavailable':
@@ -280,6 +304,14 @@ interface DecodedAudioInspection extends PcmS16LeSignalSummary {
   durationSeconds: number;
 }
 
+/**
+ * Orchestrate one upload's two-stage native inspection: the ffprobe
+ * exactly-one-audio-stream gate, then the bounded decode that measures real
+ * duration and signal. The extension must map to an allowlisted demuxer
+ * before anything is spawned, and every failure collapses into one of the two
+ * internal kinds measureAudioDuration translates: InspectionError (host fault
+ * or backpressure → 503) and InvalidInspectionError (unusable input → 415).
+ */
 async function inspectDecodedAudio(filePath: string): Promise<DecodedAudioInspection> {
   const inputFormat = inputFormatFor(path.extname(filePath).toLowerCase());
   if (!inputFormat) throw new InvalidInspectionError();
@@ -696,6 +728,11 @@ interface MediaToolAvailabilityCheck {
   label: 'FFmpeg' | 'FFprobe';
 }
 
+/**
+ * Require the tool's self-identification at the very start of its version
+ * output: a configured path that only prints a matching line later — or prints
+ * some other tool's banner — must not pass readiness.
+ */
 function identifiesExpectedMediaTool(identity: MediaToolIdentity, versionOutput: string): boolean {
   switch (identity) {
     case 'ffmpeg':
@@ -705,6 +742,14 @@ function identifiesExpectedMediaTool(identity: MediaToolIdentity, versionOutput:
   }
 }
 
+/**
+ * Run `<tool> -version` under the allowlisted inspector environment and
+ * resolve only for a clean exit whose bounded stdout self-identifies. Spawn
+ * failure, deadline, oversized output, or a wrong banner rejects with a
+ * sanitized message (never the configured path or native diagnostics), and
+ * every failure path SIGKILLs the child behind the bounded reap fallback so a
+ * slow or malformed child cannot wedge startup or leak inspection capacity.
+ */
 function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToolAvailabilityCheck): Promise<void> {
   return new Promise((resolve, reject) => {
     let child: ReturnType<typeof spawn>;
@@ -794,6 +839,7 @@ function runMediaToolAvailabilityCheck({ executable, identity, label }: MediaToo
   });
 }
 
+/** Probe both configured binaries in assessment order; either failure rejects startup/readiness. */
 async function runAudioInspectorAvailabilityCheck(): Promise<void> {
   // Validate in the same order used for an assessment: ffprobe gates the
   // container before FFmpeg decodes it. Both configured commands must prove

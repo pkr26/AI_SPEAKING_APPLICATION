@@ -46,6 +46,11 @@ export function getAiSlotsInUse(): number {
   return aiInFlight;
 }
 
+/**
+ * Take one in-process AI slot before any paid work. When AI_MAX_CONCURRENCY assessments are
+ * already running, shed immediately with 503 CAPACITY_BUSY (plus Retry-After) instead of
+ * queueing uploads; every acquire must be paired with releaseAiSlot in a finally block.
+ */
 function acquireAiSlot() {
   if (aiInFlight >= config.aiMaxConcurrency) {
     shedRequestsTotal.inc({ reason: 'capacity_busy' });
@@ -54,6 +59,7 @@ function acquireAiSlot() {
   aiInFlight++;
 }
 
+/** Return a slot taken by acquireAiSlot; call only from a finally so no failure path leaks one. */
 function releaseAiSlot() {
   aiInFlight--;
 }
@@ -105,12 +111,18 @@ export interface AbortInFlightAssessmentOptions {
   preventNew?: boolean;
 }
 
+/**
+ * Abort every registered in-flight provider call at drain start, and optionally close this
+ * process's provider gate so no request can register new work after the one-time sweep.
+ * Returns the number of aborted controllers for shutdown logging.
+ */
 export function abortInFlightAssessments({ preventNew = false }: AbortInFlightAssessmentOptions = {}): number {
   if (preventNew) assessmentShutdownStarted = true;
   for (const controller of inFlightAssessmentControllers) controller.abort();
   return inFlightAssessmentControllers.size;
 }
 
+/** Uniform 503 for provider work refused because the process drain has already started. */
 function assessmentShutdownError(): HttpError {
   return new HttpError(503, 'Assessment service is shutting down; please try again', 'PROVIDER_FAILED');
 }
@@ -122,6 +134,7 @@ const MAX_TRANSCRIPT_CHARS = 12_000;
 
 // Construct structured-output contracts at assessment time so the provider
 // formatter and the parser always share the exact same fresh schema.
+/** English speaking grade contract: a 0-100 score plus bounded feedback text. */
 function createSpeakingGradingSchema() {
   return z.object({
     score: z.number().min(0).max(100),
@@ -129,6 +142,11 @@ function createSpeakingGradingSchema() {
   });
 }
 
+/**
+ * Native comprehension grade contract. The per-field bounds feed NATIVE_MAX_COMPLETION_TOKENS
+ * sizing: every schema-legal response must fit the completion budget, or the grading parse
+ * fails on finish_reason='length' as a paid 502.
+ */
 function createNativeGradingSchema() {
   return z.object({
     understood: z.boolean(),
@@ -148,6 +166,7 @@ function createNativeGradingSchema() {
 const SPEAKING_MAX_COMPLETION_TOKENS = 400;
 const NATIVE_MAX_COMPLETION_TOKENS = 4000;
 
+/** Human-readable language name injected into the native grading system prompt. */
 function nativeLanguageName(language: NativeLanguage): string {
   switch (language) {
     case 'te':
@@ -161,6 +180,11 @@ function nativeLanguageName(language: NativeLanguage): string {
   }
 }
 
+/**
+ * Lazily construct the module-singleton OpenAI client on first real use, with the configured
+ * deadline and SDK retries disabled. Throws 503 when no API key is configured so an
+ * unprovisioned deployment fails closed before reaching the provider.
+ */
 function getOpenAI(): OpenAI {
   if (!config.openaiApiKey) {
     throw new HttpError(503, 'AI assessment not configured');

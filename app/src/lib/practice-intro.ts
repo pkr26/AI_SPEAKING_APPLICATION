@@ -13,8 +13,11 @@ const STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: 'ai-english-coach.practice-intro',
 };
 
+// Serialized tail: SecureStore gives no ordering guarantee, and a failed
+// operation must leave the queue usable so a later mark still lands.
 let storageQueue: Promise<void> = Promise.resolve();
 
+/** Runs keychain operations one at a time, preserving invocation order. */
 function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   const result = storageQueue.then(operation, operation);
   storageQueue = result.then(
@@ -24,10 +27,12 @@ function serializeStorage<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
+/** Per-user key: the explainer is one-shot per account, not per device. */
 function storageKey(userId: string): string {
   return `${STORAGE_KEY_PREFIX}${userId}`;
 }
 
+/** True when this account already dismissed the explainer; unreadable storage counts as seen. */
 export async function hasSeenPracticeIntro(userId: string): Promise<boolean> {
   return serializeStorage(async () => {
     try {
@@ -38,6 +43,7 @@ export async function hasSeenPracticeIntro(userId: string): Promise<boolean> {
   });
 }
 
+/** Best-effort one-shot mark; a failed write can only repeat the explainer. */
 export async function markPracticeIntroSeen(userId: string): Promise<void> {
   await serializeStorage(async () => {
     try {

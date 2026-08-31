@@ -7,12 +7,15 @@ import path from 'path';
 import { pipeline } from 'stream';
 import { HttpError } from './middleware';
 
+/** Private (0700) staging directory for direct multipart uploads and S3-mode downloads. */
 export const uploadsDir = path.join(__dirname, '..', 'uploads');
 fs.mkdirSync(uploadsDir, { recursive: true, mode: 0o700 });
 fs.chmodSync(uploadsDir, 0o700);
 
+/** Public 25 MiB audio ceiling, enforced identically by the S3 policy, download cap, and multipart limit. */
 export const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
 
+/** Extension → accepted MIME types; the single allowlist behind every extension/MIME gate and key check. */
 export const AUDIO_TYPES: Readonly<Record<string, readonly string[]>> = {
   '.m4a': ['audio/m4a', 'audio/mp4', 'audio/x-m4a', 'video/mp4'],
   '.mp4': ['audio/mp4', 'video/mp4'],
@@ -34,15 +37,26 @@ const AUDIO_EXTS = Object.keys(AUDIO_TYPES);
 // lifetime.
 const ownedSubmittedAudioResponses = new WeakSet<Response>();
 
+/** Hand this response's uploaded file to the assessment runner, deferring response-level close cleanup. */
 export function ownSubmittedAudioFile(res: Response): void {
   ownedSubmittedAudioResponses.add(res);
 }
 
+/** Whether the assessment runner (rather than response teardown) owns this response's file. */
 export function submittedAudioFileIsOwned(res: Response): boolean {
   return ownedSubmittedAudioResponses.has(res);
 }
 
+/**
+ * Multer storage engine that stages each accepted part as a newly created
+ * private file inside uploadsDir instead of multer's default destination.
+ */
 const privateDiskStorage: multer.StorageEngine = {
+  /**
+   * Store one multipart file under a fresh random UUID name — the allowlisted
+   * extension when the client's is known, `.m4a` otherwise — opened with `wx`
+   * so a generated name can never overwrite or append to an existing file.
+   */
   _handleFile: (_req, file, cb) => {
     const originalExt = path.extname(file.originalname).toLowerCase();
     const ext = AUDIO_EXTS.includes(originalExt) ? originalExt : '.m4a';
@@ -61,6 +75,7 @@ const privateDiskStorage: multer.StorageEngine = {
       cb(null, { destination: uploadsDir, filename, path: filePath, size: out.bytesWritten });
     });
   },
+  /** Unlink one stored upload on multer's behalf. */
   _removeFile: (_req, file, cb) => {
     // A failed _handleFile can leave no stored path; fs.unlink(undefined)
     // throws synchronously and would escape multer's error handling.
@@ -69,6 +84,7 @@ const privateDiskStorage: multer.StorageEngine = {
   },
 };
 
+/** Direct multipart engine: private disk storage, ingress limits, and the extension/MIME admission gate. */
 export const upload = multer({
   storage: privateDiskStorage,
   limits: {
@@ -89,6 +105,7 @@ export const upload = multer({
     fieldSize: 128,
     headerPairs: 50,
   },
+  /** Reject any extension/MIME pair absent from AUDIO_TYPES before a byte is stored. */
   fileFilter: (_req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const mime = file.mimetype.toLowerCase();
@@ -101,6 +118,7 @@ export const upload = multer({
 
 const singleAudio = upload.single('audio');
 
+/** Synchronous best-effort unlink used when an upload is rejected mid-flight. */
 function unlinkUploadedFile(filePath: string): void {
   try {
     fs.unlinkSync(filePath);

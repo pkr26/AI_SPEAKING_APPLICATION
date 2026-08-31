@@ -33,14 +33,21 @@ export type AssessmentEndpoint = (typeof ASSESSMENT_ENDPOINTS)[number];
 export type AudioStorageScope = 'diagnostic' | 'practice';
 export const AUDIO_STORAGE_SCOPES = ['diagnostic', 'practice'] as const satisfies readonly AudioStorageScope[];
 
+/**
+ * Map a client-echoed assessment endpoint to its durable storage scope:
+ * `/diagnostic/answer` owns the diagnostic bucket, both practice endpoints the
+ * practice bucket. Clients never name a bucket themselves.
+ */
 export function storageScopeForAssessmentEndpoint(endpoint: AssessmentEndpoint): AudioStorageScope {
   return endpoint === '/diagnostic/answer' ? 'diagnostic' : 'practice';
 }
 
+/** Per-scope bucket/region configuration accessor. */
 function storageConfig(scope: AudioStorageScope): { bucket: string; region: string } {
   return config.s3[scope];
 }
 
+/** A scope uses S3 exactly when its bucket name is configured; empty means local direct-upload mode. */
 export function s3StorageEnabled(scope: AudioStorageScope): boolean {
   return storageConfig(scope).bucket.length > 0;
 }
@@ -48,6 +55,14 @@ export function s3StorageEnabled(scope: AudioStorageScope): boolean {
 let retainedStorageReadinessCache: { expiresAt: number; error?: Error } | undefined;
 let retainedStorageReadinessInFlight: Promise<void> | undefined;
 
+/**
+ * A lifecycle filter conforms only when it selects on the single
+ * `retention=transient` tag alone — a bare Tag filter or a one-tag And filter
+ * — with no prefix, object-size bounds, or extra tags. A filter without that
+ * tag could expire retained versions, and any additional conjunct would make
+ * conformance depend on more than the retention tag, so both directions fail
+ * this predicate and the rule is treated as unsafe.
+ */
 function hasExactTransientLifecycleFilter(rule: {
   Filter?: {
     Prefix?: string;
@@ -89,6 +104,15 @@ function hasExactTransientLifecycleFilter(rule: {
   );
 }
 
+/**
+ * Verify both preconditions retained recordings depend on, for every
+ * S3-enabled scope: bucket versioning must be enabled (exact-version deletes
+ * and VersionId-pinned playback require it), and every enabled
+ * current/noncurrent expiration rule must carry the conforming transient-tag
+ * filter with recurring 1–7 day windows — with at least one such rule
+ * present. Each scope's S3 calls share one AbortController deadline; any
+ * violation throws a descriptive error that startup and /ready surface.
+ */
 async function probeRetainedAudioStorage(): Promise<void> {
   for (const scope of AUDIO_STORAGE_SCOPES) {
     if (!s3StorageEnabled(scope)) continue;
@@ -132,6 +156,12 @@ async function probeRetainedAudioStorage(): Promise<void> {
   }
 }
 
+/**
+ * Cached readiness gate for retained storage, shared by startup and /ready:
+ * successes cache for 30s, failures for 2s, and concurrent callers join the
+ * single in-flight probe instead of stampeding S3. `force` bypasses a
+ * completed cache entry, never an in-flight probe.
+ */
 export function assertRetainedAudioStorageAvailable({ force = false }: { force?: boolean } = {}): Promise<void> {
   if (!force && retainedStorageReadinessCache && retainedStorageReadinessCache.expiresAt > Date.now()) {
     return retainedStorageReadinessCache.error
@@ -159,6 +189,7 @@ export function assertRetainedAudioStorageAvailable({ force = false }: { force?:
   return retainedStorageReadinessInFlight;
 }
 
+/** True when either scope uses S3; the grant route mounts its limiter only in that mode. */
 function anyS3StorageEnabled(): boolean {
   return AUDIO_STORAGE_SCOPES.some(s3StorageEnabled);
 }
@@ -280,6 +311,11 @@ function releaseUnreadObjectBody(body: unknown): void {
 // --- S3 client (module singleton, created on first real use) ----------------
 const s3Clients: Partial<Record<AudioStorageScope, S3Client>> = {};
 
+/**
+ * Lazily create and cache one S3 client per scope on first real use. A scope
+ * with no configured bucket throws 503 so an unconfigured route fails closed
+ * instead of building a client around an empty target.
+ */
 function getS3(scope: AudioStorageScope): S3Client {
   const target = storageConfig(scope);
   if (!target.bucket) {
@@ -304,6 +340,13 @@ function getS3(scope: AudioStorageScope): S3Client {
   return s3Clients[scope];
 }
 
+/**
+ * Build the `/uploads/audio-url` router: no-store on every response,
+ * requireAuth, and — only when some scope actually uses S3 — the upload-grant
+ * limiter, so grant issuance never consumes the paid assessment budget. The
+ * single route answers either an endpoint-echoing presigned POST grant (S3
+ * mode) or the local/dev `{ mode: 'direct' }` multipart fallback.
+ */
 export function createAudioUploadRouter(limiters: Limiters) {
   const audioUrlBodySchema = z.object({
     contentType: z.string().max(128),
@@ -398,6 +441,13 @@ export async function discardPresignedAudio(scope: AudioStorageScope, userId: st
   }
 }
 
+/**
+ * Retag the exact processed VersionId `retention=retained` so the mandatory
+ * transient lifecycle stops expiring it; only a learner-owned key may be
+ * retagged. The call is deadline-bounded, and errors propagate rather than
+ * resolve — the leased retention worker retries, and until the retag lands
+ * the object remains transient and lifecycle-bounded.
+ */
 export async function retainPresignedAudioVersion(
   scope: AudioStorageScope,
   userId: string,
@@ -424,6 +474,11 @@ export async function retainPresignedAudioVersion(
   }
 }
 
+/**
+ * Mint a short-lived GET URL pinned to one exact object version, with the
+ * recorded content type forced and an inline disposition — playback can never
+ * resolve to a different version or a content-sniffed rendering.
+ */
 export async function createPresignedRecordingPlaybackUrl(
   scope: AudioStorageScope,
   audioKey: string,

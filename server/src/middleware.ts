@@ -65,6 +65,13 @@ export function defaultErrorCode(status: number): ApiErrorCode {
   }
 }
 
+/**
+ * The error type routes throw for every expected failure. Carries the HTTP
+ * status, an optional machine-readable `code` (defaulted by status family in
+ * the central handler when omitted), and optional additive `extra` fields —
+ * retry hints placed there (retryAfterSeconds/retryAfterHours) are mirrored
+ * into the Retry-After header on the way out.
+ */
 export class HttpError extends Error {
   public status: number;
   public extra?: Record<string, unknown>;
@@ -93,6 +100,7 @@ export class HttpError extends Error {
   }
 }
 
+/** Raw `users` table row exactly as pg returns it (snake_case column names). */
 export interface UserRow {
   id: string;
   name: string | null;
@@ -117,6 +125,7 @@ export interface UserRow {
  */
 export type AuthUser = Omit<UserRow, 'password_hash'>;
 
+/** A Request after requireAuth attached the authenticated, hash-free user. */
 export interface AuthedRequest extends Request {
   user?: AuthUser;
 }
@@ -134,6 +143,16 @@ export const JWT_AUDIENCE = 'ai-english-mobile';
 // well-signed but malformed token gets a 401 instead of a 22P02 500.
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Bearer-token authentication. Accepts exactly one credential from the
+ * Authorization header, verifies HS256 with the pinned issuer/audience, then
+ * enforces the issuance contract jwt.verify does not (UUID `sub`, integer
+ * `tv` >= 1, integer `exp`) before touching the database. The final user-row
+ * load makes token_version rotation revoke old bearers (TOKEN_REVOKED) and
+ * selects every column except the bcrypt hash (see AuthUser). Only
+ * authentication failures answer 401 directly; a database error propagates
+ * through next(err) so it cannot masquerade as one.
+ */
 export async function requireAuth(req: AuthedRequest, res: Response, next: NextFunction) {
   // Accept the RFC-compatible whitespace between the scheme and credentials,
   // but require the entire value to contain exactly one bearer credential.
@@ -195,6 +214,7 @@ export async function requireAuth(req: AuthedRequest, res: Response, next: NextF
   }
 }
 
+/** Which request surfaces (body/params/query) one validate() call checks. */
 interface ValidateSchemas {
   body?: z.ZodTypeAny;
   params?: z.ZodTypeAny;
@@ -286,6 +306,14 @@ export function clientVersionGateExempt(method: string | undefined, path: string
   return normalizedMethod === 'DELETE' && RECORDING_DELETE_PATH.test(routePath);
 }
 
+/**
+ * Per-request MIN_CLIENT_VERSION enforcement. Exempts the operational and
+ * privacy exits first (clientVersionGateExempt), skips entirely when no floor
+ * is configured, and fails closed with a 500 when the configured floor itself
+ * is malformed. Version comparison is segment-wise with missing segments
+ * counting as 0, so "1.2" equals "1.2.0"; older, version-less, or malformed
+ * clients get 426 CLIENT_UPGRADE_REQUIRED before any budget or parsing work.
+ */
 export const clientVersionGate: RequestHandler = (req, _res, next) => {
   if (clientVersionGateExempt(req.method, req.path)) return next();
   const minimumRaw = config.minClientVersion;
@@ -311,6 +339,18 @@ export const clientVersionGate: RequestHandler = (req, _res, next) => {
   return next();
 };
 
+/**
+ * Central error handler — the final middleware and the single place failure
+ * responses are shaped. Its check order is load-bearing: abandoned/dead
+ * sockets are dropped without writing; a response whose headers already
+ * shipped is ended cleanly (the status line can no longer change); HttpError
+ * becomes the additive `{error, code, ...extras}` body with Retry-After
+ * mirrored from retry extras; transient database backpressure (pg-pool
+ * checkout timeout, 55P03 lock waits, statement-timeout 57014) sheds as
+ * retryable 503 POOL_SATURATED; multer and body-parser failures map to
+ * stable 4xx bodies that never reflect parser messages; everything else logs
+ * at error level and answers a generic 500 that leaks no internals.
+ */
 export function errorHandler(err: unknown, req: Request, res: Response, _next: NextFunction) {
   // The client disconnected (or the response otherwise ended) before this
   // error surfaced: nobody will read the status, and writing to a dead socket

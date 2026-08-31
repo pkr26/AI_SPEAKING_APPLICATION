@@ -19,6 +19,7 @@ const LANGUAGE_STORAGE_OPTIONS: SecureStore.SecureStoreOptions = {
   keychainService: LANGUAGE_KEYCHAIN_SERVICE,
 };
 
+/** Type guard for the five supported UI language codes. */
 function isUiLanguage(value: unknown): value is UiLanguage {
   return value === 'en' || value === 'te' || value === 'hi' || value === 'es' || value === 'zh';
 }
@@ -28,6 +29,7 @@ function isUiLanguage(value: unknown): value is UiLanguage {
 // write or let that older write land after a newer provider's selection.
 let languageStorageTail: Promise<void> = Promise.resolve();
 
+/** Loads the persisted preference through the tail so it waits for older writes. */
 function readStoredLanguage(): Promise<string | null> {
   const read = languageStorageTail.then(() =>
     SecureStore.getItemAsync(LANGUAGE_KEY, LANGUAGE_STORAGE_OPTIONS),
@@ -39,6 +41,7 @@ function readStoredLanguage(): Promise<string | null> {
   return read;
 }
 
+/** Persists the preference through the tail, ordering it after every queued access. */
 function writeStoredLanguage(language: UiLanguage): Promise<void> {
   const write = languageStorageTail.then(() =>
     SecureStore.setItemAsync(LANGUAGE_KEY, language, LANGUAGE_STORAGE_OPTIONS),
@@ -63,6 +66,7 @@ interface GuestLanguageContextValue {
   mirrorAccountLanguage: (language: UiLanguage) => Promise<void>;
 }
 
+/** Deterministic English fallback for provider-less tests and boundary renders. */
 const FALLBACK_CONTEXT: GuestLanguageContextValue = {
   language: 'en',
   isRestoring: false,
@@ -123,6 +127,11 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     };
   }, [fallback]);
 
+  /**
+   * Optimistically applies and durably saves a language. Claims a new epoch so
+   * a stale restore or an older queued write can never overwrite the choice;
+   * only the in-epoch write failure surfaces `persistenceError` and rethrows.
+   */
   const persistLanguage = useCallback(async (nextLanguage: UiLanguage): Promise<void> => {
     if (!mountedRef.current || !isUiLanguage(nextLanguage)) return;
     const operationEpoch = ++epochRef.current;
@@ -143,6 +152,7 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     }
   }, []);
 
+  /** Learner-facing pick: applies the choice and never rejects to the caller. */
   const setLanguage = useCallback(
     (nextLanguage: UiLanguage) => {
       // Public signed-out pickers render persistenceError themselves. Absorb
@@ -156,6 +166,11 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     [persistLanguage],
   );
 
+  /**
+   * Records a confirmed account `uiLanguage` for the next restore/sign-out.
+   * Skips the keychain write when the same value is already confirmed, and
+   * joins an identical in-flight write instead of issuing a second one.
+   */
   const mirrorAccountLanguage = useCallback(
     async (accountLanguage: UiLanguage): Promise<void> => {
       if (!isUiLanguage(accountLanguage)) return;
@@ -182,6 +197,7 @@ export function GuestLanguageProvider({ children }: { children: React.ReactNode 
     [persistLanguage],
   );
 
+  // New identity only when observable state changes; the setters are stable.
   const value = useMemo<GuestLanguageContextValue>(
     () => ({
       language,
@@ -201,6 +217,7 @@ export function useGuestLanguage(): GuestLanguageContextValue {
   return useContext(GuestLanguageContext) ?? FALLBACK_CONTEXT;
 }
 
+/** Exposes the key and keychain options so tests can seed and reset the store. */
 export const guestLanguageStorage = Object.freeze({
   key: LANGUAGE_KEY,
   options: LANGUAGE_STORAGE_OPTIONS,

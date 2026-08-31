@@ -4,6 +4,10 @@ import { z } from 'zod';
 
 dotenv.config();
 
+/**
+ * Optional boolean env knob: 'true'/'1' parse to true; 'false'/'0' and unset
+ * parse to false; any other spelling fails boot with the message above.
+ */
 const bool = z
   .enum(['true', 'false', '1', '0'], {
     errorMap: () => ({ message: "must be one of 'true', 'false', '1', or '0'" }),
@@ -11,6 +15,12 @@ const bool = z
   .optional()
   .transform((v) => v === 'true' || v === '1');
 
+/**
+ * TRUST_PROXY must be an exact proxy hop count 0 to 10 ('0'/'false' mean
+ * off). 'true' is rejected outright: it would trust a client-supplied
+ * forwarding chain and let callers spoof X-Forwarded-For to reset per-IP
+ * rate-limit budgets.
+ */
 const trustProxyHops = z
   .string()
   .default('0')
@@ -72,6 +82,14 @@ const corsOrigins = z
     return [...result];
   });
 
+/**
+ * The complete environment surface, validated once at module load. Beyond
+ * per-field shapes, the superRefine below owns every cross-field invariant —
+ * production-only floors (TLS, mail mode, JWT entropy, S3 buckets), paired
+ * S3 settings, daily-cap ordering, and the rule that SHUTDOWN_DRAIN_MS must
+ * cover the worst-case request budget — so a bad deploy fails before the
+ * process serves anything.
+ */
 const envSchema = z
   .object({
     DATABASE_URL: z
@@ -437,11 +455,23 @@ const envSchema = z
     }
   });
 
+/** The single validation pass over process.env, executed once at module load. */
 const parsed = envSchema.safeParse(process.env);
+/**
+ * Render zod issues as the operator-facing bullet list printed before the
+ * fail-fast exit: "  - FIELD.PATH: message", with "(root)" standing in for
+ * schema-level issues that have no field path.
+ */
 export function formatConfigProblems(issues: ReadonlyArray<{ path: Array<string | number>; message: string }>): string {
   return issues.map((issue) => `  - ${issue.path.join('.') || '(root)'}: ${issue.message}`).join('\n');
 }
 
+/**
+ * Segment-wise dotted-version comparison with missing segments counting as
+ * 0: negative when `left` is older, positive when newer, 0 when equal.
+ * Inputs are capped at three segments by the MIN_CLIENT_VERSION refine — an
+ * assumption the Stryker note inside relies on.
+ */
 function compareDottedVersions(left: string, right: string): number {
   const leftParts = left.split('.').map(Number);
   const rightParts = right.split('.').map(Number);
@@ -463,6 +493,13 @@ if (!parsed.success) {
 }
 const env = parsed.data;
 
+/**
+ * The frozen-shape application configuration every module reads. These field
+ * names are the stable internal API: additions are fine, renames/retypes
+ * are cross-cutting breaks, and all env access must flow through here rather
+ * than process.env. `minClientVersion` arrives pre-resolved — production
+ * applies the hard 1.1.1 floor, non-production yields undefined (gate off).
+ */
 export const config = {
   nodeEnv: env.NODE_ENV,
   isProduction: env.NODE_ENV === 'production',

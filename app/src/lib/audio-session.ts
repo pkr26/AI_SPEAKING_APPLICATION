@@ -11,6 +11,7 @@ let activePlaybackOwner: PlaybackOwner | null = null;
 let publishedPlaybackActive = false;
 const playbackActiveListeners = new Set<() => void>();
 
+/** Notifies playback-active listeners only on a real edge; repeated states never re-fire. */
 function publishPlaybackActive(): void {
   const active = activePlaybackOwner !== null;
   if (active === publishedPlaybackActive) return;
@@ -18,10 +19,19 @@ function publishPlaybackActive(): void {
   for (const listener of playbackActiveListeners) listener();
 }
 
+/**
+ * Returns whether submitted-recording playback currently owns the process.
+ * Recorder polls this synchronously before microphone acquisition, and ad
+ * surfaces pair it with the subscribe twin to react to changes immediately.
+ */
 export function getSubmittedRecordingPlaybackActive(): boolean {
   return publishedPlaybackActive;
 }
 
+/**
+ * Subscribes to playback-active edges; together with the getter it forms the
+ * store half of a useSyncExternalStore subscription.
+ */
 export function subscribeSubmittedRecordingPlaybackActive(listener: () => void): () => void {
   playbackActiveListeners.add(listener);
   return () => playbackActiveListeners.delete(listener);
@@ -48,6 +58,7 @@ export function configurePlaybackAudioMode(): Promise<void> {
   );
 }
 
+/** Recording mode for Recorder takes; queued behind every other audio-mode change. */
 export function configureRecordingAudioMode(): Promise<void> {
   return serializeAudioMode(() =>
     setAudioModeAsync({
@@ -59,6 +70,11 @@ export function configureRecordingAudioMode(): Promise<void> {
   );
 }
 
+/**
+ * Tail-chains `operation` onto the playback-owner queue and absorbs its
+ * failure from the chain (the caller's promise still rejects), so one
+ * throwing stop() can never poison later ownership transitions.
+ */
 function serializePlaybackOwnership(operation: () => Promise<void>): Promise<void> {
   const result = playbackOwnerQueue.then(operation, operation);
   playbackOwnerQueue = result.catch(() => undefined);

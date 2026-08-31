@@ -54,6 +54,12 @@ interface ReplayState {
   diagnosticReplay: DiagnosticFeedbackReplay | null;
 }
 
+/**
+ * Seeds the phase machine for one identity/checkKey pair. `shouldCheck`
+ * decides between hiding children behind the 'checking' spinner and starting
+ * 'ready' with no replay question to ask (signed out, still restoring, or a
+ * skip-keyed run).
+ */
 function initialState(identity: string, checkKey: string, shouldCheck: boolean): ReplayState {
   return {
     identity,
@@ -105,19 +111,42 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
   const current =
     state.checkKey === checkKey ? state : initialState(identity, checkKey, shouldCheck);
 
+  /**
+   * Captures one auth session lease per identity. The lease — not render-time
+   * state — fences every post-await decision in the check effect; `identity`
+   * is read solely to recapture on real account/session rotation without
+   * touching the lease on ordinary re-renders.
+   */
   const sessionLease = useMemo(() => {
     void identity;
     return captureSessionLease();
   }, [captureSessionLease, identity]);
 
+  /**
+   * One durable-replay check per checkKey. The worker loads the pending
+   * pointer, retires foreign/expired records, then GETs the delivered result
+   * and publishes diagnostic replay state or hands practice feedback to the
+   * flow. Invariant: every await revalidates via stillCurrent(), so abort,
+   * unmount, logout, or a replaced SecureStore pointer drops all downstream
+   * state side effects. Terminal 404/409 replies retire their pointer;
+   * ambiguous failures surface an explicit retry/deferred choice instead of
+   * an automatic loop.
+   */
   useEffect(() => {
     const controller = new AbortController();
     let active = true;
     let queriedPointer: Pick<PendingAssessment, 'requestId' | 'stage'> | null = null;
     if (!shouldCheck || userId === undefined) return () => controller.abort();
 
+    /** True only while this run is uncancelled and still holds its session lease. */
     const stillCurrent = () =>
       active && !controller.signal.aborted && isSessionLeaseCurrent(sessionLease);
+    /**
+     * Retires the durable pointer when it still names `requestId` and resets
+     * to ready; `refreshCanonical` also drops the diagnostic/practice question
+     * caches so a retired request's stale prompt cannot flash once children
+     * are exposed again.
+     */
     const retireReplayPointer = async (requestId: string, refreshCanonical = true) => {
       // The clear is request-conditional, so a late terminal response can
       // never erase a newer handoff installed by Recorder or another screen.
@@ -278,15 +307,27 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
     userId,
   ]);
 
+  /**
+   * Performs the single route replacement once the check resolves with a
+   * target. `replace` (never push) keeps the replayed destination from
+   * stacking a second copy onto the back stack.
+   */
   useEffect(() => {
     if (current.phase !== 'ready' || !current.target) return;
     router.replace(current.target);
   }, [current.phase, current.target]);
 
+  /**
+   * While deferred, watches for one bounded re-check trigger: the first
+   * regained connectivity, or the first return to foreground while still
+   * online. The retryOnce latch guarantees at most one retry per deferred
+   * card instead of stacked re-entries.
+   */
   useEffect(() => {
     if (current.phase !== 'deferred') return;
     let previousAppState = AppState.currentState;
     let retryTriggered = false;
+    /** Latched one-shot retry; bumps the version at most once per deferred card. */
     const retryOnce = () => {
       if (retryTriggered) return;
       retryTriggered = true;
@@ -308,6 +349,11 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
     };
   }, [current.checkKey, current.phase]);
 
+  /**
+   * Clears the in-memory diagnostic replay card only when it still belongs to
+   * this identity and requestId, so a late clear from an old screen cannot
+   * wipe a successor's card.
+   */
   const clearDiagnosticReplay = useCallback(
     (requestId: string) => {
       setState((value) =>
@@ -395,6 +441,11 @@ export function AssessmentReplayProvider({ children }: { children: React.ReactNo
   );
 }
 
+/**
+ * Reads the replay context from the mounted provider. Outside a provider it
+ * degrades to an inert empty value so imported consumers remain renderable
+ * in tests and isolated mounts.
+ */
 export function useAssessmentReplay(): AssessmentReplayContextValue {
   return (
     useContext(AssessmentReplayContext) ?? {
@@ -404,6 +455,7 @@ export function useAssessmentReplay(): AssessmentReplayContextValue {
   );
 }
 
+/** Theme-resolved styles for the checking spinner, error pane, and deferred card. */
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
   appContent: {
     flex: 1,

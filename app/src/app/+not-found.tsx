@@ -7,6 +7,10 @@ import Button from '../components/Button';
 import { useT } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
 
+/**
+ * Expo-router catch-all for unmatched routes and hostile deep links. The only
+ * exit replaces the stack with Home, so back can never return to a dead route.
+ */
 export default function NotFoundScreen() {
   const t = useT();
   const styles = themedStyles(useTheme());

@@ -1,9 +1,11 @@
 /** Helpers for validating expo-router URL parameters. */
 
+/** Unwraps expo-router's `string | string[]` route-param shape to its first value. */
 export function firstParam(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
 }
 
+/** Type guard: true only for a well-formed version 1-5 UUID, case-insensitive. */
 export function isUuid(value: string | undefined): value is string {
   // Type-guard first: RegExp.test coerces its argument, so a hostile object
   // whose toString/valueOf are non-callable (a corrupted durable blob passed

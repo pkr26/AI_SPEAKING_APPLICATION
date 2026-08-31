@@ -33,6 +33,11 @@ export type ParsedAssessmentReplayStatus =
       result: PracticeOutcome;
     } & Omit<AssessmentReplayBase, 'context'>);
 
+/**
+ * Maps a durable handoff endpoint to its replay context. The pending-assessment
+ * contract admits exactly three endpoints, so the practice default is total:
+ * every non-diagnostic, non-native endpoint is the plain English practice POST.
+ */
 export function assessmentContextForEndpoint(
   endpoint: PendingAssessment['endpoint'],
 ): AssessmentReplayContext {

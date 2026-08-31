@@ -48,6 +48,11 @@ interface DeletionJobRow {
   claim_id: string;
 }
 
+/**
+ * Project one recording row into the public camelCase shape. Metadata only by
+ * contract: bucket, key, and version must never cross this boundary, and
+ * status/availableAt expose retention progress without storage coordinates.
+ */
 function toPublicRecording(row: RecordingRow) {
   return {
     id: row.id,
@@ -65,6 +70,7 @@ function toPublicRecording(row: RecordingRow) {
   };
 }
 
+/** Data-export projection: the public shape plus durable request/attempt identifiers. */
 function toExportRecording(row: RecordingRow) {
   return {
     ...toPublicRecording(row),
@@ -73,6 +79,11 @@ function toExportRecording(row: RecordingRow) {
   };
 }
 
+/**
+ * Run async work across items with at most `concurrency` in flight. Workers
+ * pull from one shared iterator, so no item runs twice and no unbounded
+ * promise chain is built; an empty input resolves without spawning any.
+ */
 async function mapBounded<T>(items: T[], concurrency: number, work: (item: T) => Promise<void>): Promise<void> {
   const queue = items.values();
   await Promise.all(
@@ -84,6 +95,15 @@ async function mapBounded<T>(items: T[], concurrency: number, work: (item: T) =>
   );
 }
 
+/**
+ * Atomically lease due retention_pending recordings. One CTE selects due,
+ * un-leased, current-epoch rows with SKIP LOCKED (replicas share work instead
+ * of colliding) and stamps them with a fresh claimId plus a 5-minute lease;
+ * retention_attempts increments per claim so backoff reflects genuine tries.
+ * The epoch join excludes delete-all-fenced generations entirely. Passing
+ * recordingId narrows the lease to that row for an immediate post-assessment
+ * retain attempt.
+ */
 async function claimPendingRecordings(recordingId?: string): Promise<RecordingRow[]> {
   const claimId = randomUUID();
   const { rows } = await pool.query<RecordingRow>(
@@ -179,6 +199,11 @@ export function recordingBulkCleanupBatchSql(batchSize: number): string {
      WHERE recordings.id = candidates.id`;
 }
 
+/**
+ * Janitor tick for delete-all generations: one advisory-locked batched pass of
+ * the bulk cleanup SQL. Returns stale metadata rows removed; exact-version S3
+ * job creation and queue-row pruning happen inside that same statement.
+ */
 export async function cleanupStaleRecordingMetadata(): Promise<number> {
   return runExclusiveBatchedDelete(
     'janitor:stale-recordings',
@@ -186,6 +211,13 @@ export async function cleanupStaleRecordingMetadata(): Promise<number> {
   );
 }
 
+/**
+ * Finish one leased retention: tag the exact processed S3 version as
+ * retained, then flip the row to available — both guarded by the lease owner's
+ * claimId. On failure the lease is released onto a capped exponential retry
+ * (max 1 hour), the error code is persisted for operators, that release is
+ * itself best-effort, and the error is rethrown so the caller observes it.
+ */
 async function retainClaimedRecording(recording: RecordingRow): Promise<void> {
   try {
     await retainPresignedAudioVersion(
@@ -219,6 +251,12 @@ async function retainClaimedRecording(recording: RecordingRow): Promise<void> {
   }
 }
 
+/**
+ * Best-effort immediate retain for one recording right after a successful
+ * assessment. Every failure is swallowed after logging: the durable
+ * retention_pending row stays authoritative, so a failed attempt only delays
+ * tagging to a later maintenance tick rather than losing the recording.
+ */
 export async function tryRetainRecording(recordingId: string): Promise<void> {
   try {
     const [recording] = await claimPendingRecordings(recordingId);
@@ -233,6 +271,11 @@ export async function tryRetainRecording(recordingId: string): Promise<void> {
   }
 }
 
+/**
+ * Lease due recording_deletion_jobs rows for this worker: SKIP LOCKED
+ * selection plus a fresh claimId and 5-minute lease, with attempt_count
+ * incremented per claim so backoff and metrics count real attempts.
+ */
 async function claimDeletionJobs(): Promise<DeletionJobRow[]> {
   const claimId = randomUUID();
   const { rows } = await pool.query<DeletionJobRow>(
@@ -257,6 +300,14 @@ async function claimDeletionJobs(): Promise<DeletionJobRow[]> {
   return rows;
 }
 
+/**
+ * Sweep every S3 version of one deleted recording's key under this worker's
+ * lease. Returns true only when the job row was deleted — an EMPTY listing at
+ * or after finalize_after (the extra proof pass below is deliberate).
+ * Otherwise the lease is released and the job re-arms at finalize_after or 30
+ * seconds out. Failures release the lease onto capped exponential backoff and
+ * rethrow; there is deliberately no attempt limit.
+ */
 async function processDeletionJob(job: DeletionJobRow): Promise<boolean> {
   try {
     const removed = await sweepPresignedAudioVersions(job.storage_scope, job.audio_key);
@@ -302,6 +353,13 @@ async function processDeletionJob(job: DeletionJobRow): Promise<boolean> {
   }
 }
 
+/**
+ * One maintenance tick: drop delete-all-fenced metadata first, then process
+ * leased retention tagging and version sweeps at the configured bounded
+ * concurrency. Item-level failures are already durably recorded for retry, so
+ * they are swallowed here to keep one bad S3 object from killing the batch.
+ * Returns the count of deletion jobs fully completed this tick.
+ */
 export async function runRecordingMaintenance(): Promise<number> {
   await cleanupStaleRecordingMetadata();
   const pending = await claimPendingRecordings();
@@ -321,6 +379,13 @@ export async function runRecordingMaintenance(): Promise<number> {
   return completed;
 }
 
+/**
+ * Owner-only recordings router: list, export, playback grants, and single plus
+ * bulk delete. All routes are authenticated and no-store. List/export share
+ * the one-statement cursor-validity contract; bulk delete advances the
+ * retention epoch; deletes are bearer-only privacy exits, deliberately weaker
+ * than the password-confirmed account deletion.
+ */
 export function createRecordingsRouter(limiters: Limiters) {
   const router = Router();
   const paramsSchema = z.object({ id: z.string().uuid('recording id must be a valid UUID') });

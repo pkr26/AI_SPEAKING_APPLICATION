@@ -18,12 +18,23 @@ import { buildLimiters } from './rate-limit';
 import { createRecordingsRouter } from './recordings';
 import { assertDatabaseSchemaCurrent } from './schema-readiness';
 
+/** Readiness assertions to inject; tests stub them to probe /ready without real infrastructure. */
 interface AppDependencies {
   schemaCheck?: () => Promise<unknown>;
   audioInspectorCheck?: () => Promise<unknown>;
   recordingStorageCheck?: () => Promise<unknown>;
 }
 
+/**
+ * Build the fully wired Express app. It never listens — index.ts owns the
+ * socket so the startup dependency gates can refuse traffic before the port
+ * opens. Mount order is load-bearing: security/logging/metrics observe even
+ * rejected requests, the client-version gate answers stale builds before any
+ * budget or parsing work, pre-parse limiters guard the credential routes
+ * ahead of JSON/bcrypt cost, and the terminal JSON 404 + errorHandler close
+ * the chain. Dependency checks default to the real readiness assertions and
+ * are injectable for tests.
+ */
 export function createApp({
   schemaCheck = assertDatabaseSchemaCurrent,
   audioInspectorCheck = assertAudioInspectorAvailable,
@@ -72,6 +83,10 @@ export function createApp({
     res.set('Cache-Control', 'no-store');
     res.json({ ok: true });
   });
+  // Readiness re-runs the exact startup dependency assertions (schema
+  // cutover fences, ffmpeg/ffprobe inspector, retained-audio storage) on
+  // every probe, so post-start drift pulls this replica out of rotation;
+  // routing health must target /ready, never liveness-only /health.
   app.get('/ready', limiters.readiness, async (_req, res) => {
     res.set('Cache-Control', 'no-store');
     try {
@@ -141,6 +156,9 @@ export function createApp({
   app.use('/auth/register', limiters.registerEmail);
 
   app.use('/auth', createAuthRouter(limiters));
+  // Owner-scoped status/replay lookup for one durable assessment request;
+  // client recovery polls it after an interrupted submission, and a completed
+  // request stays answerable for the replay retention window (48h).
   app.get(
     '/assessments/:requestId',
     requireAuth,
@@ -157,6 +175,7 @@ export function createApp({
   app.use('/uploads', createAudioUploadRouter(limiters));
   app.use('/recordings', createRecordingsRouter(limiters));
 
+  // Terminal JSON 404 keeps the error contract stable for unmatched routes.
   app.use((_req, res) => res.status(404).json({ error: 'Not found', code: 'NOT_FOUND' }));
   app.use(errorHandler);
 

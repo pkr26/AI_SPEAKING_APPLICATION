@@ -3148,10 +3148,16 @@ export function deviceLanguage(): UiLanguage {
  */
 let activeLanguage: UiLanguage | null = null;
 
+/** Reads the module-level language; English until the root preference loads. */
 export function getActiveLanguage(): UiLanguage {
   return activeLanguage ?? 'en';
 }
 
+/**
+ * Updates the module-level language. Owned by the root language providers'
+ * restore and choice paths; components must use `useI18n()` instead so they
+ * re-render with the change.
+ */
 export function setActiveLanguage(language: UiLanguage): void {
   activeLanguage = language;
 }
@@ -3178,6 +3184,11 @@ const FALLBACK_CONTEXT: I18nContextValue = {
   t: translate,
 };
 
+/**
+ * Resolves the rendered language: a signed-in account value always wins over
+ * the device preference. Mirrors the choice into the module-level language so
+ * non-React `translate()` calls agree with what is on screen.
+ */
 export function I18nProvider({
   accountLanguage,
   guestLanguage = 'en',
@@ -3208,10 +3219,12 @@ export function I18nProvider({
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
 }
 
+/** Context read; provider-less consumers get the active-language fallback. */
 export function useI18n(): I18nContextValue {
   return useContext(I18nContext) ?? FALLBACK_CONTEXT;
 }
 
+/** Shorthand returning only the `t` translator of `useI18n()`. */
 export function useT(): Translator {
   return useI18n().t;
 }

@@ -7,17 +7,25 @@ import { getClientUpgradeSnapshot, subscribeToClientUpgrade } from '../lib/clien
 import { useT } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
 
+/** Last-resort store destinations when the manifest carries no valid URL. */
 export const IOS_STORE_SEARCH_FALLBACK =
   'https://apps.apple.com/us/search?term=AI%20English%20Coach';
 export const ANDROID_PLAY_STORE_FALLBACK =
   'https://play.google.com/store/apps/details?id=com.aienglish.coach';
 
+/** Reads the raw, unvalidated `extra.storeUrls` value from the app manifest. */
 function configuredStoreUrls(): unknown {
   const extra: unknown = Constants.expoConfig?.extra;
   if (!extra || typeof extra !== 'object') return undefined;
   return (extra as Record<string, unknown>).storeUrls;
 }
 
+/**
+ * Validates a manifest store URL as hostile input: HTTPS only, with no
+ * credentials, port, or fragment. iOS must be an apps.apple.com product page
+ * (`/id<number>`); Android must be this app's exact Play Store details page.
+ * Returns the trimmed original only when every rule passes, else null.
+ */
 function safeConfiguredUrl(platform: string, storeUrls: unknown): string | null {
   if (!storeUrls || typeof storeUrls !== 'object') return null;
   const record = storeUrls as Record<string, unknown>;
@@ -80,6 +88,7 @@ export default function ClientUpgradeModal({
   const openingStoreRef = useRef(false);
   const localSignOutRef = useRef(false);
 
+  /** Opens the resolved store URL, one attempt at a time; failure offers a retry. */
   const openStore = async () => {
     if (openingStoreRef.current) return;
     openingStoreRef.current = true;
@@ -95,6 +104,10 @@ export default function ClientUpgradeModal({
     }
   };
 
+  /**
+   * Runs the caller's local sign-out, one attempt at a time. On failure the
+   * signed-in UI stays intact and a localized retry remains available.
+   */
   const signOutLocally = async () => {
     if (!onLocalSignOut || localSignOutRef.current) return;
     localSignOutRef.current = true;

@@ -29,6 +29,7 @@ const MAX_EMAIL_LENGTH = 254;
 
 // A real cost-12 hash keeps the unknown-email login path comparable to a
 // normal bcrypt verification without corresponding to any user password.
+/** Constant placeholder hash compared against when the login email matches no account. */
 function dummyBcryptHash(): string {
   return '$2b$12$uHmk0Jtqi.9oe6f8E8sIMuNV0ECcPhIheggvbpHkSlO/6IXNNQzFu';
 }
@@ -39,9 +40,14 @@ const RESET_TOKEN_TTL_MINUTES = 30;
 // One uniform message for every reset failure (unknown email, missing row,
 // expired, already used, wrong code): distinct errors would enumerate accounts.
 const RESET_INVALID_MESSAGE = 'Reset code is invalid or expired';
+/** Uniform 409 STATE_CHANGED for a request whose account vanished or was mutated mid-flight. */
 const authenticationStateChanged = () =>
   new HttpError(409, 'Authentication state changed; please try again', 'STATE_CHANGED');
 
+/**
+ * Public user projection shared by every auth response: deliberately excludes password_hash
+ * and token_version, which must never leave the server.
+ */
 function toUserJson(row: AuthUser) {
   return {
     id: row.id,
@@ -55,6 +61,11 @@ function toUserJson(row: AuthUser) {
   };
 }
 
+/**
+ * Issue the 30-day HS256 bearer. The embedded token_version (tv) claim is the revocation
+ * mechanism: logout, password changes, and resets bump the column and thereby invalidate
+ * every previously issued token.
+ */
 function signToken(user: { id: string; token_version: number }) {
   return jwt.sign({ sub: user.id, tv: user.token_version }, config.jwtSecret, {
     algorithm: 'HS256',
@@ -76,6 +87,11 @@ const passwordSchema = z
     message: `password must be at most ${BCRYPT_MAX_BYTES} UTF-8 bytes`,
   });
 
+/**
+ * Presence-and-length schema for credentials that only need to be VERIFIED (login password,
+ * currentPassword, delete confirmation): the letter+number policy applies only to choosing
+ * NEW passwords, so pre-policy credentials must still authenticate.
+ */
 const comparablePasswordSchema = (field: string) =>
   z
     .string({ required_error: `${field} is required` })
@@ -89,6 +105,7 @@ const comparablePasswordSchema = (field: string) =>
 // control / line-separator code points have no place in a stored display name:
 // C1 controls and U+2028/U+2029 otherwise survive the old C0-only check and
 // can split UI, audit, and export records.
+/** Reject every Unicode control, line-separator, and paragraph-separator code point. */
 const hasNoControlCharacters = (value: string) => !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
 
 const nameSchema = z
@@ -106,6 +123,7 @@ const uiLanguageSchema = z.enum(['en', 'te', 'hi', 'es', 'zh'], {
   errorMap: () => ({ message: "uiLanguage must be one of 'en','te','hi','es','zh'" }),
 });
 
+/** Shared email schema: trims and lowercases so account lookups are case-insensitive. */
 const emailSchema = (requiredError: string) =>
   z
     .string({ required_error: requiredError })
@@ -141,6 +159,7 @@ const deleteAccountSchema = z.object({
   password: comparablePasswordSchema('password'),
 });
 
+/** Query-string boolean: accepts only the literals 'true'/'false' (default 'false'), mapped to a boolean. */
 const exportDoneFlag = z
   .enum(['true', 'false'])
   .default('false')
@@ -227,14 +246,25 @@ export async function cleanupPasswordResetTokens(): Promise<number> {
   );
 }
 
+/**
+ * Build the auth router: registration, login, password reset, profile read/update, logout,
+ * password change, password-confirmed account deletion, and the paginated data export —
+ * every response no-store.
+ */
 export function createAuthRouter(limiters: Limiters) {
   const authRouter = Router();
 
+  /** Auth responses carry tokens and personal data; none of them may be cached. */
   authRouter.use((_req, res, next) => {
     res.set('Cache-Control', 'no-store');
     next();
   });
 
+  /**
+   * Create the account and its initial diagnostic state in one transaction. The bcrypt hash
+   * runs before the unique-email check so response timing cannot distinguish taken
+   * addresses; a duplicate surfaces as the documented 409 EMAIL_TAKEN.
+   */
   authRouter.post(
     '/register',
     validate({ body: registerSchema }),
@@ -273,6 +303,11 @@ export function createAuthRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Password login with one uniform 401 for unknown email and wrong password alike (the
+   * dummy hash keeps bcrypt timing comparable); a saturated per-account budget turns only a
+   * FAILED verification into 429, so the real owner is never locked out.
+   */
   authRouter.post(
     '/login',
     validate({ body: loginSchema }),
@@ -359,6 +394,12 @@ export function createAuthRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Consume a single-use reset code: constant-time SHA-256 comparison against the stored
+   * hash, a guarded in-transaction delete so only one concurrent reset can win, and a
+   * token_version bump revoking every outstanding bearer. Every failure mode answers the
+   * same uniform RESET_INVALID 400 so the route cannot enumerate accounts.
+   */
   authRouter.post(
     '/reset-password',
     validate({ body: resetPasswordSchema }),
@@ -420,10 +461,15 @@ export function createAuthRouter(limiters: Limiters) {
     }),
   );
 
+  /** Echo the authenticated user's current profile. */
   authRouter.get('/me', requireAuth, (req: AuthedRequest, res) => {
     res.json({ user: toUserJson(req.user!) });
   });
 
+  /**
+   * Partial profile update: absent fields keep their stored values through coalesce, so one
+   * endpoint serves name-only, language-only, or combined changes.
+   */
   authRouter.patch(
     '/me',
     requireAuth,
@@ -459,6 +505,11 @@ export function createAuthRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Rotate the password after verifying the current one. The write is guarded on the exact
+   * credential snapshot that was verified (hash + token_version), atomically revokes any
+   * outstanding reset code, and returns a fresh bearer for the new token_version.
+   */
   authRouter.post(
     '/change-password',
     requireAuth,
@@ -512,6 +563,11 @@ export function createAuthRouter(limiters: Limiters) {
     }),
   );
 
+  /**
+   * Password-confirmed account deletion. Deletes only the verified credential snapshot
+   * (guarded on hash + token_version) so a concurrent password change or logout wins rather
+   * than being deleted past; dependent rows are removed by ON DELETE CASCADE.
+   */
   authRouter.delete(
     '/account',
     requireAuth,

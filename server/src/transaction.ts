@@ -1,8 +1,10 @@
+/** Structural slice of a pg PoolClient (query + optional release) so helpers accept test doubles. */
 type TransactionClient = {
   query: (text: string) => Promise<unknown>;
   release?: (error?: Error) => void;
 };
 
+/** Box for an already-thrown value so rollback can rethrow the original without wrapping it. */
 export type CapturedTransactionError = { value: unknown };
 
 // pg-pool installs a fresh, one-shot `release` closure each time a client is
@@ -11,6 +13,7 @@ export type CapturedTransactionError = { value: unknown };
 // checkout of the same client.
 const releasedLeases = new WeakSet<(error?: Error) => void>();
 
+/** Coerce a rollback failure to a real Error so release(error) always poisons the lease. */
 function normalizedReleaseError(error: unknown): Error {
   return error instanceof Error ? error : new Error('PostgreSQL transaction rollback failed', { cause: error });
 }

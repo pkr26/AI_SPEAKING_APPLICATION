@@ -15,10 +15,12 @@ const REQUIRED: ClientUpgradeSnapshot = Object.freeze({ required: true });
 let snapshot = NOT_REQUIRED;
 const listeners = new Set<() => void>();
 
+/** Current latch state; both snapshots are frozen so callers can never mutate them. */
 export function getClientUpgradeSnapshot(): ClientUpgradeSnapshot {
   return snapshot;
 }
 
+/** Change notification for `useSyncExternalStore`; returns the unsubscribe. */
 export function subscribeToClientUpgrade(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

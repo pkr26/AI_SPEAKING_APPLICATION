@@ -25,6 +25,7 @@ const mockSecureData = new Map<string, string>();
 const mockArrayBuffer = jest.fn(
   async () => new TextEncoder().encode('audio').buffer as ArrayBuffer,
 );
+const mockFileBytes = jest.fn(async () => new TextEncoder().encode('audio-bytes'));
 const mockFileState: { exists: boolean; size: number } = {
   exists: true,
   size: 5,
@@ -57,6 +58,7 @@ jest.mock('expo-secure-store', () => ({
 jest.mock('expo-file-system', () => ({
   File: jest.fn(() => ({
     arrayBuffer: mockArrayBuffer,
+    bytes: mockFileBytes,
     get exists() {
       return mockFileState.exists;
     },
@@ -2214,7 +2216,7 @@ describe('resolveAudioFileDescriptor', () => {
 });
 
 describe('apiUploadAudio', () => {
-  it('builds multipart form data with the React Native file descriptor', async () => {
+  it('builds multipart form data with a bytes-bearing audio part', async () => {
     mockSecureData.set('auth_token', 'jwt-123');
     await api.getToken();
     fetchMock.mockResolvedValue(fakeResponse({ json: async () => ({ result: 'ok' }) }));
@@ -2232,15 +2234,18 @@ describe('apiUploadAudio', () => {
     expect(init.headers).toEqual({ Authorization: 'Bearer jwt-123' });
     const form = init.body as unknown as MockFormData;
     expect(form).toBeInstanceOf(MockFormData);
-    expect(form.entries).toEqual([
-      {
-        name: 'audio',
-        value: {
-          uri: 'file:///recordings/answer.m4a',
-          name: 'audio.m4a',
-          type: 'audio/mp4',
-        },
-      },
+    const audioEntry = form.entries[0];
+    expect(audioEntry.name).toBe('audio');
+    expect(audioEntry.value).toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+      bytes: expect.any(Function),
+    });
+    // The part must carry the recorded file's bytes: expo/fetch serializes
+    // the body through the bytes() member, not through any { uri } descriptor.
+    const audioPart = audioEntry.value as { bytes: () => Uint8Array };
+    expect(audioPart.bytes()).toEqual(new TextEncoder().encode('audio-bytes'));
+    expect(form.entries.slice(1)).toEqual([
       { name: 'questionId', value: 'q-1' },
       { name: 'requestId', value: 'r-1' },
       { name: 'retainRecording', value: 'false' },
@@ -2516,6 +2521,17 @@ describe('apiUploadAudio', () => {
 
   it('fails as a definite local 400 when the cached recording is gone', async () => {
     mockFileState.exists = false;
+
+    const error = await catchAsync(
+      api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}),
+    );
+
+    expect(error).toMatchObject({ status: 400, message: 'The recording is unavailable' });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fails as a definite local 400 when the recording reads back empty', async () => {
+    mockFileBytes.mockResolvedValueOnce(new TextEncoder().encode(''));
 
     const error = await catchAsync(
       api.apiUploadAudio('/practice/attempt', 'file:///rec/a.m4a', {}),

@@ -817,13 +817,23 @@ export async function apiUploadAudio<T>(
     // Mirror the presigned-upload check: if the OS evicted the cached
     // recording, fail as a definite local 400 instead of an ambiguous network
     // error that would trigger minutes of pointless recovery polling.
-    if (!new File(audioUri).exists) {
+    const audioFile = new File(audioUri);
+    if (!audioFile.exists) {
       throw new ApiError(400, 'The recording is unavailable');
     }
-    // React Native's FormData accepts { uri, name, type } file descriptors.
+    const audioBytes = await audioFile.bytes();
+    if (audioBytes.byteLength === 0) {
+      throw new ApiError(400, 'The recording is unavailable');
+    }
+    // The SDK's global fetch (expo/fetch) rejects React Native's legacy
+    // { uri } FormData descriptors ("Unsupported FormDataPart implementation")
+    // before any bytes reach the network; a part exposing name/type plus a
+    // bytes() method is its supported binary shape, so the dev-only direct
+    // multipart upload keeps working with the same wire format.
     form.append('audio', {
-      uri: audioUri,
-      ...descriptor,
+      name: descriptor.name,
+      type: descriptor.type,
+      bytes: () => audioBytes,
     } as unknown as Blob);
   }
   for (const [key, value] of Object.entries(fields)) {

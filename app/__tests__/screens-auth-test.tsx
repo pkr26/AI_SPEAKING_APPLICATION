@@ -542,20 +542,10 @@ describe('login screen', () => {
       minWidth: 0,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      flexShrink: 1,
-      maxWidth: '45%',
-      minHeight: layout.minimumTarget,
-      minWidth: layout.minimumTarget,
-      justifyContent: 'center',
+      width: layout.minimumTarget,
+      height: layout.minimumTarget,
       alignItems: 'center',
-      paddingHorizontal: spacing.sm,
-    });
-    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual({
-      flexShrink: 1,
-      color: colors.primary,
-      fontSize: 14,
-      fontWeight: '600',
-      textAlign: 'center',
+      justifyContent: 'center',
     });
   });
 
@@ -573,14 +563,8 @@ describe('login screen', () => {
       const reveal = screen.getByRole('button', { name: localT('common.showPassword') });
       expect(flattenedStyle(passwordInput)).toMatchObject({ flex: 1, minWidth: 0 });
       expect(flattenedStyle(reveal)).toMatchObject({
-        flexShrink: 1,
-        maxWidth: '45%',
-        minHeight: layout.minimumTarget,
-        minWidth: layout.minimumTarget,
-      });
-      expect(flattenedStyle(screen.getByText(localT('common.show')))).toMatchObject({
-        flexShrink: 1,
-        textAlign: 'center',
+        width: layout.minimumTarget,
+        height: layout.minimumTarget,
       });
       expect(
         flattenedStyle(parentOf(screen.getByText(localT('login.footerPrompt')))),
@@ -673,6 +657,11 @@ describe('login screen', () => {
     await render(<LoginScreen />);
     await fillLogin('not-an-email', 'password1');
 
+    // The inline error waits for the learner to leave the field; the submit
+    // gate still blocks live.
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
+    expect(logInButton().props.accessibilityState.disabled).toBe(true);
+    await fireEvent(screen.getByPlaceholderText(t('login.emailPlaceholder')), 'blur');
     expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
     expect(logInButton().props.accessibilityState.disabled).toBe(true);
     await fireEvent.press(logInButton());
@@ -806,11 +795,12 @@ describe('login screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(false);
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    // The icon flips to the eye-off glyph while the secret is revealed.
+    expect(screen.getByTestId('password-toggle-hide')).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
+    expect(screen.getByTestId('password-toggle-show')).toBeTruthy();
   });
 
   it('shows the one-shot signed-out banner when the session was expired', async () => {
@@ -1286,20 +1276,10 @@ describe('signup screen', () => {
       minWidth: 0,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      flexShrink: 1,
-      maxWidth: '45%',
-      minHeight: layout.minimumTarget,
-      minWidth: layout.minimumTarget,
-      justifyContent: 'center',
+      width: layout.minimumTarget,
+      height: layout.minimumTarget,
       alignItems: 'center',
-      paddingHorizontal: spacing.sm,
-    });
-    expect(flattenedStyle(screen.getAllByText(t('common.show'))[0])).toEqual({
-      flexShrink: 1,
-      color: colors.primary,
-      fontSize: 14,
-      fontWeight: '600',
-      textAlign: 'center',
+      justifyContent: 'center',
     });
   });
 
@@ -1666,19 +1646,19 @@ describe('signup screen', () => {
     await render(<SignupScreen />);
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
 
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(false);
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.getByTestId('password-toggle-hide')).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
 
     await fireEvent.press(screen.getByRole('button', { name: t('password.showConfirmation') }));
     expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(false);
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
+    expect(screen.getAllByTestId('password-toggle-hide')).toHaveLength(1);
     expect(screen.getByRole('button', { name: t('password.hideConfirmation') })).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('password.hideConfirmation') }));

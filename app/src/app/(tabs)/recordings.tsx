@@ -2,15 +2,16 @@ import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
 import React, { useEffect, useMemo, useRef } from 'react';
 import { ActivityIndicator, FlatList, RefreshControl, ScrollView, Text, View } from 'react-native';
 
-import Button from '../components/Button';
-import DataRefreshNotice from '../components/DataRefreshNotice';
-import OfflineState from '../components/OfflineState';
-import RecordingPlayback from '../components/RecordingPlayback';
-import { apiGetRecordings, userMessageForError } from '../lib/api';
-import { useAuth } from '../lib/auth';
-import { useI18n, type MessageKey, type UiLanguage } from '../lib/i18n';
-import { createThemedStyles, useTheme } from '../lib/theme';
-import type { RecordingItem, RecordingPage } from '../lib/types';
+import Button from '../../components/Button';
+import EmptyState from '../../components/EmptyState';
+import DataRefreshNotice from '../../components/DataRefreshNotice';
+import OfflineState from '../../components/OfflineState';
+import RecordingPlayback from '../../components/RecordingPlayback';
+import { apiGetRecordings, userMessageForError } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
+import { useI18n, type MessageKey, type UiLanguage } from '../../lib/i18n';
+import { createThemedStyles, useTheme } from '../../lib/theme';
+import type { RecordingItem, RecordingPage } from '../../lib/types';
 
 interface RecordingFetchMeta {
   fetchMore: { direction: 'forward' | 'backward' };
@@ -202,9 +203,11 @@ export default function RecordingsScreen() {
 
   if (items.length === 0) {
     return (
-      <ScrollView
-        contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.center}
+      <EmptyState
+        icon="audio-lines"
+        title={t('recordings.emptyTitle')}
+        body={t('recordings.emptyBody')}
+        testID="recordings-empty"
         refreshControl={
           <RefreshControl
             refreshing={recordingsQuery.isRefetching}
@@ -216,12 +219,7 @@ export default function RecordingsScreen() {
             tintColor={theme.colors.primary}
           />
         }
-      >
-        <Text accessibilityRole="header" style={styles.title}>
-          {t('recordings.emptyTitle')}
-        </Text>
-        <Text style={styles.muted}>{t('recordings.emptyBody')}</Text>
-      </ScrollView>
+      />
     );
   }
 

@@ -64,6 +64,7 @@ import {
 import { createThemedStyles, useTheme } from '../lib/theme';
 import { ContractError } from '../lib/types';
 import Button from './Button';
+import Icon from './Icon';
 
 export type Phase = 'idle' | 'recording' | 'recorded' | 'uploading' | 'recovering' | 'parked';
 
@@ -286,8 +287,13 @@ export function awaitAudioSessionSettled(
   });
 }
 const WAIT_TICK_MS = 1_000;
-const METER_SEGMENT_COUNT = 6;
+const METER_SEGMENT_COUNT = 12;
 const METER_RANGE_DB = 60;
+/**
+ * Static bar heights for the waveform meter: a symmetric arch so the meter
+ * reads as a sound wave rather than a battery indicator.
+ */
+const METER_BAR_HEIGHTS = [10, 14, 18, 24, 30, 34, 34, 30, 24, 18, 14, 10] as const;
 const REMAINING_TIME_ANNOUNCEMENTS: readonly (readonly [number, MessageKey])[] = [
   [60_000, 'recorder.oneMinuteLeft'],
   [90_000, 'recorder.thirtySecondsLeft'],
@@ -314,11 +320,14 @@ export function formatElapsed(durationMillis: number): string {
 }
 
 /** Maps a recorder metering reading (dBFS, ≤ 0) onto filled meter segments. */
-export function activeMeterSegments(metering: number | undefined): number {
+export function activeMeterSegments(
+  metering: number | undefined,
+  segmentCount: number = 6,
+): number {
   if (!Number.isFinite(metering)) return 0;
   const finiteMetering = metering as number;
   const level = Math.min(1, Math.max(0, (finiteMetering + METER_RANGE_DB) / METER_RANGE_DB));
-  return Math.round(level * METER_SEGMENT_COUNT);
+  return Math.round(level * segmentCount);
 }
 
 export function assessmentIdentityMatches(
@@ -3895,7 +3904,7 @@ export default function Recorder<T>({
   const elapsed = formatElapsed(
     phase === 'recorded' ? recordedDurationMillis : (recorderState.durationMillis ?? 0),
   );
-  const meterSegments = activeMeterSegments(recorderState.metering);
+  const meterSegments = activeMeterSegments(recorderState.metering, METER_SEGMENT_COUNT);
   const uploadStageText =
     waitElapsedMillis >= UPLOAD_STAGE_ALMOST_DONE_MS
       ? t('recorder.stageAlmostDone')
@@ -3951,7 +3960,11 @@ export default function Recorder<T>({
             (controlsDisabled || pressed) && styles.recordButtonDimmed,
           ]}
         >
-          <View style={isRecording ? styles.stopIcon : styles.micDot} />
+          <Icon
+            name={isRecording ? 'stop' : 'mic'}
+            size={isRecording ? 30 : 34}
+            color={theme.colors.onDanger}
+          />
         </Pressable>
       </View>
 
@@ -3970,7 +3983,13 @@ export default function Recorder<T>({
               <View
                 key={index}
                 testID={index < meterSegments ? 'level-segment-active' : 'level-segment-idle'}
-                style={[styles.meterSegment, index < meterSegments && styles.meterSegmentActive]}
+                style={[
+                  styles.meterSegment,
+                  {
+                    height: METER_BAR_HEIGHTS[Math.min(index, METER_BAR_HEIGHTS.length - 1)],
+                  },
+                  index < meterSegments && styles.meterSegmentActive,
+                ]}
               />
             ))}
           </View>
@@ -4124,6 +4143,7 @@ export default function Recorder<T>({
           />
           <Button
             title={t('recorder.submit')}
+            size="lg"
             onPress={() => void submit()}
             disabled={reviewActionsDisabled}
           />
@@ -4202,18 +4222,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   recordButtonDimmed: {
     opacity: 0.6,
   },
-  micDot: {
-    width: 30,
-    height: 30,
-    borderRadius: 15,
-    backgroundColor: colors.onDanger,
-  },
-  stopIcon: {
-    width: 28,
-    height: 28,
-    borderRadius: 6,
-    backgroundColor: colors.onDanger,
-  },
   listeningText: {
     marginTop: spacing.md,
     fontSize: 14,
@@ -4222,19 +4230,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   },
   meterRow: {
     marginTop: spacing.md,
-    height: 16,
+    height: 36,
     flexDirection: 'row',
-    alignItems: 'flex-end',
-    gap: 6,
+    alignItems: 'center',
+    gap: 4,
   },
   meterSegment: {
-    width: 10,
-    height: 6,
-    borderRadius: 2,
+    width: 5,
+    borderRadius: 3,
     backgroundColor: colors.border,
   },
   meterSegmentActive: {
-    height: 14,
     backgroundColor: colors.success,
   },
   statusText: {

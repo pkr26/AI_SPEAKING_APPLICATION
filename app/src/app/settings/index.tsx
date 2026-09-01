@@ -16,6 +16,7 @@ import {
 } from 'react-native';
 
 import Button from '../../components/Button';
+import Icon from '../../components/Icon';
 import { useAds } from '../../lib/ads';
 import {
   apiConsumeAccountExportPages,
@@ -1392,7 +1393,9 @@ export default function SettingsScreen() {
           ]}
           onPress={() => navigateOnce('/recordings')}
         >
+          <Icon name="audio-lines" size={20} color={colors.text} />
           <Text style={styles.actionText}>{t('header.recordings')}</Text>
+          <Icon name="chevron-right" size={18} color={colors.muted} />
         </Pressable>
 
         <Pressable
@@ -1435,7 +1438,9 @@ export default function SettingsScreen() {
           ]}
           onPress={() => navigateOnce('/settings/change-password')}
         >
+          <Icon name="lock" size={20} color={colors.text} />
           <Text style={styles.actionText}>{t('header.changePassword')}</Text>
+          <Icon name="chevron-right" size={18} color={colors.muted} />
         </Pressable>
 
         <Pressable
@@ -1449,6 +1454,7 @@ export default function SettingsScreen() {
           ]}
           onPress={() => void exportData()}
         >
+          <Icon name="download" size={20} color={colors.text} />
           <Text style={styles.actionText}>
             {exportBusy ? t('settings.exportBusy') : t('settings.export')}
           </Text>
@@ -1471,6 +1477,7 @@ export default function SettingsScreen() {
           ]}
           onPress={confirmRetake}
         >
+          <Icon name="target" size={20} color={colors.text} />
           <Text style={styles.actionText}>{t('settings.retake')}</Text>
         </Pressable>
         {retakeError && (
@@ -1489,7 +1496,9 @@ export default function SettingsScreen() {
           ]}
           onPress={() => navigateOnce('/settings/privacy')}
         >
+          <Icon name="user" size={20} color={colors.text} />
           <Text style={styles.actionText}>{t('header.privacy')}</Text>
+          <Icon name="chevron-right" size={18} color={colors.muted} />
         </Pressable>
 
         <Pressable
@@ -1502,7 +1511,9 @@ export default function SettingsScreen() {
           ]}
           onPress={() => navigateOnce('/settings/terms')}
         >
+          <Icon name="book" size={20} color={colors.text} />
           <Text style={styles.actionText}>{t('header.terms')}</Text>
+          <Icon name="chevron-right" size={18} color={colors.muted} />
         </Pressable>
 
         <Pressable
@@ -1726,6 +1737,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     textAlign: 'center',
   },
   actionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
     minHeight: layout.minimumTarget,
     justifyContent: 'center',
     paddingVertical: spacing.md,

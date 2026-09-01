@@ -267,22 +267,10 @@ const PASSWORD_INPUT_STYLE: SemanticStyle = {
 
 /** The bounded Show/Hide sibling, safe for long translations and large text. */
 const INPUT_ACTION_STYLE: SemanticStyle = {
-  flexShrink: 1,
-  maxWidth: '45%',
-  minHeight: layout.minimumTarget,
-  minWidth: layout.minimumTarget,
+  width: layout.minimumTarget,
+  height: layout.minimumTarget,
   justifyContent: 'center',
   alignItems: 'center',
-  paddingHorizontal: spacing.sm,
-};
-
-/** The Show/Hide caption itself. */
-const INPUT_ACTION_TEXT_STYLE: SemanticStyle = {
-  flexShrink: 1,
-  color: colors.primary,
-  fontSize: 14,
-  fontWeight: '600',
-  textAlign: 'center',
 };
 
 /** Inline, per-field validation copy. */
@@ -545,13 +533,13 @@ describe('change password screen', () => {
     expect(screen.getByText(t('cp.currentLabel'))).toBeTruthy();
     expect(screen.getByText(t('cp.newLabel'))).toBeTruthy();
     expect(screen.getByText(t('cp.confirmLabel'))).toBeTruthy();
-    // One reveal control per field, all resting on Show.
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(3);
-    expect(screen.queryByText(t('common.hide'))).toBeNull();
+    // One reveal control per field, all resting on the masked-eye glyph.
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(3);
+    expect(screen.queryByTestId('password-toggle-hide')).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: visibilityControlLabel('next') }));
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+    expect(screen.getAllByTestId('password-toggle-hide')).toHaveLength(1);
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
   });
 
   it('lays out the change-password form on the shared token scale', async () => {
@@ -583,9 +571,6 @@ describe('change password screen', () => {
     for (const field of Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]) {
       const toggle = screen.getByRole('button', { name: visibilityControlLabel(field) });
       expect(flattenedStyle(toggle)).toEqual(INPUT_ACTION_STYLE);
-    }
-    for (const caption of screen.getAllByText(t('common.show'))) {
-      expect(flattenedStyle(caption)).toEqual(INPUT_ACTION_TEXT_STYLE);
     }
   });
 
@@ -681,17 +666,16 @@ describe('change password screen', () => {
     async (language) => {
       await renderLocalizedScreen(<ChangePasswordScreen />, language);
 
-      const localizedCaption = translateFor(language, 'common.show');
       const toggles = (Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]).map(
         (field) =>
           screen.getByRole('button', { name: visibilityControlLabel(field, false, language) }),
       );
       expect(toggles).toHaveLength(3);
-      expect(screen.getAllByText(localizedCaption)).toHaveLength(3);
+      // The glyph needs no translated caption; the square target stays intrinsic.
+      expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(3);
       for (const toggle of toggles) {
         expect(flattenedStyle(toggle)).toEqual(INPUT_ACTION_STYLE);
         expect(flattenedStyle(toggle).position).toBeUndefined();
-        expect(flattenedStyle(toggle).width).toBeUndefined();
       }
       expect(
         flattenedStyle(screen.getByLabelText(translateFor(language, 'cp.currentLabel'))),
@@ -1150,12 +1134,12 @@ describe('delete account screen', () => {
     await renderScreen(<DeleteAccountScreen />);
 
     expect(screen.getByText(t('da.passwordLabel'))).toBeTruthy();
-    expect(screen.getByText(t('common.show'))).toBeTruthy();
-    expect(screen.queryByText(t('common.hide'))).toBeNull();
+    expect(screen.getByTestId('password-toggle-show')).toBeTruthy();
+    expect(screen.queryByTestId('password-toggle-hide')).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
-    expect(screen.queryByText(t('common.show'))).toBeNull();
+    expect(screen.getByTestId('password-toggle-hide')).toBeTruthy();
+    expect(screen.queryByTestId('password-toggle-show')).toBeNull();
   });
 
   it('lays out the delete-account screen on the shared token scale', async () => {
@@ -1182,7 +1166,6 @@ describe('delete account screen', () => {
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual(
       INPUT_ACTION_STYLE,
     );
-    expect(flattenedStyle(screen.getByText(t('common.show')))).toEqual(INPUT_ACTION_TEXT_STYLE);
   });
 
   it('never opens the destructive confirmation while the password is unusable', async () => {

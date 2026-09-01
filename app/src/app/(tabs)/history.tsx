@@ -11,22 +11,25 @@ import {
   View,
 } from 'react-native';
 
-import Button from '../components/Button';
-import DataRefreshNotice from '../components/DataRefreshNotice';
-import HistoryNativeAdCard from '../components/HistoryNativeAdCard';
-import OfflineState from '../components/OfflineState';
-import RecordingPlayback from '../components/RecordingPlayback';
-import { apiGetPracticeHistory, userMessageForError } from '../lib/api';
-import { useAuth } from '../lib/auth';
-import { useI18n, type Translator, type UiLanguage } from '../lib/i18n';
-import { createThemedStyles, useTheme } from '../lib/theme';
+import Button from '../../components/Button';
+import Icon from '../../components/Icon';
+import EmptyState from '../../components/EmptyState';
+import Skeleton from '../../components/Skeleton';
+import DataRefreshNotice from '../../components/DataRefreshNotice';
+import HistoryNativeAdCard from '../../components/HistoryNativeAdCard';
+import OfflineState from '../../components/OfflineState';
+import RecordingPlayback from '../../components/RecordingPlayback';
+import { apiGetPracticeHistory, userMessageForError } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
+import { useI18n, type Translator, type UiLanguage } from '../../lib/i18n';
+import { createThemedStyles, useTheme } from '../../lib/theme';
 import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_PASS_SCORE,
   type HistoryItem,
   type HistoryPage,
   type NativeLanguage,
-} from '../lib/types';
+} from '../../lib/types';
 
 /** BCP-47 tags for day headings, matching the app's UI languages. */
 const DATE_LOCALES: Record<UiLanguage, string> = {
@@ -107,7 +110,8 @@ function scoreChipStyles(styles: HistoryStyles, score: number) {
 }
 
 function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; t: Translator }) {
-  const styles = themedStyles(useTheme());
+  const theme = useTheme();
+  const styles = themedStyles(theme);
   const [expanded, setExpanded] = useState(false);
   const native = item.context === 'practice-native';
   const scoreLabel =
@@ -174,9 +178,16 @@ function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; 
             )}
           </View>
         </View>
-        <Text style={styles.expandHint}>
-          {expanded ? t('history.hideDetails') : t('history.showDetails')}
-        </Text>
+        <View style={styles.expandHintRow}>
+          <Text style={styles.expandHint}>
+            {expanded ? t('history.hideDetails') : t('history.showDetails')}
+          </Text>
+          <Icon
+            name={expanded ? 'chevron-up' : 'chevron-down'}
+            size={18}
+            color={theme.colors.primary}
+          />
+        </View>
       </Pressable>
       {expanded && (
         <View style={styles.rowDetails}>
@@ -318,16 +329,21 @@ export default function HistoryScreen() {
         {historyQuery.fetchStatus === 'paused' ? (
           <OfflineState />
         ) : (
-          <>
-            <ActivityIndicator
-              accessibilityLabel={t('history.loading')}
-              size="large"
-              color={theme.colors.primary}
-            />
-            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+          // Row skeletons preview the day sections and answer cards the list
+          // will fill, with a hidden polite line announcing the wait.
+          <View style={styles.historySkeleton}>
+            <Text
+              accessibilityLiveRegion="polite"
+              accessibilityElementsHidden
+              style={styles.hiddenLoadingText}
+            >
               {t('history.loading')}
             </Text>
-          </>
+            <Skeleton width={120} height={16} borderRadius={4} testID="history-skeleton-header" />
+            {Array.from({ length: 3 }, (_, index) => (
+              <Skeleton key={index} height={84} borderRadius={16} />
+            ))}
+          </View>
         )}
       </ScrollView>
     );
@@ -353,9 +369,11 @@ export default function HistoryScreen() {
 
   if (items.length === 0) {
     return (
-      <ScrollView
-        contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.center}
+      <EmptyState
+        icon="clock"
+        title={t('history.emptyTitle')}
+        body={t('history.emptyBody')}
+        testID="history-empty"
         refreshControl={
           <RefreshControl
             refreshing={historyQuery.isRefetching}
@@ -367,18 +385,15 @@ export default function HistoryScreen() {
             tintColor={theme.colors.primary}
           />
         }
-      >
-        <Text accessibilityRole="header" style={styles.errorTitle}>
-          {t('history.emptyTitle')}
-        </Text>
-        <Text style={styles.muted}>{t('history.emptyBody')}</Text>
-        <Button
-          title={t('home.startPractice')}
-          fullWidth
-          onPress={startPractice}
-          style={styles.emptyAction}
-        />
-      </ScrollView>
+        action={
+          <Button
+            title={t('home.startPractice')}
+            fullWidth
+            onPress={startPractice}
+            style={styles.emptyAction}
+          />
+        }
+      />
     );
   }
 
@@ -655,6 +670,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 12,
     color: colors.muted,
   },
+  expandHintRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 2,
+  },
   expandHint: {
     fontSize: 13,
     fontWeight: '600',
@@ -690,6 +710,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   footer: {
     paddingVertical: spacing.lg,
     alignItems: 'center',
+  },
+  historySkeleton: {
+    alignSelf: 'stretch',
+    gap: spacing.sm,
+  },
+  hiddenLoadingText: {
+    height: 0,
+    opacity: 0,
   },
   loadMoreButton: {
     marginTop: spacing.md,

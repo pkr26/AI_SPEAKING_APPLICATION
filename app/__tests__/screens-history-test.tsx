@@ -13,7 +13,7 @@ import HistoryScreen, {
   groupHistoryByDay,
   HISTORY_MAX_PAGES,
   nextHistoryPageParam,
-} from '../src/app/history';
+} from '../src/app/(tabs)/history';
 import HistoryNativeAdCard from '../src/components/HistoryNativeAdCard';
 import RecordingPlayback from '../src/components/RecordingPlayback';
 import { apiGetPracticeHistory, ApiError } from '../src/lib/api';
@@ -536,15 +536,18 @@ describe('history screen', () => {
     expect(mockGetHistory).not.toHaveBeenCalled();
   });
 
-  it('shows a loading state while the first page loads', async () => {
+  it('previews the list as row skeletons while the first page loads', async () => {
     mockGetHistory.mockReturnValue(new Promise(() => undefined));
     await renderHistory();
-    expect(screen.getByText(t('history.loading')).props.accessibilityLiveRegion).toBe('polite');
-    // The spinner itself is the only labelled node: screen readers announce it.
-    expect(screen.getByLabelText(t('history.loading'))).toBeTruthy();
-
-    expect(flattenedStyle(screen.getByText(t('history.loading')))).toEqual(MUTED_TEXT);
-    expect(centeredStateStyle(screen.getByText(t('history.loading')))).toEqual(CENTER_STATE);
+    const hidden = { includeHiddenElements: true } as const;
+    expect(screen.getByText(t('history.loading'), hidden).props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
+    // Day header + three answer-card blocks mirror the loaded list.
+    expect(screen.getByTestId('history-skeleton-header', hidden)).toBeTruthy();
+    expect(
+      flattenedStyle(parentOf(screen.getByTestId('history-skeleton-header', hidden))),
+    ).toMatchObject({ gap: spacing.sm });
   });
 
   it('shows a retryable error when the first page fails', async () => {
@@ -695,9 +698,8 @@ describe('history screen', () => {
     );
     expect(screen.getByText(t('history.emptyBody'))).toBeTruthy();
 
-    expect(flattenedStyle(screen.getByText(t('history.emptyTitle')))).toEqual(STATE_TITLE);
-    expect(flattenedStyle(screen.getByText(t('history.emptyBody')))).toEqual(MUTED_TEXT);
-    expect(centeredStateStyle(screen.getByText(t('history.emptyBody')))).toEqual(CENTER_STATE);
+    // The shared EmptyState carries the illustrated mark beside the copy.
+    expect(screen.getByTestId('history-empty')).toBeTruthy();
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
     ).toMatchObject({

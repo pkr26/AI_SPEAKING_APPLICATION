@@ -545,6 +545,13 @@ function recordIconNode(): TestInstance {
   return icon;
 }
 
+/** The inner SVG of the record glyph, carrying its rendered square size. */
+function recordIconSvg(): { width?: number; height?: number } {
+  const svg = recordIconNode().children.find((child) => typeof child !== 'string');
+  if (!svg || typeof svg === 'string') throw new Error('Record glyph SVG not found');
+  return (svg as { props: { width?: number; height?: number } }).props;
+}
+
 /** The fixed-size wrap that reserves room for the pulse ring behind the mic. */
 function recordButtonWrapNode(): TestInstance {
   const wrap = screen.getByLabelText(RECORD_BUTTON_LABEL).parent;
@@ -1175,6 +1182,12 @@ describe('Recorder pure behavior contracts', () => {
     [30, 6],
   ])('maps the bounded metering value %#', (metering, expected) => {
     expect(activeMeterSegments(metering)).toBe(expected);
+  });
+
+  it('scales the segment count for the waveform meter', () => {
+    expect(activeMeterSegments(-30, 12)).toBe(6);
+    expect(activeMeterSegments(0, 12)).toBe(12);
+    expect(activeMeterSegments(undefined, 12)).toBe(0);
   });
 
   it('detects each observable recorder-state field and only material duration changes', () => {
@@ -3184,12 +3197,12 @@ describe('Recorder', () => {
         elevation: 6,
       });
       expect(flattenedStyle(getRecordButton()).opacity).toBeUndefined();
+      // The mic glyph is the themed icon inside a centered host box.
       expect(flattenedStyle(recordIconNode())).toEqual({
-        width: 30,
-        height: 30,
-        borderRadius: 15,
-        backgroundColor: colors.onDanger,
+        alignItems: 'center',
+        justifyContent: 'center',
       });
+      expect(recordIconSvg()).toMatchObject({ width: 34, height: 34 });
 
       await fireEvent(getRecordButton(), 'responderGrant', responderEvent());
       expect(flattenedStyle(getRecordButton())).toMatchObject({
@@ -3212,11 +3225,10 @@ describe('Recorder', () => {
       });
       expect(flattenedStyle(activeButton).opacity).toBeUndefined();
       expect(flattenedStyle(recordIconNode())).toEqual({
-        width: 28,
-        height: 28,
-        borderRadius: 6,
-        backgroundColor: colors.onDanger,
+        alignItems: 'center',
+        justifyContent: 'center',
       });
+      expect(recordIconSvg()).toMatchObject({ width: 30, height: 30 });
 
       const ring = pulseRingNode();
       if (!ring) throw new Error('Active recording did not render its pulse ring');
@@ -6341,7 +6353,7 @@ describe('Recorder', () => {
       expect(flattenedStyle(getSubmitButton())).toMatchObject({
         backgroundColor: colors.primary,
         borderRadius: radii.button,
-        paddingVertical: spacing.md,
+        paddingVertical: spacing.ml,
         alignItems: 'center',
       });
 
@@ -6349,7 +6361,7 @@ describe('Recorder', () => {
       expect(flattenedStyle(getSubmitButton())).toMatchObject({
         backgroundColor: colors.primaryDark,
         borderRadius: radii.button,
-        paddingVertical: spacing.md,
+        paddingVertical: spacing.ml,
         alignItems: 'center',
       });
       await fireEvent(getSubmitButton(), 'responderTerminate', responderEvent());
@@ -12925,23 +12937,23 @@ describe('Recorder', () => {
       });
       // The decorative meter never reaches assistive technology.
       expect(screen.queryByTestId('live-level-meter')).toBeNull();
-      // No metering reading yet: all six segments stay idle.
-      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(6);
+      // No metering reading yet: every waveform bar stays idle.
+      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(12);
 
       mockRecorderState = { ...mockRecorderState, isRecording: true, metering: -30 };
       await view.rerender(<Recorder {...props} />);
-      expect(screen.getAllByTestId('level-segment-active', hidden)).toHaveLength(3);
-      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(3);
+      expect(screen.getAllByTestId('level-segment-active', hidden)).toHaveLength(6);
+      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(6);
 
       mockRecorderState = { ...mockRecorderState, metering: 0 };
       await view.rerender(<Recorder {...props} />);
-      expect(screen.getAllByTestId('level-segment-active', hidden)).toHaveLength(6);
+      expect(screen.getAllByTestId('level-segment-active', hidden)).toHaveLength(12);
       expect(screen.queryAllByTestId('level-segment-idle', hidden)).toHaveLength(0);
 
       mockRecorderState = { ...mockRecorderState, metering: -160 };
       await view.rerender(<Recorder {...props} />);
       expect(screen.queryAllByTestId('level-segment-active', hidden)).toHaveLength(0);
-      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(6);
+      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(12);
     });
 
     it.each([
@@ -12956,7 +12968,7 @@ describe('Recorder', () => {
       await view.rerender(<Recorder {...props} />);
 
       expect(screen.queryAllByTestId('level-segment-active', hidden)).toHaveLength(0);
-      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(6);
+      expect(screen.getAllByTestId('level-segment-idle', hidden)).toHaveLength(12);
     });
 
     it('hides the meter once the recording stops', async () => {
@@ -17316,29 +17328,24 @@ describe('Recorder', () => {
 
       expect(flattenedStyle(screen.getByTestId('live-level-meter', hidden))).toEqual({
         marginTop: spacing.md,
-        height: 16,
+        height: 36,
         flexDirection: 'row',
-        alignItems: 'flex-end',
-        gap: 6,
+        alignItems: 'center',
+        gap: 4,
       });
       const activeSegments = screen.getAllByTestId('level-segment-active', hidden);
       const idleSegments = screen.getAllByTestId('level-segment-idle', hidden);
-      expect(activeSegments).toHaveLength(3);
-      expect(idleSegments).toHaveLength(3);
-      for (const segment of activeSegments) {
+      expect(activeSegments).toHaveLength(6);
+      expect(idleSegments).toHaveLength(6);
+      // Bars follow the symmetric arch profile: edge bars short, centre tall.
+      const barHeights = [10, 14, 18, 24, 30, 34, 34, 30, 24, 18, 14, 10];
+      const allSegments = [...activeSegments, ...idleSegments];
+      for (const [index, segment] of allSegments.entries()) {
         expect(flattenedStyle(segment)).toEqual({
-          width: 10,
-          height: 14,
-          borderRadius: 2,
-          backgroundColor: colors.success,
-        });
-      }
-      for (const segment of idleSegments) {
-        expect(flattenedStyle(segment)).toEqual({
-          width: 10,
-          height: 6,
-          borderRadius: 2,
-          backgroundColor: colors.border,
+          width: 5,
+          height: barHeights[index],
+          borderRadius: 3,
+          backgroundColor: index < 6 ? colors.success : colors.border,
         });
       }
     });
@@ -17449,11 +17456,10 @@ describe('Recorder', () => {
         elevation: 6,
       });
       expect(flattenedStyle(recordIconNode())).toEqual({
-        width: 30,
-        height: 30,
-        borderRadius: 15,
-        backgroundColor: darkColors.onDanger,
+        alignItems: 'center',
+        justifyContent: 'center',
       });
+      expect(recordIconSvg()).toMatchObject({ width: 34, height: 34 });
       expect(flattenedStyle(screen.getByText(IDLE_TEXT)).color).toBe(darkColors.muted);
       expect(darkColors.danger).not.toBe(colors.danger);
     });

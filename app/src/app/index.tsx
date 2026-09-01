@@ -46,7 +46,7 @@ function LoadingView({ label }: { label: string }) {
 
 /**
  * Entry gate: routes based on auth state.
- *  - no token            → login
+ *  - no token            → welcome (value-first intro; login is one tap away)
  *  - token, not assessed → diagnostic
  *  - otherwise           → home (progress screen; practice is one tap away)
  * An expired/invalid token (401) is cleared and the user lands on login.
@@ -155,7 +155,7 @@ export default function Gate() {
   }
 
   if (!token) {
-    return <Redirect href="/login" />;
+    return <Redirect href="/welcome" />;
   }
 
   // TanStack pauses a new profile query while offline. Keep the restored

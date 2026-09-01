@@ -3,27 +3,27 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, Text, View } from 'rea
 import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
-import Button from '../../components/Button';
-import DataRefreshNotice from '../../components/DataRefreshNotice';
-import OfflineState from '../../components/OfflineState';
+import Button from '../../../components/Button';
+import DataRefreshNotice from '../../../components/DataRefreshNotice';
+import OfflineState from '../../../components/OfflineState';
 import Recorder, {
   scrollToExpandedRecorderControls,
   type RecorderResultMetadata,
-} from '../../components/Recorder';
-import { apiFetch, userMessageForError } from '../../lib/api';
-import { useAuth } from '../../lib/auth';
-import { useT } from '../../lib/i18n';
-import { firstParam, isUuid } from '../../lib/params';
-import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
-import { createThemedStyles, useTheme } from '../../lib/theme';
+} from '../../../components/Recorder';
+import { apiFetch, userMessageForError } from '../../../lib/api';
+import { useAuth } from '../../../lib/auth';
+import { useT } from '../../../lib/i18n';
+import { firstParam, isUuid } from '../../../lib/params';
+import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../../lib/practice-flow';
+import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
   parseAttemptResult,
   parseHelpContent,
   parseNativeAttemptResult,
   PRACTICE_MAX_ATTEMPTS,
   type PracticeOutcome,
-} from '../../lib/types';
-import { useHardwareBack } from '../../lib/use-hardware-back';
+} from '../../../lib/types';
+import { useHardwareBack } from '../../../lib/use-hardware-back';
 
 // Silence retries are unbounded, so retain only a small recent window while
 // still suppressing recovery replays for the current recorder owner.

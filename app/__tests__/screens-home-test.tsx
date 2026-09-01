@@ -9,7 +9,7 @@ import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
-import HomeScreen from '../src/app/home';
+import HomeScreen from '../src/app/(tabs)/home';
 import HomeBannerAd from '../src/components/HomeBannerAd';
 import { apiGetPracticeStats, ApiError } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
@@ -335,7 +335,13 @@ describe('home screen', () => {
     const removeSpy = jest.spyOn(queryClient, 'removeQueries');
     await renderHome(queryClient);
 
-    expect(screen.getByText(t('home.loading'))).toBeTruthy();
+    const hidden = { includeHiddenElements: true } as const;
+    expect(screen.getByText(t('home.loading'), hidden).props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
+    // The dashboard skeleton mirrors the loaded layout: three tiles + card.
+    expect(screen.getAllByTestId('home-skeleton-tile', hidden)).toHaveLength(1);
+    expect(screen.getByTestId('home-skeleton-card', hidden)).toBeTruthy();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
     expect(removeSpy).not.toHaveBeenCalled();
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
@@ -493,7 +499,7 @@ describe('home screen', () => {
     expect(screen.getByText(t('cefr.B1'))).toBeTruthy();
 
     const bar = screen.getByRole('progressbar', { name: t('home.masteryLabel') });
-    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 10, now: 3 });
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 30 });
     expect(
       screen.getByText(
         t('practice.progressLine', { mastered: 3, total: 10 }) +
@@ -502,8 +508,8 @@ describe('home screen', () => {
     ).toBeTruthy();
 
     expect(screen.getByText(t('home.streakMany', { count: 5 }))).toBeTruthy();
-    // The flame is decoration; screen readers get the streak text instead.
-    const flame = screen.getByText('🔥', { includeHiddenElements: true });
+    // The flame is a themed decorative icon; screen readers get the streak text.
+    const flame = screen.getByTestId('home-streak-flame', { includeHiddenElements: true });
     expect(flame.props.accessibilityElementsHidden).toBe(true);
     expect(flame.props.importantForAccessibility).toBe('no-hide-descendants');
 
@@ -658,15 +664,18 @@ describe('home screen', () => {
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
 
+    // The shared bar reports the mastered share as a percent and paints the
+    // fill with the success token.
     const bar = await screen.findByRole('progressbar', { name: t('home.masteryLabel') });
-    const fill = bar.children[0] as TestInstance;
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 30 });
+    const fill = screen.getByTestId('home-mastery-bar-fill', { includeHiddenElements: true });
     expect(flattenedStyle(fill)).toMatchObject({
-      width: '30%',
+      height: '100%',
       backgroundColor: colors.success,
     });
   });
 
-  it('renders a zero-width mastery fill when the level total is defensively zero', async () => {
+  it('reports an empty mastery bar when the level total is defensively zero', async () => {
     mockGetStats.mockResolvedValue({
       ...STATS,
       progress: { ...STATS.progress, masteredCount: 0, totalAtLevel: 0 },
@@ -674,7 +683,7 @@ describe('home screen', () => {
     await renderHome();
 
     const bar = await screen.findByRole('progressbar', { name: t('home.masteryLabel') });
-    expect(flattenedStyle(bar.children[0] as TestInstance).width).toBe('0%');
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 0 });
   });
 
   it('uses the streak-start prompt and singular lines at low counts', async () => {
@@ -711,24 +720,22 @@ describe('home screen', () => {
     expect(screen.queryByText(te('home.streakMany', { count: 1 }))).toBeNull();
   });
 
-  it.each([
-    [t('home.startPractice'), '/practice'],
-    [t('header.history'), '/history'],
-    [t('header.recordings'), '/recordings'],
-    [t('header.settings'), '/settings'],
-  ] as const)('navigates once from %s after a rapid double tap', async (label, destination) => {
-    mockGetStats.mockResolvedValue(STATS);
-    await renderHome();
-    await screen.findByText('B1');
+  it.each([[t('home.startPractice'), '/practice']] as const)(
+    'navigates once from %s after a rapid double tap',
+    async (label, destination) => {
+      mockGetStats.mockResolvedValue(STATS);
+      await renderHome();
+      await screen.findByText('B1');
 
-    const press = committedPressHandler(screen.getByRole('button', { name: label }));
-    await act(async () => {
-      press();
-      press();
-    });
-    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
-    expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
-  });
+      const press = committedPressHandler(screen.getByRole('button', { name: label }));
+      await act(async () => {
+        press();
+        press();
+      });
+      expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+      expect(mockRouter.navigate).toHaveBeenCalledWith(destination);
+    },
+  );
 
   it('forwards live route focus to the Home banner across a same-mount rerender', async () => {
     mockGetStats.mockResolvedValue(STATS);
@@ -875,15 +882,6 @@ describe('home screen', () => {
 });
 
 describe('home screen presentation', () => {
-  const CARD_LABEL = {
-    fontSize: 12,
-    fontWeight: '700',
-    color: colors.muted,
-    textTransform: 'uppercase',
-    letterSpacing: 0.8,
-    marginTop: spacing.md,
-  };
-
   const CENTERED_STATE = {
     flex: 1,
     minHeight: 240,
@@ -916,47 +914,36 @@ describe('home screen presentation', () => {
       backgroundColor: colors.background,
     });
     expect(flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name })))).toEqual({
-      fontSize: 15,
-      color: colors.muted,
+      fontSize: 24,
+      lineHeight: 30,
+      fontWeight: '800',
+      color: colors.text,
       marginBottom: spacing.md,
     });
-    // The CTA keeps its own gap from the card above it.
+    // The CTA keeps its own gap from the card above it and wears the hero size.
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
-    ).toMatchObject({ marginTop: spacing.xl });
-    // Peer destinations are outlined actions that grow into the available row
-    // and wrap instead of squeezing localized labels on narrow screens.
-    expect(
-      flattenedStyle(parentOf(screen.getByRole('button', { name: t('header.history') }))),
-    ).toEqual({
-      marginTop: spacing.lg,
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      gap: spacing.md,
-    });
+    ).toMatchObject({ marginTop: spacing.xl, paddingVertical: spacing.ml });
+    // Peer destinations moved to the bottom tab bar; the surface ends at the CTA.
     for (const label of [t('header.history'), t('header.recordings'), t('header.settings')]) {
-      expect(flattenedStyle(screen.getByRole('button', { name: label }))).toMatchObject({
-        minHeight: layout.minimumTarget,
-        borderWidth: 1,
-        borderColor: colors.primary,
-        flexBasis: 140,
-        flexGrow: 1,
-      });
+      expect(screen.queryByRole('button', { name: label })).toBeNull();
     }
   });
 
-  it('centres the loading state and names the spinner for screen readers', async () => {
+  it('mirrors the dashboard as a skeleton while politely announcing the wait', async () => {
     mockGetStats.mockReturnValue(new Promise(() => undefined));
     await renderHome();
 
-    const spinner = screen.getByLabelText(t('home.loading'));
-    expect(spinner.props.size).toBe('large');
-    expect(spinner.props.color).toBe(colors.primary);
-
-    const message = screen.getByText(t('home.loading'));
+    const hidden = { includeHiddenElements: true } as const;
+    const message = screen.getByText(t('home.loading'), hidden);
     expect(message.props.accessibilityLiveRegion).toBe('polite');
-    expect(flattenedStyle(message)).toEqual(MUTED_BODY);
-    expect(flattenedStyle(parentOf(message))).toEqual(CENTERED_STATE);
+
+    // The skeleton previews the loaded structure: the tile row, then the card.
+    expect(screen.getByTestId('home-skeleton-card', hidden)).toBeTruthy();
+    expect(flattenedStyle(parentOf(screen.getByTestId('home-skeleton-tile', hidden)))).toEqual({
+      flexDirection: 'row',
+      gap: spacing.sm,
+    });
   });
 
   it('centres the error state and its retry action', async () => {
@@ -979,42 +966,22 @@ describe('home screen presentation', () => {
     ).toMatchObject({ marginTop: spacing.xl });
   });
 
-  it('renders the stats card, its labels, and the due chip on the shared tokens', async () => {
+  it('renders the stat tiles, detail card, and due chip on the shared tokens', async () => {
     await renderLoadedHome();
 
-    const levelLabel = screen.getByText(t('home.levelLabel'));
-    const masteryLabel = screen.getByText(t('home.masteryLabel'));
-    expect(flattenedStyle(levelLabel)).toEqual(CARD_LABEL);
-    expect(flattenedStyle(masteryLabel)).toEqual(CARD_LABEL);
-    // The mastery label sits directly in the card; the level label sits one
-    // level deeper, in the row that keeps the due chip on the opposite edge.
-    expect(flattenedStyle(parentOf(masteryLabel))).toEqual({
-      backgroundColor: colors.card,
-      borderRadius: radii.card,
-      padding: layout.screenPadding,
-      borderWidth: 1,
-      borderColor: colors.border,
-    });
-    expect(flattenedStyle(parentOf(parentOf(levelLabel)))).toEqual({
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      justifyContent: 'space-between',
-      alignItems: 'flex-start',
-      gap: spacing.sm,
-    });
-    expect(flattenedStyle(parentOf(levelLabel))).toEqual({
-      flexGrow: 1,
-      flexShrink: 1,
-      minWidth: 160,
-    });
+    // The glanceable row: three tiles, each naming its own figure.
+    expect(screen.getByTestId('home-level-tile')).toBeTruthy();
+    expect(screen.getByTestId('home-streak-tile')).toBeTruthy();
+    expect(screen.getByTestId('home-mastery-tile')).toBeTruthy();
+    expect(screen.getByText(t('home.levelLabel'))).toBeTruthy();
+    expect(screen.getByText(t('home.streakLabel'))).toBeTruthy();
+    expect(screen.getByText(t('home.masteryLabel'))).toBeTruthy();
+    expect(screen.getByText('B1')).toBeTruthy();
+    expect(screen.getByText('5')).toBeTruthy();
+    expect(screen.getByText('3')).toBeTruthy();
 
-    expect(flattenedStyle(screen.getByText('B1'))).toEqual({
-      marginTop: spacing.xs,
-      fontSize: 30,
-      fontWeight: '800',
-      color: colors.primary,
-    });
-    expect(flattenedStyle(screen.getByText(t('cefr.B1')))).toEqual({
+    const explain = screen.getByText(t('cefr.B1'));
+    expect(flattenedStyle(explain)).toEqual({
       marginTop: 2,
       fontSize: 13,
       color: colors.muted,
@@ -1028,6 +995,9 @@ describe('home screen presentation', () => {
     expect(flattenedStyle(parentOf(screen.getByText(t('home.dueChip', { count: 4 }))))).toEqual({
       maxWidth: '100%',
       flexShrink: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 6,
       backgroundColor: colors.primaryLight,
       borderRadius: radii.pill,
       paddingVertical: 6,
@@ -1041,18 +1011,16 @@ describe('home screen presentation', () => {
 
     const bar = screen.getByRole('progressbar', { name: t('home.masteryLabel') });
     expect(flattenedStyle(bar)).toEqual({
-      marginTop: spacing.sm,
-      height: 12,
-      borderRadius: radii.pill,
+      alignSelf: 'stretch',
+      height: 8,
+      borderRadius: 4,
       backgroundColor: colors.border,
-      // The fill is clipped to the rounded track instead of overflowing it.
       overflow: 'hidden',
     });
-    // The fill spans the track's full height, so only its width reads as progress.
-    expect(flattenedStyle(bar.children[0] as TestInstance)).toEqual({
-      width: '30%',
+    const fill = screen.getByTestId('home-mastery-bar-fill', { includeHiddenElements: true });
+    expect(flattenedStyle(fill)).toMatchObject({
       height: '100%',
-      borderRadius: radii.pill,
+      borderRadius: 4,
       backgroundColor: colors.success,
     });
 
@@ -1065,8 +1033,10 @@ describe('home screen presentation', () => {
       ),
     ).toEqual({ marginTop: spacing.sm, fontSize: 14, color: colors.text });
 
-    const flame = screen.getByText('🔥', { includeHiddenElements: true });
-    expect(flattenedStyle(flame)).toEqual({ fontSize: 22 });
+    // The flame is the themed decorative icon in the streak row.
+    const flame = screen.getByTestId('home-streak-flame', { includeHiddenElements: true });
+    expect(flame.props.accessibilityElementsHidden).toBe(true);
+    expect(flame.props.importantForAccessibility).toBe('no-hide-descendants');
     expect(flattenedStyle(parentOf(flame))).toEqual({
       marginTop: spacing.lg,
       flexDirection: 'row',
@@ -1113,9 +1083,10 @@ describe('home screen presentation', () => {
     const dismiss = () => screen.getByRole('button', { name: t('summary.dismiss') });
     expect(flattenedStyle(screen.getByText(t('summary.dismiss')))).toEqual({
       flexShrink: 1,
-      fontWeight: '600',
+      fontWeight: '700',
       textAlign: 'center',
       fontSize: 15,
+      lineHeight: 20,
       color: colors.primary,
     });
     expect(flattenedStyle(dismiss())).toMatchObject({

@@ -11,8 +11,15 @@ import { spawnSync } from 'node:child_process';
 // Metro is pinned to the SDK-compatible 0.84.5 patch in package.json overrides;
 // that removes the separately reviewed image-size denial-of-service advisories
 // still present in React Native 0.86.2's older 0.84.4 lock resolution.
-const reviewedAdvisories = new Set([1119441]);
-const reviewedMaximums = { moderate: 13, high: 0, total: 13 };
+// GHSA-vcc3-ghjq-m6fr (1147955) flags decode-uri-component <=0.4.2 — every
+// release of the package, so no override can fix it. It reaches the tree via
+// expo-router's query-string@7.1.3 and only decodes this app's own router
+// URLs, not attacker-controlled URI input in a server context. The advisory
+// was published against an unchanged dependency tree (it failed CI before any
+// dependency was added); reviewed as the same upstream-Expo DoS class as the
+// image-size precedent above.
+const reviewedAdvisories = new Set([1119441, 1147955]);
+const reviewedMaximums = { moderate: 16, high: 0, total: 16 };
 
 const result = spawnSync('npm', ['audit', '--omit=dev', '--json'], {
   encoding: 'utf8',

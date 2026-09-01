@@ -46,6 +46,14 @@ export type DiagnosticNext =
     }
   | { done: true; level: CefrLevel; answers?: DiagnosticAnswerSummary[] };
 
+/** Word-level transcript tag for the color-coded answer view. */
+export type WordScoreStatus = 'good' | 'fair' | 'poor';
+
+export interface WordScore {
+  word: string;
+  status: WordScoreStatus;
+}
+
 export interface DiagnosticAnswerResult {
   passed: boolean;
   score: number;
@@ -56,6 +64,9 @@ export interface DiagnosticAnswerResult {
   level?: CefrLevel;
   nextQuestion?: Question;
   recordingId?: string;
+  /** Additive word-by-word tags; present only on scored answers from a
+   * deployment that produces them, never on silence. */
+  wordScores?: WordScore[];
 }
 
 export interface HelpContent {
@@ -114,6 +125,9 @@ export interface AttemptResult {
   next?: PracticeQuestionPayload;
   levelUp?: LevelUp;
   recordingId?: string;
+  /** Additive word-by-word tags; present only on scored answers from a
+   * deployment that produces them, never on silence. */
+  wordScores?: WordScore[];
 }
 
 export interface PracticeStats {
@@ -486,6 +500,25 @@ function parseDiagnosticAnswerSummaries(value: unknown): DiagnosticAnswerSummary
   });
 }
 
+/**
+ * Validate the additive word-tag list. A present-but-malformed list is a
+ * corrupt response (ContractError), while an absent list is simply an older
+ * deployment's scored answer; silence responses must never carry one.
+ */
+function parseWordScores(value: unknown): WordScore[] {
+  if (!Array.isArray(value) || value.length > 600) throw new ContractError();
+  return value.map((entry) => {
+    if (
+      !isRecord(entry) ||
+      !isBoundedNonEmptyString(entry.word, 200) ||
+      (entry.status !== 'good' && entry.status !== 'fair' && entry.status !== 'poor')
+    ) {
+      throw new ContractError();
+    }
+    return { word: entry.word, status: entry.status };
+  });
+}
+
 export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerResult {
   if (!isRecord(value)) throw new ContractError();
   const passed = value.passed;
@@ -514,6 +547,7 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
     done,
   };
   if (recordingId !== undefined) result.recordingId = recordingId;
+  const wordScores = value.wordScores;
   const level = value.level;
   const nextQuestion = value.nextQuestion;
   if (noSpeech !== undefined) {
@@ -524,7 +558,10 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
       transcript !== '' ||
       done ||
       level !== undefined ||
-      nextQuestion === undefined
+      nextQuestion === undefined ||
+      // Silence has no transcript to tag; a response carrying word tags here
+      // is corrupt, exactly as the server's durable gate treats it.
+      wordScores !== undefined
     ) {
       throw new ContractError();
     }
@@ -532,6 +569,7 @@ export function parseDiagnosticAnswerResult(value: unknown): DiagnosticAnswerRes
     result.nextQuestion = parseWith(nextQuestion, isQuestion);
     return result;
   }
+  if (wordScores !== undefined) result.wordScores = parseWordScores(wordScores);
   if (!isBoundedNonEmptyString(transcript, 12_000)) throw new ContractError();
   if (done) {
     if (!isCefrLevel(level) || nextQuestion !== undefined) {
@@ -596,6 +634,7 @@ export function parseAttemptResult(value: unknown, expectedCycleId?: string): At
   const finalFeedback = value.finalFeedback;
   const next = value.next;
   const recordingId = value.recordingId;
+  const wordScores = value.wordScores;
   if (
     !isUuid(cycleId) ||
     (expectedCycleId !== undefined && cycleId !== expectedCycleId) ||
@@ -649,7 +688,10 @@ export function parseAttemptResult(value: unknown, expectedCycleId?: string): At
       transcript !== '' ||
       finalFeedback !== undefined ||
       next !== undefined ||
-      attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (attemptNo - 1)
+      attemptsLeft !== PRACTICE_MAX_ATTEMPTS - (attemptNo - 1) ||
+      // Silence has no transcript to tag; a response carrying word tags here
+      // is corrupt, exactly as the server's durable gate treats it.
+      wordScores !== undefined
     ) {
       throw new ContractError();
     }
@@ -660,6 +702,7 @@ export function parseAttemptResult(value: unknown, expectedCycleId?: string): At
   // The server turns an empty Whisper transcript into the explicit free-retry
   // variant above. A scored response can therefore never have no transcript.
   if (!isNonEmptyString(transcript)) throw new ContractError();
+  if (wordScores !== undefined) result.wordScores = parseWordScores(wordScores);
 
   if (passed) {
     if (attemptsLeft !== 0 || finalFeedback !== undefined || next === undefined) {

@@ -3,7 +3,6 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  Pressable,
   ScrollView,
   Text,
   TextInput,
@@ -13,6 +12,7 @@ import { router, useNavigation } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 
 import Button from '../../components/Button';
+import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
   comparablePasswordError,
@@ -132,15 +132,12 @@ export default function ChangePasswordScreen() {
           : t('cp.confirmLabel');
     const actionLabel = visible ? t('common.hidePassword') : t('common.showPassword');
     return (
-      <Pressable
-        accessibilityRole="button"
+      <PasswordVisibilityToggle
+        visible={visible}
         accessibilityLabel={`${fieldLabel}: ${actionLabel}`}
-        onPress={() => toggleVisibility(field)}
         disabled={busy}
-        style={[styles.inputAction, busy && styles.controlDisabled]}
-      >
-        <Text style={styles.inputActionText}>{visible ? t('common.hide') : t('common.show')}</Text>
-      </Pressable>
+        onToggle={() => toggleVisibility(field)}
+      />
     );
   };
 

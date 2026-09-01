@@ -43,7 +43,7 @@ describe('shared Button', () => {
     expect(flattenedStyle(screen.getByText('Continue'))).toMatchObject({
       color: colors.onPrimary,
       fontSize: 17,
-      fontWeight: '600',
+      fontWeight: '700',
       flexShrink: 1,
       // Labels stay centred when a caller stretches the button.
       textAlign: 'center',
@@ -52,12 +52,45 @@ describe('shared Button', () => {
     await fireEvent(button('Continue'), 'responderGrant', responderEvent());
     expect(flattenedStyle(button('Continue'))).toMatchObject({
       backgroundColor: colors.primaryDark,
-      transform: [{ scale: 0.985 }],
+      // A felt press: the key sinks (scale + translate) and its hard bottom
+      // edge collapses instead of a barely-visible 1.5% shrink.
+      transform: [{ scale: 0.97 }, { translateY: 1 }],
     });
     await fireEvent(button('Continue'), 'responderTerminate', responderEvent());
     await waitFor(() =>
       expect(flattenedStyle(button('Continue')).backgroundColor).toBe(colors.primary),
     );
+  });
+
+  it('gives the primary variant a hard bottom edge that presses flat', async () => {
+    await render(<Button title="Continue" onPress={jest.fn()} />);
+
+    expect(flattenedStyle(button('Continue'))).toMatchObject({
+      shadowRadius: 0,
+      shadowOffset: { width: 0, height: 3 },
+      elevation: 3,
+    });
+
+    await fireEvent(button('Continue'), 'responderGrant', responderEvent());
+    expect(flattenedStyle(button('Continue'))).toMatchObject({
+      shadowOffset: { width: 0, height: 1 },
+      elevation: 1,
+    });
+    await fireEvent(button('Continue'), 'responderTerminate', responderEvent());
+  });
+
+  it('renders the large hero size with roomier padding and label', async () => {
+    await render(<Button title="Start Practice" size="lg" onPress={jest.fn()} />);
+
+    expect(flattenedStyle(button('Start Practice'))).toMatchObject({
+      minHeight: layout.minimumTarget,
+      paddingVertical: spacing.ml,
+      paddingHorizontal: spacing.xl,
+    });
+    expect(flattenedStyle(screen.getByText('Start Practice'))).toMatchObject({
+      fontSize: 18,
+      lineHeight: 24,
+    });
   });
 
   it('renders the secondary variant as an outline that tints when pressed', async () => {

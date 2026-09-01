@@ -65,6 +65,11 @@ describe('theme palette', () => {
       onSuccess: '#FFFFFF',
       warning: '#9A3412',
       onWarning: '#FFFFFF',
+      // Celebration accent (amber-700 family) — see the accent contrast block.
+      accent: '#B45309',
+      accentDark: '#92400E',
+      accentLight: '#FFFBEB',
+      onAccent: '#FFFFFF',
       shadow: '#000000',
     });
     // Legacy static export stays the light palette for scheme-independent uses.
@@ -94,6 +99,12 @@ describe('theme palette', () => {
       onSuccess: '#052E16',
       warning: '#FDBA74',
       onWarning: '#431407',
+      // Celebration accent: bright amber fill with dark amber ink so accent
+      // TEXT stays legible on dark surfaces (white-on-tint would fail 4.5:1).
+      accent: '#FBBF24',
+      accentDark: '#FDE68A',
+      accentLight: '#33240A',
+      onAccent: '#451A03',
       shadow: '#000000',
     });
   });
@@ -129,6 +140,11 @@ describe('theme palette', () => {
       ['warning text on background', palette.warning, palette.background],
       ['warning text on card', palette.warning, palette.card],
       ['banner text on primaryLight', palette.primaryDark, palette.primaryLight],
+      ['accent text on background', palette.accent, palette.background],
+      ['accent text on card', palette.accent, palette.card],
+      ['accent chip text on accentLight', palette.accent, palette.accentLight],
+      ['accent label on accent fill', palette.onAccent, palette.accent],
+      ['accent label on pressed accent', palette.onAccent, palette.accentDark],
     ])('%s meets 4.5:1', (_pair, foreground, background) => {
       expect(contrastRatio(foreground, background)).toBeGreaterThanOrEqual(4.5);
     });

@@ -20,14 +20,14 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import * as Haptics from 'expo-haptics';
 
-import AttemptScreen from '../src/app/practice/attempt';
-import FeedbackScreen from '../src/app/practice/feedback';
-import HelpScreen from '../src/app/practice/help';
-import PracticeScreen from '../src/app/practice/index';
+import AttemptScreen from '../src/app/(tabs)/practice/attempt';
+import FeedbackScreen from '../src/app/(tabs)/practice/feedback';
+import HelpScreen from '../src/app/(tabs)/practice/help';
+import PracticeScreen from '../src/app/(tabs)/practice/index';
 import type { RecorderResultMetadata } from '../src/components/Recorder';
 import RecordingPlayback from '../src/components/RecordingPlayback';
 import { ApiError, apiFetch, apiSkipPracticeWord } from '../src/lib/api';
-import { LogoutCleanupError, useAuth, type SessionLease } from '../src/lib/auth';
+import { useAuth, type SessionLease } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
 import { acknowledgePendingAssessmentFeedback } from '../src/lib/pending-assessment';
 import type { usePracticeFlow } from '../src/lib/practice-flow';
@@ -727,30 +727,17 @@ describe('practice home screen', () => {
     const replacement = deferred<unknown>();
     mockApiFetch.mockReturnValue(replacement.promise);
     await renderScreen(<PracticeScreen />);
-    expect(screen.getByText(t('practice.loadingQuestion')).props.accessibilityLiveRegion).toBe(
-      'polite',
-    );
+    const hidden = { includeHiddenElements: true } as const;
+    expect(
+      screen.getByText(t('practice.loadingQuestion'), hidden).props.accessibilityLiveRegion,
+    ).toBe('polite');
+    expect(screen.getByTestId('practice-question-skeleton', hidden)).toBeTruthy();
     expect(screen.queryByTestId('recorder')).toBeNull();
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
-    expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
-    await act(async () => {
-      replacement.resolve(PRACTICE_QUESTION);
-      await replacement.promise;
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-  });
-
-  it('keeps footer actions above a larger device safe-area inset', async () => {
-    const replacement = deferred<unknown>();
-    mockApiFetch.mockReturnValue(replacement.promise);
-    await renderScreen(<PracticeScreen />, undefined, 34);
-
-    expect(buttonContainerPaddingBottom(t('practice.settings'))).toBe(34);
+    // Section navigation moved to the tab bar; the learning surface exposes
+    // no account exits while its question is still loading.
+    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
     await act(async () => {
       replacement.resolve(PRACTICE_QUESTION);
       await replacement.promise;
@@ -1180,7 +1167,7 @@ describe('practice home screen', () => {
     expect(mockSkipWord).not.toHaveBeenCalled();
   });
 
-  it('locks help and footer actions while a recording or submission is active', async () => {
+  it('locks help and question actions while a recording or submission is active', async () => {
     mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
@@ -1192,17 +1179,15 @@ describe('practice home screen', () => {
     await fireEvent.press(help);
     expect(mockRouter.navigate).not.toHaveBeenCalled();
 
-    const settings = screen.getByRole('button', { name: t('practice.settings') });
-    expect(settings.props.accessibilityState).toEqual({ disabled: true });
-    expect(flattenedStyle(settings)).toMatchObject({ opacity: 0.5 });
-    await fireEvent.press(settings);
-    expect(alertSpy).not.toHaveBeenCalled();
+    const skip = screen.getByRole('button', { name: t('practice.skipWord') });
+    expect(skip.props.accessibilityState).toEqual({ disabled: true, busy: false });
+    await fireEvent.press(skip);
+    expect(mockSkipWord).not.toHaveBeenCalled();
 
-    const logout = screen.getByRole('button', { name: t('common.logOut') });
-    expect(logout.props.accessibilityState).toEqual({ disabled: true });
-    expect(flattenedStyle(logout)).toMatchObject({ opacity: 0.5 });
-    await fireEvent.press(logout);
-    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+    // Account exits live in Settings/Profile now, so the learning surface has
+    // no footer actions left to lock.
+    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
 
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel'))).opacity).toBeUndefined();
@@ -1230,12 +1215,6 @@ describe('practice home screen', () => {
     expect(
       screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityState,
     ).toMatchObject({ disabled: true });
-    expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toMatchObject({ disabled: false });
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
-    ).toMatchObject({ disabled: false });
     expect(pressHardwareBack()).toBe(false);
     expect(dispatchBeforeRemove()).not.toHaveBeenCalled();
   });
@@ -1502,7 +1481,8 @@ describe('practice home screen', () => {
       expect(mockApiFetch).toHaveBeenCalledTimes(requestsBeforeBoundary);
       expect(mockSetOptions).not.toHaveBeenCalled();
       expect(
-        screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+        screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+          .accessibilityState,
       ).toMatchObject({ disabled: false });
     },
   );
@@ -1742,13 +1722,11 @@ describe('practice home screen', () => {
     mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
     const view = await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
-    const staleSettingsPress = committedPressHandler(
-      screen.getByRole('button', { name: t('practice.settings') }),
-    );
+    const staleHelpPress = committedPressHandler(screen.getByLabelText(t('practice.helpLabel')));
 
     await view.unmount();
     await act(async () => {
-      staleSettingsPress();
+      staleHelpPress();
     });
 
     expect(mockRouter.navigate).not.toHaveBeenCalled();
@@ -1782,179 +1760,6 @@ describe('practice home screen', () => {
 
     expect(await screen.findByText(t('practice.loadFailed'))).toBeTruthy();
     expect(screen.queryByText(t('practice.loadingQuestion'))).toBeNull();
-  });
-
-  it('navigates to the settings screen instead of an Alert menu', async () => {
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    const press = committedPressHandler(
-      screen.getByRole('button', { name: t('practice.settings') }),
-    );
-    await act(async () => {
-      press();
-      press();
-    });
-    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
-    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
-    expect(alertSpy).not.toHaveBeenCalled();
-  });
-
-  it('does not let a queued logout run after Settings owns navigation', async () => {
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const openSettings = committedPressHandler(
-      screen.getByRole('button', { name: t('practice.settings') }),
-    );
-    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
-
-    await act(async () => {
-      openSettings();
-      void logOut();
-      await Promise.resolve();
-    });
-
-    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
-    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
-    expect(mockAuthValue.logout).not.toHaveBeenCalled();
-  });
-
-  it('blocks Settings behind logout and releases the shared action claim after failure', async () => {
-    const logoutRequest = deferred<void>();
-    const logout = jest.fn(() => logoutRequest.promise);
-    mockAuthValue = makeAuth({ logout });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const openSettings = committedPressHandler(
-      screen.getByRole('button', { name: t('practice.settings') }),
-    );
-    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
-
-    await act(async () => {
-      void logOut();
-      openSettings();
-      await Promise.resolve();
-    });
-    expect(logout).toHaveBeenCalledTimes(1);
-    expect(mockRouter.navigate).not.toHaveBeenCalled();
-
-    await act(async () => {
-      logoutRequest.reject(new Error('offline'));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
-
-    await act(async () => openSettings());
-    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
-  });
-
-  it('rejects a practice logout handler after its render lease is invalidated', async () => {
-    const renderLease = { owner: 'practice-account-actions' } as never;
-    let currentLease: unknown = renderLease;
-    const logout = jest.fn();
-    mockAuthValue = makeAuth({
-      logout,
-      captureSessionLease: jest.fn(() => currentLease as never),
-      isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
-    });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const staleLogout = committedPressHandler(
-      screen.getByRole('button', { name: t('common.logOut') }),
-    );
-
-    currentLease = { owner: 'replacement-session' };
-    await act(async () => {
-      void staleLogout();
-      await Promise.resolve();
-    });
-
-    expect(logout).not.toHaveBeenCalled();
-    expect(mockRouter.replace).not.toHaveBeenCalled();
-    expect(alertSpy).not.toHaveBeenCalled();
-  });
-
-  it('logs out and returns to the gate', async () => {
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
-    expect(mockAuthValue.logout).toHaveBeenCalled();
-  });
-
-  it('serializes same-frame logout taps and releases the latch after a failure', async () => {
-    const firstLogout = deferred<void>();
-    const logout = jest
-      .fn()
-      .mockReturnValueOnce(firstLogout.promise)
-      .mockResolvedValueOnce(undefined);
-    mockAuthValue = makeAuth({ logout });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const press = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
-
-    await act(async () => {
-      press();
-      press();
-      await Promise.resolve();
-    });
-    expect(logout).toHaveBeenCalledTimes(1);
-
-    await act(async () => {
-      firstLogout.reject(new Error('offline'));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody')),
-    );
-
-    await act(async () => {
-      press();
-      await Promise.resolve();
-    });
-    await waitFor(() => expect(logout).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
-  });
-
-  it('reports a cleanup failure after logout', async () => {
-    mockAuthValue = makeAuth({
-      logout: jest.fn().mockRejectedValue(new LogoutCleanupError()),
-    });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(
-        t('logout.cleanupTitle'),
-        t('auth.logoutCleanupFailed'),
-      ),
-    );
-    expect(mockRouter.replace).not.toHaveBeenCalled();
-  });
-
-  it('reports a generic logout failure', async () => {
-    mockAuthValue = makeAuth({
-      logout: jest.fn().mockRejectedValue(new Error('offline')),
-    });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody')),
-    );
   });
 });
 
@@ -2883,7 +2688,10 @@ describe('practice feedback screen', () => {
     expect(
       screen.getByText(t('feedback.passedBody', { score: PRACTICE_MASTER_SCORE })),
     ).toBeTruthy();
-    expect(screen.getByText(t('feedback.scoreLine', { score: 72 }))).toBeTruthy();
+    expect(screen.getByText('72')).toBeTruthy();
+    expect(
+      screen.getByRole('progressbar', { name: t('feedback.scoreLine', { score: 72 }) }),
+    ).toBeTruthy();
     expect(
       screen.getByText(
         t('feedback.scoreMeaning', { pass: PRACTICE_PASS_SCORE, master: PRACTICE_MASTER_SCORE }),
@@ -3111,7 +2919,10 @@ describe('practice feedback screen', () => {
     expect(
       screen.getByText(t('feedback.masteredBody', { score: PRACTICE_MASTER_SCORE })),
     ).toBeTruthy();
-    expect(screen.getByText(t('feedback.scoreLine', { score: 88 }))).toBeTruthy();
+    expect(screen.getByText('88')).toBeTruthy();
+    expect(
+      screen.getByRole('progressbar', { name: t('feedback.scoreLine', { score: 88 }) }),
+    ).toBeTruthy();
     expect(
       screen.getByText(
         t('feedback.scoreMeaning', { pass: PRACTICE_PASS_SCORE, master: PRACTICE_MASTER_SCORE }),
@@ -3125,7 +2936,7 @@ describe('practice feedback screen', () => {
     expect(
       flattenedStyle(screen.getByRole('header', { name: t('feedback.masteredTitle') })),
     ).toMatchObject({
-      color: colors.success,
+      color: colors.accent,
       textAlign: 'center',
     });
 
@@ -3179,14 +2990,23 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText(/\/ 100/)).toBeNull();
     expect(screen.queryByText(t('feedback.nextQuestion'))).toBeNull();
     expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
-    for (const name of [t('feedback.tryInEnglish'), t('feedback.tryAgainNative')]) {
-      expect(flattenedStyle(screen.getByRole('button', { name }))).toMatchObject({
-        minHeight: layout.minimumTarget,
-        alignSelf: 'stretch',
-        paddingVertical: spacing.md,
-        paddingHorizontal: spacing.xl,
-      });
-    }
+    // The primary action wears the hero size; its quieter sibling stays md.
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('feedback.tryInEnglish') })),
+    ).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      paddingVertical: spacing.ml,
+      paddingHorizontal: spacing.xl,
+    });
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('feedback.tryAgainNative') })),
+    ).toMatchObject({
+      minHeight: layout.minimumTarget,
+      alignSelf: 'stretch',
+      paddingVertical: spacing.md,
+      paddingHorizontal: spacing.xl,
+    });
     expect(
       flattenedStyle(parentOf(screen.getByRole('button', { name: t('feedback.tryInEnglish') }))),
     ).toEqual({ alignSelf: 'stretch', gap: spacing.sm });
@@ -3250,7 +3070,7 @@ describe('practice feedback screen', () => {
     expect(flattenedStyle(next)).toMatchObject({
       minHeight: layout.minimumTarget,
       alignSelf: 'stretch',
-      paddingVertical: spacing.md,
+      paddingVertical: spacing.ml,
       paddingHorizontal: spacing.xl,
     });
 
@@ -3337,6 +3157,7 @@ describe('practice feedback screen', () => {
     ).toEqual({
       marginTop: spacing.md,
       fontSize: 24,
+      lineHeight: 30,
       fontWeight: '800',
       textAlign: 'center',
       color: colors.warning,
@@ -3462,7 +3283,10 @@ describe('practice feedback screen', () => {
       screen.getByText(t('feedback.retryTitle', { attempt: 3, max: PRACTICE_MAX_ATTEMPTS })),
     ).toBeTruthy();
     expect(screen.getByText(t('feedback.retryBodyOne'))).toBeTruthy();
-    expect(screen.getByText(t('feedback.scoreLine', { score: 40 }))).toBeTruthy();
+    expect(screen.getByText('40')).toBeTruthy();
+    expect(
+      screen.getByRole('progressbar', { name: t('feedback.scoreLine', { score: 40 }) }),
+    ).toBeTruthy();
     expect(
       screen.getByText(
         t('feedback.scoreMeaning', { pass: PRACTICE_PASS_SCORE, master: PRACTICE_MASTER_SCORE }),
@@ -3767,10 +3591,10 @@ describe('practice feedback screen', () => {
     expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
   });
 
-  it('hides the decorative emoji from screen readers on every variant', async () => {
-    const cases: [PracticeOutcome, string][] = [
-      [PASSED_RESULT, '🎉'],
-      [{ ...PASSED_RESULT, mastered: true, score: 88 }, '🏆'],
+  it('hides the decorative outcome badge from screen readers on every variant', async () => {
+    const cases: readonly [PracticeOutcome][] = [
+      [PASSED_RESULT],
+      [{ ...PASSED_RESULT, mastered: true, score: 88 }],
       [
         {
           cycleId: CYCLE_ID,
@@ -3782,7 +3606,6 @@ describe('practice feedback screen', () => {
           transcript: 'I tried.',
           feedback: 'Keep going.',
         },
-        '💪',
       ],
       [
         {
@@ -3795,7 +3618,6 @@ describe('practice feedback screen', () => {
           transcript: 'last try',
           feedback: 'Final.',
         },
-        '📘',
       ],
       [
         {
@@ -3809,7 +3631,6 @@ describe('practice feedback screen', () => {
           transcript: '',
           feedback: 'We could not detect any speech.',
         },
-        '🎤',
       ],
       [
         {
@@ -3824,7 +3645,6 @@ describe('practice feedback screen', () => {
           modelAnswer: 'She showed courage at work.',
           feedback: 'On topic.',
         },
-        '🌏',
       ],
       [
         {
@@ -3839,7 +3659,6 @@ describe('practice feedback screen', () => {
           modelAnswer: 'She showed courage at work.',
           feedback: 'Off topic.',
         },
-        '🧩',
       ],
       [
         {
@@ -3855,19 +3674,20 @@ describe('practice feedback screen', () => {
           modelAnswer: '',
           feedback: 'We could not detect any speech.',
         },
-        '🎤',
       ],
     ];
-    for (const [result, emoji] of cases) {
+    for (const [result] of cases) {
       mockPracticeFlow = makePracticeFlow({ feedback: { questionId: QUESTION.id, result } });
       const view = await renderScreen(<FeedbackScreen />);
 
-      // Hidden from screen readers means hidden from default queries too.
-      expect(screen.queryByText(emoji)).toBeNull();
-      expect(screen.getByText(emoji, { includeHiddenElements: true }).props).toMatchObject({
-        accessibilityElementsHidden: true,
-        importantForAccessibility: 'no-hide-descendants',
+      // The icon badge is the celebration mark: present, decorative, hidden
+      // from screen readers exactly like the emoji art it replaces.
+      const badge = screen.getByTestId('feedback-outcome-badge', {
+        includeHiddenElements: true,
       });
+      expect(badge.props.accessibilityElementsHidden).toBe(true);
+      expect(badge.props.importantForAccessibility).toBe('no-hide-descendants');
+      expect(badge.children).not.toHaveLength(0);
       await view.unmount();
     }
   });
@@ -3882,8 +3702,11 @@ describe('practice feedback screen', () => {
     const liveHeader = header.parent;
     if (!liveHeader) throw new Error('Feedback headline has no live-region container');
     expect(liveHeader.props.accessibilityLiveRegion).toBe('polite');
-    // The score announces itself with the headline…
-    expect(screen.getByText(t('feedback.scoreLine', { score: 72 })).parent).toBe(liveHeader);
+    // The score ring announces itself with the headline…
+    expect(screen.getByTestId('feedback-score-ring').parent).toBe(liveHeader);
+    expect(
+      screen.getByRole('progressbar', { name: t('feedback.scoreLine', { score: 72 }) }),
+    ).toBeTruthy();
     // …while the transcript/feedback card stays out of the live region.
     const card = screen.getByText('Nice work.').parent;
     expect(card?.props.accessibilityLiveRegion).toBeUndefined();
@@ -4348,18 +4171,16 @@ describe('skip word', () => {
       screen.getByRole('button', { name: t('practice.skipWord') }),
     );
     const openHelp = committedPressHandler(screen.getByLabelText(t('practice.helpLabel')));
-    const openSettings = committedPressHandler(
-      screen.getByRole('button', { name: t('practice.settings') }),
+    const flipMode = committedPressHandler(
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
     );
-    const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
     mockSetOptions.mockClear();
     let prevented!: jest.Mock;
 
     await act(async () => {
       void skipWord();
       openHelp();
-      openSettings();
-      void logOut();
+      flipMode();
       prevented = dispatchBeforeRemove();
       expect(pressHardwareBack()).toBe(true);
       await Promise.resolve();
@@ -4368,7 +4189,7 @@ describe('skip word', () => {
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
     expect(prevented).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).not.toHaveBeenCalled();
-    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
     expect(mockSetOptions).toHaveBeenCalledWith({
       headerBackVisible: false,
       gestureEnabled: false,
@@ -4377,10 +4198,8 @@ describe('skip word', () => {
       disabled: true,
     });
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toMatchObject({ disabled: true });
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
     ).toMatchObject({ disabled: true });
 
     await act(async () => {
@@ -4390,14 +4209,12 @@ describe('skip word', () => {
     });
     await waitFor(() =>
       expect(
-        screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
+        screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+          .accessibilityState,
       ).toMatchObject({ disabled: false }),
     );
     expect(pressHardwareBack()).toBe(false);
     expect(dispatchBeforeRemove()).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toMatchObject({ disabled: false });
   });
 
   it('does no post-skip reconciliation after blur invalidates the render session lease', async () => {
@@ -4686,7 +4503,7 @@ describe('level-up celebration', () => {
     expect(apply(null)).toBeNull();
   }
 
-  it('celebrates the promotion with localized copy, a hidden emoji, and a success haptic', async () => {
+  it('celebrates the promotion with localized copy, hidden art, confetti, and a success haptic', async () => {
     await renderLevelUpFeedback();
 
     expect(screen.getByRole('header', { name: t('levelUp.title') })).toBeTruthy();
@@ -4695,18 +4512,24 @@ describe('level-up celebration', () => {
     expect(screen.getByText(t('cefr.B2'))).toBeTruthy();
     // The celebration replaces the plain mastery headline.
     expect(screen.queryByText(t('feedback.masteredTitle'))).toBeNull();
-    expect(screen.getByText(t('feedback.scoreLine', { score: 90 }))).toBeTruthy();
+    expect(
+      screen.getByRole('progressbar', { name: t('feedback.scoreLine', { score: 90 }) }),
+    ).toBeTruthy();
 
-    const rocket = screen.getByText('🚀', { includeHiddenElements: true });
-    expect(rocket.props.accessibilityElementsHidden).toBe(true);
-    expect(rocket.props.importantForAccessibility).toBe('no-hide-descendants');
+    const badge = screen.getByTestId('feedback-outcome-badge', {
+      includeHiddenElements: true,
+    });
+    expect(badge.props.accessibilityElementsHidden).toBe(true);
+    expect(badge.props.importantForAccessibility).toBe('no-hide-descendants');
+    expect(screen.getByTestId('feedback-confetti', { includeHiddenElements: true })).toBeTruthy();
     expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledWith('success');
     expect(flattenedStyle(screen.getByRole('header', { name: t('levelUp.title') }))).toEqual({
       marginTop: spacing.md,
       fontSize: 24,
+      lineHeight: 30,
       fontWeight: '800',
       textAlign: 'center',
-      color: colors.success,
+      color: colors.accent,
     });
     expect(flattenedStyle(screen.getByText(t('levelUp.body', { level: 'B2' })))).toEqual({
       marginTop: spacing.sm,
@@ -4982,8 +4805,9 @@ describe('practice mutation ownership sentinels', () => {
 
     expect(mockSetOptions).not.toHaveBeenCalled();
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
   });
 
   it('rolls practice cache, lease, owner locks, and navigation into a new account', async () => {
@@ -5010,8 +4834,9 @@ describe('practice mutation ownership sentinels', () => {
     expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
     await act(async () => recorderProps().onInteractionLockChange?.(true));
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: true });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
 
     currentLease = secondLease;
     mockAuthValue = makeAuth({
@@ -5026,16 +4851,20 @@ describe('practice mutation ownership sentinels', () => {
     expect(screen.queryByText(QUESTION.questionText)).toBeNull();
     expect(captureSessionLease).toHaveBeenCalledTimes(2);
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
 
     await act(async () => recorderProps().onInteractionLockChange?.(true));
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: true });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
     await act(async () => recorderProps().onInteractionLockChange?.(false));
-    await fireEvent.press(screen.getByRole('button', { name: t('practice.settings') }));
-    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    await fireEvent.press(screen.getByLabelText(t('practice.helpLabel')));
+    expect(mockRouter.navigate).toHaveBeenCalledWith(
+      expect.objectContaining({ pathname: '/practice/help' }),
+    );
     expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
   });
 
@@ -5058,21 +4887,24 @@ describe('practice mutation ownership sentinels', () => {
     const rerenderScreen = await renderRerenderable(<PracticeScreen />);
     await screen.findByText(QUESTION.questionText);
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: false });
     const englishCallbacks = recorderProps();
     await act(async () => englishCallbacks.onInteractionLockChange?.(true));
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: true });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toEqual({ checked: false, disabled: true });
     mockSetOptions.mockClear();
 
     mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
     await rerenderScreen(<PracticeScreen />);
     expect(recorderProps().endpoint).toBe('/practice/attempt/native');
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toMatchObject({ checked: true, disabled: false });
     expect(mockSetOptions).toHaveBeenLastCalledWith({
       headerBackVisible: true,
       gestureEnabled: true,
@@ -5086,8 +4918,9 @@ describe('practice mutation ownership sentinels', () => {
 
     expect(alertSpy).not.toHaveBeenCalled();
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
+      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
+        .accessibilityState,
+    ).toMatchObject({ disabled: false });
   });
 
   it('moves practice navigation subscriptions and lock publication to a new navigation object', async () => {
@@ -5416,107 +5249,6 @@ describe('practice mutation ownership sentinels', () => {
     mockSetOptions.mockClear();
     await act(async () => {
       skipRequest.resolve(undefined);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(mockSetOptions).not.toHaveBeenCalled();
-  });
-
-  it('locks exits synchronously for logout and restores the actual controls after failure', async () => {
-    const firstLogout = deferred<void>();
-    const logout = jest
-      .fn()
-      .mockReturnValueOnce(firstLogout.promise)
-      .mockResolvedValueOnce(undefined);
-    mockAuthValue = makeAuth({ logout });
-    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-    await renderScreen(<PracticeScreen />);
-    await screen.findByText(QUESTION.questionText);
-    const pressLogout = committedPressHandler(
-      screen.getByRole('button', { name: t('common.logOut') }),
-    );
-    let immediateBack = false;
-    let immediateRemoval!: jest.Mock;
-
-    await act(async () => {
-      void pressLogout();
-      immediateBack = pressHardwareBack();
-      immediateRemoval = dispatchBeforeRemove();
-      await Promise.resolve();
-    });
-    expect(immediateBack).toBe(true);
-    expect(immediateRemoval).toHaveBeenCalledTimes(1);
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
-    ).toEqual({ disabled: true });
-
-    await act(async () => {
-      firstLogout.reject(new Error('offline'));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityState,
-    ).toEqual({ disabled: false });
-    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    expect(logout).toHaveBeenCalledTimes(2);
-  });
-
-  it.each(['resolve', 'reject'] as const)(
-    'publishes no practice logout %s continuation after focus is lost',
-    async (outcome) => {
-      const logoutRequest = deferred<void>();
-      mockAuthValue = makeAuth({ logout: jest.fn(() => logoutRequest.promise) });
-      mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
-      await renderScreen(<PracticeScreen />);
-      await screen.findByText(QUESTION.questionText);
-      const logout = committedPressHandler(
-        screen.getByRole('button', { name: t('common.logOut') }),
-      );
-      await act(async () => {
-        void logout();
-        await Promise.resolve();
-      });
-      expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
-      await blurScreen();
-      mockRouter.replace.mockClear();
-      alertSpy.mockClear();
-
-      await act(async () => {
-        if (outcome === 'resolve') logoutRequest.resolve(undefined);
-        else logoutRequest.reject(new Error('late logout failure'));
-        await Promise.resolve();
-        await Promise.resolve();
-      });
-
-      expect(mockRouter.replace).not.toHaveBeenCalled();
-      expect(alertSpy).not.toHaveBeenCalled();
-    },
-  );
-
-  it('publishes no old logout finalizer into a replacement account', async () => {
-    const logoutRequest = deferred<void>();
-    mockAuthValue = makeAuth({ logout: jest.fn(() => logoutRequest.promise) });
-    const client = makeQueryClient();
-    client.setQueryDefaults(['practice-question'], { staleTime: Infinity });
-    client.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
-    client.setQueryData(
-      ['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel],
-      NEXT_PRACTICE_QUESTION,
-    );
-    const view = await render(withProviders(<PracticeScreen />, client, 0));
-    await act(async () => {
-      void committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }))();
-      await Promise.resolve();
-    });
-    expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
-
-    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
-    await view.rerender(withProviders(<PracticeScreen />, client, 0));
-    mockSetOptions.mockClear();
-    await act(async () => {
-      logoutRequest.reject(new Error('old logout failed'));
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -5936,9 +5668,11 @@ describe('practice home presentation', () => {
       alignSelf: 'center',
     });
     expect(flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name })))).toEqual({
-      fontSize: 15,
-      color: colors.muted,
-      marginBottom: spacing.md,
+      fontSize: 20,
+      lineHeight: 26,
+      fontWeight: '800',
+      color: colors.text,
+      marginBottom: spacing.sm,
     });
     // Recorder phases grow downward from one stable top edge; the ScrollView
     // owns any extra height so review and upload actions stay reachable.
@@ -5955,7 +5689,8 @@ describe('practice home presentation', () => {
     const promptWord = screen.getByText('courage');
     expect(flattenedStyle(promptWord)).toEqual({
       marginTop: spacing.xs,
-      fontSize: 30,
+      fontSize: 34,
+      lineHeight: 41,
       fontWeight: '800',
       color: colors.primary,
     });
@@ -6123,11 +5858,10 @@ describe('practice home presentation', () => {
       shadowOffset: { width: 0, height: 3 },
       elevation: 4,
     });
-    expect(flattenedStyle(screen.getByText('?'))).toEqual({
-      color: colors.onPrimary,
-      fontSize: 20,
-      fontWeight: '800',
-    });
+    // The "?" text glyph is retired: the circle now carries the themed help
+    // icon, hidden from screen readers because the button owns the label.
+    expect(screen.queryByText('?')).toBeNull();
+    expect(screen.getByLabelText(t('practice.helpLabel')).children).not.toHaveLength(0);
 
     const questionLabel = screen.getByText(t('label.question'));
     const help = screen.getByLabelText(t('practice.helpLabel'));
@@ -6232,34 +5966,10 @@ describe('practice home presentation', () => {
       textDecorationLine: 'underline',
     });
 
-    const settings = screen.getByRole('button', { name: t('practice.settings') });
-    expect(flattenedStyle(settings)).toEqual({
-      flexShrink: 1,
-      maxWidth: '100%',
-      minHeight: layout.minimumTarget,
-      justifyContent: 'center',
-      paddingHorizontal: spacing.ml,
-    });
-    expect(flattenedStyle(screen.getByText(t('practice.settings')))).toEqual({
-      flexShrink: 1,
-      fontSize: 14,
-      color: colors.muted,
-      textDecorationLine: 'underline',
-      textAlign: 'center',
-    });
-    expect(flattenedStyle(parentOf(settings))).toEqual({
-      minHeight: 56,
-      flexDirection: 'row',
-      flexWrap: 'wrap',
-      justifyContent: 'center',
-      gap: spacing.xl,
-      paddingTop: spacing.xs,
-      paddingHorizontal: spacing.ml,
-      borderTopWidth: 1,
-      borderTopColor: colors.border,
-      backgroundColor: colors.card,
-      paddingBottom: 10,
-    });
+    // Account exits moved to the tab bar and Settings: the learning surface
+    // ends at the skip action with no footer row.
+    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
   });
 
   it('explains every locked control while the recorder holds a take', async () => {
@@ -6271,9 +5981,6 @@ describe('practice home presentation', () => {
     ).toBeUndefined();
     expect(
       screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
-    ).toBeUndefined();
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint,
     ).toBeUndefined();
 
     await act(async () => recorderProps().onInteractionLockChange?.(true));
@@ -6288,12 +5995,6 @@ describe('practice home presentation', () => {
       screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
     ).toBe(hint);
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
-    ).toBe(hint);
-    expect(screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint).toBe(
-      hint,
-    );
-    expect(
       flattenedStyle(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') })),
     ).toMatchObject({ opacity: 0.5 });
 
@@ -6307,25 +6008,23 @@ describe('practice home presentation', () => {
       screen.getByRole('button', { name: t('practice.skipWord') }).props.accessibilityHint,
     ).toBeUndefined();
     expect(
-      screen.getByRole('button', { name: t('practice.settings') }).props.accessibilityHint,
-    ).toBeUndefined();
-    expect(
-      screen.getByRole('button', { name: t('common.logOut') }).props.accessibilityHint,
-    ).toBeUndefined();
-    expect(
       flattenedStyle(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }))
         .opacity,
     ).toBeUndefined();
   });
 
-  it('centres the loading state and labels its spinner', async () => {
+  it('lays out the question skeleton and announces the wait politely', async () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await renderScreen(<PracticeScreen />);
 
-    const loading = screen.getByText(t('practice.loadingQuestion'));
-    expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
-    expect(flattenedStyle(parentOf(loading))).toEqual(CENTERED_STATE);
-    expect(screen.getByLabelText(t('practice.loadingQuestion'))).toBeTruthy();
+    const hidden = { includeHiddenElements: true } as const;
+    // The hidden live-region line keeps the wait announced without sight.
+    const loading = screen.getByText(t('practice.loadingQuestion'), hidden);
+    expect(loading.props.accessibilityLiveRegion).toBe('polite');
+    // The skeleton mirrors the served card: badge row, hero word, lines.
+    expect(screen.getByTestId('practice-question-skeleton', hidden)).toBeTruthy();
+    expect(screen.getByTestId('practice-skeleton-word', hidden)).toBeTruthy();
+    expect(screen.queryByTestId('recorder')).toBeNull();
   });
 
   it('centres the load failure and spaces its retry action', async () => {
@@ -7016,26 +6715,37 @@ describe('practice feedback presentation', () => {
     expect(flattenedStyle(header)).toEqual({
       marginTop: spacing.md,
       fontSize: 24,
+      lineHeight: 30,
       fontWeight: '800',
       textAlign: 'center',
       color: colors.success,
     });
+    // A passed outcome sits on the success-tinted panel.
     expect(flattenedStyle(parentOf(header))).toEqual({
       alignSelf: 'stretch',
       alignItems: 'center',
+      backgroundColor: colors.successLight,
+      borderRadius: radii.card,
+      paddingVertical: spacing.xl,
+      paddingHorizontal: spacing.lg,
+      overflow: 'hidden',
     });
-    expect(flattenedStyle(screen.getByText('🎉', { includeHiddenElements: true }))).toEqual({
-      fontSize: 52,
-      marginTop: spacing.md,
+    expect(
+      flattenedStyle(screen.getByTestId('feedback-outcome-badge', { includeHiddenElements: true })),
+    ).toEqual({
+      width: 84,
+      height: 84,
+      borderRadius: 42,
+      backgroundColor: colors.success,
+      alignItems: 'center',
+      justifyContent: 'center',
     });
     expect(
       flattenedStyle(screen.getByText(t('feedback.passedBody', { score: PRACTICE_MASTER_SCORE }))),
     ).toEqual(SUBTITLE);
-    expect(flattenedStyle(screen.getByText(t('feedback.scoreLine', { score: 72 })))).toEqual({
-      marginTop: spacing.ml,
-      fontSize: 28,
+    expect(flattenedStyle(screen.getByText('72'))).toMatchObject({
       fontWeight: '800',
-      color: colors.primary,
+      color: colors.success,
     });
     expect(
       flattenedStyle(
@@ -7047,8 +6757,10 @@ describe('practice feedback presentation', () => {
         ),
       ),
     ).toEqual({
-      marginTop: spacing.xs,
-      fontSize: 13,
+      marginTop: 2,
+      fontSize: 12,
+      lineHeight: 16,
+      fontWeight: '600',
       color: colors.muted,
       textAlign: 'center',
     });

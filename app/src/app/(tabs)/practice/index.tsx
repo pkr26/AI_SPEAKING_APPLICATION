@@ -11,20 +11,21 @@ import {
   Text,
   View,
 } from 'react-native';
-import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import Button from '../../components/Button';
-import OfflineState from '../../components/OfflineState';
+import Button from '../../../components/Button';
+import Icon from '../../../components/Icon';
+import OfflineState from '../../../components/OfflineState';
+import Skeleton from '../../../components/Skeleton';
 import Recorder, {
   scrollToExpandedRecorderControls,
   type RecorderResultMetadata,
-} from '../../components/Recorder';
-import { ApiError, apiFetch, apiSkipPracticeWord, userMessageForError } from '../../lib/api';
-import { LogoutCleanupError, useAuth } from '../../lib/auth';
-import { useT } from '../../lib/i18n';
-import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../lib/practice-flow';
-import { hasSeenPracticeIntro, markPracticeIntroSeen } from '../../lib/practice-intro';
-import { createThemedStyles, useTheme } from '../../lib/theme';
+} from '../../../components/Recorder';
+import { ApiError, apiFetch, apiSkipPracticeWord, userMessageForError } from '../../../lib/api';
+import { useAuth } from '../../../lib/auth';
+import { useT } from '../../../lib/i18n';
+import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../../lib/practice-flow';
+import { hasSeenPracticeIntro, markPracticeIntroSeen } from '../../../lib/practice-intro';
+import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
   parseAttemptResult,
   parseNativeAttemptResult,
@@ -33,8 +34,8 @@ import {
   PRACTICE_MAX_ATTEMPTS,
   type PracticeOutcome,
   type PracticeQuestionPayload,
-} from '../../lib/types';
-import { useHardwareBack } from '../../lib/use-hardware-back';
+} from '../../../lib/types';
+import { useHardwareBack } from '../../../lib/use-hardware-back';
 
 // Silence retries are unbounded, so retain only a small recent window while
 // still suppressing recovery replays for the current recorder owner.
@@ -49,14 +50,13 @@ function isClosedPracticeCycle(error: unknown): error is ApiError {
 }
 
 export default function PracticeScreen() {
-  const { user, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
+  const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
   const navigation = useNavigation();
   const { answerMode, setAnswerMode, showFeedback } = usePracticeFlow();
   const queryClient = useQueryClient();
-  const insets = useSafeAreaInsets();
   const scrollViewRef = useRef<ScrollView>(null);
   const [recorderLockState, setRecorderLockState] = useState<{
     owner: string | null;
@@ -76,8 +76,6 @@ export default function PracticeScreen() {
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
-  const logoutBusyRef = useRef(false);
-  const [logoutBusy, setLogoutBusy] = useState(false);
   const navigationStartedRef = useRef(true);
   const mountedRef = useRef(true);
   const focusedRef = useRef(false);
@@ -192,14 +190,14 @@ export default function PracticeScreen() {
     scrollToExpandedRecorderControls(scrollViewRef.current, recorderOwnsWork(recorderOwner));
   }, [recorderOwner, recorderOwnsWork]);
 
-  const interactionLocked = recorderLocked || skipBusy || logoutBusy;
-  const navigationLocked = recorderExitLocked || skipBusy || logoutBusy;
+  const interactionLocked = recorderLocked || skipBusy;
+  const navigationLocked = recorderExitLocked || skipBusy;
   const interactionLockedNow = useCallback(
-    () => recorderLockedRef.current || skipBusyRef.current || logoutBusyRef.current,
+    () => recorderLockedRef.current || skipBusyRef.current,
     [],
   );
   const navigationLockedNow = useCallback(
-    () => recorderExitLockedRef.current || skipBusyRef.current || logoutBusyRef.current,
+    () => recorderExitLockedRef.current || skipBusyRef.current,
     [],
   );
 
@@ -489,8 +487,7 @@ export default function PracticeScreen() {
       !recorderOwnsWork(owner) ||
       navigationStartedRef.current ||
       skipBusyRef.current ||
-      recorderLockedRef.current ||
-      logoutBusyRef.current
+      recorderLockedRef.current
     ) {
       return;
     }
@@ -548,40 +545,6 @@ export default function PracticeScreen() {
     }
   };
 
-  const handleLogout = async () => {
-    if (!claimNavigation()) return;
-    logoutBusyRef.current = true;
-    setLogoutBusy(true);
-    publishNavigationLock();
-    let rearm = false;
-    try {
-      await logout();
-      if (mountedRef.current && focusedRef.current) router.replace('/');
-    } catch (error) {
-      if (error instanceof LogoutCleanupError) {
-        Alert.alert(t('logout.cleanupTitle'), error.message);
-      } else if (
-        mountedRef.current &&
-        focusedRef.current &&
-        activeRenderOwnerRef.current === renderOwner &&
-        isSessionLeaseCurrent(sessionLease, { identityOnly: true })
-      ) {
-        // Auth intentionally invalidates the render lease while logout is in
-        // flight. A failed request rearms leases asynchronously, so reporting
-        // this same-identity failure must use the stable mounted identity.
-        Alert.alert(t('logout.failedTitle'), t('logout.failedBody'));
-        rearm = true;
-      }
-    } finally {
-      logoutBusyRef.current = false;
-      if (mountedRef.current && activeRenderOwnerRef.current === renderOwner) {
-        setLogoutBusy(false);
-        if (rearm) navigationStartedRef.current = false;
-        publishNavigationLock();
-      }
-    }
-  };
-
   // The route gate will redirect after logout/session expiry. Avoid showing a
   // disabled-query loading state during that transition.
   if (!user) return null;
@@ -601,15 +564,26 @@ export default function PracticeScreen() {
           (questionQuery.fetchStatus === 'paused' ? (
             <OfflineState />
           ) : (
-            <View style={styles.center}>
-              <ActivityIndicator
-                accessibilityLabel={t('practice.loadingQuestion')}
-                size="large"
-                color={theme.colors.primary}
-              />
-              <Text accessibilityLiveRegion="polite" style={styles.muted}>
+            // The skeleton mirrors the served card: badge row, hero word,
+            // question lines. The recorder stays absent until a real question
+            // owns the surface.
+            <View style={styles.questionSkeleton} testID="practice-question-skeleton">
+              <Text
+                accessibilityLiveRegion="polite"
+                accessibilityElementsHidden
+                style={styles.hiddenLoadingText}
+              >
                 {t('practice.loadingQuestion')}
               </Text>
+              <View style={styles.skeletonBadgeRow}>
+                <Skeleton width={44} height={22} borderRadius={8} />
+                <Skeleton width={72} height={22} borderRadius={8} />
+                <Skeleton width={64} height={22} borderRadius={8} />
+              </View>
+              <Skeleton width="55%" height={40} borderRadius={10} testID="practice-skeleton-word" />
+              <Skeleton height={18} />
+              <Skeleton height={18} width="82%" />
+              <Skeleton height={18} width="70%" />
             </View>
           ))}
 
@@ -693,18 +667,8 @@ export default function PracticeScreen() {
                   </View>
                 )}
               </View>
-              <Text style={styles.levelExplainLine}>{t(`cefr.${question.cefrLevel}`)}</Text>
-              {progress && (
-                <Text style={styles.progressLine}>
-                  {t('practice.progressLine', {
-                    mastered: progress.masteredCount,
-                    total: progress.totalAtLevel,
-                  })}
-                  {progress.learningCount > 0
-                    ? t('practice.progressLearning', { count: progress.learningCount })
-                    : ''}
-                </Text>
-              )}
+              {/* The prompt word is the hero of this screen; everything else is
+                  supporting metadata so a learner reads the word first. */}
               <Text style={styles.cardLabel}>{t('label.word')}</Text>
               <Text
                 accessibilityLanguage="en-US"
@@ -740,7 +704,7 @@ export default function PracticeScreen() {
                     });
                   }}
                 >
-                  <Text style={styles.helpButtonText}>?</Text>
+                  <Icon name="help" size={22} color={theme.colors.onPrimary} strokeWidth={2.2} />
                 </Pressable>
               </View>
               {/* The served card persists across questions, so its live region
@@ -753,6 +717,18 @@ export default function PracticeScreen() {
               >
                 {question.questionText}
               </Text>
+              <Text style={styles.levelExplainLine}>{t(`cefr.${question.cefrLevel}`)}</Text>
+              {progress && (
+                <Text style={styles.progressLine}>
+                  {t('practice.progressLine', {
+                    mastered: progress.masteredCount,
+                    total: progress.totalAtLevel,
+                  })}
+                  {progress.learningCount > 0
+                    ? t('practice.progressLearning', { count: progress.learningCount })
+                    : ''}
+                </Text>
+              )}
             </View>
 
             <Pressable
@@ -793,8 +769,8 @@ export default function PracticeScreen() {
                 ownerId={user.id}
                 questionId={question.id}
                 cycleId={cycleId}
-                disabled={skipBusy || logoutBusy}
-                isStartBlocked={() => skipBusyRef.current || logoutBusyRef.current}
+                disabled={skipBusy}
+                isStartBlocked={() => skipBusyRef.current}
                 endpoint={nativeMode ? '/practice/attempt/native' : '/practice/attempt'}
                 parseResult={(raw) =>
                   nativeMode
@@ -826,31 +802,6 @@ export default function PracticeScreen() {
           </>
         )}
       </ScrollView>
-
-      <View style={[styles.footerRow, { paddingBottom: Math.max(insets.bottom, 10) }]}>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={navigationLocked}
-          hitSlop={4}
-          style={[styles.footerButton, navigationLocked && styles.controlDisabled]}
-          onPress={() => {
-            if (claimNavigation()) router.navigate('/settings');
-          }}
-        >
-          <Text style={styles.footerButtonText}>{t('practice.settings')}</Text>
-        </Pressable>
-        <Pressable
-          accessibilityRole="button"
-          accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
-          disabled={navigationLocked}
-          hitSlop={4}
-          style={[styles.footerButton, navigationLocked && styles.controlDisabled]}
-          onPress={() => void handleLogout()}
-        >
-          <Text style={styles.footerButtonText}>{t('common.logOut')}</Text>
-        </Pressable>
-      </View>
     </View>
   );
 }
@@ -873,10 +824,29 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     alignItems: 'center',
     justifyContent: 'center',
   },
+  questionSkeleton: {
+    alignSelf: 'stretch',
+    backgroundColor: colors.card,
+    borderRadius: radii.card,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    gap: spacing.md,
+  },
+  skeletonBadgeRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  hiddenLoadingText: {
+    height: 0,
+    opacity: 0,
+  },
   greeting: {
-    fontSize: 15,
-    color: colors.muted,
-    marginBottom: spacing.md,
+    fontSize: 20,
+    lineHeight: 26,
+    fontWeight: '800',
+    color: colors.text,
+    marginBottom: spacing.sm,
   },
   muted: {
     marginTop: spacing.md,
@@ -907,11 +877,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   },
   helpButtonPressed: {
     backgroundColor: colors.primaryDark,
-  },
-  helpButtonText: {
-    color: colors.onPrimary,
-    fontSize: 20,
-    fontWeight: '800',
   },
   card: {
     marginTop: spacing.sm,
@@ -1054,7 +1019,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
   },
   promptWord: {
     marginTop: spacing.xs,
-    fontSize: 30,
+    fontSize: 34,
+    lineHeight: 41,
     fontWeight: '800',
     color: colors.primary,
   },
@@ -1093,31 +1059,5 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     fontSize: 14,
     color: colors.muted,
     textDecorationLine: 'underline',
-  },
-  footerRow: {
-    minHeight: 56,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: spacing.xl,
-    paddingTop: spacing.xs,
-    paddingHorizontal: spacing.ml,
-    borderTopWidth: 1,
-    borderTopColor: colors.border,
-    backgroundColor: colors.card,
-  },
-  footerButton: {
-    flexShrink: 1,
-    maxWidth: '100%',
-    minHeight: layout.minimumTarget,
-    justifyContent: 'center',
-    paddingHorizontal: spacing.ml,
-  },
-  footerButtonText: {
-    flexShrink: 1,
-    fontSize: 14,
-    color: colors.muted,
-    textDecorationLine: 'underline',
-    textAlign: 'center',
   },
 }));

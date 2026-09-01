@@ -1,4 +1,4 @@
-import { StyleSheet, useColorScheme } from 'react-native';
+import { Easing, StyleSheet, useColorScheme } from 'react-native';
 
 /**
  * Design tokens for both color schemes.
@@ -42,6 +42,17 @@ export interface ThemeColors {
   warning: string;
   /** Text/icon color on a `warning` fill. */
   onWarning: string;
+  /**
+   * Warm celebration accent: streaks, rewards, level-ups. Kept separate from
+   * `primary` so the brand indigo stays calm while achievements feel warm.
+   */
+  accent: string;
+  /** Pressed-state shift of `accent` (darker in light, lighter in dark). */
+  accentDark: string;
+  /** Subtle accent-tinted surface for chips and celebration panels. */
+  accentLight: string;
+  /** Text/icon color on an `accent` fill. */
+  onAccent: string;
   /** Shadow ink for elevated controls. */
   shadow: string;
 }
@@ -54,6 +65,8 @@ export interface ThemeColors {
  * Key ratios: text/bg 16.6, muted/bg 4.52, onPrimary/primary 6.29,
  * onSuccess/success 5.02, success/successLight 4.79, danger/dangerLight 5.91,
  * primary/primaryLight 5.62, onWarning/warning 7.31, inputBorder/inputBg 4.83.
+ * Accent family (amber-700): onAccent/accent 5.03, accent/background 4.69,
+ * accent/card 5.03, accent/accentLight 4.86, onAccent/accentDark 7.09.
  */
 export const lightColors: ThemeColors = {
   primary: '#4F46E5',
@@ -76,6 +89,10 @@ export const lightColors: ThemeColors = {
   onSuccess: '#FFFFFF',
   warning: '#9A3412',
   onWarning: '#FFFFFF',
+  accent: '#B45309',
+  accentDark: '#92400E',
+  accentLight: '#FFFBEB',
+  onAccent: '#FFFFFF',
   shadow: '#000000',
 };
 
@@ -87,6 +104,9 @@ export const lightColors: ThemeColors = {
  * Key ratios: text/bg 16.3, muted/bg 7.57, onPrimary/primary 8.02,
  * onSuccess/success 8.55, success/successLight 8.39, danger/dangerLight 5.72,
  * primary/primaryLight 6.91, onWarning/warning 9.28, inputBorder/inputBg 4.09.
+ * Accent family (amber-400 fill with amber-950 ink): onAccent/accent 10.1,
+ * accent/background 11.1, accent/card 9.8, accent/accentLight 9.4,
+ * onAccent/accentDark 13.5.
  */
 export const darkColors: ThemeColors = {
   primary: '#A5B4FC',
@@ -109,6 +129,10 @@ export const darkColors: ThemeColors = {
   onSuccess: '#052E16',
   warning: '#FDBA74',
   onWarning: '#431407',
+  accent: '#FBBF24',
+  accentDark: '#FDE68A',
+  accentLight: '#33240A',
+  onAccent: '#451A03',
   shadow: '#000000',
 };
 
@@ -151,7 +175,126 @@ export const spacing = {
   xxl: 32,
 } as const;
 
+/**
+ * The type scale. Sizes are consolidated from the 21 ad-hoc per-screen values
+ * into named roles so hierarchy comes from the scale, not per-file tuning.
+ * `bodyLg` matches the HIG body convention (17pt) and `body` Material's
+ * Body Large (16sp); both sit above the former 14–15pt default that made
+ * screens read as fine print.
+ */
+export const type = {
+  /** Celebration numerals and hero moments. */
+  display: { fontSize: 34, lineHeight: 41 } as const,
+  /** Level reveals and large outcomes. */
+  titleLg: { fontSize: 28, lineHeight: 34 } as const,
+  /** Screen-level headlines (feedback titles, level). */
+  title: { fontSize: 24, lineHeight: 30 } as const,
+  /** Card and section titles. */
+  headline: { fontSize: 20, lineHeight: 26 } as const,
+  /** Primary content text (HIG body). */
+  bodyLg: { fontSize: 17, lineHeight: 24 } as const,
+  /** Supporting content text (Material body large). */
+  body: { fontSize: 16, lineHeight: 23 } as const,
+  /** Compact supporting copy. */
+  callout: { fontSize: 15, lineHeight: 21 } as const,
+  /** Captions, helper lines. */
+  footnote: { fontSize: 13, lineHeight: 18 } as const,
+  /** Uppercase labels, badges, chips. */
+  caption: { fontSize: 12, lineHeight: 16 } as const,
+} as const;
+
+/**
+ * Motion durations (ms) and easings. NN/g's research range for interface
+ * motion is 100–500ms: ~100ms for state feedback, 200–300ms for entrances.
+ * `overshoot` is the celebration curve (Duolingo's bounce token);
+ * celebrations alone may exceed the plain range.
+ */
+export const motion = {
+  /** Press feedback, toggles, chips. */
+  fast: 120,
+  /** Entrances, layout changes, sheet-like transitions. */
+  base: 220,
+  /** Celebrations and hero moments. */
+  slow: 340,
+  easing: {
+    /** M3 standard curve: symmetric, for moves and fades. */
+    standard: Easing.bezier(0.2, 0, 0, 1),
+    /** Fast-out slow-in: entering elements settle (NN/g recommendation). */
+    decelerate: Easing.bezier(0.05, 0.7, 0.1, 1),
+    /** Accelerating exit. */
+    accelerate: Easing.bezier(0.3, 0, 1, 1),
+    /** Playful overshoot for rewards and level-ups only. */
+    overshoot: Easing.bezier(0.68, -0.55, 0.265, 1.55),
+  },
+} as const;
+
 export type ColorScheme = 'light' | 'dark';
+
+/**
+ * Elevation presets, tuned per scheme: light casts soft shadows, dark leans on
+ * a stronger cast plus the elevated card fill (black shadows vanish on the
+ * dark background). `resting` cards stay quiet; `raised` is for floating
+ * controls (record button, banners); `overlay` for celebration panels.
+ */
+export interface ThemeElevation {
+  shadowColor: string;
+  shadowOpacity: number;
+  shadowRadius: number;
+  shadowOffset: { width: number; height: number };
+  elevation: number;
+}
+
+export const elevations: Record<
+  ColorScheme,
+  { resting: ThemeElevation; raised: ThemeElevation; overlay: ThemeElevation }
+> = {
+  light: {
+    resting: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.04,
+      shadowRadius: 6,
+      shadowOffset: { width: 0, height: 2 },
+      elevation: 1,
+    },
+    raised: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.16,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 4 },
+      elevation: 5,
+    },
+    overlay: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.24,
+      shadowRadius: 18,
+      shadowOffset: { width: 0, height: 8 },
+      elevation: 8,
+    },
+  },
+  dark: {
+    resting: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.2,
+      shadowRadius: 6,
+      shadowOffset: { width: 0, height: 2 },
+      elevation: 1,
+    },
+    raised: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.5,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 4 },
+      elevation: 5,
+    },
+    overlay: {
+      shadowColor: '#000000',
+      shadowOpacity: 0.65,
+      shadowRadius: 18,
+      shadowOffset: { width: 0, height: 8 },
+      elevation: 8,
+    },
+  },
+};
 
 export interface Theme {
   scheme: ColorScheme;
@@ -159,12 +302,33 @@ export interface Theme {
   spacing: typeof spacing;
   radii: typeof radii;
   layout: typeof layout;
+  type: typeof type;
+  motion: typeof motion;
+  elevation: { resting: ThemeElevation; raised: ThemeElevation; overlay: ThemeElevation };
 }
 
 /** Built once per scheme so consumers get referentially stable themes. */
 const themes: Record<ColorScheme, Theme> = {
-  light: { scheme: 'light', colors: lightColors, spacing, radii, layout },
-  dark: { scheme: 'dark', colors: darkColors, spacing, radii, layout },
+  light: {
+    scheme: 'light',
+    colors: lightColors,
+    spacing,
+    radii,
+    layout,
+    type,
+    motion,
+    elevation: elevations.light,
+  },
+  dark: {
+    scheme: 'dark',
+    colors: darkColors,
+    spacing,
+    radii,
+    layout,
+    type,
+    motion,
+    elevation: elevations.dark,
+  },
 };
 
 /**

@@ -2032,12 +2032,17 @@ describe('settings screen layout', () => {
   it('lays every account row on the shared row scale and tints it while held', async () => {
     await renderSettings();
 
+    // Rows are icon + label (+ chevron) rows: centred on the cross axis and
+    // spaced on the 4-pt scale.
     const restingRow = {
       minHeight: layout.minimumTarget,
       justifyContent: 'center',
       paddingVertical: spacing.md,
       borderBottomWidth: 1,
       borderBottomColor: colors.border,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
     };
     const heldRow = { ...restingRow, backgroundColor: colors.background };
     for (const name of [

@@ -92,38 +92,13 @@ function RootNavigator() {
           />
         </Stack.Protected>
         <Stack.Protected guard={canPractice}>
-          <Stack.Screen
-            name="home"
-            options={{
-              title: t('header.home'),
-              headerBackVisible: false,
-              gestureEnabled: false,
-            }}
-          />
-          <Stack.Screen
-            name="practice/index"
-            options={{
-              title: t('header.practice'),
-              // The screen relaxes these while no recording/upload holds the
-              // interaction lock; locked exits would discard the take.
-              headerBackVisible: false,
-              gestureEnabled: false,
-            }}
-          />
-          <Stack.Screen name="practice/help" options={{ title: t('header.help') }} />
-          <Stack.Screen name="practice/attempt" options={{ title: t('header.attempt') }} />
-          <Stack.Screen
-            name="practice/feedback"
-            options={{
-              title: t('header.feedback'),
-              headerBackVisible: false,
-              gestureEnabled: false,
-            }}
-          />
-          <Stack.Screen name="history" options={{ title: t('header.history') }} />
+          {/* Bottom-tab navigation: Home, Practice (flow stack), History,
+              Recordings. Settings remains a pushed stack screen so the
+              signed-out legal screens and the mid-diagnostic entry keep their
+              existing paths and guards. */}
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         </Stack.Protected>
         <Stack.Protected guard={hasProfile}>
-          <Stack.Screen name="recordings" options={{ title: t('header.recordings') }} />
           <Stack.Screen name="settings/index" options={{ title: t('header.settings') }} />
           <Stack.Screen
             name="settings/change-password"

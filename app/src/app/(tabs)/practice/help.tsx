@@ -4,15 +4,15 @@ import { router, useLocalSearchParams } from 'expo-router';
 import { useQuery } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import Button from '../../components/Button';
-import DataRefreshNotice from '../../components/DataRefreshNotice';
-import OfflineState from '../../components/OfflineState';
-import { apiFetch, userMessageForError } from '../../lib/api';
-import { useAuth } from '../../lib/auth';
-import { useT } from '../../lib/i18n';
-import { firstParam, isUuid } from '../../lib/params';
-import { createThemedStyles, useTheme } from '../../lib/theme';
-import { parseHelpContent, type NativeLanguage } from '../../lib/types';
+import Button from '../../../components/Button';
+import DataRefreshNotice from '../../../components/DataRefreshNotice';
+import OfflineState from '../../../components/OfflineState';
+import { apiFetch, userMessageForError } from '../../../lib/api';
+import { useAuth } from '../../../lib/auth';
+import { useT } from '../../../lib/i18n';
+import { firstParam, isUuid } from '../../../lib/params';
+import { createThemedStyles, useTheme } from '../../../lib/theme';
+import { parseHelpContent, type NativeLanguage } from '../../../lib/types';
 
 const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
   te: 'te-IN',

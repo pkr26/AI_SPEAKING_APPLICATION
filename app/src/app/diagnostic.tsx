@@ -12,7 +12,11 @@ import { router, useFocusEffect } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 
 import Button from '../components/Button';
+import Confetti from '../components/Confetti';
+import Icon from '../components/Icon';
 import OfflineState from '../components/OfflineState';
+import ProgressBar from '../components/ProgressBar';
+import WordTaggedTranscript from '../components/WordTaggedTranscript';
 import Recorder, {
   scrollToExpandedRecorderControls,
   type RecorderResultMetadata,
@@ -747,13 +751,15 @@ export default function DiagnosticScreen() {
         contentInsetAdjustmentBehavior="automatic"
         contentContainerStyle={styles.centerScroll}
       >
-        <Text
+        <Confetti testID="diagnostic-confetti" />
+        <View
           accessibilityElementsHidden
           importantForAccessibility="no-hide-descendants"
-          style={styles.congratsEmoji}
+          testID="diagnostic-complete-badge"
+          style={styles.congratsBadge}
         >
-          🎉
-        </Text>
+          <Icon name="trophy" size={38} color={theme.colors.onAccent} strokeWidth={2.1} />
+        </View>
         {/* Live region gives TalkBack the same level-reveal transition iOS
             receives through the queued step announcement below. */}
         <Text
@@ -858,12 +864,26 @@ export default function DiagnosticScreen() {
       ) : (
         <>
           {currentProgress && (
-            <Text style={styles.progressText}>
-              {t('diag.progress', {
-                current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
-                max: currentProgress.maxQuestions,
-              })}
-            </Text>
+            <>
+              <Text style={styles.progressText}>
+                {t('diag.progress', {
+                  current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
+                  max: currentProgress.maxQuestions,
+                })}
+              </Text>
+              <View style={styles.progressBar}>
+                <ProgressBar
+                  progress={
+                    currentProgress.maxQuestions > 0
+                      ? Math.min(1, currentProgress.asked / currentProgress.maxQuestions)
+                      : 0
+                  }
+                  accessibilityLabel={t('header.diagnostic')}
+                  fill={theme.colors.primary}
+                  testID="diagnostic-progress"
+                />
+              </View>
+            </>
           )}
 
           <View style={styles.card}>
@@ -902,9 +922,12 @@ export default function DiagnosticScreen() {
                     })}
                   </Text>
                   <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
-                  <Text accessibilityLanguage="en-US" selectable style={styles.transcriptText}>
-                    {currentResult.transcript}
-                  </Text>
+                  <WordTaggedTranscript
+                    transcript={currentResult.transcript}
+                    wordScores={currentResult.wordScores}
+                    accessibilityLanguage="en-US"
+                    testID="diagnostic-word-transcript"
+                  />
                   <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
                   <Text accessibilityLanguage="en-US" style={styles.feedbackText}>
                     {currentResult.feedback}
@@ -971,6 +994,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
     backgroundColor: colors.background,
+  },
+  progressBar: {
+    marginTop: spacing.xs,
+    marginBottom: spacing.sm,
   },
   progressText: {
     marginTop: spacing.xs,
@@ -1076,8 +1103,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     lineHeight: 22,
     textAlign: 'center',
   },
-  congratsEmoji: {
-    fontSize: 56,
+  congratsBadge: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.accent,
+    marginBottom: spacing.sm,
   },
   congratsTitle: {
     marginTop: spacing.md,

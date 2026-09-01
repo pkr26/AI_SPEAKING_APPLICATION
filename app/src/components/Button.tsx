@@ -11,7 +11,7 @@ import {
 import { createThemedStyles, useTheme } from '../lib/theme';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'danger' | 'quiet';
-export type ButtonSize = 'md' | 'sm';
+export type ButtonSize = 'lg' | 'md' | 'sm';
 
 export interface ButtonProps {
   /** Visible label; also the accessible name unless a label is provided. */
@@ -37,7 +37,7 @@ export interface ButtonProps {
   style?: StyleProp<ViewStyle>;
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
   base: {
     minHeight: layout.minimumTarget,
     maxWidth: '100%',
@@ -46,6 +46,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     justifyContent: 'center',
     gap: spacing.sm,
     borderRadius: radii.button,
+  },
+  lg: {
+    paddingVertical: spacing.ml,
+    paddingHorizontal: spacing.xl,
   },
   md: {
     paddingVertical: spacing.md,
@@ -59,16 +63,28 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'stretch',
   },
   pressed: {
-    transform: [{ scale: 0.985 }],
+    transform: [{ scale: 0.97 }, { translateY: 1 }],
   },
   disabled: {
     opacity: 0.5,
   },
   primary: {
     backgroundColor: colors.primary,
+    // A hard bottom edge (no blur) reads as a physical key; pressing it
+    // collapses the edge (see primaryPressed) so the tap feels mechanical
+    // rather than painted. Dark keeps a stronger cast for the same reason the
+    // record button does: black shadows vanish on the dark background.
+    shadowColor: colors.shadow,
+    shadowOpacity: scheme === 'dark' ? 0.55 : 0.28,
+    shadowRadius: 0,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 3,
   },
   primaryPressed: {
     backgroundColor: colors.primaryDark,
+    shadowOpacity: scheme === 'dark' ? 0.3 : 0.12,
+    shadowOffset: { width: 0, height: 1 },
+    elevation: 1,
   },
   secondary: {
     borderWidth: 1,
@@ -89,14 +105,20 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   text: {
     flexShrink: 1,
-    fontWeight: '600',
+    fontWeight: '700',
     textAlign: 'center',
+  },
+  lgText: {
+    fontSize: 18,
+    lineHeight: 24,
   },
   mdText: {
     fontSize: 17,
+    lineHeight: 23,
   },
   smText: {
     fontSize: 15,
+    lineHeight: 20,
   },
   primaryText: {
     color: colors.onPrimary,

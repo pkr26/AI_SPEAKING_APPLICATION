@@ -1521,13 +1521,18 @@ describe('diagnostic screen', () => {
     expect(
       screen.getByText(t('diag.answerLine', { number: 1, score: 91, mark: '✓' })),
     ).toBeTruthy();
-    // The celebration emoji is decorative: hidden from screen readers (and so
-    // from default queries), while the headline carries the meaning.
-    expect(screen.queryByText('🎉')).toBeNull();
-    expect(screen.getByText('🎉', { includeHiddenElements: true }).props).toMatchObject({
-      accessibilityElementsHidden: true,
-      importantForAccessibility: 'no-hide-descendants',
+    // The celebration mark and confetti are decorative: hidden from screen
+    // readers (and so from default queries), while the headline carries the
+    // meaning.
+    const badge = screen.getByTestId('diagnostic-complete-badge', {
+      includeHiddenElements: true,
     });
+    expect(badge.props.accessibilityElementsHidden).toBe(true);
+    expect(badge.props.importantForAccessibility).toBe('no-hide-descendants');
+    expect(
+      screen.getByTestId('diagnostic-confetti', { includeHiddenElements: true }).props
+        .accessibilityElementsHidden,
+    ).toBe(true);
 
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('diag.startPracticing') }),
@@ -2651,6 +2656,12 @@ describe('diagnostic presentation', () => {
     backgroundColor: colors.primary,
     alignSelf: 'stretch',
     marginTop: spacing.lg,
+    // The shared primary button's hard bottom edge (see Button).
+    shadowColor: colors.shadow,
+    shadowOpacity: 0.28,
+    shadowRadius: 0,
+    shadowOffset: { width: 0, height: 3 },
+    elevation: 3,
   };
 
   it('centres the preparing state on the page tokens', async () => {
@@ -2792,10 +2803,13 @@ describe('diagnostic presentation', () => {
       fontWeight: '700',
       color: colors.text,
     });
+    // The transcript renders through the shared word-tagged view: same
+    // quotation-free fallback text, on the shared chip scale.
     expect(flattenedStyle(screen.getByText('An answer.'))).toEqual({
-      marginTop: spacing.xs,
-      fontSize: 17,
-      lineHeight: 25,
+      marginTop: spacing.sm,
+      fontSize: 18,
+      fontWeight: '600',
+      lineHeight: 27,
       color: colors.text,
     });
     expect(flattenedStyle(screen.getByText('Great answer.'))).toEqual({
@@ -2836,9 +2850,20 @@ describe('diagnostic presentation', () => {
       alignSelf: 'center',
       backgroundColor: colors.background,
     });
-    expect(flattenedStyle(screen.getByText('🎉', { includeHiddenElements: true }))).toEqual({
-      fontSize: 56,
+    expect(
+      flattenedStyle(
+        screen.getByTestId('diagnostic-complete-badge', { includeHiddenElements: true }),
+      ),
+    ).toEqual({
+      width: 84,
+      height: 84,
+      borderRadius: 42,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.accent,
+      marginBottom: spacing.sm,
     });
+    expect(screen.getByTestId('diagnostic-confetti', { includeHiddenElements: true })).toBeTruthy();
     expect(flattenedStyle(screen.getByText(t('diag.completeTitle')))).toEqual({
       marginTop: spacing.md,
       fontSize: 26,

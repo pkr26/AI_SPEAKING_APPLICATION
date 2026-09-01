@@ -8,7 +8,7 @@ import React from 'react';
 import { BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
-import HomeScreen from '../src/app/home';
+import HomeScreen from '../src/app/(tabs)/home';
 import { apiGetPracticeStats } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
 import { translateFor, type MessageKey } from '../src/lib/i18n';
@@ -152,7 +152,7 @@ describe('home screen in dark mode', () => {
     // Greeting uses the dark muted ink.
     expect(
       flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name }))),
-    ).toMatchObject({ color: darkColors.muted });
+    ).toMatchObject({ color: darkColors.text });
 
     // The primary CTA picks the dark accent fill and dark on-fill ink.
     const cta = screen.getByRole('button', { name: t('home.startPractice') });
@@ -167,10 +167,13 @@ describe('home screen in dark mode', () => {
       backgroundColor: darkColors.border,
     });
 
-    // Level accent text is the light indigo tint, not the light-mode indigo.
+    // The level figure rides in its StatTile with full body ink; the tile's
+    // tinted background is the dark accent surface, not the light-mode one.
+    const levelTile = screen.getByTestId('home-level-tile');
     expect(flattenedStyle(screen.getByText('B1'))).toMatchObject({
-      color: darkColors.primary,
+      color: darkColors.text,
     });
+    expect(flattenedStyle(levelTile)).toMatchObject({ backgroundColor: darkColors.primaryLight });
     expect(darkColors.primary).not.toBe(lightColors.primary);
   });
 

@@ -549,6 +549,65 @@ describe('practice contract parsers', () => {
     expectContractError(() => parseHelpContent(value));
   });
 
+  it('accepts additive word tags on scored answers and rejects malformed ones', () => {
+    const scored = {
+      cycleId,
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 50,
+      transcript: 'I brung courage.',
+      feedback: 'Add more detail.',
+      wordScores: [
+        { word: 'I', status: 'good' },
+        { word: 'brung', status: 'poor' },
+        { word: 'courage', status: 'fair' },
+      ],
+    };
+    const parsed = parseAttemptResult(scored);
+    expect(parsed.wordScores).toEqual(scored.wordScores);
+    // Absent tags stay absent: older deployments' scored answers parse clean.
+    const { wordScores: _omitted, ...untagged } = scored;
+    void _omitted;
+    expect('wordScores' in parseAttemptResult(untagged)).toBe(false);
+
+    expectContractError(() =>
+      parseAttemptResult({ ...scored, wordScores: [{ word: 'brung', status: 'excellent' }] }),
+    );
+    expectContractError(() =>
+      parseAttemptResult({ ...scored, wordScores: [{ word: '   ', status: 'good' }] }),
+    );
+    expectContractError(() => parseAttemptResult({ ...scored, wordScores: 'good' }));
+    // Silence never carries tags: both parsers reject the combination.
+    expectContractError(() =>
+      parseAttemptResult({
+        cycleId,
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 3,
+        noSpeech: true,
+        score: 0,
+        transcript: '',
+        feedback: 'Try again.',
+        wordScores: [{ word: 'no', status: 'good' }],
+      }),
+    );
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: 'Try again.',
+        noSpeech: true,
+        done: false,
+        nextQuestion: question,
+        wordScores: [{ word: 'no', status: 'good' }],
+      }),
+    );
+  });
+
   it('rejects array and wrong-boolean attempt envelopes that otherwise satisfy the contract', () => {
     const passedAttempt = {
       cycleId,

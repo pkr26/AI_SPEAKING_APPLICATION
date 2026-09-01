@@ -1,17 +1,21 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { ScrollView, Text, View, type StyleProp, type TextStyle } from 'react-native';
+import { ScrollView, Text, View } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useQueryClient } from '@tanstack/react-query';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import * as Haptics from 'expo-haptics';
 
-import Button from '../../components/Button';
-import RecordingPlayback from '../../components/RecordingPlayback';
-import { useAuth } from '../../lib/auth';
-import { useT } from '../../lib/i18n';
-import { acknowledgePendingAssessmentFeedback } from '../../lib/pending-assessment';
-import { usePracticeFlow } from '../../lib/practice-flow';
-import { createThemedStyles, useTheme } from '../../lib/theme';
+import Button from '../../../components/Button';
+import Confetti from '../../../components/Confetti';
+import Icon, { type IconName } from '../../../components/Icon';
+import RecordingPlayback from '../../../components/RecordingPlayback';
+import WordTaggedTranscript from '../../../components/WordTaggedTranscript';
+import ScoreRing from '../../../components/ScoreRing';
+import { useAuth } from '../../../lib/auth';
+import { useT } from '../../../lib/i18n';
+import { acknowledgePendingAssessmentFeedback } from '../../../lib/pending-assessment';
+import { usePracticeFlow } from '../../../lib/practice-flow';
+import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
   isNativeOutcome,
   PRACTICE_MASTER_SCORE,
@@ -20,8 +24,8 @@ import {
   type NativeLanguage,
   type PracticeOutcome,
   type Question,
-} from '../../lib/types';
-import { useHardwareBack } from '../../lib/use-hardware-back';
+} from '../../../lib/types';
+import { useHardwareBack } from '../../../lib/use-hardware-back';
 
 type Variant =
   | 'native'
@@ -48,12 +52,49 @@ const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
   zh: 'zh-Hans',
 };
 
-/** Celebration art only; screen readers get the adjacent title instead. */
-function DecorativeEmoji({ children, style }: { children: string; style: StyleProp<TextStyle> }) {
+/** Per-variant outcome art: icon, its ink, and the tint behind the header. */
+interface OutcomeArt {
+  icon: IconName;
+  ink: 'success' | 'danger' | 'warning' | 'accent' | 'primary';
+}
+
+const OUTCOME_ART: Record<Variant, OutcomeArt> = {
+  native: { icon: 'globe', ink: 'success' },
+  'native-final': { icon: 'book', ink: 'danger' },
+  'native-nospeech': { icon: 'mic', ink: 'warning' },
+  nospeech: { icon: 'mic', ink: 'warning' },
+  levelup: { icon: 'trending-up', ink: 'accent' },
+  mastered: { icon: 'trophy', ink: 'accent' },
+  passed: { icon: 'check', ink: 'success' },
+  retry: { icon: 'refresh', ink: 'warning' },
+  final: { icon: 'book', ink: 'danger' },
+};
+
+/**
+ * Celebration mark only; screen readers get the adjacent title instead. The
+ * badge is a filled circle in the outcome's semantic ink with a light glyph —
+ * the emoji art it replaces rendered differently per device vendor and could
+ * not be tinted to the palette.
+ */
+function OutcomeBadge({ art, testID }: { art: OutcomeArt; testID: string }) {
+  const theme = useTheme();
+  const ink = theme.colors[art.ink === 'accent' ? 'accent' : art.ink];
   return (
-    <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={style}>
-      {children}
-    </Text>
+    <View
+      accessibilityElementsHidden
+      importantForAccessibility="no-hide-descendants"
+      testID={testID}
+      style={{
+        width: 84,
+        height: 84,
+        borderRadius: 42,
+        alignItems: 'center',
+        justifyContent: 'center',
+        backgroundColor: ink,
+      }}
+    >
+      <Icon name={art.icon} size={38} color={theme.colors.card} strokeWidth={2.1} />
+    </View>
   );
 }
 
@@ -165,11 +206,19 @@ export default function FeedbackScreen() {
             : 'final';
   }
 
-  // Mastery (and the level-up it can earn) deserves a physical cheer; haptics
-  // are best effort (web/simulator).
+  // Mastery (and the level-up it can earn) deserves a physical cheer; the
+  // out-of-tries end of a word gets the gentler warning buzz. Haptics are
+  // best effort (web/simulator).
   useEffect(() => {
-    if (variant !== 'mastered' && variant !== 'levelup') return;
-    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+    if (variant === 'mastered' || variant === 'levelup') {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(
+        () => undefined,
+      );
+    } else if (variant === 'final' || variant === 'native-final') {
+      void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(
+        () => undefined,
+      );
+    }
   }, [result, variant]);
 
   // Every processed spoken attempt changes the home stats and history list.
@@ -359,13 +408,23 @@ export default function FeedbackScreen() {
     <View style={styles.container}>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
         {/* Only the outcome headline and score announce themselves; the rest
-            of the card is reachable without being read out all at once. */}
-        <View accessibilityLiveRegion="polite" style={styles.liveHeader}>
+            of the card is reachable without being read out all at once. The
+            panel is tinted with the outcome's semantic color so the result is
+            readable at a glance, before a single word is read. */}
+        <View
+          accessibilityLiveRegion="polite"
+          style={[
+            styles.outcomePanel,
+            variant ? styles[`panel_${OUTCOME_ART[variant].ink}`] : null,
+          ]}
+        >
+          {(variant === 'mastered' || variant === 'levelup') && (
+            <Confetti testID="feedback-confetti" />
+          )}
+          {variant && <OutcomeBadge art={OUTCOME_ART[variant]} testID="feedback-outcome-badge" />}
+
           {variant === 'native' && isNativeOutcome(result) && (
             <>
-              <DecorativeEmoji style={styles.emoji}>
-                {result.understood ? '🌏' : '🧩'}
-              </DecorativeEmoji>
               <Text
                 accessibilityRole="header"
                 style={[
@@ -387,7 +446,6 @@ export default function FeedbackScreen() {
 
           {variant === 'native-nospeech' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>🎤</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
                 {t('feedback.noSpeechTitle')}
               </Text>
@@ -397,7 +455,6 @@ export default function FeedbackScreen() {
 
           {variant === 'native-final' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>📘</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.danger }]}>
                 {t('feedback.nativeFinalTitle')}
               </Text>
@@ -407,7 +464,6 @@ export default function FeedbackScreen() {
 
           {variant === 'nospeech' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>🎤</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
                 {t('feedback.noSpeechTitle')}
               </Text>
@@ -417,8 +473,7 @@ export default function FeedbackScreen() {
 
           {variant === 'levelup' && !isNativeOutcome(result) && result.levelUp && (
             <>
-              <DecorativeEmoji style={styles.emoji}>🚀</DecorativeEmoji>
-              <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
+              <Text accessibilityRole="header" style={[styles.title, { color: colors.accent }]}>
                 {t('levelUp.title')}
               </Text>
               <Text style={styles.levelUpBody}>
@@ -436,8 +491,7 @@ export default function FeedbackScreen() {
 
           {variant === 'mastered' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>🏆</DecorativeEmoji>
-              <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
+              <Text accessibilityRole="header" style={[styles.title, { color: colors.accent }]}>
                 {t('feedback.masteredTitle')}
               </Text>
               <Text style={styles.subtitle}>
@@ -448,7 +502,6 @@ export default function FeedbackScreen() {
 
           {variant === 'passed' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>🎉</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.success }]}>
                 {t('feedback.passedTitle')}
               </Text>
@@ -460,7 +513,6 @@ export default function FeedbackScreen() {
 
           {variant === 'retry' && !isNativeOutcome(result) && (
             <>
-              <DecorativeEmoji style={styles.emoji}>💪</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.warning }]}>
                 {t('feedback.retryTitle', {
                   // The practice-screen attempt chip counts the UPCOMING try
@@ -481,7 +533,6 @@ export default function FeedbackScreen() {
 
           {variant === 'final' && (
             <>
-              <DecorativeEmoji style={styles.emoji}>📘</DecorativeEmoji>
               <Text accessibilityRole="header" style={[styles.title, { color: colors.danger }]}>
                 {t('feedback.finalTitle')}
               </Text>
@@ -497,20 +548,26 @@ export default function FeedbackScreen() {
           </Text>
 
           {!isNativeOutcome(result) && variant !== 'nospeech' && (
-            <>
-              <Text style={styles.scoreLine}>
-                {t('feedback.scoreLine', { score: result.score })}
-              </Text>
-              <Text style={styles.scoreMeaning}>
-                {t('feedback.scoreMeaning', {
-                  pass: PRACTICE_PASS_SCORE,
-                  master: PRACTICE_MASTER_SCORE,
-                })}
-              </Text>
-            </>
+            <ScoreRing
+              score={result.score}
+              size={132}
+              thickness={11}
+              color={
+                variant === 'final'
+                  ? colors.danger
+                  : variant === 'retry'
+                    ? colors.warning
+                    : colors.success
+              }
+              label={t('feedback.scoreMeaning', {
+                pass: PRACTICE_PASS_SCORE,
+                master: PRACTICE_MASTER_SCORE,
+              })}
+              accessibilityLabel={t('feedback.scoreLine', { score: result.score })}
+              testID="feedback-score-ring"
+            />
           )}
         </View>
-
         <View style={styles.card}>
           {card?.question && (
             <View style={styles.questionSummary}>
@@ -539,17 +596,17 @@ export default function FeedbackScreen() {
                     })
                   : t('feedback.weHeard')}
               </Text>
-              <Text
+              <WordTaggedTranscript
+                transcript={result.transcript}
+                quoted
+                wordScores={isNativeOutcome(result) ? undefined : result.wordScores}
                 accessibilityLanguage={
                   isNativeOutcome(result)
                     ? NATIVE_ACCESSIBILITY_LANGUAGES[result.nativeLanguage]
                     : 'en-US'
                 }
-                selectable
-                style={styles.transcript}
-              >
-                “{result.transcript}”
-              </Text>
+                testID="feedback-word-transcript"
+              />
             </View>
           )}
 
@@ -606,7 +663,7 @@ export default function FeedbackScreen() {
             <Button
               title={t('common.tryAgain')}
               fullWidth
-              size="md"
+              size="lg"
               disabled={cardActionBusy}
               onPress={retry}
             />
@@ -620,7 +677,7 @@ export default function FeedbackScreen() {
             <Button
               title={t('feedback.nextQuestion')}
               fullWidth
-              size="md"
+              size="lg"
               disabled={cardActionBusy}
               onPress={goToNextQuestion}
             />
@@ -631,7 +688,7 @@ export default function FeedbackScreen() {
               <Button
                 title={t('feedback.tryInEnglish')}
                 fullWidth
-                size="md"
+                size="lg"
                 disabled={cardActionBusy}
                 onPress={tryInEnglish}
               />
@@ -650,7 +707,7 @@ export default function FeedbackScreen() {
             <Button
               title={t('feedback.tryAgainNative')}
               fullWidth
-              size="md"
+              size="lg"
               disabled={cardActionBusy}
               onPress={backToPractice}
             />
@@ -661,7 +718,7 @@ export default function FeedbackScreen() {
               <Button
                 title={t('common.tryAgain')}
                 fullWidth
-                size="md"
+                size="lg"
                 disabled={cardActionBusy}
                 onPress={retry}
               />
@@ -707,13 +764,23 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'stretch',
     alignItems: 'center',
   },
-  emoji: {
-    fontSize: 52,
-    marginTop: spacing.md,
+  outcomePanel: {
+    alignSelf: 'stretch',
+    alignItems: 'center',
+    borderRadius: radii.card,
+    paddingVertical: spacing.xl,
+    paddingHorizontal: spacing.lg,
+    overflow: 'hidden',
   },
+  panel_success: { backgroundColor: colors.successLight },
+  panel_danger: { backgroundColor: colors.dangerLight },
+  panel_warning: { backgroundColor: colors.card },
+  panel_accent: { backgroundColor: colors.accentLight },
+  panel_primary: { backgroundColor: colors.primaryLight },
   title: {
     marginTop: spacing.md,
     fontSize: 24,
+    lineHeight: 30,
     fontWeight: '800',
     textAlign: 'center',
   },
@@ -728,18 +795,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 20,
     fontWeight: '800',
     color: colors.primary,
-    textAlign: 'center',
-  },
-  scoreLine: {
-    marginTop: spacing.ml,
-    fontSize: 28,
-    fontWeight: '800',
-    color: colors.primary,
-  },
-  scoreMeaning: {
-    marginTop: spacing.xs,
-    fontSize: 13,
-    color: colors.muted,
     textAlign: 'center',
   },
   attemptLine: {

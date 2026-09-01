@@ -1007,27 +1007,27 @@ describe('reset-password screen', () => {
     const confirmationToggle = screen.getByLabelText(t('password.showConfirmation'));
     expect(confirmationToggle.props.accessibilityRole).toBe('button');
     expect(confirmationToggle.props.accessibilityLabel).toBe(t('password.showConfirmation'));
-    // The visible label mirrors the accessible name of the same control.
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
-    expect(screen.queryByText(t('common.hide'))).toBeNull();
+    // Both secrets start masked with the eye glyph.
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
+    expect(screen.queryByTestId('password-toggle-hide')).toBeNull();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.showPassword') }));
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(false);
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(1);
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(1);
+    expect(screen.getAllByTestId('password-toggle-hide')).toHaveLength(1);
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.hidePassword') }));
     expect(screen.getByLabelText(t('cp.newLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.getAllByText(t('common.show'))).toHaveLength(2);
+    expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
 
     await fireEvent.press(screen.getByRole('button', { name: t('password.showConfirmation') }));
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(false);
-    expect(screen.getByText(t('common.hide'))).toBeTruthy();
     expect(screen.getByRole('button', { name: t('password.hideConfirmation') })).toBeTruthy();
+    expect(screen.getAllByTestId('password-toggle-hide')).toHaveLength(1);
 
     await fireEvent.press(screen.getByRole('button', { name: t('password.hideConfirmation') }));
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.queryByText(t('common.hide'))).toBeNull();
+    expect(screen.queryByTestId('password-toggle-hide')).toBeNull();
   });
 
   it('chains email to code to password confirmation and submits from confirmation', async () => {
@@ -1248,20 +1248,10 @@ describe('reset-password screen', () => {
     });
     expect(flattenedStyle(password)).toEqual({ ...restingInput, flex: 1, minWidth: 0 });
     expect(flattenedStyle(screen.getByRole('button', { name: t('common.showPassword') }))).toEqual({
-      flexShrink: 1,
-      maxWidth: '45%',
-      minHeight: layout.minimumTarget,
-      minWidth: layout.minimumTarget,
-      justifyContent: 'center',
+      width: layout.minimumTarget,
+      height: layout.minimumTarget,
       alignItems: 'center',
-      paddingHorizontal: spacing.sm,
-    });
-    expect(flattenedStyle(screen.getAllByText(t('common.show'))[0])).toEqual({
-      flexShrink: 1,
-      color: colors.primary,
-      fontSize: 14,
-      fontWeight: '600',
-      textAlign: 'center',
+      justifyContent: 'center',
     });
   });
 

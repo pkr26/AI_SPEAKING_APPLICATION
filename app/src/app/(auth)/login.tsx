@@ -1,17 +1,11 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import {
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  ScrollView,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput, View } from 'react-native';
 import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import Icon from '../../components/Icon';
+import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
@@ -44,6 +38,9 @@ export default function LoginScreen() {
   const [password, setPassword] = useState('');
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [focusedField, setFocusedField] = useState<'email' | 'password' | null>(null);
+  // Inline validation waits for the learner to leave the field (NN/g: erroring
+  // mid-typing is a hostile pattern; the submit gate still checks live).
+  const [emailTouched, setEmailTouched] = useState(false);
   const [sessionNotice, setSessionNotice] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -132,6 +129,9 @@ export default function LoginScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <View style={styles.brandMark}>
+            <Icon name="mic" size={30} color={theme.colors.primary} strokeWidth={2.1} />
+          </View>
           <Text accessibilityRole="header" style={styles.brand}>
             {t('login.title')}
           </Text>
@@ -172,7 +172,10 @@ export default function LoginScreen() {
                 setError(null);
               }}
               onFocus={() => setFocusedField('email')}
-              onBlur={() => setFocusedField(null)}
+              onBlur={() => {
+                setFocusedField(null);
+                setEmailTouched(true);
+              }}
               placeholder={t('login.emailPlaceholder')}
               placeholderTextColor={colors.muted}
               autoCapitalize="none"
@@ -185,7 +188,7 @@ export default function LoginScreen() {
               maxLength={MAX_EMAIL_LENGTH}
               editable={!busy}
             />
-            {emailError && (
+            {emailTouched && emailError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
                 {emailError}
               </Text>
@@ -224,19 +227,14 @@ export default function LoginScreen() {
                 maxLength={MAX_PASSWORD_UTF8_BYTES}
                 editable={!busy}
               />
-              <Pressable
-                accessibilityRole="button"
+              <PasswordVisibilityToggle
+                visible={passwordVisible}
                 accessibilityLabel={
                   passwordVisible ? t('common.hidePassword') : t('common.showPassword')
                 }
                 disabled={busy}
-                onPress={() => setPasswordVisible((visible) => !visible)}
-                style={[styles.inputAction, busy && styles.controlDisabled]}
-              >
-                <Text style={styles.inputActionText}>
-                  {passwordVisible ? t('common.hide') : t('common.show')}
-                </Text>
-              </Pressable>
+                onToggle={() => setPasswordVisible((visible) => !visible)}
+              />
             </View>
             {passwordError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
@@ -296,6 +294,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     padding: spacing.xl,
     width: '100%',
     maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
+  },
+  brandMark: {
+    width: 68,
+    height: 68,
+    borderRadius: 34,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.primaryLight,
+    marginBottom: spacing.md,
     alignSelf: 'center',
   },
   brand: {
@@ -379,25 +387,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   inputWithAction: {
     flex: 1,
     minWidth: 0,
-  },
-  inputAction: {
-    flexShrink: 1,
-    maxWidth: '45%',
-    minHeight: layout.minimumTarget,
-    minWidth: layout.minimumTarget,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: spacing.sm,
-  },
-  inputActionText: {
-    flexShrink: 1,
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  controlDisabled: {
-    opacity: 0.5,
   },
   error: {
     marginTop: 14,

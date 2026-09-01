@@ -16,12 +16,21 @@ import RecordingsScreen, {
   recordingContextMessageKey,
   RECORDING_DATE_LOCALES,
   recordingsThemedStyles,
-} from '../src/app/recordings';
+} from '../src/app/(tabs)/recordings';
 import RecordingPlayback from '../src/components/RecordingPlayback';
 import { apiGetRecordings } from '../src/lib/api';
 import { type SessionLease, useAuth } from '../src/lib/auth';
 import { I18nProvider, translateFor, type UiLanguage } from '../src/lib/i18n';
-import { layout, lightColors, radii, spacing } from '../src/lib/theme';
+import {
+  colors,
+  elevations,
+  layout,
+  lightColors,
+  motion,
+  radii,
+  spacing,
+  type,
+} from '../src/lib/theme';
 import type { RecordingItem, RecordingPage, User } from '../src/lib/types';
 
 const t = (key: Parameters<typeof translateFor>[1], params?: Record<string, string | number>) =>
@@ -148,21 +157,32 @@ async function renderRecordings(
   return Object.assign(view, { client });
 }
 
-function expectScrollableState(): void {
+function expectScrollableState(empty = false): void {
   const [stateScroll] = screen.container.queryAll(
     (candidate) => candidate.props.contentContainerStyle !== undefined,
   );
   expect(stateScroll?.props.contentInsetAdjustmentBehavior).toBe('automatic');
-  expect(StyleSheet.flatten(stateScroll?.props.contentContainerStyle)).toEqual({
-    flexGrow: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl,
-    width: '100%',
-    maxWidth: layout.contentMaxWidth,
-    alignSelf: 'center',
-    backgroundColor: lightColors.background,
-  });
+  expect(StyleSheet.flatten(stateScroll?.props.contentContainerStyle)).toEqual(
+    empty
+      ? // The shared EmptyState host: centered stack on the component's tokens.
+        {
+          flexGrow: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: spacing.xl,
+          gap: spacing.md,
+        }
+      : {
+          flexGrow: 1,
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: spacing.xl,
+          width: '100%',
+          maxWidth: layout.contentMaxWidth,
+          alignSelf: 'center',
+          backgroundColor: colors.background,
+        },
+  );
 }
 
 function refreshHandler(): () => void {
@@ -295,6 +315,9 @@ describe('recordings library', () => {
       layout,
       radii,
       spacing,
+      type,
+      motion,
+      elevation: elevations.light,
     });
     expect(styles).toEqual({
       list: { flex: 1, backgroundColor: lightColors.background },
@@ -422,7 +445,8 @@ describe('recordings library', () => {
     await waitFor(() =>
       expect(screen.getByText(t('recordings.emptyTitle')).props.accessibilityRole).toBe('header'),
     );
-    expectScrollableState();
+    expectScrollableState(true);
+    expect(screen.getByTestId('recordings-empty')).toBeTruthy();
     expect(screen.getByText(t('recordings.emptyBody'))).toBeTruthy();
     await act(async () => {
       refreshHandler()();

@@ -1,35 +1,22 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { router, useFocusEffect, useIsFocused } from 'expo-router';
 import React, { useCallback, useEffect, useMemo, useRef } from 'react';
-import {
-  ActivityIndicator,
-  RefreshControl,
-  ScrollView,
-  Text,
-  View,
-  type StyleProp,
-  type TextStyle,
-} from 'react-native';
+import { ActivityIndicator, RefreshControl, ScrollView, Text, View } from 'react-native';
 
-import Button from '../components/Button';
-import DataRefreshNotice from '../components/DataRefreshNotice';
-import HomeBannerAd from '../components/HomeBannerAd';
-import OfflineState from '../components/OfflineState';
-import { apiGetPracticeStats, userMessageForError } from '../lib/api';
-import { useAuth } from '../lib/auth';
-import { useT } from '../lib/i18n';
-import { usePracticeFlow } from '../lib/practice-flow';
-import { createThemedStyles, useTheme } from '../lib/theme';
-import { useHardwareBack } from '../lib/use-hardware-back';
-
-/** Decorative art (streak flame); screen readers get the adjacent text. */
-function DecorativeEmoji({ children, style }: { children: string; style: StyleProp<TextStyle> }) {
-  return (
-    <Text accessibilityElementsHidden importantForAccessibility="no-hide-descendants" style={style}>
-      {children}
-    </Text>
-  );
-}
+import Button from '../../components/Button';
+import DataRefreshNotice from '../../components/DataRefreshNotice';
+import HomeBannerAd from '../../components/HomeBannerAd';
+import Icon from '../../components/Icon';
+import OfflineState from '../../components/OfflineState';
+import ProgressBar from '../../components/ProgressBar';
+import Skeleton from '../../components/Skeleton';
+import StatTile from '../../components/StatTile';
+import { apiGetPracticeStats, userMessageForError } from '../../lib/api';
+import { useAuth } from '../../lib/auth';
+import { useT } from '../../lib/i18n';
+import { usePracticeFlow } from '../../lib/practice-flow';
+import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 
 /**
  * Post-diagnostic landing screen: mastery progress, streak, due-for-review
@@ -200,15 +187,23 @@ export default function HomeScreen() {
         (statsQuery.fetchStatus === 'paused' ? (
           <OfflineState />
         ) : (
-          <View style={styles.center}>
-            <ActivityIndicator
-              accessibilityLabel={t('home.loading')}
-              size="large"
-              color={theme.colors.primary}
-            />
-            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+          // The wait mirrors the loaded dashboard's structure so the page
+          // reads as its own content arriving (NN/g skeletons), while the
+          // polite line keeps the wait announced without sight.
+          <View style={styles.skeletonStack}>
+            <Text
+              accessibilityLiveRegion="polite"
+              accessibilityElementsHidden
+              style={styles.hiddenLoadingText}
+            >
               {t('home.loading')}
             </Text>
+            <View style={styles.skeletonTileRow}>
+              <Skeleton height={96} borderRadius={16} testID="home-skeleton-tile" />
+              <Skeleton height={96} borderRadius={16} />
+              <Skeleton height={96} borderRadius={16} />
+            </View>
+            <Skeleton height={120} borderRadius={16} testID="home-skeleton-card" />
           </View>
         ))}
 
@@ -238,19 +233,40 @@ export default function HomeScreen() {
       )}
 
       {stats && (
+        <View style={styles.statRow}>
+          <StatTile
+            icon="target"
+            value={level ?? '—'}
+            label={t('home.levelLabel')}
+            tint="primary"
+            testID="home-level-tile"
+          />
+          <StatTile
+            icon="flame"
+            value={String(stats.streakDays)}
+            label={t('home.streakLabel')}
+            tint="accent"
+            testID="home-streak-tile"
+          />
+          <StatTile
+            icon="trophy"
+            value={String(stats.progress.masteredCount)}
+            label={t('home.masteryLabel')}
+            tint="success"
+            testID="home-mastery-tile"
+          />
+        </View>
+      )}
+
+      {stats && (
         <View style={styles.card}>
           <View style={styles.levelRow}>
             <View style={styles.levelSummary}>
-              <Text style={styles.cardLabel}>{t('home.levelLabel')}</Text>
-              {level && (
-                <>
-                  <Text style={styles.levelText}>{level}</Text>
-                  <Text style={styles.levelExplain}>{t(`cefr.${level}`)}</Text>
-                </>
-              )}
+              {level && <Text style={styles.levelExplain}>{t(`cefr.${level}`)}</Text>}
             </View>
             {stats.progress.dueCount > 0 && (
               <View style={styles.dueChip}>
+                <Icon name="refresh" size={13} color={theme.colors.primary} strokeWidth={2.4} />
                 <Text style={styles.dueChipText}>
                   {t('home.dueChip', { count: stats.progress.dueCount })}
                 </Text>
@@ -258,38 +274,17 @@ export default function HomeScreen() {
             )}
           </View>
 
-          <Text style={styles.cardLabel}>{t('home.masteryLabel')}</Text>
-          <View
-            accessible
-            accessibilityRole="progressbar"
+          <ProgressBar
+            progress={
+              // totalAtLevel is 0 only on the pre-placement snapshot, which
+              // normal routing never renders here; divide defensively anyway.
+              stats.progress.totalAtLevel > 0
+                ? Math.min(1, stats.progress.masteredCount / stats.progress.totalAtLevel)
+                : 0
+            }
             accessibilityLabel={t('home.masteryLabel')}
-            accessibilityValue={{
-              min: 0,
-              max: stats.progress.totalAtLevel,
-              now: stats.progress.masteredCount,
-            }}
-            style={styles.masteryTrack}
-          >
-            <View
-              style={[
-                styles.masteryFill,
-                {
-                  // totalAtLevel is 0 only on the pre-placement snapshot, which
-                  // normal routing never renders here; divide defensively anyway.
-                  width: `${
-                    stats.progress.totalAtLevel > 0
-                      ? Math.min(
-                          100,
-                          Math.round(
-                            (stats.progress.masteredCount / stats.progress.totalAtLevel) * 100,
-                          ),
-                        )
-                      : 0
-                  }%`,
-                },
-              ]}
-            />
-          </View>
+            testID="home-mastery-bar"
+          />
           <Text style={styles.masteryLine}>
             {t('practice.progressLine', {
               mastered: stats.progress.masteredCount,
@@ -301,7 +296,13 @@ export default function HomeScreen() {
           </Text>
 
           <View style={styles.streakRow}>
-            <DecorativeEmoji style={styles.streakEmoji}>🔥</DecorativeEmoji>
+            <Icon
+              name="flame"
+              size={22}
+              color={theme.colors.accent}
+              strokeWidth={2.2}
+              testID="home-streak-flame"
+            />
             <Text style={styles.streakText}>{streakLine}</Text>
           </View>
           <Text style={styles.todayLine}>{practicedTodayLine}</Text>
@@ -314,33 +315,10 @@ export default function HomeScreen() {
       <Button
         title={t('home.startPractice')}
         fullWidth
+        size="lg"
         onPress={() => navigateOnce('/practice')}
         style={styles.primaryAction}
       />
-
-      <View style={styles.linkRow}>
-        <Button
-          title={t('header.history')}
-          variant="secondary"
-          size="sm"
-          onPress={() => navigateOnce('/history')}
-          style={styles.secondaryAction}
-        />
-        <Button
-          title={t('header.recordings')}
-          variant="secondary"
-          size="sm"
-          onPress={() => navigateOnce('/recordings')}
-          style={styles.secondaryAction}
-        />
-        <Button
-          title={t('header.settings')}
-          variant="secondary"
-          size="sm"
-          onPress={() => navigateOnce('/settings')}
-          style={styles.secondaryAction}
-        />
-      </View>
       <HomeBannerAd focused={focused} />
     </ScrollView>
   );
@@ -361,6 +339,18 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignItems: 'center',
     justifyContent: 'center',
   },
+  skeletonStack: {
+    alignSelf: 'stretch',
+    gap: spacing.md,
+  },
+  skeletonTileRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  hiddenLoadingText: {
+    height: 0,
+    opacity: 0,
+  },
   fullScreenCenter: {
     flexGrow: 1,
     alignItems: 'center',
@@ -372,8 +362,15 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.background,
   },
   greeting: {
-    fontSize: 15,
-    color: colors.muted,
+    fontSize: 24,
+    lineHeight: 30,
+    fontWeight: '800',
+    color: colors.text,
+    marginBottom: spacing.md,
+  },
+  statRow: {
+    flexDirection: 'row',
+    gap: spacing.sm,
     marginBottom: spacing.md,
   },
   muted: {
@@ -437,12 +434,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     letterSpacing: 0.8,
     marginTop: spacing.md,
   },
-  levelText: {
-    marginTop: spacing.xs,
-    fontSize: 30,
-    fontWeight: '800',
-    color: colors.primary,
-  },
   levelExplain: {
     marginTop: 2,
     fontSize: 13,
@@ -451,6 +442,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   dueChip: {
     maxWidth: '100%',
     flexShrink: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
     backgroundColor: colors.primaryLight,
     borderRadius: radii.pill,
     paddingVertical: 6,
@@ -462,18 +456,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 13,
     fontWeight: '700',
     color: colors.primary,
-  },
-  masteryTrack: {
-    marginTop: spacing.sm,
-    height: 12,
-    borderRadius: radii.pill,
-    backgroundColor: colors.border,
-    overflow: 'hidden',
-  },
-  masteryFill: {
-    height: '100%',
-    borderRadius: radii.pill,
-    backgroundColor: colors.success,
   },
   masteryLine: {
     marginTop: spacing.sm,
@@ -502,15 +484,5 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   primaryAction: {
     marginTop: spacing.xl,
-  },
-  linkRow: {
-    marginTop: spacing.lg,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: spacing.md,
-  },
-  secondaryAction: {
-    flexBasis: 140,
-    flexGrow: 1,
   },
 }));

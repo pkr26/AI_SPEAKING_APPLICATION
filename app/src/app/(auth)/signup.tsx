@@ -12,6 +12,9 @@ import { Link, router, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import Icon from '../../components/Icon';
+import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
+import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
@@ -137,6 +140,9 @@ export default function SignupScreen() {
         behavior={Platform.OS === 'ios' ? 'padding' : undefined}
       >
         <ScrollView contentContainerStyle={styles.container} keyboardShouldPersistTaps="handled">
+          <View style={styles.brandMark}>
+            <Icon name="mic" size={26} color={theme.colors.primary} strokeWidth={2.1} />
+          </View>
           <Text accessibilityRole="header" style={styles.brand}>
             {t('signup.title')}
           </Text>
@@ -234,20 +240,16 @@ export default function SignupScreen() {
                 maxLength={MAX_PASSWORD_UTF8_BYTES}
                 editable={!busy}
               />
-              <Pressable
-                accessibilityRole="button"
+              <PasswordVisibilityToggle
+                visible={passwordVisible}
                 accessibilityLabel={
                   passwordVisible ? t('common.hidePassword') : t('common.showPassword')
                 }
                 disabled={busy}
-                onPress={() => setPasswordVisible((visible) => !visible)}
-                style={[styles.inputAction, busy && styles.controlDisabled]}
-              >
-                <Text style={styles.inputActionText}>
-                  {passwordVisible ? t('common.hide') : t('common.show')}
-                </Text>
-              </Pressable>
+                onToggle={() => setPasswordVisible((visible) => !visible)}
+              />
             </View>
+            <PasswordStrengthMeter password={password} testID="signup-strength" />
             {passwordError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
                 {passwordError}
@@ -283,21 +285,16 @@ export default function SignupScreen() {
                 maxLength={MAX_PASSWORD_UTF8_BYTES}
                 editable={!busy}
               />
-              <Pressable
-                accessibilityRole="button"
+              <PasswordVisibilityToggle
+                visible={confirmPasswordVisible}
                 accessibilityLabel={
                   confirmPasswordVisible
                     ? t('password.hideConfirmation')
                     : t('password.showConfirmation')
                 }
                 disabled={busy}
-                onPress={() => setConfirmPasswordVisible((visible) => !visible)}
-                style={[styles.inputAction, busy && styles.controlDisabled]}
-              >
-                <Text style={styles.inputActionText}>
-                  {confirmPasswordVisible ? t('common.hide') : t('common.show')}
-                </Text>
-              </Pressable>
+                onToggle={() => setConfirmPasswordVisible((visible) => !visible)}
+              />
             </View>
             {confirmationError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
@@ -411,6 +408,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     padding: spacing.xl,
     width: '100%',
     maxWidth: layout.formMaxWidth,
+    alignSelf: 'center',
+  },
+  brandMark: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.primaryLight,
+    marginBottom: spacing.md,
     alignSelf: 'center',
   },
   brand: {

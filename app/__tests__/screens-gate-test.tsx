@@ -441,13 +441,7 @@ describe('root layout route guards', () => {
       'index',
       '(auth)',
       'diagnostic',
-      'home',
-      'practice/index',
-      'practice/help',
-      'practice/attempt',
-      'practice/feedback',
-      'history',
-      'recordings',
+      '(tabs)',
       'settings/index',
       'settings/change-password',
       'settings/delete-account',
@@ -484,15 +478,10 @@ describe('root layout route guards', () => {
           { title?: unknown } | undefined
       )?.title;
 
+    // Tab-group titles (home/practice/history/recordings) are owned by the
+    // (tabs) layouts; the root stack titles the diagnostic flow and Settings.
     expect([
       titleFor('diagnostic'),
-      titleFor('home'),
-      titleFor('practice/index'),
-      titleFor('practice/help'),
-      titleFor('practice/attempt'),
-      titleFor('practice/feedback'),
-      titleFor('history'),
-      titleFor('recordings'),
       titleFor('settings/index'),
       titleFor('settings/change-password'),
       titleFor('settings/delete-account'),
@@ -502,13 +491,6 @@ describe('root layout route guards', () => {
       // UI language, despite the account's Telugu learning language.
     ]).toEqual([
       translateFor('hi', 'header.diagnostic'),
-      translateFor('hi', 'header.home'),
-      translateFor('hi', 'header.practice'),
-      translateFor('hi', 'header.help'),
-      translateFor('hi', 'header.attempt'),
-      translateFor('hi', 'header.feedback'),
-      translateFor('hi', 'header.history'),
-      translateFor('hi', 'header.recordings'),
       translateFor('hi', 'header.settings'),
       translateFor('hi', 'header.changePassword'),
       translateFor('hi', 'header.deleteAccount'),
@@ -533,14 +515,14 @@ describe('root layout route guards', () => {
         capturedScreenProps.filter((props) => props?.name === name).at(-1)?.options as
           { title?: unknown } | undefined
       )?.title;
-    expect(latestTitle('home')).toBe(translateFor('hi', 'header.home'));
+    expect(latestTitle('settings/index')).toBe(translateFor('hi', 'header.settings'));
 
     mockRefreshDailyReminderLanguage.mockClear();
     mockAuthValue = makeAuth({
       user: { ...firstUser, nativeLanguage: 'zh' },
     });
     await rendered.rerender(<RootLayout />);
-    expect(latestTitle('home')).toBe(translateFor('hi', 'header.home'));
+    expect(latestTitle('settings/index')).toBe(translateFor('hi', 'header.settings'));
     expect(mockRefreshDailyReminderLanguage).not.toHaveBeenCalled();
 
     mockAuthValue = makeAuth({
@@ -548,7 +530,7 @@ describe('root layout route guards', () => {
     });
     await rendered.rerender(<RootLayout />);
     await waitFor(() => expect(mockRefreshDailyReminderLanguage).toHaveBeenCalledWith('es'));
-    expect(latestTitle('home')).toBe(translateFor('es', 'header.home'));
+    expect(latestTitle('settings/index')).toBe(translateFor('es', 'header.settings'));
 
     mockRefreshDailyReminderLanguage.mockClear();
     mockAuthValue = makeAuth({
@@ -640,12 +622,7 @@ describe('root layout route guards', () => {
     );
     expect(accountGroup).toEqual({
       guard: false,
-      screenNames: [
-        'recordings',
-        'settings/index',
-        'settings/change-password',
-        'settings/delete-account',
-      ],
+      screenNames: ['settings/index', 'settings/change-password', 'settings/delete-account'],
     });
     const protectedNames = capturedProtectedProps.flatMap((props) => props.screenNames);
     expect(protectedNames).not.toContain('settings/privacy');
@@ -706,11 +683,12 @@ describe('root layout route guards', () => {
 
     expect(optionsFor('index')).toEqual(expect.objectContaining({ headerShown: false }));
     expect(optionsFor('(auth)')).toEqual(expect.objectContaining({ headerShown: false }));
-    for (const name of ['diagnostic', 'practice/index', 'practice/feedback']) {
-      expect(optionsFor(name)).toEqual(
-        expect.objectContaining({ headerBackVisible: false, gestureEnabled: false }),
-      );
-    }
+    // The tab group is headerless at the root; its practice-flow locks live in
+    // the (tabs)/practice stack layout and are pinned by the tabs layout test.
+    expect(optionsFor('(tabs)')).toEqual(expect.objectContaining({ headerShown: false }));
+    expect(optionsFor('diagnostic')).toEqual(
+      expect.objectContaining({ headerBackVisible: false, gestureEnabled: false }),
+    );
   });
 
   it('pins the complete option set of every back-locked route, home included', async () => {
@@ -718,30 +696,17 @@ describe('root layout route guards', () => {
     const optionsFor = (name: string) =>
       capturedScreenProps.find((props) => props?.name === name)?.options;
 
-    // `home` is the post-diagnostic landing screen: leaving it by back or swipe
-    // would strand the user on the assessment they already finished.
-    const locked = [
-      ['diagnostic', 'header.diagnostic'],
-      ['home', 'header.home'],
-      ['practice/index', 'header.practice'],
-      ['practice/feedback', 'header.feedback'],
-    ] as const;
-    for (const [name, key] of locked) {
-      expect(optionsFor(name)).toEqual({
-        title: translateFor('hi', key),
-        headerBackVisible: false,
-        gestureEnabled: false,
-      });
-    }
+    // `home` (inside the tab group) is the post-diagnostic landing screen; the
+    // root-level lock protects the diagnostic itself, while the tab layouts
+    // own the home/practice exit locks.
+    expect(optionsFor('diagnostic')).toEqual({
+      title: translateFor('hi', 'header.diagnostic'),
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
 
     // Routes the user may leave freely keep the default back affordances.
-    for (const name of [
-      'practice/help',
-      'practice/attempt',
-      'history',
-      'recordings',
-      'settings/index',
-    ]) {
+    for (const name of ['settings/index', 'settings/privacy', 'settings/terms']) {
       expect(optionsFor(name)).not.toHaveProperty('headerBackVisible');
       expect(optionsFor(name)).not.toHaveProperty('gestureEnabled');
     }
@@ -1341,10 +1306,10 @@ describe('index gate', () => {
     });
   });
 
-  it('redirects to login when there is no token', async () => {
+  it('redirects to the value-first welcome screen when there is no token', async () => {
     mockAuthValue = makeAuth({ token: null, user: null });
     await renderGate();
-    expect(screen.getByTestId('redirect')).toHaveTextContent('/login');
+    expect(screen.getByTestId('redirect')).toHaveTextContent('/welcome');
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
 

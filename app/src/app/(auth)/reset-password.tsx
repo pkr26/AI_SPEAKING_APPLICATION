@@ -1,17 +1,10 @@
 import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import {
-  KeyboardAvoidingView,
-  Platform,
-  Pressable,
-  ScrollView,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
+import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
+import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { apiResetPassword, userMessageForError } from '../../lib/api';
 import {
@@ -219,19 +212,14 @@ export default function ResetPasswordScreen() {
               maxLength={MAX_PASSWORD_UTF8_BYTES}
               editable={!busy}
             />
-            <Pressable
-              accessibilityRole="button"
+            <PasswordVisibilityToggle
+              visible={passwordVisible}
               accessibilityLabel={
                 passwordVisible ? t('common.hidePassword') : t('common.showPassword')
               }
-              onPress={() => setPasswordVisible((visible) => !visible)}
               disabled={busy}
-              style={[styles.inputAction, busy && styles.controlDisabled]}
-            >
-              <Text style={styles.inputActionText}>
-                {passwordVisible ? t('common.hide') : t('common.show')}
-              </Text>
-            </Pressable>
+              onToggle={() => setPasswordVisible((visible) => !visible)}
+            />
           </View>
           {passwordError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
@@ -265,21 +253,16 @@ export default function ResetPasswordScreen() {
               maxLength={MAX_PASSWORD_UTF8_BYTES}
               editable={!busy}
             />
-            <Pressable
-              accessibilityRole="button"
+            <PasswordVisibilityToggle
+              visible={confirmPasswordVisible}
               accessibilityLabel={
                 confirmPasswordVisible
                   ? t('password.hideConfirmation')
                   : t('password.showConfirmation')
               }
-              onPress={() => setConfirmPasswordVisible((visible) => !visible)}
               disabled={busy}
-              style={[styles.inputAction, busy && styles.controlDisabled]}
-            >
-              <Text style={styles.inputActionText}>
-                {confirmPasswordVisible ? t('common.hide') : t('common.show')}
-              </Text>
-            </Pressable>
+              onToggle={() => setConfirmPasswordVisible((visible) => !visible)}
+            />
           </View>
           {confirmationError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>

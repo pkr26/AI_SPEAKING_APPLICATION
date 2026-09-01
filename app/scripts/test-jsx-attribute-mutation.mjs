@@ -212,19 +212,23 @@ test('checked-in discovery is exhaustive and lane-owned for both JSX modes', asy
     appDir: appDirectory,
     mode: 'accessibility',
   });
-  assert.equal(eventSites.length, 221);
-  // +12 sites from the first-frontend-audit a11y fixes: live regions on the
-  // diagnostic preparing/done/question views and the practice question card,
-  // list roles on history/recordings, and the signup/settings radiogroups.
-  assert.equal(accessibilitySites.length, 346);
+  // +3 event sites from the audit remediation (welcome login link, tab-bar
+  // presses, password submit-reveal wrappers).
+  assert.equal(eventSites.length, 224);
+  // +23 sites from the audit remediation: per-chip word/status labels and
+  // tablist/hint/disabled states on the tab bar, the submit-reveal wrappers,
+  // and Dynamic Type caps on the score ring.
+  assert.equal(accessibilitySites.length, 369);
   for (const sites of [eventSites, accessibilitySites]) {
     assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
     assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));
     assert.ok(sites.every(({ testFiles }) => testFiles.length > 0));
   }
+  // Home's nav buttons became tab-bar entries in the tabs redesign, leaving
+  // its data-refresh, retry, and CTA handlers.
   assert.equal(
     selectCampaignSites(eventSites, { lanes: ['home'], files: [], sites: [] }).length,
-    8,
+    5,
   );
 });
 

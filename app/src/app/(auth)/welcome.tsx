@@ -1,5 +1,5 @@
-import { router } from 'expo-router';
-import React from 'react';
+import { router, useFocusEffect } from 'expo-router';
+import React, { useCallback, useRef } from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -21,6 +21,20 @@ export default function WelcomeScreen() {
   const theme = useTheme();
   const styles = themedStyles(theme);
   const { language, setLanguage, persistenceError } = useGuestLanguage();
+  // One navigation per focus: a double-tap on a CTA must not push twice, and
+  // the latch re-arms when this screen regains focus after a back gesture.
+  const navigationStartedRef = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => undefined;
+    }, []),
+  );
+  const navigateOnce = (href: '/signup' | '/login') => {
+    if (navigationStartedRef.current) return;
+    navigationStartedRef.current = true;
+    router.navigate(href);
+  };
 
   const features: {
     icon: IconName;
@@ -97,12 +111,12 @@ export default function WelcomeScreen() {
           title={t('welcome.getStarted')}
           fullWidth
           size="lg"
-          onPress={() => router.push('/signup')}
+          onPress={() => navigateOnce('/signup')}
           style={styles.primaryAction}
         />
         <Pressable
           accessibilityRole="button"
-          onPress={() => router.push('/login')}
+          onPress={() => navigateOnce('/login')}
           style={({ pressed }) => [styles.loginLink, pressed && styles.loginLinkPressed]}
         >
           <Text style={styles.loginLinkText}>

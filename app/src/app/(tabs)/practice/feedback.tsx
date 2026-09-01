@@ -14,6 +14,7 @@ import ScoreRing from '../../../components/ScoreRing';
 import { useAuth } from '../../../lib/auth';
 import { useT } from '../../../lib/i18n';
 import { acknowledgePendingAssessmentFeedback } from '../../../lib/pending-assessment';
+import { setPracticeExitLocked } from '../../../lib/practice-exit-lock';
 import { usePracticeFlow } from '../../../lib/practice-flow';
 import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
@@ -78,7 +79,7 @@ const OUTCOME_ART: Record<Variant, OutcomeArt> = {
  */
 function OutcomeBadge({ art, testID }: { art: OutcomeArt; testID: string }) {
   const theme = useTheme();
-  const ink = theme.colors[art.ink === 'accent' ? 'accent' : art.ink];
+  const ink = theme.colors[art.ink];
   return (
     <View
       accessibilityElementsHidden
@@ -179,8 +180,15 @@ export default function FeedbackScreen() {
   useFocusEffect(
     React.useCallback(() => {
       focusedRef.current = true;
+      // This screen is statically locked (every exit routes through the
+      // variant's primary action so the cycle always advances deliberately);
+      // the shared exit lock extends that to the other tabs and the Home
+      // header Settings action, matching the pre-tabs design where feedback
+      // had no unguarded exit.
+      setPracticeExitLocked(true);
       return () => {
         focusedRef.current = false;
+        setPracticeExitLocked(false);
       };
     }, []),
   );
@@ -787,7 +795,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   subtitle: {
     marginTop: spacing.sm,
     fontSize: 15,
-    color: colors.muted,
+    // Subtitles sit on the outcome panel's tinted fill, where plain `muted`
+    // ink misses 4.5:1 in light mode; the on-tint token is pinned in tests.
+    color: colors.mutedTint,
     textAlign: 'center',
   },
   levelUpBody: {

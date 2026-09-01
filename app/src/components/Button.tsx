@@ -37,7 +37,7 @@ export interface ButtonProps {
   style?: StyleProp<ViewStyle>;
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing, type }) => ({
   base: {
     minHeight: layout.minimumTarget,
     maxWidth: '100%',
@@ -109,16 +109,16 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     textAlign: 'center',
   },
   lgText: {
-    fontSize: 18,
-    lineHeight: 24,
+    fontSize: type.hero.fontSize,
+    lineHeight: type.hero.lineHeight,
   },
   mdText: {
-    fontSize: 17,
-    lineHeight: 23,
+    fontSize: type.bodyLg.fontSize,
+    lineHeight: type.bodyLg.lineHeight,
   },
   smText: {
-    fontSize: 15,
-    lineHeight: 20,
+    fontSize: type.callout.fontSize,
+    lineHeight: type.callout.lineHeight,
   },
   primaryText: {
     color: colors.onPrimary,

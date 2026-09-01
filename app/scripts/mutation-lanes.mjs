@@ -96,7 +96,11 @@ export const mutationLanes = Object.freeze({
   // RecordingPlayback owns playback plus local-file sharing and single-item
   // deletion; its focused test covers operation/file ownership for all three.
   recordings: lane(
-    ['src/app/recordings.tsx', 'src/components/RecordingPlayback.tsx', 'src/lib/audio-session.ts'],
+    [
+      'src/app/(tabs)/recordings.tsx',
+      'src/components/RecordingPlayback.tsx',
+      'src/lib/audio-session.ts',
+    ],
     [
       '__tests__/recording-playback-test.tsx',
       '__tests__/recorder-audio-owner-contract-test.tsx',
@@ -133,6 +137,37 @@ export const mutationLanes = Object.freeze({
     ['src/components/Button.tsx', 'src/lib/theme.ts'],
     ['__tests__/button-test.tsx', '__tests__/dark-mode-test.tsx', '__tests__/theme-test.ts'],
   ),
+  // The redesign's shared visual vocabulary: icon set, celebration, progress,
+  // skeleton, stat tile, empty state, auth field helpers, and the tagged
+  // transcript. use-reduce-motion lives here because these components' Reduce
+  // Motion branches are its owning assertions.
+  visualComponents: lane(
+    [
+      'src/components/Confetti.tsx',
+      'src/components/EmptyState.tsx',
+      'src/components/Icon.tsx',
+      'src/components/PasswordStrengthMeter.tsx',
+      'src/components/PasswordVisibilityToggle.tsx',
+      'src/components/ProgressBar.tsx',
+      'src/components/ScoreRing.tsx',
+      'src/components/Skeleton.tsx',
+      'src/components/StatTile.tsx',
+      'src/components/WordTaggedTranscript.tsx',
+      'src/lib/use-reduce-motion.ts',
+    ],
+    ['__tests__/icon-test.tsx', '__tests__/shared-visual-components-test.tsx'],
+  ),
+  // Bottom-tab navigation and the cross-tree practice exit lock that keeps the
+  // tab bar from discarding a held take; the practice screens that publish the
+  // lock are covered by the practice lane below.
+  tabsLayout: lane(
+    [
+      'src/app/(tabs)/_layout.tsx',
+      'src/app/(tabs)/practice/_layout.tsx',
+      'src/lib/practice-exit-lock.ts',
+    ],
+    ['__tests__/tabs-layout-test.tsx'],
+  ),
   hardwareBack: lane(
     ['src/lib/use-hardware-back.ts'],
     [
@@ -154,11 +189,17 @@ export const mutationLanes = Object.freeze({
     ['__tests__/screens-gate-test.tsx'],
   ),
   authScreens: lane(
-    ['src/app/(auth)/login.tsx', 'src/app/(auth)/signup.tsx', 'src/lib/identity-validation.ts'],
+    [
+      'src/app/(auth)/login.tsx',
+      'src/app/(auth)/signup.tsx',
+      'src/app/(auth)/welcome.tsx',
+      'src/lib/identity-validation.ts',
+    ],
     // login.tsx is also rendered by the reset-password journey.
     [
       '__tests__/screens-auth-test.tsx',
       '__tests__/screens-reset-password-test.tsx',
+      '__tests__/screens-welcome-test.tsx',
       '__tests__/adversarial-input-storm-test.tsx',
     ],
   ),
@@ -171,17 +212,17 @@ export const mutationLanes = Object.freeze({
     ['__tests__/screens-reset-password-test.tsx'],
   ),
   home: lane(
-    ['src/app/home.tsx'],
+    ['src/app/(tabs)/home.tsx'],
     ['__tests__/dark-mode-test.tsx', '__tests__/screens-home-test.tsx'],
   ),
-  history: lane(['src/app/history.tsx'], ['__tests__/screens-history-test.tsx']),
+  history: lane(['src/app/(tabs)/history.tsx'], ['__tests__/screens-history-test.tsx']),
   diagnostic: lane(['src/app/diagnostic.tsx'], ['__tests__/screens-diagnostic-test.tsx']),
   practice: lane(
     [
-      'src/app/practice/attempt.tsx',
-      'src/app/practice/feedback.tsx',
-      'src/app/practice/help.tsx',
-      'src/app/practice/index.tsx',
+      'src/app/(tabs)/practice/attempt.tsx',
+      'src/app/(tabs)/practice/feedback.tsx',
+      'src/app/(tabs)/practice/help.tsx',
+      'src/app/(tabs)/practice/index.tsx',
     ],
     ['__tests__/screens-practice-test.tsx'],
   ),

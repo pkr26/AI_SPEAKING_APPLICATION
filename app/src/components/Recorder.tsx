@@ -320,10 +320,7 @@ export function formatElapsed(durationMillis: number): string {
 }
 
 /** Maps a recorder metering reading (dBFS, ≤ 0) onto filled meter segments. */
-export function activeMeterSegments(
-  metering: number | undefined,
-  segmentCount: number = 6,
-): number {
+export function activeMeterSegments(metering: number | undefined, segmentCount: number): number {
   if (!Number.isFinite(metering)) return 0;
   const finiteMetering = metering as number;
   const level = Math.min(1, Math.max(0, (finiteMetering + METER_RANGE_DB) / METER_RANGE_DB));

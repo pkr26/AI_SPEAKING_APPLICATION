@@ -331,25 +331,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexShrink: 1,
     minWidth: 0,
   },
-  inputAction: {
-    flexShrink: 1,
-    maxWidth: '45%',
-    minHeight: layout.minimumTarget,
-    minWidth: layout.minimumTarget,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: spacing.sm,
-  },
-  inputActionText: {
-    flexShrink: 1,
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
-  },
-  controlDisabled: {
-    opacity: 0.5,
-  },
   fieldError: {
     marginTop: 6,
     color: colors.danger,

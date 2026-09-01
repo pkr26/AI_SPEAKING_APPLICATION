@@ -1,14 +1,18 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Animated, StyleSheet, View } from 'react-native';
 
+import { useReduceMotion } from '../lib/use-reduce-motion';
 import { useTheme } from '../lib/theme';
-import { useReduceMotion } from './ScoreRing';
 
 export interface ConfettiProps {
-  /** Pieces in the burst. Default 26. */
+  /** Pieces in the burst (read once at mount; later changes are ignored).
+   *  Default 26, clamped to 1–80 so a stray value cannot allocate wildly. */
   count?: number;
   testID?: string;
 }
+
+/** Upper bound keeps a bad count from allocating unbounded Animated.Values. */
+const MAX_PIECES = 80;
 
 /**
  * A one-shot celebration burst. Deterministic pseudo-random placement (derived
@@ -19,9 +23,13 @@ export interface ConfettiProps {
 export default function Confetti({ count = 26, testID }: ConfettiProps) {
   const theme = useTheme();
   const reduceMotion = useReduceMotion();
+  // The count is an initial-mount value: the lazy state initializer reads it
+  // exactly once, freezing the piece list so a mid-flight prop change can
+  // never restart the burst or strand visible, unanimated pieces.
+  const [pieceCount] = useState(() => Math.max(1, Math.min(MAX_PIECES, Math.round(count))));
   const animations = useMemo(
-    () => Array.from({ length: count }, () => new Animated.Value(0)),
-    [count],
+    () => Array.from({ length: pieceCount }, () => new Animated.Value(0)),
+    [pieceCount],
   );
   const startedRef = useRef(false);
 

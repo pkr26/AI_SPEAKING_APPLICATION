@@ -976,7 +976,7 @@ export default function DiagnosticScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   centerScroll: {
     flexGrow: 1,
     alignItems: 'center',
@@ -1114,7 +1114,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   congratsTitle: {
     marginTop: spacing.md,
-    fontSize: 26,
+    fontSize: type.titleLg.fontSize,
+    lineHeight: type.titleLg.lineHeight,
     fontWeight: '800',
     color: colors.text,
     textAlign: 'center',

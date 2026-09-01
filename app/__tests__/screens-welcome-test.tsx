@@ -16,13 +16,19 @@ jest.mock('../src/lib/auth', () => ({
   useAuth: () => ({ user: null, token: null }),
 }));
 
+const mockSetLanguage = jest.fn();
+let mockGuestLanguageState: {
+  language: 'en' | 'te' | 'hi' | 'es' | 'zh';
+  persistenceError: string | null;
+} = { language: 'en', persistenceError: null };
+
 jest.mock('../src/lib/guest-language', () => ({
   useGuestLanguage: () => ({
-    language: 'en',
+    language: mockGuestLanguageState.language,
     isRestoring: false,
-    setLanguage: jest.fn(),
+    setLanguage: mockSetLanguage,
     mirrorAccountLanguage: jest.fn(),
-    persistenceError: null,
+    persistenceError: mockGuestLanguageState.persistenceError,
   }),
 }));
 
@@ -31,10 +37,21 @@ jest.mock('expo-router', () => ({
   router: { push: jest.fn(), replace: jest.fn(), navigate: jest.fn() },
   Redirect: () => null,
   useLocalSearchParams: () => ({}),
-  useFocusEffect: jest.fn(),
+  // Invoke the effect like the real hook does on focus so the screen's
+  // latch-reset body is exercised.
+  useFocusEffect: (effect: () => (() => void) | undefined) => {
+    void effect();
+  },
 }));
 
 const t = (key: Parameters<typeof translateFor>[1]) => translateFor('en', key);
+
+beforeEach(() => {
+  mockSetLanguage.mockClear();
+  mockGuestLanguageState = { language: 'en', persistenceError: null };
+  asMock(router.push).mockClear();
+  asMock(router.navigate).mockClear();
+});
 
 describe('welcome screen', () => {
   it('shows the brand, the three value promises, and the language picker', async () => {
@@ -55,16 +72,51 @@ describe('welcome screen', () => {
     ).toBeTruthy();
   });
 
-  it('sends new learners to signup and returning learners to login', async () => {
+  it('sends new learners to signup exactly once per tap burst', async () => {
+    const first = await render(<WelcomeScreen />);
+
+    // A double-tap on the CTA navigates once (singleton-navigation latch).
+    const cta = screen.getByRole('button', { name: t('welcome.getStarted') });
+    await fireEvent.press(cta);
+    await fireEvent.press(cta);
+    expect(asMock(router.navigate)).toHaveBeenCalledTimes(1);
+    expect(asMock(router.navigate)).toHaveBeenCalledWith('/signup');
+    expect(asMock(router.push)).not.toHaveBeenCalled();
+    first.unmount();
+  });
+
+  it('sends returning learners to login exactly once per tap burst', async () => {
     await render(<WelcomeScreen />);
 
-    await fireEvent.press(screen.getByRole('button', { name: t('welcome.getStarted') }));
-    expect(asMock(router.push)).toHaveBeenCalledWith('/signup');
+    // The login link's accessible name is its full sentence; the once-latch
+    // applies to it exactly as it does to the primary CTA.
+    const loginLink = screen.getByRole('button', {
+      name: `${t('login.footerPrompt')}${t('login.footerLink')}`,
+    });
+    await fireEvent.press(loginLink);
+    await fireEvent.press(loginLink);
+    expect(asMock(router.navigate)).toHaveBeenCalledTimes(1);
+    expect(asMock(router.navigate)).toHaveBeenCalledWith('/login');
+    expect(asMock(router.push)).not.toHaveBeenCalled();
+  });
 
-    // The login link's accessible name is its full sentence.
-    await fireEvent.press(
-      screen.getByRole('button', { name: `${t('login.footerPrompt')}${t('login.footerLink')}` }),
-    );
-    expect(asMock(router.push)).toHaveBeenCalledWith('/login');
+  it('wires the language picker to the device UiLanguage preference', async () => {
+    await render(<WelcomeScreen />);
+
+    // Choosing a UI language writes the non-sensitive device preference, not
+    // any account state (this screen renders before any account exists).
+    await fireEvent.press(screen.getByTestId('ui-language-te'));
+    expect(mockSetLanguage).toHaveBeenCalledTimes(1);
+    expect(mockSetLanguage).toHaveBeenCalledWith('te');
+
+    // A persistence failure from the picker's own store surfaces as an alert.
+    mockGuestLanguageState = { language: 'te', persistenceError: 'Secure storage unavailable' };
+    await render(<WelcomeScreen />);
+    expect(
+      screen.getAllByText('Secure storage unavailable').some((node) => {
+        const role = (node.props as { accessibilityRole?: string }).accessibilityRole;
+        return role === 'alert';
+      }),
+    ).toBe(true);
   });
 });

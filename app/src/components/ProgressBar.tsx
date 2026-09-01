@@ -1,14 +1,20 @@
 import React, { useEffect } from 'react';
 import { Animated, StyleSheet, useAnimatedValue, View } from 'react-native';
 
+import { useReduceMotion } from '../lib/use-reduce-motion';
 import { useTheme } from '../lib/theme';
-import { useReduceMotion } from './ScoreRing';
 
 export interface ProgressBarProps {
   /** Fill fraction 0–1; values outside the range are clamped. */
   progress: number;
   /** Accessible description of what is progressing. */
   accessibilityLabel: string;
+  /**
+   * Count semantics for assistive tech (e.g. {min: 0, max: 40, now: 12} for
+   * "12 of 40 words mastered"). When provided it replaces the default percent
+   * value, so screen-reader users keep count granularity, not just a percent.
+   */
+  accessibilityCount?: { min: number; max: number; now: number };
   /** Fill ink for the completed fraction. */
   fill?: string;
   height?: number;
@@ -23,6 +29,7 @@ export interface ProgressBarProps {
 export default function ProgressBar({
   progress,
   accessibilityLabel,
+  accessibilityCount,
   fill,
   height = 8,
   testID,
@@ -57,10 +64,15 @@ export default function ProgressBar({
       accessible
       accessibilityRole="progressbar"
       accessibilityLabel={accessibilityLabel}
-      accessibilityValue={{ min: 0, max: 100, now: Math.round(clamped * 100) }}
+      accessibilityValue={
+        accessibilityCount ?? { min: 0, max: 100, now: Math.round(clamped * 100) }
+      }
       testID={testID}
       style={[
         styles.track,
+        // The decorative track keeps the border hairline: the FILL is the
+        // indicator and clears 3:1 against this track in both schemes (pinned
+        // in theme-test), while the value itself is exposed accessibly.
         { height, backgroundColor: theme.colors.border },
         { borderRadius: height / 2 },
       ]}

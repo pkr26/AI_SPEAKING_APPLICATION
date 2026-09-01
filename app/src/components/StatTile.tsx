@@ -80,6 +80,10 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, type, elevati
     borderRadius: 16,
     alignItems: 'center',
     justifyContent: 'center',
+    // The badge fills with card, so on the neutral card tile it would vanish
+    // into its background; a hairline border keeps it visible on every tint.
+    borderWidth: 1,
+    borderColor: colors.border,
   },
   value: {
     fontSize: type.titleLg.fontSize,
@@ -92,7 +96,9 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, type, elevati
     fontSize: type.caption.fontSize,
     lineHeight: type.caption.lineHeight,
     fontWeight: '600',
-    color: colors.muted,
+    // Tinted fills sit below plain `muted` ink's 4.5:1 guarantee, so captions
+    // on tint surfaces use the on-tint token (pinned in theme-test).
+    color: colors.mutedTint,
     textAlign: 'center',
   },
 }));

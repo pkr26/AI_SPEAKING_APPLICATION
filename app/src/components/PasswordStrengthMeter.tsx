@@ -2,20 +2,22 @@ import React from 'react';
 import { Text, View } from 'react-native';
 
 import { useT, type MessageKey } from '../lib/i18n';
+import { MAX_PASSWORD_UTF8_BYTES, utf8ByteLength } from '../lib/password-policy';
 import { createThemedStyles, useTheme } from '../lib/theme';
 
 export type PasswordStrength = 'empty' | 'weak' | 'fair' | 'strong';
 
 /**
  * Local strength tier for a candidate password. The server's policy (8+
- * characters with a letter and a number) is the "fair" floor — anything the
- * server would reject is "weak" — and strength beyond it rewards length and
- * character variety. Pure client-side guidance: the authoritative check stays
- * on the server.
+ * characters with a letter and a number — with the letter class exactly the
+ * policy's `\p{L}`, so Unicode-letter passwords rate fairly) is the "fair"
+ * floor — anything the server would reject is "weak" — and strength beyond it
+ * rewards length and character variety. Pure client-side guidance: the
+ * authoritative check stays on the server.
  */
 export function passwordStrength(password: string): PasswordStrength {
   if (password.length === 0) return 'empty';
-  const hasLetter = /[a-zA-Z]/.test(password);
+  const hasLetter = /\p{L}/u.test(password);
   const hasNumber = /[0-9]/.test(password);
   if (password.length < 8 || !hasLetter || !hasNumber) return 'weak';
   const variety =
@@ -56,7 +58,10 @@ export default function PasswordStrengthMeter({ password, testID }: PasswordStre
   const theme = useTheme();
   const styles = themedStyles(theme);
   const tier = passwordStrength(password);
-  if (tier === 'empty') return null;
+  // Past the bcrypt byte ceiling the adjacent "too long" field error is the
+  // only useful feedback — never show a tier beside a password the field
+  // already rejects.
+  if (tier === 'empty' || utf8ByteLength(password) > MAX_PASSWORD_UTF8_BYTES) return null;
 
   const filled = SEGMENT_TIER[tier];
   const ink =
@@ -67,7 +72,13 @@ export default function PasswordStrengthMeter({ password, testID }: PasswordStre
         : theme.colors.success;
 
   return (
-    <View accessible accessibilityLabel={t(LABEL_KEY[tier])} testID={testID} style={styles.row}>
+    <View
+      accessible
+      accessibilityLabel={t(LABEL_KEY[tier])}
+      accessibilityLiveRegion="polite"
+      testID={testID}
+      style={styles.row}
+    >
       <View style={styles.segments}>
         {[0, 1, 2].map((index) => (
           <View

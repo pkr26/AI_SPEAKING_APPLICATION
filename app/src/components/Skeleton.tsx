@@ -1,8 +1,8 @@
 import React, { useEffect } from 'react';
 import { Animated, useAnimatedValue } from 'react-native';
 
+import { useReduceMotion } from '../lib/use-reduce-motion';
 import { useTheme } from '../lib/theme';
-import { useReduceMotion } from './ScoreRing';
 
 export interface SkeletonProps {
   /** Block width in dp, or a percentage string. */

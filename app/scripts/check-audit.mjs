@@ -13,11 +13,14 @@ import { spawnSync } from 'node:child_process';
 // still present in React Native 0.86.2's older 0.84.4 lock resolution.
 // GHSA-vcc3-ghjq-m6fr (1147955) flags decode-uri-component <=0.4.2 — every
 // release of the package, so no override can fix it. It reaches the tree via
-// expo-router's query-string@7.1.3 and only decodes this app's own router
-// URLs, not attacker-controlled URI input in a server context. The advisory
-// was published against an unchanged dependency tree (it failed CI before any
-// dependency was added); reviewed as the same upstream-Expo DoS class as the
-// image-size precedent above.
+// expo-router's query-string@7.1.3. The registered aienglishcoach:// deep-link
+// scheme means an attacker-crafted link CAN reach that parsing (not only this
+// app's own router URLs), so the honest exposure is a client-side
+// denial-of-service of one victim's app — the same upstream-Expo DoS class as
+// the image-size precedent above, at moderate severity. Accepted on
+// 2026-09-01; RE-VIEW when decode-uri-component publishes a fixed release
+// (then remove 1147955 from the set and drop the maximums back) or whenever
+// the advisory is re-rated above moderate.
 const reviewedAdvisories = new Set([1119441, 1147955]);
 const reviewedMaximums = { moderate: 16, high: 0, total: 16 };
 

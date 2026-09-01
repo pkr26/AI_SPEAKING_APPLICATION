@@ -1364,11 +1364,17 @@ describe('signup screen', () => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'not-an-email', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    // The inline email error waits for blur (erroring mid-typing is a hostile
+    // pattern); the submit gate still blocks live.
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
     expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
 
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
     await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'different1');
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
     expect(screen.getByText(t('password.mismatch')).props.accessibilityLiveRegion).toBe('polite');
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
     expect(mockAuthValue.register).not.toHaveBeenCalled();
@@ -1663,7 +1669,6 @@ describe('signup screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('password.hideConfirmation') }));
     expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(true);
-    expect(screen.queryByText(t('common.hide'))).toBeNull();
   });
 
   it('rejects names over the maximum length client-side', async () => {

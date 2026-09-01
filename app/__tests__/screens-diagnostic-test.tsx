@@ -2866,7 +2866,8 @@ describe('diagnostic presentation', () => {
     expect(screen.getByTestId('diagnostic-confetti', { includeHiddenElements: true })).toBeTruthy();
     expect(flattenedStyle(screen.getByText(t('diag.completeTitle')))).toEqual({
       marginTop: spacing.md,
-      fontSize: 26,
+      fontSize: 28,
+      lineHeight: 34,
       fontWeight: '800',
       color: colors.text,
       textAlign: 'center',

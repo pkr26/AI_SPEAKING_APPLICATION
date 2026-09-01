@@ -149,7 +149,7 @@ describe('home screen in dark mode', () => {
     await renderHome();
     await screen.findByText(t('home.dueChip', { count: 4 }));
 
-    // Greeting uses the dark muted ink.
+    // Greeting uses the full dark body ink.
     expect(
       flattenedStyle(screen.getByText(t('practice.greeting', { name: USER.name }))),
     ).toMatchObject({ color: darkColors.text });
@@ -161,7 +161,8 @@ describe('home screen in dark mode', () => {
       color: darkColors.onPrimary,
     });
 
-    // The mastery progress bar uses the dark success fill on the dark track.
+    // The mastery progress bar uses the dark success fill on the dark track
+    // (the fill clears 3:1 against it; the track itself is decorative).
     const progressbar = screen.getByRole('progressbar');
     expect(flattenedStyle(progressbar)).toMatchObject({
       backgroundColor: darkColors.border,

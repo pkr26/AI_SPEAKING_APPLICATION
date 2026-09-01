@@ -608,6 +608,61 @@ describe('practice contract parsers', () => {
     );
   });
 
+  it('accepts word tags on scored diagnostic answers and tolerates the edge shapes', () => {
+    const scored = {
+      passed: true,
+      score: 82,
+      transcript: 'I would travel to Spain.',
+      feedback: 'Clear and relevant.',
+      done: false,
+      nextQuestion: question,
+      wordScores: [
+        { word: 'I', status: 'good' },
+        { word: 'would', status: 'fair' },
+        { word: 'travel', status: 'good' },
+      ],
+    };
+    // The diagnostic acceptance branch mirrors the practice one.
+    expect(parseDiagnosticAnswerResult(scored).wordScores).toEqual(scored.wordScores);
+
+    // An empty list is schema-legal (the server has no .min(1)) and parses to
+    // a present-but-empty array; the UI renders its plain-transcript fallback.
+    const empty = parseDiagnosticAnswerResult({ ...scored, wordScores: [] });
+    expect(empty.wordScores).toEqual([]);
+
+    // Unknown extra fields alongside tags are additive and ignored.
+    expect(
+      parseDiagnosticAnswerResult({ ...scored, futureField: { novel: true } }).wordScores,
+    ).toEqual(scored.wordScores);
+
+    // Bounds match the server: 601 entries and 201-char words are corrupt.
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        ...scored,
+        wordScores: Array.from({ length: 601 }, () => ({ word: 'x', status: 'good' })),
+      }),
+    );
+    expectContractError(() =>
+      parseDiagnosticAnswerResult({
+        ...scored,
+        wordScores: [{ word: 'x'.repeat(201), status: 'good' }],
+      }),
+    );
+    expectContractError(() =>
+      parseAttemptResult({
+        cycleId,
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 50,
+        transcript: 'I brung courage.',
+        feedback: 'Add more detail.',
+        wordScores: [{ word: 'x'.repeat(201), status: 'good' }],
+      }),
+    );
+  });
+
   it('rejects array and wrong-boolean attempt envelopes that otherwise satisfy the contract', () => {
     const passedAttempt = {
       cycleId,

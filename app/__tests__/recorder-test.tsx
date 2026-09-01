@@ -1181,7 +1181,7 @@ describe('Recorder pure behavior contracts', () => {
     [0, 6],
     [30, 6],
   ])('maps the bounded metering value %#', (metering, expected) => {
-    expect(activeMeterSegments(metering)).toBe(expected);
+    expect(activeMeterSegments(metering, 6)).toBe(expected);
   });
 
   it('scales the segment count for the waveform meter', () => {

@@ -499,7 +499,7 @@ describe('home screen', () => {
     expect(screen.getByText(t('cefr.B1'))).toBeTruthy();
 
     const bar = screen.getByRole('progressbar', { name: t('home.masteryLabel') });
-    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 30 });
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 10, now: 3 });
     expect(
       screen.getByText(
         t('practice.progressLine', { mastered: 3, total: 10 }) +
@@ -667,7 +667,7 @@ describe('home screen', () => {
     // The shared bar reports the mastered share as a percent and paints the
     // fill with the success token.
     const bar = await screen.findByRole('progressbar', { name: t('home.masteryLabel') });
-    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 30 });
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 10, now: 3 });
     const fill = screen.getByTestId('home-mastery-bar-fill', { includeHiddenElements: true });
     expect(flattenedStyle(fill)).toMatchObject({
       height: '100%',
@@ -683,7 +683,7 @@ describe('home screen', () => {
     await renderHome();
 
     const bar = await screen.findByRole('progressbar', { name: t('home.masteryLabel') });
-    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 0 });
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 0, now: 0 });
   });
 
   it('uses the streak-start prompt and singular lines at low counts', async () => {
@@ -1086,7 +1086,7 @@ describe('home screen presentation', () => {
       fontWeight: '700',
       textAlign: 'center',
       fontSize: 15,
-      lineHeight: 20,
+      lineHeight: 21,
       color: colors.primary,
     });
     expect(flattenedStyle(dismiss())).toMatchObject({

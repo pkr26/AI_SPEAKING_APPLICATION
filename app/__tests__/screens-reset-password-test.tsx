@@ -980,9 +980,12 @@ describe('reset-password screen', () => {
     expect(button().props.accessibilityState).toMatchObject({ disabled: false });
   });
 
-  it('announces an invalid reset email inline', async () => {
+  it('announces an invalid reset email inline after blur', async () => {
     await render(<ResetPasswordScreen />);
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    // The inline error waits for blur; erroring mid-typing is hostile.
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
 
     expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
   });

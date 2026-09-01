@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
 import { AccessibilityInfo, StyleSheet } from 'react-native';
 import React from 'react';
 
@@ -10,6 +10,8 @@ import PasswordVisibilityToggle from '../src/components/PasswordVisibilityToggle
 import ProgressBar from '../src/components/ProgressBar';
 import ScoreRing from '../src/components/ScoreRing';
 import StatTile from '../src/components/StatTile';
+import { lightColors } from '../src/lib/theme';
+import { useReduceMotion } from '../src/lib/use-reduce-motion';
 import WordTaggedTranscript from '../src/components/WordTaggedTranscript';
 
 jest.spyOn(AccessibilityInfo, 'isReduceMotionEnabled').mockResolvedValue(false);
@@ -32,6 +34,16 @@ describe('ScoreRing', () => {
     expect(screen.getByText('0')).toBeTruthy();
   });
 
+  it('renders a non-finite score as zero, mirroring ProgressBar', async () => {
+    await render(<ScoreRing score={Number.NaN} accessibilityLabel="Score" />);
+    expect(screen.getByText('0')).toBeTruthy();
+    expect(screen.getByRole('progressbar', { name: 'Score' }).props.accessibilityValue).toEqual({
+      min: 0,
+      max: 100,
+      now: 0,
+    });
+  });
+
   it('renders the arc at its final position immediately under Reduce Motion', async () => {
     (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockResolvedValueOnce(true);
     await render(<ScoreRing score={70} accessibilityLabel="Score" testID="ring" />);
@@ -52,10 +64,49 @@ describe('Confetti', () => {
     );
   });
 
+  it('clamps an absurd piece count to the fixed ceiling', async () => {
+    await render(<Confetti count={5_000} testID="confetti" />);
+    expect(screen.getAllByTestId('confetti-piece', { includeHiddenElements: true })).toHaveLength(
+      80,
+    );
+  });
+
   it('skips the burst entirely under Reduce Motion', async () => {
     (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockResolvedValueOnce(true);
     const { toJSON } = await render(<Confetti testID="confetti" />);
     expect(toJSON()).toBeNull();
+  });
+});
+
+describe('useReduceMotion', () => {
+  it('tracks a live Reduce Motion change and unmounts cleanly', async () => {
+    let reduceMotionChanged: ((enabled: boolean) => void) | undefined;
+    (AccessibilityInfo.addEventListener as jest.Mock).mockImplementationOnce(
+      (_event: string, handler: (enabled: boolean) => void) => {
+        reduceMotionChanged = handler;
+        return { remove: jest.fn() } as never;
+      },
+    );
+    const { result, unmount } = await renderHook(() => useReduceMotion());
+    expect(result.current).toBe(false);
+
+    await act(async () => {
+      reduceMotionChanged?.(true);
+    });
+    expect(result.current).toBe(true);
+
+    unmount();
+  });
+
+  it('fails closed to motion-enabled when the native probe rejects', async () => {
+    (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockRejectedValueOnce(
+      new Error('native bridge unavailable'),
+    );
+    const { result } = await renderHook(() => useReduceMotion());
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(result.current).toBe(false);
   });
 });
 
@@ -83,6 +134,19 @@ describe('ProgressBar', () => {
       0,
     );
   });
+
+  it('exposes count semantics instead of a percent when counts are supplied', async () => {
+    await render(
+      <ProgressBar
+        progress={0.3}
+        accessibilityLabel="Words mastered"
+        accessibilityCount={{ min: 0, max: 40, now: 12 }}
+      />,
+    );
+    expect(
+      screen.getByRole('progressbar', { name: 'Words mastered' }).props.accessibilityValue,
+    ).toEqual({ min: 0, max: 40, now: 12 });
+  });
 });
 
 describe('StatTile', () => {
@@ -90,6 +154,15 @@ describe('StatTile', () => {
     await render(<StatTile icon="flame" value="7" label="Day streak" tint="accent" />);
     expect(screen.getByText('7')).toBeTruthy();
     expect(screen.getByText('Day streak')).toBeTruthy();
+  });
+
+  it('keeps the caption on the contrast-verified on-tint ink', async () => {
+    await render(<StatTile icon="target" value="B1" label="Current level" tint="primary" />);
+    // The label sits on the primaryLight tint fill, where plain muted ink
+    // misses 4.5:1 in light mode (4.32) — the on-tint token is pinned here.
+    expect(StyleSheet.flatten(screen.getByText('Current level').props.style).color).toBe(
+      lightColors.mutedTint,
+    );
   });
 });
 
@@ -129,6 +202,30 @@ describe('WordTaggedTranscript', () => {
     // The plain merged transcript never renders beside the chips.
     expect(screen.queryByText('I brung courage.')).toBeNull();
   });
+
+  it('names each chip with its word and localized status for screen readers', async () => {
+    await render(<WordTaggedTranscript transcript="I brung courage." wordScores={TAGS} />);
+    // Status is not color-only for assistive tech: the legend is hidden, so
+    // the chip's own accessible name carries the verdict.
+    expect(screen.getByLabelText('I, Good')).toBeTruthy();
+    expect(screen.getByLabelText('brung, Practice')).toBeTruthy();
+    expect(screen.getByLabelText('courage, Close')).toBeTruthy();
+  });
+
+  it('pairs hue with a non-color cue: check glyphs on good, dashed underline on poor', async () => {
+    await render(<WordTaggedTranscript transcript="I brung courage." wordScores={TAGS} />);
+    const hidden = { includeHiddenElements: true } as const;
+    // Exactly the good chips carry the check glyph.
+    expect(screen.getAllByTestId('word-tag-check', hidden)).toHaveLength(2);
+    // The poor word wears a dashed underline; the good word does not.
+    expect(StyleSheet.flatten(screen.getByText('brung').props.style)).toMatchObject({
+      textDecorationLine: 'underline',
+      textDecorationStyle: 'dashed',
+    });
+    expect(StyleSheet.flatten(screen.getByText('showed').props.style)).not.toMatchObject({
+      textDecorationLine: 'underline',
+    });
+  });
 });
 
 describe('PasswordStrengthMeter', () => {
@@ -144,8 +241,26 @@ describe('PasswordStrengthMeter', () => {
     expect(passwordStrength('Str0ng!Phrase')).toBe('strong');
   });
 
+  it('rates Unicode-letter passwords against the same letter rule as the server policy', () => {
+    // The policy's letter class is \p{L}, not [a-zA-Z]: Telugu, Hindi, and
+    // Cyrillic letters with a digit satisfy it and must rate fairly instead
+    // of being mislabeled "Weak" beside a working submit.
+    expect(passwordStrength('తెలుగు123')).toBe('fair');
+    expect(passwordStrength('पासवर्ड123')).toBe('fair');
+    expect(passwordStrength('пароль123')).toBe('fair');
+    // A Unicode password the policy WOULD reject (no digit) stays weak.
+    expect(passwordStrength('తెలుగుమాట')).toBe('weak');
+  });
+
   it('renders nothing for an empty candidate', async () => {
     const { toJSON } = await render(<PasswordStrengthMeter password="" />);
+    expect(toJSON()).toBeNull();
+  });
+
+  it('hides beside a candidate the field already rejects as too long', async () => {
+    // Past the 72-UTF-8-byte bcrypt ceiling the adjacent "too long" error is
+    // the only useful feedback — a tier label beside it would contradict it.
+    const { toJSON } = await render(<PasswordStrengthMeter password={`${'pass'.repeat(19)}1`} />);
     expect(toJSON()).toBeNull();
   });
 
@@ -161,6 +276,11 @@ describe('PasswordStrengthMeter', () => {
     expect(screen.getByLabelText('Strong')).toBeTruthy();
     expect(screen.getAllByTestId('meter-segment-on')).toHaveLength(3);
     expect(screen.queryByTestId('meter-segment-off')).toBeNull();
+  });
+
+  it('announces tier changes politely while typing', async () => {
+    await render(<PasswordStrengthMeter password="short" />);
+    expect(screen.getByLabelText('Weak').props.accessibilityLiveRegion).toBe('polite');
   });
 });
 

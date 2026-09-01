@@ -42,6 +42,9 @@ export default function ResetPasswordScreen() {
   const [focusedField, setFocusedField] = useState<
     'email' | 'code' | 'password' | 'confirmPassword' | null
   >(null);
+  // Inline email validation waits for blur (the field arrives prefilled from
+  // the forgot-password step; an edit that breaks it is explained on exit).
+  const [emailTouched, setEmailTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const codeRef = useRef<TextInput>(null);
@@ -93,6 +96,7 @@ export default function ResetPasswordScreen() {
     !busy;
 
   const handleSubmit = async () => {
+    setEmailTouched(true);
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
     publishNavigationLock();
@@ -142,7 +146,10 @@ export default function ResetPasswordScreen() {
             value={email}
             onChangeText={setEmail}
             onFocus={() => setFocusedField('email')}
-            onBlur={() => setFocusedField(null)}
+            onBlur={() => {
+              setFocusedField(null);
+              setEmailTouched(true);
+            }}
             placeholder={t('login.emailPlaceholder')}
             placeholderTextColor={colors.muted}
             autoCapitalize="none"
@@ -155,7 +162,7 @@ export default function ResetPasswordScreen() {
             maxLength={MAX_EMAIL_LENGTH}
             editable={!busy}
           />
-          {emailError && (
+          {emailTouched && emailError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {emailError}
             </Text>

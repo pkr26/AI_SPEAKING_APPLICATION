@@ -504,6 +504,12 @@ function parseDiagnosticAnswerSummaries(value: unknown): DiagnosticAnswerSummary
  * Validate the additive word-tag list. A present-but-malformed list is a
  * corrupt response (ContractError), while an absent list is simply an older
  * deployment's scored answer; silence responses must never carry one.
+ *
+ * The status enum is deliberately strict: an unrecognized status fails the
+ * whole response closed instead of degrading, so a future server-side enum
+ * addition is NOT additive for this binary and must ship with a synchronized
+ * MIN_CLIENT_VERSION bump (the component itself would tolerate an unknown
+ * status gracefully — the parser gate is what fails closed, by design).
  */
 function parseWordScores(value: unknown): WordScore[] {
   if (!Array.isArray(value) || value.length > 600) throw new ContractError();

@@ -161,6 +161,37 @@ function wordScoreArraySchema() {
     .max(600);
 }
 
+type WordScoreEntry = { word: string; status: 'good' | 'fair' | 'poor' };
+
+/**
+ * The grading prompt asks the model to echo the transcript "exactly word by
+ * word, in order". A provider that paraphrases, drops, or adds words would
+ * otherwise silently replace the learner's answer under the client's "We
+ * heard" heading with verdicts attached to words they never said, so the echo
+ * is reconciled before it is emitted: both sides are normalized (lowercased,
+ * punctuation and whitespace stripped) and must match word for word. A
+ * divergent list is dropped entirely — `wordScores` is optional in the
+ * additive response contract, so every client renders its plain-transcript
+ * fallback instead of a falsified echo.
+ */
+export function reconcileWordScores(
+  wordScores: WordScoreEntry[] | null | undefined,
+  transcript: string,
+): WordScoreEntry[] | undefined {
+  if (wordScores == null) return undefined;
+  const normalize = (value: string): string => value.toLocaleLowerCase('en-US').replace(/[^\p{L}\p{N}]/gu, '');
+  const transcriptWords = transcript
+    .split(/\s+/)
+    .map(normalize)
+    .filter((word) => word.length > 0);
+  const echoedWords = wordScores.map((entry) => normalize(entry.word)).filter((word) => word.length > 0);
+  if (echoedWords.length !== transcriptWords.length) return undefined;
+  for (let index = 0; index < echoedWords.length; index += 1) {
+    if (echoedWords[index] !== transcriptWords[index]) return undefined;
+  }
+  return wordScores;
+}
+
 /**
  * English speaking grade contract: a 0-100 score plus bounded feedback text.
  * Two shapes share these fields: the strict response-format schema sent to
@@ -582,12 +613,15 @@ export function assessSpeaking(
       const parsed = gradingSchema.safeParse(rawParsed);
       if (!parsed.success) return undefined;
       const score = Math.round(parsed.data.score);
+      // A divergent echo degrades to the plain transcript (see
+      // reconcileWordScores) instead of falsifying what the learner said.
+      const reconciled = reconcileWordScores(parsed.data.wordScores, transcript);
       return {
         transcript,
         score,
         passed: score >= 60, // enforced in code regardless of model output
         feedback: parsed.data.feedback,
-        ...(parsed.data.wordScores == null ? {} : { wordScores: parsed.data.wordScores }),
+        ...(reconciled ? { wordScores: reconciled } : {}),
       };
     },
   });

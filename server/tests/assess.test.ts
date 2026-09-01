@@ -532,6 +532,8 @@ describe('assessSpeaking (OpenAI path)', () => {
 
   it('carries provider word tags through and tolerates null or missing lists', async () => {
     openaiMocks.transcribe.mockResolvedValue({ text: 'I showed courage when I tried.' });
+    // The echo reproduces the transcript word for word (punctuation and case
+    // may differ — reconciliation normalizes both), so the tags survive.
     openaiMocks.parse.mockResolvedValue({
       choices: [
         {
@@ -541,8 +543,11 @@ describe('assessSpeaking (OpenAI path)', () => {
               feedback: 'Clear answer.',
               wordScores: [
                 { word: 'I', status: 'good' },
-                { word: 'showed', status: 'good' },
+                { word: 'SHOWED', status: 'good' },
                 { word: 'courage', status: 'fair' },
+                { word: 'when.', status: 'fair' },
+                { word: 'I', status: 'good' },
+                { word: 'tried', status: 'poor' },
               ],
             },
           },
@@ -552,8 +557,11 @@ describe('assessSpeaking (OpenAI path)', () => {
     await expect(assessSpeaking(audioPath, QUESTION, userId)).resolves.toMatchObject({
       wordScores: [
         { word: 'I', status: 'good' },
-        { word: 'showed', status: 'good' },
+        { word: 'SHOWED', status: 'good' },
         { word: 'courage', status: 'fair' },
+        { word: 'when.', status: 'fair' },
+        { word: 'I', status: 'good' },
+        { word: 'tried', status: 'poor' },
       ],
     });
 
@@ -573,6 +581,58 @@ describe('assessSpeaking (OpenAI path)', () => {
     });
     const missing = await assessSpeaking(audioPath, QUESTION, userId);
     expect('wordScores' in missing).toBe(false);
+  });
+
+  it('drops a provider word echo that diverges from the transcript', async () => {
+    openaiMocks.transcribe.mockResolvedValue({ text: 'I showed courage when I tried.' });
+
+    // A partial echo (the old fixture) must not replace the learner's answer
+    // with tags for words out of context.
+    openaiMocks.parse.mockResolvedValue({
+      choices: [
+        {
+          message: {
+            parsed: {
+              score: 82,
+              feedback: 'Clear answer.',
+              wordScores: [
+                { word: 'I', status: 'good' },
+                { word: 'showed', status: 'good' },
+                { word: 'courage', status: 'fair' },
+              ],
+            },
+          },
+        },
+      ],
+    });
+    const partial = await assessSpeaking(audioPath, QUESTION, userId);
+    expect(partial.score).toBe(82);
+    expect('wordScores' in partial).toBe(false);
+
+    // A paraphrasing echo fails reconciliation the same way.
+    openaiMocks.parse.mockResolvedValue({
+      choices: [
+        {
+          message: {
+            parsed: {
+              score: 82,
+              feedback: 'Clear answer.',
+              wordScores: [
+                { word: 'I', status: 'good' },
+                { word: 'demonstrated', status: 'good' },
+                { word: 'courage', status: 'fair' },
+                { word: 'when', status: 'fair' },
+                { word: 'I', status: 'good' },
+                { word: 'tried', status: 'poor' },
+              ],
+            },
+          },
+        },
+      ],
+    });
+    const paraphrased = await assessSpeaking(audioPath, QUESTION, userId);
+    expect(paraphrased.transcript).toBe('I showed courage when I tried.');
+    expect('wordScores' in paraphrased).toBe(false);
   });
 
   it('rejects a provider word-tag list with an unknown status', async () => {

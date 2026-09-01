@@ -24,6 +24,7 @@ import { ApiError, apiFetch, apiSkipPracticeWord, userMessageForError } from '..
 import { useAuth } from '../../../lib/auth';
 import { useT } from '../../../lib/i18n';
 import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../../lib/practice-flow';
+import { setPracticeExitLocked } from '../../../lib/practice-exit-lock';
 import { hasSeenPracticeIntro, markPracticeIntroSeen } from '../../../lib/practice-intro';
 import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
@@ -112,6 +113,8 @@ export default function PracticeScreen() {
       focusedRef.current = false;
       navigationStartedRef.current = true;
       activeRenderOwnerRef.current = null;
+      // Never let this screen's exit lock outlive it (logout, gate reset).
+      setPracticeExitLocked(false);
       cancelFocusRevalidation();
     };
   }, [cancelFocusRevalidation]);
@@ -170,6 +173,7 @@ export default function PracticeScreen() {
     recoveryRefreshRef.current = null;
     recorderLockedRef.current = false;
     recorderExitLockedRef.current = false;
+    setPracticeExitLocked(false);
   }, [recorderOwner]);
 
   const renderOwnsWork = useCallback(
@@ -293,12 +297,19 @@ export default function PracticeScreen() {
         ? { headerBackVisible: false, gestureEnabled: false }
         : { headerBackVisible: true, gestureEnabled: true },
     );
+    // Mirror the same lock for the bottom tab bar and the Home header
+    // Settings action: they sit outside this stack, where a tab switch or a
+    // pushed Settings screen would blur it and let Recorder cleanup discard
+    // a held take. Synchronous with the ref above, so there is no pre-render
+    // window in which the bar stays tappable.
+    setPracticeExitLocked(navigationLockedNow());
   }, [navigationLockedNow, navigation]);
 
-  // Practice now sits above Home. Leaving is a normal exit, except while a
-  // recording, upload, or recovery is active — popping then would let blur
-  // cleanup discard the take. Hardware back, header back, and the iOS swipe
-  // gesture all follow the same lock.
+  // Practice is one tab among four. Leaving is a normal exit, except while a
+  // recording, upload, or recovery is active — leaving then would let blur
+  // cleanup discard the take. Hardware back, header back, the iOS swipe
+  // gesture, and (via the shared exit lock) the other tabs and the Home
+  // header Settings action all follow the same lock.
   useHardwareBack(navigationLockedNow);
   useFocusEffect(
     useCallback(() => {
@@ -312,6 +323,8 @@ export default function PracticeScreen() {
         cancelFocusRevalidation();
         focusedRef.current = false;
         navigationStartedRef.current = true;
+        // Only the focused screen may hold the tab bar's exit lock.
+        setPracticeExitLocked(false);
       };
     }, [cancelFocusRevalidation, publishNavigationLock, scheduleFocusRevalidation]),
   );
@@ -568,11 +581,10 @@ export default function PracticeScreen() {
             // question lines. The recorder stays absent until a real question
             // owns the surface.
             <View style={styles.questionSkeleton} testID="practice-question-skeleton">
-              <Text
-                accessibilityLiveRegion="polite"
-                accessibilityElementsHidden
-                style={styles.hiddenLoadingText}
-              >
+              {/* Visually hidden but kept in the accessibility tree: Android
+                  announces it via the live region, iOS VoiceOver can focus it
+                  (live regions alone are not announced there). */}
+              <Text accessibilityLiveRegion="polite" style={styles.hiddenLoadingText}>
                 {t('practice.loadingQuestion')}
               </Text>
               <View style={styles.skeletonBadgeRow}>
@@ -806,7 +818,7 @@ export default function PracticeScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, elevation }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -817,6 +829,9 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
+    // No bottom safe-area padding by design: the bottom tab bar (not this
+    // screen's footer, removed by the redesign) owns insets.bottom for every
+    // tab screen, so scroll content stops above the bar itself.
   },
   center: {
     flex: 1,
@@ -869,11 +884,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     backgroundColor: colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
-    shadowColor: colors.shadow,
-    shadowOpacity: scheme === 'dark' ? 0.4 : 0.15,
-    shadowRadius: 6,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 4,
+    ...elevation.raised,
   },
   helpButtonPressed: {
     backgroundColor: colors.primaryDark,

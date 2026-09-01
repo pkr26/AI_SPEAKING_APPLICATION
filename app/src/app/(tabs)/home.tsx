@@ -191,11 +191,10 @@ export default function HomeScreen() {
           // reads as its own content arriving (NN/g skeletons), while the
           // polite line keeps the wait announced without sight.
           <View style={styles.skeletonStack}>
-            <Text
-              accessibilityLiveRegion="polite"
-              accessibilityElementsHidden
-              style={styles.hiddenLoadingText}
-            >
+            {/* Visually hidden but kept in the accessibility tree: Android
+                announces it via the live region, iOS VoiceOver can focus it
+                (live regions alone are not announced there). */}
+            <Text accessibilityLiveRegion="polite" style={styles.hiddenLoadingText}>
               {t('home.loading')}
             </Text>
             <View style={styles.skeletonTileRow}>
@@ -283,6 +282,14 @@ export default function HomeScreen() {
                 : 0
             }
             accessibilityLabel={t('home.masteryLabel')}
+            accessibilityCount={{
+              // Screen-reader users keep "X of Y words" granularity from the
+              // bar itself, not just a percent (the old inline bar announced
+              // counts; the adjacent masteryLine still spells them out).
+              min: 0,
+              max: Math.max(stats.progress.totalAtLevel, stats.progress.masteredCount),
+              now: stats.progress.masteredCount,
+            }}
             testID="home-mastery-bar"
           />
           <Text style={styles.masteryLine}>
@@ -324,7 +331,7 @@ export default function HomeScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   container: {
     flexGrow: 1,
     padding: layout.screenPadding,
@@ -362,8 +369,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     backgroundColor: colors.background,
   },
   greeting: {
-    fontSize: 24,
-    lineHeight: 30,
+    fontSize: type.title.fontSize,
+    lineHeight: type.title.lineHeight,
     fontWeight: '800',
     color: colors.text,
     marginBottom: spacing.md,

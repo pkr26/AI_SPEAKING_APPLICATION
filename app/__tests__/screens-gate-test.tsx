@@ -654,12 +654,16 @@ describe('root layout route guards', () => {
     expect(guards()).toEqual([false, false, false, false]);
   });
 
-  it('routes users without a completed diagnostic to the diagnostic screen only', async () => {
+  it('routes users without a completed diagnostic to diagnostic while keeping recordings reachable', async () => {
     mockAuthValue = makeAuth({
       user: { ...USER, diagnosticCompleted: false, cefrLevel: null },
     });
     await render(<RootLayout />);
-    expect(guards()).toEqual([false, true, false, true]);
+    // The (tabs) group registers under hasProfile (not canPractice) so the
+    // Recordings tab — like Settings — stays reachable pre-placement; the
+    // tabs' own Tabs.Protected guard gates Home/Practice/History, and the
+    // gate screen itself still routes this learner to diagnostic.
+    expect(guards()).toEqual([false, true, true, true]);
   });
 
   it('routes users with a completed diagnostic to practice and settings', async () => {
@@ -673,7 +677,10 @@ describe('root layout route guards', () => {
       user: { ...USER, diagnosticAcknowledged: false },
     });
     await render(<RootLayout />);
-    expect(guards()).toEqual([false, true, false, true]);
+    // (tabs) stays registered (hasProfile) for Recordings; the inner tabs
+    // guard still hides the learning surfaces until the reveal is
+    // acknowledged.
+    expect(guards()).toEqual([false, true, true, true]);
   });
 
   it('locks assessment routes against header-back and swipe-back bypasses', async () => {
@@ -697,8 +704,9 @@ describe('root layout route guards', () => {
       capturedScreenProps.find((props) => props?.name === name)?.options;
 
     // `home` (inside the tab group) is the post-diagnostic landing screen; the
-    // root-level lock protects the diagnostic itself, while the tab layouts
-    // own the home/practice exit locks.
+    // root-level lock protects the diagnostic itself, while the practice-flow
+    // exit locks live in the (tabs)/practice stack (home is a free-exit root
+    // tab and is pinned by the tabs layout test).
     expect(optionsFor('diagnostic')).toEqual({
       title: translateFor('hi', 'header.diagnostic'),
       headerBackVisible: false,

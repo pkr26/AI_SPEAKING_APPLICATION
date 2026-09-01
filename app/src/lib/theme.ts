@@ -23,6 +23,13 @@ export interface ThemeColors {
   text: string;
   /** Secondary ink. */
   muted: string;
+  /**
+   * Secondary ink for text sitting on a tinted fill (primaryLight,
+   * accentLight, successLight, dangerLight): darker than `muted` in light so
+   * it clears 4.5:1 on every tint (plain `muted` fails on primaryLight and
+   * dangerLight); equal to `muted` in dark, where the tints are dark fills.
+   */
+  mutedTint: string;
   /** Decorative hairlines and dividers. */
   border: string;
   /** Form-field border: stronger than `border` for non-text contrast. */
@@ -65,8 +72,10 @@ export interface ThemeColors {
  * Key ratios: text/bg 16.6, muted/bg 4.52, onPrimary/primary 6.29,
  * onSuccess/success 5.02, success/successLight 4.79, danger/dangerLight 5.91,
  * primary/primaryLight 5.62, onWarning/warning 7.31, inputBorder/inputBg 4.83.
- * Accent family (amber-700): onAccent/accent 5.03, accent/background 4.69,
- * accent/card 5.03, accent/accentLight 4.86, onAccent/accentDark 7.09.
+ * mutedTint clears 4.5:1 on every tinted fill: primaryLight 6.76,
+ * dangerLight 6.91, accentLight 7.29, successLight 7.22, card 7.56.
+ * Accent family (amber-700): onAccent/accent 5.02, accent/background 4.69,
+ * accent/card 5.02, accent/accentLight 4.84, onAccent/accentDark 7.09.
  */
 export const lightColors: ThemeColors = {
   primary: '#4F46E5',
@@ -77,6 +86,7 @@ export const lightColors: ThemeColors = {
   card: '#FFFFFF',
   text: '#111827',
   muted: '#6B7280',
+  mutedTint: '#4B5563',
   border: '#E5E7EB',
   inputBorder: '#6B7280',
   inputBackground: '#FFFFFF',
@@ -104,9 +114,11 @@ export const lightColors: ThemeColors = {
  * Key ratios: text/bg 16.3, muted/bg 7.57, onPrimary/primary 8.02,
  * onSuccess/success 8.55, success/successLight 8.39, danger/dangerLight 5.72,
  * primary/primaryLight 6.91, onWarning/warning 9.28, inputBorder/inputBg 4.09.
- * Accent family (amber-400 fill with amber-950 ink): onAccent/accent 10.1,
- * accent/background 11.1, accent/card 9.8, accent/accentLight 9.4,
- * onAccent/accentDark 13.5.
+ * mutedTint on the tinted fills: primaryLight 5.63, dangerLight 6.46,
+ * accentLight 6.14, successLight 5.97, card 6.63.
+ * Accent family (amber-400 fill with amber-950 ink): onAccent/accent 8.97,
+ * accent/background 11.11, accent/card 9.72, accent/accentLight 9.00,
+ * onAccent/accentDark 12.03.
  */
 export const darkColors: ThemeColors = {
   primary: '#A5B4FC',
@@ -117,6 +129,7 @@ export const darkColors: ThemeColors = {
   card: '#1A2129',
   text: '#ECF1F7',
   muted: '#9BA7B4',
+  mutedTint: '#9BA7B4',
   border: '#2A333D',
   inputBorder: '#6E7B89',
   inputBackground: '#131920',
@@ -191,6 +204,8 @@ export const type = {
   title: { fontSize: 24, lineHeight: 30 } as const,
   /** Card and section titles. */
   headline: { fontSize: 20, lineHeight: 26 } as const,
+  /** Primary CTA label (the shared Button's hero `lg` size). */
+  hero: { fontSize: 18, lineHeight: 24 } as const,
   /** Primary content text (HIG body). */
   bodyLg: { fontSize: 17, lineHeight: 24 } as const,
   /** Supporting content text (Material body large). */
@@ -204,27 +219,22 @@ export const type = {
 } as const;
 
 /**
- * Motion durations (ms) and easings. NN/g's research range for interface
- * motion is 100–500ms: ~100ms for state feedback, 200–300ms for entrances.
- * `overshoot` is the celebration curve (Duolingo's bounce token);
+ * Motion durations (ms) and easings, restricted to what the app consumes:
+ * every token here has at least one caller (unused tokens were dropped so the
+ * scale stays honest). NN/g's research range for interface motion is
+ * 100–500ms: ~100ms for state feedback, 200–300ms for entrances;
  * celebrations alone may exceed the plain range.
  */
 export const motion = {
-  /** Press feedback, toggles, chips. */
-  fast: 120,
   /** Entrances, layout changes, sheet-like transitions. */
   base: 220,
   /** Celebrations and hero moments. */
   slow: 340,
   easing: {
-    /** M3 standard curve: symmetric, for moves and fades. */
-    standard: Easing.bezier(0.2, 0, 0, 1),
     /** Fast-out slow-in: entering elements settle (NN/g recommendation). */
     decelerate: Easing.bezier(0.05, 0.7, 0.1, 1),
     /** Accelerating exit. */
     accelerate: Easing.bezier(0.3, 0, 1, 1),
-    /** Playful overshoot for rewards and level-ups only. */
-    overshoot: Easing.bezier(0.68, -0.55, 0.265, 1.55),
   },
 } as const;
 
@@ -234,7 +244,7 @@ export type ColorScheme = 'light' | 'dark';
  * Elevation presets, tuned per scheme: light casts soft shadows, dark leans on
  * a stronger cast plus the elevated card fill (black shadows vanish on the
  * dark background). `resting` cards stay quiet; `raised` is for floating
- * controls (record button, banners); `overlay` for celebration panels.
+ * controls (record button, banners, the tab bar).
  */
 export interface ThemeElevation {
   shadowColor: string;
@@ -244,57 +254,41 @@ export interface ThemeElevation {
   elevation: number;
 }
 
-export const elevations: Record<
-  ColorScheme,
-  { resting: ThemeElevation; raised: ThemeElevation; overlay: ThemeElevation }
-> = {
-  light: {
-    resting: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.04,
-      shadowRadius: 6,
-      shadowOffset: { width: 0, height: 2 },
-      elevation: 1,
+export const elevations: Record<ColorScheme, { resting: ThemeElevation; raised: ThemeElevation }> =
+  {
+    light: {
+      resting: {
+        shadowColor: '#000000',
+        shadowOpacity: 0.04,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: 1,
+      },
+      raised: {
+        shadowColor: '#000000',
+        shadowOpacity: 0.16,
+        shadowRadius: 10,
+        shadowOffset: { width: 0, height: 4 },
+        elevation: 5,
+      },
     },
-    raised: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.16,
-      shadowRadius: 10,
-      shadowOffset: { width: 0, height: 4 },
-      elevation: 5,
+    dark: {
+      resting: {
+        shadowColor: '#000000',
+        shadowOpacity: 0.2,
+        shadowRadius: 6,
+        shadowOffset: { width: 0, height: 2 },
+        elevation: 1,
+      },
+      raised: {
+        shadowColor: '#000000',
+        shadowOpacity: 0.5,
+        shadowRadius: 10,
+        shadowOffset: { width: 0, height: 4 },
+        elevation: 5,
+      },
     },
-    overlay: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.24,
-      shadowRadius: 18,
-      shadowOffset: { width: 0, height: 8 },
-      elevation: 8,
-    },
-  },
-  dark: {
-    resting: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.2,
-      shadowRadius: 6,
-      shadowOffset: { width: 0, height: 2 },
-      elevation: 1,
-    },
-    raised: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.5,
-      shadowRadius: 10,
-      shadowOffset: { width: 0, height: 4 },
-      elevation: 5,
-    },
-    overlay: {
-      shadowColor: '#000000',
-      shadowOpacity: 0.65,
-      shadowRadius: 18,
-      shadowOffset: { width: 0, height: 8 },
-      elevation: 8,
-    },
-  },
-};
+  };
 
 export interface Theme {
   scheme: ColorScheme;
@@ -304,7 +298,7 @@ export interface Theme {
   layout: typeof layout;
   type: typeof type;
   motion: typeof motion;
-  elevation: { resting: ThemeElevation; raised: ThemeElevation; overlay: ThemeElevation };
+  elevation: { resting: ThemeElevation; raised: ThemeElevation };
 }
 
 /** Built once per scheme so consumers get referentially stable themes. */

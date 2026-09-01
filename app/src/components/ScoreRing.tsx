@@ -1,23 +1,11 @@
-import React, { useEffect, useState } from 'react';
-import { AccessibilityInfo, Animated, Text, useAnimatedValue, View } from 'react-native';
+import React, { useEffect } from 'react';
+import { Animated, Text, useAnimatedValue, View } from 'react-native';
 import Svg, { Circle as SvgCircle } from 'react-native-svg';
 
+import { useReduceMotion } from '../lib/use-reduce-motion';
 import { useTheme } from '../lib/theme';
 
 const AnimatedRingCircle = Animated.createAnimatedComponent(SvgCircle);
-
-/** Reads the OS Reduce Motion setting and keeps it live. */
-export function useReduceMotion(): boolean {
-  const [reduceMotion, setReduceMotion] = useState(false);
-  useEffect(() => {
-    const subscription = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
-    void AccessibilityInfo.isReduceMotionEnabled()
-      .then(setReduceMotion)
-      .catch(() => undefined);
-    return () => subscription.remove();
-  }, []);
-  return reduceMotion;
-}
 
 export interface ScoreRingProps {
   /** Score to display, 0–100. Values outside the range are clamped. */
@@ -55,9 +43,12 @@ export default function ScoreRing({
   const theme = useTheme();
   const arcColor = color ?? theme.colors.primary;
   const reduceMotion = useReduceMotion();
-  const clamped = Math.max(0, Math.min(100, Math.round(score)));
+  // Non-finite scores render as 0, mirroring ProgressBar's guard: the parsers
+  // never produce them, but the two components must not disagree.
+  const clamped = Math.max(0, Math.min(100, Math.round(Number.isFinite(score) ? score : 0)));
   const progress = useAnimatedValue(0);
-  const radius = (size - thickness) / 2;
+  // A degenerate thickness >= size still leaves a positive-radius ring.
+  const radius = Math.max(1, (size - thickness) / 2);
   const circumference = 2 * Math.PI * radius;
 
   useEffect(() => {
@@ -95,6 +86,8 @@ export default function ScoreRing({
             cx={size / 2}
             cy={size / 2}
             r={radius}
+            // Decorative track; the arc is the indicator and the value is
+            // exposed accessibly (see ProgressBar's track note).
             stroke={trackColor ?? theme.colors.border}
             strokeWidth={thickness}
             fill="none"
@@ -125,6 +118,7 @@ export default function ScoreRing({
           }}
         >
           <Text
+            maxFontSizeMultiplier={1.4}
             style={{
               fontSize: Math.round(size * 0.28),
               fontWeight: '800',
@@ -138,6 +132,7 @@ export default function ScoreRing({
       </View>
       {label ? (
         <Text
+          maxFontSizeMultiplier={1.4}
           style={{
             marginTop: 2,
             fontSize: theme.type.caption.fontSize,

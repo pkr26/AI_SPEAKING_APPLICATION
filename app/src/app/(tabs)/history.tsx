@@ -332,11 +332,10 @@ export default function HistoryScreen() {
           // Row skeletons preview the day sections and answer cards the list
           // will fill, with a hidden polite line announcing the wait.
           <View style={styles.historySkeleton}>
-            <Text
-              accessibilityLiveRegion="polite"
-              accessibilityElementsHidden
-              style={styles.hiddenLoadingText}
-            >
+            {/* Visually hidden but kept in the accessibility tree: Android
+                announces it via the live region, iOS VoiceOver can focus it
+                (live regions alone are not announced there). */}
+            <Text accessibilityLiveRegion="polite" style={styles.hiddenLoadingText}>
               {t('history.loading')}
             </Text>
             <Skeleton width={120} height={16} borderRadius={4} testID="history-skeleton-header" />

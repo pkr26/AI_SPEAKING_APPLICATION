@@ -5853,10 +5853,10 @@ describe('practice home presentation', () => {
       alignItems: 'center',
       justifyContent: 'center',
       shadowColor: colors.shadow,
-      shadowOpacity: 0.15,
-      shadowRadius: 6,
-      shadowOffset: { width: 0, height: 3 },
-      elevation: 4,
+      shadowOpacity: 0.16,
+      shadowRadius: 10,
+      shadowOffset: { width: 0, height: 4 },
+      elevation: 5,
     });
     // The "?" text glyph is retired: the circle now carries the themed help
     // icon, hidden from screen readers because the button owns the label.
@@ -5889,11 +5889,11 @@ describe('practice home presentation', () => {
     asMock(useColorScheme).mockReturnValue('dark');
     await renderLoadedHome();
 
-    // A 0.15 shadow disappears on a dark surface; dark mode raises it.
+    // The raised elevation preset's cast strengthens on a dark surface.
     expect(flattenedStyle(screen.getByLabelText(t('practice.helpLabel')))).toMatchObject({
       backgroundColor: darkColors.primary,
       shadowColor: darkColors.shadow,
-      shadowOpacity: 0.4,
+      shadowOpacity: 0.5,
     });
     expect(screenContainerStyle()).toMatchObject({ backgroundColor: darkColors.background });
   });
@@ -6692,7 +6692,8 @@ describe('practice feedback presentation', () => {
   const SUBTITLE = {
     marginTop: spacing.sm,
     fontSize: 15,
-    color: colors.muted,
+    // On-tint ink: plain muted misses 4.5:1 on the outcome panels' tinted fills.
+    color: colors.mutedTint,
     textAlign: 'center',
   };
 

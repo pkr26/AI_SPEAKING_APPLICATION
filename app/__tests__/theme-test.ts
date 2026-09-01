@@ -50,6 +50,9 @@ describe('theme palette', () => {
       card: '#FFFFFF',
       text: '#111827',
       muted: '#6B7280',
+      // On-tint secondary ink: plain muted reaches only 4.32:1 on primaryLight
+      // and 4.42:1 on dangerLight in light mode, so tinted surfaces carry it.
+      mutedTint: '#4B5563',
       border: '#E5E7EB',
       // U-M1: form-field borders need 3:1 non-text contrast on white, which
       // the former #9CA3AF (2.54:1) never reached.
@@ -87,6 +90,7 @@ describe('theme palette', () => {
       card: '#1A2129',
       text: '#ECF1F7',
       muted: '#9BA7B4',
+      mutedTint: '#9BA7B4',
       border: '#2A333D',
       inputBorder: '#6E7B89',
       inputBackground: '#131920',
@@ -140,6 +144,14 @@ describe('theme palette', () => {
       ['warning text on background', palette.warning, palette.background],
       ['warning text on card', palette.warning, palette.card],
       ['banner text on primaryLight', palette.primaryDark, palette.primaryLight],
+      // Secondary ink on the tinted fills the redesign places it on (StatTile
+      // captions, feedback outcome panels). Plain `muted` misses 4.5:1 on
+      // primaryLight (4.32) and dangerLight (4.42) in light mode.
+      ['mutedTint ink on primaryLight', palette.mutedTint, palette.primaryLight],
+      ['mutedTint ink on accentLight', palette.mutedTint, palette.accentLight],
+      ['mutedTint ink on successLight', palette.mutedTint, palette.successLight],
+      ['mutedTint ink on dangerLight', palette.mutedTint, palette.dangerLight],
+      ['mutedTint ink on card', palette.mutedTint, palette.card],
       ['accent text on background', palette.accent, palette.background],
       ['accent text on card', palette.accent, palette.card],
       ['accent chip text on accentLight', palette.accent, palette.accentLight],

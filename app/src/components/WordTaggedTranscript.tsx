@@ -4,6 +4,7 @@ import { Text, View } from 'react-native';
 import { useT, type MessageKey } from '../lib/i18n';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import type { WordScore, WordScoreStatus } from '../lib/types';
+import Icon from './Icon';
 
 export interface WordTaggedTranscriptProps {
   /** The full transcript, rendered when no word tags are available. */
@@ -28,8 +29,11 @@ const LEGEND_KEYS: Record<WordScoreStatus, MessageKey> = {
  * — good / close / needs-practice — so a learner sees exactly which words to
  * work on before reading a word of prose. Deployments that do not tag words
  * (and pre-tag replays) render the plain quoted transcript unchanged. Hue is
- * only one of the cues: the legend names each state and every chip keeps its
- * word text, so the reading never depends on color alone.
+ * never the only cue: good chips carry a check glyph, poor chips a dashed
+ * underline, and every chip's accessible name merges the word with its
+ * localized status, so both color-blind and screen-reader learners get the
+ * full per-word verdict (the visual legend stays hidden from assistive tech
+ * to avoid re-reading it once per chip row).
  */
 export default function WordTaggedTranscript({
   transcript,
@@ -58,8 +62,30 @@ export default function WordTaggedTranscript({
     <View style={styles.wrap} testID={testID}>
       <View accessibilityLanguage={accessibilityLanguage} style={styles.chipRow}>
         {wordScores.map((entry, index) => (
-          <View key={`${entry.word}-${index}`} style={[styles.chip, styles[entry.status]]}>
-            <Text style={[styles.chipText, styles[`${entry.status}Text`]]}>{entry.word}</Text>
+          <View
+            key={`${entry.word}-${index}`}
+            accessible
+            accessibilityLabel={`${entry.word}, ${t(LEGEND_KEYS[entry.status])}`}
+            style={[styles.chip, styles[entry.status]]}
+          >
+            <Text
+              selectable
+              style={[styles.chipText, styles[`${entry.status}Text`]]}
+              textBreakStrategy="simple"
+            >
+              {entry.word}
+            </Text>
+            {entry.status === 'good' && (
+              // Icon is decorative-by-default (hidden from assistive tech);
+              // the chip's own accessible name already carries the status.
+              <Icon
+                name="check"
+                size={11}
+                color={theme.colors.success}
+                strokeWidth={3}
+                testID="word-tag-check"
+              />
+            )}
           </View>
         ))}
       </View>
@@ -81,7 +107,7 @@ export default function WordTaggedTranscript({
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme }) => {
+const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme, type }) => {
   // 'fair' pairs with the calmer primary register in light mode and the
   // warning tint in dark (both pass text contrast on their chip fills).
   const fairInk = scheme === 'dark' ? colors.warning : colors.primary;
@@ -110,6 +136,9 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme }) => 
       paddingVertical: 3,
       paddingHorizontal: 8,
       borderWidth: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 3,
     },
     chipText: {
       fontSize: 16,
@@ -121,7 +150,13 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme }) => 
     fair: { backgroundColor: fairFill, borderColor: fairBorder },
     fairText: { color: fairInk },
     poor: { backgroundColor: colors.dangerLight, borderColor: colors.danger },
-    poorText: { color: colors.danger },
+    poorText: {
+      color: colors.danger,
+      // Dashed underline on the word itself is the second, non-color cue for
+      // "needs practice" (paired with the check glyph on good chips).
+      textDecorationLine: 'underline',
+      textDecorationStyle: 'dashed',
+    },
     legendRow: {
       flexDirection: 'row',
       flexWrap: 'wrap',
@@ -139,7 +174,8 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme }) => 
       borderRadius: 4,
     },
     legendLabel: {
-      fontSize: 11,
+      fontSize: type.caption.fontSize,
+      lineHeight: type.caption.lineHeight,
       fontWeight: '700',
       textTransform: 'uppercase',
       letterSpacing: 0.5,

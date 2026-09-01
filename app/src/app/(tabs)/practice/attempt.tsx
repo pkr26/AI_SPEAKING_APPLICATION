@@ -14,6 +14,7 @@ import { apiFetch, userMessageForError } from '../../../lib/api';
 import { useAuth } from '../../../lib/auth';
 import { useT } from '../../../lib/i18n';
 import { firstParam, isUuid } from '../../../lib/params';
+import { setPracticeExitLocked } from '../../../lib/practice-exit-lock';
 import { applyFailedAttemptToQuestionCache, usePracticeFlow } from '../../../lib/practice-flow';
 import { createThemedStyles, useTheme } from '../../../lib/theme';
 import {
@@ -112,6 +113,8 @@ export default function AttemptScreen() {
       focusedRef.current = false;
       navigationStartedRef.current = true;
       activeRecorderOwnerRef.current = null;
+      // Never let this screen's exit lock outlive it.
+      setPracticeExitLocked(false);
     };
   }, []);
 
@@ -121,6 +124,7 @@ export default function AttemptScreen() {
     recoveryExitRef.current = null;
     recorderLockedRef.current = false;
     recorderExitLockedRef.current = false;
+    setPracticeExitLocked(false);
   }, [recorderOwner]);
 
   const renderOwnsWork = useCallback(
@@ -142,6 +146,9 @@ export default function AttemptScreen() {
         ? { headerBackVisible: false, gestureEnabled: false }
         : { headerBackVisible: true, gestureEnabled: true },
     );
+    // Mirror the same lock for the bottom tab bar and the Home header
+    // Settings action (they sit outside this stack; see practice-exit-lock).
+    setPracticeExitLocked(recorderExitLockedRef.current);
   }, [navigation]);
 
   useFocusEffect(
@@ -152,6 +159,8 @@ export default function AttemptScreen() {
       return () => {
         focusedRef.current = false;
         navigationStartedRef.current = true;
+        // Only the focused screen may hold the tab bar's exit lock.
+        setPracticeExitLocked(false);
       };
     }, [publishNavigationLock]),
   );

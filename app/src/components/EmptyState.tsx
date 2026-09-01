@@ -35,7 +35,6 @@ export default function EmptyState({
       contentContainerStyle={styles.host}
       refreshControl={refreshControl}
       testID={testID}
-      accessibilityLabel={title}
     >
       <View style={styles.markBadge}>
         <Icon name={icon} size={30} />

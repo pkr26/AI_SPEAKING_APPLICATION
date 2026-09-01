@@ -62,7 +62,6 @@ function RootNavigator() {
   const hasProfile = !isRestoring && !restoreError && !!token && !!user;
   const placementRevealPending =
     user?.diagnosticCompleted === true && user.diagnosticAcknowledged === false;
-  const canPractice = hasProfile && user?.diagnosticCompleted === true && !placementRevealPending;
 
   return (
     <>
@@ -91,11 +90,15 @@ function RootNavigator() {
             }}
           />
         </Stack.Protected>
-        <Stack.Protected guard={canPractice}>
+        <Stack.Protected guard={hasProfile}>
           {/* Bottom-tab navigation: Home, Practice (flow stack), History,
-              Recordings. Settings remains a pushed stack screen so the
-              signed-out legal screens and the mid-diagnostic entry keep their
-              existing paths and guards. */}
+              Recordings. `hasProfile` (not canPractice) registers the group so
+              Recordings — like Settings — stays reachable for every signed-in
+              learner, including one mid-placement; the tabs' own
+              Tabs.Protected guard still gates Home/Practice/History on a
+              completed placement. Settings remains a pushed stack screen so
+              the signed-out legal screens and the mid-diagnostic entry keep
+              their existing paths and guards. */}
           <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
         </Stack.Protected>
         <Stack.Protected guard={hasProfile}>

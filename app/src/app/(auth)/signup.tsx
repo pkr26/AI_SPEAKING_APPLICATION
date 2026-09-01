@@ -50,6 +50,10 @@ export default function SignupScreen() {
   const [focusedField, setFocusedField] = useState<
     'name' | 'email' | 'password' | 'confirmPassword' | null
   >(null);
+  // Inline email validation waits for the learner to leave the field (NN/g:
+  // erroring mid-typing is a hostile pattern; the submit gate still checks
+  // live). A tap on the disabled submit also reveals it (see handleSignup).
+  const [emailTouched, setEmailTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -107,6 +111,10 @@ export default function SignupScreen() {
     !busy;
 
   const handleSignup = async () => {
+    // A submit attempt (button tap or keyboard "go") counts as leaving the
+    // email field: an autofilled-but-invalid address must explain its
+    // disabled submit instead of failing silently.
+    setEmailTouched(true);
     if (!canSubmit || !nativeLanguage || busyRef.current) return;
     busyRef.current = true;
     publishNavigationLock();
@@ -188,7 +196,10 @@ export default function SignupScreen() {
                 setError(null);
               }}
               onFocus={() => setFocusedField('email')}
-              onBlur={() => setFocusedField(null)}
+              onBlur={() => {
+                setFocusedField(null);
+                setEmailTouched(true);
+              }}
               placeholder={t('login.emailPlaceholder')}
               placeholderTextColor={colors.muted}
               autoCapitalize="none"
@@ -201,7 +212,7 @@ export default function SignupScreen() {
               maxLength={MAX_EMAIL_LENGTH}
               editable={!busy}
             />
-            {emailError && (
+            {emailTouched && emailError && (
               <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
                 {emailError}
               </Text>
@@ -352,13 +363,19 @@ export default function SignupScreen() {
               </Text>
             )}
 
-            <Button
-              title={busy ? t('signup.submitBusy') : t('signup.submit')}
-              disabled={!canSubmit}
-              loading={busy}
-              onPress={() => void handleSignup()}
-              style={styles.submitButton}
-            />
+            {/* The wrapper receives the tap when the Button inside is disabled
+                by validation, so pressing a blocked submit reveals the email
+                error instead of failing silently; an enabled Button consumes
+                its own press. */}
+            <Pressable accessible={false} onPress={() => setEmailTouched(true)}>
+              <Button
+                title={busy ? t('signup.submitBusy') : t('signup.submit')}
+                disabled={!canSubmit}
+                loading={busy}
+                onPress={() => void handleSignup()}
+                style={styles.submitButton}
+              />
+            </Pressable>
 
             <View style={styles.legalLinks}>
               <Link
@@ -468,22 +485,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   inputWithAction: {
     flex: 1,
     minWidth: 0,
-  },
-  inputAction: {
-    flexShrink: 1,
-    maxWidth: '45%',
-    minHeight: layout.minimumTarget,
-    minWidth: layout.minimumTarget,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: spacing.sm,
-  },
-  inputActionText: {
-    flexShrink: 1,
-    color: colors.primary,
-    fontSize: 14,
-    fontWeight: '600',
-    textAlign: 'center',
   },
   languageHelp: {
     marginBottom: spacing.sm,

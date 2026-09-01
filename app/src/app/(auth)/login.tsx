@@ -1,5 +1,13 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput, View } from 'react-native';
+import {
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
@@ -98,6 +106,10 @@ export default function LoginScreen() {
     !busy;
 
   const handleLogin = async () => {
+    // A submit attempt (button tap or keyboard "go") counts as leaving the
+    // email field: an autofilled-but-invalid address must explain its
+    // disabled submit instead of failing silently.
+    setEmailTouched(true);
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
     publishNavigationLock();
@@ -248,13 +260,19 @@ export default function LoginScreen() {
               </Text>
             )}
 
-            <Button
-              title={busy ? t('login.submitBusy') : t('login.submit')}
-              disabled={!canSubmit}
-              loading={busy}
-              onPress={() => void handleLogin()}
-              style={styles.submitButton}
-            />
+            {/* The wrapper receives the tap when the Button inside is disabled
+                by validation, so pressing a blocked submit reveals the email
+                error instead of failing silently; an enabled Button consumes
+                its own press. */}
+            <Pressable accessible={false} onPress={() => setEmailTouched(true)}>
+              <Button
+                title={busy ? t('login.submitBusy') : t('login.submit')}
+                disabled={!canSubmit}
+                loading={busy}
+                onPress={() => void handleLogin()}
+                style={styles.submitButton}
+              />
+            </Pressable>
 
             <Link
               href="/forgot-password"

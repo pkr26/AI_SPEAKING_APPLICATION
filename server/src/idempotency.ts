@@ -119,6 +119,16 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
   const learningPassScore = integer(PRACTICE_PASS_SCORE, PRACTICE_MASTER_SCORE - 1);
   const masteryScore = integer(PRACTICE_MASTER_SCORE, 100);
 
+  /**
+   * Additive word-level transcript tags (see assess.ts). Optional on every
+   * scored speaking response so pre-wordScores rows replay unchanged and
+   * silence/native responses never carry it.
+   */
+  const wordScores = z
+    .array(z.object({ word: nonEmptyString(200), status: z.enum(['good', 'fair', 'poor']) }))
+    .max(600)
+    .optional();
+
   const question = z.object({
     id: uuid,
     cefrLevel,
@@ -169,6 +179,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
       score: failingScore,
       transcript: nonEmptyString(12_000),
       feedback: nonEmptyString(800),
+      wordScores,
     }),
     z.object({
       ...recordingFields,
@@ -176,6 +187,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
       score: passingScore,
       transcript: nonEmptyString(12_000),
       feedback: nonEmptyString(800),
+      wordScores,
     }),
   ]);
   const noDiagnosticSilenceField = { noSpeech: absent } as const;
@@ -197,6 +209,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
     done: z.literal(false),
     level: absent,
     nextQuestion: question,
+    wordScores: absent,
   });
   const diagnosticResponse = z.union([diagnosticScoredResponse, diagnosticSilenceResponse]);
 
@@ -224,6 +237,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
       finalFeedback: absent,
       next: absent,
       levelUp: absent,
+      wordScores: absent,
     })
     .refine(({ attemptNo, attemptsLeft }) => attemptsLeft === PRACTICE_MAX_ATTEMPTS - (attemptNo - 1));
 
@@ -234,6 +248,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
       mastered: z.literal(false),
       score: failingScore,
       transcript: nonEmptyString(12_000),
+      wordScores,
       noSpeech: absent,
       attemptsLeft: attemptNumber,
       finalFeedback: absent,
@@ -248,6 +263,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
     mastered: z.literal(false),
     score: failingScore,
     transcript: nonEmptyString(12_000),
+    wordScores,
     noSpeech: absent,
     attemptsLeft: z.literal(0),
     finalFeedback: nonEmptyString(4_000),
@@ -263,6 +279,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
     mastered: z.literal(false),
     score: learningPassScore,
     transcript: nonEmptyString(12_000),
+    wordScores,
     next: practiceQuestionPayload,
   });
 
@@ -274,6 +291,7 @@ function createResponseSchemas(): Record<AssessmentContext, z.ZodTypeAny> {
     mastered: z.literal(true),
     score: masteryScore,
     transcript: nonEmptyString(12_000),
+    wordScores,
     next: practiceQuestionPayload,
   });
 

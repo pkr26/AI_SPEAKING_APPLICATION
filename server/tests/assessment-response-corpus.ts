@@ -5,6 +5,13 @@ export interface AssessmentResponseCase {
   context: ResponseContext;
   value: unknown;
   valid: boolean;
+  /**
+   * Expected app-parser acceptance when the additive client contract is
+   * deliberately more tolerant than the server's durable-data gate. Clients
+   * ignore unknown fields so old binaries survive new additive responses;
+   * the server still rejects the row as corrupt. Defaults to `valid`.
+   */
+  appValid?: boolean;
 }
 
 const QUESTION_ID = '11111111-1111-4111-8111-111111111111';
@@ -547,6 +554,29 @@ for (const [context, value] of [
   ['practice-native', nativeSpoken({ recordingId: null })],
 ] as const) {
   invalid(`${context} invalid retained recording id`, context, value);
+}
+
+// Additive word-level transcript tags: valid on every scored speaking shape,
+// rejected with an unknown status, and rejected on silence (which never
+// carries a transcript to tag).
+const WORD_SCORES = [
+  { word: 'courage', status: 'good' },
+  { word: 'brung', status: 'poor' },
+  { word: 'when', status: 'fair' },
+];
+for (const [context, value] of [
+  ['diagnostic', diagnosticDone({ wordScores: WORD_SCORES })],
+  ['practice', practiceRetry({ wordScores: WORD_SCORES })],
+  ['practice', practiceTerminal({ wordScores: WORD_SCORES })],
+] as const) {
+  valid(`${context} word-level transcript tags`, context, value);
+}
+for (const [context, value] of [
+  ['practice', practiceRetry({ wordScores: [{ word: 'courage', status: 'excellent' }] })],
+  ['practice', practiceSilence({ wordScores: WORD_SCORES })],
+  ['diagnostic', diagnosticDone({ wordScores: [{ word: '', status: 'good' }] })],
+] as const) {
+  invalid(`${context} invalid word-level transcript tags`, context, value);
 }
 
 export const assessmentResponseCases: readonly AssessmentResponseCase[] = cases;

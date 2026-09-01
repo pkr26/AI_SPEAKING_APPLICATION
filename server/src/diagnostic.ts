@@ -342,6 +342,8 @@ async function finalizeDiagnosticAnswer(
       score: result.score,
       transcript: result.transcript,
       feedback: result.feedback,
+      // Additive word-level transcript tags (absent on older deployments).
+      ...(result.wordScores === undefined ? {} : { wordScores: result.wordScores }),
     };
 
     if (done) {

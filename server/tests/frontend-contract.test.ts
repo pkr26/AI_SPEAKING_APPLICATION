@@ -151,7 +151,7 @@ describe('real API responses satisfy the mobile app parsers', () => {
 
       expect(serverAccepted, `${testCase.name}: server`).toBe(testCase.valid);
       expect(appAccepted, `${testCase.name}: app`).toBe(testCase.valid);
-      expect(serverAccepted, `${testCase.name}: parity`).toBe(appAccepted);
+      expect(appAccepted, `${testCase.name}: parity`).toBe(serverAccepted);
     }
     error.mockRestore();
   });

@@ -143,6 +143,12 @@ const envSchema = z
     // slowest legitimate assessment; the superRefine below enforces that
     // invariant for every configuration.
     SHUTDOWN_DRAIN_MS: z.coerce.number().int().min(10_000).max(300_000).default(140_000),
+    // Optional ceiling on concurrently accepted HTTP sockets (0 = unlimited,
+    // Node's own default). The slow-client guards bound stalled/idle sockets,
+    // not a flood of legitimately-paced parallel connections; this cap is the
+    // in-process backstop for accidental direct exposure, while a fronting
+    // proxy with its own connection/header limits remains the primary defense.
+    MAX_CONNECTIONS: z.coerce.number().int().min(0).max(1_000_000).default(0),
     // Prometheus endpoint gate. Off by default: GET /metrics exposes
     // operational detail (routes, latencies, provider error rates) and must
     // only be scraped from a private network when enabled (404 when off).
@@ -533,6 +539,7 @@ export const config = {
   openaiTimeoutMs: env.OPENAI_TIMEOUT_MS,
   gradingModel: env.GRADING_MODEL,
   shutdownDrainMs: env.SHUTDOWN_DRAIN_MS,
+  maxConnections: env.MAX_CONNECTIONS,
   metricsEnabled: env.METRICS_ENABLED,
   metricsBearerToken: env.METRICS_BEARER_TOKEN,
   ads: {

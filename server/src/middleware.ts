@@ -430,7 +430,10 @@ export function errorHandler(err: unknown, req: Request, res: Response, _next: N
     if (err.code === 'LIMIT_FILE_SIZE') {
       return res.status(413).json({ error: 'File too large (max 25MB)', code: 'AUDIO_TOO_LARGE' });
     }
-    return res.status(400).json({ error: err.message, code: 'VALIDATION_FAILED' });
+    // Static message by design: multer embeds the client-controlled field name
+    // in LIMIT_UNEXPECTED_FILE text, and reflecting parser messages echoes
+    // request fragments back out.
+    return res.status(400).json({ error: 'Invalid multipart upload', code: 'VALIDATION_FAILED' });
   }
   // Map body-parser protocol errors to stable, non-sensitive API responses.
   // Never reflect parser messages because they can include request fragments.

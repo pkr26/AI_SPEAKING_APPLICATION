@@ -1,3 +1,4 @@
+import { createHash, timingSafeEqual } from 'node:crypto';
 import compression from 'compression';
 import cors from 'cors';
 import express from 'express';
@@ -123,7 +124,14 @@ export function createApp({
         // scheme whitespace, exactly one bearer token, exact string match.
         const authorization = req.headers.authorization;
         const token = typeof authorization === 'string' ? /^Bearer[ \t]+([^\s]+)$/.exec(authorization)?.[1] : undefined;
-        if (token !== expected) {
+        // Compare SHA-256 digests with timingSafeEqual: the verdict stays
+        // constant-time (a plain !== shortcut-times on the shared prefix) and,
+        // because digests are fixed-length, timingSafeEqual's equal-length
+        // requirement disappears — so a wrong-length guess reveals nothing
+        // about the configured token either.
+        const presentedDigest = token === undefined ? undefined : createHash('sha256').update(token).digest();
+        const expectedDigest = createHash('sha256').update(expected).digest();
+        if (presentedDigest === undefined || !timingSafeEqual(presentedDigest, expectedDigest)) {
           throw new HttpError(401, 'Missing or invalid Authorization header', 'UNAUTHENTICATED');
         }
         return next();

@@ -29,6 +29,7 @@ const MANAGED_KEYS = [
   'OPENAI_TIMEOUT_MS',
   'GRADING_MODEL',
   'SHUTDOWN_DRAIN_MS',
+  'MAX_CONNECTIONS',
   'METRICS_ENABLED',
   'METRICS_BEARER_TOKEN',
   'ADS_ENABLED',
@@ -179,6 +180,7 @@ describe('config env validation', () => {
     expect(config.openaiTimeoutMs).toBe(60_000);
     expect(config.gradingModel).toBe('gpt-4o-mini-2024-07-18');
     expect(config.shutdownDrainMs).toBe(140_000);
+    expect(config.maxConnections).toBe(0);
     expect(config.metricsEnabled).toBe(false);
     expect(config.metricsBearerToken).toBe('');
     expect(config.ads).toEqual({
@@ -845,6 +847,15 @@ describe('config env validation', () => {
 
     for (const version of ['12', '1.12', '1.2.345', '123456789.123456789.123456789']) {
       expect((await loadConfig(baseEnv({ MIN_CLIENT_VERSION: version }))).minClientVersion).toBe(version);
+    }
+  });
+
+  it('parses the optional HTTP socket cap and rejects negative or non-integer values', async () => {
+    const configured = await loadConfig(baseEnv({ MAX_CONNECTIONS: '2048' }));
+    expect(configured.maxConnections).toBe(2048);
+
+    for (const invalid of ['-1', '1.5', 'abc', '1000001']) {
+      await expectInvalid(baseEnv({ MAX_CONNECTIONS: invalid }), 'MAX_CONNECTIONS');
     }
   });
 

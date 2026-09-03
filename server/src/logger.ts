@@ -56,7 +56,10 @@ export const httpLogger = pinoHttp({
     req: (req) => ({
       id: req.id,
       method: req.method,
-      url: req.url,
+      // Log the path only. No route needs its query string for diagnostics,
+      // and keeping it out of the log stream means a future route that puts a
+      // token or other secret in a query cannot leak it into logs.
+      url: (req.url ?? '').split('?')[0],
       remoteAddress: req.remoteAddress,
     }),
     res: (res) => ({ statusCode: res.statusCode }),

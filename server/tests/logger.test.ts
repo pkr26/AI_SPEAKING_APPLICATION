@@ -123,8 +123,9 @@ describe('httpLogger', () => {
     await request(a).get('/ready');
     const urls = entries().map((e) => e.req?.url);
     expect(urls).toContain('/healthz');
-    expect(urls).toContain('/ready?x=1');
-    expect(urls).toContain('/ready');
+    // Logged URLs carry the path only (query strings are stripped), so both
+    // /ready spellings above surface as the same bare path.
+    expect(urls.filter((u) => u === '/ready')).toHaveLength(2);
   });
 
   it('redacts credentials from direct application logs as well as HTTP logs', () => {

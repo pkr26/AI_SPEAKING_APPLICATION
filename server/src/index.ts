@@ -57,6 +57,13 @@ server.headersTimeout = 30_000;
 // unaffected, and shutdown severs idle sockets explicitly
 // (closeIdleConnections) so a longer keep-alive cannot pin the drain open.
 server.keepAliveTimeout = 65_000;
+// Optional ceiling on concurrently accepted sockets (0 = unlimited, Node's
+// default; MAX_CONNECTIONS). The slow-client guards destroy stalled and idle
+// sockets but cannot see a connection before its first request byte, so a
+// flood of legitimately-paced parallel connections is otherwise bounded only
+// by file descriptors. A proxy/ALB stays the primary defense; this is the
+// in-process backstop for accidental direct exposure.
+server.maxConnections = config.maxConnections;
 
 // Uploads sweep the local disk four times as often as the database janitors:
 // orphaned multipart files are pure disk waste, while DB cleanups are bounded

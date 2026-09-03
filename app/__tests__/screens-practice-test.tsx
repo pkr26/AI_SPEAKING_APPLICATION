@@ -20,7 +20,6 @@ import { SafeAreaProvider } from 'react-native-safe-area-context';
 
 import * as Haptics from 'expo-haptics';
 
-import AttemptScreen from '../src/app/(tabs)/practice/attempt';
 import FeedbackScreen from '../src/app/(tabs)/practice/feedback';
 import HelpScreen from '../src/app/(tabs)/practice/help';
 import PracticeScreen from '../src/app/(tabs)/practice/index';
@@ -100,6 +99,7 @@ jest.mock('expo-router', () => {
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
+      canGoBack: jest.fn(() => false),
     },
     useLocalSearchParams: () => ({
       cycleId: '550e8400-e29b-41d4-a716-446655440020',
@@ -322,6 +322,7 @@ const mockRouter = jest.requireMock('expo-router').router as {
   replace: jest.Mock;
   back: jest.Mock;
   dismissTo: jest.Mock;
+  canGoBack: jest.Mock;
 };
 
 // ----- fixtures -----
@@ -421,6 +422,20 @@ function trackQueryRefetches(): jest.SpyInstance {
 function pressHardwareBack(): boolean {
   if (backHandlers.length === 0) throw new Error('No hardware back handler registered');
   return backHandlers[backHandlers.length - 1]();
+}
+
+type MockAlertButton = { text: string; style?: string; onPress?: () => void };
+
+/** Confirms the most recent skip-confirmation alert exactly as the OS would. */
+function confirmSkipAlert(): void {
+  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as [
+    string,
+    string,
+    MockAlertButton[],
+  ];
+  const confirm = (call[2] ?? []).find((button) => button.text === t('practice.skipWord'));
+  if (!confirm?.onPress) throw new Error('No skip confirmation button in the last alert');
+  confirm.onPress();
 }
 
 function dispatchBeforeRemove(type = 'GO_BACK'): jest.Mock {
@@ -535,29 +550,6 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function abortableApiResult<T>(source: ReturnType<typeof deferred<T>>) {
-  return (_path: string, options?: { signal?: AbortSignal }) =>
-    new Promise<T>((resolve, reject) => {
-      const signal = options?.signal;
-      const abort = () => reject(signal?.reason ?? new DOMException('Aborted', 'AbortError'));
-      if (signal?.aborted) {
-        abort();
-        return;
-      }
-      signal?.addEventListener('abort', abort, { once: true });
-      void source.promise.then(
-        (value) => {
-          signal?.removeEventListener('abort', abort);
-          resolve(value);
-        },
-        (error: unknown) => {
-          signal?.removeEventListener('abort', abort);
-          reject(error);
-        },
-      );
-    });
-}
-
 async function blurScreen(): Promise<void> {
   await act(async () => {
     for (const registration of mockFocusRegistrations) {
@@ -666,6 +658,8 @@ beforeEach(() => {
   asMock(useColorScheme).mockReturnValue('light');
   mockApiFetch.mockReset();
   mockSkipWord.mockReset();
+  // The gate-guard default: nothing beneath the signed-in stack to pop.
+  mockRouter.canGoBack.mockReturnValue(false);
   mockAcknowledgePendingFeedback.mockReset().mockResolvedValue(true);
   mockRecorderProps = null;
   mockRecorderInstanceSerial = 0;
@@ -736,7 +730,7 @@ describe('practice home screen', () => {
     expect(screen.getByText(t('practice.greeting', { name: USER.name }))).toBeTruthy();
     // Section navigation moved to the tab bar; the learning surface exposes
     // no account exits while its question is still loading.
-    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('settings.retake') })).toBeNull();
     expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
     await act(async () => {
       replacement.resolve(PRACTICE_QUESTION);
@@ -1186,7 +1180,7 @@ describe('practice home screen', () => {
 
     // Account exits live in Settings/Profile now, so the learning surface has
     // no footer actions left to lock.
-    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('settings.retake') })).toBeNull();
     expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
 
     await act(async () => recorderProps().onInteractionLockChange?.(false));
@@ -1256,6 +1250,23 @@ describe('practice home screen', () => {
 
     await view.unmount();
     expect(backSubscriptionRemove).toHaveBeenCalled();
+  });
+
+  it('consumes an idle hardware back press only when practice has somewhere to pop', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    // Nothing beneath the tab root to pop: the press falls through so
+    // Android's own "back at the task root leaves the app" behavior works.
+    expect(mockRouter.canGoBack()).toBe(false);
+    expect(pressHardwareBack()).toBe(false);
+
+    // The entry gate sits beneath the signed-in stack: consume the press so
+    // back never lands on the gate (which would bounce straight back here).
+    mockRouter.canGoBack.mockReturnValue(true);
+    expect(pressHardwareBack()).toBe(true);
+    expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
   it('hides header back and the iOS gesture only while the recorder is locked', async () => {
@@ -1763,903 +1774,6 @@ describe('practice home screen', () => {
   });
 });
 
-describe('practice attempt screen', () => {
-  it('accepts the valid routed cycle before longer Practice Mode cases run', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    attemptCycleSentinelAttempted = true;
-    await renderScreen(<AttemptScreen />);
-
-    attemptCycleSentinelPassed =
-      screen.queryByRole('header', { name: t('help.invalidLinkTitle') }) === null;
-    expect(attemptCycleSentinelPassed).toBe(true);
-    expect(await screen.findByText(QUESTION.questionText)).toBeTruthy();
-  });
-
-  it('shows the offline state before linked practice help can load', async () => {
-    onlineManager.setOnline(false);
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-
-    expect(await screen.findByRole('header', { name: t('network.offlineTitle') })).toBeTruthy();
-    expect(mockApiFetch).not.toHaveBeenCalled();
-    expect(screen.queryByTestId('recorder')).toBeNull();
-  });
-
-  it('rejects an invalid question link', async () => {
-    mockSearchParams = { questionId: 'not-a-uuid' };
-    await renderScreen(<AttemptScreen />);
-
-    expect(screen.getByRole('header', { name: t('help.invalidLinkTitle') })).toBeTruthy();
-    // Practice Mode sends the learner back a different way than help does.
-    expect(screen.getByText(t('attempt.invalidLinkBody'))).toBeTruthy();
-    expect(screen.queryByText(t('help.invalidLinkBody'))).toBeNull();
-    expect(screen.queryByTestId('recorder')).toBeNull();
-    expect(screen.queryByText(t('attempt.loading'))).toBeNull();
-    await expectPressFeedback(
-      () => screen.getByRole('button', { name: t('common.backToPractice') }),
-      { backgroundColor: colors.primary },
-      { backgroundColor: colors.primaryDark },
-    );
-    await fireEvent.press(screen.getByRole('button', { name: t('common.backToPractice') }));
-    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
-    expect(mockApiFetch).not.toHaveBeenCalled();
-  });
-
-  it('rejects an invalid practice cycle before loading help or mounting Recorder', async () => {
-    mockSearchParams = { questionId: QUESTION.id, cycleId: 'not-a-cycle-uuid' };
-    await renderScreen(<AttemptScreen />);
-
-    expect(screen.getByRole('header', { name: t('help.invalidLinkTitle') })).toBeTruthy();
-    expect(screen.getByText(t('attempt.invalidLinkBody'))).toBeTruthy();
-    expect(screen.queryByTestId('recorder')).toBeNull();
-    expect(mockApiFetch).not.toHaveBeenCalled();
-  });
-
-  it('shows a loading state while the question loads', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockReturnValue(new Promise(() => undefined));
-    await renderScreen(<AttemptScreen />);
-    expect(screen.getByText(t('attempt.loading')).props.accessibilityLiveRegion).toBe('polite');
-    // The spinner itself is labelled, so the wait is announced without sight.
-    expect(screen.getByLabelText(t('attempt.loading'))).toBeTruthy();
-  });
-
-  it('renders the question and wires the recorder for the attempt endpoint', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    await renderScreen(<AttemptScreen />, queryClient);
-
-    expect(
-      (await screen.findByText('Describe a time you showed courage.')).props.accessibilityLanguage,
-    ).toBe('en-US');
-    expect(screen.getByRole('header', { name: 'courage' }).props.accessibilityLanguage).toBe(
-      'en-US',
-    );
-    expect(mockApiFetch).toHaveBeenCalledWith(
-      `/practice/question/${QUESTION.id}/help`,
-      expect.objectContaining({ signal: expect.anything() }),
-    );
-    expect(recorderProps()).toMatchObject({
-      ownerId: USER.id,
-      questionId: QUESTION.id,
-      endpoint: '/practice/attempt',
-    });
-    expect(recorderProps().onExpandedControlsLayout).toEqual(expect.any(Function));
-    expect(() => recorderProps().onExpandedControlsLayout?.()).not.toThrow();
-    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
-    // The screen chooses which response contract the recorder parses with; a
-    // swapped parser breaks the flow at runtime, so pin the wiring.
-    expect(recorderProps().parseResult(PASSED_RESULT)).toEqual(PASSED_RESULT);
-    expect(
-      queryClient.getQueryCache().find({
-        queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
-        exact: true,
-      }),
-    ).toBeDefined();
-    expect(
-      queryClient.getQueryCache().find({
-        queryKey: ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
-        exact: true,
-      })?.options,
-    ).toEqual(expect.objectContaining({ enabled: true, retry: false }));
-    // Practice Mode deliberately hides translations and examples.
-    expect(screen.queryByText('ధైర్యం')).toBeNull();
-    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt/native')).toBe(true);
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
-  });
-
-  it('does not scroll expanded controls after Practice Mode loses ownership', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const rendered = await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const reveal = recorderProps().onExpandedControlsLayout!;
-    mockScrollToExpandedRecorderControls.mockClear();
-
-    await rendered.unmount();
-    reveal();
-
-    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(null, false);
-  });
-
-  it('preserves native mode when practice is entered from help', async () => {
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    expect(screen.getByText(t('practice.answeringNative'))).toBeTruthy();
-    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
-    expect(recorderProps().parseResult(NATIVE_RESULT_FOR_PARSER)).toEqual(NATIVE_RESULT_FOR_PARSER);
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: true, disabled: false });
-
-    await fireEvent.press(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }));
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('english');
-
-    expect(recorderProps().onRecoveryEndpointMismatch?.('/practice/attempt')).toBe(true);
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenLastCalledWith('english');
-    expect(recorderProps().onRecoveryEndpointMismatch?.('/diagnostic/answer')).toBe(false);
-
-    const nativeResult: NativeAttemptResult = {
-      mode: 'native',
-      nativeLanguage: 'te',
-      cycleId: CYCLE_ID,
-      understood: true,
-      attemptNo: 1,
-      attemptsLeft: 2,
-      transcript: 'నాకు ప్రయాణం ఇష్టం.',
-      translatedTranscript: 'I like travelling.',
-      modelAnswer: 'I enjoy travelling because I discover new places.',
-      feedback: 'Your answer was on topic.',
-    };
-    await act(async () => recorderProps().onResult(nativeResult));
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      nativeResult,
-      QUESTION,
-      expect.any(String),
-    );
-    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
-  });
-
-  it('remounts the Practice Mode Recorder when answer mode changes endpoint in place', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    expect(mockRecorderMounts).toHaveLength(1);
-    const englishInstance = mockRecorderMounts[0];
-    expect(recorderProps().endpoint).toBe('/practice/attempt');
-
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    await act(async () => {
-      await rerenderScreen(<AttemptScreen />);
-    });
-
-    expect(recorderProps().endpoint).toBe('/practice/attempt/native');
-    expect(recorderProps().parseResult(NATIVE_RESULT_FOR_PARSER)).toEqual(NATIVE_RESULT_FOR_PARSER);
-    expect(mockRecorderMounts).toHaveLength(2);
-    expect(mockRecorderUnmounts).toEqual([englishInstance]);
-    expect(mockRecorderMounts[1]).not.toBe(englishInstance);
-
-    mockScrollToExpandedRecorderControls.mockClear();
-    recorderProps().onExpandedControlsLayout?.();
-    expect(mockScrollToExpandedRecorderControls).toHaveBeenLastCalledWith(expect.anything(), true);
-  });
-
-  it('keeps the active Recorder mounted across a remote mother-tongue refresh', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValueOnce(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />, queryClient);
-    await screen.findByText(QUESTION.questionText);
-    expect(mockRecorderMounts).toHaveLength(1);
-    const recorderInstance = mockRecorderMounts[0];
-
-    // ProfileRefreshBridge publishes the remotely changed account profile while
-    // retiring only inactive old-language help. The replacement request stays
-    // pending to exercise the key handoff that used to replace Recorder.
-    const replacement = deferred<unknown>();
-    mockApiFetch.mockImplementation(abortableApiResult(replacement));
-    await act(async () => {
-      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'hi' } });
-      await rerenderScreen(<AttemptScreen />);
-      await Promise.resolve();
-    });
-
-    expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
-    expect(screen.getByTestId('recorder')).toBeTruthy();
-    expect(mockRecorderMounts).toEqual([recorderInstance]);
-    expect(mockRecorderUnmounts).toEqual([]);
-    expect(recorderProps()).toMatchObject({
-      ownerId: USER.id,
-      questionId: QUESTION.id,
-      cycleId: CYCLE_ID,
-    });
-
-    await act(async () => {
-      replacement.resolve(HELP_CONTENT);
-      await replacement.promise;
-    });
-    await waitFor(() => expect(screen.queryByText(t('refresh.updating'))).toBeNull());
-    await act(async () => {
-      await queryClient.cancelQueries();
-      await cleanup();
-      queryClient.clear();
-    });
-  });
-
-  it('keeps the active Recorder and offers retry when replacement help fails', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValueOnce(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />, queryClient);
-    await screen.findByText(QUESTION.questionText);
-    const replacement = deferred<unknown>();
-    mockApiFetch.mockImplementation(abortableApiResult(replacement));
-
-    await act(async () => {
-      mockAuthValue = makeAuth({ user: { ...USER, nativeLanguage: 'hi' } });
-      await rerenderScreen(<AttemptScreen />);
-      await Promise.resolve();
-    });
-    expect(screen.getByTestId('recorder')).toBeTruthy();
-
-    await act(async () => {
-      replacement.reject(new ApiError(500, 'replacement failed'));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(await screen.findByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved'));
-    expect(screen.getByText(QUESTION.questionText)).toBeTruthy();
-    expect(screen.getByTestId('recorder')).toBeTruthy();
-    expect(mockRecorderMounts).toEqual([expect.anything()]);
-    expect(mockRecorderUnmounts).toEqual([]);
-    await act(async () => {
-      await queryClient.cancelQueries();
-      await cleanup();
-      queryClient.clear();
-    });
-  });
-
-  it('locks the help-entry language switch during recording and submission', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await act(async () => {
-      recorderProps().onInteractionLockChange?.(true);
-      expect(mockSetOptions).toHaveBeenLastCalledWith({
-        headerBackVisible: false,
-        gestureEnabled: false,
-      });
-    });
-    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
-    expect(toggle.props.accessibilityState).toEqual({ checked: false, disabled: true });
-    // The lock is explained, not just enforced, and it is visible as dimming.
-    expect(toggle.props.accessibilityHint).toBe(t('hint.finishRecordingFirst'));
-    expect(flattenedStyle(toggle)).toMatchObject({ opacity: 0.5 });
-    await fireEvent.press(toggle);
-    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
-
-    await act(async () => {
-      recorderProps().onInteractionLockChange?.(false);
-      expect(mockSetOptions).toHaveBeenLastCalledWith({
-        headerBackVisible: true,
-        gestureEnabled: true,
-      });
-    });
-    const unlocked = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
-    expect(unlocked.props.accessibilityHint).toBeUndefined();
-    expect(flattenedStyle(unlocked).opacity).toBeUndefined();
-    await fireEvent.press(unlocked);
-    expect(mockPracticeFlow.setAnswerMode).toHaveBeenCalledWith('native');
-  });
-
-  it('rejects a stale Practice Mode switch tap delivered with its recorder lock', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const staleTogglePress = committedPressHandler(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
-    );
-
-    await act(async () => {
-      recorderProps().onInteractionLockChange?.(true);
-      staleTogglePress();
-    });
-
-    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
-  });
-
-  it('blocks the Android hardware back press only while a recording or submission is active', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    expect(pressHardwareBack()).toBe(false);
-
-    let immediateBack = false;
-    let immediatePrevent: jest.Mock | null = null;
-    await act(async () => {
-      recorderProps().onInteractionLockChange?.(true);
-      immediateBack = pressHardwareBack();
-      immediatePrevent = dispatchBeforeRemove();
-    });
-    expect(immediateBack).toBe(true);
-    expect(immediatePrevent).toHaveBeenCalledTimes(1);
-    expect(pressHardwareBack()).toBe(true);
-    expect(dispatchBeforeRemove('RESET')).not.toHaveBeenCalled();
-
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
-    expect(pressHardwareBack()).toBe(false);
-  });
-
-  it('hides header back and disables the swipe gesture while the recorder is locked', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    // Unlocked screens keep their normal exits.
-    expect(mockSetOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(mockSetOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: false,
-      gestureEnabled: false,
-    });
-
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
-    expect(mockSetOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-  });
-
-  it('lets parked recovery release route exits while Practice Mode controls stay locked', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await act(async () => {
-      recorderProps().onInteractionLockChange?.(true);
-      recorderProps().onExitLockChange?.(false);
-    });
-
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toMatchObject({ disabled: true });
-    expect(pressHardwareBack()).toBe(false);
-    expect(dispatchBeforeRemove()).not.toHaveBeenCalled();
-    expect(mockSetOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-  });
-
-  it('fills the language switch with contrast-checked text when native mode is on', async () => {
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
-    expect(flattenedStyle(toggle)).toMatchObject({
-      minHeight: layout.minimumTarget,
-      justifyContent: 'center',
-      backgroundColor: colors.primary,
-    });
-    expect(flattenedStyle(screen.getByText(t('practice.answeringNative')))).toMatchObject({
-      color: '#FFFFFF',
-    });
-    await expectPressFeedback(
-      () => screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
-      { backgroundColor: colors.primary },
-      { backgroundColor: colors.primaryDark },
-    );
-  });
-
-  it('keeps the outlined off state with a touch-safe target', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
-    expect(flattenedStyle(toggle)).toMatchObject({
-      minHeight: layout.minimumTarget,
-      borderWidth: 1,
-      borderColor: colors.primary,
-    });
-    expect(flattenedStyle(toggle).backgroundColor).toBeUndefined();
-    expect(flattenedStyle(screen.getByText(t('practice.answerInMyLanguage')))).toMatchObject({
-      color: colors.primary,
-    });
-  });
-
-  it('shows the attempt chip for the question the retry state belongs to', async () => {
-    mockPracticeFlow = makePracticeFlow({
-      attemptStatus: { questionId: QUESTION.id, cycleId: CYCLE_ID, attemptsLeft: 2 },
-    });
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    expect(
-      screen.getByText(t('practice.attemptChip', { current: 2, max: PRACTICE_MAX_ATTEMPTS })),
-    ).toBeTruthy();
-  });
-
-  it.each([
-    ['no attempt state is known', null],
-    [
-      'the retry state belongs to another word',
-      { questionId: NEXT_QUESTION.id, cycleId: CYCLE_ID, attemptsLeft: 2 },
-    ],
-    [
-      'the retry state belongs to an older cycle of the same word',
-      { questionId: QUESTION.id, cycleId: NEXT_CYCLE_ID, attemptsLeft: 1 },
-    ],
-  ])(
-    'falls back to the routed durable first-try position when %s',
-    async (_case, attemptStatus) => {
-      mockPracticeFlow = makePracticeFlow({ attemptStatus });
-      mockSearchParams = { questionId: QUESTION.id };
-      mockApiFetch.mockResolvedValue(HELP_CONTENT);
-      await renderScreen(<AttemptScreen />);
-      await screen.findByText('Describe a time you showed courage.');
-
-      expect(screen.getByText(t('practice.attemptChip', { current: 1, max: 3 }))).toBeTruthy();
-    },
-  );
-
-  it('does not load help or mount a recorder without an authenticated user', async () => {
-    mockAuthValue = makeAuth({ user: null });
-    mockSearchParams = { questionId: QUESTION.id };
-
-    await renderScreen(<AttemptScreen />);
-
-    expect(mockApiFetch).not.toHaveBeenCalled();
-    expect(mockRecorderProps).toBeNull();
-    expect(screen.queryByText(t('attempt.loading'))).toBeNull();
-  });
-
-  it.each([
-    ['the prompt word', { ...HELP_CONTENT, promptWord: '' }],
-    ['the question text', { ...HELP_CONTENT, questionText: '' }],
-  ])('does not mount the recorder when help omits %s', async (_label, content) => {
-    mockSearchParams = { questionId: QUESTION.id };
-    const queryClient = makeQueryClient();
-    const queryKey = ['question-help', USER.id, USER.nativeLanguage, QUESTION.id] as const;
-    // Exercise the screen's defense against corrupt cached data independently
-    // of the API parser, which rejects these shapes before caching them.
-    queryClient.setQueryDefaults(queryKey, { staleTime: Infinity });
-    queryClient.setQueryData(queryKey, content);
-
-    await renderScreen(<AttemptScreen />, queryClient);
-
-    expect(mockApiFetch).not.toHaveBeenCalled();
-    expect(mockRecorderProps).toBeNull();
-    expect(screen.queryByText('courage')).toBeNull();
-    expect(screen.queryByText(t('attempt.loadFailedTitle'))).toBeNull();
-  });
-
-  it('forwards results to the practice flow and feedback route', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
-    await renderScreen(<AttemptScreen />, queryClient);
-    await screen.findByText('Describe a time you showed courage.');
-
-    const result = {
-      ...PASSED_RESULT,
-      recordingId: '550e8400-e29b-41d4-a716-446655440090',
-    };
-    await act(async () => recorderProps().onResult(result));
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      result,
-      QUESTION,
-      expect.any(String),
-    );
-    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['recordings', USER.id] });
-    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
-  });
-
-  it('accepts one Practice Mode result when the Recorder repeats its callback', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-    const callbacks = recorderProps();
-
-    await act(async () => {
-      callbacks.onResult(PASSED_RESULT);
-      callbacks.onResult(PASSED_RESULT);
-    });
-
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(1);
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      PASSED_RESULT,
-      QUESTION,
-      expect.any(String),
-    );
-    expect(mockRouter.push).toHaveBeenCalledTimes(1);
-  });
-
-  it('accepts a distinct second Practice Mode attempt after refocus and rejects replays', async () => {
-    const firstMiss: AttemptResult = {
-      cycleId: CYCLE_ID,
-      passed: false,
-      mastered: false,
-      attemptNo: 1,
-      attemptsLeft: 2,
-      score: 45,
-      transcript: 'My first answer.',
-      feedback: 'Add more detail.',
-    };
-    const secondMiss: AttemptResult = {
-      cycleId: CYCLE_ID,
-      passed: false,
-      mastered: false,
-      attemptNo: 2,
-      attemptsLeft: 1,
-      score: 52,
-      transcript: 'My second answer.',
-      feedback: 'Add one specific example.',
-    };
-    const firstMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440201' };
-    const secondMetadata = { requestId: '550e8400-e29b-41d4-a716-446655440202' };
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-
-    await act(async () => recorderProps().onResult(firstMiss, firstMetadata));
-    await blurScreen();
-    await focusScreen();
-    await act(async () => {
-      const callbacks = recorderProps();
-      callbacks.onResult(firstMiss, firstMetadata);
-      callbacks.onResult(secondMiss, secondMetadata);
-    });
-    await blurScreen();
-    await focusScreen();
-    await act(async () => recorderProps().onResult(secondMiss, secondMetadata));
-
-    expect(mockRecorderMounts).toHaveLength(1);
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(2);
-    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(
-      1,
-      QUESTION.id,
-      firstMiss,
-      QUESTION,
-      firstMetadata.requestId,
-    );
-    expect(mockPracticeFlow.showFeedback).toHaveBeenNthCalledWith(
-      2,
-      QUESTION.id,
-      secondMiss,
-      QUESTION,
-      secondMetadata.requestId,
-    );
-    expect(mockRouter.push).toHaveBeenCalledTimes(2);
-  });
-
-  it('bounds handled Practice Mode request IDs while retaining newest duplicates', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    const requestIds = Array.from(
-      { length: 9 },
-      (_, index) => `550e8400-e29b-41d4-a716-44665544021${index}`,
-    );
-
-    for (const requestId of requestIds) {
-      await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId }));
-      await blurScreen();
-      await focusScreen();
-    }
-    await act(async () =>
-      recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[requestIds.length - 1]! }),
-    );
-    await act(async () => recorderProps().onResult(PASSED_RESULT, { requestId: requestIds[0]! }));
-
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(10);
-    expect(mockRouter.push).toHaveBeenCalledTimes(10);
-  });
-
-  it.each(['blur', 'session lease'] as const)(
-    'drops Practice Mode callbacks after %s ownership is lost',
-    async (boundary) => {
-      const renderLease = { owner: 'attempt-render' } as never;
-      let currentLease: unknown = renderLease;
-      mockAuthValue = makeAuth({
-        captureSessionLease: jest.fn(() => currentLease as never),
-        isSessionLeaseCurrent: jest.fn((lease: SessionLease) => lease === currentLease),
-      });
-      mockSearchParams = { questionId: QUESTION.id };
-      mockApiFetch.mockResolvedValue(HELP_CONTENT);
-      const queryClient = makeQueryClient();
-      const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
-      await renderScreen(<AttemptScreen />, queryClient);
-      await screen.findByText('Describe a time you showed courage.');
-      const callbacks = recorderProps();
-
-      if (boundary === 'blur') {
-        await blurScreen();
-      } else {
-        currentLease = { owner: 'new-session' };
-      }
-      alertSpy.mockClear();
-      mockSetOptions.mockClear();
-      let acceptedEndpointMismatch: boolean | undefined;
-
-      await act(async () => {
-        callbacks.onResult(PASSED_RESULT);
-        callbacks.onResult(PASSED_RESULT);
-        callbacks.onError('late attempt failure');
-        callbacks.onRateLimited?.('late attempt wait');
-        callbacks.onRecoveryUnresolved();
-        acceptedEndpointMismatch = callbacks.onRecoveryEndpointMismatch?.(
-          '/practice/attempt/native',
-        );
-        callbacks.onInteractionLockChange?.(true);
-        await Promise.resolve();
-      });
-
-      expect(mockPracticeFlow.showFeedback).not.toHaveBeenCalled();
-      expect(mockRouter.push).not.toHaveBeenCalled();
-      expect(mockRouter.dismissTo).not.toHaveBeenCalled();
-      expect(alertSpy).not.toHaveBeenCalled();
-      expect(screen.queryByText('late attempt wait')).toBeNull();
-      expect(acceptedEndpointMismatch).toBe(false);
-      expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
-      expect(invalidateSpy).not.toHaveBeenCalled();
-      expect(mockSetOptions).not.toHaveBeenCalled();
-    },
-  );
-
-  it('updates a cached new word to revision after a real scored miss', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    queryClient.setQueryData(['practice-question', USER.id, USER.cefrLevel], PRACTICE_QUESTION);
-    await renderScreen(<AttemptScreen />, queryClient);
-    await screen.findByText('Describe a time you showed courage.');
-    const miss: AttemptResult = {
-      cycleId: CYCLE_ID,
-      passed: false,
-      mastered: false,
-      attemptNo: 1,
-      attemptsLeft: 2,
-      score: 45,
-      transcript: 'I tried to answer.',
-      feedback: 'Add more detail.',
-    };
-
-    await act(async () => recorderProps().onResult(miss));
-
-    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
-      ...PRACTICE_QUESTION,
-      kind: 'revision',
-      attemptsUsed: 1,
-      attemptsLeft: 2,
-      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
-    });
-    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledWith(
-      QUESTION.id,
-      miss,
-      QUESTION,
-      expect.any(String),
-    );
-    expect(mockRouter.push).toHaveBeenCalledWith('/practice/feedback');
-  });
-
-  it('cancels the underlying active question GET before Practice Mode accepts a miss', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    const queryKey = ['practice-question', USER.id, USER.cefrLevel] as const;
-    queryClient.setQueryData(queryKey, PRACTICE_QUESTION);
-    const staleRefresh = deferred<PracticeQuestionPayload>();
-    let staleSignal: AbortSignal | undefined;
-    const backgroundRefresh = queryClient.fetchQuery({
-      queryKey,
-      queryFn: ({ signal }) => {
-        staleSignal = signal;
-        return staleRefresh.promise;
-      },
-      staleTime: 0,
-    });
-    const backgroundSettled = Promise.allSettled([backgroundRefresh]);
-    await renderScreen(<AttemptScreen />, queryClient);
-    await screen.findByText('Describe a time you showed courage.');
-    const miss: AttemptResult = {
-      cycleId: CYCLE_ID,
-      passed: false,
-      mastered: false,
-      attemptNo: 1,
-      attemptsLeft: 2,
-      score: 45,
-      transcript: 'I tried to answer.',
-      feedback: 'Add more detail.',
-    };
-
-    await act(async () => recorderProps().onResult(miss));
-    const staleWasAborted = staleSignal?.aborted;
-    await act(async () => {
-      staleRefresh.resolve(PRACTICE_QUESTION);
-      await backgroundSettled;
-      await Promise.resolve();
-    });
-
-    expect(staleWasAborted).toBe(true);
-    expect(queryClient.getQueryData(queryKey)).toEqual({
-      ...PRACTICE_QUESTION,
-      kind: 'revision',
-      attemptsUsed: 1,
-      attemptsLeft: 2,
-      progress: { ...PRACTICE_QUESTION.progress, learningCount: 2 },
-    });
-  });
-
-  it('does not double-count a scored miss for a word already in revision', async () => {
-    const revision = {
-      ...PRACTICE_QUESTION,
-      kind: 'revision' as const,
-    };
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    queryClient.setQueryData(['practice-question', USER.id, USER.cefrLevel], revision);
-    await renderScreen(<AttemptScreen />, queryClient);
-    await screen.findByText('Describe a time you showed courage.');
-    const miss: AttemptResult = {
-      cycleId: CYCLE_ID,
-      passed: false,
-      mastered: false,
-      attemptNo: 2,
-      attemptsLeft: 1,
-      score: 50,
-      transcript: 'I tried again.',
-      feedback: 'Add another supporting detail.',
-    };
-
-    await act(async () => recorderProps().onResult(miss));
-
-    expect(queryClient.getQueryData(['practice-question', USER.id, USER.cefrLevel])).toEqual({
-      ...revision,
-      attemptsUsed: 2,
-      attemptsLeft: 1,
-    });
-  });
-
-  it('surfaces attempt recorder errors through an alert', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await act(async () => recorderProps().onError('microphone upload failed'));
-
-    expect(alertSpy).toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'microphone upload failed');
-  });
-
-  it('keeps cached attempt content visible during a background refresh', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    const queryClient = makeQueryClient();
-    queryClient.setQueryData(
-      ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
-      HELP_CONTENT,
-    );
-    mockApiFetch.mockReturnValue(new Promise(() => undefined));
-
-    await renderScreen(<AttemptScreen />, queryClient);
-
-    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
-    expect(screen.queryByText(t('attempt.loading'))).toBeNull();
-    expect(screen.getByText(t('refresh.updating'))).toBeTruthy();
-    expect(recorderProps().questionId).toBe(QUESTION.id);
-  });
-
-  it('invalidates the practice question and exits when recovery is unresolved', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const queryClient = makeQueryClient();
-    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
-    await renderScreen(<AttemptScreen />, queryClient);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await act(async () => recorderProps().onRecoveryUnresolved());
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ['practice-question', USER.id, USER.cefrLevel],
-    });
-    // Practice Mode is entered from help, so replacing only this route would
-    // strand that help screen under a second live Practice screen.
-    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
-    expect(mockRouter.replace).not.toHaveBeenCalled();
-  });
-
-  it('shows a retryable error when the question fails to load', async () => {
-    const refetchSpy = trackQueryRefetches();
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
-    await renderScreen(<AttemptScreen />);
-
-    expect(await screen.findByText(t('attempt.loadFailedTitle'))).toBeTruthy();
-    expect(screen.getByText(t('error.serverBusy')).props.accessibilityLiveRegion).toBe('assertive');
-    await expectPressFeedback(
-      () => screen.getByRole('button', { name: t('common.tryAgain') }),
-      { backgroundColor: colors.primary },
-      { backgroundColor: colors.primaryDark },
-    );
-
-    await act(async () => {
-      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
-      // Let the refetch settle and the batched query notification fire.
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(mockApiFetch).toHaveBeenCalledTimes(2);
-    expect(refetchSpy).toHaveBeenLastCalledWith({ cancelRefetch: false });
-  });
-
-  it('uses the attempt-specific fallback for non-API failures', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockRejectedValue(new Error('private parse detail'));
-    await renderScreen(<AttemptScreen />);
-
-    expect(await screen.findByText(t('attempt.loadFailed'))).toBeTruthy();
-  });
-
-  it('keeps linked attempt content visible and retries a failed background refresh', async () => {
-    const refetchSpy = trackQueryRefetches();
-    mockSearchParams = { questionId: QUESTION.id };
-    const queryClient = makeQueryClient();
-    queryClient.setQueryData(
-      ['question-help', USER.id, USER.nativeLanguage, QUESTION.id],
-      HELP_CONTENT,
-    );
-    mockApiFetch
-      .mockRejectedValueOnce(new ApiError(500, 'refresh failed'))
-      .mockResolvedValueOnce(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />, queryClient);
-
-    expect(screen.getByText('courage')).toBeTruthy();
-    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
-    await waitFor(() =>
-      expect(screen.getByRole('alert')).toHaveTextContent(t('refresh.failedUsingSaved')),
-    );
-
-    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
-    await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(2));
-    expect(refetchSpy).toHaveBeenLastCalledWith({ cancelRefetch: false });
-    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
-  });
-});
-
 describe('practice feedback screen', () => {
   it('handles missing feedback with a way back to practice', async () => {
     await renderScreen(<FeedbackScreen />);
@@ -2674,7 +1788,7 @@ describe('practice feedback screen', () => {
       { backgroundColor: colors.primaryDark },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('common.backToPractice') }));
-    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
   });
 
   it('renders the passed variant and seeds the next question', async () => {
@@ -3147,7 +2261,6 @@ describe('practice feedback screen', () => {
     expect(screen.queryByText(t('feedback.attemptLine', { current: 1, max: 3 }))).toBeNull();
     expect(screen.getByText('We could not detect any speech.')).toBeTruthy();
     expect(screen.queryByText(t('feedback.weHeard'))).toBeNull();
-    expect(screen.queryByText(t('feedback.sayInEnglish'))).toBeNull();
     expect(screen.queryByText(/\/ 100/)).toBeNull();
     // Silence is not a judged answer: neither native verdict may appear.
     expect(screen.queryByText(t('feedback.nativeUnderstoodTitle'))).toBeNull();
@@ -3230,7 +2343,7 @@ describe('practice feedback screen', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('feedback.seeHelp') }));
     expect(mockPracticeFlow.clearFeedback).toHaveBeenCalled();
     expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
-    expect(mockRouter.push).toHaveBeenCalledWith({
+    expect(mockRouter.navigate).toHaveBeenCalledWith({
       pathname: '/practice/help',
       params: { questionId: QUESTION.id, cycleId: CYCLE_ID, attemptsUsed: '0' },
     });
@@ -3587,7 +2700,7 @@ describe('practice feedback screen', () => {
     });
 
     expect(consumed).toBe(true);
-    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
     expect(mockPracticeFlow.clearFeedback).not.toHaveBeenCalled();
   });
 
@@ -3868,14 +2981,13 @@ describe('practice help screen', () => {
     expect(screen.getByText(t('help.invalidLinkTitle'))).toBeTruthy();
     // Help sends the learner back through the question they came from.
     expect(screen.getByText(t('help.invalidLinkBody'))).toBeTruthy();
-    expect(screen.queryByText(t('attempt.invalidLinkBody'))).toBeNull();
     await expectPressFeedback(
       () => screen.getByRole('button', { name: t('common.backToPractice') }),
       { alignItems: 'center', backgroundColor: colors.primary },
       { backgroundColor: colors.primaryDark },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('common.backToPractice') }));
-    expect(mockRouter.replace).toHaveBeenCalledWith('/practice');
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
 
@@ -4071,13 +3183,56 @@ describe('skip word', () => {
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(mockSkipWord).toHaveBeenCalledWith(QUESTION.id, CYCLE_ID);
     expect(await screen.findByText('Tell me about a memorable journey.')).toBeTruthy();
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
-    expect(alertSpy).not.toHaveBeenCalled();
+    // Only the confirmation dialog was shown; no failure alert fired.
+    expect(alertSpy).not.toHaveBeenCalledWith(t('practice.skipFailedTitle'), expect.anything());
+  });
+
+  it('requires an explicit confirmation before skipping and honours cancel', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+    expect(mockSkipWord).not.toHaveBeenCalled();
+    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
+      string,
+      string,
+      MockAlertButton[],
+    ];
+    expect(alertSpy).toHaveBeenLastCalledWith(
+      t('practice.skipConfirmTitle'),
+      t('practice.skipConfirmBody'),
+      [
+        expect.objectContaining({ text: t('common.cancel'), style: 'cancel' }),
+        expect.objectContaining({ text: t('practice.skipWord') }),
+      ],
+    );
+
+    buttons[0]!.onPress?.();
+    expect(mockSkipWord).not.toHaveBeenCalled();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+  });
+
+  it('runs one skip when the confirmation is confirmed twice in the same frame', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    mockSkipWord.mockReturnValue(new Promise<void>(() => undefined));
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText('Describe a time you showed courage.');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
+      confirmSkipAlert();
+    });
+
+    expect(mockSkipWord).toHaveBeenCalledTimes(1);
   });
 
   it('replaces a pre-skip question refresh after the word is parked', async () => {
@@ -4105,6 +3260,10 @@ describe('skip word', () => {
     expect(mockApiFetch).toHaveBeenCalledTimes(2);
 
     await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+    await act(async () => {
+      confirmSkipAlert();
+      await Promise.resolve();
+    });
     await waitFor(() => expect(mockSkipWord).toHaveBeenCalledWith(QUESTION.id, CYCLE_ID));
     await waitFor(() => expect(mockApiFetch).toHaveBeenCalledTimes(3));
     const callsAfterSkip = mockApiFetch.mock.calls.length;
@@ -4144,10 +3303,16 @@ describe('skip word', () => {
     expect(startBlocked?.()).toBe(false);
     let blockedDuringSkip = false;
 
+    // Both queued taps only open the confirmation; no skip runs unconfirmed.
     await act(async () => {
       void press();
-      blockedDuringSkip = startBlocked?.() ?? false;
       void press();
+    });
+    expect(mockSkipWord).not.toHaveBeenCalled();
+
+    await act(async () => {
+      confirmSkipAlert();
+      blockedDuringSkip = startBlocked?.() ?? false;
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
     expect(blockedDuringSkip).toBe(true);
@@ -4179,6 +3344,7 @@ describe('skip word', () => {
 
     await act(async () => {
       void skipWord();
+      confirmSkipAlert();
       openHelp();
       flipMode();
       prevented = dispatchBeforeRemove();
@@ -4234,6 +3400,7 @@ describe('skip word', () => {
     );
     await act(async () => {
       void skipWord();
+      confirmSkipAlert();
       await Promise.resolve();
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
@@ -4272,6 +3439,7 @@ describe('skip word', () => {
     );
     await act(async () => {
       void skipWord();
+      confirmSkipAlert();
       await Promise.resolve();
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
@@ -4319,6 +3487,7 @@ describe('skip word', () => {
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
@@ -4344,13 +3513,15 @@ describe('skip word', () => {
 
       await act(async () => {
         await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+        confirmSkipAlert();
         await new Promise((resolve) => setTimeout(resolve, 0));
       });
 
       expect(await screen.findByText(NEXT_QUESTION.questionText)).toBeTruthy();
       expect(mockApiFetch).toHaveBeenCalledTimes(2);
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['me'] });
-      expect(alertSpy).not.toHaveBeenCalled();
+      // Only the confirmation dialog was shown; no failure alert fired.
+      expect(alertSpy).not.toHaveBeenCalledWith(t('practice.skipFailedTitle'), expect.anything());
     },
   );
 
@@ -4370,6 +3541,7 @@ describe('skip word', () => {
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
@@ -4390,6 +3562,7 @@ describe('skip word', () => {
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
@@ -4427,22 +3600,6 @@ describe('inline rate-limit notice', () => {
     expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
 
     // Releasing the lock is not a new take: the wait line has to survive it.
-    await act(async () => recorderProps().onInteractionLockChange?.(false));
-    expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
-
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(screen.queryByText(WAIT_MESSAGE)).toBeNull();
-  });
-
-  it('renders the wait line inline on the attempt screen too', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-
-    await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
-    expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
-
     await act(async () => recorderProps().onInteractionLockChange?.(false));
     expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
 
@@ -4755,14 +3912,24 @@ describe('skip word busy state', () => {
     );
     await renderScreen(<PracticeScreen />);
     await screen.findByText('Describe a time you showed courage.');
-    const skip = () => screen.getByRole('button', { name: t('practice.skipWord') });
+    const idleSkip = () => screen.getByRole('button', { name: t('practice.skipWord') });
+    const busySkip = () => screen.getByRole('button', { name: t('practice.skipBusy') });
+    const hidden = { includeHiddenElements: true } as const;
 
-    expect(skip().props.accessibilityState).toEqual({ disabled: false, busy: false });
-    expect(flattenedStyle(skip()).opacity).toBeUndefined();
+    expect(idleSkip().props.accessibilityState).toEqual({ disabled: false, busy: false });
+    expect(flattenedStyle(idleSkip()).opacity).toBeUndefined();
+    expect(screen.queryByTestId('practice-skip-busy-indicator', hidden)).toBeNull();
 
-    await fireEvent.press(skip());
-    expect(skip().props.accessibilityState).toEqual({ disabled: true, busy: true });
-    expect(flattenedStyle(skip())).toMatchObject({ opacity: 0.5 });
+    await act(async () => {
+      await fireEvent.press(idleSkip());
+      confirmSkipAlert();
+    });
+    expect(busySkip().props.accessibilityState).toEqual({ disabled: true, busy: true });
+    expect(flattenedStyle(busySkip())).toMatchObject({ opacity: 0.5 });
+    // The busy label swaps in with a decorative, screen-reader-hidden spinner.
+    expect(screen.getByTestId('practice-skip-busy-indicator', hidden)).toBeTruthy();
+    expect(screen.getByText(t('practice.skipBusy'))).toBeTruthy();
+    expect(screen.queryByText(t('practice.skipWord'))).toBeNull();
 
     await act(async () => {
       settleSkip?.();
@@ -4770,9 +3937,9 @@ describe('skip word busy state', () => {
     });
 
     await waitFor(() =>
-      expect(skip().props.accessibilityState).toEqual({ disabled: false, busy: false }),
+      expect(idleSkip().props.accessibilityState).toEqual({ disabled: false, busy: false }),
     );
-    expect(flattenedStyle(skip()).opacity).toBeUndefined();
+    expect(flattenedStyle(idleSkip()).opacity).toBeUndefined();
   });
 
   it('hands the control back after a failed skip and uses the skip fallback copy', async () => {
@@ -4783,6 +3950,7 @@ describe('skip word busy state', () => {
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
@@ -5143,6 +4311,7 @@ describe('practice mutation ownership sentinels', () => {
     );
     await act(async () => {
       skip();
+      confirmSkipAlert();
       await Promise.resolve();
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
@@ -5174,6 +4343,7 @@ describe('practice mutation ownership sentinels', () => {
     );
     await act(async () => {
       skip();
+      confirmSkipAlert();
       await Promise.resolve();
     });
     expect(mockSkipWord).toHaveBeenCalledTimes(1);
@@ -5209,6 +4379,7 @@ describe('practice mutation ownership sentinels', () => {
     );
     await act(async () => {
       skip();
+      confirmSkipAlert();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -5241,6 +4412,7 @@ describe('practice mutation ownership sentinels', () => {
     );
     await act(async () => {
       skip();
+      confirmSkipAlert();
       await Promise.resolve();
     });
 
@@ -5254,264 +4426,6 @@ describe('practice mutation ownership sentinels', () => {
     });
 
     expect(mockSetOptions).not.toHaveBeenCalled();
-  });
-});
-
-describe('practice attempt mutation ownership sentinels', () => {
-  beforeEach(() => {
-    mockSearchParams = { questionId: QUESTION.id };
-  });
-
-  it('ignores a Practice Mode Recorder lock before focus ownership is granted', async () => {
-    mockDeferFocusSetup = true;
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    mockSetOptions.mockClear();
-
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-
-    expect(mockSetOptions).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: false });
-  });
-
-  it('rolls Practice Mode cache, lease, owner locks, and callbacks into a new account', async () => {
-    const firstLease = { owner: 'attempt-first-account' } as never;
-    const secondLease = { owner: 'attempt-second-account' } as never;
-    let currentLease: SessionLease = firstLease;
-    const captureSessionLease = jest.fn(() => currentLease);
-    const isSessionLeaseCurrent = jest.fn((lease: SessionLease) => lease === currentLease);
-    mockAuthValue = makeAuth({ captureSessionLease, isSessionLeaseCurrent });
-    const client = makeQueryClient();
-    const invalidateSpy = jest.spyOn(client, 'invalidateQueries');
-    client.setQueryDefaults(['question-help'], { staleTime: Infinity });
-    const secondHelp = {
-      ...HELP_CONTENT,
-      promptWord: 'clarity',
-      questionText: 'Explain why clarity matters.',
-    };
-    client.setQueryData(['question-help', USER.id, USER.nativeLanguage, QUESTION.id], HELP_CONTENT);
-    client.setQueryData(
-      ['question-help', OTHER_USER.id, OTHER_USER.nativeLanguage, QUESTION.id],
-      secondHelp,
-    );
-    const view = await render(withProviders(<AttemptScreen />, client, 0));
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: true });
-
-    currentLease = secondLease;
-    mockAuthValue = makeAuth({
-      user: OTHER_USER,
-      sessionVersion: 1,
-      captureSessionLease,
-      isSessionLeaseCurrent,
-    });
-    await view.rerender(withProviders(<AttemptScreen />, client, 0));
-
-    expect(screen.getByText('Explain why clarity matters.')).toBeTruthy();
-    expect(screen.queryByText(QUESTION.questionText)).toBeNull();
-    expect(captureSessionLease).toHaveBeenCalledTimes(2);
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: false });
-
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: true });
-    expect(isSessionLeaseCurrent).toHaveBeenCalledWith(secondLease);
-
-    invalidateSpy.mockClear();
-    mockRouter.dismissTo.mockClear();
-    await act(async () => recorderProps().onRecoveryUnresolved());
-    expect(invalidateSpy).toHaveBeenCalledWith({
-      queryKey: ['practice-question', OTHER_USER.id, OTHER_USER.cefrLevel],
-    });
-    expect(mockRouter.dismissTo).toHaveBeenCalledTimes(1);
-    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
-  });
-
-  it('uses the synchronous Practice Mode layout cleanup before passive focus cleanup', async () => {
-    mockDeferFocusCleanup = true;
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const view = await renderScreen(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    const callbacks = recorderProps();
-
-    await view.unmount();
-    alertSpy.mockClear();
-    await act(async () => callbacks.onError('attempt layout cleanup window'));
-
-    expect(alertSpy).not.toHaveBeenCalled();
-  });
-
-  it('rejects the previous Practice Mode Recorder and accepts the new mode owner', async () => {
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: false });
-    const englishCallbacks = recorderProps();
-    await act(async () => englishCallbacks.onInteractionLockChange?.(true));
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: false, disabled: true });
-    mockSetOptions.mockClear();
-
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    await rerenderScreen(<AttemptScreen />);
-    const nativeCallbacks = recorderProps();
-    expect(nativeCallbacks.endpoint).toBe('/practice/attempt/native');
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: true, disabled: false });
-    expect(mockSetOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-    alertSpy.mockClear();
-
-    await act(async () => {
-      englishCallbacks.onError('old attempt recorder');
-      englishCallbacks.onInteractionLockChange?.(true);
-    });
-    expect(alertSpy).not.toHaveBeenCalled();
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: true, disabled: false });
-
-    await act(async () => nativeCallbacks.onInteractionLockChange?.(true));
-    expect(
-      screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
-        .accessibilityState,
-    ).toEqual({ checked: true, disabled: true });
-  });
-
-  it('moves Practice Mode navigation subscriptions and owner unlocks to a new navigator', async () => {
-    const firstNavigation = createNavigationDouble();
-    const secondNavigation = createNavigationDouble();
-    mockCurrentNavigation = firstNavigation.navigation;
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(firstNavigation.setOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: false,
-      gestureEnabled: false,
-    });
-
-    firstNavigation.setOptions.mockClear();
-    mockCurrentNavigation = secondNavigation.navigation;
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    await rerenderScreen(<AttemptScreen />);
-    expect(firstNavigation.listeners.size).toBe(0);
-    expect(secondNavigation.listeners.size).toBe(1);
-    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-
-    firstNavigation.setOptions.mockClear();
-    secondNavigation.setOptions.mockClear();
-    await blurScreen();
-    await focusScreen();
-    expect(firstNavigation.setOptions).not.toHaveBeenCalled();
-    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: true,
-      gestureEnabled: true,
-    });
-
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    expect(secondNavigation.setOptions).toHaveBeenLastCalledWith({
-      headerBackVisible: false,
-      gestureEnabled: false,
-    });
-    expect(dispatchNavigationBeforeRemove(secondNavigation.listeners)).toHaveBeenCalledTimes(1);
-    expect(dispatchNavigationBeforeRemove(firstNavigation.listeners)).not.toHaveBeenCalled();
-  });
-
-  it('publishes no Practice Mode navigation options for an owner reset off-focus', async () => {
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const rerenderScreen = await renderRerenderable(<AttemptScreen />);
-    await screen.findByText(QUESTION.questionText);
-    await act(async () => recorderProps().onInteractionLockChange?.(true));
-    await blurScreen();
-    mockSetOptions.mockClear();
-
-    mockPracticeFlow = makePracticeFlow({ answerMode: 'native' });
-    await rerenderScreen(<AttemptScreen />);
-
-    expect(mockSetOptions).not.toHaveBeenCalled();
-  });
-
-  it('isolates Practice Mode result cancellation and blocks late Recorder work', async () => {
-    const client = makeQueryClient();
-    const unrelated = deferred<string>();
-    let unrelatedSignal: AbortSignal | undefined;
-    const unrelatedRequest = client.fetchQuery({
-      queryKey: ['attempt-unrelated-sentinel'],
-      queryFn: ({ signal }) => {
-        unrelatedSignal = signal;
-        return unrelated.promise;
-      },
-    });
-    const unrelatedSettled = Promise.allSettled([unrelatedRequest]);
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />, client);
-    await screen.findByText(QUESTION.questionText);
-    const callbacks = recorderProps();
-
-    await act(async () => {
-      callbacks.onResult(PASSED_RESULT);
-      callbacks.onError('late attempt result error');
-      callbacks.onRecoveryUnresolved();
-      await Promise.resolve();
-    });
-    const unrelatedWasAborted = unrelatedSignal?.aborted;
-    unrelated.resolve('kept');
-    await unrelatedSettled;
-
-    expect(unrelatedWasAborted).toBe(false);
-    expect(alertSpy).not.toHaveBeenCalledWith(
-      t('diag.assessFailedTitle'),
-      'late attempt result error',
-    );
-    expect(mockRouter.dismissTo).not.toHaveBeenCalled();
-  });
-
-  it('blocks late Practice Mode work after recovery has already claimed navigation', async () => {
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    const client = makeQueryClient();
-    const invalidateSpy = jest.spyOn(client, 'invalidateQueries');
-    await renderScreen(<AttemptScreen />, client);
-    await screen.findByText(QUESTION.questionText);
-    const callbacks = recorderProps();
-
-    await act(async () => {
-      callbacks.onRecoveryUnresolved();
-      callbacks.onError('late recovery error');
-      callbacks.onResult(PASSED_RESULT);
-      callbacks.onRecoveryEndpointMismatch?.('/practice/attempt/native');
-    });
-
-    expect(invalidateSpy).toHaveBeenCalledTimes(1);
-    expect(mockRouter.dismissTo).toHaveBeenCalledTimes(1);
-    expect(alertSpy).not.toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'late recovery error');
-    expect(mockPracticeFlow.showFeedback).not.toHaveBeenCalled();
-    expect(mockPracticeFlow.setAnswerMode).not.toHaveBeenCalled();
   });
 });
 
@@ -5834,7 +4748,7 @@ describe('practice home presentation', () => {
     expect(flattenedStyle(screen.getByText(t('practiceIntro.silence')))).toEqual({
       marginTop: spacing.sm,
       fontSize: 15,
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
     expect(
@@ -5949,7 +4863,7 @@ describe('practice home presentation', () => {
       borderColor: colors.primary,
     });
     expect(flattenedStyle(screen.getByText(t('practice.answerInMyLanguage')))).toEqual({
-      fontSize: 14,
+      fontSize: 15,
       fontWeight: '600',
       color: colors.primary,
     });
@@ -5968,7 +4882,7 @@ describe('practice home presentation', () => {
 
     // Account exits moved to the tab bar and Settings: the learning surface
     // ends at the skip action with no footer row.
-    expect(screen.queryByRole('button', { name: t('practice.settings') })).toBeNull();
+    expect(screen.queryByRole('button', { name: t('settings.retake') })).toBeNull();
     expect(screen.queryByRole('button', { name: t('common.logOut') })).toBeNull();
   });
 
@@ -6067,189 +4981,6 @@ describe('practice home presentation', () => {
   });
 });
 
-describe('practice attempt presentation', () => {
-  async function renderLoadedAttempt() {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockResolvedValue(HELP_CONTENT);
-    await renderScreen(<AttemptScreen />);
-    await screen.findByText('Describe a time you showed courage.');
-  }
-
-  const CENTERED_STATE = {
-    flexGrow: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
-    padding: spacing.xl,
-    width: '100%',
-    maxWidth: layout.contentMaxWidth,
-    alignSelf: 'center',
-    backgroundColor: colors.background,
-  };
-
-  const MUTED_BODY = {
-    marginTop: spacing.md,
-    fontSize: 15,
-    color: colors.muted,
-    textAlign: 'center',
-  };
-
-  it('lays Practice Mode out on the shared page tokens', async () => {
-    await renderLoadedAttempt();
-
-    expect(scrollContentStyle()).toEqual({
-      flexGrow: 1,
-      padding: layout.screenPadding,
-      width: '100%',
-      maxWidth: layout.contentMaxWidth,
-      alignSelf: 'center',
-      backgroundColor: colors.background,
-    });
-    // Review/upload controls extend the scroll content below a top-anchored mic.
-    expect(recorderAreaStyle()).toEqual({
-      width: '100%',
-      alignSelf: 'stretch',
-      justifyContent: 'flex-start',
-    });
-  });
-
-  it('renders the stripped-back question card from the tokens', async () => {
-    await renderLoadedAttempt();
-
-    const promptWord = screen.getByText('courage');
-    expect(flattenedStyle(promptWord)).toEqual({
-      fontSize: 30,
-      fontWeight: '800',
-      color: colors.primary,
-    });
-    expect(flattenedStyle(parentOf(promptWord))).toEqual({
-      marginTop: spacing.sm,
-      backgroundColor: colors.card,
-      borderRadius: radii.card,
-      padding: spacing.lg,
-      borderWidth: 1,
-      borderColor: colors.border,
-    });
-    expect(flattenedStyle(screen.getByText(QUESTION.questionText))).toEqual({
-      marginTop: 10,
-      fontSize: 18,
-      lineHeight: 26,
-      color: colors.text,
-    });
-  });
-
-  it('renders the attempt chip above the word', async () => {
-    mockPracticeFlow = makePracticeFlow({
-      attemptStatus: { questionId: QUESTION.id, cycleId: CYCLE_ID, attemptsLeft: 2 },
-    });
-    await renderLoadedAttempt();
-
-    const chipText = screen.getByText(
-      t('practice.attemptChip', { current: 2, max: PRACTICE_MAX_ATTEMPTS }),
-    );
-    expect(flattenedStyle(chipText)).toEqual({
-      fontSize: 12,
-      fontWeight: '700',
-      color: colors.primary,
-    });
-    expect(flattenedStyle(parentOf(chipText))).toEqual({
-      alignSelf: 'flex-start',
-      backgroundColor: colors.primaryLight,
-      borderRadius: radii.badge,
-      paddingVertical: 3,
-      paddingHorizontal: 10,
-      marginBottom: spacing.xs,
-    });
-  });
-
-  it('keeps the language switch on the token scale and tints it when pressed', async () => {
-    await renderLoadedAttempt();
-
-    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
-    expect(flattenedStyle(toggle)).toEqual({
-      alignSelf: 'center',
-      marginTop: spacing.ml,
-      minHeight: layout.minimumTarget,
-      justifyContent: 'center',
-      paddingVertical: spacing.sm,
-      paddingHorizontal: spacing.ml,
-      borderRadius: radii.pill,
-      borderWidth: 1,
-      borderColor: colors.primary,
-    });
-    expect(flattenedStyle(screen.getByText(t('practice.answerInMyLanguage')))).toEqual({
-      fontSize: 14,
-      fontWeight: '600',
-      color: colors.primary,
-    });
-    await expectPressFeedback(
-      () => screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }),
-      { borderColor: colors.primary },
-      { backgroundColor: colors.primaryLight },
-    );
-  });
-
-  it('centres the loading, failure, and broken-link states', async () => {
-    mockSearchParams = { questionId: QUESTION.id };
-    mockApiFetch.mockReturnValue(new Promise(() => undefined));
-    await renderScreen(<AttemptScreen />);
-
-    const loading = screen.getByText(t('attempt.loading'));
-    expect(flattenedStyle(loading)).toEqual(MUTED_BODY);
-    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
-
-    mockApiFetch.mockReset();
-    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
-    await renderScreen(<AttemptScreen />);
-
-    const failureTitle = await screen.findByRole('header', {
-      name: t('attempt.loadFailedTitle'),
-    });
-    expect(flattenedStyle(failureTitle)).toEqual({
-      fontSize: 20,
-      fontWeight: '700',
-      color: colors.text,
-    });
-    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
-    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_BODY);
-    expect(
-      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
-    ).toMatchObject({ marginTop: spacing.lg });
-
-    mockSearchParams = { questionId: 'not-a-uuid' };
-    await renderScreen(<AttemptScreen />);
-
-    const brokenLinkTitle = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
-    expect(brokenLinkTitle).toBeTruthy();
-    expect(scrollContentStyle()).toEqual(CENTERED_STATE);
-    expect(flattenedStyle(screen.getByText(t('attempt.invalidLinkBody')))).toEqual(MUTED_BODY);
-    expect(
-      flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
-    ).toMatchObject({ marginTop: spacing.lg });
-  });
-
-  it('renders the inline wait notice as a danger-tinted card', async () => {
-    await renderLoadedAttempt();
-    const wait = `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`;
-    await act(async () => recorderProps().onRateLimited?.(wait));
-
-    const notice = screen.getByRole('alert');
-    expect(flattenedStyle(notice)).toEqual({
-      color: colors.danger,
-      fontSize: 14,
-      lineHeight: 20,
-      textAlign: 'center',
-    });
-    expect(flattenedStyle(parentOf(notice))).toEqual({
-      marginTop: spacing.md,
-      backgroundColor: colors.dangerLight,
-      borderColor: colors.danger,
-      borderWidth: 1,
-      borderRadius: radii.input,
-      padding: spacing.md,
-    });
-  });
-});
-
 describe('practice help presentation', () => {
   async function renderLoadedHelp() {
     mockSearchParams = { questionId: QUESTION.id };
@@ -6262,7 +4993,7 @@ describe('practice help presentation', () => {
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -6320,10 +5051,11 @@ describe('practice help presentation', () => {
       padding: spacing.lg,
       borderWidth: 1,
       borderColor: colors.border,
-      marginBottom: 14,
+      marginBottom: spacing.md,
     });
     expect(flattenedStyle(screen.getByText('courage'))).toEqual({
-      fontSize: 28,
+      // type.headline
+      fontSize: 20,
       fontWeight: '800',
       color: colors.primary,
     });
@@ -6509,7 +5241,6 @@ describe('feedback outcome wiring', () => {
     // Nothing was said, so there is nothing to translate back: showing the
     // answer here would hand it over for free.
     expect(screen.getByText(t('feedback.noSpeechTitle'))).toBeTruthy();
-    expect(screen.queryByText(t('feedback.sayInEnglish'))).toBeNull();
     expect(screen.queryByText('She showed courage at work.')).toBeNull();
   });
 
@@ -6705,7 +5436,7 @@ describe('practice feedback presentation', () => {
 
     expect(screenContainerStyle()).toEqual({ flex: 1, backgroundColor: colors.background });
     expect(scrollContentStyle()).toEqual({
-      padding: spacing.xl,
+      padding: layout.screenPadding,
       alignItems: 'center',
       width: '100%',
       maxWidth: layout.contentMaxWidth,
@@ -6779,7 +5510,7 @@ describe('practice feedback presentation', () => {
       fontWeight: '800',
       color: colors.text,
       textTransform: 'uppercase',
-      letterSpacing: 0.6,
+      letterSpacing: 0.8,
     });
     expect(flattenedStyle(parentOf(cardLabel))).toEqual({
       marginTop: spacing.lg,
@@ -6801,7 +5532,7 @@ describe('practice feedback presentation', () => {
     expect(flattenedStyle(screen.getByText('Nice work.'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 16,
-      lineHeight: 24,
+      lineHeight: 23,
       color: colors.text,
     });
     const barContent = parentOf(screen.getByRole('button', { name: t('feedback.nextQuestion') }));
@@ -6842,7 +5573,7 @@ describe('practice feedback presentation', () => {
     expect(flattenedStyle(screen.getByText('She showed courage at work.'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 16,
-      lineHeight: 24,
+      lineHeight: 23,
       color: colors.primary,
       fontWeight: '600',
     });
@@ -6894,16 +5625,23 @@ describe('practice feedback presentation', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
       width: '100%',
       maxWidth: layout.contentMaxWidth,
       alignSelf: 'center',
       backgroundColor: colors.background,
     });
+    // The fallback headline renders the base title style with no inline
+    // variant ink; without a base color it is invisible on a dark background.
+    expect(flattenedStyle(title)).toMatchObject({
+      fontSize: 24,
+      lineHeight: 30,
+      color: colors.text,
+    });
     expect(flattenedStyle(screen.getByText(t('feedback.noResultBody')))).toEqual({
       marginTop: spacing.xs,
       fontSize: 16,
-      lineHeight: 24,
+      lineHeight: 23,
       color: colors.text,
     });
     expect(

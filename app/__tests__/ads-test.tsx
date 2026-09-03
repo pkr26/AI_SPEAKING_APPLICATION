@@ -106,11 +106,13 @@ jest.mock('react-native-google-mobile-ads', () => {
     NativeAd: { createForAdRequest: mockNativeAdCreate },
     NativeAdView: ({
       accessibilityLabel,
+      accessibilityRole,
       children,
       nativeAd,
       style,
     }: {
       accessibilityLabel?: string;
+      accessibilityRole?: React.ComponentProps<typeof NativeView>['accessibilityRole'];
       children: React.ReactNode;
       nativeAd: unknown;
       style?: React.ComponentProps<typeof NativeView>['style'];
@@ -118,7 +120,7 @@ jest.mock('react-native-google-mobile-ads', () => {
       mockNativeAdViewRender({ accessibilityLabel, nativeAd, style });
       return ReactModule.createElement(
         NativeView,
-        { accessibilityLabel, style, testID: 'native-ad-view' },
+        { accessibilityLabel, accessibilityRole, style, testID: 'native-ad-view' },
         children,
       );
     },
@@ -1234,7 +1236,8 @@ describe('ad surfaces', () => {
       borderColor: lightColors.border,
     });
     expect(StyleSheet.flatten(screen.getByText('Advertisement').props.style)).toEqual({
-      fontSize: 10,
+      fontSize: 12,
+      lineHeight: 16,
       marginBottom: 2,
       color: lightColors.muted,
     });
@@ -1466,7 +1469,8 @@ describe('ad surfaces', () => {
 
     const reserved = screen.getByTestId('history-native-ad-reserved');
     const reservedHeight = historyNativeAdReservedHeight(Dimensions.get('window').fontScale);
-    expect(reserved.props.accessibilityLabel).toBe('Advertisement');
+    // The reserved placeholder names itself through its visible text only.
+    expect(reserved.props.accessibilityLabel).toBeUndefined();
     expect(reserved).toHaveTextContent('Advertisement');
     expect(StyleSheet.flatten(reserved.props.style)).toEqual({
       marginTop: 24,
@@ -1474,7 +1478,8 @@ describe('ad surfaces', () => {
       borderWidth: 1,
       borderRadius: 12,
       padding: 14,
-      fontSize: 11,
+      fontSize: 12,
+      lineHeight: 16,
       fontWeight: '600',
       textTransform: 'uppercase',
       textAlign: 'center',
@@ -1792,30 +1797,30 @@ describe('ad surfaces', () => {
       'body',
       'callToAction',
     ]);
+    // The loaded card is announced as a labelled image.
     expect(card.props.accessibilityLabel).toBe('Advertisement');
+    expect(card.props.accessibilityRole).toBe('image');
     expect(StyleSheet.flatten(card.props.style)).toEqual({
       borderWidth: 1,
       borderRadius: 12,
       marginTop: 24,
       marginBottom: 24,
-      paddingTop: 28,
-      paddingHorizontal: 14,
-      paddingBottom: 14,
+      padding: 20,
       gap: 8,
       minHeight: historyNativeAdReservedHeight(Dimensions.get('window').fontScale),
       backgroundColor: lightColors.card,
       borderColor: lightColors.border,
     });
     expect(StyleSheet.flatten(screen.getByText('Advertisement').props.style)).toEqual({
-      fontSize: 11,
-      lineHeight: 14,
+      fontSize: 12,
+      lineHeight: 16,
       fontWeight: '600',
       textTransform: 'uppercase',
       color: lightColors.muted,
     });
     expect(StyleSheet.flatten(screen.getByText('Learn today').props.style)).toEqual({
       fontSize: 17,
-      lineHeight: 22,
+      lineHeight: 24,
       fontWeight: '700',
       color: lightColors.text,
     });
@@ -1826,20 +1831,26 @@ describe('ad surfaces', () => {
       color: lightColors.muted,
     });
     expect(screen.getByText('A test ad').props.numberOfLines).toBe(3);
-    expect(screen.getByText('Open').props.accessibilityRole).toBe('button');
+    // The CTA is a real Pressable button (NativeAdView performs activation);
+    // the authored constant state keeps the role honest for assistive tech.
+    const cta = screen.getByRole('button', { name: 'Open' });
+    expect(cta.props.accessibilityState).toEqual({ disabled: false });
     expect(screen.getByText('Open').props.numberOfLines).toBe(2);
-    expect(StyleSheet.flatten(screen.getByText('Open').props.style)).toEqual({
+    expect(StyleSheet.flatten(cta.props.style)).toEqual({
       // Meets the app's shared 48dp minimum touch target.
       minHeight: 48,
-      textAlign: 'center',
-      textAlignVertical: 'center',
-      borderRadius: 8,
+      borderRadius: 14,
       paddingHorizontal: 16,
       paddingVertical: 12,
-      fontSize: 15,
-      lineHeight: 20,
-      fontWeight: '700',
+      alignItems: 'center',
+      justifyContent: 'center',
       backgroundColor: lightColors.primary,
+    });
+    expect(StyleSheet.flatten(screen.getByText('Open').props.style)).toEqual({
+      fontSize: 15,
+      lineHeight: 21,
+      fontWeight: '700',
+      textAlign: 'center',
       color: lightColors.onPrimary,
     });
     // Two headline lines, three body lines, and a two-line CTA all remain

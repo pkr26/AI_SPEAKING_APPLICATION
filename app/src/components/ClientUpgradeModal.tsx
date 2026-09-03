@@ -189,12 +189,12 @@ export default function ClientUpgradeModal({
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacing }) => ({
   backdrop: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: 'rgba(0, 0, 0, 0.66)',
+    backgroundColor: colors.scrim,
     padding: spacing.xl,
   },
   card: {
@@ -204,8 +204,10 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     overflow: 'hidden',
     borderRadius: radii.card,
     backgroundColor: colors.card,
+    // Dark keeps the stronger cast for the same reason the shared Button's
+    // filled key does: black shadows vanish on the dark background.
     shadowColor: colors.shadow,
-    shadowOpacity: 0.3,
+    shadowOpacity: scheme === 'dark' ? 0.55 : 0.3,
     shadowRadius: 16,
     shadowOffset: { width: 0, height: 8 },
     elevation: 20,

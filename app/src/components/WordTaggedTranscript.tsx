@@ -142,7 +142,7 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme, type 
     },
     chipText: {
       fontSize: 16,
-      lineHeight: 22,
+      lineHeight: 23,
       fontWeight: '600',
     },
     good: { backgroundColor: colors.successLight, borderColor: colors.success },
@@ -178,7 +178,7 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, scheme, type 
       lineHeight: type.caption.lineHeight,
       fontWeight: '700',
       textTransform: 'uppercase',
-      letterSpacing: 0.5,
+      letterSpacing: 0.8,
     },
   };
 });

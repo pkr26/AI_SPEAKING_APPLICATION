@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
-import { Platform, StyleSheet, Text, type TextProps } from 'react-native';
+import { Platform, StyleSheet, Text } from 'react-native';
 
 import LoginScreen from '../src/app/(auth)/login';
 import SignupScreen from '../src/app/(auth)/signup';
@@ -24,7 +24,7 @@ import {
   type UiLanguage,
 } from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
-import { colors, layout, radii, spacing } from '../src/lib/theme';
+import { colors, layout, radii, spacing, type as typeScale } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 // No I18nProvider is mounted in these tests, so screens render in English
@@ -130,41 +130,12 @@ let mockNavigation: { setOptions: jest.Mock; addListener: jest.Mock } = {
   addListener: mockAddNavigationListener,
 };
 let mockHardwareBackHandler: (() => boolean) | null = null;
-const mockLinkNavigate = jest.fn();
 
 jest.mock('../src/lib/use-hardware-back', () => ({
   useHardwareBack: (handler: () => boolean) => {
     mockHardwareBackHandler = handler;
   },
 }));
-
-function MockLink({
-  children,
-  href,
-  accessibilityRole,
-  onPress,
-  ...textProps
-}: TextProps & { children: React.ReactNode; href: string }) {
-  const handlePress = () => {
-    let prevented = false;
-    onPress?.({
-      preventDefault: () => {
-        prevented = true;
-      },
-    } as never);
-    if (!prevented) mockLinkNavigate(href);
-  };
-  return (
-    <Text
-      {...textProps}
-      accessibilityRole={accessibilityRole ?? 'link'}
-      onPress={handlePress}
-      {...{ href }}
-    >
-      {children}
-    </Text>
-  );
-}
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
@@ -173,6 +144,7 @@ jest.mock('expo-router', () => {
   return {
     router: {
       push: jest.fn(),
+      navigate: jest.fn(),
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
@@ -187,7 +159,6 @@ jest.mock('expo-router', () => {
         return typeof cleanup === 'function' ? cleanup : undefined;
       }, [callback]);
     },
-    Link: MockLink,
   };
 });
 
@@ -247,6 +218,7 @@ jest.mock('../src/lib/auth', () => ({
 
 const mockRouter = jest.requireMock('expo-router').router as {
   push: jest.Mock;
+  navigate: jest.Mock;
   replace: jest.Mock;
   back: jest.Mock;
   dismissTo: jest.Mock;
@@ -432,21 +404,23 @@ describe('login screen', () => {
     expect(screen.queryByText(t('password.tooLong'))).toBeNull();
     expect(screen.queryByText(t('reset.doneBanner'))).toBeNull();
     expect(screen.getByText(t('login.footerPrompt'))).toBeTruthy();
-    expect(screen.getByRole('link', { name: t('login.forgot') }).props.href).toBe(
-      '/forgot-password',
-    );
-    expect(screen.getByRole('link', { name: t('login.footerLink') }).props.href).toBe('/signup');
+    expect(screen.getByRole('link', { name: t('login.forgot') })).toBeTruthy();
+    expect(screen.getByRole('link', { name: t('login.footerLink') })).toBeTruthy();
     for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
       expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityRole).toBe('radio');
     }
   });
 
-  it('lets an idle login Link navigate', async () => {
+  it('navigates to forgot-password once per tap burst', async () => {
     await render(<LoginScreen />);
 
-    await fireEvent.press(screen.getByRole('link', { name: t('login.forgot') }));
+    const forgot = screen.getByRole('link', { name: t('login.forgot') });
+    await fireEvent.press(forgot);
+    // The once-per-focus latch swallows the impatient second tap.
+    await fireEvent.press(forgot);
 
-    expect(mockLinkNavigate).toHaveBeenCalledWith('/forgot-password');
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/forgot-password');
   });
 
   it('sends an app-language choice to the guest-language preference', async () => {
@@ -483,13 +457,14 @@ describe('login screen', () => {
     expect(scrollContentStyle()).toEqual({
       flexGrow: 1,
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
       width: '100%',
       maxWidth: layout.formMaxWidth,
       alignSelf: 'center',
     });
     expect(flattenedStyle(screen.getByRole('header', { name: t('login.title') }))).toEqual({
-      fontSize: 32,
+      fontSize: typeScale.titleLg.fontSize,
+      lineHeight: typeScale.titleLg.lineHeight,
       fontWeight: '800',
       color: colors.text,
       textAlign: 'center',
@@ -503,7 +478,7 @@ describe('login screen', () => {
 
     const emailLabel = screen.getByText(t('login.emailLabel'));
     expect(flattenedStyle(parentOf(emailLabel))).toEqual({
-      marginTop: 36,
+      marginTop: spacing.xl,
       backgroundColor: colors.card,
       borderRadius: radii.card,
       padding: spacing.lg,
@@ -514,7 +489,7 @@ describe('login screen', () => {
       fontSize: 14,
       fontWeight: '600',
       color: colors.text,
-      marginBottom: 6,
+      marginBottom: spacing.sm,
       marginTop: spacing.md,
     });
   });
@@ -577,10 +552,15 @@ describe('login screen', () => {
     await render(<LoginScreen />);
 
     expect(flattenedStyle(logInButton())).toMatchObject({ marginTop: spacing.lg });
-    expect(flattenedStyle(screen.getByRole('link', { name: t('login.forgot') }))).toEqual({
+    const forgotLink = screen.getByRole('link', { name: t('login.forgot') });
+    expect(flattenedStyle(forgotLink)).toEqual({
       marginTop: spacing.ml,
       minHeight: layout.minimumTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
       paddingVertical: spacing.md,
+    });
+    expect(flattenedStyle(textNode(forgotLink, t('login.forgot')))).toEqual({
       fontSize: 15,
       color: colors.primary,
       fontWeight: '600',
@@ -602,10 +582,15 @@ describe('login screen', () => {
       color: colors.muted,
       textAlign: 'center',
     });
-    expect(flattenedStyle(screen.getByRole('link', { name: t('login.footerLink') }))).toEqual({
+    const footerLink = screen.getByRole('link', { name: t('login.footerLink') });
+    expect(flattenedStyle(footerLink)).toEqual({
       flexShrink: 1,
       minHeight: layout.minimumTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
       paddingVertical: spacing.md,
+    });
+    expect(flattenedStyle(textNode(footerLink, t('login.footerLink')))).toEqual({
       fontSize: 15,
       color: colors.primary,
       fontWeight: '600',
@@ -866,7 +851,7 @@ describe('login screen', () => {
     const fieldError = screen.getByText(t('password.tooLong'));
     expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
     expect(flattenedStyle(fieldError)).toEqual({
-      marginTop: 6,
+      marginTop: spacing.sm,
       color: colors.danger,
       fontSize: 13,
     });
@@ -958,7 +943,7 @@ describe('login screen', () => {
     expect(signup.props.accessibilityState).toMatchObject({ disabled: true });
     await fireEvent.press(forgot);
     await fireEvent.press(signup);
-    expect(mockLinkNavigate).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     await act(async () => {
       firstLogin.reject(new Error('offline'));
@@ -1033,7 +1018,7 @@ describe('login screen', () => {
     const alert = await screen.findByText(t('error.wrongCredentials'));
     expect(alert.props.accessibilityRole).toBe('alert');
     expect(flattenedStyle(alert)).toEqual({
-      marginTop: 14,
+      marginTop: spacing.md,
       color: colors.danger,
       fontSize: 14,
       textAlign: 'center',
@@ -1131,26 +1116,34 @@ function LanguageProbe() {
 }
 
 describe('signup screen', () => {
-  it('lets the idle login Link navigate', async () => {
+  it('navigates to login once per tap burst', async () => {
     await render(<SignupScreen />);
 
-    await fireEvent.press(screen.getByRole('link', { name: t('signup.footerLink') }));
+    const login = screen.getByRole('link', { name: t('signup.footerLink') });
+    await fireEvent.press(login);
+    // The once-per-focus latch swallows the impatient second tap.
+    await fireEvent.press(login);
 
-    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
   });
 
   it('links to the public Privacy Policy and Terms of Use before account creation', async () => {
+    const first = await render(<SignupScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('header.privacy') }));
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings/privacy');
+    // One navigation per focus: a rapid second exit must not stack another
+    // route behind the first while the screen is still interactive.
+    await fireEvent.press(screen.getByRole('link', { name: t('header.terms') }));
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    await first.unmount();
+
     await render(<SignupScreen />);
-
-    const privacy = screen.getByRole('link', { name: t('header.privacy') });
-    const terms = screen.getByRole('link', { name: t('header.terms') });
-    expect(privacy.props.href).toBe('/settings/privacy');
-    expect(terms.props.href).toBe('/settings/terms');
-
-    await fireEvent.press(privacy);
-    await fireEvent.press(terms);
-    expect(mockLinkNavigate).toHaveBeenNthCalledWith(1, '/settings/privacy');
-    expect(mockLinkNavigate).toHaveBeenNthCalledWith(2, '/settings/terms');
+    await fireEvent.press(screen.getByRole('link', { name: t('header.terms') }));
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(2);
+    expect(mockRouter.navigate).toHaveBeenLastCalledWith('/settings/terms');
   });
 
   it('resubscribes the signup removal guard when navigation identity changes', async () => {
@@ -1175,7 +1168,7 @@ describe('signup screen', () => {
     expect(screen.getByLabelText('Telugu, తెలుగు')).toBeTruthy();
     expect(screen.getByLabelText('Hindi, हिन्दी')).toBeTruthy();
     expect(screen.getByLabelText('Spanish, Español')).toBeTruthy();
-    expect(screen.getByLabelText('Chinese (Simplified), 简体中文')).toBeTruthy();
+    expect(screen.getByLabelText('Chinese, 简体中文')).toBeTruthy();
     expect(screen.getByText(t('signup.nameLabel'))).toBeTruthy();
     expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe('');
     expect(screen.getByText(t('login.emailLabel'))).toBeTruthy();
@@ -1186,7 +1179,7 @@ describe('signup screen', () => {
     expect(screen.getByText(t('signup.languageHelp'))).toBeTruthy();
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.getByText(t('signup.footerPrompt'))).toBeTruthy();
-    expect(screen.getByRole('link', { name: t('signup.footerLink') }).props.href).toBe('/login');
+    expect(screen.getByRole('link', { name: t('signup.footerLink') })).toBeTruthy();
     expect(screen.getByRole('link', { name: t('header.privacy') })).toBeTruthy();
     expect(screen.getByRole('link', { name: t('header.terms') })).toBeTruthy();
     for (const language of ['en', 'te', 'hi', 'es', 'zh']) {
@@ -1213,20 +1206,22 @@ describe('signup screen', () => {
     expect(scrollContentStyle()).toEqual({
       flexGrow: 1,
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
       width: '100%',
       maxWidth: layout.formMaxWidth,
       alignSelf: 'center',
     });
     expect(flattenedStyle(screen.getByRole('header', { name: t('signup.title') }))).toEqual({
-      fontSize: 28,
+      fontSize: typeScale.titleLg.fontSize,
+      lineHeight: typeScale.titleLg.lineHeight,
       fontWeight: '800',
       color: colors.text,
       textAlign: 'center',
     });
     expect(flattenedStyle(screen.getByText(t('signup.subtitle')))).toEqual({
       marginTop: spacing.sm,
-      fontSize: 15,
+      fontSize: typeScale.body.fontSize,
+      lineHeight: typeScale.body.lineHeight,
       color: colors.muted,
       textAlign: 'center',
     });
@@ -1239,7 +1234,7 @@ describe('signup screen', () => {
 
     const nameLabel = screen.getByText(t('signup.nameLabel'));
     expect(flattenedStyle(parentOf(nameLabel))).toEqual({
-      marginTop: 28,
+      marginTop: spacing.xl,
       backgroundColor: colors.card,
       borderRadius: radii.card,
       padding: spacing.lg,
@@ -1250,7 +1245,7 @@ describe('signup screen', () => {
       fontSize: 14,
       fontWeight: '600',
       color: colors.text,
-      marginBottom: 6,
+      marginBottom: spacing.sm,
       marginTop: spacing.md,
     });
   });
@@ -1290,7 +1285,8 @@ describe('signup screen', () => {
     expect(flattenedStyle(parentOf(screen.getByLabelText('Telugu, తెలుగు')))).toEqual({
       flexDirection: 'row',
       flexWrap: 'wrap',
-      gap: 10,
+      justifyContent: 'center',
+      gap: spacing.sm,
     });
     expect(flattenedStyle(signUpButton())).toMatchObject({ marginTop: spacing.lg });
 
@@ -1309,10 +1305,15 @@ describe('signup screen', () => {
       color: colors.muted,
       textAlign: 'center',
     });
-    expect(flattenedStyle(screen.getByRole('link', { name: t('signup.footerLink') }))).toEqual({
+    const footerLink = screen.getByRole('link', { name: t('signup.footerLink') });
+    expect(flattenedStyle(footerLink)).toEqual({
       flexShrink: 1,
       minHeight: layout.minimumTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
       paddingVertical: spacing.md,
+    });
+    expect(flattenedStyle(textNode(footerLink, t('signup.footerLink')))).toEqual({
       fontSize: 15,
       color: colors.primary,
       fontWeight: '600',
@@ -1353,7 +1354,7 @@ describe('signup screen', () => {
     });
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(false);
     expect(flattenedStyle(signUpButton('te')).opacity).toBeUndefined();
-    expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
+    expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.checked).toBe(true);
     await expectPressFeedback(
       () => signUpButton('te'),
       { backgroundColor: colors.primary },
@@ -1376,7 +1377,7 @@ describe('signup screen', () => {
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
     await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'different1');
     expect(screen.queryByText(t('email.invalid'))).toBeNull();
-    expect(screen.getByText(t('password.mismatch')).props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.getByText(t('cp.mismatch')).props.accessibilityLiveRegion).toBe('polite');
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
     expect(mockAuthValue.register).not.toHaveBeenCalled();
   });
@@ -1390,13 +1391,13 @@ describe('signup screen', () => {
     expect(spanish.props.accessibilityRole).toBe('radio');
     expect(telugu.props.accessibilityState).toEqual({
       checked: false,
-      selected: false,
       disabled: false,
+      busy: false,
     });
     expect(spanish.props.accessibilityState).toEqual({
       checked: false,
-      selected: false,
       disabled: false,
+      busy: false,
     });
     // The single-choice control is grouped for screen readers (the picker at
     // the top of the form carries its own app-language radiogroup).
@@ -1417,19 +1418,22 @@ describe('signup screen', () => {
       fontSize: 17,
       fontWeight: '700',
       color: colors.text,
+      textAlign: 'center',
     });
     expect(flattenedStyle(textNode(telugu, 'Telugu'))).toEqual({
       marginTop: 2,
       fontSize: 13,
       color: colors.muted,
+      lineHeight: 18,
+      textAlign: 'center',
     });
 
     await fireEvent.press(telugu);
     const selectedTelugu = screen.getByLabelText('Telugu, తెలుగు');
     expect(selectedTelugu.props.accessibilityState).toEqual({
       checked: true,
-      selected: true,
       disabled: false,
+      busy: false,
     });
     const teluguCheck = screen.getByTestId('signup-language-check-te', {
       includeHiddenElements: true,
@@ -1449,20 +1453,20 @@ describe('signup screen', () => {
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       checked: false,
-      selected: false,
       disabled: false,
+      busy: false,
     });
 
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
     expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
       checked: false,
-      selected: false,
       disabled: false,
+      busy: false,
     });
     expect(screen.getByLabelText('Spanish, Español').props.accessibilityState).toEqual({
       checked: true,
-      selected: true,
       disabled: false,
+      busy: false,
     });
     expect(
       screen.queryByTestId('signup-language-check-te', { includeHiddenElements: true }),
@@ -1480,7 +1484,7 @@ describe('signup screen', () => {
       </I18nProvider>,
     );
 
-    await fireEvent.press(screen.getByLabelText('Chinese (Simplified), 简体中文'));
+    await fireEvent.press(screen.getByLabelText('Chinese, 简体中文'));
     expect(screen.getByTestId('provider-language')).toHaveTextContent('en');
     expect(screen.getByText(t('signup.title'))).toBeTruthy();
   });
@@ -1686,11 +1690,26 @@ describe('signup screen', () => {
     const fieldError = screen.getByText(t('password.tooShort'));
     expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
     expect(flattenedStyle(fieldError)).toEqual({
-      marginTop: 6,
+      marginTop: spacing.sm,
       color: colors.danger,
       fontSize: 13,
     });
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+  });
+
+  it('rejects a control-character name locally before registration', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Priya\n', 'ada@example.com', 'password1');
+
+    // The submit gate blocks live on the control-character name...
+    expect(signUpButton().props.accessibilityState.disabled).toBe(true);
+    // ...but the inline copy waits for blur (erroring mid-typing is hostile).
+    expect(screen.queryByText(t('name.invalid'))).toBeNull();
+    await fireEvent(screen.getByLabelText(t('signup.nameLabel')), 'blur');
+    const fieldError = screen.getByText(t('name.invalid'));
+    expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
+    await fireEvent.press(signUpButton());
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
   });
 
   it('shows the letter+number policy error for passwords without digits', async () => {
@@ -1769,7 +1788,7 @@ describe('signup screen', () => {
 
   it.each([
     ['Hindi, हिन्दी', 'hi'],
-    ['Chinese (Simplified), 简体中文', 'zh'],
+    ['Chinese, 简体中文', 'zh'],
   ] as const)('submits the exact server language code for %s', async (label, code) => {
     await render(<SignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
@@ -1821,11 +1840,11 @@ describe('signup screen', () => {
       expect(screen.getByLabelText(t('password.confirmLabel')).props.secureTextEntry).toBe(true);
       expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState).toEqual({
         checked: true,
-        selected: true,
         disabled: true,
+        busy: false,
       });
       await fireEvent.press(screen.getByLabelText('Spanish, Español'));
-      expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.selected).toBe(true);
+      expect(screen.getByLabelText('Telugu, తెలుగు').props.accessibilityState.checked).toBe(true);
       expect(
         screen.getByRole('link', { name: t('header.privacy') }).props.accessibilityState,
       ).toEqual({ disabled: true });
@@ -1836,7 +1855,7 @@ describe('signup screen', () => {
       });
       await fireEvent.press(screen.getByRole('link', { name: t('header.privacy') }));
       await fireEvent.press(screen.getByRole('link', { name: t('header.terms') }));
-      expect(mockLinkNavigate).not.toHaveBeenCalled();
+      expect(mockRouter.navigate).not.toHaveBeenCalled();
     } finally {
       try {
         await act(async () => registration.resolve(USER));
@@ -1884,7 +1903,7 @@ describe('signup screen', () => {
     });
     expect(loginLink.props.accessibilityState).toMatchObject({ disabled: true });
     await fireEvent.press(loginLink);
-    expect(mockLinkNavigate).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     await act(async () => {
       firstRegistration.reject(new Error('offline'));
@@ -1963,7 +1982,7 @@ describe('signup screen', () => {
     const alert = await screen.findByText(t('error.emailTaken'));
     expect(alert.props.accessibilityRole).toBe('alert');
     expect(flattenedStyle(alert)).toEqual({
-      marginTop: 14,
+      marginTop: spacing.md,
       color: colors.danger,
       fontSize: 14,
       textAlign: 'center',
@@ -2126,12 +2145,12 @@ describe('signup deep contracts', () => {
     await render(<SignupScreen />);
     await fillSignup('Priya', 'priya@example.com', 'password1');
     await fillConfirm('password2');
-    expect(screen.getByText(translateFor('en', 'password.mismatch'))).toBeTruthy();
+    expect(screen.getByText(translateFor('en', 'cp.mismatch'))).toBeTruthy();
     // An empty confirmation is not a mismatch — the required-field copy owns it.
     await fillConfirm('');
-    expect(screen.queryByText(translateFor('en', 'password.mismatch'))).toBeNull();
+    expect(screen.queryByText(translateFor('en', 'cp.mismatch'))).toBeNull();
     await fillConfirm('password1');
-    expect(screen.queryByText(translateFor('en', 'password.mismatch'))).toBeNull();
+    expect(screen.queryByText(translateFor('en', 'cp.mismatch'))).toBeNull();
   });
 
   it('blocks registration without a confirmation and past the email bound', async () => {

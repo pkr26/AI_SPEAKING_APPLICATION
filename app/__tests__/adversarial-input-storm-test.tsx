@@ -744,7 +744,10 @@ describe('A6 account security submit storms', () => {
     await act(async () => {
       change.resolve(undefined);
     });
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled());
+    // Success is the inline note + re-titled Done button, not a modal Alert.
+    await waitFor(() => expect(screen.getByText(t('cp.updatedBody'))).toBeTruthy());
+    expect(screen.getByRole('button', { name: t('cp.done') })).toBeTruthy();
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it('deletes the account exactly once when the destructive confirmation is double-invoked', async () => {

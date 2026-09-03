@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { Platform, StyleSheet, Text, type TextProps } from 'react-native';
+import { Platform, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import ForgotPasswordScreen from '../src/app/(auth)/forgot-password';
@@ -10,7 +10,7 @@ import { ApiError, apiForgotPassword, apiResetPassword } from '../src/lib/api';
 import { MAX_EMAIL_LENGTH, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
 import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
-import { colors, layout, radii, spacing } from '../src/lib/theme';
+import { colors, layout, radii, spacing, type as typeScale } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 const t = (key: MessageKey, params?: Record<string, string | number>) =>
@@ -63,41 +63,12 @@ let mockNavigation: { setOptions: jest.Mock; addListener: jest.Mock } = {
   addListener: mockAddNavigationListener,
 };
 let mockHardwareBackHandler: (() => boolean) | null = null;
-const mockLinkNavigate = jest.fn();
 
 jest.mock('../src/lib/use-hardware-back', () => ({
   useHardwareBack: (handler: () => boolean) => {
     mockHardwareBackHandler = handler;
   },
 }));
-
-function MockLink({
-  children,
-  href,
-  accessibilityRole,
-  onPress,
-  ...textProps
-}: TextProps & { children: React.ReactNode; href: string }) {
-  const handlePress = () => {
-    let prevented = false;
-    onPress?.({
-      preventDefault: () => {
-        prevented = true;
-      },
-    } as never);
-    if (!prevented) mockLinkNavigate(href);
-  };
-  return (
-    <Text
-      {...textProps}
-      accessibilityRole={accessibilityRole ?? 'link'}
-      onPress={handlePress}
-      {...{ href }}
-    >
-      {children}
-    </Text>
-  );
-}
 
 let mockSearchParams: Record<string, string | string[] | undefined> = {};
 
@@ -119,7 +90,6 @@ jest.mock('expo-router', () => {
         return typeof cleanup === 'function' ? cleanup : undefined;
       }, [callback]);
     },
-    Link: MockLink,
   };
 });
 
@@ -304,14 +274,15 @@ const screenChrome: SemanticStyle = { flex: 1, backgroundColor: colors.backgroun
 const formContainer: SemanticStyle = {
   flexGrow: 1,
   justifyContent: 'center',
-  padding: spacing.xl,
+  padding: layout.screenPadding,
   width: '100%',
   maxWidth: layout.formMaxWidth,
   alignSelf: 'center',
 };
 
 const screenTitle: SemanticStyle = {
-  fontSize: 26,
+  fontSize: typeScale.titleLg.fontSize,
+  lineHeight: typeScale.titleLg.lineHeight,
   fontWeight: '800',
   color: colors.text,
   textAlign: 'center',
@@ -334,7 +305,7 @@ const focusedInput: SemanticStyle = {
 };
 
 const formError: SemanticStyle = {
-  marginTop: 14,
+  marginTop: spacing.md,
   color: colors.danger,
   fontSize: 14,
   textAlign: 'center',
@@ -343,7 +314,12 @@ const formError: SemanticStyle = {
 const footerLink: SemanticStyle = {
   marginTop: spacing.xl,
   minHeight: layout.minimumTarget,
+  alignItems: 'center',
+  justifyContent: 'center',
   paddingVertical: spacing.md,
+};
+
+const footerLinkText: SemanticStyle = {
   fontSize: 15,
   color: colors.primary,
   fontWeight: '600',
@@ -371,6 +347,31 @@ function spyOnTextInputFocus(element: TestInstance): jest.Mock {
   throw new Error('TextInput instance not found');
 }
 
+function textNode(node: TestInstance, text: string): TestInstance {
+  const match = node.queryAll((candidate) => candidate.children.includes(text))[0];
+  if (!match) throw new Error(`Text "${text}" not found inside rendered control`);
+  return match;
+}
+
+/** Underlying React fiber of a rendered element; identity changes on remount. */
+function fiberOf(node: TestInstance): unknown {
+  return (node as unknown as { unstable_fiber?: unknown }).unstable_fiber;
+}
+
+/**
+ * The never-disabled Pressable wrapping a validation-gated submit Button: a
+ * real tap on the blocked CTA lands on its host view (marked
+ * accessible=false), revealing the hidden field error.
+ */
+function revealWrapperOf(node: TestInstance): TestInstance {
+  let current: TestInstance | null = node;
+  while (current) {
+    if (current.props.accessible === false) return current;
+    current = current.parent;
+  }
+  throw new Error('No reveal wrapper found');
+}
+
 beforeEach(() => {
   jest.clearAllMocks();
   mockSearchParams = {};
@@ -393,10 +394,11 @@ afterEach(async () => {
 });
 
 describe('login entry points', () => {
-  it('links to the forgot-password screen', async () => {
+  it('navigates to the forgot-password screen from the login link', async () => {
     await render(<LoginScreen />);
-    const link = screen.getByText(t('login.forgot'));
-    expect(link.props.href).toBe('/forgot-password');
+    await fireEvent.press(screen.getByRole('link', { name: t('login.forgot') }));
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/forgot-password');
   });
 
   it('shows the one-shot reset success banner after a completed reset', async () => {
@@ -419,24 +421,48 @@ describe('login entry points', () => {
 });
 
 describe('forgot-password screen', () => {
-  it('rejects malformed email locally', async () => {
+  it('shows the email error only after blur or submit, never mid-typing', async () => {
     await render(<ForgotPasswordScreen />);
-    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    const email = screen.getByLabelText(t('login.emailLabel'));
 
-    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    await fireEvent.changeText(email, 'not-an-email');
+    // Inline validation waits for the learner to leave the field; the submit
+    // gate still blocks live.
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
     expect(
       screen.getByRole('button', { name: t('reset.submitRequest') }).props.accessibilityState
         .disabled,
     ).toBe(true);
+
+    await fireEvent(email, 'blur');
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+
+    // A corrected field clears the inline complaint.
+    await fireEvent.changeText(email, 'ada@example.com');
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
+  });
+
+  it('reveals the email error from the return key without issuing the request', async () => {
+    await render(<ForgotPasswordScreen />);
+    const email = screen.getByLabelText(t('login.emailLabel'));
+
+    await fireEvent.changeText(email, 'not-an-email');
+    await fireEvent(email, 'submitEditing');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
     expect(mockForgot).not.toHaveBeenCalled();
   });
 
-  it('lets the idle Back to login Link navigate', async () => {
+  it('navigates back to login once per tap burst', async () => {
     await render(<ForgotPasswordScreen />);
 
-    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+    const back = screen.getByRole('link', { name: t('reset.backToLogin') });
+    await fireEvent.press(back);
+    // The once-per-focus latch swallows the impatient second tap.
+    await fireEvent.press(back);
 
-    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
   });
 
   it('sends app-language choices from both request states to the device preference', async () => {
@@ -521,9 +547,13 @@ describe('forgot-password screen', () => {
     await screen.findByText(t('reset.sentTitle'));
     mockForgot.mockClear();
 
+    const noteBefore = fiberOf(screen.getByText(t('reset.sentBody')));
     await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
     expect(mockForgot).toHaveBeenCalledWith('ada@example.com');
     expect(screen.getByText(t('reset.sentBody'))).toBeTruthy();
+    // A successful resend mirrors the first send: the keyed note remounts so
+    // the polite live region announces the confirmation again.
+    expect(fiberOf(screen.getByText(t('reset.sentBody')))).not.toBe(noteBefore);
   });
 
   it('keeps the neutral sent state and allows another resend after failure', async () => {
@@ -580,6 +610,10 @@ describe('forgot-password screen', () => {
     ).toBeTruthy();
     // Still on the form; the neutral sent state is only for accepted requests.
     expect(screen.queryByText(t('reset.sentTitle'))).toBeNull();
+
+    // Editing the field clears the stale summary error, like the login form.
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('falls back to the request-failed copy for unexpected errors', async () => {
@@ -644,15 +678,15 @@ describe('forgot-password screen', () => {
       fontSize: 14,
       fontWeight: '600',
       color: colors.text,
-      marginBottom: 6,
-      marginTop: spacing.xl,
+      marginBottom: spacing.sm,
+      marginTop: spacing.md,
     });
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('reset.submitRequest') })),
     ).toMatchObject({ marginTop: spacing.lg });
-    expect(flattenedStyle(screen.getByRole('link', { name: t('reset.backToLogin') }))).toEqual(
-      footerLink,
-    );
+    const footer = screen.getByRole('link', { name: t('reset.backToLogin') });
+    expect(flattenedStyle(footer)).toEqual(footerLink);
+    expect(flattenedStyle(textNode(footer, t('reset.backToLogin')))).toEqual(footerLinkText);
   });
 
   it('changes the request field border color without changing its width', async () => {
@@ -738,13 +772,13 @@ describe('forgot-password screen', () => {
 
     const resend = deferred<void>();
     mockForgot.mockReturnValueOnce(resend.promise);
-    mockLinkNavigate.mockClear();
+    mockRouter.navigate.mockClear();
     await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
     expect(screen.getByRole('button', { name: t('reset.resendBusy') })).toBeTruthy();
     const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
     expect(backToLogin.props.accessibilityState).toEqual({ disabled: true });
     await fireEvent.press(backToLogin);
-    expect(mockLinkNavigate).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     await act(async () => {
       resend.resolve();
@@ -782,7 +816,7 @@ describe('forgot-password screen', () => {
     const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
     expect(backToLogin.props.accessibilityState).toMatchObject({ disabled: true });
     await fireEvent.press(backToLogin);
-    expect(mockLinkNavigate).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     await act(async () => {
       firstRequest.reject(new Error('offline'));
@@ -884,9 +918,9 @@ describe('forgot-password screen', () => {
     });
 
     const link = await screen.findByRole('link', { name: t('reset.backToLogin') });
-    expect(link.props.href).toBe('/login');
     expect(link.props.accessibilityState).toEqual({ disabled: false });
     expect(flattenedStyle(link)).toEqual(footerLink);
+    expect(flattenedStyle(textNode(link, t('reset.backToLogin')))).toEqual(footerLinkText);
     expect(screen.getByText(t('reset.sentBody')).props.accessibilityLiveRegion).toBe('polite');
   });
 
@@ -906,13 +940,17 @@ describe('forgot-password screen', () => {
 });
 
 describe('reset-password screen', () => {
-  it('lets the idle Back to login Link navigate', async () => {
+  it('navigates back to login once per tap burst', async () => {
     mockSearchParams = { email: 'ada@example.com' };
     await render(<ResetPasswordScreen />);
 
-    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+    const back = screen.getByRole('link', { name: t('reset.backToLogin') });
+    await fireEvent.press(back);
+    // The once-per-focus latch swallows the impatient second tap.
+    await fireEvent.press(back);
 
-    expect(mockLinkNavigate).toHaveBeenCalledWith('/login');
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
   });
 
   it('sends an app-language choice to the guest-language preference', async () => {
@@ -1228,16 +1266,16 @@ describe('reset-password screen', () => {
       fontSize: 14,
       fontWeight: '600',
       color: colors.text,
-      marginBottom: 6,
-      marginTop: spacing.lg,
+      marginBottom: spacing.sm,
+      marginTop: spacing.md,
     });
     expect(flattenedStyle(screen.getByLabelText(t('reset.codeLabel')))).toEqual(restingInput);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('reset.submitNew') })),
     ).toMatchObject({ marginTop: spacing.lg });
-    expect(flattenedStyle(screen.getByRole('link', { name: t('reset.backToLogin') }))).toEqual(
-      footerLink,
-    );
+    const footer = screen.getByRole('link', { name: t('reset.backToLogin') });
+    expect(flattenedStyle(footer)).toEqual(footerLink);
+    expect(flattenedStyle(textNode(footer, t('reset.backToLogin')))).toEqual(footerLinkText);
   });
 
   it('lays the reveal control beside a flexible new-password field', async () => {
@@ -1265,10 +1303,27 @@ describe('reset-password screen', () => {
     const fieldError = screen.getByText(t('password.tooShort'));
     expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
     expect(flattenedStyle(fieldError)).toEqual({
-      marginTop: 6,
+      marginTop: spacing.sm,
       color: colors.danger,
       fontSize: 13,
     });
+  });
+
+  it('reveals the hidden email error when the disabled submit is tapped', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'somecode');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
+
+    const submit = screen.getByRole('button', { name: t('reset.submitNew') });
+    expect(submit.props.accessibilityState.disabled).toBe(true);
+    expect(screen.queryByText(t('email.invalid'))).toBeNull();
+    // The wrapper Pressable receives the tap the disabled Button drops.
+    await fireEvent.press(revealWrapperOf(submit));
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(mockReset).not.toHaveBeenCalled();
   });
 
   it('holds the submit at the exact email and code length limits', async () => {
@@ -1425,7 +1480,7 @@ describe('reset-password screen', () => {
     const backToLogin = screen.getByRole('link', { name: t('reset.backToLogin') });
     expect(backToLogin.props.accessibilityState).toMatchObject({ disabled: true });
     await fireEvent.press(backToLogin);
-    expect(mockLinkNavigate).not.toHaveBeenCalled();
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
 
     await act(async () => {
       firstReset.reject(new Error('offline'));
@@ -1524,6 +1579,10 @@ describe('reset-password screen', () => {
     ).toEqual({ disabled: false, busy: false });
     expect(mockRouter.dismissTo).not.toHaveBeenCalled();
 
+    // Editing any field clears the stale summary error, like the login form.
+    await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'fresh-code');
+    expect(screen.queryByText(t('cp.failed'))).toBeNull();
+
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
     });
@@ -1550,13 +1609,15 @@ describe('reset-password screen', () => {
     },
   );
 
-  it('links back to login from both reset screens', async () => {
+  it('navigates back to login from both reset screens', async () => {
     const forgot = await render(<ForgotPasswordScreen />);
-    expect(screen.getByText(t('reset.backToLogin')).props.href).toBe('/login');
+    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
     await forgot.unmount();
 
     await render(<ResetPasswordScreen />);
-    expect(screen.getByText(t('reset.backToLogin')).props.href).toBe('/login');
+    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
   });
 });
 
@@ -1584,6 +1645,21 @@ describe('reset-password deep contracts', () => {
   function resetButton() {
     return screen.getByRole('button', { name: t('reset.submitNew') });
   }
+
+  it('shows the live strength meter under the new-password field', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    expect(screen.queryByTestId('reset-password-strength')).toBeNull();
+
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
+      'newpass1',
+    );
+    const meter = screen.getByTestId('reset-password-strength');
+    // 'newpass1' meets the policy but stays a fair tier: two filled segments.
+    expect(screen.getAllByTestId('reset-password-strength-segment-on')).toHaveLength(2);
+    expect(meter.props.accessibilityLiveRegion).toBe('polite');
+  });
 
   it('starts the confirmation field empty with autocorrect off and labelled copy', async () => {
     mockSearchParams = { email: 'ada@example.com' };

@@ -163,6 +163,7 @@ const TAB_ICONS: Record<TabRouteName, IconName> = {
 function SettingsHeaderAction() {
   const theme = useTheme();
   const t = useT();
+  const styles = themedStyles(theme);
   const practiceExitLocked = usePracticeExitLocked();
   // One navigation per tap: a double-tap on the header action must not push
   // Settings twice (the singleton-navigation convention).
@@ -184,10 +185,7 @@ function SettingsHeaderAction() {
           navigationStartedRef.current = false;
         }, 400);
       }}
-      style={({ pressed }) => [
-        { padding: 8, marginRight: 4, borderRadius: 20 },
-        pressed && { opacity: 0.6 },
-      ]}
+      style={({ pressed }) => [styles.settingsAction, pressed && styles.settingsActionPressed]}
     >
       <Icon name="sliders" size={22} color={theme.colors.text} />
     </Pressable>
@@ -221,10 +219,18 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type,
     backgroundColor: colors.primaryLight,
   },
   tabButtonExitLocked: {
-    opacity: 0.4,
+    opacity: 0.5,
   },
   tabButtonPressed: {
     opacity: 0.7,
+  },
+  settingsAction: {
+    padding: spacing.sm,
+    marginRight: spacing.xs,
+    borderRadius: 20,
+  },
+  settingsActionPressed: {
+    opacity: 0.6,
   },
   tabLabel: {
     fontSize: type.caption.fontSize,

@@ -10,16 +10,10 @@ import OfflineState from '../../../components/OfflineState';
 import { apiFetch, userMessageForError } from '../../../lib/api';
 import { useAuth } from '../../../lib/auth';
 import { useT } from '../../../lib/i18n';
+import { NATIVE_LANGUAGE_LOCALES } from '../../../lib/language-options';
 import { firstParam, isUuid } from '../../../lib/params';
 import { createThemedStyles, useTheme } from '../../../lib/theme';
-import { parseHelpContent, type NativeLanguage } from '../../../lib/types';
-
-const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
+import { parseHelpContent } from '../../../lib/types';
 
 export default function HelpScreen() {
   const insets = useSafeAreaInsets();
@@ -67,7 +61,7 @@ export default function HelpScreen() {
   // The protected-route gate owns navigation when the session disappears.
   // Keep the disabled query from presenting an endless loading state.
   if (!user) return null;
-  const nativeAccessibilityLanguage = NATIVE_ACCESSIBILITY_LANGUAGES[user.nativeLanguage];
+  const nativeAccessibilityLanguage = NATIVE_LANGUAGE_LOCALES[user.nativeLanguage];
 
   if (!validLink) {
     return (
@@ -78,7 +72,7 @@ export default function HelpScreen() {
         <Text style={styles.muted}>{t('help.invalidLinkBody')}</Text>
         <Button
           title={t('common.backToPractice')}
-          onPress={() => router.replace('/practice')}
+          onPress={() => router.dismissTo('/practice')}
           style={styles.retryButton}
         />
       </ScrollView>
@@ -128,6 +122,7 @@ export default function HelpScreen() {
           </Text>
           <Button
             title={t('common.tryAgain')}
+            fullWidth
             onPress={() => void helpQuery.refetch({ cancelRefetch: false })}
             style={styles.retryButton}
           />
@@ -211,7 +206,7 @@ export default function HelpScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -220,7 +215,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -256,7 +251,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: 14,
+    marginBottom: spacing.md,
   },
   sectionLabel: {
     fontSize: 12,
@@ -267,7 +262,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginBottom: spacing.sm,
   },
   promptWord: {
-    fontSize: 28,
+    fontSize: type.headline.fontSize,
     fontWeight: '800',
     color: colors.primary,
   },

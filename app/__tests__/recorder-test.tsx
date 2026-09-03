@@ -268,7 +268,7 @@ const STOP_LABEL = t('recorder.stopLabel');
 const SUBMIT_TEXT = t('recorder.submit');
 const RERECORD_TEXT = t('recorder.rerecord');
 const DISCARD_TEXT = t('recorder.discard');
-const CANCEL_TEXT = /^(Cancel Sending|Stop Waiting)$/;
+const CANCEL_TEXT = /^(Cancel sending|Stop waiting)$/;
 const RECOVERING_TEXT = t('recorder.statusRecovering');
 const IDLE_TEXT = t('recorder.statusIdle');
 const RECORD_BUTTON_LABEL = new RegExp(`^(${START_LABEL}|${STOP_LABEL})$`);
@@ -2139,10 +2139,12 @@ describe('Recorder', () => {
     expect(screen.getByLabelText(t('recorder.a11yIdle'))).toBeTruthy();
     // Critical privacy copy pinned literally on purpose: this must match
     // t('recorder.privacyNote') exactly, so a silent copy edit fails here.
-    expect(screen.getByText('We send your recording only after you tap Send Answer.')).toBeTruthy();
+    expect(
+      screen.getByText('We send your recording only after you tap “Send answer”.'),
+    ).toBeTruthy();
     expect(
       screen.getByText(
-        'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on Save this recording.',
+        'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on “Save this recording”.',
       ),
     ).toBeTruthy();
     expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
@@ -3469,9 +3471,13 @@ describe('Recorder', () => {
       mockRecorderState.durationMillis = 1_000;
       await view.rerender(<Recorder {...props} />);
       const timer = screen.getByText(recordingStatusText('0:01'));
-      expect(timer.props.accessible).toBe(false);
+      // The elapsed line is focusable while recording and carries the same
+      // interpolated status label as its visible text.
+      expect(screen.getByLabelText(recordingStatusText('0:01'))).toBe(timer);
+      expect(timer.props.accessible).not.toBe(false);
+      // It stays non-live during recording (anti-chatter): per-second elapsed
+      // updates never announce; the countdown marks remain the only timers.
       expect(timer.props.accessibilityLiveRegion).toBeUndefined();
-      expect(timer.props.accessibilityLabel).toBe(t('recorder.a11yRecording'));
       expect(announce).toHaveBeenCalledTimes(announcementCount);
 
       await fireEvent.press(screen.getByLabelText(STOP_LABEL));
@@ -3819,7 +3825,7 @@ describe('Recorder', () => {
 
       expect(flattenedStyle(getSettingsButton())).toMatchObject({
         minHeight: layout.minimumTarget,
-        marginTop: 10,
+        marginTop: spacing.sm,
         alignSelf: 'center',
         justifyContent: 'center',
         borderRadius: radii.button,
@@ -17376,12 +17382,22 @@ describe('Recorder', () => {
       const spinner = waitSpinnerNode(t('recorder.a11yUploading'));
       expect(flattenedStyle(spinner)).toEqual({ marginTop: spacing.ml });
       expect(spinner.props.color).toBe(colors.primary);
+      // The staged copy and the elapsed wait line announce politely (no timer
+      // announcements); the recording elapsed line alone stays non-live.
+      expect(screen.getByText(t('recorder.stageUploading')).props.accessibilityLiveRegion).toBe(
+        'polite',
+      );
       expect(flattenedStyle(screen.getByText(waitingForText('0:00')))).toEqual({
         marginTop: spacing.sm,
         fontSize: 13,
         color: colors.muted,
         textAlign: 'center',
       });
+      // The elapsed wait clock deliberately has NO live region (per-second chatter);
+      // only the staged status copy and the wait hint announce politely.
+      expect(
+        screen.getByText(waitingForText('0:00')).props.accessibilityLiveRegion,
+      ).toBeUndefined();
       const cancel = screen.getByRole('button', { name: CANCEL_TEXT });
       expect(cancel).toHaveTextContent(t('recorder.cancelSending'));
       expect(screen.queryByRole('button', { name: t('recorder.stopWaiting') })).toBeNull();
@@ -17413,6 +17429,8 @@ describe('Recorder', () => {
         color: colors.muted,
         textAlign: 'center',
       });
+      // The longer-than-usual recovery note announces itself politely.
+      expect(screen.getByText(t('recorder.waitHint')).props.accessibilityLiveRegion).toBe('polite');
       expect(flattenedStyle(waitSpinnerNode(t('recorder.a11yRecovering')))).toEqual({
         marginTop: spacing.ml,
       });

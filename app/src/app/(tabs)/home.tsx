@@ -407,7 +407,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
   summaryLine: {
     marginTop: spacing.sm,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   summaryDismissAction: {
@@ -451,11 +451,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
     flexShrink: 1,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 6,
+    gap: spacing.xs,
     backgroundColor: colors.primaryLight,
     borderRadius: radii.pill,
-    paddingVertical: 6,
-    paddingHorizontal: 14,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.md,
     marginTop: spacing.md,
   },
   dueChipText: {

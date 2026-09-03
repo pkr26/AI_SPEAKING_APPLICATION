@@ -1,9 +1,11 @@
 import { fireEvent, render, screen } from '@testing-library/react-native';
 import React from 'react';
+import { StyleSheet } from 'react-native';
 
 import DataRefreshNotice from '../src/components/DataRefreshNotice';
 import OfflineState from '../src/components/OfflineState';
 import { I18nProvider, translateFor } from '../src/lib/i18n';
+import { lightColors } from '../src/lib/theme';
 
 function localized(children: React.ReactNode, language: 'en' | 'te' = 'en') {
   return render(<I18nProvider accountLanguage={language}>{children}</I18nProvider>);
@@ -13,11 +15,29 @@ describe('shared data states', () => {
   it('renders a localized semantic offline state without a dead retry action', async () => {
     await localized(<OfflineState />, 'te');
 
-    expect(
-      screen.getByRole('header', { name: translateFor('te', 'network.offlineTitle') }),
-    ).toBeTruthy();
+    const title = screen.getByRole('header', { name: translateFor('te', 'network.offlineTitle') });
+    expect(title).toBeTruthy();
+    expect(StyleSheet.flatten(title.props.style)).toMatchObject({
+      color: lightColors.text,
+      fontSize: 20,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
     const body = screen.getByText(translateFor('te', 'network.offlineBody'));
     expect(body.props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('accepts caller-supplied title and body copy for the entry gate', async () => {
+    await localized(<OfflineState title="Gate title" body="Gate body" />);
+
+    const title = screen.getByRole('header', { name: 'Gate title' });
+    expect(title).toBeTruthy();
+    const body = screen.getByText('Gate body');
+    // A11y semantics stay unchanged with custom copy.
+    expect(body.props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.queryByText(translateFor('en', 'network.offlineTitle'))).toBeNull();
+    expect(screen.queryByText(translateFor('en', 'network.offlineBody'))).toBeNull();
     expect(screen.queryByRole('button')).toBeNull();
   });
 

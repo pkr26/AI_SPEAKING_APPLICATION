@@ -21,3 +21,24 @@ export const UI_LANGUAGE_OPTIONS: readonly LanguageOption[] = [
   { code: 'en', english: 'English', native: 'English' },
   ...NATIVE_LANGUAGE_OPTIONS,
 ];
+
+/**
+ * The single BCP-47 tag per UI language. Date/time formatting and
+ * `accessibilityLanguage` tagging must resolve through these maps so adding a
+ * UI language is one edit instead of six synchronized per-screen copies.
+ */
+export const UI_LANGUAGE_LOCALES: Readonly<Record<UiLanguage, string>> = {
+  en: 'en-US',
+  te: 'te-IN',
+  hi: 'hi-IN',
+  es: 'es-ES',
+  zh: 'zh-Hans',
+};
+
+/** BCP-47 tags for native-language (mother-tongue) content. */
+export const NATIVE_LANGUAGE_LOCALES: Readonly<Record<NativeLanguage, string>> = {
+  te: 'te-IN',
+  hi: 'hi-IN',
+  es: 'es-ES',
+  zh: 'zh-Hans',
+};

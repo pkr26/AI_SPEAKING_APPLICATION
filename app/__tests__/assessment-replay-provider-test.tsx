@@ -414,7 +414,7 @@ describe('AssessmentReplayProvider', () => {
       });
     await render(tree());
 
-    const checkLater = await screen.findByRole('button', { name: 'Check Later' });
+    const checkLater = await screen.findByRole('button', { name: 'Check later' });
     expect(screen.getByRole('alert')).toBeTruthy();
     await fireEvent.press(checkLater);
 
@@ -424,7 +424,7 @@ describe('AssessmentReplayProvider', () => {
       screen.getByText('Your answer is safe. Check again to restore feedback when it is ready.')
         .props.accessibilityLiveRegion,
     ).toBe('polite');
-    await fireEvent.press(screen.getByRole('button', { name: 'Check Now' }));
+    await fireEvent.press(screen.getByRole('button', { name: 'Check now' }));
     await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
     expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
@@ -468,7 +468,7 @@ describe('AssessmentReplayProvider', () => {
       });
     await render(tree());
 
-    expect(await screen.findByRole('button', { name: 'Check Now' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: 'Check now' })).toBeTruthy();
     expect(screen.getByText('protected app')).toBeTruthy();
     // The deferred-state subscription is installed in the passive effect
     // following the render that publishes the persistent banner.
@@ -479,7 +479,7 @@ describe('AssessmentReplayProvider', () => {
     });
     // Foregrounding while still offline must preserve the nonblocking banner.
     expect(apiFetch).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('button', { name: 'Check Now' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Check now' })).toBeTruthy();
     await act(async () => {
       onlineManager.setOnline(true);
       // A reconnect and foreground notification can arrive in the same native
@@ -517,7 +517,7 @@ describe('AssessmentReplayProvider', () => {
       });
     await render(tree());
 
-    await fireEvent.press(await screen.findByRole('button', { name: 'Try Again' }));
+    await fireEvent.press(await screen.findByRole('button', { name: 'Try again' }));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
     expect(apiFetch).toHaveBeenCalledTimes(2);
   });

@@ -1,10 +1,19 @@
-import { Link, router, useLocalSearchParams, useNavigation } from 'expo-router';
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput, View } from 'react-native';
+import { router, useFocusEffect, useLocalSearchParams, useNavigation } from 'expo-router';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+  View,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
 import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
+import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
 import UiLanguagePicker from '../../components/UiLanguagePicker';
 import { apiResetPassword, userMessageForError } from '../../lib/api';
 import {
@@ -52,6 +61,23 @@ export default function ResetPasswordScreen() {
   const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
+  // One navigation per focus: a double-tap on any exit must not push twice,
+  // and the latch re-arms when this screen regains focus after a back gesture.
+  const navigationStartedRef = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => undefined;
+    }, []),
+  );
+  const navigateOnce = (href: '/login') => {
+    // Spending the one-shot code owns the screen: exits stay blocked without
+    // consuming the latch, so they work again once the request settles.
+    if (busyRef.current) return;
+    if (navigationStartedRef.current) return;
+    navigationStartedRef.current = true;
+    router.navigate(href);
+  };
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -74,9 +100,6 @@ export default function ResetPasswordScreen() {
     });
     return unsubscribe;
   }, [navigation]);
-  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
-    if (busyRef.current) event.preventDefault();
-  };
 
   const trimmedEmail = email.trim();
   const trimmedCode = code.trim();
@@ -144,7 +167,10 @@ export default function ResetPasswordScreen() {
             accessibilityLabel={t('login.emailLabel')}
             style={[styles.input, focusedField === 'email' && styles.inputFocused]}
             value={email}
-            onChangeText={setEmail}
+            onChangeText={(value) => {
+              setEmail(value);
+              setError(null);
+            }}
             onFocus={() => setFocusedField('email')}
             onBlur={() => {
               setFocusedField(null);
@@ -174,7 +200,10 @@ export default function ResetPasswordScreen() {
             accessibilityLabel={t('reset.codeLabel')}
             style={[styles.input, focusedField === 'code' && styles.inputFocused]}
             value={code}
-            onChangeText={setCode}
+            onChangeText={(value) => {
+              setCode(value);
+              setError(null);
+            }}
             onFocus={() => setFocusedField('code')}
             onBlur={() => setFocusedField(null)}
             placeholder={t('reset.codePlaceholder')}
@@ -204,7 +233,10 @@ export default function ResetPasswordScreen() {
                 focusedField === 'password' && styles.inputFocused,
               ]}
               value={password}
-              onChangeText={setPassword}
+              onChangeText={(value) => {
+                setPassword(value);
+                setError(null);
+              }}
               onFocus={() => setFocusedField('password')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('signup.passwordPlaceholder')}
@@ -228,6 +260,7 @@ export default function ResetPasswordScreen() {
               onToggle={() => setPasswordVisible((visible) => !visible)}
             />
           </View>
+          <PasswordStrengthMeter password={password} testID="reset-password-strength" />
           {passwordError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {passwordError}
@@ -245,7 +278,10 @@ export default function ResetPasswordScreen() {
                 focusedField === 'confirmPassword' && styles.inputFocused,
               ]}
               value={confirmPassword}
-              onChangeText={setConfirmPassword}
+              onChangeText={(value) => {
+                setConfirmPassword(value);
+                setError(null);
+              }}
               onFocus={() => setFocusedField('confirmPassword')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('cp.confirmPlaceholder')}
@@ -283,29 +319,35 @@ export default function ResetPasswordScreen() {
             </Text>
           )}
 
-          <Button
-            title={busy ? t('reset.submitNewBusy') : t('reset.submitNew')}
-            disabled={!canSubmit}
-            loading={busy}
-            onPress={() => void handleSubmit()}
-            style={styles.submitButton}
-          />
+          {/* The wrapper receives the tap when the Button inside is disabled
+              by validation, so pressing a blocked submit reveals the email
+              error instead of failing silently; an enabled Button consumes its
+              own press. */}
+          <Pressable accessible={false} onPress={() => setEmailTouched(true)}>
+            <Button
+              title={busy ? t('reset.submitNewBusy') : t('reset.submitNew')}
+              disabled={!canSubmit}
+              loading={busy}
+              onPress={() => void handleSubmit()}
+              style={styles.submitButton}
+            />
+          </Pressable>
 
-          <Link
-            href="/login"
+          <Pressable
+            accessibilityRole="link"
             accessibilityState={{ disabled: busy }}
-            onPress={blockLinkWhileBusy}
-            style={styles.footerLink}
+            onPress={() => navigateOnce('/login')}
+            style={({ pressed }) => [styles.footerLink, pressed && styles.linkPressed]}
           >
-            {t('reset.backToLogin')}
-          </Link>
+            <Text style={styles.footerLinkText}>{t('reset.backToLogin')}</Text>
+          </Pressable>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   flex: {
     flex: 1,
     backgroundColor: colors.background,
@@ -313,13 +355,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   container: {
     flexGrow: 1,
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.formMaxWidth,
     alignSelf: 'center',
   },
   title: {
-    fontSize: 26,
+    fontSize: type.titleLg.fontSize,
+    lineHeight: type.titleLg.lineHeight,
     fontWeight: '800',
     color: colors.text,
     textAlign: 'center',
@@ -328,8 +371,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
-    marginBottom: 6,
-    marginTop: spacing.lg,
+    marginBottom: spacing.sm,
+    marginTop: spacing.md,
   },
   input: {
     borderWidth: 1,
@@ -373,12 +416,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     opacity: 0.5,
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },
   error: {
-    marginTop: 14,
+    marginTop: spacing.md,
     color: colors.danger,
     fontSize: 14,
     textAlign: 'center',
@@ -389,10 +432,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   footerLink: {
     marginTop: spacing.xl,
     minHeight: layout.minimumTarget,
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: spacing.md,
+  },
+  footerLinkText: {
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  linkPressed: {
+    opacity: 0.6,
   },
 }));

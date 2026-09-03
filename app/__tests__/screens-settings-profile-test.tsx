@@ -26,6 +26,7 @@ import {
   refreshDailyReminderLanguage,
 } from '../src/lib/daily-reminder';
 import { deviceLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
+import { UI_LANGUAGE_LOCALES } from '../src/lib/language-options';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { HistoryPage, RecordingPage, User, UserDataPage } from '../src/lib/types';
 
@@ -215,7 +216,9 @@ const LANGUAGE_CHIPS = [
   { code: 'te', english: 'Telugu', native: 'తెలుగు' },
   { code: 'hi', english: 'Hindi', native: 'हिन्दी' },
   { code: 'es', english: 'Spanish', native: 'Español' },
-  { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
+  // The chip's secondary line is the localized `language.${code}` copy, whose
+  // English value is "Chinese" — not the option list's "Chinese (Simplified)".
+  { code: 'zh', english: 'Chinese', native: '简体中文' },
 ] as const;
 
 const UI_LANGUAGE_CHIPS = [
@@ -489,12 +492,17 @@ afterEach(async () => {
 
 describe('formatReminderHour', () => {
   it('renders the hour locale-aware in the given UI language', () => {
-    // en uses 12-hour clock; zh prefixes the hour with 时-like formatting.
+    // Each UI language formats through its pinned BCP-47 locale, never the
+    // bare tag (which Intl could re-resolve against the device locale).
     expect(formatReminderHour(19, 'en')).toBe(
-      new Intl.DateTimeFormat('en', { hour: 'numeric' }).format(new Date(2020, 0, 1, 19, 0)),
+      new Intl.DateTimeFormat(UI_LANGUAGE_LOCALES.en, { hour: 'numeric' }).format(
+        new Date(2020, 0, 1, 19, 0),
+      ),
     );
     expect(formatReminderHour(19, 'zh')).toBe(
-      new Intl.DateTimeFormat('zh', { hour: 'numeric' }).format(new Date(2020, 0, 1, 19, 0)),
+      new Intl.DateTimeFormat(UI_LANGUAGE_LOCALES.zh, { hour: 'numeric' }).format(
+        new Date(2020, 0, 1, 19, 0),
+      ),
     );
     expect(formatReminderHour(19, 'en')).not.toBe('19:00');
   });
@@ -506,7 +514,7 @@ describe('formatReminderHour', () => {
     expect(formatReminderHour(19)).not.toBe('19:00');
   });
 
-  it('falls back to zero-padded HH:00 when Intl rejects the language tag', () => {
+  it('falls back to zero-padded HH:00 when the UI language has no locale', () => {
     expect(formatReminderHour(9, '123456789' as never)).toBe('09:00');
   });
 });
@@ -526,9 +534,9 @@ describe('settings profile card', () => {
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
 
     const telugu = screen.getByRole('radio', { name: 'Telugu, తెలుగు' });
-    expect(telugu.props.accessibilityState).toMatchObject({ checked: true, selected: true });
+    expect(telugu.props.accessibilityState).toMatchObject({ checked: true, disabled: false });
     const hindi = screen.getByRole('radio', { name: 'Hindi, हिन्दी' });
-    expect(hindi.props.accessibilityState).toMatchObject({ checked: false, selected: false });
+    expect(hindi.props.accessibilityState).toMatchObject({ checked: false, disabled: false });
     // Both single-choice controls are grouped radiogroups for screen readers.
     const groupLabels = screen.container
       .queryAll((node) => node.props.accessibilityRole === 'radiogroup')
@@ -590,25 +598,37 @@ describe('settings profile card', () => {
       const chip = uiLanguageChip(index);
       expect(chip.props.accessibilityState).toMatchObject({
         busy: false,
-        selected: index === 0,
+        checked: index === 0,
         disabled: false,
       });
+      // The shared grid recipe: capped half-width chips with a hard tap floor.
       expect(flattenedStyle(chip)).toMatchObject({
+        minHeight: layout.minimumTarget,
+        minWidth: layout.minimumTarget,
+        flexGrow: 1,
         flexBasis: '47%',
-        flexGrow: 0,
-        flexShrink: 0,
+        maxWidth: '48%',
         borderWidth: 1.5,
         borderColor: index === 0 ? colors.primary : colors.inputBorder,
         borderRadius: radii.input,
+        paddingHorizontal: spacing.sm,
         paddingVertical: spacing.md,
         alignItems: 'center',
+        justifyContent: 'center',
         backgroundColor: index === 0 ? colors.primaryLight : colors.card,
       });
       expect(flattenedStyle(chip).opacity).toBeUndefined();
+      // En: the localized line equals the autonym, so the chip collapses to a
+      // single "English" line instead of repeating it twice.
       const nativeCopy = within(chip).getAllByText(language.native)[0];
-      const englishCopy = within(chip).getAllByText(language.english).at(-1)!;
+      const englishCopies = within(chip).getAllByText(language.english);
+      expect(englishCopies).toHaveLength(1);
       expect(flattenedStyle(nativeCopy).color).toBe(index === 0 ? colors.primary : colors.text);
-      expect(flattenedStyle(englishCopy).color).toBe(index === 0 ? colors.primary : colors.muted);
+      if (language.english !== language.native) {
+        expect(flattenedStyle(englishCopies[0]).color).toBe(
+          index === 0 ? colors.primary : colors.muted,
+        );
+      }
     }
     // Five choices keep equal half-width columns; the unpaired fifth option
     // must not stretch across the whole final row.
@@ -616,8 +636,8 @@ describe('settings profile card', () => {
       flattenedStyle(uiLanguageChip(0)).flexBasis,
     );
     // A 320-point screen leaves about 238 points inside the Settings card.
-    // Two 47% columns plus the 10-point gap still fit on that narrow budget.
-    expect(2 * 0.47 * 238 + 10).toBeLessThanOrEqual(238);
+    // Two 47% columns plus the 8-point gap still fit on that narrow budget.
+    expect(2 * 0.47 * 238 + 8).toBeLessThanOrEqual(238);
     const stableStatus = {
       height: spacing.lg,
       marginTop: spacing.xs,
@@ -625,11 +645,15 @@ describe('settings profile card', () => {
       justifyContent: 'center',
     };
     for (const language of UI_LANGUAGE_CHIPS) {
+      expect(screen.getByTestId(`app-language-chip-${language.code}`).props.testID).toBe(
+        `app-language-chip-${language.code}`,
+      );
       expect(flattenedStyle(screen.getByTestId(`app-language-status-${language.code}`))).toEqual(
         stableStatus,
       );
     }
     for (const language of LANGUAGE_CHIPS) {
+      expect(screen.getByTestId(`learning-language-chip-${language.code}`)).toBeTruthy();
       expect(
         flattenedStyle(screen.getByTestId(`learning-language-status-${language.code}`)),
       ).toEqual(stableStatus);
@@ -850,7 +874,7 @@ describe('settings profile card', () => {
     const saved = await screen.findByText(t('settings.saved'));
     expect(saved.props.accessibilityLiveRegion).toBe('polite');
     expect(flattenedStyle(saved)).toEqual({
-      marginTop: 6,
+      marginTop: 8,
       color: colors.success,
       fontSize: 13,
     });
@@ -995,6 +1019,31 @@ describe('settings profile card', () => {
     ).toMatchObject({ disabled: true });
   });
 
+  it('flags control characters in the name inline and blocks the save', async () => {
+    await renderSettings();
+    const input = screen.getByLabelText(t('signup.nameLabel'));
+    const saveButton = () => screen.getByRole('button', { name: t('settings.saveName') });
+
+    await fireEvent.changeText(input, 'Ada\nKing');
+    // Inline validation is blur-gated (the signup/forgot pattern): mid-typing
+    // errors are hostile; saveName re-validates regardless.
+    expect(screen.queryByText(t('name.invalid'))).toBeNull();
+    await fireEvent(input, 'blur');
+    const inlineError = screen.getByText(t('name.invalid'));
+    expect(inlineError.props.accessibilityRole).toBe('alert');
+    expect(flattenedStyle(inlineError)).toEqual({
+      marginTop: 8,
+      color: colors.danger,
+      fontSize: 13,
+    });
+    expect(saveButton().props.accessibilityState).toMatchObject({ disabled: true });
+    expect(mockUpdateProfile).not.toHaveBeenCalled();
+
+    await fireEvent.changeText(input, 'Ada King');
+    expect(screen.queryByText(t('name.invalid'))).toBeNull();
+    expect(saveButton().props.accessibilityState).toMatchObject({ disabled: false });
+  });
+
   it('saves on the keyboard return key and ignores it when nothing changed', async () => {
     mockUpdateProfile.mockResolvedValue({ ...USER, name: 'Ada King' });
     await renderSettings();
@@ -1118,7 +1167,7 @@ describe('settings profile card', () => {
 
     const error = await screen.findByRole('alert');
     expect(error).toHaveTextContent(t('settings.updateFailed'));
-    expect(flattenedStyle(error)).toEqual({ marginTop: 6, color: colors.danger, fontSize: 13 });
+    expect(flattenedStyle(error)).toEqual({ marginTop: 8, color: colors.danger, fontSize: 13 });
     expect(mockAuthValue.setUser).not.toHaveBeenCalled();
     // A failed save must never leave a "Saved" confirmation behind.
     expect(screen.queryByText(t('settings.saved'))).toBeNull();
@@ -1163,10 +1212,12 @@ describe('settings profile card', () => {
     for (const [index] of UI_LANGUAGE_CHIPS.entries()) {
       const chip = uiLanguageChip(index);
       expect(chip.props.accessibilityState).toMatchObject({
-        selected: index === 0,
+        checked: index === 0,
         disabled: true,
       });
-      expect(flattenedStyle(chip).opacity).toBe(index === 0 ? undefined : 0.5);
+      // The shared grid dims every chip while the radiogroup is disabled,
+      // including the one that stays selected.
+      expect(flattenedStyle(chip).opacity).toBe(0.5);
     }
     expect(languageSpinners()).toHaveLength(1);
     expect(languageSpinners()[0].props).toMatchObject({
@@ -1730,18 +1781,18 @@ describe('settings profile card', () => {
     expect(languageChip(1).props.accessibilityState).toMatchObject({
       busy: true,
       disabled: true,
-      selected: false,
+      checked: false,
     });
     expect(languageChip(0).props.accessibilityState).toMatchObject({
       busy: false,
       disabled: true,
-      selected: true,
+      checked: true,
     });
-    // Only the chips you could still move to are dimmed; the current one keeps
-    // its full-strength selected treatment.
+    // The shared grid dims every chip while the radiogroup is disabled,
+    // including the still-selected current language.
     expect(flattenedStyle(languageChip(1)).opacity).toBe(0.5);
     expect(flattenedStyle(languageChip(2)).opacity).toBe(0.5);
-    expect(flattenedStyle(languageChip(0)).opacity).toBeUndefined();
+    expect(flattenedStyle(languageChip(0)).opacity).toBe(0.5);
     expect(languageSpinners()).toHaveLength(1);
     expect(languageSpinners()[0].props).toMatchObject({
       accessibilityElementsHidden: true,
@@ -1760,7 +1811,7 @@ describe('settings profile card', () => {
     expect(languageChip(1).props.accessibilityState).toMatchObject({
       busy: false,
       disabled: false,
-      selected: false,
+      checked: false,
     });
     expect(flattenedStyle(languageChip(1)).opacity).toBeUndefined();
     expect(languageSpinners()).toHaveLength(0);
@@ -1772,7 +1823,7 @@ describe('settings profile card', () => {
     await renderSettings();
 
     for (const index of LANGUAGE_CHIPS.keys()) {
-      expect(languageChip(index).props.accessibilityState).toMatchObject({ selected: false });
+      expect(languageChip(index).props.accessibilityState).toMatchObject({ checked: false });
     }
 
     await act(async () => {
@@ -1814,7 +1865,7 @@ describe('settings profile card', () => {
     expect(languageChip(1).props.accessibilityState).toMatchObject({
       busy: false,
       disabled: false,
-      selected: false,
+      checked: false,
     });
     expect(flattenedStyle(languageChip(1)).opacity).toBeUndefined();
     expect(languageSpinners()).toHaveLength(0);
@@ -1838,13 +1889,13 @@ describe('settings screen layout', () => {
     expect(flattenedStyle(parentOf(profileTitle))).toEqual({
       backgroundColor: colors.card,
       borderRadius: radii.card,
-      padding: layout.screenPadding,
+      padding: spacing.lg,
       borderWidth: 1,
       borderColor: colors.border,
       marginBottom: spacing.lg,
     });
     expect(flattenedStyle(profileTitle)).toEqual({
-      fontSize: 18,
+      fontSize: 17,
       fontWeight: '800',
       color: colors.text,
     });
@@ -1913,16 +1964,22 @@ describe('settings screen layout', () => {
     expect(flattenedStyle(parentOf(languageChip(0)))).toEqual({
       flexDirection: 'row',
       flexWrap: 'wrap',
-      gap: 10,
+      justifyContent: 'center',
+      gap: spacing.sm,
     });
     const chip = {
+      position: 'relative',
+      minHeight: layout.minimumTarget,
+      minWidth: layout.minimumTarget,
+      flexGrow: 1,
       flexBasis: '47%',
-      flexGrow: 0,
-      flexShrink: 0,
+      maxWidth: '48%',
       borderWidth: 1.5,
       borderRadius: radii.input,
+      paddingHorizontal: spacing.sm,
       paddingVertical: spacing.md,
       alignItems: 'center',
+      justifyContent: 'center',
     };
     expect(flattenedStyle(languageChip(0))).toEqual({
       ...chip,
@@ -1939,21 +1996,27 @@ describe('settings screen layout', () => {
       fontSize: 17,
       fontWeight: '700',
       color: colors.primary,
+      textAlign: 'center',
     });
     expect(flattenedStyle(within(languageChip(0)).getByText('Telugu'))).toEqual({
       marginTop: 2,
       fontSize: 13,
+      lineHeight: 18,
       color: colors.primary,
+      textAlign: 'center',
     });
     expect(flattenedStyle(within(languageChip(1)).getByText('हिन्दी'))).toEqual({
       fontSize: 17,
       fontWeight: '700',
       color: colors.text,
+      textAlign: 'center',
     });
     expect(flattenedStyle(within(languageChip(1)).getByText('Hindi'))).toEqual({
       marginTop: 2,
       fontSize: 13,
+      lineHeight: 18,
       color: colors.muted,
+      textAlign: 'center',
     });
   });
 
@@ -2069,7 +2132,12 @@ describe('settings screen layout', () => {
 
     const actionText = { fontSize: 16, fontWeight: '600', color: colors.primary };
     expect(flattenedStyle(screen.getByText(t('header.changePassword')))).toEqual(actionText);
+    // Both destructive exits share the danger ink.
     expect(flattenedStyle(screen.getByText(t('header.deleteAccount')))).toEqual({
+      ...actionText,
+      color: colors.danger,
+    });
+    expect(flattenedStyle(screen.getByText(t('common.logOut')))).toEqual({
       ...actionText,
       color: colors.danger,
     });
@@ -2797,7 +2865,7 @@ describe('daily reminder controls', () => {
 
     const error = await screen.findByRole('alert');
     expect(error).toHaveTextContent(t('reminder.failed'));
-    expect(flattenedStyle(error)).toEqual({ marginTop: 6, color: colors.danger, fontSize: 13 });
+    expect(flattenedStyle(error)).toEqual({ marginTop: 8, color: colors.danger, fontSize: 13 });
     expect(
       screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
     ).toMatchObject({ checked: false });
@@ -3131,7 +3199,7 @@ describe('retake placement test', () => {
     await pressAlertButton(t('retake.confirm'));
 
     const error = await screen.findByText(t('retake.failed'));
-    expect(flattenedStyle(error)).toEqual({ marginTop: 6, color: colors.danger, fontSize: 13 });
+    expect(flattenedStyle(error)).toEqual({ marginTop: 8, color: colors.danger, fontSize: 13 });
     expect(
       screen.getByRole('button', { name: t('settings.retake') }).props.accessibilityState,
     ).toEqual({ disabled: false, busy: false });
@@ -3524,7 +3592,8 @@ describe('account actions', () => {
     const logoutRow = () => screen.getByRole('button', { name: t('common.logOut') });
 
     await fireEvent.press(logoutRow());
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
+    // The failed server logout offers the local-only exit as the latest Alert.
     await pressAlertButton(t('logout.thisDevice'));
     await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
     expect(logoutRow().props.accessibilityState).toMatchObject({ busy: true });
@@ -3548,12 +3617,14 @@ describe('account actions', () => {
     const view = await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await pressAlertButton(t('logout.thisDevice'));
     await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
     await view.unmount();
 
     await act(async () => request.reject(new Error('offline')));
-    expect(alertSpy).toHaveBeenCalledTimes(1);
+    // Only the entry confirmation and the local-exit offer were ever shown.
+    expect(alertSpy).toHaveBeenCalledTimes(2);
   });
 
   it('authorizes local sign-out through the identity-only lease view', async () => {
@@ -3572,7 +3643,7 @@ describe('account actions', () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
     currentLease = { owner: 'replacement' };
     await pressAlertButton(t('logout.thisDevice'));
     await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
@@ -3688,10 +3759,39 @@ describe('account actions', () => {
     expect(mockRouter.navigate).toHaveBeenCalledTimes(2);
   });
 
+  it('requires an explicit destructive confirmation before logging out', async () => {
+    mockAuthValue = makeAuth();
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(alertSpy).toHaveBeenCalledWith(
+      t('settings.logOutConfirmTitle'),
+      t('settings.logOutConfirmBody'),
+      [
+        { text: t('common.cancel'), style: 'cancel' },
+        {
+          text: t('common.logOut'),
+          style: 'destructive',
+          onPress: expect.any(Function),
+        },
+      ],
+    );
+    // Dismissing the confirmation leaves the session signed in.
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
+
+    await waitFor(() => expect(mockAuthValue.logout).toHaveBeenCalledTimes(1));
+  });
+
   it('logs out and returns to the gate', async () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
   });
@@ -3702,6 +3802,7 @@ describe('account actions', () => {
       screen.getByRole('button', { name: t('settings.export') }),
     );
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     mockSharingAvailable.mockClear();
 
@@ -3713,9 +3814,11 @@ describe('account actions', () => {
     expect(mockSharingAvailable).not.toHaveBeenCalled();
   });
 
-  it('logs out once when the row is tapped twice before a re-render', async () => {
-    // The second tap would throw out of the auth transition guard, alerting
-    // "we could not log you out" over a logout that is in fact succeeding.
+  it('logs out once when the confirmation is taken twice before a re-render', async () => {
+    // Each row tap only opens a confirmation; the destructive handler re-runs
+    // the guarded logout path, so a doubled confirmation still starts exactly
+    // one logout — the second would throw out of the auth transition guard and
+    // alert a failure over a logout that is in fact succeeding.
     let resolveLogout: () => void = () => undefined;
     const logout = jest.fn().mockReturnValue(
       new Promise<void>((resolve) => {
@@ -3731,9 +3834,28 @@ describe('account actions', () => {
       press();
       press();
     });
+    const confirms = alertSpy.mock.calls
+      .filter(([title]) => title === t('settings.logOutConfirmTitle'))
+      .map(
+        (call) =>
+          (call[2] as { text?: string; onPress?: () => void }[]).find(
+            (button) => button.text === t('common.logOut'),
+          )?.onPress,
+      );
+    expect(confirms).toHaveLength(2);
+
+    await act(async () => {
+      void confirms[0]!();
+      void confirms[1]!();
+      await Promise.resolve();
+    });
 
     expect(logout).toHaveBeenCalledTimes(1);
-    expect(alertSpy).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalledWith(
+      t('logout.failedTitle'),
+      t('logout.localBody'),
+      expect.any(Array),
+    );
 
     await act(async () => {
       resolveLogout();
@@ -3755,6 +3877,7 @@ describe('account actions', () => {
     expect(logoutRow().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(logoutRow());
+    await pressAlertButton(t('common.logOut'));
 
     expect(logoutRow().props.accessibilityState).toEqual({ disabled: true, busy: true });
     expect(flattenedStyle(logoutRow()).opacity).toBe(0.5);
@@ -3772,9 +3895,17 @@ describe('account actions', () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('logout.failedTitle'),
+        t('logout.localBody'),
+        expect.any(Array),
+      ),
+    );
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await waitFor(() => expect(mockAuthValue.logout).toHaveBeenCalledTimes(2));
   });
 
@@ -3785,6 +3916,7 @@ describe('account actions', () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
         t('logout.cleanupTitle'),
@@ -3803,6 +3935,7 @@ describe('account actions', () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.localBody'), [
         { text: t('common.cancel'), style: 'cancel' },
@@ -3830,7 +3963,8 @@ describe('account actions', () => {
     const view = await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(2));
 
     // AuthProvider fences the failed transition and then republishes its lease
     // capture callback. sessionVersion remains identity-stable, so practice and
@@ -3861,7 +3995,8 @@ describe('account actions', () => {
     const view = await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(2));
 
     mockAuthValue = makeAuth({
       ...replacement,
@@ -3883,7 +4018,7 @@ describe('account actions', () => {
     await renderSettings();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
-    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('common.logOut'));
     await pressAlertButton(t('logout.thisDevice'));
 
     await waitFor(() =>
@@ -4171,6 +4306,13 @@ describe('settings async race fences', () => {
       );
       await act(async () => {
         void logOut();
+      });
+      const confirm = latestAlertButtons().find(
+        (button) => button.text === t('common.logOut'),
+      )?.onPress;
+      expect(confirm).toEqual(expect.any(Function));
+      await act(async () => {
+        void confirm!();
         await Promise.resolve();
       });
       expect(logout).toHaveBeenCalledTimes(1);
@@ -4235,6 +4377,7 @@ describe('settings async race fences', () => {
         await Promise.resolve();
       });
       if (operation === 'retake') await pressAlertButton(t('retake.confirm'));
+      else if (operation === 'logout') await pressAlertButton(t('common.logOut'));
       await waitFor(() => expect(called).toHaveBeenCalledTimes(1));
       await crossSettingsOwnershipBoundary(view, 'identity');
       mockSetOptions.mockClear();
@@ -4263,6 +4406,12 @@ describe('settings async race fences', () => {
     const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
     await act(async () => {
       void logOut();
+    });
+    const confirm = latestAlertButtons().find(
+      (button) => button.text === t('common.logOut'),
+    )?.onPress;
+    await act(async () => {
+      void confirm!();
       await Promise.resolve();
     });
     expect(logout).toHaveBeenCalledTimes(1);
@@ -4289,6 +4438,12 @@ describe('settings async race fences', () => {
     const logOut = committedPressHandler(screen.getByRole('button', { name: t('common.logOut') }));
     await act(async () => {
       void logOut();
+    });
+    const confirm = latestAlertButtons().find(
+      (button) => button.text === t('common.logOut'),
+    )?.onPress;
+    await act(async () => {
+      void confirm!();
       await Promise.resolve();
     });
     expect(logout).toHaveBeenCalledTimes(1);
@@ -4518,6 +4673,7 @@ describe('settings async race fences', () => {
     ['blank', '   '],
     ['overlong', 'a'.repeat(MAX_NAME_LENGTH + 1)],
     ['astral-overlong', '😀'.repeat(51)],
+    ['control-characters', 'Ada\nKing'],
     ['canonical', USER.name],
   ])('revalidates a same-frame %s draft before PATCH', async (_label, unsafeDraft) => {
     mockUpdateProfile.mockResolvedValue({ ...USER, name: 'Ada King' });
@@ -4923,6 +5079,7 @@ describe('settings async race fences', () => {
     mockRouter.replace.mockClear();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
 
     expect(replacementLogout).toHaveBeenCalledTimes(1);
     expect(mockRouter.replace).toHaveBeenCalledWith('/');

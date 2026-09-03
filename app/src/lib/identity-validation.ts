@@ -24,3 +24,19 @@ export function isValidEmailAddress(value: string): boolean {
 export function emailAddressError(value: string, t: Translator = translate): string | null {
   return value.trim().length > 0 && !isValidEmailAddress(value) ? t('email.invalid') : null;
 }
+
+/**
+ * Mirrors the server's `nameSchema` control-character refinement
+ * (server/src/auth.ts): every Unicode control, line-separator, and
+ * paragraph-separator code point is refused so a pasted name cannot pass the
+ * client gate and then fail with only the generic VALIDATION_FAILED copy.
+ * Blank and over-length names stay gated by the existing per-form rules.
+ */
+export function hasNoControlCharacters(value: string): boolean {
+  return !/[\p{Cc}\p{Zl}\p{Zp}]/u.test(value);
+}
+
+/** No complaint for an untouched field; forms separately require nonempty. */
+export function nameError(value: string, t: Translator = translate): string | null {
+  return value.length > 0 && !hasNoControlCharacters(value) ? t('name.invalid') : null;
+}

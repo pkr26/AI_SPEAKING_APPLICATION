@@ -8,6 +8,9 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-
 import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { AccessibilityInfo, Alert, BackHandler, ScrollView, StyleSheet } from 'react-native';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+
+import * as Haptics from 'expo-haptics';
 
 import DiagnosticScreen from '../src/app/diagnostic';
 import type { RecorderResultMetadata } from '../src/components/Recorder';
@@ -68,6 +71,15 @@ jest.mock('expo-router', () => {
   };
 });
 
+// ----- expo-haptics mock (no native module under jest) -----
+
+jest.mock('expo-haptics', () => ({
+  impactAsync: jest.fn(async () => undefined),
+  notificationAsync: jest.fn(async () => undefined),
+  ImpactFeedbackStyle: { Light: 'light' },
+  NotificationFeedbackType: { Success: 'success' },
+}));
+
 // ----- Recorder stub (captures props; internals tested elsewhere) -----
 
 interface CapturedRecorderProps {
@@ -79,6 +91,7 @@ interface CapturedRecorderProps {
   parseResult: (data: unknown) => DiagnosticAnswerResult;
   onResult: (data: DiagnosticAnswerResult, metadata?: RecorderResultMetadata) => void;
   onError: (message: string) => void;
+  onRateLimited?: (message: string) => void;
   onRecoveryUnresolved: () => void;
   onInteractionLockChange?: (locked: boolean) => void;
   onExitLockChange?: (locked: boolean) => void;
@@ -277,9 +290,16 @@ function makeQueryClient() {
 
 async function renderScreen(queryClient = makeQueryClient()) {
   const tree = () => (
-    <QueryClientProvider client={queryClient}>
-      <DiagnosticScreen />
-    </QueryClientProvider>
+    <SafeAreaProvider
+      initialMetrics={{
+        frame: { x: 0, y: 0, width: 390, height: 844 },
+        insets: { top: 0, left: 0, right: 0, bottom: 0 },
+      }}
+    >
+      <QueryClientProvider client={queryClient}>
+        <DiagnosticScreen />
+      </QueryClientProvider>
+    </SafeAreaProvider>
   );
   const rendered = await render(tree());
   return {
@@ -331,6 +351,34 @@ function scrollView(): TestInstance {
 
 function scrollContentStyle(): SemanticStyle {
   return StyleSheet.flatten(scrollView().props.contentContainerStyle) ?? {};
+}
+
+/** True when any ancestor view of `node` satisfies `predicate` (e.g. the host
+ * ScrollView, to prove a footer is pinned outside the scrolling column). */
+function hasAncestor(node: TestInstance, predicate: (candidate: TestInstance) => boolean): boolean {
+  let parent: TestInstance | null = node.parent;
+  while (parent) {
+    if (predicate(parent)) return true;
+    parent = parent.parent;
+  }
+  return false;
+}
+
+/** The host ScrollView type the RN test renderer publishes. */
+const isScrollView = (node: TestInstance) => node.type === 'RCTScrollView';
+
+type MockAlertButton = { text: string; style?: string; onPress?: () => void };
+
+/** Confirms the most recent logout-confirmation alert exactly as the OS would. */
+function confirmLogoutAlert(): void {
+  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as [
+    string,
+    string,
+    MockAlertButton[],
+  ];
+  const confirm = (call[2] ?? []).find((button) => button.text === t('common.logOut'));
+  if (!confirm?.onPress) throw new Error('No logout confirmation button in the last alert');
+  confirm.onPress();
 }
 
 function responderEvent() {
@@ -1489,7 +1537,7 @@ describe('diagnostic screen', () => {
         marginTop: spacing.md,
         color: colors.danger,
         fontSize: 15,
-        lineHeight: 22,
+        lineHeight: 21,
         textAlign: 'center',
       });
       expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
@@ -1530,7 +1578,7 @@ describe('diagnostic screen', () => {
     expect(flattenedStyle(screen.getByText('Please speak clearly and try again.'))).toEqual({
       marginTop: spacing.sm,
       fontSize: 15,
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.muted,
     });
     expect(
@@ -2191,6 +2239,26 @@ describe('diagnostic screen', () => {
     expect(alertSpy).toHaveBeenCalledWith(t('diag.assessFailedTitle'), 'upload failed');
   });
 
+  it('renders the recorder-reported wait line inline and clears it on the next lock', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+    const wait = `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`;
+
+    expect(recorderProps().onRateLimited).toEqual(expect.any(Function));
+    await act(async () => recorderProps().onRateLimited?.(wait));
+
+    const notice = screen.getByText(wait);
+    expect(notice).toBeTruthy();
+    // The wait line is an alert for assistive tech, not a silent style change.
+    expect(screen.getByRole('alert')).toBeTruthy();
+    expect(alertSpy).not.toHaveBeenCalled();
+
+    // A fresh take owns the inline space again: the recorder lock clears it.
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(screen.queryByText(wait)).toBeNull();
+  });
+
   it('refetches server state when recorder recovery is unresolved', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
@@ -2400,12 +2468,16 @@ describe('diagnostic screen', () => {
 
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+    // Settings owns the action claim: the logout fence rejects before its
+    // confirmation can even open.
+    expect(alertSpy).not.toHaveBeenCalled();
     expect(mockAuthValue.logout).not.toHaveBeenCalled();
 
     await blurScreen();
     await focusScreen();
     await act(async () => {
       void logOut();
+      confirmLogoutAlert();
       await Promise.resolve();
     });
     expect(mockAuthValue.logout).toHaveBeenCalledTimes(1);
@@ -2426,6 +2498,7 @@ describe('diagnostic screen', () => {
 
     await act(async () => {
       void logOut();
+      confirmLogoutAlert();
       openSettings();
       await Promise.resolve();
     });
@@ -2488,6 +2561,7 @@ describe('diagnostic screen', () => {
 
     await act(async () => {
       void logOut();
+      confirmLogoutAlert();
       blockedDuringLogout = startBlocked?.() ?? false;
       await Promise.resolve();
     });
@@ -2518,9 +2592,47 @@ describe('diagnostic screen', () => {
       { backgroundColor: colors.primaryLight },
     );
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
 
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.logout).toHaveBeenCalled();
+  });
+
+  it('requires a destructive confirmation before logging out', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
+      string,
+      string,
+      MockAlertButton[],
+    ];
+    expect(alertSpy).toHaveBeenLastCalledWith(
+      t('settings.logOutConfirmTitle'),
+      t('settings.logOutConfirmBody'),
+      [
+        expect.objectContaining({ text: t('common.cancel'), style: 'cancel' }),
+        expect.objectContaining({ text: t('common.logOut'), style: 'destructive' }),
+      ],
+    );
+
+    // Cancelling keeps the session signed in.
+    buttons[0]!.onPress?.();
+    expect(mockAuthValue.logout).not.toHaveBeenCalled();
+
+    // Confirming the destructive action runs the guarded logout path.
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(mockAuthValue.logout).toHaveBeenCalledTimes(1));
   });
 
   it('dedupes same-frame logout taps and releases the latch after a failure', async () => {
@@ -2538,6 +2650,7 @@ describe('diagnostic screen', () => {
     await act(async () => {
       void pressLogout();
       void pressLogout();
+      confirmLogoutAlert();
       await Promise.resolve();
     });
     expect(logout).toHaveBeenCalledTimes(1);
@@ -2554,6 +2667,10 @@ describe('diagnostic screen', () => {
     ).toMatchObject({ disabled: false });
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
     await waitFor(() => expect(logout).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
   });
@@ -2567,6 +2684,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
     expect(logout).toHaveBeenCalledTimes(1);
     await blurScreen();
     pendingLogout.resolve();
@@ -2576,7 +2697,8 @@ describe('diagnostic screen', () => {
     });
 
     expect(mockRouter.replace).not.toHaveBeenCalled();
-    expect(alertSpy).not.toHaveBeenCalled();
+    // Only the confirmation dialog was shown; no failure alert fired.
+    expect(alertSpy).not.toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
   });
 
   it('drops a pending logout failure after its strict session lease expires without a rerender', async () => {
@@ -2594,6 +2716,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
     expect(logout).toHaveBeenCalledTimes(1);
     currentLease = { owner: 'logout-lease-b' };
     pendingLogout.reject(new Error('late offline failure'));
@@ -2602,7 +2728,8 @@ describe('diagnostic screen', () => {
       await Promise.resolve();
     });
 
-    expect(alertSpy).not.toHaveBeenCalled();
+    // Only the confirmation dialog was shown; no failure alert fired.
+    expect(alertSpy).not.toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
     expect(mockRouter.replace).not.toHaveBeenCalled();
     await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
     expect(mockRouter.navigate).not.toHaveBeenCalled();
@@ -2617,6 +2744,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
 
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody')),
@@ -2633,6 +2764,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
 
     await waitFor(() =>
       expect(alertSpy).toHaveBeenCalledWith(
@@ -2745,6 +2880,22 @@ describe('diagnostic screen', () => {
       { queue: true },
     );
     announceSpy.mockRestore();
+  });
+
+  it('celebrates the level reveal with exactly one success haptic', async () => {
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2' });
+    const rendered = await renderScreen();
+    await screen.findByText(t('diag.completeTitle'));
+
+    expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledTimes(1);
+    expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledWith('success');
+
+    // Re-renders of the same reveal (queries, focus churn) never re-celebrate.
+    await act(async () => {
+      await rendered.rerenderScreen();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(jest.mocked(Haptics.notificationAsync)).toHaveBeenCalledTimes(1);
   });
 
   it('announces each step once and scrolls only between steps', async () => {
@@ -2992,6 +3143,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
     expect(logout).toHaveBeenCalledTimes(1);
     await blurScreen();
     await act(async () => {
@@ -3000,7 +3155,7 @@ describe('diagnostic screen', () => {
       await Promise.resolve();
     });
 
-    expect(alertSpy).not.toHaveBeenCalled();
+    expect(alertSpy).not.toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
     expect(mockRouter.replace).not.toHaveBeenCalled();
   });
 
@@ -3025,6 +3180,10 @@ describe('diagnostic screen', () => {
     await startFreshTest();
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await act(async () => {
+      confirmLogoutAlert();
+      await Promise.resolve();
+    });
     expect(logout).toHaveBeenCalledTimes(1);
     currentLease = { owner: 'replacement-session' };
     await act(async () => {
@@ -3062,6 +3221,9 @@ describe('diagnostic screen', () => {
     expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
 
     mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    // Park the replacement identity's canonical fetch: the preparing state
+    // asserted below must not race a freshly resolved same-shape payload.
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
     await rendered.rerenderScreen();
     await act(async () => {
       acknowledgement.resolve(true);
@@ -3181,7 +3343,7 @@ describe('diagnostic presentation', () => {
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -3221,7 +3383,7 @@ describe('diagnostic presentation', () => {
   };
 
   const INTRO_LINE = {
-    marginTop: 10,
+    marginTop: spacing.sm,
     fontSize: 16,
     lineHeight: 23,
     color: colors.text,
@@ -3289,6 +3451,7 @@ describe('diagnostic presentation', () => {
       backgroundColor: colors.background,
     });
     expect(screen.queryByText(t('header.diagnostic'))).toBeNull();
+    // The account exits sit in a fixed bottom bar, outside the scroll column.
     const accountActions = parentOf(screen.getByRole('button', { name: t('header.settings') }));
     expect(flattenedStyle(accountActions)).toEqual({
       alignSelf: 'stretch',
@@ -3296,15 +3459,21 @@ describe('diagnostic presentation', () => {
       flexWrap: 'wrap',
       justifyContent: 'center',
       gap: spacing.sm,
-      marginTop: spacing.xl,
+    });
+    const footer = parentOf(accountActions);
+    expect(footer.props.testID).toBe('diagnostic-account-footer');
+    expect(flattenedStyle(footer)).toEqual({
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+      backgroundColor: colors.background,
+      paddingVertical: spacing.sm,
+      paddingBottom: spacing.sm,
     });
     expect(flattenedStyle(introTitle)).toEqual(CARD_TITLE);
     const introCard = parentOf(introTitle);
     expect(flattenedStyle(introCard)).toEqual(CARD);
-    expect(parentOf(introCard)).toBe(parentOf(accountActions));
-    expect(parentOf(introCard).children.indexOf(introCard)).toBeLessThan(
-      parentOf(accountActions).children.indexOf(accountActions),
-    );
+    expect(hasAncestor(introCard, (node) => node.type === 'RCTScrollView')).toBe(true);
+    expect(hasAncestor(footer, (node) => node.type === 'RCTScrollView')).toBe(false);
     for (const line of [
       t('diag.introWhat'),
       t('diag.introCount', { count: 3 }),
@@ -3316,6 +3485,20 @@ describe('diagnostic presentation', () => {
     expect(flattenedStyle(screen.getByRole('button', { name: t('diag.introStart') }))).toEqual(
       PRIMARY_ACTION,
     );
+  });
+
+  it('pins the account footer outside the ScrollView in the intro and question states', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await screen.findByText(t('diag.introTitle'));
+    // Intro state: the intro card scrolls, the account bar stays pinned.
+    expect(hasAncestor(screen.getByTestId('diagnostic-account-footer'), isScrollView)).toBe(false);
+
+    await startFreshTest();
+    // During the test the same footer stays pinned below the question card.
+    expect(screen.getByTestId('diagnostic-account-footer')).toBeTruthy();
+    expect(hasAncestor(screen.getByTestId('diagnostic-account-footer'), isScrollView)).toBe(false);
+    expect(hasAncestor(screen.getByText(QUESTION_1.questionText), isScrollView)).toBe(true);
   });
 
   it('renders the question card and its progress line from the tokens', async () => {
@@ -3346,11 +3529,12 @@ describe('diagnostic presentation', () => {
     // Both halves of the card are named for the learner.
     expect(flattenedStyle(screen.getByText(t('label.word')))).toEqual(CARD_LABEL);
     expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+    // The account exits stay pinned in the bottom bar, outside the scroll.
     const accountActions = parentOf(screen.getByRole('button', { name: t('header.settings') }));
-    expect(parentOf(questionCard)).toBe(parentOf(accountActions));
-    expect(parentOf(questionCard).children.indexOf(questionCard)).toBeLessThan(
-      parentOf(accountActions).children.indexOf(accountActions),
-    );
+    const footer = parentOf(accountActions);
+    expect(footer.props.testID).toBe('diagnostic-account-footer');
+    expect(hasAncestor(questionCard, isScrollView)).toBe(true);
+    expect(hasAncestor(footer, isScrollView)).toBe(false);
   });
 
   it('renders the checked-answer detail card from the tokens', async () => {
@@ -3414,7 +3598,7 @@ describe('diagnostic presentation', () => {
     expect(flattenedStyle(screen.getByText('Great answer.'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 16,
-      lineHeight: 24,
+      lineHeight: 23,
       color: colors.text,
     });
     expect(flattenedStyle(screen.getByRole('button', { name: t('diag.nextQuestion') }))).toEqual(
@@ -3443,7 +3627,7 @@ describe('diagnostic presentation', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
       width: '100%',
       maxWidth: layout.contentMaxWidth,
       alignSelf: 'center',
@@ -3510,7 +3694,7 @@ describe('diagnostic presentation', () => {
       alignSelf: 'stretch',
       backgroundColor: colors.card,
       borderRadius: radii.card,
-      padding: spacing.ml,
+      padding: spacing.lg,
       borderWidth: 1,
       borderColor: colors.border,
     });
@@ -3543,14 +3727,14 @@ describe('diagnostic presentation', () => {
       marginTop: spacing.xs,
       fontSize: 15,
       fontWeight: '600',
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
     expect(flattenedStyle(screen.getByText(t('diag.transcriptLabel')))).toBeTruthy();
     expect(flattenedStyle(screen.getByText('transcript'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 15,
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
     expect(screen.getByText(t('feedback.feedbackLabel'))).toBeTruthy();

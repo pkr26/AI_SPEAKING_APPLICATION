@@ -44,7 +44,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   paragraph: {
     marginTop: spacing.lg,
     fontSize: 16,
-    lineHeight: 24,
+    lineHeight: 23,
     color: colors.text,
   },
 }));

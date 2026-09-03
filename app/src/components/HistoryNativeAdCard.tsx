@@ -1,6 +1,6 @@
 import type { NativeAd } from 'react-native-google-mobile-ads';
 import React, { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { StyleSheet, Text, useWindowDimensions } from 'react-native';
+import { Text, View, useWindowDimensions } from 'react-native';
 
 import { adUnitIdFor, adsNativeModuleWhenReady, useAds } from '../lib/ads';
 import {
@@ -8,7 +8,7 @@ import {
   subscribeSubmittedRecordingPlaybackActive,
 } from '../lib/audio-session';
 import { useT } from '../lib/i18n';
-import { useTheme } from '../lib/theme';
+import { createThemedStyles, useTheme } from '../lib/theme';
 
 export function historyNativeAdReservedHeight(fontScale: number): number {
   const safeScale = Number.isFinite(fontScale) ? Math.max(fontScale, 1) : 1;
@@ -19,7 +19,7 @@ export function historyNativeAdReservedHeight(fontScale: number): number {
 export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   const ads = useAds();
   const t = useT();
-  const theme = useTheme();
+  const styles = themedStyles(useTheme());
   const { fontScale } = useWindowDimensions();
   const reservedHeight = historyNativeAdReservedHeight(fontScale);
   const { activatePlacement, currentRequestNonPersonalizedAdsOnly } = ads;
@@ -106,16 +106,7 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   if (!nativeAd) {
     return (
       <Text
-        accessibilityLabel={t('ads.label')}
-        style={[
-          styles.placeholder,
-          {
-            minHeight: reservedHeight,
-            backgroundColor: theme.colors.card,
-            borderColor: theme.colors.border,
-            color: theme.colors.muted,
-          },
-        ]}
+        style={[styles.placeholder, { minHeight: reservedHeight }]}
         testID="history-native-ad-reserved"
       >
         {t('ads.label')}
@@ -128,82 +119,95 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   return (
     <NativeAdView
       nativeAd={nativeAd}
-      style={[
-        styles.card,
-        {
-          minHeight: reservedHeight,
-          backgroundColor: theme.colors.card,
-          borderColor: theme.colors.border,
-        },
-      ]}
+      style={[styles.card, { minHeight: reservedHeight }]}
       accessibilityLabel={t('ads.label')}
+      accessibilityRole="image"
     >
-      <Text style={[styles.label, { color: theme.colors.muted }]}>{t('ads.label')}</Text>
+      <Text style={styles.label}>{t('ads.label')}</Text>
       <NativeAsset assetType={NativeAssetType.HEADLINE}>
-        <Text numberOfLines={2} style={[styles.headline, { color: theme.colors.text }]}>
+        <Text numberOfLines={2} style={styles.headline}>
           {nativeAd.headline}
         </Text>
       </NativeAsset>
       {nativeAd.body ? (
         <NativeAsset assetType={NativeAssetType.BODY}>
-          <Text numberOfLines={3} style={[styles.body, { color: theme.colors.muted }]}>
+          <Text numberOfLines={3} style={styles.body}>
             {nativeAd.body}
           </Text>
         </NativeAsset>
       ) : null}
       {nativeAd.callToAction ? (
         <NativeAsset assetType={NativeAssetType.CALL_TO_ACTION}>
-          <Text
+          <View
+            accessible
             accessibilityRole="button"
-            numberOfLines={2}
-            style={[
-              styles.cta,
-              { backgroundColor: theme.colors.primary, color: theme.colors.onPrimary },
-            ]}
+            // Rendered only for a loaded creative, and NativeAdView performs
+            // the activation: this View deliberately has no press handler so
+            // it cannot claim the touch responder away from the ad view, while
+            // accessible + the authored role/state keep assistive tech honest.
+            accessibilityState={{ disabled: false }}
+            style={styles.cta}
           >
-            {nativeAd.callToAction}
-          </Text>
+            <Text numberOfLines={2} style={styles.ctaText}>
+              {nativeAd.callToAction}
+            </Text>
+          </View>
         </NativeAsset>
       ) : null}
     </NativeAdView>
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, radii, spacing, type }) => ({
   card: {
     borderWidth: 1,
-    borderRadius: 12,
+    borderRadius: radii.input,
     marginTop: 24,
     marginBottom: 24,
-    paddingTop: 28,
-    paddingHorizontal: 14,
-    paddingBottom: 14,
+    padding: spacing.lg,
     gap: 8,
+    backgroundColor: colors.card,
+    borderColor: colors.border,
   },
   placeholder: {
     marginTop: 24,
     marginBottom: 24,
     borderWidth: 1,
-    borderRadius: 12,
+    borderRadius: radii.input,
     padding: 14,
-    fontSize: 11,
+    fontSize: type.caption.fontSize,
+    lineHeight: type.caption.lineHeight,
     fontWeight: '600',
     textTransform: 'uppercase',
     textAlign: 'center',
     textAlignVertical: 'top',
+    backgroundColor: colors.card,
+    borderColor: colors.border,
+    color: colors.muted,
   },
-  label: { fontSize: 11, lineHeight: 14, fontWeight: '600', textTransform: 'uppercase' },
-  headline: { fontSize: 17, lineHeight: 22, fontWeight: '700' },
-  body: { fontSize: 14, lineHeight: 20 },
+  label: {
+    fontSize: type.caption.fontSize,
+    lineHeight: type.caption.lineHeight,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    color: colors.muted,
+  },
+  headline: { fontSize: 17, lineHeight: 24, fontWeight: '700', color: colors.text },
+  body: { fontSize: 14, lineHeight: 20, color: colors.muted },
   cta: {
     minHeight: 48,
-    textAlign: 'center',
-    textAlignVertical: 'center',
-    borderRadius: 8,
+    borderRadius: radii.button,
     paddingHorizontal: 16,
     paddingVertical: 12,
-    fontSize: 15,
-    lineHeight: 20,
-    fontWeight: '700',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: colors.primary,
   },
-});
+  ctaText: {
+    fontSize: 15,
+    lineHeight: 21,
+    fontWeight: '700',
+    textAlign: 'center',
+    color: colors.onPrimary,
+  },
+}));

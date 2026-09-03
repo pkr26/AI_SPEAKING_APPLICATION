@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render } from '@testing-library/react-native';
+import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/react-native';
 import { Keyboard, Platform, StyleSheet } from 'react-native';
 import React from 'react';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -27,6 +27,15 @@ function renderWithProviders(ui: React.ReactElement) {
 }
 
 const asMock = (fn: unknown) => fn as jest.Mock;
+
+/** Minimal pressable responder payload for driving pressed-state rendering. */
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
 
 jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
   __esModule: true,
@@ -225,6 +234,17 @@ describe('bottom tab layout', () => {
     const settings = header.getByRole('button', {
       name: translateFor('en', 'header.settings'),
     });
+    // The gear's chrome lives in the themed styles, not inline numbers, and it
+    // dims while pressed.
+    expect(StyleSheet.flatten(settings.props.style)).toEqual({
+      padding: spacing.sm,
+      marginRight: spacing.xs,
+      borderRadius: 20,
+    });
+    await fireEvent(settings, 'responderGrant', responderEvent());
+    expect(StyleSheet.flatten(settings.props.style)).toMatchObject({ opacity: 0.6 });
+    await fireEvent(settings, 'responderTerminate', responderEvent());
+    await waitFor(() => expect(StyleSheet.flatten(settings.props.style).opacity).toBeUndefined());
     await fireEvent.press(settings);
     expect(asMock(ExpoRouter.router.navigate)).toHaveBeenCalledTimes(1);
     expect(asMock(ExpoRouter.router.navigate)).toHaveBeenCalledWith('/settings');
@@ -378,7 +398,7 @@ describe('bottom tab layout', () => {
     // a press cannot navigate away from the focused practice flow.
     expect(homeTab.props.accessibilityState).toEqual({ selected: false, disabled: true });
     expect(homeTab.props.accessibilityHint).toBe(translateFor('en', 'hint.finishRecordingFirst'));
-    expect(StyleSheet.flatten(homeTab.props.style)).toMatchObject({ opacity: 0.4 });
+    expect(StyleSheet.flatten(homeTab.props.style)).toMatchObject({ opacity: 0.5 });
     await fireEvent.press(homeTab);
     expect(navigate).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
@@ -597,11 +617,10 @@ describe('practice tab stack', () => {
       headerBackVisible: false,
       gestureEnabled: false,
     });
-    expect(byName.get('attempt')).toMatchObject({ title: translateFor('en', 'header.attempt') });
     expect(byName.get('help')).toMatchObject({ title: translateFor('en', 'header.help') });
   });
 
-  it('locks the practice home and feedback exits and leaves help/attempt free', async () => {
+  it('locks the practice home and feedback exits and leaves help free', async () => {
     await renderWithProviders(<PracticeTabLayout />);
     const optionsFor = (name: string) =>
       captured.capturedStackScreenProps.find((props) => props?.name === name)?.options;
@@ -615,7 +634,6 @@ describe('practice tab stack', () => {
       headerBackVisible: false,
       gestureEnabled: false,
     });
-    expect(optionsFor('attempt')).toEqual({ title: translateFor('en', 'header.attempt') });
     expect(optionsFor('help')).toEqual({ title: translateFor('en', 'header.help') });
   });
 });

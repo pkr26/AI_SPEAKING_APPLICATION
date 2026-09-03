@@ -1,4 +1,4 @@
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   KeyboardAvoidingView,
   Platform,
@@ -8,11 +8,12 @@ import {
   TextInput,
   View,
 } from 'react-native';
-import { Link, router, useNavigation } from 'expo-router';
+import { router, useFocusEffect, useNavigation } from 'expo-router';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
 import Icon from '../../components/Icon';
+import LanguageChipGrid from '../../components/LanguageChipGrid';
 import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
 import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import UiLanguagePicker from '../../components/UiLanguagePicker';
@@ -28,6 +29,7 @@ import {
 } from '../../lib/auth';
 import { useGuestLanguage } from '../../lib/guest-language';
 import { useT } from '../../lib/i18n';
+import { nameError } from '../../lib/identity-validation';
 import { NATIVE_LANGUAGE_OPTIONS } from '../../lib/language-options';
 import { createThemedStyles, useTheme } from '../../lib/theme';
 import type { NativeLanguage } from '../../lib/types';
@@ -50,10 +52,12 @@ export default function SignupScreen() {
   const [focusedField, setFocusedField] = useState<
     'name' | 'email' | 'password' | 'confirmPassword' | null
   >(null);
-  // Inline email validation waits for the learner to leave the field (NN/g:
-  // erroring mid-typing is a hostile pattern; the submit gate still checks
-  // live). A tap on the disabled submit also reveals it (see handleSignup).
+  // Inline email/name validation waits for the learner to leave the field
+  // (NN/g: erroring mid-typing is a hostile pattern; the submit gate still
+  // checks live). A tap on the disabled submit also reveals it (see
+  // handleSignup).
   const [emailTouched, setEmailTouched] = useState(false);
+  const [nameTouched, setNameTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [nativeLanguage, setNativeLanguage] = useState<NativeLanguage | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -62,6 +66,23 @@ export default function SignupScreen() {
   const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
+  // One navigation per focus: a double-tap on any exit must not push twice,
+  // and the latch re-arms when this screen regains focus after a back gesture.
+  const navigationStartedRef = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => undefined;
+    }, []),
+  );
+  const navigateOnce = (href: '/settings/privacy' | '/settings/terms' | '/login') => {
+    // A pending registration owns the screen: exits stay blocked without
+    // consuming the latch, so they work again once the request settles.
+    if (busyRef.current) return;
+    if (navigationStartedRef.current) return;
+    navigationStartedRef.current = true;
+    router.navigate(href);
+  };
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -84,9 +105,6 @@ export default function SignupScreen() {
     });
     return unsubscribe;
   }, [navigation]);
-  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
-    if (busyRef.current) event.preventDefault();
-  };
 
   const chooseLanguage = (code: NativeLanguage) => {
     setNativeLanguage(code);
@@ -95,12 +113,14 @@ export default function SignupScreen() {
 
   const passwordError = password.length > 0 ? passwordPolicyError(password, t) : null;
   const emailError = emailAddressError(email, t);
+  const nameValidationError = nameError(name, t);
   const confirmationError =
-    confirmPassword.length > 0 && confirmPassword !== password ? t('password.mismatch') : null;
+    confirmPassword.length > 0 && confirmPassword !== password ? t('cp.mismatch') : null;
 
   const canSubmit =
     name.trim().length > 0 &&
     name.trim().length <= MAX_NAME_LENGTH &&
+    nameValidationError === null &&
     email.trim().length > 0 &&
     email.trim().length <= MAX_EMAIL_LENGTH &&
     emailError === null &&
@@ -112,9 +132,10 @@ export default function SignupScreen() {
 
   const handleSignup = async () => {
     // A submit attempt (button tap or keyboard "go") counts as leaving the
-    // email field: an autofilled-but-invalid address must explain its
+    // email and name fields: an autofilled-but-invalid value must explain its
     // disabled submit instead of failing silently.
     setEmailTouched(true);
+    setNameTouched(true);
     if (!canSubmit || !nativeLanguage || busyRef.current) return;
     busyRef.current = true;
     publishNavigationLock();
@@ -173,7 +194,10 @@ export default function SignupScreen() {
                 setError(null);
               }}
               onFocus={() => setFocusedField('name')}
-              onBlur={() => setFocusedField(null)}
+              onBlur={() => {
+                setFocusedField(null);
+                setNameTouched(true);
+              }}
               placeholder={t('signup.namePlaceholder')}
               placeholderTextColor={colors.muted}
               autoCapitalize="words"
@@ -184,6 +208,11 @@ export default function SignupScreen() {
               maxLength={MAX_NAME_LENGTH}
               editable={!busy}
             />
+            {nameTouched && nameValidationError && (
+              <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
+                {nameValidationError}
+              </Text>
+            )}
 
             <Text style={styles.label}>{t('login.emailLabel')}</Text>
             <TextInput
@@ -315,47 +344,29 @@ export default function SignupScreen() {
 
             <Text style={styles.label}>{t('signup.languageLabel')}</Text>
             <Text style={styles.languageHelp}>{t('signup.languageHelp')}</Text>
-            <View
-              accessibilityRole="radiogroup"
-              accessibilityLabel={t('signup.languageLabel')}
-              style={styles.languageGrid}
-            >
-              {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
-                const selected = nativeLanguage === lang.code;
-                return (
-                  <Pressable
-                    key={lang.code}
-                    accessibilityRole="radio"
-                    accessibilityLabel={`${lang.english}, ${lang.native}`}
-                    accessibilityState={{ checked: selected, selected, disabled: busy }}
-                    disabled={busy}
-                    onPress={() => chooseLanguage(lang.code)}
-                    style={[
-                      styles.languageChip,
-                      selected && styles.languageChipSelected,
-                      busy && styles.controlDisabled,
-                    ]}
+            <LanguageChipGrid
+              options={NATIVE_LANGUAGE_OPTIONS}
+              selected={nativeLanguage}
+              onSelect={chooseLanguage}
+              disabled={busy}
+              groupAccessibilityLabel={t('signup.languageLabel')}
+              chipTestIDPrefix="signup-language"
+              accessibilityLabelFor={(option, localizedLabel) =>
+                `${localizedLabel}, ${option.native}`
+              }
+              renderOverlay={(code, selected) =>
+                selected ? (
+                  <Text
+                    testID={`signup-language-check-${code}`}
+                    accessibilityElementsHidden
+                    importantForAccessibility="no-hide-descendants"
+                    style={styles.languageCheck}
                   >
-                    {selected && (
-                      <Text
-                        testID={`signup-language-check-${lang.code}`}
-                        accessibilityElementsHidden
-                        importantForAccessibility="no-hide-descendants"
-                        style={styles.languageCheck}
-                      >
-                        ✓
-                      </Text>
-                    )}
-                    <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
-                      {lang.native}
-                    </Text>
-                    <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
-                      {lang.english}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
+                    ✓
+                  </Text>
+                ) : null
+              }
+            />
 
             {error && (
               <Text accessibilityRole="alert" style={styles.error}>
@@ -365,9 +376,15 @@ export default function SignupScreen() {
 
             {/* The wrapper receives the tap when the Button inside is disabled
                 by validation, so pressing a blocked submit reveals the email
-                error instead of failing silently; an enabled Button consumes
-                its own press. */}
-            <Pressable accessible={false} onPress={() => setEmailTouched(true)}>
+                and name errors instead of failing silently; an enabled Button
+                consumes its own press. */}
+            <Pressable
+              accessible={false}
+              onPress={() => {
+                setEmailTouched(true);
+                setNameTouched(true);
+              }}
+            >
               <Button
                 title={busy ? t('signup.submitBusy') : t('signup.submit')}
                 disabled={!canSubmit}
@@ -378,35 +395,35 @@ export default function SignupScreen() {
             </Pressable>
 
             <View style={styles.legalLinks}>
-              <Link
-                href="/settings/privacy"
+              <Pressable
+                accessibilityRole="link"
                 accessibilityState={{ disabled: busy }}
-                onPress={blockLinkWhileBusy}
-                style={styles.legalLink}
+                onPress={() => navigateOnce('/settings/privacy')}
+                style={({ pressed }) => [styles.legalLink, pressed && styles.linkPressed]}
               >
-                {t('header.privacy')}
-              </Link>
-              <Link
-                href="/settings/terms"
+                <Text style={styles.legalLinkText}>{t('header.privacy')}</Text>
+              </Pressable>
+              <Pressable
+                accessibilityRole="link"
                 accessibilityState={{ disabled: busy }}
-                onPress={blockLinkWhileBusy}
-                style={styles.legalLink}
+                onPress={() => navigateOnce('/settings/terms')}
+                style={({ pressed }) => [styles.legalLink, pressed && styles.linkPressed]}
               >
-                {t('header.terms')}
-              </Link>
+                <Text style={styles.legalLinkText}>{t('header.terms')}</Text>
+              </Pressable>
             </View>
           </View>
 
           <View style={styles.footer}>
             <Text style={styles.footerText}>{t('signup.footerPrompt')}</Text>
-            <Link
-              href="/login"
+            <Pressable
+              accessibilityRole="link"
               accessibilityState={{ disabled: busy }}
-              onPress={blockLinkWhileBusy}
-              style={styles.footerLink}
+              onPress={() => navigateOnce('/login')}
+              style={({ pressed }) => [styles.footerLink, pressed && styles.linkPressed]}
             >
-              {t('signup.footerLink')}
-            </Link>
+              <Text style={styles.footerLinkText}>{t('signup.footerLink')}</Text>
+            </Pressable>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -414,7 +431,7 @@ export default function SignupScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   flex: {
     flex: 1,
     backgroundColor: colors.background,
@@ -422,15 +439,15 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   container: {
     flexGrow: 1,
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.formMaxWidth,
     alignSelf: 'center',
   },
   brandMark: {
-    width: 56,
-    height: 56,
-    borderRadius: 28,
+    width: layout.brandMark,
+    height: layout.brandMark,
+    borderRadius: layout.brandMark / 2,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: colors.primaryLight,
@@ -438,19 +455,21 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignSelf: 'center',
   },
   brand: {
-    fontSize: 28,
+    fontSize: type.titleLg.fontSize,
+    lineHeight: type.titleLg.lineHeight,
     fontWeight: '800',
     color: colors.text,
     textAlign: 'center',
   },
   subtitle: {
     marginTop: spacing.sm,
-    fontSize: 15,
+    fontSize: type.body.fontSize,
+    lineHeight: type.body.lineHeight,
     color: colors.muted,
     textAlign: 'center',
   },
   form: {
-    marginTop: 28,
+    marginTop: spacing.xl,
     backgroundColor: colors.card,
     borderRadius: radii.card,
     padding: spacing.lg,
@@ -461,7 +480,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
-    marginBottom: 6,
+    marginBottom: spacing.sm,
     marginTop: spacing.md,
   },
   input: {
@@ -492,44 +511,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 13,
     lineHeight: 18,
   },
-  languageGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  languageChip: {
-    position: 'relative',
-    flexBasis: '47%',
-    flexGrow: 1,
-    borderWidth: 1.5,
-    // The chip fill is the form's own card color, so this border is the only
-    // thing that makes a mandatory tap target visible. `border` is a
-    // decorative hairline (1.24:1 on card in light, 1.27:1 in dark); the
-    // form-field token clears the 3:1 non-text threshold and is what the same
-    // control uses in Settings.
-    borderColor: colors.inputBorder,
-    borderRadius: radii.input,
-    paddingVertical: spacing.md,
-    alignItems: 'center',
-    backgroundColor: colors.card,
-  },
-  languageChipSelected: {
-    borderColor: colors.primary,
-    backgroundColor: colors.primaryLight,
-  },
-  languageNative: {
-    fontSize: 17,
-    fontWeight: '700',
-    color: colors.text,
-  },
-  languageEnglish: {
-    marginTop: 2,
-    fontSize: 13,
-    color: colors.muted,
-  },
-  languageTextSelected: {
-    color: colors.primary,
-  },
   languageCheck: {
     position: 'absolute',
     top: spacing.sm,
@@ -538,17 +519,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 16,
     fontWeight: '800',
   },
-  controlDisabled: {
-    opacity: 0.5,
+  linkPressed: {
+    opacity: 0.6,
   },
   error: {
-    marginTop: 14,
+    marginTop: spacing.md,
     color: colors.danger,
     fontSize: 14,
     textAlign: 'center',
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },
@@ -566,9 +547,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   legalLink: {
     minHeight: layout.minimumTarget,
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: spacing.md,
+  },
+  legalLinkText: {
+    fontSize: 15,
     color: colors.primary,
-    fontSize: 14,
     fontWeight: '600',
     textAlign: 'center',
   },
@@ -589,7 +574,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   footerLink: {
     flexShrink: 1,
     minHeight: layout.minimumTarget,
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: spacing.md,
+  },
+  footerLinkText: {
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',

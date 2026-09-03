@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../components/Button';
+import OfflineState from '../components/OfflineState';
 import { ApiError, apiFetch, userMessageForError } from '../lib/api';
 import { useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
@@ -141,12 +142,14 @@ export default function Gate() {
         </Text>
         <Button
           title={t('common.tryAgain')}
+          fullWidth
           onPress={retrySessionRestore}
           style={styles.retryButton}
         />
         <Button
           title={t('gate.resetSession')}
           variant="danger"
+          fullWidth
           onPress={resetStoredSession}
           style={styles.resetButton}
         />
@@ -164,12 +167,7 @@ export default function Gate() {
   if (!user && !meQuery.data && (reachability === 'offline' || meQuery.fetchStatus === 'paused')) {
     return (
       <FallbackScreen>
-        <Text accessibilityRole="header" style={styles.title}>
-          {t('gate.offlineTitle')}
-        </Text>
-        <Text accessibilityLiveRegion="polite" style={styles.muted}>
-          {t('gate.offlineBody')}
-        </Text>
+        <OfflineState title={t('gate.offlineTitle')} body={t('gate.offlineBody')} />
       </FallbackScreen>
     );
   }
@@ -194,6 +192,7 @@ export default function Gate() {
         </Text>
         <Button
           title={t('common.tryAgain')}
+          fullWidth
           onPress={() => void meQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
@@ -224,7 +223,7 @@ const themedStyles = createThemedStyles(({ colors, layout, spacing }) => ({
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
   },
   content: {
     width: '100%',

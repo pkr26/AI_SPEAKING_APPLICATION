@@ -83,13 +83,13 @@ describe('A1-English source copy pins for critical safety strings', () => {
   // privacy, so changes must be conscious, not incidental.
   it('pins the recorder privacy note', () => {
     expect(dictionaries.en['recorder.privacyNote']).toBe(
-      'We send your recording only after you tap Send Answer.',
+      'We send your recording only after you tap “Send answer”.',
     );
     expect(dictionaries.en['recorder.retentionNote']).toBe(
-      'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on Save this recording.',
+      'Your score, transcript, and feedback are saved either way. Audio is deleted after checking unless you turn on “Save this recording”.',
     );
     expect(dictionaries.en['recorder.saveRecordingLabel']).toBe('Save this recording');
-    expect(dictionaries.en['recorder.discard']).toBe('Discard Take');
+    expect(dictionaries.en['recorder.discard']).toBe('Discard recording');
     expect(dictionaries.en['recorder.discardBody']).toBe(
       'This unsent recording will be deleted from this device. Nothing will be sent.',
     );
@@ -196,7 +196,7 @@ describe('A1-English source copy pins for critical safety strings', () => {
     expect(dictionaries.en['replay.pendingBody']).toBe(
       'Your answer is safe. Check again to restore feedback when it is ready.',
     );
-    expect(dictionaries.en['replay.checkNow']).toBe('Check Now');
+    expect(dictionaries.en['replay.checkNow']).toBe('Check now');
   });
 
   it('pins the expired-reset-code copy to the code the mail actually carries', () => {

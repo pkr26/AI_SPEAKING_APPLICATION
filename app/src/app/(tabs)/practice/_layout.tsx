@@ -6,7 +6,7 @@ import { useTheme } from '../../../lib/theme';
 
 /**
  * The practice flow lives in its own stack inside the Practice tab so the
- * attempt/feedback/help pushes stay within the tab while each screen keeps the
+ * feedback/help pushes stay within the tab while each screen keeps the
  * exit-lock/gesture gating it already publishes through navigation.setOptions.
  */
 export default function PracticeTabLayout() {
@@ -18,6 +18,7 @@ export default function PracticeTabLayout() {
         headerTintColor: theme.colors.text,
         headerStyle: { backgroundColor: theme.colors.background },
         headerShadowVisible: false,
+        headerTitleAlign: 'center',
         contentStyle: { backgroundColor: theme.colors.background },
       }}
     >
@@ -31,7 +32,6 @@ export default function PracticeTabLayout() {
           gestureEnabled: false,
         }}
       />
-      <Stack.Screen name="attempt" options={{ title: t('header.attempt') }} />
       <Stack.Screen
         name="feedback"
         options={{

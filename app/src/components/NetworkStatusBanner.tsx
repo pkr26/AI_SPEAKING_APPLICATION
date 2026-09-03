@@ -52,7 +52,7 @@ export default function NetworkStatusBanner() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, elevation, layout, radii, spacing }) => ({
   host: {
     flexShrink: 0,
     paddingHorizontal: spacing.md,
@@ -70,10 +70,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignItems: 'center',
     justifyContent: 'center',
     gap: spacing.sm,
-    shadowColor: colors.shadow,
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 3 },
+    ...elevation.raised,
   },
   offline: {
     backgroundColor: colors.warning,
@@ -95,7 +92,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   text: {
     flexShrink: 1,
     fontSize: 15,
-    lineHeight: 20,
+    lineHeight: 21,
     fontWeight: '700',
     textAlign: 'center',
   },

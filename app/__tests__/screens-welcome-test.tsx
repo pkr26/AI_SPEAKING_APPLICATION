@@ -235,9 +235,9 @@ describe('welcome screen deep contracts', () => {
     // The brand mark badge centers above the headline.
     const brandMark = nodeChild(header.parent!, 0);
     expect(StyleSheet.flatten(brandMark.props.style)).toMatchObject({
-      width: 76,
-      height: 76,
-      borderRadius: 38,
+      width: theme.layout.brandMark,
+      height: theme.layout.brandMark,
+      borderRadius: theme.layout.brandMark / 2,
       alignItems: 'center',
       justifyContent: 'center',
       backgroundColor: lightColors.primaryLight,

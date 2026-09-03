@@ -50,7 +50,7 @@ export default function EmptyState({
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, radii, spacing, type }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   host: {
     flexGrow: 1,
     alignItems: 'center',
@@ -59,9 +59,9 @@ const themedStyles = createThemedStyles(({ colors, radii, spacing, type }) => ({
     gap: spacing.md,
   },
   markBadge: {
-    width: 72,
-    height: 72,
-    borderRadius: 36,
+    width: layout.brandMark,
+    height: layout.brandMark,
+    borderRadius: layout.brandMark / 2,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: colors.primaryLight,

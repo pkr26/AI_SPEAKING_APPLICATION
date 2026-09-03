@@ -2,7 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 import React from 'react';
-import { Alert, Platform, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Alert, Platform, StyleSheet } from 'react-native';
 
 import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
@@ -239,7 +239,7 @@ const FIELD_LABEL_STYLE: SemanticStyle = {
   fontSize: 14,
   fontWeight: '600',
   color: colors.text,
-  marginBottom: 6,
+  marginBottom: spacing.sm,
   marginTop: spacing.md,
 };
 
@@ -275,17 +275,24 @@ const INPUT_ACTION_STYLE: SemanticStyle = {
 
 /** Inline, per-field validation copy. */
 const FIELD_ERROR_STYLE: SemanticStyle = {
-  marginTop: 6,
+  marginTop: spacing.sm,
   color: colors.danger,
   fontSize: 13,
 };
 
 /** Form-level failure copy announced as an alert. */
 const FORM_ERROR_STYLE: SemanticStyle = {
-  marginTop: 14,
+  marginTop: spacing.md,
   color: colors.danger,
   fontSize: 14,
   textAlign: 'center',
+};
+
+/** Inline success confirmation replacing the former modal Alert. */
+const SAVED_NOTE_STYLE: SemanticStyle = {
+  marginTop: spacing.sm,
+  color: colors.success,
+  fontSize: 13,
 };
 
 /**
@@ -552,7 +559,7 @@ describe('change password screen', () => {
       flex: 1,
       backgroundColor: colors.background,
     });
-    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: spacing.xl });
+    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: layout.screenPadding });
     expect(flattenedStyle(parentOf(screen.getByText(t('cp.currentLabel'))))).toEqual(
       FORM_CARD_STYLE,
     );
@@ -797,7 +804,10 @@ describe('change password screen', () => {
     expect(updateButton().props.accessibilityState.disabled).toBe(true);
   });
 
-  it('changes the password and navigates back after confirmation', async () => {
+  it('changes the password, confirms inline, and navigates back once on Done', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibility')
+      .mockImplementation(() => undefined);
     await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
@@ -805,16 +815,73 @@ describe('change password screen', () => {
     await waitFor(() =>
       expect(mockAuthValue.changePassword).toHaveBeenCalledWith('oldpass1', 'newpass1'),
     );
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(
-        t('cp.updatedTitle'),
-        t('cp.updatedBody'),
-        expect.any(Array),
-      ),
-    );
+    // Success is reversible, so the app-wide rule is an inline note, never a
+    // modal Alert.
+    expect(alertSpy).not.toHaveBeenCalled();
+    const note = await screen.findByText(t('cp.updatedBody'));
+    // One announce mechanism: the explicit announcement (no live region, which
+    // would double-speak on Android alongside the announce call).
+    expect(note.props.accessibilityLiveRegion).toBeUndefined();
+    expect(flattenedStyle(note)).toEqual(SAVED_NOTE_STYLE);
+    expect(announceSpy).toHaveBeenCalledWith(t('cp.updatedBody'));
 
-    await pressAlertButton(t('common.ok'));
-    expect(mockRouter.back).toHaveBeenCalled();
+    // While saved, the credential fields and their toggles stay locked.
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.editable).toBe(false);
+    expect(screen.getByLabelText(t('cp.newLabel')).props.editable).toBe(false);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.editable).toBe(false);
+    expect(
+      screen.getByRole('button', {
+        name: `${t('cp.currentLabel')}: ${t('common.showPassword')}`,
+      }).props.accessibilityState,
+    ).toEqual({ disabled: true });
+
+    const done = screen.getByRole('button', { name: t('cp.done') });
+    expect(done.props.accessibilityState).toEqual({ disabled: false, busy: false });
+    await fireEvent.press(done);
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+    // The one-shot ref guard absorbs a same-frame double press of Done.
+    await fireEvent.press(done);
+    expect(mockRouter.back).toHaveBeenCalledTimes(1);
+    announceSpy.mockRestore();
+  });
+
+  it('shows the live strength meter under the new-password field', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+    expect(screen.queryByTestId('change-password-strength')).toBeNull();
+
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
+      'newpass1',
+    );
+    const meter = screen.getByTestId('change-password-strength');
+    // 'newpass1' meets the policy but stays a fair tier: two filled segments.
+    expect(screen.getAllByTestId('change-password-strength-segment-on')).toHaveLength(2);
+    expect(screen.getAllByTestId('change-password-strength-segment-off')).toHaveLength(1);
+    expect(meter.props.accessibilityLiveRegion).toBe('polite');
+    // The meter sits directly under the new-password row, inside the same card.
+    const newPasswordInput = screen.getByLabelText(t('cp.newLabel'));
+    expect(parentOf(meter)).toBe(parentOf(parentOf(newPasswordInput)));
+
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
+      'short',
+    );
+    expect(screen.getByTestId('change-password-strength-segment-on')).toBeTruthy();
+  });
+
+  it('clears the summary error as soon as any field is edited', async () => {
+    mockAuthValue.changePassword = jest.fn().mockRejectedValue(new ApiError(401, 'unauthorized'));
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    await fireEvent.press(updateButton());
+
+    expect(await screen.findByText(t('cp.wrongCurrent'))).toBeTruthy();
+
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('cp.currentPlaceholder')),
+      'otherpass1',
+    );
+    expect(screen.queryByText(t('cp.wrongCurrent'))).toBeNull();
   });
 
   it('preserves opaque whitespace and accepts a legacy current password', async () => {
@@ -869,7 +936,9 @@ describe('change password screen', () => {
         await pressPromise;
       }
     }
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled());
+    // The saved note replaces the former success Alert.
+    expect(await screen.findByText(t('cp.updatedBody'))).toBeTruthy();
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it('locks only back navigation for exactly the lifetime of a password change', async () => {
@@ -954,16 +1023,15 @@ describe('change password screen', () => {
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
 
-  it('makes the password-success Alert action inert once its screen is gone', async () => {
+  it('keeps the saved note inert once its screen is gone', async () => {
     const rendered = await renderScreen(<ChangePasswordScreen />);
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     await fireEvent.press(updateButton());
-    await waitFor(() => expect(alertSpy).toHaveBeenCalled());
-    const confirm = alertButtons().find((button) => button.text === t('common.ok'))?.onPress;
-    expect(confirm).toEqual(expect.any(Function));
+    const done = await screen.findByRole('button', { name: t('cp.done') });
+    const pressDone = committedPressHandler(done);
 
     await rendered.unmount();
-    await act(async () => confirm!());
+    await act(async () => pressDone());
 
     expect(mockRouter.back).not.toHaveBeenCalled();
   });
@@ -971,8 +1039,8 @@ describe('change password screen', () => {
   it('changes the password once when Update is pressed twice before a re-render', async () => {
     // canSubmit reads the render-time busy flag, so a second press landing in
     // the same committed render still passes it. The second request would fail
-    // in the auth transition guard and paint that error under the success
-    // alert while re-arming the button mid-flight.
+    // in the auth transition guard and paint that error over the saved note
+    // while re-arming the button mid-flight.
     const change = deferred<void>();
     mockAuthValue.changePassword = jest.fn(() => change.promise);
     await renderScreen(<ChangePasswordScreen />);
@@ -997,13 +1065,8 @@ describe('change password screen', () => {
     });
 
     await act(async () => change.resolve(undefined));
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(
-        t('cp.updatedTitle'),
-        t('cp.updatedBody'),
-        expect.any(Array),
-      ),
-    );
+    expect(await screen.findByText(t('cp.updatedBody'))).toBeTruthy();
+    expect(alertSpy).not.toHaveBeenCalled();
   });
 
   it('shows a credential error on 401', async () => {
@@ -1049,13 +1112,8 @@ describe('change password screen', () => {
     expect(updateButton().props.accessibilityState).toEqual({ disabled: false, busy: false });
 
     await fireEvent.press(updateButton());
-    await waitFor(() =>
-      expect(alertSpy).toHaveBeenCalledWith(
-        t('cp.updatedTitle'),
-        expect.any(String),
-        expect.any(Array),
-      ),
-    );
+    expect(await screen.findByText(t('cp.updatedBody'))).toBeTruthy();
+    expect(alertSpy).not.toHaveBeenCalled();
     expect(mockAuthValue.changePassword).toHaveBeenCalledTimes(2);
   });
 });
@@ -1101,7 +1159,7 @@ describe('delete account screen', () => {
     expect(flattenedStyle(warningBody)).toEqual({
       marginTop: spacing.sm,
       fontSize: 15,
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
     expect(flattenedStyle(parentOf(warningBody))).toEqual({
@@ -1152,7 +1210,7 @@ describe('delete account screen', () => {
       flex: 1,
       backgroundColor: colors.background,
     });
-    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: spacing.xl });
+    expect(scrollContentStyle()).toEqual({ flexGrow: 1, padding: layout.screenPadding });
     const passwordLabel = screen.getByText(t('da.passwordLabel'));
     expect(flattenedStyle(parentOf(passwordLabel))).toEqual(FORM_CARD_STYLE);
     expect(flattenedStyle(passwordLabel)).toEqual(FIELD_LABEL_STYLE);
@@ -1740,7 +1798,7 @@ function expectLegalLayout(paragraphKeys: readonly MessageKey[]): void {
     expect(flattenedStyle(screen.getByText(t(key)))).toEqual({
       marginTop: spacing.lg,
       fontSize: 16,
-      lineHeight: 24,
+      lineHeight: 23,
       color: colors.text,
     });
   }

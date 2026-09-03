@@ -58,7 +58,14 @@
         }
       ],
       "react-native-google-mobile-ads",
-      "expo-build-properties"
-    ]
+      "expo-build-properties",
+      "expo-localization"
+    ],
+    "locales": {
+      "te": "./locales/te.json",
+      "hi": "./locales/hi.json",
+      "es": "./locales/es.json",
+      "zh": "./locales/zh.json"
+    }
   }
 }

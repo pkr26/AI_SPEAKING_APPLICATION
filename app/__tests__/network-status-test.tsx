@@ -12,7 +12,7 @@ import {
   NetworkStatusBridge,
   resetNetworkStatusModuleForTests,
 } from '../src/lib/network-status';
-import { darkColors, spacing } from '../src/lib/theme';
+import { darkColors, elevations, spacing } from '../src/lib/theme';
 
 const asMock = (value: unknown) => value as jest.Mock;
 
@@ -115,6 +115,12 @@ it('subscribes before sampling, ignores a stale sample, and announces reconnect 
   expect(screen.getByRole('alert')).toHaveTextContent(offlineMessage);
   expect(screen.getByRole('alert').props.accessibilityLiveRegion).toBe('assertive');
   expect(flattenedStyle(screen.getByRole('alert')).backgroundColor).toBe(darkColors.warning);
+  // The floating banner consumes the scheme-aware raised elevation preset.
+  expect(flattenedStyle(screen.getByRole('alert'))).toMatchObject(elevations.dark.raised);
+  expect(flattenedStyle(screen.getByText(offlineMessage))).toMatchObject({
+    fontSize: 15,
+    lineHeight: 21,
+  });
   expect(flattenedStyle(statusDot()).backgroundColor).toBe(darkColors.onWarning);
   expect(flattenedStyle(screen.getByText(offlineMessage)).color).toBe(darkColors.onWarning);
   const bannerHost = screen.getByTestId('network-status-banner');

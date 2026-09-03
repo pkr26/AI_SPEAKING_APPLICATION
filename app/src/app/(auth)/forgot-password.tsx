@@ -1,6 +1,13 @@
-import { Link, router, useNavigation } from 'expo-router';
-import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { KeyboardAvoidingView, Platform, ScrollView, Text, TextInput } from 'react-native';
+import { router, useFocusEffect, useNavigation } from 'expo-router';
+import React, { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import {
+  KeyboardAvoidingView,
+  Platform,
+  Pressable,
+  ScrollView,
+  Text,
+  TextInput,
+} from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
 import Button from '../../components/Button';
@@ -26,11 +33,35 @@ export default function ForgotPasswordScreen() {
   const { colors } = theme;
   const [email, setEmail] = useState('');
   const [emailFocused, setEmailFocused] = useState(false);
+  // Inline validation waits for the learner to leave the field (NN/g: erroring
+  // mid-typing is a hostile pattern; the submit gate still checks live).
+  const [emailTouched, setEmailTouched] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sentEmail, setSentEmail] = useState<string | null>(null);
+  // Bumped on every accepted send/resend so the neutral note re-presents (and
+  // its polite live region re-announces) instead of sitting stale after a
+  // resend that otherwise changed nothing on screen.
+  const [sentNoteKey, setSentNoteKey] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const busyRef = useRef(false);
   const mountedRef = useRef(true);
+  // One navigation per focus: a double-tap on any exit must not push twice,
+  // and the latch re-arms when this screen regains focus after a back gesture.
+  const navigationStartedRef = useRef(false);
+  useFocusEffect(
+    useCallback(() => {
+      navigationStartedRef.current = false;
+      return () => undefined;
+    }, []),
+  );
+  const navigateOnce = (href: '/login') => {
+    // A pending request owns the screen: exits stay blocked without consuming
+    // the latch, so they work again once the request settles.
+    if (busyRef.current) return;
+    if (navigationStartedRef.current) return;
+    navigationStartedRef.current = true;
+    router.navigate(href);
+  };
 
   useLayoutEffect(() => {
     mountedRef.current = true;
@@ -53,9 +84,6 @@ export default function ForgotPasswordScreen() {
     });
     return unsubscribe;
   }, [navigation]);
-  const blockLinkWhileBusy = (event: { preventDefault: () => void }) => {
-    if (busyRef.current) event.preventDefault();
-  };
 
   const trimmedEmail = email.trim();
   const emailError = emailAddressError(email, t);
@@ -66,6 +94,10 @@ export default function ForgotPasswordScreen() {
     !busy;
 
   const handleSubmit = async () => {
+    // A submit attempt (button tap or keyboard "go") counts as leaving the
+    // email field: an invalid address must explain its disabled submit instead
+    // of failing silently.
+    setEmailTouched(true);
     if (!canSubmit || busyRef.current) return;
     const requestedEmail = trimmedEmail;
     busyRef.current = true;
@@ -77,7 +109,10 @@ export default function ForgotPasswordScreen() {
       // The field remains editable while the request is in flight. Pin the
       // address that actually received the code so a late edit cannot prefill
       // the next step with a different account.
-      if (mountedRef.current) setSentEmail(requestedEmail);
+      if (mountedRef.current) {
+        setSentEmail(requestedEmail);
+        setSentNoteKey((key) => key + 1);
+      }
     } catch (err) {
       // Only transport/rate-limit failures surface; the 204 contract itself
       // never distinguishes existing from unknown accounts.
@@ -101,6 +136,10 @@ export default function ForgotPasswordScreen() {
       // Same uniform endpoint and pinned address as the first request: this
       // remains non-enumerating while recovering from transient mail delivery.
       await apiForgotPassword(sentEmail);
+      // A successful resend mirrors the first send: the neutral note is
+      // re-presented (keyed remount re-announces the polite live region) so
+      // the learner sees the confirmation again.
+      if (mountedRef.current) setSentNoteKey((key) => key + 1);
     } catch (err) {
       if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));
     } finally {
@@ -123,7 +162,7 @@ export default function ForgotPasswordScreen() {
           <Text accessibilityRole="header" style={styles.title}>
             {t('reset.sentTitle')}
           </Text>
-          <Text accessibilityLiveRegion="polite" style={styles.subtitle}>
+          <Text key={sentNoteKey} accessibilityLiveRegion="polite" style={styles.subtitle}>
             {t('reset.sentBody')}
           </Text>
           <UiLanguagePicker
@@ -154,14 +193,14 @@ export default function ForgotPasswordScreen() {
               {error}
             </Text>
           )}
-          <Link
-            href="/login"
+          <Pressable
+            accessibilityRole="link"
             accessibilityState={{ disabled: busy }}
-            onPress={blockLinkWhileBusy}
-            style={styles.footerLink}
+            onPress={() => navigateOnce('/login')}
+            style={({ pressed }) => [styles.footerLink, pressed && styles.linkPressed]}
           >
-            {t('reset.backToLogin')}
-          </Link>
+            <Text style={styles.footerLinkText}>{t('reset.backToLogin')}</Text>
+          </Pressable>
         </ScrollView>
       </SafeAreaView>
     );
@@ -190,9 +229,15 @@ export default function ForgotPasswordScreen() {
             accessibilityLabel={t('login.emailLabel')}
             style={[styles.input, emailFocused && styles.inputFocused]}
             value={email}
-            onChangeText={setEmail}
+            onChangeText={(value) => {
+              setEmail(value);
+              setError(null);
+            }}
             onFocus={() => setEmailFocused(true)}
-            onBlur={() => setEmailFocused(false)}
+            onBlur={() => {
+              setEmailFocused(false);
+              setEmailTouched(true);
+            }}
             placeholder={t('login.emailPlaceholder')}
             placeholderTextColor={colors.muted}
             autoCapitalize="none"
@@ -204,7 +249,7 @@ export default function ForgotPasswordScreen() {
             onSubmitEditing={() => void handleSubmit()}
             maxLength={MAX_EMAIL_LENGTH}
           />
-          {emailError && (
+          {emailTouched && emailError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {emailError}
             </Text>
@@ -224,21 +269,21 @@ export default function ForgotPasswordScreen() {
             style={styles.submitButton}
           />
 
-          <Link
-            href="/login"
+          <Pressable
+            accessibilityRole="link"
             accessibilityState={{ disabled: busy }}
-            onPress={blockLinkWhileBusy}
-            style={styles.footerLink}
+            onPress={() => navigateOnce('/login')}
+            style={({ pressed }) => [styles.footerLink, pressed && styles.linkPressed]}
           >
-            {t('reset.backToLogin')}
-          </Link>
+            <Text style={styles.footerLinkText}>{t('reset.backToLogin')}</Text>
+          </Pressable>
         </ScrollView>
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   flex: {
     flex: 1,
     backgroundColor: colors.background,
@@ -246,21 +291,22 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   container: {
     flexGrow: 1,
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.formMaxWidth,
     alignSelf: 'center',
   },
   title: {
-    fontSize: 26,
+    fontSize: type.titleLg.fontSize,
+    lineHeight: type.titleLg.lineHeight,
     fontWeight: '800',
     color: colors.text,
     textAlign: 'center',
   },
   subtitle: {
     marginTop: spacing.sm,
-    fontSize: 16,
-    lineHeight: 23,
+    fontSize: type.body.fontSize,
+    lineHeight: type.body.lineHeight,
     color: colors.muted,
     textAlign: 'center',
   },
@@ -268,8 +314,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
-    marginBottom: 6,
-    marginTop: spacing.xl,
+    marginBottom: spacing.sm,
+    marginTop: spacing.md,
   },
   input: {
     borderWidth: 1,
@@ -285,13 +331,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     borderColor: colors.primary,
   },
   error: {
-    marginTop: 14,
+    marginTop: spacing.md,
     color: colors.danger,
     fontSize: 14,
     textAlign: 'center',
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },
@@ -304,10 +350,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   footerLink: {
     marginTop: spacing.xl,
     minHeight: layout.minimumTarget,
+    alignItems: 'center',
+    justifyContent: 'center',
     paddingVertical: spacing.md,
+  },
+  footerLinkText: {
     fontSize: 15,
     color: colors.primary,
     fontWeight: '600',
     textAlign: 'center',
+  },
+  linkPressed: {
+    opacity: 0.6,
   },
 }));

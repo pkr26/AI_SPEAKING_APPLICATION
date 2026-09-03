@@ -1,6 +1,7 @@
 import React from 'react';
-import { Pressable, Text, View } from 'react-native';
+import { Text, View } from 'react-native';
 
+import LanguageChipGrid from './LanguageChipGrid';
 import { useT } from '../lib/i18n';
 import { UI_LANGUAGE_OPTIONS } from '../lib/language-options';
 import { createThemedStyles, useTheme } from '../lib/theme';
@@ -31,45 +32,24 @@ export default function UiLanguagePicker({
       <Text nativeID="ui-language-help" style={styles.help}>
         {t('language.appHelp')}
       </Text>
-      <View
-        accessibilityRole="radiogroup"
-        accessibilityLabel={t('language.appLabel')}
-        accessibilityHint={t('language.appHelp')}
-        style={styles.grid}
-      >
-        {UI_LANGUAGE_OPTIONS.map((option) => {
-          const selected = value === option.code;
-          const localizedName = t(`language.${option.code}`);
+      <LanguageChipGrid
+        options={UI_LANGUAGE_OPTIONS}
+        selected={value}
+        onSelect={onChange}
+        disabled={disabled}
+        groupAccessibilityLabel={t('language.appLabel')}
+        groupAccessibilityHint={t('language.appHelp')}
+        gridMarginTop={styles.gridWrap.marginTop}
+        chipFlexBasis="30%"
+        chipTestIDPrefix="ui-language"
+        accessibilityLabelFor={(option, localizedLabel) => {
           const spokenName =
-            localizedName === option.native ? localizedName : `${localizedName}, ${option.native}`;
-          return (
-            <Pressable
-              key={option.code}
-              testID={`ui-language-${option.code}`}
-              accessibilityRole="radio"
-              accessibilityLabel={`${t('language.appLabel')}: ${spokenName}`}
-              accessibilityState={{ checked: selected, selected, disabled }}
-              disabled={disabled}
-              onPress={() => onChange(option.code)}
-              style={({ pressed }) => [
-                styles.chip,
-                selected && styles.chipSelected,
-                pressed && !disabled && styles.chipPressed,
-                disabled && styles.disabled,
-              ]}
-            >
-              <Text style={[styles.nativeName, selected && styles.selectedText]}>
-                {option.native}
-              </Text>
-              {localizedName !== option.native && (
-                <Text style={[styles.englishName, selected && styles.selectedText]}>
-                  {localizedName}
-                </Text>
-              )}
-            </Pressable>
-          );
-        })}
-      </View>
+            localizedLabel === option.native
+              ? localizedLabel
+              : `${localizedLabel}, ${option.native}`;
+          return `${t('language.appLabel')}: ${spokenName}`;
+        }}
+      />
       {error && (
         <Text accessibilityRole="alert" style={styles.error}>
           {error}
@@ -79,7 +59,7 @@ export default function UiLanguagePicker({
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, spacing }) => ({
   container: {
     marginTop: spacing.lg,
     width: '100%',
@@ -97,52 +77,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     lineHeight: 18,
     textAlign: 'center',
   },
-  grid: {
+  gridWrap: {
     marginTop: spacing.sm,
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    justifyContent: 'center',
-    gap: spacing.sm,
-  },
-  chip: {
-    minHeight: layout.minimumTarget,
-    minWidth: layout.minimumTarget,
-    flexGrow: 1,
-    flexBasis: '30%',
-    maxWidth: '48%',
-    alignItems: 'center',
-    justifyContent: 'center',
-    borderWidth: 1.5,
-    borderColor: colors.inputBorder,
-    borderRadius: radii.input,
-    backgroundColor: colors.card,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: spacing.sm,
-  },
-  chipSelected: {
-    borderColor: colors.primary,
-    backgroundColor: colors.primaryLight,
-  },
-  chipPressed: {
-    borderColor: colors.primary,
-  },
-  nativeName: {
-    color: colors.text,
-    fontSize: 14,
-    fontWeight: '700',
-    textAlign: 'center',
-  },
-  englishName: {
-    marginTop: 1,
-    color: colors.muted,
-    fontSize: 11,
-    textAlign: 'center',
-  },
-  selectedText: {
-    color: colors.primary,
-  },
-  disabled: {
-    opacity: 0.5,
   },
   error: {
     marginTop: spacing.sm,

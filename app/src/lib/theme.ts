@@ -62,6 +62,11 @@ export interface ThemeColors {
   onAccent: string;
   /** Shadow ink for elevated controls. */
   shadow: string;
+  /**
+   * Full-screen scrim behind modal overlays. Kept as a token so the one
+   * overlay in the app (ClientUpgradeModal) cannot drift from the palette.
+   */
+  scrim: string;
 }
 
 /**
@@ -104,6 +109,7 @@ export const lightColors: ThemeColors = {
   accentLight: '#FFFBEB',
   onAccent: '#FFFFFF',
   shadow: '#000000',
+  scrim: 'rgba(0, 0, 0, 0.66)',
 };
 
 /**
@@ -147,6 +153,7 @@ export const darkColors: ThemeColors = {
   accentLight: '#33240A',
   onAccent: '#451A03',
   shadow: '#000000',
+  scrim: 'rgba(0, 0, 0, 0.66)',
 };
 
 /**
@@ -164,6 +171,10 @@ export const layout = {
   // cross-platform target makes compact controls easier for motor-impaired
   // learners without branching every component by platform.
   minimumTarget: 48,
+  /** One diameter for every brand-mark circle (auth mic badges, empty-state icon). */
+  brandMark: 68,
+  /** Diameter of the diagnostic/feedback outcome badge circles. */
+  outcomeBadge: 84,
 } as const;
 
 export const radii = {

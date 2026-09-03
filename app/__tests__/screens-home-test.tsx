@@ -997,11 +997,11 @@ describe('home screen presentation', () => {
       flexShrink: 1,
       flexDirection: 'row',
       alignItems: 'center',
-      gap: 6,
+      gap: spacing.xs,
       backgroundColor: colors.primaryLight,
       borderRadius: radii.pill,
-      paddingVertical: 6,
-      paddingHorizontal: 14,
+      paddingVertical: spacing.xs,
+      paddingHorizontal: spacing.md,
       marginTop: spacing.md,
     });
   });
@@ -1076,7 +1076,7 @@ describe('home screen presentation', () => {
     expect(flattenedStyle(screen.getByText(t('summary.attempts', { count: 5 })))).toEqual({
       marginTop: spacing.sm,
       fontSize: 15,
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
     // The dismiss control is the shared quiet Button: primary text, no fill.

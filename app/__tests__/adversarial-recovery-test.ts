@@ -923,8 +923,9 @@ describe('adversarial recovery audit', () => {
       expect(isUuid('550e8400-e29b-41d4-7716-446655440000')).toBe(false);
     });
 
-    // Literal mirror of the routed gate in src/app/practice/attempt.tsx; the
-    // screen itself is deliberately not imported here.
+    // Literal mirror of the attemptsUsed param rule the help route still
+    // validates (the former attempt screen was removed; the param contract
+    // itself is deliberately not imported from the screen).
     const ROUTED_ATTEMPTS_USED_PATTERN = /^[0-2]$/;
     const routedAttemptsUsed = (value: string | undefined): number | null =>
       value !== undefined && ROUTED_ATTEMPTS_USED_PATTERN.test(value) ? Number(value) : null;

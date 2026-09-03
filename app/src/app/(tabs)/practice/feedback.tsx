@@ -13,6 +13,7 @@ import WordTaggedTranscript from '../../../components/WordTaggedTranscript';
 import ScoreRing from '../../../components/ScoreRing';
 import { useAuth } from '../../../lib/auth';
 import { useT } from '../../../lib/i18n';
+import { NATIVE_LANGUAGE_LOCALES } from '../../../lib/language-options';
 import { acknowledgePendingAssessmentFeedback } from '../../../lib/pending-assessment';
 import { setPracticeExitLocked } from '../../../lib/practice-exit-lock';
 import { usePracticeFlow } from '../../../lib/practice-flow';
@@ -22,7 +23,6 @@ import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_MAX_ATTEMPTS,
   PRACTICE_PASS_SCORE,
-  type NativeLanguage,
   type PracticeOutcome,
   type Question,
 } from '../../../lib/types';
@@ -45,13 +45,6 @@ interface FeedbackCard {
   question?: Question;
   requestId?: string;
 }
-
-const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
 
 /** Per-variant outcome art: icon, its ink, and the tint behind the header. */
 interface OutcomeArt {
@@ -79,20 +72,14 @@ const OUTCOME_ART: Record<Variant, OutcomeArt> = {
  */
 function OutcomeBadge({ art, testID }: { art: OutcomeArt; testID: string }) {
   const theme = useTheme();
+  const styles = themedStyles(theme);
   const ink = theme.colors[art.ink];
   return (
     <View
       accessibilityElementsHidden
       importantForAccessibility="no-hide-descendants"
       testID={testID}
-      style={{
-        width: 84,
-        height: 84,
-        borderRadius: 42,
-        alignItems: 'center',
-        justifyContent: 'center',
-        backgroundColor: ink,
-      }}
+      style={[styles.outcomeBadge, { backgroundColor: ink }]}
     >
       <Icon name={art.icon} size={38} color={theme.colors.card} strokeWidth={2.1} />
     </View>
@@ -365,7 +352,7 @@ export default function FeedbackScreen() {
     runOnce(card, () => {
       clearFeedback();
       router.dismissTo('/practice');
-      router.push({
+      router.navigate({
         pathname: '/practice/help',
         params: {
           questionId,
@@ -389,7 +376,9 @@ export default function FeedbackScreen() {
     } else if (variant) {
       goToNextQuestion();
     } else {
-      router.replace('/practice');
+      // Same dismissTo pattern as the variant actions: a cold-start replay
+      // may leave no Practice route underneath to pop.
+      router.dismissTo('/practice');
     }
     return true;
   });
@@ -405,7 +394,7 @@ export default function FeedbackScreen() {
           title={t('common.backToPractice')}
           fullWidth
           size="md"
-          onPress={() => router.replace('/practice')}
+          onPress={() => router.dismissTo('/practice')}
           style={styles.noResultButton}
         />
       </ScrollView>
@@ -609,9 +598,7 @@ export default function FeedbackScreen() {
                 quoted
                 wordScores={isNativeOutcome(result) ? undefined : result.wordScores}
                 accessibilityLanguage={
-                  isNativeOutcome(result)
-                    ? NATIVE_ACCESSIBILITY_LANGUAGES[result.nativeLanguage]
-                    : 'en-US'
+                  isNativeOutcome(result) ? NATIVE_LANGUAGE_LOCALES[result.nativeLanguage] : 'en-US'
                 }
                 testID="feedback-word-transcript"
               />
@@ -673,6 +660,7 @@ export default function FeedbackScreen() {
               fullWidth
               size="lg"
               disabled={cardActionBusy}
+              loading={cardActionBusy}
               onPress={retry}
             />
           )}
@@ -687,6 +675,7 @@ export default function FeedbackScreen() {
               fullWidth
               size="lg"
               disabled={cardActionBusy}
+              loading={cardActionBusy}
               onPress={goToNextQuestion}
             />
           )}
@@ -717,6 +706,7 @@ export default function FeedbackScreen() {
               fullWidth
               size="lg"
               disabled={cardActionBusy}
+              loading={cardActionBusy}
               onPress={backToPractice}
             />
           )}
@@ -736,6 +726,7 @@ export default function FeedbackScreen() {
                 fullWidth
                 size="md"
                 disabled={cardActionBusy}
+                loading={cardActionBusy}
                 onPress={openHelp}
               />
             </View>
@@ -746,7 +737,7 @@ export default function FeedbackScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -755,14 +746,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
     backgroundColor: colors.background,
   },
   content: {
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     alignItems: 'center',
     width: '100%',
     maxWidth: layout.contentMaxWidth,
@@ -787,10 +778,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   panel_primary: { backgroundColor: colors.primaryLight },
   title: {
     marginTop: spacing.md,
-    fontSize: 24,
-    lineHeight: 30,
+    fontSize: type.title.fontSize,
+    lineHeight: type.title.lineHeight,
     fontWeight: '800',
     textAlign: 'center',
+    // The no-result fallback renders this style with no inline variant ink;
+    // without a base color the headline is invisible on the dark background.
+    color: colors.text,
   },
   subtitle: {
     marginTop: spacing.sm,
@@ -807,15 +801,22 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.primary,
     textAlign: 'center',
   },
+  outcomeBadge: {
+    width: layout.outcomeBadge,
+    height: layout.outcomeBadge,
+    borderRadius: layout.outcomeBadge / 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   attemptLine: {
     marginTop: spacing.md,
-    paddingVertical: spacing.xs,
-    paddingHorizontal: spacing.md,
+    paddingVertical: 3,
+    paddingHorizontal: 10,
     borderRadius: radii.badge,
     backgroundColor: colors.primaryLight,
     color: colors.primary,
-    fontSize: 14,
-    fontWeight: '800',
+    fontSize: 12,
+    fontWeight: '700',
   },
   card: {
     marginTop: spacing.xl,
@@ -842,14 +843,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   feedbackWord: {
     marginTop: spacing.xs,
     color: colors.primary,
-    fontSize: 24,
+    fontSize: type.headline.fontSize,
     fontWeight: '800',
   },
   feedbackQuestion: {
     marginTop: spacing.xs,
     color: colors.text,
     fontSize: 17,
-    lineHeight: 25,
+    lineHeight: 24,
   },
   transcriptSection: {
     marginTop: spacing.lg,
@@ -872,7 +873,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontWeight: '800',
     color: colors.text,
     textTransform: 'uppercase',
-    letterSpacing: 0.6,
+    letterSpacing: 0.8,
   },
   transcript: {
     marginTop: spacing.sm,
@@ -890,14 +891,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   modelAnswer: {
     marginTop: spacing.xs,
     fontSize: 16,
-    lineHeight: 24,
+    lineHeight: 23,
     color: colors.primary,
     fontWeight: '600',
   },
   body: {
     marginTop: spacing.xs,
     fontSize: 16,
-    lineHeight: 24,
+    lineHeight: 23,
     color: colors.text,
   },
   noResultButton: {
@@ -922,7 +923,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     marginBottom: spacing.md,
     color: colors.danger,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     textAlign: 'center',
   },
 }));

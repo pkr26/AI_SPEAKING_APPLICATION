@@ -74,6 +74,8 @@ export default function PracticeScreen() {
   const recorderExitLockedRef = useRef(false);
   const [skipBusy, setSkipBusy] = useState(false);
   const skipBusyRef = useRef(false);
+  /** True while the skip confirmation alert is showing (Android queues dialogs). */
+  const skipAlertOpenRef = useRef(false);
   // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
   // rendered inline next to the recorder instead of only in a passing alert.
   const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
@@ -144,6 +146,10 @@ export default function PracticeScreen() {
     () => ['practice-question', user?.id, user?.cefrLevel] as const,
     [user?.cefrLevel, user?.id],
   );
+  // Deliberately no pull-to-refresh: the served question is durable for its
+  // practice cycle (staleTime Infinity below), and this screen's focus
+  // revalidation already reconciles cross-device staleness. A manual pull
+  // could otherwise replace the question underneath an active Recorder take.
   const questionQuery = useQuery({
     queryKey: questionQueryKey,
     queryFn: async ({ signal }) =>
@@ -309,8 +315,12 @@ export default function PracticeScreen() {
   // recording, upload, or recovery is active — leaving then would let blur
   // cleanup discard the take. Hardware back, header back, the iOS swipe
   // gesture, and (via the shared exit lock) the other tabs and the Home
-  // header Settings action all follow the same lock.
-  useHardwareBack(navigationLockedNow);
+  // header Settings action all follow the same lock. While unlocked the press
+  // is consumed only when there is something to pop to (the entry gate sits
+  // beneath the signed-in stack): with nothing left the press falls through
+  // to Android's own "back at the task root leaves the app" behavior instead
+  // of being swallowed.
+  useHardwareBack(() => navigationLockedNow() || router.canGoBack());
   useFocusEffect(
     useCallback(() => {
       focusedRef.current = true;
@@ -492,8 +502,20 @@ export default function PracticeScreen() {
     return false;
   };
 
-  const handleSkip = async () => {
+  const skipFenced = () =>
+    !question ||
+    !cycleId ||
+    !recorderOwnsWork(recorderOwner) ||
+    navigationStartedRef.current ||
+    skipBusyRef.current ||
+    recorderLockedRef.current;
+
+  const performSkip = async () => {
     const owner = recorderOwner;
+    // Every guard is re-checked here — spelled out rather than shared with
+    // skipFenced so TypeScript can narrow the served question and cycle: the
+    // confirmation alert below leaves a backgrounding-sized gap before this
+    // body runs.
     if (
       !question ||
       !cycleId ||
@@ -558,6 +580,30 @@ export default function PracticeScreen() {
     }
   };
 
+  /** Skipping parks the served word for later revision — an irreversible
+   * step for the cycle, so it must be confirmed explicitly. The same guard
+   * set fences the alert itself, and the confirm press re-runs every guard
+   * inside performSkip after the alert gap. */
+  const handleSkip = () => {
+    if (skipFenced() || skipAlertOpenRef.current) return;
+    // Android queues Alert dialogs: without this latch a same-frame double
+    // tap could stack two confirms and park a second, newly served word.
+    skipAlertOpenRef.current = true;
+    const closeAlert = () => {
+      skipAlertOpenRef.current = false;
+    };
+    Alert.alert(t('practice.skipConfirmTitle'), t('practice.skipConfirmBody'), [
+      { text: t('common.cancel'), style: 'cancel', onPress: closeAlert },
+      {
+        text: t('practice.skipWord'),
+        onPress: () => {
+          closeAlert();
+          void performSkip();
+        },
+      },
+    ]);
+  };
+
   // The route gate will redirect after logout/session expiry. Avoid showing a
   // disabled-query loading state during that transition.
   if (!user) return null;
@@ -609,6 +655,7 @@ export default function PracticeScreen() {
             </Text>
             <Button
               title={t('common.tryAgain')}
+              fullWidth
               onPress={() => void questionQuery.refetch({ cancelRefetch: false })}
               style={styles.retryButton}
             />
@@ -697,6 +744,7 @@ export default function PracticeScreen() {
                   accessibilityRole="button"
                   accessibilityLabel={t('practice.helpLabel')}
                   accessibilityHint={recorderLocked ? t('hint.finishRecordingFirst') : undefined}
+                  accessibilityState={{ disabled: interactionLocked }}
                   disabled={interactionLocked}
                   hitSlop={4}
                   style={({ pressed }) => [
@@ -807,9 +855,24 @@ export default function PracticeScreen() {
               disabled={interactionLocked}
               hitSlop={4}
               style={[styles.skipButton, interactionLocked && styles.controlDisabled]}
-              onPress={() => void handleSkip()}
+              onPress={handleSkip}
             >
-              <Text style={styles.skipButtonText}>{t('practice.skipWord')}</Text>
+              {skipBusy ? (
+                <View style={styles.skipBusyRow}>
+                  {/* The spinner is pure decoration: the busy accessibility
+                      state plus the "Skipping…" label carry the meaning. */}
+                  <View
+                    accessibilityElementsHidden
+                    importantForAccessibility="no-hide-descendants"
+                    testID="practice-skip-busy-indicator"
+                  >
+                    <ActivityIndicator size="small" color={theme.colors.primary} />
+                  </View>
+                  <Text style={styles.skipButtonText}>{t('practice.skipBusy')}</Text>
+                </View>
+              ) : (
+                <Text style={styles.skipButtonText}>{t('practice.skipWord')}</Text>
+              )}
             </Pressable>
           </>
         )}
@@ -818,7 +881,7 @@ export default function PracticeScreen() {
   );
 }
 
-const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, elevation }) => ({
+const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, elevation, type }) => ({
   container: {
     flex: 1,
     backgroundColor: colors.background,
@@ -960,7 +1023,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, eleva
   introLine: {
     marginTop: spacing.sm,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   attemptChip: {
@@ -1001,7 +1064,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, eleva
     opacity: 0.5,
   },
   modeToggleText: {
-    fontSize: 14,
+    fontSize: 15,
     fontWeight: '600',
     color: colors.primary,
   },
@@ -1030,8 +1093,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, eleva
   },
   promptWord: {
     marginTop: spacing.xs,
-    fontSize: 34,
-    lineHeight: 41,
+    fontSize: type.display.fontSize,
+    lineHeight: type.display.lineHeight,
     fontWeight: '800',
     color: colors.primary,
   },
@@ -1065,6 +1128,11 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, eleva
     minHeight: layout.minimumTarget,
     justifyContent: 'center',
     paddingHorizontal: spacing.ml,
+  },
+  skipBusyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
   },
   skipButtonText: {
     fontSize: 14,

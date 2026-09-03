@@ -6,7 +6,7 @@ import {
 } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { SectionList, StyleSheet, useColorScheme } from 'react-native';
+import { BackHandler, SectionList, StyleSheet, useColorScheme } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import HistoryScreen, {
@@ -79,6 +79,7 @@ jest.mock('expo-router', () => {
       replace: jest.fn(),
       back: jest.fn(),
       dismissTo: jest.fn(),
+      canGoBack: jest.fn(),
     },
     useFocusEffect: (callback: () => void | (() => void)) => {
       ReactActual.useEffect(() => {
@@ -184,7 +185,13 @@ jest.mock('../src/components/HistoryNativeAdCard', () => ({
 const mockGetHistory = apiGetPracticeHistory as jest.Mock;
 const mockHistoryRouter = jest.requireMock('expo-router').router as {
   navigate: jest.Mock;
+  back: jest.Mock;
+  replace: jest.Mock;
+  canGoBack: jest.Mock;
 };
+
+/** Hardware-back handlers registered by the mounted screen (mocked native side). */
+let backHandlers: (() => boolean)[] = [];
 
 function historyItem(overrides: Partial<HistoryItem> = {}): HistoryItem {
   return {
@@ -375,7 +382,7 @@ const CENTER_STATE: SemanticStyle = {
   flexGrow: 1,
   alignItems: 'center',
   justifyContent: 'center',
-  padding: spacing.xl,
+  padding: layout.screenPadding,
   width: '100%',
   maxWidth: layout.contentMaxWidth,
   alignSelf: 'center',
@@ -409,7 +416,7 @@ const DETAIL_LABEL: SemanticStyle = {
 const DETAIL_TEXT: SemanticStyle = {
   marginTop: spacing.xs,
   fontSize: 15,
-  lineHeight: 22,
+  lineHeight: 21,
   color: colors.text,
 };
 
@@ -419,7 +426,7 @@ const ROW_HEADER: SemanticStyle = {
   alignItems: 'center',
   justifyContent: 'space-between',
   gap: spacing.sm,
-  padding: 14,
+  padding: spacing.lg,
 };
 
 const SCORE_CHIP: SemanticStyle = {
@@ -449,6 +456,9 @@ beforeEach(() => {
   // Module factory mocks outlive clearAllMocks; re-arm the light default.
   asMock(useColorScheme).mockReset();
   asMock(useColorScheme).mockReturnValue('light');
+  // clearAllMocks keeps recorded return values, so re-arm the rooted default:
+  // History is the whole signed-in stack unless a test puts a route beneath it.
+  mockHistoryRouter.canGoBack.mockReturnValue(false);
   // The account-language tests mount the real I18nProvider, whose effect moves
   // the module-level language; pin it back so every test starts in English.
   setActiveLanguage('en');
@@ -460,6 +470,11 @@ beforeEach(() => {
   asMock(SectionList).mockClear();
   asMock(RecordingPlayback).mockClear();
   asMock(HistoryNativeAdCard).mockClear();
+  backHandlers = [];
+  jest.spyOn(BackHandler, 'addEventListener').mockImplementation((_event, handler) => {
+    backHandlers.push(handler as () => boolean);
+    return { remove: jest.fn() };
+  });
 });
 
 afterEach(async () => {
@@ -564,9 +579,10 @@ describe('history screen', () => {
     expect(flattenedStyle(screen.getByText(t('history.loadFailedTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_TEXT);
     expect(centeredStateStyle(screen.getByText(t('error.serverBusy')))).toEqual(CENTER_STATE);
+    // The full-screen retry is a full-width primary action under the message.
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
-    ).toMatchObject({ marginTop: spacing.lg });
+    ).toMatchObject({ alignSelf: 'stretch', marginTop: spacing.lg });
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
@@ -794,6 +810,35 @@ describe('history screen', () => {
     expect(mockHistoryRouter.navigate).toHaveBeenCalledWith('/practice');
   });
 
+  it('consumes the Android hardware back press while the entry gate is still beneath History', async () => {
+    mockHistoryRouter.canGoBack.mockReturnValue(true);
+    mockGetHistory.mockResolvedValue({ items: [historyItem()], nextCursor: null });
+    await renderHistory();
+    await screen.findByText('courage');
+
+    expect(backHandlers.length).toBeGreaterThan(0);
+    // Popping would land on the gate, which redirects straight back into the
+    // signed-in area.
+    expect(backHandlers[backHandlers.length - 1]()).toBe(true);
+    expect(mockHistoryRouter.back).not.toHaveBeenCalled();
+    expect(mockHistoryRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('lets the Android hardware back press fall through when History is the whole stack', async () => {
+    // Nothing to pop: swallowing the press would make back a dead key, since
+    // React Native only reaches its exit-the-app default when no handler
+    // claims the press.
+    mockHistoryRouter.canGoBack.mockReturnValue(false);
+    mockGetHistory.mockResolvedValue({ items: [historyItem()], nextCursor: null });
+    await renderHistory();
+    await screen.findByText('courage');
+
+    expect(backHandlers.length).toBeGreaterThan(0);
+    expect(backHandlers[backHandlers.length - 1]()).toBe(false);
+    expect(mockHistoryRouter.back).not.toHaveBeenCalled();
+    expect(mockHistoryRouter.replace).not.toHaveBeenCalled();
+  });
+
   it('renders rows grouped by day with score chips and context badges', async () => {
     mockGetHistory.mockResolvedValue({
       items: [
@@ -857,7 +902,7 @@ describe('history screen', () => {
       fontWeight: '700',
       color: colors.muted,
       textTransform: 'uppercase',
-      letterSpacing: 0.6,
+      letterSpacing: 0.8,
     });
   });
 
@@ -919,13 +964,13 @@ describe('history screen', () => {
       borderRadius: radii.card,
       borderWidth: 1,
       borderColor: colors.border,
-      marginBottom: spacing.sm,
+      marginBottom: spacing.md,
       overflow: 'hidden',
     });
     expect(flattenedStyle(rowHeader('courage', 82))).toEqual(ROW_HEADER);
     expect(flattenedStyle(parentOf(screen.getByText('courage')))).toEqual({ flex: 1 });
     expect(flattenedStyle(screen.getByText('courage'))).toEqual({
-      fontSize: 18,
+      fontSize: 20,
       fontWeight: '800',
       color: colors.text,
     });
@@ -1328,8 +1373,8 @@ describe('history screen', () => {
     await fireEvent.press(rowHeader('courage', 82));
 
     expect(flattenedStyle(parentOf(screen.getByText(t('label.question'))))).toEqual({
-      paddingHorizontal: 14,
-      paddingBottom: 14,
+      paddingHorizontal: spacing.lg,
+      paddingBottom: spacing.lg,
       borderTopWidth: 1,
       borderTopColor: colors.border,
     });
@@ -1344,7 +1389,7 @@ describe('history screen', () => {
       marginTop: spacing.xs,
       fontSize: 15,
       fontStyle: 'italic',
-      lineHeight: 22,
+      lineHeight: 21,
       color: colors.text,
     });
   });

@@ -45,7 +45,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
   },
   card: {
     width: '100%',
@@ -55,7 +55,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     borderColor: colors.border,
     borderRadius: radii.card,
     backgroundColor: colors.card,
-    padding: spacing.xl,
+    padding: spacing.lg,
   },
   body: {
     color: colors.muted,

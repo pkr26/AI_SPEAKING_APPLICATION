@@ -3,7 +3,7 @@ import { type LayoutChangeEvent, StyleSheet, Text, useWindowDimensions, View } f
 
 import { adUnitIdFor, adsNativeModuleWhenReady, useAds } from '../lib/ads';
 import { useT } from '../lib/i18n';
-import { layout, useTheme } from '../lib/theme';
+import { createThemedStyles, layout, useTheme } from '../lib/theme';
 
 export function homeBannerContentWidth(windowWidth: number): number {
   return Math.max(
@@ -20,7 +20,7 @@ export default function HomeBannerAd({ focused }: { focused: boolean }) {
 function FocusedHomeBannerAd() {
   const ads = useAds();
   const t = useT();
-  const theme = useTheme();
+  const styles = themedStyles(useTheme());
   const { width: windowWidth } = useWindowDimensions();
   const { activatePlacement } = ads;
   const [failedConsentVersion, setFailedConsentVersion] = useState<number | null>(null);
@@ -45,7 +45,7 @@ function FocusedHomeBannerAd() {
   const BannerAd = native?.BannerAd;
   return (
     <View
-      style={[styles.slot, { borderColor: theme.colors.border }]}
+      style={styles.slot}
       accessibilityLabel={t('ads.label')}
       onLayout={(event: LayoutChangeEvent) => {
         const measured = Math.floor(event.nativeEvent.layout.width);
@@ -54,7 +54,7 @@ function FocusedHomeBannerAd() {
         }
       }}
     >
-      <Text style={[styles.label, { color: theme.colors.muted }]}>{t('ads.label')}</Text>
+      <Text style={styles.label}>{t('ads.label')}</Text>
       {BannerAd && unitId ? (
         <BannerAd
           key={ads.consentVersion}
@@ -71,7 +71,7 @@ function FocusedHomeBannerAd() {
   );
 }
 
-const styles = StyleSheet.create({
+const themedStyles = createThemedStyles(({ colors, type }) => ({
   slot: {
     // The label plus the largest anchored adaptive creative fit without a
     // load-time expansion on tablets; narrower creatives remain centered.
@@ -80,9 +80,12 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     borderTopWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
   },
   label: {
-    fontSize: 10,
+    fontSize: type.caption.fontSize,
+    lineHeight: type.caption.lineHeight,
     marginBottom: 2,
+    color: colors.muted,
   },
-});
+}));

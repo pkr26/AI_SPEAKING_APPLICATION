@@ -74,6 +74,7 @@ describe('theme palette', () => {
       accentLight: '#FFFBEB',
       onAccent: '#FFFFFF',
       shadow: '#000000',
+      scrim: 'rgba(0, 0, 0, 0.66)',
     });
     // Legacy static export stays the light palette for scheme-independent uses.
     expect(colors).toBe(lightColors);
@@ -110,6 +111,7 @@ describe('theme palette', () => {
       accentLight: '#33240A',
       onAccent: '#451A03',
       shadow: '#000000',
+      scrim: 'rgba(0, 0, 0, 0.66)',
     });
   });
 
@@ -264,6 +266,8 @@ describe('theme palette', () => {
       formMaxWidth: 560,
       contentMaxWidth: 760,
       minimumTarget: 48,
+      brandMark: 68,
+      outcomeBadge: 84,
     });
     expect(radii).toEqual({ badge: 8, input: 12, button: 14, card: 16, pill: 999 });
     expect(spacing).toEqual({

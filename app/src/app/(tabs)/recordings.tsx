@@ -1,4 +1,5 @@
 import { useInfiniteQuery, useQueryClient } from '@tanstack/react-query';
+import { router } from 'expo-router';
 import React, { useEffect, useMemo, useRef } from 'react';
 import { ActivityIndicator, FlatList, RefreshControl, ScrollView, Text, View } from 'react-native';
 
@@ -7,10 +8,13 @@ import EmptyState from '../../components/EmptyState';
 import DataRefreshNotice from '../../components/DataRefreshNotice';
 import OfflineState from '../../components/OfflineState';
 import RecordingPlayback from '../../components/RecordingPlayback';
+import Skeleton from '../../components/Skeleton';
 import { apiGetRecordings, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
-import { useI18n, type MessageKey, type UiLanguage } from '../../lib/i18n';
+import { useI18n, type MessageKey } from '../../lib/i18n';
+import { UI_LANGUAGE_LOCALES } from '../../lib/language-options';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 import type { RecordingItem, RecordingPage } from '../../lib/types';
 
 interface RecordingFetchMeta {
@@ -19,13 +23,10 @@ interface RecordingFetchMeta {
 
 export const RECORDING_MAX_PAGES = 500;
 
-export const RECORDING_DATE_LOCALES: Record<UiLanguage, string> = {
-  en: 'en-US',
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
+// The single BCP-47 tag per UI language (shared with date formatting and
+// accessibility tagging app-wide); re-exported under the screen's historical
+// name because the tests pin the locale contract through it.
+export { UI_LANGUAGE_LOCALES as RECORDING_DATE_LOCALES };
 
 export function formatRecordingDuration(durationMs: number | null): string | null {
   if (durationMs === null) return null;
@@ -117,6 +118,12 @@ function RecordingCard({
 }
 
 export default function RecordingsScreen() {
+  // Android hardware back must not pop back onto the gate (which would
+  // immediately redirect into the signed-in area). With nothing left to pop the
+  // press falls through instead of being swallowed, so Android's own "back at
+  // the task root leaves the app" behavior still works.
+  useHardwareBack(() => router.canGoBack());
+
   const { user, sessionVersion, captureSessionLease, isSessionLeaseCurrent } = useAuth();
   const { t, language } = useI18n();
   const theme = useTheme();
@@ -168,16 +175,30 @@ export default function RecordingsScreen() {
         {recordingsQuery.fetchStatus === 'paused' ? (
           <OfflineState />
         ) : (
-          <>
-            <ActivityIndicator
-              accessibilityLabel={t('recordings.loading')}
-              size="large"
-              color={theme.colors.primary}
-            />
-            <Text accessibilityLiveRegion="polite" style={styles.muted}>
+          // Card skeletons preview the header bar and recording cards the list
+          // will fill, with a hidden polite line announcing the wait.
+          <View style={styles.listSkeleton}>
+            {/* Visually hidden but kept in the accessibility tree: Android
+                announces it via the live region, iOS VoiceOver can focus it
+                (live regions alone are not announced there). */}
+            <Text accessibilityLiveRegion="polite" style={styles.hiddenLoadingText}>
               {t('recordings.loading')}
             </Text>
-          </>
+            <Skeleton
+              width={120}
+              height={16}
+              borderRadius={4}
+              testID="recordings-skeleton-header"
+            />
+            {Array.from({ length: 3 }, (_, index) => (
+              <Skeleton
+                key={index}
+                height={84}
+                borderRadius={16}
+                testID="recordings-skeleton-card"
+              />
+            ))}
+          </View>
         )}
       </ScrollView>
     );
@@ -189,11 +210,12 @@ export default function RecordingsScreen() {
         <Text accessibilityRole="header" style={styles.title}>
           {t('recordings.loadFailedTitle')}
         </Text>
-        <Text accessibilityRole="alert" style={styles.muted}>
+        <Text accessibilityLiveRegion="assertive" style={styles.muted}>
           {userMessageForError(recordingsQuery.error, t('recordings.loadFailed'))}
         </Text>
         <Button
           title={t('common.tryAgain')}
+          fullWidth
           onPress={() => void recordingsQuery.refetch({ cancelRefetch: false })}
           style={styles.action}
         />
@@ -269,7 +291,7 @@ export default function RecordingsScreen() {
       data={items}
       keyExtractor={(item) => item.id}
       renderItem={({ item }) => (
-        <RecordingCard item={item} ownerId={user.id} locale={RECORDING_DATE_LOCALES[language]} />
+        <RecordingCard item={item} ownerId={user.id} locale={UI_LANGUAGE_LOCALES[language]} />
       )}
       onEndReachedThreshold={0.4}
       onEndReached={() => {
@@ -311,10 +333,15 @@ export default function RecordingsScreen() {
           </View>
         ) : recordingsQuery.isFetchNextPageError ? (
           <View style={styles.footer}>
-            <Text accessibilityRole="alert" style={styles.muted}>
+            <Text accessibilityLiveRegion="assertive" style={styles.muted}>
               {userMessageForError(recordingsQuery.error, t('recordings.loadFailed'))}
             </Text>
-            <Button title={t('common.tryAgain')} variant="secondary" onPress={loadOlder} />
+            <Button
+              title={t('common.tryAgain')}
+              variant="secondary"
+              fullWidth
+              onPress={loadOlder}
+            />
           </View>
         ) : paginationStopped ? (
           <View style={styles.footer}>
@@ -351,7 +378,7 @@ export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radi
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -359,8 +386,8 @@ export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radi
   },
   title: {
     color: colors.text,
-    fontSize: 22,
-    fontWeight: '800',
+    fontSize: 20,
+    fontWeight: '700',
     textAlign: 'center',
   },
   muted: {
@@ -379,7 +406,7 @@ export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radi
   introText: {
     color: colors.muted,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
   },
   card: {
     marginBottom: spacing.md,
@@ -433,6 +460,14 @@ export const recordingsThemedStyles = createThemedStyles(({ colors, layout, radi
   footer: {
     paddingVertical: spacing.xl,
     alignItems: 'center',
+  },
+  listSkeleton: {
+    alignSelf: 'stretch',
+    gap: spacing.sm,
+  },
+  hiddenLoadingText: {
+    height: 0,
+    opacity: 0,
   },
 }));
 

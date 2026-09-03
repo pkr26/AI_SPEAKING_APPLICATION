@@ -21,7 +21,8 @@ import { AssessmentReplayProvider } from '../lib/assessment-replay-provider';
 import { AuthProvider, useAuth } from '../lib/auth';
 import { refreshDailyReminderLanguage } from '../lib/daily-reminder';
 import { GuestLanguageProvider, useGuestLanguage } from '../lib/guest-language';
-import { I18nProvider, translate, useT, type UiLanguage } from '../lib/i18n';
+import { I18nProvider, translate, useT } from '../lib/i18n';
+import { UI_LANGUAGE_LOCALES } from '../lib/language-options';
 import { NetworkStatusBridge } from '../lib/network-status';
 import { PracticeFlowProvider } from '../lib/practice-flow';
 import { createThemedStyles, useTheme } from '../lib/theme';
@@ -47,14 +48,6 @@ const queryClient = new QueryClient({
   },
 });
 
-const UI_ACCESSIBILITY_LANGUAGES: Record<UiLanguage, string> = {
-  en: 'en-US',
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
-
 function RootNavigator() {
   const { token, user, isRestoring, restoreError } = useAuth();
   const t = useT();
@@ -71,6 +64,7 @@ function RootNavigator() {
           headerTintColor: colors.text,
           headerStyle: { backgroundColor: colors.background },
           headerShadowVisible: false,
+          headerTitleAlign: 'center',
           contentStyle: { backgroundColor: colors.background },
         }}
       >
@@ -134,7 +128,7 @@ function LocalizedProviders({ children }: { children: React.ReactNode }) {
   return (
     <I18nProvider accountLanguage={accountLanguage ?? null} guestLanguage={guestLanguage}>
       <View
-        accessibilityLanguage={UI_ACCESSIBILITY_LANGUAGES[renderedLanguage]}
+        accessibilityLanguage={UI_LANGUAGE_LOCALES[renderedLanguage]}
         style={styles.localizedRoot}
       >
         {children}
@@ -295,7 +289,12 @@ export function ErrorBoundary({ retry }: ErrorBoundaryProps) {
           <Text accessibilityRole="alert" style={styles.errorBody}>
             {translate('boundary.body')}
           </Text>
-          <Button title={translate('common.tryAgain')} onPress={retry} style={styles.errorButton} />
+          <Button
+            title={translate('common.tryAgain')}
+            fullWidth
+            onPress={retry}
+            style={styles.errorButton}
+          />
         </View>
       </ScrollView>
     </SafeAreaView>
@@ -344,7 +343,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
   },
   errorCard: {
     width: '100%',
@@ -353,17 +352,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     borderColor: colors.border,
     borderRadius: radii.card,
     backgroundColor: colors.card,
-    padding: spacing.xl,
+    padding: spacing.lg,
     alignItems: 'center',
   },
   errorTitle: {
     color: colors.text,
-    fontSize: 24,
+    fontSize: 20,
     fontWeight: '800',
     textAlign: 'center',
   },
   errorBody: {
-    marginTop: 10,
+    marginTop: spacing.sm,
     color: colors.muted,
     fontSize: 16,
     lineHeight: 23,

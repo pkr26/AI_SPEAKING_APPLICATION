@@ -17,6 +17,7 @@ import {
 
 import Button from '../../components/Button';
 import Icon from '../../components/Icon';
+import LanguageChipGrid from '../../components/LanguageChipGrid';
 import { useAds } from '../../lib/ads';
 import {
   apiConsumeAccountExportPages,
@@ -34,8 +35,15 @@ import {
   refreshDailyReminderLanguage,
 } from '../../lib/daily-reminder';
 import { useGuestLanguage } from '../../lib/guest-language';
+// Aliased: this screen keeps a `nameError` state for PATCH failures, and the
+// imported validator must not collide with it.
+import { nameError as nameErrorFor } from '../../lib/identity-validation';
 import { translateFor, useT, useI18n, type UiLanguage } from '../../lib/i18n';
-import { NATIVE_LANGUAGE_OPTIONS, UI_LANGUAGE_OPTIONS } from '../../lib/language-options';
+import {
+  NATIVE_LANGUAGE_OPTIONS,
+  UI_LANGUAGE_LOCALES,
+  UI_LANGUAGE_OPTIONS,
+} from '../../lib/language-options';
 import { usePracticeFlow } from '../../lib/practice-flow';
 import { claimPrivateExportFile, type OwnedPrivateFile } from '../../lib/private-artifacts';
 import { createThemedStyles, useTheme } from '../../lib/theme';
@@ -43,8 +51,15 @@ import type { HistoryPage, NativeLanguage, RecordingPage, User } from '../../lib
 import { useHardwareBack } from '../../lib/use-hardware-back';
 
 export function formatReminderHour(hour: number, language: UiLanguage = 'en'): string {
+  // Resolve the exact BCP-47 locale for the UI language: passing the bare tag
+  // lets Intl re-resolve an unknown value against the device locale, silently
+  // formatting the reminder hour in the wrong language.
+  const locale = UI_LANGUAGE_LOCALES[language];
+  if (locale === undefined) {
+    return `${hour.toString().padStart(2, '0')}:00`;
+  }
   try {
-    return new Intl.DateTimeFormat(language, { hour: 'numeric' }).format(
+    return new Intl.DateTimeFormat(locale, { hour: 'numeric' }).format(
       new Date(2020, 0, 1, hour, 0),
     );
   } catch {
@@ -128,6 +143,8 @@ export default function SettingsScreen() {
 
   const [nameDraft, setNameDraft] = useState(canonicalName);
   const [nameFocused, setNameFocused] = useState(false);
+  /** Inline name validation is blur-gated (signup/forgot pattern). */
+  const [nameTouched, setNameTouched] = useState(false);
   const [nameBusy, setNameBusy] = useState(false);
   const [nameSaved, setNameSaved] = useState(false);
   const [nameError, setNameError] = useState<string | null>(null);
@@ -406,9 +423,13 @@ export default function SettingsScreen() {
   if (!user) return null;
 
   const trimmedName = nameDraft.trim();
+  // Mirrors the server's nameSchema control-character refinement so a pasted
+  // name cannot pass the client gate and then fail with generic copy.
+  const nameValidationError = nameErrorFor(nameDraft, t);
   const canSaveName =
     trimmedName.length > 0 &&
     trimmedName.length <= MAX_NAME_LENGTH &&
+    nameValidationError === null &&
     trimmedName !== user.name &&
     !nameBusy;
 
@@ -421,6 +442,7 @@ export default function SettingsScreen() {
       !current ||
       submittedName.length === 0 ||
       submittedName.length > MAX_NAME_LENGTH ||
+      nameErrorFor(submittedDraft, t) !== null ||
       submittedName === current.name
     ) {
       return;
@@ -1085,6 +1107,24 @@ export default function SettingsScreen() {
     }
   };
 
+  const confirmLogout = () => {
+    // Logging out ends every session on every device: the entry tap only opens
+    // the confirmation. The destructive handler re-runs the guarded logout
+    // path, so a stale captured callback can never log a replaced identity out.
+    if (!renderCanHandle() || blockingOperationActive()) return;
+    Alert.alert(t('settings.logOutConfirmTitle'), t('settings.logOutConfirmBody'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      {
+        text: t('common.logOut'),
+        style: 'destructive',
+        onPress: () => {
+          if (!renderCanHandle() || blockingOperationActive()) return;
+          void handleLogout();
+        },
+      },
+    ]);
+  };
+
   return (
     <ScrollView
       contentInsetAdjustmentBehavior="automatic"
@@ -1118,6 +1158,10 @@ export default function SettingsScreen() {
               if (!renderOwnsIdentity()) return;
               nameFocusedRef.current = false;
               setNameFocused(false);
+              // Inline validation waits for blur (the signup/forgot pattern):
+              // live mid-typing errors are hostile to a field the user is
+              // still editing; saveName re-validates regardless.
+              setNameTouched(true);
               if (!nameDirtyRef.current) {
                 const currentName = userRef.current?.name ?? '';
                 nameDraftRef.current = currentName;
@@ -1147,6 +1191,11 @@ export default function SettingsScreen() {
             {t('settings.saved')}
           </Text>
         )}
+        {nameTouched && nameValidationError && (
+          <Text accessibilityRole="alert" style={styles.fieldError}>
+            {nameValidationError}
+          </Text>
+        )}
         {nameError && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {nameError}
@@ -1165,49 +1214,32 @@ export default function SettingsScreen() {
 
         <Text style={styles.label}>{t('settings.appLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.appLanguageHelp')}</Text>
-        <View
-          accessibilityRole="radiogroup"
-          accessibilityLabel={t('settings.appLanguageLabel')}
-          style={styles.languageGrid}
-        >
-          {UI_LANGUAGE_OPTIONS.map((lang) => {
-            const selected = user.uiLanguage === lang.code;
-            const saving =
-              languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === lang.code;
-            return (
-              <Pressable
-                key={lang.code}
-                accessibilityRole="radio"
-                accessibilityLabel={`${t('settings.appLanguageLabel')}: ${lang.english}, ${lang.native}`}
-                accessibilityState={{ checked: selected, selected, busy: saving }}
-                disabled={languageBusy || logoutBusy}
-                onPress={() => void chooseUiLanguage(lang.code)}
-                style={[
-                  styles.languageChip,
-                  selected && styles.languageChipSelected,
-                  (languageBusy || logoutBusy) && !selected && styles.controlDisabled,
-                ]}
-              >
-                <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
-                  {lang.native}
-                </Text>
-                <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
-                  {lang.english}
-                </Text>
-                <View testID={`app-language-status-${lang.code}`} style={styles.languageChipStatus}>
-                  {saving && (
-                    <ActivityIndicator
-                      accessibilityElementsHidden
-                      importantForAccessibility="no-hide-descendants"
-                      size="small"
-                      color={colors.primary}
-                    />
-                  )}
-                </View>
-              </Pressable>
-            );
-          })}
-        </View>
+        <LanguageChipGrid
+          options={UI_LANGUAGE_OPTIONS}
+          selected={user.uiLanguage}
+          onSelect={(code) => void chooseUiLanguage(code)}
+          disabled={languageBusy || logoutBusy}
+          isBusy={(code) =>
+            languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === code
+          }
+          accessibilityLabelFor={(option, localizedLabel) =>
+            `${t('settings.appLanguageLabel')}: ${localizedLabel}, ${option.native}`
+          }
+          groupAccessibilityLabel={t('settings.appLanguageLabel')}
+          chipTestIDPrefix="app-language-chip"
+          renderOverlay={(code, _selected, saving) => (
+            <View testID={`app-language-status-${code}`} style={styles.languageChipStatus}>
+              {saving && (
+                <ActivityIndicator
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  size="small"
+                  color={colors.primary}
+                />
+              )}
+            </View>
+          )}
+        />
         {languageError && languageErrorScope === 'ui' && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {languageError}
@@ -1216,54 +1248,30 @@ export default function SettingsScreen() {
 
         <Text style={styles.label}>{t('settings.learningLanguageLabel')}</Text>
         <Text style={styles.languageHelp}>{t('settings.learningLanguageHelp')}</Text>
-        <View
-          accessibilityRole="radiogroup"
-          accessibilityLabel={t('settings.learningLanguageLabel')}
-          style={styles.languageGrid}
-        >
-          {NATIVE_LANGUAGE_OPTIONS.map((lang) => {
-            const selected = user.nativeLanguage === lang.code;
-            const saving =
-              languageBusy &&
-              languageTarget?.scope === 'native' &&
-              languageTarget.code === lang.code;
-            return (
-              <Pressable
-                key={lang.code}
-                accessibilityRole="radio"
-                accessibilityLabel={`${lang.english}, ${lang.native}`}
-                accessibilityState={{ checked: selected, selected, busy: saving }}
-                disabled={languageBusy || logoutBusy}
-                onPress={() => void chooseNativeLanguage(lang.code)}
-                style={[
-                  styles.languageChip,
-                  selected && styles.languageChipSelected,
-                  (languageBusy || logoutBusy) && !selected && styles.controlDisabled,
-                ]}
-              >
-                <Text style={[styles.languageNative, selected && styles.languageTextSelected]}>
-                  {lang.native}
-                </Text>
-                <Text style={[styles.languageEnglish, selected && styles.languageTextSelected]}>
-                  {lang.english}
-                </Text>
-                <View
-                  testID={`learning-language-status-${lang.code}`}
-                  style={styles.languageChipStatus}
-                >
-                  {saving && (
-                    <ActivityIndicator
-                      accessibilityElementsHidden
-                      importantForAccessibility="no-hide-descendants"
-                      size="small"
-                      color={colors.primary}
-                    />
-                  )}
-                </View>
-              </Pressable>
-            );
-          })}
-        </View>
+        <LanguageChipGrid
+          options={NATIVE_LANGUAGE_OPTIONS}
+          selected={user.nativeLanguage}
+          onSelect={(code) => void chooseNativeLanguage(code)}
+          disabled={languageBusy || logoutBusy}
+          isBusy={(code) =>
+            languageBusy && languageTarget?.scope === 'native' && languageTarget.code === code
+          }
+          accessibilityLabelFor={(option, localizedLabel) => `${localizedLabel}, ${option.native}`}
+          groupAccessibilityLabel={t('settings.learningLanguageLabel')}
+          chipTestIDPrefix="learning-language-chip"
+          renderOverlay={(code, _selected, saving) => (
+            <View testID={`learning-language-status-${code}`} style={styles.languageChipStatus}>
+              {saving && (
+                <ActivityIndicator
+                  accessibilityElementsHidden
+                  importantForAccessibility="no-hide-descendants"
+                  size="small"
+                  color={colors.primary}
+                />
+              )}
+            </View>
+          )}
+        />
         {languageError && languageErrorScope === 'native' && (
           <Text accessibilityRole="alert" style={styles.fieldError}>
             {languageError}
@@ -1445,7 +1453,7 @@ export default function SettingsScreen() {
 
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ busy: exportBusy }}
+          accessibilityState={{ busy: exportBusy, disabled: exportBusy || logoutBusy }}
           disabled={exportBusy || logoutBusy}
           style={({ pressed }) => [
             styles.actionRow,
@@ -1468,7 +1476,10 @@ export default function SettingsScreen() {
 
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ busy: retakeBusy }}
+          accessibilityState={{
+            busy: retakeBusy,
+            disabled: retakeBusy || retakeConfirming || logoutBusy,
+          }}
           disabled={retakeBusy || retakeConfirming || logoutBusy}
           style={({ pressed }) => [
             styles.actionRow,
@@ -1518,16 +1529,16 @@ export default function SettingsScreen() {
 
         <Pressable
           accessibilityRole="button"
-          accessibilityState={{ busy: logoutBusy }}
+          accessibilityState={{ busy: logoutBusy, disabled: screenBusy }}
           disabled={screenBusy}
           style={({ pressed }) => [
             styles.actionRow,
             screenBusy && styles.controlDisabled,
             pressed && styles.actionRowPressed,
           ]}
-          onPress={() => void handleLogout()}
+          onPress={confirmLogout}
         >
-          <Text style={styles.actionText}>{t('common.logOut')}</Text>
+          <Text style={[styles.actionText, styles.actionTextDanger]}>{t('common.logOut')}</Text>
         </Pressable>
 
         <Pressable
@@ -1562,13 +1573,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   card: {
     backgroundColor: colors.card,
     borderRadius: radii.card,
-    padding: layout.screenPadding,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
     marginBottom: spacing.lg,
   },
   cardTitle: {
-    fontSize: 18,
+    fontSize: 17,
     fontWeight: '800',
     color: colors.text,
   },
@@ -1614,12 +1625,12 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexShrink: 0,
   },
   savedNote: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.success,
     fontSize: 13,
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },
@@ -1628,39 +1639,6 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.muted,
     fontSize: 13,
     lineHeight: 18,
-  },
-  languageGrid: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10,
-  },
-  languageChip: {
-    flexBasis: '47%',
-    flexGrow: 0,
-    flexShrink: 0,
-    borderWidth: 1.5,
-    borderColor: colors.inputBorder,
-    borderRadius: radii.input,
-    paddingVertical: spacing.md,
-    alignItems: 'center',
-    backgroundColor: colors.card,
-  },
-  languageChipSelected: {
-    borderColor: colors.primary,
-    backgroundColor: colors.primaryLight,
-  },
-  languageNative: {
-    fontSize: 17,
-    fontWeight: '700',
-    color: colors.text,
-  },
-  languageEnglish: {
-    marginTop: 2,
-    fontSize: 13,
-    color: colors.muted,
-  },
-  languageTextSelected: {
-    color: colors.primary,
   },
   languageChipStatus: {
     height: spacing.lg,

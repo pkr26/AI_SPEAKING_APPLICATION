@@ -19,7 +19,7 @@ import ProgressBar from '../src/components/ProgressBar';
 import ScoreRing from '../src/components/ScoreRing';
 import Skeleton from '../src/components/Skeleton';
 import StatTile from '../src/components/StatTile';
-import { darkColors, lightColors, useTheme } from '../src/lib/theme';
+import { darkColors, layout, lightColors, useTheme } from '../src/lib/theme';
 import { useReduceMotion } from '../src/lib/use-reduce-motion';
 import WordTaggedTranscript from '../src/components/WordTaggedTranscript';
 
@@ -823,7 +823,7 @@ describe('WordTaggedTranscript styling', () => {
     expect(StyleSheet.flatten(screen.getByText('Good', hidden).props.style)).toMatchObject({
       fontWeight: '700',
       textTransform: 'uppercase',
-      letterSpacing: 0.5,
+      letterSpacing: 0.8,
     });
   });
 
@@ -956,6 +956,16 @@ describe('EmptyState styling', () => {
     const scrollHost = contentHost.parent!;
     expect(StyleSheet.flatten(scrollHost.props.contentContainerStyle)).toMatchObject({
       alignItems: 'center',
+    });
+    // The friendly mark rides in the shared brand-mark circle diameter.
+    const markBadge = childAt(contentHost, 0);
+    expect(StyleSheet.flatten(markBadge.props.style)).toMatchObject({
+      width: layout.brandMark,
+      height: layout.brandMark,
+      borderRadius: layout.brandMark / 2,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: lightColors.primaryLight,
     });
     expect(StyleSheet.flatten(title.props.style)).toMatchObject({
       fontWeight: '800',

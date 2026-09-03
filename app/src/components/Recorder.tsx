@@ -63,6 +63,7 @@ import {
 } from '../lib/pending-assessment';
 import { createThemedStyles, useTheme } from '../lib/theme';
 import { ContractError } from '../lib/types';
+import { useReduceMotion } from '../lib/use-reduce-motion';
 import Button from './Button';
 import Icon from './Icon';
 
@@ -1089,7 +1090,7 @@ export default function Recorder<T>({
   const [permissionDenied, setPermissionDenied] = useState(false);
   const [permissionNeedsSettings, setPermissionNeedsSettings] = useState(false);
   const permissionNeedsSettingsRef = useRef(false);
-  const [reduceMotion, setReduceMotion] = useState(false);
+  const reduceMotion = useReduceMotion();
   const [recordedDurationMillis, setRecordedDurationMillis] = useState(0);
   const [waitElapsedMillis, setWaitElapsedMillis] = useState(0);
   const [remoteTransferStarted, setRemoteTransferStarted] = useState(false);
@@ -2725,20 +2726,6 @@ export default function Recorder<T>({
     }
   }, [cycleId, endpoint, ownerId, questionId, stopForLifecycle]);
 
-  useEffect(() => {
-    let active = true;
-    void AccessibilityInfo.isReduceMotionEnabled()
-      .then((enabled) => {
-        if (active) setReduceMotion(enabled);
-      })
-      .catch(() => undefined);
-    const subscription = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotion);
-    return () => {
-      active = false;
-      subscription.remove();
-    };
-  }, []);
-
   // Pre-submit playback exists only while a take is held for review; every
   // other phase releases the native player (submit, re-record, lifecycle).
   useEffect(() => {
@@ -3993,10 +3980,9 @@ export default function Recorder<T>({
         ))}
 
       <Text
-        accessible={!isRecording}
         accessibilityLabel={
           isRecording
-            ? t('recorder.a11yRecording')
+            ? t('recorder.statusRecording', { elapsed })
             : phase === 'recorded'
               ? t('recorder.a11ySaved')
               : phase === 'recovering'
@@ -4007,6 +3993,10 @@ export default function Recorder<T>({
                     ? t('recorder.a11yUploading')
                     : t('recorder.a11yIdle')
         }
+        // The staged wait copy announces politely, but the per-second elapsed
+        // line stays non-live while recording (anti-chatter); the countdown
+        // marks below remain the only timer announcements.
+        accessibilityLiveRegion={busy ? 'polite' : undefined}
         style={styles.statusText}
       >
         {isRecording
@@ -4040,8 +4030,13 @@ export default function Recorder<T>({
             color={theme.colors.primary}
           />
           {phase === 'recovering' && (
-            <Text style={styles.waitHintText}>{t('recorder.waitHint')}</Text>
+            <Text accessibilityLiveRegion="polite" style={styles.waitHintText}>
+              {t('recorder.waitHint')}
+            </Text>
           )}
+          {/* The per-second elapsed clock stays non-live: a live region here
+              would make TalkBack announce every tick of the wait. The staged
+              status copy above (8s/25s marks) owns the polite announcements. */}
           <Text style={styles.waitElapsedText}>
             {t('recorder.waitingFor', { elapsed: formatElapsed(waitElapsedMillis) })}
           </Text>
@@ -4185,7 +4180,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, scheme, spacin
     textAlign: 'center',
   },
   settingsButton: {
-    marginTop: 10,
+    marginTop: spacing.sm,
     alignSelf: 'center',
   },
   buttonWrap: {

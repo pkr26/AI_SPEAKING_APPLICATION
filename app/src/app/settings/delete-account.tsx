@@ -234,7 +234,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   container: {
     flexGrow: 1,
-    padding: spacing.xl,
+    padding: layout.screenPadding,
   },
   warningCard: {
     backgroundColor: colors.dangerLight,
@@ -255,7 +255,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   warningText: {
     marginTop: spacing.sm,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   form: {
@@ -272,7 +272,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
-    marginBottom: 6,
+    marginBottom: spacing.sm,
     marginTop: spacing.md,
   },
   input: {
@@ -318,13 +318,13 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     opacity: 0.5,
   },
   error: {
-    marginTop: 14,
+    marginTop: spacing.md,
     color: colors.danger,
     fontSize: 14,
     textAlign: 'center',
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },

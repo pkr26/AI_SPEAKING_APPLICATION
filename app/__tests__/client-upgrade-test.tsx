@@ -1,6 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React, { useEffect } from 'react';
-import { AccessibilityInfo, Linking, Platform, Text } from 'react-native';
+import { AccessibilityInfo, Linking, Platform, StyleSheet, Text } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import ClientUpgradeModal, {
@@ -15,6 +15,10 @@ import {
   subscribeToClientUpgrade,
 } from '../src/lib/client-upgrade-store';
 import { I18nProvider, translateFor } from '../src/lib/i18n';
+import { darkColors, lightColors } from '../src/lib/theme';
+
+const useColorScheme = jest.requireMock('react-native/Libraries/Utilities/useColorScheme')
+  .default as jest.Mock;
 
 const mockExpoExtra: { value: unknown } = { value: undefined };
 
@@ -293,6 +297,47 @@ it('awaits local sign-out, blocks repeat taps, and reports a localized failure',
   // The retry explanation announces itself assertively, like the store error.
   expect(localFailure.props.accessibilityLiveRegion).toBe('assertive');
   expect(visibleModalNode().props.visible).toBe(true);
+});
+
+it('draws the scrim and the scheme-aware card shadow from the theme tokens', async () => {
+  const view = await render(
+    <I18nProvider accountLanguage="en">
+      <ClientUpgradeModal />
+    </I18nProvider>,
+  );
+  await act(async () => latchClientUpgradeRequired());
+
+  const modalCard = () =>
+    screen.container.queryAll((node) => node.props.accessibilityViewIsModal === true)[0];
+  const backdrop = modalCard().parent;
+  if (!backdrop) throw new Error('modal backdrop was not rendered');
+  expect(StyleSheet.flatten(backdrop.props.style)).toMatchObject({
+    backgroundColor: lightColors.scrim,
+  });
+  expect(StyleSheet.flatten(modalCard().props.style)).toMatchObject({
+    backgroundColor: lightColors.card,
+    shadowOpacity: 0.3,
+    shadowRadius: 16,
+    shadowOffset: { width: 0, height: 8 },
+    elevation: 20,
+  });
+
+  // Dark keeps the stronger cast: black shadows vanish on the dark background
+  // (the same reason the shared Button's filled key darkens its shadow).
+  useColorScheme.mockReturnValue('dark');
+  await act(async () => {
+    await view.rerender(
+      <I18nProvider accountLanguage="en">
+        <ClientUpgradeModal />
+      </I18nProvider>,
+    );
+  });
+  expect(StyleSheet.flatten(modalCard().props.style)).toMatchObject({
+    backgroundColor: darkColors.card,
+    shadowOpacity: 0.55,
+    elevation: 20,
+  });
+  useColorScheme.mockReturnValue('light');
 });
 
 it('keeps the modal latched and reports a localized store-opening failure', async () => {

@@ -10,6 +10,9 @@ import {
 } from 'react-native';
 import { router, useFocusEffect } from 'expo-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+
+import * as Haptics from 'expo-haptics';
 
 import Button from '../components/Button';
 import Confetti from '../components/Confetti';
@@ -26,7 +29,7 @@ import { useAssessmentReplay } from '../lib/assessment-replay-provider';
 import { LogoutCleanupError, useAuth } from '../lib/auth';
 import { useT } from '../lib/i18n';
 import { acknowledgePendingAssessmentFeedback } from '../lib/pending-assessment';
-import { createThemedStyles, useTheme } from '../lib/theme';
+import { createThemedStyles, spacing, useTheme } from '../lib/theme';
 import {
   parseDiagnosticAnswerResult,
   parseDiagnosticNext,
@@ -62,6 +65,7 @@ export default function DiagnosticScreen() {
   const t = useT();
   const theme = useTheme();
   const styles = themedStyles(theme);
+  const insets = useSafeAreaInsets();
   const queryClient = useQueryClient();
   const userId = user?.id ?? null;
   const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;
@@ -137,6 +141,9 @@ export default function DiagnosticScreen() {
   const resultActionBusyRef = useRef(false);
   const [resultActionBusy, setResultActionBusy] = useState(false);
   const [resultActionError, setResultActionError] = useState(false);
+  // Localized "when can I try again" line from a 429/DAILY_LIMIT rejection,
+  // rendered inline above the recorder instead of only in a passing alert.
+  const [rateLimitNotice, setRateLimitNotice] = useState<string | null>(null);
 
   // The diagnostic is a root-like screen: Android hardware back would pop it
   // mid-test, and the stale question then costs a 409 mismatch and minutes of
@@ -185,6 +192,7 @@ export default function DiagnosticScreen() {
     setLevel(null);
     setIntroStarted(false);
     setAnswers([]);
+    setRateLimitNotice(null);
     practiceStartRef.current = false;
     setPracticeStartBusy(false);
     recorderLockedRef.current = false;
@@ -357,6 +365,22 @@ export default function DiagnosticScreen() {
       });
     }
   }, [accessibleStepAnnouncement, accessibleStepKey]);
+
+  // The level reveal is this screen's one celebration; keep it to a single
+  // success haptic per reveal and re-arm whenever the level clears (identity
+  // reset, or advancing off a completion). Haptics are best effort
+  // (web/simulator).
+  const levelRevealHapticRef = useRef(false);
+  useEffect(() => {
+    if (!currentLevel) {
+      levelRevealHapticRef.current = false;
+      return;
+    }
+    if (levelRevealHapticRef.current) return;
+    levelRevealHapticRef.current = true;
+    void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => undefined);
+  }, [currentLevel]);
+
   const recorderOwner = currentQuestion !== null ? `${identityKey}:${currentQuestion.id}` : null;
 
   useLayoutEffect(() => {
@@ -387,6 +411,8 @@ export default function DiagnosticScreen() {
 
   const handleResult = (data: DiagnosticAnswerResult, metadata?: RecorderResultMetadata) => {
     if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
+    // A new submission owns the inline space again: clear the old wait line.
+    setRateLimitNotice(null);
     resultRef.current = data;
     resultRequestIdRef.current = metadata?.requestId ?? null;
     replayResultRequestIdRef.current = null;
@@ -424,6 +450,11 @@ export default function DiagnosticScreen() {
     Alert.alert(t('diag.assessFailedTitle'), message);
   };
 
+  const handleRateLimited = (message: string) => {
+    if (!recorderOwnsWork(recorderOwner) || resultRef.current !== null) return;
+    setRateLimitNotice(message);
+  };
+
   const handleRecoveryUnresolved = () => {
     const owner = recorderOwner;
     if (
@@ -449,6 +480,9 @@ export default function DiagnosticScreen() {
     (locked: boolean) => {
       if (!recorderOwnsWork(recorderOwner)) return;
       if (locked && resultRef.current !== null) return;
+      // A fresh take owns the inline wait line: retire it the moment the
+      // recorder locks for the next attempt.
+      if (locked) setRateLimitNotice(null);
       recorderLockedRef.current = locked;
       recorderExitLockedRef.current = locked;
       setRecorderExitLocked(locked);
@@ -480,17 +514,18 @@ export default function DiagnosticScreen() {
     router.navigate('/settings');
   };
 
-  const handleLogout = async () => {
-    if (
-      !renderOwnsWork() ||
-      recorderExitLockedRef.current ||
-      logoutBusyRef.current ||
-      practiceStartRef.current ||
-      resultActionBusyRef.current ||
-      accountActionRef.current
-    ) {
-      return;
-    }
+  const logoutBlocked = () =>
+    !renderOwnsWork() ||
+    recorderExitLockedRef.current ||
+    logoutBusyRef.current ||
+    practiceStartRef.current ||
+    resultActionBusyRef.current ||
+    accountActionRef.current;
+
+  const performLogout = async () => {
+    // Every ownership guard is re-checked here: the confirmation alert below
+    // leaves a backgrounding-sized gap before this body runs.
+    if (logoutBlocked()) return;
     accountActionRef.current = true;
     logoutBusyRef.current = true;
     setLogoutBusy(true);
@@ -520,6 +555,18 @@ export default function DiagnosticScreen() {
         if (rearm) accountActionRef.current = false;
       }
     }
+  };
+
+  /** "Log out on all devices" ends every session at once: require an explicit
+   * destructive confirmation. The same guard set fences the alert itself, and
+   * the confirm press re-runs every ownership guard inside performLogout
+   * after the alert gap. */
+  const handleLogout = () => {
+    if (logoutBlocked()) return;
+    Alert.alert(t('settings.logOutConfirmTitle'), t('settings.logOutConfirmBody'), [
+      { text: t('common.cancel'), style: 'cancel' },
+      { text: t('common.logOut'), style: 'destructive', onPress: () => void performLogout() },
+    ]);
   };
 
   const commitAdvance = (
@@ -686,8 +733,22 @@ export default function DiagnosticScreen() {
         size="sm"
         accessibilityHint={recorderExitLocked ? t('hint.finishRecordingFirst') : undefined}
         disabled={accountActionsLocked}
-        onPress={() => void handleLogout()}
+        onPress={handleLogout}
       />
+    </View>
+  );
+
+  // Settings and "Log out on all devices" are pinned as a fixed bottom bar in
+  // every state that shows them: the learner can always reach the account
+  // exits without scrolling past a long completion reveal. Only the placement
+  // moved — every gating semantic (locks, hints, confirmation, busy latches)
+  // stays with renderAccountActions above.
+  const renderAccountFooter = () => (
+    <View
+      testID="diagnostic-account-footer"
+      style={[styles.accountFooter, { paddingBottom: Math.max(insets.bottom, spacing.sm) }]}
+    >
+      {renderAccountActions()}
     </View>
   );
 
@@ -697,48 +758,52 @@ export default function DiagnosticScreen() {
   if (!currentLevel && !currentQuestion) {
     if (nextQuery.isPending) {
       return (
-        <ScrollView
-          contentInsetAdjustmentBehavior="automatic"
-          contentContainerStyle={styles.centerScroll}
-        >
-          {nextQuery.fetchStatus === 'paused' ? (
-            <OfflineState />
-          ) : (
-            <>
-              <ActivityIndicator
-                accessibilityLabel={t('diag.preparing')}
-                size="large"
-                color={theme.colors.primary}
-              />
-              <Text accessibilityLiveRegion="polite" style={styles.muted}>
-                {t('diag.preparing')}
-              </Text>
-            </>
-          )}
-          {renderAccountActions()}
-        </ScrollView>
+        <View style={styles.screen}>
+          <ScrollView
+            contentInsetAdjustmentBehavior="automatic"
+            contentContainerStyle={styles.centerScroll}
+          >
+            {nextQuery.fetchStatus === 'paused' ? (
+              <OfflineState />
+            ) : (
+              <>
+                <ActivityIndicator
+                  accessibilityLabel={t('diag.preparing')}
+                  size="large"
+                  color={theme.colors.primary}
+                />
+                <Text accessibilityLiveRegion="polite" style={styles.muted}>
+                  {t('diag.preparing')}
+                </Text>
+              </>
+            )}
+          </ScrollView>
+          {renderAccountFooter()}
+        </View>
       );
     }
     if (nextQuery.isError) {
       return (
-        <ScrollView
-          contentInsetAdjustmentBehavior="automatic"
-          contentContainerStyle={styles.centerScroll}
-        >
-          <Text accessibilityRole="header" style={styles.errorTitle}>
-            {t('diag.loadFailedTitle')}
-          </Text>
-          <Text accessibilityLiveRegion="assertive" style={styles.muted}>
-            {userMessageForError(nextQuery.error, t('diag.loadFailed'))}
-          </Text>
-          <Button
-            title={t('common.tryAgain')}
-            fullWidth
-            onPress={() => void nextQuery.refetch({ cancelRefetch: false })}
-            style={styles.primaryAction}
-          />
-          {renderAccountActions()}
-        </ScrollView>
+        <View style={styles.screen}>
+          <ScrollView
+            contentInsetAdjustmentBehavior="automatic"
+            contentContainerStyle={styles.centerScroll}
+          >
+            <Text accessibilityRole="header" style={styles.errorTitle}>
+              {t('diag.loadFailedTitle')}
+            </Text>
+            <Text accessibilityLiveRegion="assertive" style={styles.muted}>
+              {userMessageForError(nextQuery.error, t('diag.loadFailed'))}
+            </Text>
+            <Button
+              title={t('common.tryAgain')}
+              fullWidth
+              onPress={() => void nextQuery.refetch({ cancelRefetch: false })}
+              style={styles.primaryAction}
+            />
+          </ScrollView>
+          {renderAccountFooter()}
+        </View>
       );
     }
   }
@@ -746,75 +811,77 @@ export default function DiagnosticScreen() {
   // ----- Done: congrats view with the per-answer reveal -----
   if (currentLevel) {
     return (
-      <ScrollView
-        ref={questionScrollRef}
-        contentInsetAdjustmentBehavior="automatic"
-        contentContainerStyle={styles.centerScroll}
-      >
-        <Confetti testID="diagnostic-confetti" />
-        <View
-          accessibilityElementsHidden
-          importantForAccessibility="no-hide-descendants"
-          testID="diagnostic-complete-badge"
-          style={styles.congratsBadge}
+      <View style={styles.screen}>
+        <ScrollView
+          ref={questionScrollRef}
+          contentInsetAdjustmentBehavior="automatic"
+          contentContainerStyle={styles.centerScroll}
         >
-          <Icon name="trophy" size={38} color={theme.colors.onAccent} strokeWidth={2.1} />
-        </View>
-        {/* Live region gives TalkBack the same level-reveal transition iOS
-            receives through the queued step announcement below. */}
-        <Text
-          accessibilityLiveRegion="polite"
-          accessibilityRole="header"
-          style={styles.congratsTitle}
-        >
-          {t('diag.completeTitle')}
-        </Text>
-        <Text style={styles.congratsText}>{t('diag.levelIntro')}</Text>
-        <View style={styles.levelBadge}>
-          <Text style={styles.levelBadgeText}>{currentLevel}</Text>
-        </View>
-        <Text style={styles.levelExplainText}>{t(`cefr.${currentLevel}`)}</Text>
-        {answers.length > 0 && (
-          <View style={styles.answersCard}>
-            <Text style={styles.answersTitle}>{t('diag.answersTitle')}</Text>
-            {answers.map((answer, index) => (
-              <View key={answer.attemptNo} style={styles.answerSummary}>
-                <Text style={styles.answerLine}>
-                  {t('diag.answerLine', {
-                    number: index + 1,
-                    score: answer.score,
-                    mark: answer.passed ? '✓' : '✗',
-                  })}
-                </Text>
-                <Text style={styles.answerQuestion}>
-                  {t('diag.answerQuestion', {
-                    word: answer.promptWord,
-                    question: answer.questionText,
-                  })}
-                </Text>
-                <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
-                <Text accessibilityLanguage="en-US" selectable style={styles.answerDetail}>
-                  {answer.transcript}
-                </Text>
-                <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
-                <Text accessibilityLanguage="en-US" style={styles.answerDetail}>
-                  {answer.feedback}
-                </Text>
-              </View>
-            ))}
+          <Confetti testID="diagnostic-confetti" />
+          <View
+            accessibilityElementsHidden
+            importantForAccessibility="no-hide-descendants"
+            testID="diagnostic-complete-badge"
+            style={styles.congratsBadge}
+          >
+            <Icon name="trophy" size={38} color={theme.colors.onAccent} strokeWidth={2.1} />
           </View>
-        )}
-        <Text style={styles.congratsHint}>{t('diag.levelHint')}</Text>
-        <Button
-          title={practiceStartBusy ? t('diag.startPracticingBusy') : t('diag.startPracticing')}
-          fullWidth
-          disabled={practiceStartBusy}
-          loading={practiceStartBusy}
-          onPress={() => void startPracticing()}
-          style={styles.primaryAction}
-        />
-        {renderAccountActions()}
-      </ScrollView>
+          {/* Live region gives TalkBack the same level-reveal transition iOS
+            receives through the queued step announcement below. */}
+          <Text
+            accessibilityLiveRegion="polite"
+            accessibilityRole="header"
+            style={styles.congratsTitle}
+          >
+            {t('diag.completeTitle')}
+          </Text>
+          <Text style={styles.congratsText}>{t('diag.levelIntro')}</Text>
+          <View style={styles.levelBadge}>
+            <Text style={styles.levelBadgeText}>{currentLevel}</Text>
+          </View>
+          <Text style={styles.levelExplainText}>{t(`cefr.${currentLevel}`)}</Text>
+          {answers.length > 0 && (
+            <View style={styles.answersCard}>
+              <Text style={styles.answersTitle}>{t('diag.answersTitle')}</Text>
+              {answers.map((answer, index) => (
+                <View key={answer.attemptNo} style={styles.answerSummary}>
+                  <Text style={styles.answerLine}>
+                    {t('diag.answerLine', {
+                      number: index + 1,
+                      score: answer.score,
+                      mark: answer.passed ? '✓' : '✗',
+                    })}
+                  </Text>
+                  <Text style={styles.answerQuestion}>
+                    {t('diag.answerQuestion', {
+                      word: answer.promptWord,
+                      question: answer.questionText,
+                    })}
+                  </Text>
+                  <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
+                  <Text accessibilityLanguage="en-US" selectable style={styles.answerDetail}>
+                    {answer.transcript}
+                  </Text>
+                  <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
+                  <Text accessibilityLanguage="en-US" style={styles.answerDetail}>
+                    {answer.feedback}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )}
+          <Text style={styles.congratsHint}>{t('diag.levelHint')}</Text>
+          <Button
+            title={practiceStartBusy ? t('diag.startPracticingBusy') : t('diag.startPracticing')}
+            fullWidth
+            disabled={practiceStartBusy}
+            loading={practiceStartBusy}
+            onPress={() => void startPracticing()}
+            style={styles.primaryAction}
+          />
+        </ScrollView>
+        {renderAccountFooter()}
+      </View>
     );
   }
 
@@ -836,152 +903,168 @@ export default function DiagnosticScreen() {
 
   // ----- Question view -----
   return (
-    <ScrollView
-      ref={questionScrollRef}
-      contentInsetAdjustmentBehavior="automatic"
-      contentContainerStyle={styles.container}
-    >
-      {showIntro ? (
-        <View style={styles.card}>
-          <Text accessibilityRole="header" style={styles.resultTitle}>
-            {t('diag.introTitle')}
-          </Text>
-          <Text style={styles.introLine}>{t('diag.introWhat')}</Text>
-          {currentProgress && (
-            <Text style={styles.introLine}>
-              {t('diag.introCount', { count: currentProgress.maxQuestions })}
-            </Text>
-          )}
-          <Text style={styles.introLine}>{t('diag.introRecorded')}</Text>
-          <Text style={styles.introLine}>{t('diag.introSpeakEnglish')}</Text>
-          <Button
-            title={t('diag.introStart')}
-            fullWidth
-            onPress={() => setIntroStarted(true)}
-            style={styles.primaryAction}
-          />
-        </View>
-      ) : (
-        <>
-          {currentProgress && (
-            <>
-              <Text style={styles.progressText}>
-                {t('diag.progress', {
-                  current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
-                  max: currentProgress.maxQuestions,
-                })}
-              </Text>
-              <View style={styles.progressBar}>
-                <ProgressBar
-                  progress={
-                    currentProgress.maxQuestions > 0
-                      ? Math.min(1, currentProgress.asked / currentProgress.maxQuestions)
-                      : 0
-                  }
-                  accessibilityLabel={t('header.diagnostic')}
-                  fill={theme.colors.primary}
-                  testID="diagnostic-progress"
-                />
-              </View>
-            </>
-          )}
-
+    <View style={styles.screen}>
+      <ScrollView
+        ref={questionScrollRef}
+        contentInsetAdjustmentBehavior="automatic"
+        contentContainerStyle={styles.container}
+      >
+        {showIntro ? (
           <View style={styles.card}>
-            <Text style={styles.cardLabel}>{t('label.word')}</Text>
-            <Text accessibilityLanguage="en-US" style={styles.promptWord}>
-              {currentQuestion.promptWord}
+            <Text accessibilityRole="header" style={styles.resultTitle}>
+              {t('diag.introTitle')}
             </Text>
-            <Text style={styles.cardLabel}>{t('label.question')}</Text>
-            {/* TalkBack learns a new question was served through this live
+            <Text style={styles.introLine}>{t('diag.introWhat')}</Text>
+            {currentProgress && (
+              <Text style={styles.introLine}>
+                {t('diag.introCount', { count: currentProgress.maxQuestions })}
+              </Text>
+            )}
+            <Text style={styles.introLine}>{t('diag.introRecorded')}</Text>
+            <Text style={styles.introLine}>{t('diag.introSpeakEnglish')}</Text>
+            <Button
+              title={t('diag.introStart')}
+              fullWidth
+              onPress={() => setIntroStarted(true)}
+              style={styles.primaryAction}
+            />
+          </View>
+        ) : (
+          <>
+            {currentProgress && (
+              <>
+                <Text style={styles.progressText}>
+                  {t('diag.progress', {
+                    current: Math.min(currentProgress.asked + 1, currentProgress.maxQuestions),
+                    max: currentProgress.maxQuestions,
+                  })}
+                </Text>
+                <View style={styles.progressBar}>
+                  <ProgressBar
+                    progress={
+                      currentProgress.maxQuestions > 0
+                        ? Math.min(1, currentProgress.asked / currentProgress.maxQuestions)
+                        : 0
+                    }
+                    accessibilityLabel={t('header.diagnostic')}
+                    fill={theme.colors.primary}
+                    testID="diagnostic-progress"
+                  />
+                </View>
+              </>
+            )}
+
+            <View style={styles.card}>
+              <Text style={styles.cardLabel}>{t('label.word')}</Text>
+              <Text accessibilityLanguage="en-US" style={styles.promptWord}>
+                {currentQuestion.promptWord}
+              </Text>
+              <Text style={styles.cardLabel}>{t('label.question')}</Text>
+              {/* TalkBack learns a new question was served through this live
                 region; the announcement effect below covers VoiceOver, which
                 does not implement live regions. */}
-            <Text
-              accessibilityLiveRegion="polite"
-              accessibilityLanguage="en-US"
-              style={styles.questionText}
-            >
-              {currentQuestion.questionText}
-            </Text>
-          </View>
-
-          {currentResult ? (
-            <View accessibilityLiveRegion="polite" style={styles.resultCard}>
-              <Text accessibilityRole="header" style={styles.resultTitle}>
-                {currentResult.noSpeech ? t('diag.noSpeechTitle') : t('diag.answerCheckedTitle')}
+              <Text
+                accessibilityLiveRegion="polite"
+                accessibilityLanguage="en-US"
+                style={styles.questionText}
+              >
+                {currentQuestion.questionText}
               </Text>
-              {currentResult.noSpeech ? (
-                <Text accessibilityLanguage="en-US" style={styles.resultText}>
-                  {currentResult.feedback}
+            </View>
+
+            {currentResult ? (
+              <View accessibilityLiveRegion="polite" style={styles.resultCard}>
+                <Text accessibilityRole="header" style={styles.resultTitle}>
+                  {currentResult.noSpeech ? t('diag.noSpeechTitle') : t('diag.answerCheckedTitle')}
                 </Text>
-              ) : (
-                <>
-                  <Text style={styles.scoreText}>
-                    {t('diag.scoreLine', {
-                      score: currentResult.score,
-                      result: currentResult.passed ? t('diag.passed') : t('diag.notPassed'),
-                    })}
-                  </Text>
-                  <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
-                  <WordTaggedTranscript
-                    transcript={currentResult.transcript}
-                    wordScores={currentResult.wordScores}
-                    accessibilityLanguage="en-US"
-                    testID="diagnostic-word-transcript"
-                  />
-                  <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
-                  <Text accessibilityLanguage="en-US" style={styles.feedbackText}>
+                {currentResult.noSpeech ? (
+                  <Text accessibilityLanguage="en-US" style={styles.resultText}>
                     {currentResult.feedback}
                   </Text>
-                </>
-              )}
-              <Button
-                title={resultActionTitle}
-                fullWidth
-                disabled={resultActionBusy}
-                loading={resultActionBusy}
-                onPress={() => void advance()}
-                style={styles.primaryAction}
-              />
-              {resultActionError && (
-                <Text accessibilityRole="alert" style={styles.resultActionError}>
-                  {t('boundary.body')}
-                </Text>
-              )}
-            </View>
-          ) : (
-            <Recorder
-              ownerId={user.id}
-              questionId={currentQuestion.id}
-              // Mirror the practice screen: a logout already in flight must not
-              // admit a new take while the auth epoch is being torn down. The
-              // state prop disables the visible controls and the ref-backed
-              // guard blocks event-time starts inside the same commit.
-              disabled={logoutBusy}
-              isStartBlocked={() => logoutBusyRef.current}
-              endpoint="/diagnostic/answer"
-              parseResult={parseDiagnosticAnswerResult}
-              onResultWithMetadata={handleResult}
-              onError={handleError}
-              onRecoveryUnresolved={handleRecoveryUnresolved}
-              onInteractionLockChange={handleRecorderLockChange}
-              onExitLockChange={handleRecorderExitLockChange}
-              onExpandedControlsLayout={revealExpandedRecorderControls}
-            />
-          )}
-        </>
-      )}
+                ) : (
+                  <>
+                    <Text style={styles.scoreText}>
+                      {t('diag.scoreLine', {
+                        score: currentResult.score,
+                        result: currentResult.passed ? t('diag.passed') : t('diag.notPassed'),
+                      })}
+                    </Text>
+                    <Text style={styles.resultLabel}>{t('diag.transcriptLabel')}</Text>
+                    <WordTaggedTranscript
+                      transcript={currentResult.transcript}
+                      wordScores={currentResult.wordScores}
+                      accessibilityLanguage="en-US"
+                      testID="diagnostic-word-transcript"
+                    />
+                    <Text style={styles.resultLabel}>{t('feedback.feedbackLabel')}</Text>
+                    <Text accessibilityLanguage="en-US" style={styles.feedbackText}>
+                      {currentResult.feedback}
+                    </Text>
+                  </>
+                )}
+                <Button
+                  title={resultActionTitle}
+                  fullWidth
+                  disabled={resultActionBusy}
+                  loading={resultActionBusy}
+                  onPress={() => void advance()}
+                  style={styles.primaryAction}
+                />
+                {resultActionError && (
+                  <Text accessibilityRole="alert" style={styles.resultActionError}>
+                    {t('boundary.body')}
+                  </Text>
+                )}
+              </View>
+            ) : (
+              <>
+                {rateLimitNotice && (
+                  <View style={styles.rateLimitCard}>
+                    <Text accessibilityRole="alert" style={styles.rateLimitText}>
+                      {rateLimitNotice}
+                    </Text>
+                  </View>
+                )}
+                <Recorder
+                  ownerId={user.id}
+                  questionId={currentQuestion.id}
+                  // Mirror the practice screen: a logout already in flight must not
+                  // admit a new take while the auth epoch is being torn down. The
+                  // state prop disables the visible controls and the ref-backed
+                  // guard blocks event-time starts inside the same commit.
+                  disabled={logoutBusy}
+                  isStartBlocked={() => logoutBusyRef.current}
+                  endpoint="/diagnostic/answer"
+                  parseResult={parseDiagnosticAnswerResult}
+                  onResultWithMetadata={handleResult}
+                  onError={handleError}
+                  onRateLimited={handleRateLimited}
+                  onRecoveryUnresolved={handleRecoveryUnresolved}
+                  onInteractionLockChange={handleRecorderLockChange}
+                  onExitLockChange={handleRecorderExitLockChange}
+                  onExpandedControlsLayout={revealExpandedRecorderControls}
+                />
+              </>
+            )}
+          </>
+        )}
+      </ScrollView>
 
-      {renderAccountActions()}
-    </ScrollView>
+      {renderAccountFooter()}
+    </View>
   );
 }
 
 const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type }) => ({
+  screen: {
+    flex: 1,
+    backgroundColor: colors.background,
+  },
   centerScroll: {
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -1010,7 +1093,26 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
     flexWrap: 'wrap',
     justifyContent: 'center',
     gap: spacing.sm,
-    marginTop: spacing.xl,
+  },
+  accountFooter: {
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    backgroundColor: colors.background,
+    paddingVertical: spacing.sm,
+  },
+  rateLimitCard: {
+    marginTop: spacing.md,
+    backgroundColor: colors.dangerLight,
+    borderColor: colors.danger,
+    borderWidth: 1,
+    borderRadius: radii.input,
+    padding: spacing.md,
+  },
+  rateLimitText: {
+    color: colors.danger,
+    fontSize: 14,
+    lineHeight: 20,
+    textAlign: 'center',
   },
   card: {
     marginTop: spacing.lg,
@@ -1067,7 +1169,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
   resultText: {
     marginTop: spacing.sm,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.muted,
   },
   scoreText: {
@@ -1087,26 +1189,26 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
   transcriptText: {
     marginTop: spacing.xs,
     fontSize: 17,
-    lineHeight: 25,
+    lineHeight: 24,
     color: colors.text,
   },
   feedbackText: {
     marginTop: spacing.xs,
     fontSize: 16,
-    lineHeight: 24,
+    lineHeight: 23,
     color: colors.text,
   },
   resultActionError: {
     marginTop: spacing.md,
     color: colors.danger,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     textAlign: 'center',
   },
   congratsBadge: {
-    width: 84,
-    height: 84,
-    borderRadius: 42,
+    width: layout.outcomeBadge,
+    height: layout.outcomeBadge,
+    borderRadius: layout.outcomeBadge / 2,
     alignItems: 'center',
     justifyContent: 'center',
     backgroundColor: colors.accent,
@@ -1156,7 +1258,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
     alignSelf: 'stretch',
     backgroundColor: colors.card,
     borderRadius: radii.card,
-    padding: spacing.ml,
+    padding: spacing.lg,
     borderWidth: 1,
     borderColor: colors.border,
   },
@@ -1180,17 +1282,17 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing, type 
     marginTop: spacing.xs,
     fontSize: 15,
     fontWeight: '600',
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   answerDetail: {
     marginTop: spacing.xs,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   introLine: {
-    marginTop: 10,
+    marginTop: spacing.sm,
     fontSize: 16,
     lineHeight: 23,
     color: colors.text,

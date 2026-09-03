@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
-  Alert,
+  AccessibilityInfo,
   KeyboardAvoidingView,
   Platform,
   ScrollView,
@@ -12,6 +12,7 @@ import { router, useNavigation } from 'expo-router';
 import { useHeaderHeight } from 'expo-router/react-navigation';
 
 import Button from '../../components/Button';
+import PasswordStrengthMeter from '../../components/PasswordStrengthMeter';
 import PasswordVisibilityToggle from '../../components/PasswordVisibilityToggle';
 import { ApiError, userMessageForError } from '../../lib/api';
 import {
@@ -44,10 +45,14 @@ export default function ChangePasswordScreen() {
   });
   const [focusedField, setFocusedField] = useState<FieldName | null>(null);
   const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const newPasswordRef = useRef<TextInput>(null);
   const confirmPasswordRef = useRef<TextInput>(null);
   const busyRef = useRef(false);
+  // One-shot guard for the post-success Done button: router.back() must never
+  // fire twice off one confirmation, even for a same-frame double press.
+  const donePressedRef = useRef(false);
   const mountedRef = useRef(false);
 
   useLayoutEffect(() => {
@@ -80,16 +85,34 @@ export default function ChangePasswordScreen() {
     passwordPolicyError(newPassword) === null &&
     samePasswordError === null &&
     confirmPassword === newPassword &&
-    !busy;
+    !busy &&
+    !saved;
 
   const toggleVisibility = (field: FieldName) => {
     setVisibleFields((fields) => ({ ...fields, [field]: !fields[field] }));
   };
 
+  // Editing any field retracts a stale summary failure (login pattern): the
+  // learner sees which entry the next submit will actually send.
+  const handleFieldEdit = (field: FieldName, value: string) => {
+    if (field === 'current') setCurrentPassword(value);
+    else if (field === 'next') setNewPassword(value);
+    else setConfirmPassword(value);
+    setError(null);
+  };
+
+  const handleDonePress = () => {
+    // The mounted guard matches the former Alert handler: a stale captured
+    // callback must never navigate a screen that has already gone away.
+    if (donePressedRef.current || !mountedRef.current) return;
+    donePressedRef.current = true;
+    router.back();
+  };
+
   const handleSubmit = async () => {
     // canSubmit reads the render-time `busy`, so two presses landing before
     // React re-renders both pass it. The second would throw out of the auth
-    // transition guard, painting a failure under the success alert and freeing
+    // transition guard, painting a failure over the saved note and freeing
     // the button while the real request is still in flight.
     if (!canSubmit || busyRef.current) return;
     busyRef.current = true;
@@ -99,14 +122,10 @@ export default function ChangePasswordScreen() {
     try {
       await changePassword(currentPassword, newPassword);
       if (!mountedRef.current) return;
-      Alert.alert(t('cp.updatedTitle'), t('cp.updatedBody'), [
-        {
-          text: t('common.ok'),
-          onPress: () => {
-            if (mountedRef.current) router.back();
-          },
-        },
-      ]);
+      // A reversible save confirms inline (the app-wide success-feedback rule):
+      // modal alerts stay reserved for irreversible exits and failures.
+      setSaved(true);
+      AccessibilityInfo.announceForAccessibility(t('cp.updatedBody'));
     } catch (err) {
       if (!mountedRef.current) return;
       if (err instanceof ApiError && err.status === 401) {
@@ -135,7 +154,7 @@ export default function ChangePasswordScreen() {
       <PasswordVisibilityToggle
         visible={visible}
         accessibilityLabel={`${fieldLabel}: ${actionLabel}`}
-        disabled={busy}
+        disabled={busy || saved}
         onToggle={() => toggleVisibility(field)}
       />
     );
@@ -167,7 +186,7 @@ export default function ChangePasswordScreen() {
                 focusedField === 'current' && styles.inputFocused,
               ]}
               value={currentPassword}
-              onChangeText={setCurrentPassword}
+              onChangeText={(value) => handleFieldEdit('current', value)}
               onFocus={() => setFocusedField('current')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('cp.currentPlaceholder')}
@@ -180,7 +199,7 @@ export default function ChangePasswordScreen() {
               returnKeyType="next"
               onSubmitEditing={() => newPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
-              editable={!busy}
+              editable={!busy && !saved}
             />
             {visibilityToggle('current', visibleFields.current)}
           </View>
@@ -201,7 +220,7 @@ export default function ChangePasswordScreen() {
                 focusedField === 'next' && styles.inputFocused,
               ]}
               value={newPassword}
-              onChangeText={setNewPassword}
+              onChangeText={(value) => handleFieldEdit('next', value)}
               onFocus={() => setFocusedField('next')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('signup.passwordPlaceholder')}
@@ -214,10 +233,11 @@ export default function ChangePasswordScreen() {
               returnKeyType="next"
               onSubmitEditing={() => confirmPasswordRef.current?.focus()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
-              editable={!busy}
+              editable={!busy && !saved}
             />
             {visibilityToggle('next', visibleFields.next)}
           </View>
+          <PasswordStrengthMeter password={newPassword} testID="change-password-strength" />
           {newPasswordError && (
             <Text accessibilityLiveRegion="polite" style={styles.fieldError}>
               {newPasswordError}
@@ -240,7 +260,7 @@ export default function ChangePasswordScreen() {
                 focusedField === 'confirm' && styles.inputFocused,
               ]}
               value={confirmPassword}
-              onChangeText={setConfirmPassword}
+              onChangeText={(value) => handleFieldEdit('confirm', value)}
               onFocus={() => setFocusedField('confirm')}
               onBlur={() => setFocusedField(null)}
               placeholder={t('cp.confirmPlaceholder')}
@@ -253,7 +273,7 @@ export default function ChangePasswordScreen() {
               returnKeyType="done"
               onSubmitEditing={() => void handleSubmit()}
               maxLength={MAX_PASSWORD_UTF8_BYTES}
-              editable={!busy}
+              editable={!busy && !saved}
             />
             {visibilityToggle('confirm', visibleFields.confirm)}
           </View>
@@ -269,11 +289,15 @@ export default function ChangePasswordScreen() {
             </Text>
           )}
 
+          {/* The explicit announceForAccessibility call owns the success
+              announcement; a live region here would double-speak on Android. */}
+          {saved && <Text style={styles.savedNote}>{t('cp.updatedBody')}</Text>}
+
           <Button
-            title={busy ? t('cp.submitBusy') : t('cp.submit')}
-            disabled={!canSubmit}
+            title={saved ? t('cp.done') : busy ? t('cp.submitBusy') : t('cp.submit')}
+            disabled={saved ? false : !canSubmit}
             loading={busy}
-            onPress={() => void handleSubmit()}
+            onPress={saved ? handleDonePress : () => void handleSubmit()}
             style={styles.submitButton}
           />
         </View>
@@ -289,7 +313,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   },
   container: {
     flexGrow: 1,
-    padding: spacing.xl,
+    padding: layout.screenPadding,
   },
   form: {
     backgroundColor: colors.card,
@@ -305,7 +329,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontSize: 14,
     fontWeight: '600',
     color: colors.text,
-    marginBottom: 6,
+    marginBottom: spacing.sm,
     marginTop: spacing.md,
   },
   input: {
@@ -332,15 +356,20 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     minWidth: 0,
   },
   fieldError: {
-    marginTop: 6,
+    marginTop: spacing.sm,
     color: colors.danger,
     fontSize: 13,
   },
   error: {
-    marginTop: 14,
+    marginTop: spacing.md,
     color: colors.danger,
     fontSize: 14,
     textAlign: 'center',
+  },
+  savedNote: {
+    marginTop: spacing.sm,
+    color: colors.success,
+    fontSize: 13,
   },
   submitButton: {
     marginTop: spacing.lg,

@@ -21,31 +21,16 @@ import OfflineState from '../../components/OfflineState';
 import RecordingPlayback from '../../components/RecordingPlayback';
 import { apiGetPracticeHistory, userMessageForError } from '../../lib/api';
 import { useAuth } from '../../lib/auth';
-import { useI18n, type Translator, type UiLanguage } from '../../lib/i18n';
+import { useI18n, type Translator } from '../../lib/i18n';
+import { NATIVE_LANGUAGE_LOCALES, UI_LANGUAGE_LOCALES } from '../../lib/language-options';
 import { createThemedStyles, useTheme } from '../../lib/theme';
+import { useHardwareBack } from '../../lib/use-hardware-back';
 import {
   PRACTICE_MASTER_SCORE,
   PRACTICE_PASS_SCORE,
   type HistoryItem,
   type HistoryPage,
-  type NativeLanguage,
 } from '../../lib/types';
-
-/** BCP-47 tags for day headings, matching the app's UI languages. */
-const DATE_LOCALES: Record<UiLanguage, string> = {
-  en: 'en-US',
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
-
-const NATIVE_ACCESSIBILITY_LANGUAGES: Record<NativeLanguage, string> = {
-  te: 'te-IN',
-  hi: 'hi-IN',
-  es: 'es-ES',
-  zh: 'zh-Hans',
-};
 
 interface DaySection {
   title: string;
@@ -206,7 +191,7 @@ function HistoryRow({ item, ownerId, t }: { item: HistoryItem; ownerId: string; 
               </Text>
               <Text
                 accessibilityLanguage={
-                  native ? NATIVE_ACCESSIBILITY_LANGUAGES[item.nativeLanguage!] : 'en-US'
+                  native ? NATIVE_LANGUAGE_LOCALES[item.nativeLanguage!] : 'en-US'
                 }
                 selectable
                 style={styles.transcript}
@@ -288,6 +273,13 @@ export default function HistoryScreen() {
     router.navigate('/practice');
   }, [isSessionLeaseCurrent, sessionLease]);
 
+  // History is the root of its tab: while the entry gate is still beneath it,
+  // Android hardware back must not pop back onto the gate (which would
+  // immediately redirect into the signed-in area). With nothing left to pop the
+  // press falls through instead of being swallowed, so Android's own "back at
+  // the task root leaves the app" behavior still works.
+  useHardwareBack(() => router.canGoBack());
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -314,7 +306,7 @@ export default function HistoryScreen() {
     [historyQuery.data],
   );
   const sections = useMemo(
-    () => groupHistoryByDay(items, DATE_LOCALES[language]),
+    () => groupHistoryByDay(items, UI_LANGUAGE_LOCALES[language]),
     [items, language],
   );
   const historyAdAnchorId = items[7]?.id ?? null;
@@ -359,6 +351,7 @@ export default function HistoryScreen() {
         </Text>
         <Button
           title={t('common.tryAgain')}
+          fullWidth
           onPress={() => void historyQuery.refetch({ cancelRefetch: false })}
           style={styles.retryButton}
         />
@@ -544,7 +537,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flexGrow: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    padding: spacing.xl,
+    padding: layout.screenPadding,
     width: '100%',
     maxWidth: layout.contentMaxWidth,
     alignSelf: 'center',
@@ -579,14 +572,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     fontWeight: '700',
     color: colors.muted,
     textTransform: 'uppercase',
-    letterSpacing: 0.6,
+    letterSpacing: 0.8,
   },
   row: {
     backgroundColor: colors.card,
     borderRadius: radii.card,
     borderWidth: 1,
     borderColor: colors.border,
-    marginBottom: spacing.sm,
+    marginBottom: spacing.md,
     overflow: 'hidden',
   },
   rowHeader: {
@@ -595,7 +588,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     alignItems: 'center',
     justifyContent: 'space-between',
     gap: spacing.sm,
-    padding: 14,
+    padding: spacing.lg,
   },
   rowHeaderPressed: {
     backgroundColor: colors.background,
@@ -604,7 +597,7 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     flex: 1,
   },
   promptWord: {
-    fontSize: 18,
+    fontSize: 20,
     fontWeight: '800',
     color: colors.text,
   },
@@ -680,8 +673,8 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
     color: colors.primary,
   },
   rowDetails: {
-    paddingHorizontal: 14,
-    paddingBottom: 14,
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.lg,
     borderTopWidth: 1,
     borderTopColor: colors.border,
   },
@@ -696,14 +689,14 @@ const themedStyles = createThemedStyles(({ colors, layout, radii, spacing }) => 
   detailText: {
     marginTop: spacing.xs,
     fontSize: 15,
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   transcript: {
     marginTop: spacing.xs,
     fontSize: 15,
     fontStyle: 'italic',
-    lineHeight: 22,
+    lineHeight: 21,
     color: colors.text,
   },
   footer: {

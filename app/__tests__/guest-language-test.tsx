@@ -326,8 +326,8 @@ describe('public app-language picker', () => {
       );
       expect(screen.getByTestId(`ui-language-${language}`).props.accessibilityState).toEqual({
         checked: true,
-        selected: true,
         disabled: false,
+        busy: false,
       });
     },
   );
@@ -569,11 +569,11 @@ describe('UiLanguagePicker presentation', () => {
     expect(screen.getByRole('radio', { name: 'App language: Chinese, 简体中文' })).toBeTruthy();
 
     const te = screen.getByTestId('ui-language-te');
-    expect(te.props.accessibilityState).toEqual({ checked: true, selected: true, disabled: false });
+    expect(te.props.accessibilityState).toEqual({ checked: true, disabled: false, busy: false });
     expect(screen.getByTestId('ui-language-en').props.accessibilityState).toEqual({
       checked: false,
-      selected: false,
       disabled: false,
+      busy: false,
     });
     // Exactly the selected chip wears the selected fill and border.
     expect(StyleSheet.flatten(te.props.style)).toMatchObject({
@@ -592,7 +592,7 @@ describe('UiLanguagePicker presentation', () => {
       flexBasis: '30%',
       maxWidth: '48%',
       paddingHorizontal: theme.spacing.sm,
-      paddingVertical: theme.spacing.sm,
+      paddingVertical: theme.spacing.md,
     });
     // Grid and container composition.
     expect(StyleSheet.flatten(group.props.style)).toMatchObject({
@@ -641,7 +641,7 @@ describe('UiLanguagePicker presentation', () => {
       ),
     ).toMatchObject({
       color: theme.colors.text,
-      fontSize: 14,
+      fontSize: 17,
       fontWeight: '700',
       textAlign: 'center',
     });
@@ -649,7 +649,7 @@ describe('UiLanguagePicker presentation', () => {
       StyleSheet.flatten(
         (te.children[1] as unknown as { props: { style: unknown[] } }).props.style,
       ),
-    ).toMatchObject({ marginTop: 1, color: theme.colors.muted, fontSize: 11, textAlign: 'center' });
+    ).toMatchObject({ marginTop: 2, color: theme.colors.muted, fontSize: 13, textAlign: 'center' });
     // The selected English chip inks both names with the primary color.
     expect(
       StyleSheet.flatten(
@@ -662,7 +662,7 @@ describe('UiLanguagePicker presentation', () => {
     const theme = await lightTheme();
     await render(<StyledPickerHarness value="te" disabled />);
     const te = screen.getByTestId('ui-language-te');
-    expect(te.props.accessibilityState).toEqual({ checked: true, selected: true, disabled: true });
+    expect(te.props.accessibilityState).toEqual({ checked: true, disabled: true, busy: false });
     expect(StyleSheet.flatten(te.props.style)).toMatchObject({ opacity: 0.5 });
     expect(StyleSheet.flatten(screen.getByTestId('ui-language-en').props.style)).toMatchObject({
       opacity: 0.5,

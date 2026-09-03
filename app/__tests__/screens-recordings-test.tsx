@@ -6,7 +6,7 @@ import {
 } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { FlatList, StyleSheet } from 'react-native';
+import { BackHandler, FlatList, StyleSheet } from 'react-native';
 
 import RecordingsScreen, {
   formatRecordingDuration,
@@ -68,6 +68,24 @@ jest.mock('react-native', () => {
     },
   });
 });
+
+jest.mock('expo-router', () => ({
+  router: {
+    push: jest.fn(),
+    navigate: jest.fn(),
+    replace: jest.fn(),
+    back: jest.fn(),
+    dismissTo: jest.fn(),
+    canGoBack: jest.fn(),
+  },
+  useFocusEffect: (callback: () => void | (() => void)) => {
+    const ReactActual = jest.requireActual<typeof import('react')>('react');
+    ReactActual.useEffect(() => {
+      const cleanup = callback();
+      return typeof cleanup === 'function' ? cleanup : undefined;
+    }, [callback]);
+  },
+}));
 
 const USER: User = {
   id: '550e8400-e29b-41d4-a716-446655440000',
@@ -176,7 +194,7 @@ function expectScrollableState(empty = false): void {
           flexGrow: 1,
           alignItems: 'center',
           justifyContent: 'center',
-          padding: spacing.xl,
+          padding: layout.screenPadding,
           width: '100%',
           maxWidth: layout.contentMaxWidth,
           alignSelf: 'center',
@@ -262,6 +280,22 @@ describe('recordings library', () => {
     expect(apiGetRecordings).not.toHaveBeenCalled();
   });
 
+  it('previews the list as card skeletons while the first page loads', async () => {
+    asMock(apiGetRecordings).mockReturnValue(new Promise(() => undefined));
+    await renderRecordings();
+
+    const hidden = { includeHiddenElements: true } as const;
+    // The wait is politely announced by a visually hidden live-region line...
+    expect(screen.getByText(t('recordings.loading'), hidden).props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
+    // ...while a header bar plus three recording-card blocks mirror the loaded
+    // list (the same twin treatment History's first load uses).
+    expect(screen.getByTestId('recordings-skeleton-header', hidden)).toBeTruthy();
+    expect(screen.getAllByTestId('recordings-skeleton-card', hidden)).toHaveLength(3);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('pins locale, formatting, pagination-boundary, and visual-style contracts', () => {
     expect(RECORDING_DATE_LOCALES).toEqual({
       en: 'en-US',
@@ -331,7 +365,7 @@ describe('recordings library', () => {
         flexGrow: 1,
         alignItems: 'center',
         justifyContent: 'center',
-        padding: spacing.xl,
+        padding: layout.screenPadding,
         width: '100%',
         maxWidth: layout.contentMaxWidth,
         alignSelf: 'center',
@@ -339,8 +373,8 @@ describe('recordings library', () => {
       },
       title: {
         color: lightColors.text,
-        fontSize: 22,
-        fontWeight: '800',
+        fontSize: 20,
+        fontWeight: '700',
         textAlign: 'center',
       },
       muted: {
@@ -351,7 +385,7 @@ describe('recordings library', () => {
       },
       action: { marginTop: spacing.lg },
       intro: { marginBottom: spacing.lg, gap: spacing.sm },
-      introText: { color: lightColors.muted, fontSize: 15, lineHeight: 22 },
+      introText: { color: lightColors.muted, fontSize: 15, lineHeight: 21 },
       card: {
         marginBottom: spacing.md,
         padding: spacing.lg,
@@ -385,6 +419,8 @@ describe('recordings library', () => {
       },
       metadataText: { color: lightColors.muted, fontSize: 13 },
       footer: { paddingVertical: spacing.xl, alignItems: 'center' },
+      listSkeleton: { alignSelf: 'stretch', gap: spacing.sm },
+      hiddenLoadingText: { height: 0, opacity: 0 },
     });
   });
 
@@ -438,8 +474,10 @@ describe('recordings library', () => {
       }),
     );
     const loading = await renderRecordings();
-    expect(screen.getByText(t('recordings.loading')).props.accessibilityLiveRegion).toBe('polite');
-    expect(screen.getByLabelText(t('recordings.loading'))).toBeTruthy();
+    const hidden = { includeHiddenElements: true } as const;
+    expect(screen.getByText(t('recordings.loading'), hidden).props.accessibilityLiveRegion).toBe(
+      'polite',
+    );
     expectScrollableState();
     resolve({ items: [], nextCursor: null });
     await waitFor(() =>
@@ -463,7 +501,14 @@ describe('recordings library', () => {
         'header',
       ),
     );
-    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
+    // The failure copy is an assertive live region (not a role=alert text) so
+    // screen readers announce the replacement of the loading skeletons.
+    expect(screen.getByText(t('recordings.loadFailed')).props.accessibilityLiveRegion).toBe(
+      'assertive',
+    );
+    expect(
+      StyleSheet.flatten(screen.getByRole('button', { name: t('common.tryAgain') }).props.style),
+    ).toMatchObject({ alignSelf: 'stretch', marginTop: spacing.lg });
     expectScrollableState();
     asMock(apiGetRecordings).mockResolvedValueOnce({ items: [], nextCursor: null });
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
@@ -682,9 +727,16 @@ describe('recordings library', () => {
       expect(screen.getByRole('button', { name: t('recordings.loadMore') })).toBeTruthy(),
     );
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
-    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
-    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.loadFailed'));
+    await waitFor(() =>
+      expect(screen.getByText(t('recordings.loadFailed')).props.accessibilityLiveRegion).toBe(
+        'assertive',
+      ),
+    );
     expect(screen.getByText('courage')).toBeTruthy();
+    // The footer retry is a full-width secondary action under the message.
+    expect(
+      StyleSheet.flatten(screen.getByRole('button', { name: t('common.tryAgain') }).props.style),
+    ).toMatchObject({ alignSelf: 'stretch' });
     await act(async () => asMock(FlatList).mock.calls.at(-1)?.[0].onEndReached());
     expect(apiGetRecordings).toHaveBeenCalledTimes(2);
     await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
@@ -952,5 +1004,48 @@ describe('recordings library', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(screen.queryByText(t('refresh.failedUsingSaved'))).toBeNull());
+  });
+});
+
+describe('recordings Android hardware back', () => {
+  const backHandlers: (() => boolean)[] = [];
+  let backHandlerSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    backHandlers.length = 0;
+    backHandlerSpy = jest
+      .spyOn(BackHandler, 'addEventListener')
+      .mockImplementation((_event, handler) => {
+        backHandlers.push(handler as () => boolean);
+        return { remove: jest.fn() };
+      });
+  });
+
+  afterEach(() => {
+    backHandlerSpy.mockRestore();
+  });
+
+  it('consumes the back press while the entry gate is still beneath Recordings', async () => {
+    asMock(jest.requireMock('expo-router').router.canGoBack).mockReturnValue(true);
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
+    await renderRecordings();
+    await waitFor(() => expect(screen.queryByText(t('recordings.loading'))).toBeNull());
+
+    expect(backHandlers.length).toBeGreaterThan(0);
+    // Popping would land on the gate, which redirects straight back into the
+    // signed-in area.
+    expect(backHandlers[backHandlers.length - 1]()).toBe(true);
+  });
+
+  it('lets the back press fall through when Recordings is the whole stack', async () => {
+    asMock(jest.requireMock('expo-router').router.canGoBack).mockReturnValue(false);
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
+    await renderRecordings();
+    await waitFor(() => expect(screen.queryByText(t('recordings.loading'))).toBeNull());
+
+    // Nothing to pop: swallowing the press would make back a dead key, since
+    // React Native only reaches its exit-the-app default when no handler
+    // claims the press.
+    expect(backHandlers[backHandlers.length - 1]()).toBe(false);
   });
 });

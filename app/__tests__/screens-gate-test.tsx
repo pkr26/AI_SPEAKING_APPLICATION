@@ -574,6 +574,7 @@ describe('root layout route guards', () => {
       headerTintColor: colors.text,
       headerStyle: { backgroundColor: colors.background },
       headerShadowVisible: false,
+      headerTitleAlign: 'center',
       contentStyle: { backgroundColor: colors.background },
     });
   });
@@ -590,6 +591,7 @@ describe('root layout route guards', () => {
       headerTintColor: darkColors.text,
       headerStyle: { backgroundColor: darkColors.background },
       headerShadowVisible: false,
+      headerTitleAlign: 'center',
       contentStyle: { backgroundColor: darkColors.background },
     });
   });
@@ -860,7 +862,7 @@ describe('root fallback screens', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
     });
     expect(flattenedStyle(card)).toEqual({
       width: '100%',
@@ -869,17 +871,17 @@ describe('root fallback screens', () => {
       borderColor: colors.border,
       borderRadius: radii.card,
       backgroundColor: colors.card,
-      padding: spacing.xl,
+      padding: spacing.lg,
       alignItems: 'center',
     });
     expect(flattenedStyle(title)).toEqual({
       color: colors.text,
-      fontSize: 24,
+      fontSize: 20,
       fontWeight: '800',
       textAlign: 'center',
     });
     expect(flattenedStyle(screen.getByRole('alert'))).toEqual({
-      marginTop: 10,
+      marginTop: spacing.sm,
       color: colors.muted,
       fontSize: 16,
       lineHeight: 23,
@@ -938,7 +940,7 @@ describe('root fallback screens', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
     });
     expect(flattenedStyle(card)).toEqual({
       width: '100%',
@@ -948,7 +950,7 @@ describe('root fallback screens', () => {
       borderColor: colors.border,
       borderRadius: radii.card,
       backgroundColor: colors.card,
-      padding: spacing.xl,
+      padding: spacing.lg,
     });
     expect(flattenedStyle(body)).toEqual({
       color: colors.muted,
@@ -1263,7 +1265,7 @@ describe('index gate', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
     });
     expect(flattenedStyle(title)).toEqual({
       fontSize: 20,
@@ -1304,7 +1306,7 @@ describe('index gate', () => {
       flexGrow: 1,
       alignItems: 'center',
       justifyContent: 'center',
-      padding: spacing.xl,
+      padding: layout.screenPadding,
     });
     expect(flattenedStyle(label)).toEqual({
       marginTop: spacing.md,

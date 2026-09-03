@@ -631,7 +631,9 @@ describe('errorHandler', () => {
 
     const other = await request(buildApp()).get('/multer-other');
     expect(other.status).toBe(400);
-    expect(other.body).toEqual({ error: 'Too many fields', code: 'VALIDATION_FAILED' });
+    // Static message by design: multer embeds the client-controlled field
+    // name in LIMIT_UNEXPECTED_FILE text, so it must not be reflected.
+    expect(other.body).toEqual({ error: 'Invalid multipart upload', code: 'VALIDATION_FAILED' });
   });
 
   it('maps malformed JSON bodies to 400 instead of a misleading 500', async () => {

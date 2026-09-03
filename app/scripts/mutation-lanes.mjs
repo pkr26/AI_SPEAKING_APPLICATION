@@ -46,6 +46,7 @@ export const mutationLanes = Object.freeze({
   ),
   guestLanguage: lane(
     [
+      'src/components/LanguageChipGrid.tsx',
       'src/components/UiLanguagePicker.tsx',
       'src/lib/guest-language.tsx',
       'src/lib/language-options.ts',
@@ -219,7 +220,6 @@ export const mutationLanes = Object.freeze({
   diagnostic: lane(['src/app/diagnostic.tsx'], ['__tests__/screens-diagnostic-test.tsx']),
   practice: lane(
     [
-      'src/app/(tabs)/practice/attempt.tsx',
       'src/app/(tabs)/practice/feedback.tsx',
       'src/app/(tabs)/practice/help.tsx',
       'src/app/(tabs)/practice/index.tsx',

@@ -212,13 +212,12 @@ test('checked-in discovery is exhaustive and lane-owned for both JSX modes', asy
     appDir: appDirectory,
     mode: 'accessibility',
   });
-  // +3 event sites from the audit remediation (welcome login link, tab-bar
-  // presses, password submit-reveal wrappers).
-  assert.equal(eventSites.length, 224);
-  // +23 sites from the audit remediation: per-chip word/status labels and
-  // tablist/hint/disabled states on the tab bar, the submit-reveal wrappers,
-  // and Dynamic Type caps on the score ring.
-  assert.equal(accessibilitySites.length, 369);
+  // Six sites below the audit-remediation count: the deleted orphaned
+  // attempt screen carried that many authored JSX callbacks.
+  assert.equal(eventSites.length, 215);
+  // Nine sites below the audit-remediation count: the deleted orphaned
+  // attempt screen carried that many authored accessibility props.
+  assert.equal(accessibilitySites.length, 360);
   for (const sites of [eventSites, accessibilitySites]) {
     assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
     assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));

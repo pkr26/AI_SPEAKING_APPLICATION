@@ -1352,43 +1352,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     locations: exactLocations(780, 49, 780, 57, 780, 60, 780, 69),
   },
   {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The mount layout effect receives a constant dependency literal, preserving its setup and cleanup lifetime.',
-    locations: exactLocations(119, 6, 119, 8),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['!user ||\n      !validQuestionId ||'],
-    replacements: ['false'],
-    reason:
-      'Recorder onResult is rendered only after user and the UUID question parameter pass their route gates, so this leading subgroup remains false even though later cycle/content guards were added.',
-    locations: exactLocations(257, 7, 258, 23),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'LogicalOperator',
-    originals: ['!user ||\n      !validQuestionId ||'],
-    replacements: ['!user && !validQuestionId'],
-    reason:
-      'Recorder onResult is rendered only after user and the UUID question parameter pass their route gates; changing this constant-false OR subgroup to AND cannot alter the full guard.',
-    locations: exactLocations(257, 7, 258, 23),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'StringLiteral',
-    originals: ["key={`${validCycleId}:${nativeMode ? 'native' : 'english'}`}"],
-    replacements: ['""'],
-    count: 2,
-    reason:
-      'The Recorder is its parent view’s only child. The cycle prefix remains unchanged and either emptied mode branch stays distinct from its sibling, so remount behavior is identical.',
-    locations: exactLocations(474, 48, 474, 56, 474, 59, 474, 68),
-  },
-  {
     file: 'src/app/settings/index.tsx',
     mutator: 'StringLiteral',
     originals: ["const canonicalName = user?.name ?? '';"],
@@ -2497,119 +2460,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     reason:
       'questionQueryKey is the complete three-element practice-question key and the app creates no descendant key, so exact and prefix cancellation match the same query.',
     locations: exactLocations(438, 73, 438, 77),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'ObjectLiteral',
-    originals: ['}>({ owner: null, locked: false });'],
-    replacements: ['{}'],
-    reason:
-      'Undefined owner/locked fields behave like null/false until the first full lock update, and the initial object is never partially merged.',
-    locations: exactLocations(49, 6, 49, 36),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['}>({ owner: null, locked: false });'],
-    replacements: ['true'],
-    reason:
-      'With valid help recorderOwner is non-null, so owner:null cannot report locked; invalid/loading renders expose no switch, and header publication reads recorderLockedRef, not this state field.',
-    locations: exactLocations(49, 29, 49, 34),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const recorderLockedRef = useRef(false);'],
-    replacements: ['true'],
-    reason:
-      'The Recorder-owner layout effect resets the interaction-lock ref before the Recorder or language switch can consume its render-time seed.',
-    locations: exactLocations(52, 36, 52, 41),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const mountedRef = useRef(true);', 'const navigationStartedRef = useRef(true);'],
-    replacements: ['false'],
-    count: 2,
-    reason:
-      'The mount and focus effects establish the authoritative values before interaction; before focus, focusedRef independently rejects every action.',
-    locations: exactLocations(61, 29, 61, 33, 63, 39, 63, 43),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'StringLiteral',
-    originals: ["const renderOwner = `${sessionVersion}:${userId ?? 'anonymous'}`;"],
-    replacements: ['""'],
-    reason:
-      'Only the no-user fallback changes; the protected screen returns null without a user and signed-in UUIDs retain their real identity segment.',
-    locations: exactLocations(91, 54, 91, 65),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'StringLiteral',
-    originals: [
-      "? `${renderOwner}:${validQuestionId}:${validCycleId}:${nativeMode ? 'native' : 'english'}`",
-    ],
-    replacements: ['""'],
-    count: 2,
-    reason:
-      'The cycle-aware owner keeps owner/session/question/cycle segments unchanged. Emptying either mode suffix still leaves native and English owners distinct, and the owner string is otherwise opaque.',
-    locations: exactLocations(99, 75, 99, 83, 99, 86, 99, 95),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['mountedRef.current = false;', 'focusedRef.current = false;'],
-    replacements: ['true'],
-    count: 2,
-    reason:
-      'Each individual cleanup mutation leaves another lifecycle fence false and clears active Recorder ownership, so stale callbacks remain rejected.',
-    locations: exactLocations(112, 28, 112, 33, 113, 28, 113, 33),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['navigationStartedRef.current = true;'],
-    replacements: ['false'],
-    reason:
-      'The cleanup already makes mounted/focused ownership false, and refocus writes the latch false before interaction resumes.',
-    locations: exactLocations(114, 38, 114, 42),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),'],
-    replacements: ['true'],
-    reason:
-      'A Recorder callback exists only after a UUID parameter and help content have produced a rendered Recorder with a non-null owner.',
-    locations: exactLocations(136, 7, 136, 21),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['navigationStartedRef.current = true;'],
-    replacements: ['false'],
-    reason:
-      'During focus cleanup focusedRef is already false, and focus setup writes the navigation latch false before actions become valid again.',
-    locations: exactLocations(161, 40, 161, 44),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['void queryClient.cancelQueries({ queryKey: practiceQuestionKey, exact: true });'],
-    replacements: ['false'],
-    reason:
-      'practiceQuestionKey is a complete three-element leaf key with no descendants, making exact and prefix cancellation identical.',
-    locations: exactLocations(274, 76, 274, 80),
-  },
-  {
-    file: 'src/app/(tabs)/practice/attempt.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['recoveryExitRef.current === owner'],
-    replacements: ['false'],
-    reason:
-      'A recovery exit sets navigationStarted in the same synchronous claim and both latches reset with Recorder ownership, so navigation independently deduplicates it.',
-    locations: exactLocations(310, 7, 310, 40),
   },
   {
     file: 'src/app/(tabs)/practice/feedback.tsx',
@@ -5365,8 +5215,6 @@ export const equivalentMutantSourceHashes = Object.freeze({
   'src/app/(auth)/signup.tsx': '43d01b18d18a3e66196608349fb49c2444dea392305912c8f761c96880741464',
   'src/app/(tabs)/history.tsx': 'bf2b9583ceb92d94dac9acacd11322f8be5544dd49fd1ecb6fbaaa4cb66c9cd5',
   'src/app/(tabs)/home.tsx': 'f58828b066e1995b399da32a69cb7a010cffb2c80877a99fd5d911881d051608',
-  'src/app/(tabs)/practice/attempt.tsx':
-    '116802db9c79560393941a51f4f21b866ff2c4b74f7807bf5af779c8d0af477b',
   'src/app/(tabs)/practice/feedback.tsx':
     '4835379e7f8e332aad6f1b2563ea0a935e7204a32e2ca5c7dcbc04bc11be84ac',
   'src/app/(tabs)/practice/help.tsx':

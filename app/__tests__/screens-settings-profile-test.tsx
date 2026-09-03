@@ -3,7 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { Directory, File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import React from 'react';
-import { Alert, AppState, type AppStateStatus, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Alert, AppState, type AppStateStatus, StyleSheet } from 'react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 
 import SettingsScreen, {
@@ -3382,6 +3382,285 @@ describe('account actions', () => {
         .accessibilityState,
     ).toEqual({ disabled: false, busy: false });
     expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+  });
+
+  it('renders the destructive data rows without a premature success banner', async () => {
+    await renderSettings();
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    const help = screen.getByText(t('settings.exportHelp'));
+    expect(flattenedStyle(help)).toEqual({
+      marginTop: spacing.sm,
+      marginBottom: spacing.sm,
+      color: colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
+    });
+    const deleteRow = screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+    expect(flattenedStyle(deleteRow)).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
+      minHeight: layout.minimumTarget,
+      justifyContent: 'center',
+      paddingVertical: spacing.md,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    });
+  });
+
+  it('keeps the destructive row visually busy without a success banner until the deletion lands', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibility')
+      .mockImplementation(() => undefined);
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('settings.recordingsDeleteAllBusy') })),
+    ).toMatchObject({ opacity: 0.5 });
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    expect(announceSpy).not.toHaveBeenCalled();
+
+    await act(async () => request.resolve(undefined));
+    expect(await screen.findByText(t('settings.recordingsDeleteAllSuccess'))).toBeTruthy();
+    expect(announceSpy).toHaveBeenCalledWith(t('settings.recordingsDeleteAllSuccess'));
+    announceSpy.mockRestore();
+  });
+
+  it('blocks the bulk delete behind an in-flight data export', async () => {
+    mockConsumeExportPages.mockImplementation(() => new Promise<void>(() => undefined));
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    await waitFor(() => expect(screen.getByText(t('settings.exportBusy'))).toBeTruthy());
+
+    // The busy screen never even opens the destructive confirmation.
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockDeleteAllRecordings).not.toHaveBeenCalled();
+  });
+
+  it('drops a bulk deletion success across an identity boundary', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibility')
+      .mockImplementation(() => undefined);
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    const client = makeQueryClient();
+    const invalidate = jest.spyOn(client, 'invalidateQueries');
+    const view = await renderSettings(client);
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerenderSettings();
+    invalidate.mockClear();
+
+    await act(async () => request.resolve(undefined));
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    expect(announceSpy).not.toHaveBeenCalled();
+    expect(invalidate).not.toHaveBeenCalled();
+    announceSpy.mockRestore();
+  });
+
+  it('drops a stale bulk-delete failure after an identity boundary', async () => {
+    const failure = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(failure.promise);
+    const view = await renderSettings();
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerenderSettings();
+    await act(async () => failure.reject(new Error('stale delete failed')));
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }).props
+        .accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+  });
+
+  it('ignores a replaced bulk-delete confirmation frame', async () => {
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+
+    await fireEvent.press(row());
+    const staleButtons = latestAlertButtons();
+    const staleConfirm = staleButtons.find(
+      (button) => button.text === t('settings.recordingsDeleteAllConfirm'),
+    )?.onPress;
+    const staleCancel = staleButtons.find((button) => button.text === t('common.cancel'))?.onPress;
+    expect(staleConfirm).toEqual(expect.any(Function));
+    expect(staleCancel).toEqual(expect.any(Function));
+    await pressAlertButton(t('common.cancel'));
+
+    await fireEvent.press(row());
+    await act(async () => staleCancel!());
+    // A replaced frame's cancel may not close the live confirmation.
+    expect(row().props.accessibilityState).toMatchObject({ disabled: true });
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+
+    alertSpy.mockClear();
+    mockDeleteAllRecordings.mockClear();
+    await act(async () => staleConfirm!());
+    expect(mockDeleteAllRecordings).not.toHaveBeenCalled();
+  });
+
+  it('shows the local sign-out busy state, dedupes repeat Alert presses, and releases after failure', async () => {
+    const request = deferred<void>();
+    const signOutThisDevice = jest.fn(() => request.promise);
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+    });
+    await renderSettings();
+    const logoutRow = () => screen.getByRole('button', { name: t('common.logOut') });
+
+    await fireEvent.press(logoutRow());
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    await pressAlertButton(t('logout.thisDevice'));
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+    expect(logoutRow().props.accessibilityState).toMatchObject({ busy: true });
+
+    await pressAlertButton(t('logout.thisDevice'));
+    expect(signOutThisDevice).toHaveBeenCalledTimes(1);
+
+    await act(async () => request.reject(new Error('offline')));
+    await waitFor(() =>
+      expect(logoutRow().props.accessibilityState).toMatchObject({ busy: false }),
+    );
+  });
+
+  it('drops a local sign-out failure after the screen unmounts', async () => {
+    const request = deferred<void>();
+    const signOutThisDevice = jest.fn(() => request.promise);
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+    });
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('logout.thisDevice'));
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+    await view.unmount();
+
+    await act(async () => request.reject(new Error('offline')));
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it('authorizes local sign-out through the identity-only lease view', async () => {
+    const strictLease = { owner: 'settings-signout' } as never;
+    let currentLease: unknown = strictLease;
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn(
+        (lease: unknown, options?: { identityOnly?: boolean }) =>
+          options?.identityOnly === true || lease === currentLease,
+      ),
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(1));
+    currentLease = { owner: 'replacement' };
+    await pressAlertButton(t('logout.thisDevice'));
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+  });
+
+  it('holds a UI-language device-mirror failure behind the identity that started it', async () => {
+    const update = deferred<User>();
+    const mirror = deferred<void>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    mockMirrorAccountLanguage.mockReturnValue(mirror.promise);
+    const view = await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(1));
+    expect(mockUpdateProfile).toHaveBeenCalledTimes(1);
+    await act(async () => update.resolve({ ...USER, uiLanguage: 'te' }));
+    await waitFor(() => expect(mockMirrorAccountLanguage).toHaveBeenCalledTimes(1));
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerenderSettings();
+    await act(async () => mirror.reject(new Error('keychain unavailable')));
+    // The failure copy is authored in the language that was being applied.
+    expect(screen.queryByText(translateFor('te', 'language.saveFailed'))).toBeNull();
+    expect(screen.queryByText(t('language.saveFailed'))).toBeNull();
+  });
+
+  it('holds a UI-language reminder rebuild behind the identity that started it', async () => {
+    const update = deferred<User>();
+    const mirror = deferred<void>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    mockMirrorAccountLanguage.mockReturnValue(mirror.promise);
+    mockRefreshReminderLanguage.mockClear();
+    const view = await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(1));
+    await act(async () => update.resolve({ ...USER, uiLanguage: 'te' }));
+    await waitFor(() => expect(mockMirrorAccountLanguage).toHaveBeenCalledTimes(1));
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await view.rerenderSettings();
+    await act(async () => mirror.resolve(undefined));
+    expect(mockRefreshReminderLanguage).not.toHaveBeenCalled();
+  });
+
+  it('reconciles the reminder only on genuine foreground returns', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', { configurable: true, value: 'active' });
+    let onAppStateChange: ((state: AppStateStatus) => void) | undefined;
+    const remove = jest.fn();
+    const listener = jest.spyOn(AppState, 'addEventListener').mockImplementation((_event, next) => {
+      onAppStateChange = next;
+      return { remove } as ReturnType<typeof AppState.addEventListener>;
+    });
+    mockGetReminder.mockResolvedValue({ hour: 8 });
+
+    try {
+      const view = await renderSettings();
+      await waitFor(() => expect(mockGetReminder).toHaveBeenCalledTimes(1));
+
+      await act(async () => {
+        onAppStateChange?.('background');
+        await Promise.resolve();
+      });
+      expect(mockGetReminder).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        onAppStateChange?.('inactive');
+        onAppStateChange?.('inactive');
+        await Promise.resolve();
+      });
+      expect(mockGetReminder).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        onAppStateChange?.('active');
+        await Promise.resolve();
+      });
+      expect(mockGetReminder).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        onAppStateChange?.('active');
+        await Promise.resolve();
+      });
+      expect(mockGetReminder).toHaveBeenCalledTimes(2);
+      await view.unmount();
+    } finally {
+      listener.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
   });
 
   it('re-arms singleton navigation on focus and blocks saved handlers after blur', async () => {

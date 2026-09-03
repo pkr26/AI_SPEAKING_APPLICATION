@@ -506,6 +506,67 @@ describe('recording playback primitives', () => {
     await rejection;
     operation.resolve(undefined);
   });
+
+  it('rejects a pre-aborted operation without starting its work', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const operation = jest.fn(() => new Promise<void>(() => undefined));
+    await expect(runWithAbortableTimeout(operation, controller, 1_000)).rejects.toMatchObject({
+      name: 'AbortError',
+    });
+    expect(operation).not.toHaveBeenCalled();
+  });
+
+  it('settles a completed operation once, registered once, and removes its listener', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const add = jest.spyOn(controller.signal, 'addEventListener');
+    const remove = jest.spyOn(controller.signal, 'removeEventListener');
+    const operation = async () => 'prepared';
+    const outcome = runWithAbortableTimeout(operation, controller, 5_000);
+
+    expect(add).toHaveBeenCalledTimes(1);
+    expect(add).toHaveBeenCalledWith('abort', expect.any(Function), { once: true });
+    await expect(outcome).resolves.toBe('prepared');
+    expect(remove).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith('abort', add.mock.calls[0][1]);
+    expect(controller.signal.aborted).toBe(false);
+    await jest.advanceTimersByTimeAsync(5_000);
+    await expect(outcome).resolves.toBe('prepared');
+  });
+
+  it('propagates an operation failure through the same single settlement', async () => {
+    jest.useFakeTimers();
+    const controller = new AbortController();
+    const remove = jest.spyOn(controller.signal, 'removeEventListener');
+    const failure = new Error('operation failed');
+    const outcome = runWithAbortableTimeout(() => Promise.reject(failure), controller, 5_000);
+
+    await expect(outcome).rejects.toBe(failure);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    expect(controller.signal.aborted).toBe(false);
+    await jest.advanceTimersByTimeAsync(5_000);
+    await expect(outcome).rejects.toBe(failure);
+  });
+
+  it('keeps a fired abort listener from receiving a second event', async () => {
+    const controller = new AbortController();
+    const add = jest.spyOn(controller.signal, 'addEventListener');
+    const outcome = runWithAbortableTimeout(
+      () => new Promise<void>(() => undefined),
+      controller,
+      60_000,
+    );
+    const rejection = expect(outcome).rejects.toMatchObject({ name: 'AbortError' });
+    expect(add.mock.calls[0][2]).toEqual({ once: true });
+
+    controller.abort();
+    await flushMicrotasks();
+    // The once:true registration self-removed; a second abort of the same
+    // signal (with a reason) must not re-enter the settled finish path.
+    expect(add).toHaveBeenCalledTimes(1);
+    await rejection;
+  });
 });
 
 describe('RecordingPlayback', () => {
@@ -744,6 +805,30 @@ describe('RecordingPlayback', () => {
 
     await act(async () => download.reject(signal.reason));
     expect(screen.queryByRole('alert')).toBeNull();
+    // The cancelled share visually releases the action for the next attempt.
+    expect(screen.queryByText(t('recordings.sharing'))).toBeNull();
+    expect(
+      screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+  });
+
+  it('keeps a partial share in place when the app is only inactive', async () => {
+    const download = deferred<void>();
+    asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+    await renderPlayback();
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+
+    await emitAppState('inactive');
+    expect(signal.aborted).toBe(false);
+    expect(playbackFiles[0].release).not.toHaveBeenCalled();
+    expect(screen.getByText(t('recordings.sharing'))).toBeTruthy();
+
+    await emitAppState('background');
+    expect(signal.aborted).toBe(true);
+    expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
+    await act(async () => download.reject(signal.reason));
   });
 
   it.each(['blur', 'unmount', 'logout'] as const)(
@@ -2288,6 +2373,13 @@ describe('RecordingPlayback', () => {
     expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy();
     expect(screen.queryByText(t('common.tryAgain'))).toBeNull();
     expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+    // The failed delete restores the ordinary controls, not a stuck deleting phase.
+    expect(
+      screen.getByRole('button', { name: t('recordings.deleteAction') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+    expect(
+      screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
     const completedDeleteSignal = asMock(apiDeleteRecording).mock.calls[0][1] as AbortSignal;
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
@@ -2902,6 +2994,275 @@ describe('RecordingPlayback', () => {
   });
 });
 
+it('resumes a paused player audibly and finishes without stranding the next Play', async () => {
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  const player = players[0];
+  await waitFor(() => expect(player.play).toHaveBeenCalledTimes(1));
+
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy(),
+  );
+  expect(player.pause).toHaveBeenCalledTimes(1);
+
+  // The retained Play must resume the SAME native player, explicitly
+  // audible, and land in the playing phase.
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(player.play).toHaveBeenCalledTimes(2));
+  expect(player.muted).toBe(false);
+  expect(player.volume).toBe(1);
+  expect(players).toHaveLength(1);
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: t('recordings.pauseLabel') })).toBeTruthy(),
+  );
+
+  // A take that plays to the end must also leave Play ready to resume.
+  await act(async () => {
+    player.emit({
+      currentTime: 4,
+      duration: 8,
+      playing: false,
+      isLoaded: true,
+      didJustFinish: true,
+      error: null,
+    });
+  });
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy(),
+  );
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(player.play).toHaveBeenCalledTimes(3));
+  expect(players).toHaveLength(1);
+});
+
+it('fails preparation when the grant itself stalls past the deadline', async () => {
+  jest.useFakeTimers();
+  const grantDeferred = deferred<void>();
+  asMock(apiGetRecordingPlaybackGrant).mockReturnValueOnce(grantDeferred.promise as never);
+  await renderPlayback();
+
+  await act(async () => {
+    fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await flushMicrotasks();
+  });
+  expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
+
+  await act(async () => {
+    await jest.advanceTimersByTimeAsync(30_000);
+  });
+  expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+  expect(
+    screen.getByRole('button', { name: t('recordings.playLabel') }).props.accessibilityState,
+  ).toEqual({ disabled: false, busy: false });
+
+  await act(async () => {
+    grantDeferred.reject(new Error('late grant'));
+    await flushMicrotasks();
+  });
+  expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+});
+
+it('abandons a stale operation between audio-mode configuration and download', async () => {
+  const mode = deferred<void>();
+  mockSetAudioModeAsync.mockReturnValueOnce(mode.promise);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(mockSetAudioModeAsync).toHaveBeenCalledTimes(1));
+
+  await act(async () => focusRegistrations[0].cleanup?.());
+  asMock(claimPrivatePlaybackFile).mockClear();
+  asMock(downloadPrivatePlaybackFile).mockClear();
+  asMock(createAudioPlayer).mockClear();
+
+  await act(async () => {
+    mode.resolve(undefined);
+    await flushMicrotasks();
+  });
+  expect(claimPrivatePlaybackFile).not.toHaveBeenCalled();
+  expect(downloadPrivatePlaybackFile).not.toHaveBeenCalled();
+  expect(createAudioPlayer).not.toHaveBeenCalled();
+  await waitFor(() =>
+    expect(screen.getByRole('button', { name: t('recordings.playLabel') })).toBeTruthy(),
+  );
+});
+
+it('abandons a stale download continuation before creating a player', async () => {
+  const download = deferred<void>();
+  asMock(downloadPrivatePlaybackFile).mockReturnValueOnce(download.promise);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
+
+  await act(async () => focusRegistrations[0].cleanup?.());
+  asMock(createAudioPlayer).mockClear();
+
+  await act(async () => {
+    download.resolve(undefined);
+    await flushMicrotasks();
+  });
+  expect(createAudioPlayer).not.toHaveBeenCalled();
+});
+
+it('reports a failed native play request after the source loads', async () => {
+  mockAutoLoadPlayer = false;
+  mockPlayerInitiallyLoaded = true;
+  mockNextPlayerPlayError = new Error('native play rejected');
+  await renderPlayback();
+
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(screen.getByText(t('common.tryAgain'))).toBeTruthy());
+  expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.playFailed'));
+  expect(players[0].play).toHaveBeenCalledTimes(1);
+  expect(players[0].remove).toHaveBeenCalledTimes(1);
+});
+
+it('disables Share while playback or deletion owns the recording', async () => {
+  const grantDeferred = deferred<void>();
+  asMock(apiGetRecordingPlaybackGrant).mockReturnValueOnce(grantDeferred.promise as never);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(screen.getByText(t('recordings.preparing'))).toBeTruthy());
+  expect(
+    screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+  ).toEqual({ disabled: true, busy: false });
+  await act(async () => {
+    grantDeferred.reject(new Error('no grant'));
+    await flushMicrotasks();
+  });
+
+  const deletion = deferred<void>();
+  asMock(apiDeleteRecording).mockReturnValueOnce(deletion.promise);
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+  alertActions()[1].onPress?.();
+  await waitFor(() =>
+    expect(
+      screen.getByRole('button', { name: t('recordings.deleteAction') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true }),
+  );
+  expect(
+    screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+  ).toEqual({ disabled: true, busy: false });
+  await act(async () => {
+    deletion.resolve(undefined);
+    await flushMicrotasks();
+  });
+});
+
+it('rejects Share while playback, deletion, or another share owns the recording', async () => {
+  const grantDeferred = deferred<void>();
+  asMock(apiGetRecordingPlaybackGrant).mockReturnValueOnce(grantDeferred.promise as never);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+  await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).not.toHaveBeenCalled();
+  await act(async () => {
+    grantDeferred.reject(new Error('no grant'));
+    await flushMicrotasks();
+  });
+
+  const deletion = deferred<void>();
+  asMock(apiDeleteRecording).mockReturnValueOnce(deletion.promise);
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+  alertActions()[1].onPress?.();
+  await waitFor(() => expect(apiDeleteRecording).toHaveBeenCalledTimes(1));
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).not.toHaveBeenCalled();
+  await act(async () => {
+    deletion.reject(new Error('delete failed'));
+    await flushMicrotasks();
+  });
+  await waitFor(() =>
+    expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.deleteFailed')),
+  );
+
+  const available = deferred<boolean>();
+  asMock(Sharing.isAvailableAsync).mockReturnValueOnce(available.promise);
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await waitFor(() => expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1));
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1);
+  await act(async () => available.resolve(true));
+  await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+});
+
+it('rejects Share while the recording is unavailable or the surface is blurred', async () => {
+  await renderPlayback({ recordingStatus: 'unavailable' });
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).not.toHaveBeenCalled();
+  await cleanup();
+
+  await renderPlayback();
+  await act(async () => focusRegistrations[0].cleanup?.());
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).not.toHaveBeenCalled();
+});
+
+it('rejects a retained Share handler after the recording identity changes', async () => {
+  const view = await renderPlayback();
+  const staleShare = rawButtonHandler(t('recordings.shareLabel'));
+
+  await act(async () => {
+    await view.rerender(
+      <QueryClientProvider client={view.queryClient}>
+        <RecordingPlayback ownerId={OWNER_ID} recordingId={OTHER_RECORDING_ID} />
+      </QueryClientProvider>,
+    );
+  });
+  await act(async () => staleShare());
+  await flushMicrotasks();
+  expect(Sharing.isAvailableAsync).not.toHaveBeenCalled();
+});
+
+it('does not continue share preparation after the boundary that aborted it', async () => {
+  const available = deferred<boolean>();
+  asMock(Sharing.isAvailableAsync).mockReturnValueOnce(available.promise);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await waitFor(() => expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(1));
+
+  await act(async () => focusRegistrations[0].cleanup?.());
+  await act(async () => {
+    available.resolve(true);
+    await flushMicrotasks();
+  });
+  expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();
+  await cleanup();
+
+  const grantDeferred = deferred<void>();
+  asMock(apiGetRecordingPlaybackGrant).mockReturnValueOnce(grantDeferred.promise as never);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await waitFor(() => expect(apiGetRecordingPlaybackGrant).toHaveBeenCalledTimes(1));
+  await act(async () => focusRegistrations[0].cleanup?.());
+  asMock(claimPrivatePlaybackFile).mockClear();
+  asMock(claimPrivatePlaybackFile).mockClear();
+  await act(async () => {
+    grantDeferred.resolve(grant() as never);
+    await flushMicrotasks();
+  });
+  expect(claimPrivatePlaybackFile).not.toHaveBeenCalled();
+  await cleanup();
+
+  const unavailable = deferred<boolean>();
+  asMock(Sharing.isAvailableAsync).mockReturnValueOnce(unavailable.promise);
+  await renderPlayback();
+  await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+  await waitFor(() => expect(Sharing.isAvailableAsync).toHaveBeenCalledTimes(3));
+  await act(async () => focusRegistrations[0].cleanup?.());
+  await act(async () => {
+    unavailable.resolve(false);
+    await flushMicrotasks();
+  });
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
 describe('recording cache helpers', () => {
   it('are no-ops for missing data and remove only the selected recording', () => {
     expect(removeRecordingFromPages(undefined, RECORDING_ID)).toBeUndefined();
@@ -3036,6 +3397,36 @@ describe('submitted-recording audio session', () => {
         },
       ],
     ]);
+  });
+
+  it('rejects a hung native audio-mode mutation at its deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      mockSetAudioModeAsync.mockReturnValue(new Promise<void>(() => undefined));
+      let settled: unknown = 'pending';
+      const configured = configurePlaybackAudioMode().then(
+        () => (settled = 'resolved'),
+        (error: unknown) => (settled = error),
+      );
+      void configured;
+
+      await jest.advanceTimersByTimeAsync(AUDIO_MODE_OPERATION_TIMEOUT_MS - 1);
+      expect(settled).toBe('pending');
+      await jest.advanceTimersByTimeAsync(1);
+      await configured;
+      expect(settled).toMatchObject({
+        message: 'audio mode operation did not settle in time',
+      });
+
+      // The serialized queue recovers: the next mutation still runs.
+      mockSetAudioModeAsync.mockResolvedValue(undefined);
+      await configureRecordingAudioMode();
+      expect(mockSetAudioModeAsync).toHaveBeenLastCalledWith(
+        expect.objectContaining({ allowsRecording: true }),
+      );
+    } finally {
+      mockSetAudioModeAsync.mockResolvedValue(undefined);
+    }
   });
 
   it('serializes audio-mode work and recovers the queue after a rejected operation', async () => {

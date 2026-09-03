@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render } from '@testing-library/react-native';
-import { Keyboard, Platform } from 'react-native';
+import { Keyboard, Platform, StyleSheet } from 'react-native';
 import React from 'react';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 import * as ExpoRouter from 'expo-router';
@@ -14,6 +14,7 @@ import {
   setPracticeExitLocked,
   subscribeToPracticeExitLock,
 } from '../src/lib/practice-exit-lock';
+import { colors, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
 
 const initialMetrics = {
@@ -377,6 +378,7 @@ describe('bottom tab layout', () => {
     // a press cannot navigate away from the focused practice flow.
     expect(homeTab.props.accessibilityState).toEqual({ selected: false, disabled: true });
     expect(homeTab.props.accessibilityHint).toBe(translateFor('en', 'hint.finishRecordingFirst'));
+    expect(StyleSheet.flatten(homeTab.props.style)).toMatchObject({ opacity: 0.4 });
     await fireEvent.press(homeTab);
     expect(navigate).not.toHaveBeenCalled();
     expect(emit).not.toHaveBeenCalled();
@@ -384,6 +386,9 @@ describe('bottom tab layout', () => {
     // The tab that owns the lock stays reachable so the learner can return.
     const practiceTab = barView.getByRole('tab', { name: translateFor('en', 'header.practice') });
     expect(practiceTab.props.accessibilityState).toEqual({ selected: true, disabled: false });
+    expect(StyleSheet.flatten(practiceTab.props.style)).toMatchObject({
+      backgroundColor: colors.primaryLight,
+    });
 
     // Releasing the lock restores normal tab switching (the layout re-rendered
     // with a fresh, unlocked tab bar closure).
@@ -422,6 +427,128 @@ describe('bottom tab layout', () => {
   });
 });
 
+it('never registers keyboard listeners on iOS', async () => {
+  const keyboardSpy = jest.spyOn(Keyboard, 'addListener');
+  try {
+    await renderWithProviders(<TabLayout />);
+    expect(keyboardSpy).not.toHaveBeenCalled();
+  } finally {
+    keyboardSpy.mockRestore();
+  }
+});
+
+it('removes both Android keyboard listeners on unmount', async () => {
+  const platformSpy = jest.replaceProperty(Platform, 'OS', 'android');
+  const removes = [jest.fn(), jest.fn()];
+  let index = 0;
+  const keyboardSpy = jest.spyOn(Keyboard, 'addListener').mockImplementation((() => {
+    const remove = removes[index];
+    index += 1;
+    return { remove };
+  }) as never);
+  try {
+    const view = await renderWithProviders(<TabLayout />);
+    expect(keyboardSpy).toHaveBeenCalledTimes(2);
+    await view.unmount();
+    expect(removes[0]).toHaveBeenCalledTimes(1);
+    expect(removes[1]).toHaveBeenCalledTimes(1);
+  } finally {
+    keyboardSpy.mockRestore();
+    platformSpy.restore();
+  }
+});
+
+it('applies the shared header and tab tint tokens to the navigator', async () => {
+  await renderWithProviders(<TabLayout />);
+  const options = captured.capturedTabProps.at(-1)?.screenOptions ?? {};
+  expect(options.headerTintColor).toBe(colors.text);
+  expect(options.headerStyle).toEqual({ backgroundColor: colors.background });
+  expect(options.headerShadowVisible).toBe(false);
+  expect(options.headerTitleAlign).toBe('center');
+  expect(options.tabBarActiveTintColor).toBe(colors.primary);
+  expect(options.tabBarInactiveTintColor).toBe(colors.muted);
+  const practiceScreen = captured.capturedTabScreenProps.find(
+    (screen) => screen?.name === 'practice',
+  );
+  expect(practiceScreen?.options).toMatchObject({ headerShown: false });
+});
+
+it('lays the custom tab bar out on the shared tokens with focused and locked states', async () => {
+  await renderWithProviders(<TabLayout />);
+  const TabBar = captured.capturedTabProps.at(-1)?.tabBar as unknown as (props: {
+    state: { index: number; routes: { key: string; name: string }[] };
+    descriptors: Record<string, { options?: { title?: string } }>;
+    navigation: { emit: jest.Mock; navigate: jest.Mock };
+  }) => React.ReactElement | null;
+  const emit = jest.fn(() => ({ defaultPrevented: false }));
+  const bar = TabBar?.({
+    state: {
+      index: 0,
+      routes: [
+        { key: 'home-route', name: 'home' },
+        { key: 'recordings-route', name: 'recordings' },
+      ],
+    },
+    descriptors: {
+      'home-route': { options: { title: translateFor('en', 'header.home') } },
+      'recordings-route': { options: { title: translateFor('en', 'header.recordings') } },
+    },
+    navigation: { emit, navigate: jest.fn() },
+  } as never);
+  expect(bar).not.toBeNull();
+  const barView = await render(bar as React.ReactElement);
+
+  const barList = barView.getByRole('tab', { name: translateFor('en', 'header.home') }).parent;
+  expect(barList).not.toBeNull();
+  expect(StyleSheet.flatten(barList!.props.style)).toMatchObject({
+    flexDirection: 'row',
+    alignItems: 'stretch',
+    backgroundColor: colors.card,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    paddingTop: spacing.xs,
+    minHeight: 56,
+    // Zero safe-area insets still clamp to the design floor.
+    paddingBottom: 6,
+    paddingStart: spacing.xs,
+    paddingEnd: spacing.xs,
+  });
+
+  const homeTab = barView.getByRole('tab', { name: translateFor('en', 'header.home') });
+  expect(StyleSheet.flatten(homeTab.props.style)).toMatchObject({
+    flex: 1,
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 48,
+    backgroundColor: colors.primaryLight,
+  });
+  const homeLabel = homeTab.children[1] as unknown as { props: { style: unknown } };
+  expect(StyleSheet.flatten(homeLabel.props.style)).toEqual({
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '700',
+    color: colors.primary,
+  });
+
+  const recordingsTab = barView.getByRole('tab', {
+    name: translateFor('en', 'header.recordings'),
+  });
+  const recordingsStyle = StyleSheet.flatten(recordingsTab.props.style);
+  expect(recordingsStyle.backgroundColor).toBeUndefined();
+  const recordingsLabel = recordingsTab.children[1] as unknown as { props: { style: unknown } };
+  expect(StyleSheet.flatten(recordingsLabel.props.style)).toEqual({
+    fontSize: 12,
+    lineHeight: 16,
+    fontWeight: '600',
+    color: colors.muted,
+  });
+
+  await fireEvent.press(recordingsTab);
+  expect(emit).toHaveBeenCalledWith(
+    expect.objectContaining({ type: 'tabPress', canPreventDefault: true }),
+  );
+});
+
 describe('practice exit lock store', () => {
   it('notifies subscribers only on real changes', () => {
     const listener = jest.fn();
@@ -440,12 +567,40 @@ describe('practice exit lock store', () => {
     resetPracticeExitLockForTests();
   });
 
+  it('starts the module unlocked before any publisher writes', () => {
+    resetPracticeExitLockForTests();
+    expect(getPracticeExitLocked()).toBe(false);
+  });
+
   it('reports an always-unlocked server snapshot (navigation is client-only)', () => {
     expect(getPracticeExitLockServerSnapshot()).toBe(false);
   });
 });
 
 describe('practice tab stack', () => {
+  it('declares the practice stack chrome on the shared tokens', async () => {
+    await renderWithProviders(<PracticeTabLayout />);
+    const options = captured.capturedStackProps.at(-1)?.screenOptions ?? {};
+    expect(options.headerTintColor).toBe(colors.text);
+    expect(options.headerStyle).toEqual({ backgroundColor: colors.background });
+    expect(options.headerShadowVisible).toBe(false);
+    expect(options.contentStyle).toEqual({ backgroundColor: colors.background });
+    const screens = captured.capturedStackScreenProps.filter(Boolean);
+    const byName = new Map(screens.map((screen) => [screen?.name, screen?.options]));
+    expect(byName.get('index')).toMatchObject({
+      title: translateFor('en', 'header.practice'),
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+    expect(byName.get('feedback')).toMatchObject({
+      title: translateFor('en', 'header.feedback'),
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+    expect(byName.get('attempt')).toMatchObject({ title: translateFor('en', 'header.attempt') });
+    expect(byName.get('help')).toMatchObject({ title: translateFor('en', 'header.help') });
+  });
+
   it('locks the practice home and feedback exits and leaves help/attempt free', async () => {
     await renderWithProviders(<PracticeTabLayout />);
     const optionsFor = (name: string) =>

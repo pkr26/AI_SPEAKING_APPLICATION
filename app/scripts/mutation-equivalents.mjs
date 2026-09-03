@@ -48,6 +48,899 @@ const equivalentMutantLocations = Object.freeze([]);
 
 const redesignRePinnedEquivalents = Object.freeze([
   {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'StringLiteral',
+    originals: ["const identityKey = `${sessionVersion}:${userId ?? 'anonymous'}`;"],
+    replacements: ['""'],
+    reason:
+      "identityKey is an internal React-only scoping key consumed by refs and effect dependencies; the 'anonymous' fallback spelling never reaches rendered output, and every observable transition already keys on identity through sessionVersion/userId equality.",
+    locations: exactLocations(67, 54, 67, 65),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['activeReplayBinding?.replay === diagnosticReplay &&'],
+    replacements: ['true'],
+    reason:
+      'The replay-binding chain is repaired synchronously in the render body before this expression evaluates: a non-null diagnosticReplay always has a fresh binding, and a null replay short-circuits the operand so the optional chain and equality can never diverge observably.',
+    locations: exactLocations(89, 5, 89, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['activeReplayBinding?.replay === diagnosticReplay &&'],
+    replacements: ['activeReplayBinding.replay'],
+    reason:
+      'The replay-binding chain is repaired synchronously in the render body before this expression evaluates: a non-null diagnosticReplay always has a fresh binding, and a null replay short-circuits the operand so the optional chain and equality can never diverge observably.',
+    locations: exactLocations(89, 5, 89, 32),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrowFunction',
+    count: 2,
+    originals: [
+      '() => currentDiagnosticReplay?.result ?? null,',
+      '() => currentDiagnosticReplay?.requestId ?? null,',
+    ],
+    replacements: ['() => undefined'],
+    reason:
+      "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
+    locations: exactLocations(101, 5, 101, 50, 104, 5, 104, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['() => currentDiagnosticReplay?.result ?? null,'],
+    replacements: ['currentDiagnosticReplay?.result && null'],
+    reason:
+      "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
+    locations: exactLocations(101, 11, 101, 50),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['() => currentDiagnosticReplay?.requestId ?? null,'],
+    replacements: ['currentDiagnosticReplay?.requestId && null'],
+    reason:
+      "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
+    locations: exactLocations(104, 11, 104, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrowFunction',
+    originals: [
+      'const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);',
+    ],
+    replacements: ['() => undefined'],
+    reason:
+      'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
+    locations: exactLocations(109, 52, 109, 90),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);',
+    ],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
+    locations: exactLocations(109, 58, 109, 90),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);',
+    ],
+    replacements: ['false'],
+    reason:
+      'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
+    locations: exactLocations(109, 58, 109, 90),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'EqualityOperator',
+    originals: [
+      'const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);',
+    ],
+    replacements: ['currentDiagnosticReplay === null'],
+    reason:
+      'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
+    locations: exactLocations(109, 58, 109, 90),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['const [answers, setAnswers] = useState<DiagnosticAnswerSummary[]>([]);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The identity-reset layout effect resets answers in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(110, 69, 110, 71),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const recorderLockedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses recorderLockedRef in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(112, 36, 112, 41),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const [recorderExitLocked, setRecorderExitLocked] = useState(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses the exit-lock state in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(113, 64, 113, 69),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const recorderExitLockedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect and the recorder-owner layout effect both re-falses this ref in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(114, 40, 114, 45),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const logoutBusyRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses logoutBusyRef in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(115, 32, 115, 37),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const [logoutBusy, setLogoutBusy] = useState(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses the logout busy state in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(116, 48, 116, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const practiceStartRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses practiceStartRef in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(117, 35, 117, 40),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const [practiceStartBusy, setPracticeStartBusy] = useState(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses the practice-start busy state in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(118, 62, 118, 67),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const mountedRef = useRef(true);'],
+    replacements: ['false'],
+    reason:
+      'The mount layout effect sets mountedRef true in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(119, 29, 119, 33),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const focusedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The focus effect sets focusedRef true in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(120, 29, 120, 34),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const accountActionRef = useRef(true);'],
+    replacements: ['false'],
+    reason:
+      'The identity-reset layout effect assigns accountActionRef on the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(121, 35, 121, 39),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      'const resultRef = useRef<DiagnosticAnswerResult | null>(currentDiagnosticReplay?.result ?? null);',
+    ],
+    replacements: ['currentDiagnosticReplay?.result && null'],
+    reason:
+      'The replay-seed and identity-reset layout effects overwrite resultRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(130, 59, 130, 98),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      'const resultRequestIdRef = useRef<string | null>(currentDiagnosticReplay?.requestId ?? null);',
+    ],
+    replacements: ['currentDiagnosticReplay?.requestId && null'],
+    reason:
+      'The replay-seed and identity-reset layout effects overwrite resultRequestIdRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(131, 52, 131, 94),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['currentDiagnosticReplay?.requestId ?? null,'],
+    replacements: ['currentDiagnosticReplay?.requestId && null'],
+    reason:
+      'The replay-seed and identity-reset layout effects overwrite replayResultRequestIdRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(133, 5, 133, 47),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const resultActionBusyRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses resultActionBusyRef in the same first commit, so the useRef initializer never reaches an observable read.',
+    locations: exactLocations(137, 38, 137, 43),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const [resultActionBusy, setResultActionBusy] = useState(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses the action-busy state in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(138, 60, 138, 65),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const [resultActionError, setResultActionError] = useState(false);'],
+    replacements: ['true'],
+    reason:
+      'The identity-reset layout effect re-falses the action-error state in the same first commit, so the useState initializer never reaches an observable render.',
+    locations: exactLocations(139, 62, 139, 67),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useLayoutEffect(() => {\n    mountedRef.current = true;\n    return () => {\n      mountedRef.current = false;\n      focusedRef.current = false;\n      accountActionRef.current = true;\n      activeIdentityRef.current = null;\n      activeRecorderOwnerRef.current = null;\n    };\n  }, []);',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The body only writes mountedRef/focusedRef inits that already hold those values on the first commit; the observable ownership checks read the same refs the reset effects keep current.',
+    locations: exactLocations(146, 25, 155, 4),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'return () => {\n      mountedRef.current = false;\n      focusedRef.current = false;\n      accountActionRef.current = true;\n      activeIdentityRef.current = null;\n      activeRecorderOwnerRef.current = null;\n    };',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The cleanup only falses refs on unmount; every callback guarded by those refs is additionally fenced by mounted/identity/lease checks, and React discards post-unmount state writes.',
+    locations: exactLocations(148, 18, 154, 6),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['mountedRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'Writing mountedRef true instead of false only affects post-unmount continuations, which every caller additionally fences with identity and lease checks whose values are already stale at that point.',
+    locations: exactLocations(149, 28, 149, 33),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['focusedRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'Writing focusedRef true instead of false only affects post-blur continuations, which renderOwnsWork already rejects through the same focused check that would have read true.',
+    locations: exactLocations(150, 28, 150, 33),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['accountActionRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      'On blur the focus cleanup sets accountActionRef true; a queued account action is still fenced by the focused conjunct inside renderOwnsWork, so the latch write cannot change any reachable decision.',
+    locations: exactLocations(151, 34, 151, 38),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      "The mount effect's dependency literal is empty and its callback identity is stable for the process lifetime; a constant element compares equal on every render and the setup/cleanup lifetimes are unchanged.",
+    locations: exactLocations(155, 6, 155, 8),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['accountActionRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      "The focus cleanup's accountActionRef=true latches actions while blurred, but renderOwnsWork's focused conjunct already rejects every such action; forcing the latch false cannot let a blurred action run.",
+    locations: exactLocations(163, 36, 163, 40),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      "The focus effect's dependency literal is empty and its callback identity is stable for the process lifetime; a constant element compares equal on every render and the setup/cleanup lifetimes are unchanged.",
+    locations: exactLocations(165, 8, 165, 10),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['setResultActionError(false);'],
+    replacements: ['true'],
+    reason:
+      "Every path that renders a result card (recorder result, replay seed, /next effect, advance claim) re-falses the error flag in the same commit that shows the card, so the reset's mutated value is always overwritten before an alert could render.",
+    locations: exactLocations(184, 26, 184, 31),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['setAnswers([]);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      "Every path that re-establishes a completion level after an identity reset funnels through the /next done branch, which overwrites answers in the same commit, so the reset's seeded array never reaches the reveal.",
+    locations: exactLocations(187, 16, 187, 18),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['recorderLockedRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'The recorder-owner layout effect re-falses recorderLockedRef in the same commit whenever an owner exists, and the only ownerless states reset it before any lock read is reachable.',
+    locations: exactLocations(190, 33, 190, 38),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['recorderExitLockedRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'The recorder-owner layout effect re-falses this ref in the same commit whenever an owner exists; crossing into an ownerless state always changes the owner key, which re-runs that effect and re-falses the ref before an exit action can read it.',
+    locations: exactLocations(191, 37, 191, 42),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['setRecorderExitLocked(false);'],
+    replacements: ['true'],
+    reason:
+      'The recorder-owner layout effect re-falses the exit-lock state in the same commit whenever an owner exists, and the only ownerless states reset it before any exit read is reachable.',
+    locations: exactLocations(192, 27, 192, 32),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'return () => {\n      if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;\n    };',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The cleanup only nulls identity refs after unmount; every continuation guarded by them is additionally fenced by mounted/lease checks, and React discards post-unmount state writes.',
+    locations: exactLocations(197, 18, 199, 6),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;'],
+    replacements: ['true'],
+    reason:
+      'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
+    locations: exactLocations(198, 11, 198, 52),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;'],
+    replacements: ['false'],
+    reason:
+      'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
+    locations: exactLocations(198, 11, 198, 52),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'EqualityOperator',
+    originals: ['if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;'],
+    replacements: ['activeIdentityRef.current !== identityKey'],
+    reason:
+      'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
+    locations: exactLocations(198, 11, 198, 52),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (seededReplayKeyRef.current === replayKey) return;'],
+    replacements: ['false'],
+    reason:
+      'A re-published replay with the same requestId reseeds identical state in the same commit; the dedupe only suppresses a redundant identical commit, and the answers reset it guards is re-derived from the same replay pointer.',
+    locations: exactLocations(208, 9, 208, 49),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'if (activeIdentityRef.current !== identityKey || !isSessionLeaseCurrent(sessionLease)) {',
+    ],
+    replacements: ['false'],
+    reason:
+      'The identity-scoped view selector hides any state a stale data effect commits: stateIdentity is reset to the new identity in the same layout pass, so processing or rejecting the response writes only dead state the selector never renders.',
+    locations: exactLocations(238, 9, 238, 50),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['resultRequestIdRef.current === replayResultRequestIdRef.current'],
+    replacements: ['true'],
+    reason:
+      'The second conjunct is already true for metadata-less recorder results (both refs null) and exactly mirrors the first conjunct for seeded replays; forcing it true cannot admit a case the first conjunct does not already gate.',
+    locations: exactLocations(244, 9, 244, 72),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['setResultActionError(false);'],
+    replacements: ['true'],
+    reason:
+      'No result card is mounted on the fresh-/next path that runs this reset; every later result resets the flag in the same commit that shows its card.',
+    locations: exactLocations(277, 26, 277, 31),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'const currentResultRequestId = stateIdentity === identityKey ? resultRequestId : null;',
+    ],
+    replacements: ['true'],
+    reason:
+      'When the identity selector rejects the state, currentResult is null and advance() returns before reading the leaked requestId, so the guarded value has no reader.',
+    locations: exactLocations(305, 34, 305, 63),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['currentQuestion !== null &&'],
+    replacements: ['true'],
+    reason:
+      'The only reader of showIntro sits behind a non-null currentQuestion in the same expression chain; forcing the conjunct true cannot change any rendered branch.',
+    locations: exactLocations(309, 5, 309, 29),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['(currentProgress?.asked ?? 0) === 0;'],
+    replacements: ['currentProgress.asked'],
+    reason:
+      'The progress operand short-circuits behind introStarted for replayed states (the seed latches it true), and a canonical question always carries non-null progress, so the optional chain never dereferences null.',
+    locations: exactLocations(312, 6, 312, 28),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "? `${identityKey}:result:${currentQuestion?.id ?? 'none'}:${currentResult.noSpeech}:${currentResult.done}`",
+    ],
+    replacements: ['""'],
+    reason:
+      'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
+    locations: exactLocations(316, 57, 316, 63),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      "? `${identityKey}:result:${currentQuestion?.id ?? 'none'}:${currentResult.noSpeech}:${currentResult.done}`",
+    ],
+    replacements: ["currentQuestion?.id && 'none'"],
+    reason:
+      'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
+    locations: exactLocations(316, 34, 316, 63),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'OptionalChaining',
+    originals: [
+      "? `${identityKey}:result:${currentQuestion?.id ?? 'none'}:${currentResult.noSpeech}:${currentResult.done}`",
+    ],
+    replacements: ['currentQuestion.id'],
+    reason:
+      'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
+    locations: exactLocations(316, 34, 316, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'StringLiteral',
+    count: 2,
+    originals: ["? `${identityKey}:${showIntro ? 'intro' : 'question'}:${currentQuestion.id}`"],
+    replacements: ['""'],
+    reason:
+      'The intro/question step-key literals are dedupe-only identities that stay distinct within their branch and are never rendered; swapping the literal cannot change which transitions announce or scroll.',
+    locations: exactLocations(318, 41, 318, 48, 318, 51, 318, 61),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['questionScrollRef.current?.scrollTo({ y: 0, animated: false });'],
+    replacements: ['questionScrollRef.current.scrollTo'],
+    reason:
+      'The optional chain only guards a null scroll ref that cannot coexist with an announced step: the only refless branches (loading/error) have a null step key, and the announced branches mount the scroll view before the effect runs.',
+    locations: exactLocations(349, 7, 349, 42),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (Platform.OS === 'ios') {"],
+    replacements: ['true'],
+    reason:
+      "The Jest React Native preset reports Platform.OS 'ios', so the true-forcing mutant is behaviorally identical on the test platform while the false-forcing mutant is killed by the announcement assertions.",
+    locations: exactLocations(354, 9, 354, 30),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['owner !== null && activeRecorderOwnerRef.current === owner && renderOwnsWork(),'],
+    replacements: ['true'],
+    reason:
+      "Every callback invoked while the owner key is null is additionally rejected by renderOwnsWork's identity/lease conjuncts, which fail in every reachable ownerless interleaving (unmount, identity change, or user loss).",
+    locations: exactLocations(381, 7, 381, 21),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['exact: true,'],
+    replacements: ['false'],
+    reason:
+      'No registered query key extends the cancelled diagnostic-next prefix, so exact and prefix cancellation address the same single query; the flag cannot change which fetch is aborted.',
+    locations: exactLocations(400, 14, 400, 18),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ArithmeticOperator',
+    originals: ['attemptNo: previous.length + 1,'],
+    replacements: ['previous.length - 1'],
+    reason:
+      'attemptNo is only a React list key here: the reveal numbers rows by index, and the mutated sequence stays unique within a session, so no duplicate-key or rendering difference can be observed.',
+    locations: exactLocations(410, 22, 410, 41),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['accountActionRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      'The logoutBusyRef latch set by the same synchronous block already blocks the account action; the accountAction latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
+    locations: exactLocations(494, 32, 494, 36),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['let rearm = false;'],
+    replacements: ['true'],
+    reason:
+      "rearm only re-arms accountActionRef after a same-identity logout failure; on the success path the route replaces away from this screen, so the initializer's value never reaches a reachable decision.",
+    locations: exactLocations(497, 17, 497, 22),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['activeIdentityRef.current === identityKey &&'],
+    replacements: ['true'],
+    reason:
+      'Reaching the forced conjunct requires an account swap mid-logout while this route keeps focus; every identity transition that swaps the account also reroutes or resets the identity refs the surrounding conjuncts check, so the mutated condition can never differ observably.',
+    locations: exactLocations(507, 9, 507, 50),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    count: 2,
+    originals: ['if (mountedRef.current && activeIdentityRef.current === identityKey) {'],
+    replacements: ['true'],
+    reason:
+      "The finally's post-boundary setLogoutBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
+    locations: exactLocations(518, 11, 518, 74, 518, 33, 518, 74),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (mountedRef.current && activeIdentityRef.current === identityKey) {'],
+    replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
+    reason:
+      "The finally's post-boundary setLogoutBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
+    locations: exactLocations(518, 11, 518, 74),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (rearm) accountActionRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'rearm only re-arms accountActionRef after a same-identity logout failure the catch already localized; forcing it true cannot let a stale handler run because renderOwnsWork re-checks focus and identity synchronously.',
+    locations: exactLocations(520, 13, 520, 18),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    count: 4,
+    originals: [
+      '!renderOwnsWork() ||\n      resultRef.current !== expectedResult ||\n      resultRequestIdRef.current !== expectedRequestId',
+      '!renderOwnsWork() ||\n      resultRef.current !== expectedResult ||',
+      'resultRef.current !== expectedResult ||',
+      'resultRequestIdRef.current !== expectedRequestId',
+    ],
+    replacements: ['false'],
+    reason:
+      'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
+    locations: exactLocations(530, 7, 532, 55, 530, 7, 531, 43, 531, 7, 531, 43, 532, 7, 532, 55),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      '!renderOwnsWork() ||\n      resultRef.current !== expectedResult ||\n      resultRequestIdRef.current !== expectedRequestId',
+    ],
+    replacements: [
+      '(!renderOwnsWork() || resultRef.current !== expectedResult) && resultRequestIdRef.current !== expectedRequestId',
+    ],
+    reason:
+      'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
+    locations: exactLocations(530, 7, 532, 55),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['!renderOwnsWork() ||\n      resultRef.current !== expectedResult ||'],
+    replacements: ['!renderOwnsWork() && resultRef.current !== expectedResult'],
+    reason:
+      'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
+    locations: exactLocations(530, 7, 531, 43),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BlockStatement',
+    originals: [') {\n      return;\n    }'],
+    replacements: ['{}'],
+    reason:
+      'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
+    locations: exactLocations(533, 7, 535, 6),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['setResultActionError(false);'],
+    replacements: ['true'],
+    reason:
+      'No result card is mounted after commitAdvance clears the result; the alert renders only inside the card, and every later card resets the flag before rendering.',
+    locations: exactLocations(542, 26, 542, 31),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    count: 2,
+    originals: [
+      '!renderOwnsWork() ||\n      !currentResult ||\n      resultRef.current !== currentResult ||',
+      '!renderOwnsWork() ||\n      !currentResult ||',
+    ],
+    replacements: ['false'],
+    reason:
+      "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
+    locations: exactLocations(564, 7, 566, 42, 564, 7, 565, 21),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      '!renderOwnsWork() ||\n      !currentResult ||\n      resultRef.current !== currentResult ||',
+    ],
+    replacements: ['(!renderOwnsWork() || !currentResult) && resultRef.current !== currentResult'],
+    reason:
+      "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
+    locations: exactLocations(564, 7, 566, 42),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['!renderOwnsWork() ||\n      !currentResult ||'],
+    replacements: ['!renderOwnsWork() && !currentResult'],
+    reason:
+      "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
+    locations: exactLocations(564, 7, 565, 21),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['resultRef.current !== currentResult ||'],
+    replacements: ['false'],
+    reason:
+      "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose identity re-validation still returns before any observable write.",
+    locations: exactLocations(566, 7, 566, 42),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'if (!userId) {\n      resultActionClaimRef.current = null;\n      setResultActionError(true);\n      return;\n    }',
+    ],
+    replacements: ['{}'],
+    reason:
+      'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
+    locations: exactLocations(578, 18, 582, 6),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!userId) {'],
+    replacements: ['false'],
+    reason:
+      'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
+    locations: exactLocations(578, 9, 578, 16),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['setResultActionError(true);'],
+    replacements: ['false'],
+    reason:
+      'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
+    locations: exactLocations(580, 28, 580, 32),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['mountedRef.current &&\n        activeIdentityRef.current === identityKey &&'],
+    replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
+    reason:
+      'The regroup only matters when the first conjuncts disagree in an unreachable direction: the unmount sweep nulls activeIdentityRef before any continuation runs, and the result/request refs are stable across the acknowledgement await because no setter runs between claim and settlement.',
+    locations: exactLocations(595, 9, 596, 50),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['activeIdentityRef.current === identityKey &&'],
+    replacements: ['true'],
+    reason:
+      'The identity conjunct is shadowed by the mounted conjunct in every reachable interleaving: unmount nulls the ref in the same sweep that falses mountedRef, and identity changes rerender the route before the continuation settles.',
+    locations: exactLocations(596, 9, 596, 50),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['resultRef.current === currentResult &&'],
+    replacements: ['true'],
+    reason:
+      'resultRef cannot change between the advance claim and the acknowledgement settlement: the recorder is unmounted while the card shows, and every refetch path that could clear it also fails the identity/lease conjuncts checked in the same expression.',
+    locations: exactLocations(598, 9, 598, 44),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['resultRequestIdRef.current === requestId;'],
+    replacements: ['true'],
+    reason:
+      'resultRequestIdRef cannot change between the advance claim and the acknowledgement settlement: no setter runs in that window, and every path that could clear it also fails the identity/lease conjuncts checked in the same expression.',
+    locations: exactLocations(599, 9, 599, 49),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['resultActionBusyRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      "The acknowledgement path's busy-ref write is immediately re-falsed by commitAdvance's own write in the same synchronous block, so a stuck-true value never reaches a reader.",
+    locations: exactLocations(603, 39, 603, 44),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['resultActionBusyRef.current = false;'],
+    replacements: ['true'],
+    reason:
+      'The rearm branch runs only after focus loss; every account action is already fenced by the focused conjunct until refocus, and the refocused advance re-falses the ref in the same commit that resumes the card.',
+    locations: exactLocations(617, 39, 617, 44),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['practiceStartRef.current ||\n      accountActionRef.current ||'],
+    replacements: ['practiceStartRef.current && accountActionRef.current'],
+    reason:
+      'Every interleaving where the practice/account latches differ also fails a later conjunct: blur sets accountActionRef while dropping focus, and failures reset both flags together, so the regrouped pair cannot change the decision.',
+    locations: exactLocations(627, 7, 628, 31),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['accountActionRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      'The practiceStart latch set in the same synchronous block already blocks every account action; the accountAction latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
+    locations: exactLocations(637, 32, 637, 36),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['practiceStartRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      'The accountAction latch set in the same synchronous block already blocks every account action; the practiceStart latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
+    locations: exactLocations(638, 32, 638, 36),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    count: 2,
+    originals: ['if (mountedRef.current && activeIdentityRef.current === identityKey) {'],
+    replacements: ['true'],
+    reason:
+      "The finally's post-boundary setPracticeStartBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
+    locations: exactLocations(665, 11, 665, 74, 665, 33, 665, 74),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (mountedRef.current && activeIdentityRef.current === identityKey) {'],
+    replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
+    reason:
+      "The finally's post-boundary setPracticeStartBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
+    locations: exactLocations(665, 11, 665, 74),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ObjectLiteral',
+    originals: ["{t('diag.introCount', { count: currentProgress.maxQuestions })}"],
+    replacements: ['{}'],
+    reason:
+      "The English catalog copy for diag.introCount is a fixed 'You will answer 2 or 3 questions.' with no count placeholder, so the params object never reaches the rendered string in any locale.",
+    locations: exactLocations(852, 37, 852, 76),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['currentProgress.maxQuestions > 0'],
+    replacements: ['true'],
+    reason:
+      "parseDiagnosticNext rejects maxQuestions < 1, so a committed progress always satisfies maxQuestions > 0; the guard's false direction is killed by the asked-fraction assertion while the true direction cannot diverge.",
+    locations: exactLocations(877, 21, 877, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'EqualityOperator',
+    originals: ['currentProgress.maxQuestions > 0'],
+    replacements: ['currentProgress.maxQuestions >= 0'],
+    reason:
+      "parseDiagnosticNext rejects maxQuestions < 1, so a committed progress always satisfies maxQuestions > 0; the guard's false direction is killed by the asked-fraction assertion while the true direction cannot diverge.",
+    locations: exactLocations(877, 21, 877, 53),
+  },
+  {
+    file: 'src/app/diagnostic.tsx',
+    mutator: 'ObjectLiteral',
+    originals: [
+      'transcriptText: {\n    marginTop: spacing.xs,\n    fontSize: 17,\n    lineHeight: 25,\n    color: colors.text,\n  },',
+    ],
+    replacements: ['{}'],
+    reason:
+      "Dead style key: the word-tagged transcript component replaced this style's only historical consumer, and no JSX in the file references transcriptText.",
+    locations: exactLocations(1087, 19, 1092, 4),
+  },
+
+  {
     file: 'src/app/(auth)/login.tsx',
     mutator: 'BlockStatement',
     originals: ['return () => {\n      active = false;\n    };'],

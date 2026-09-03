@@ -654,6 +654,8 @@ describe('recordings library', () => {
     await screen.findByText('courage');
     await act(async () => asMock(FlatList).mock.calls.at(-1)?.[0].onEndReached());
     expect(apiGetRecordings).toHaveBeenCalledTimes(1);
+    // A null cursor is the natural end of the list, not the safety stop.
+    expect(screen.queryByText(t('pagination.safetyStop'))).toBeNull();
   });
 
   it('does not page after its captured session lease expires', async () => {
@@ -875,5 +877,80 @@ describe('recordings library', () => {
     });
     expect(await screen.findByText('travel')).toBeTruthy();
     expect(apiGetRecordings).toHaveBeenNthCalledWith(3, SECOND_ID, expect.any(AbortSignal));
+  });
+
+  it('joins an in-flight empty-state refresh and holds it behind the session lease', async () => {
+    let resolveRefresh!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockReturnValue(pending);
+    await renderRecordings();
+    await waitFor(() => expect(screen.getByTestId('recordings-empty')).toBeTruthy());
+
+    await act(async () => refreshHandler()());
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await act(async () => refreshHandler()());
+    // The second pull joins the in-flight refresh instead of restarting it.
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
+
+    leaseCurrent = false;
+    await act(async () => refreshHandler()());
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      resolveRefresh({ items: [], nextCursor: null });
+      await Promise.resolve();
+    });
+  });
+
+  it('joins an in-flight list refresh and mirrors the refresh state in the notice', async () => {
+    let resolveRefresh!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: null })
+      .mockReturnValueOnce(pending);
+    await renderRecordings();
+    await screen.findByText('courage');
+    expect(screen.queryByText(t('refresh.updating'))).toBeNull();
+
+    await act(async () => (flatListProps().onRefresh as () => void)());
+    await waitFor(() => expect(screen.getByText(t('refresh.updating'))).toBeTruthy());
+    await act(async () => (flatListProps().onRefresh as () => void)());
+    expect(apiGetRecordings).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      resolveRefresh({ items: [recording()], nextCursor: null });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.queryByText(t('refresh.updating'))).toBeNull());
+  });
+
+  it('joins a notice retry behind the in-flight refresh it reports', async () => {
+    let resolveRetry!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRetry = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: null })
+      .mockRejectedValueOnce(new Error('refresh failed'))
+      .mockReturnValueOnce(pending);
+    await renderRecordings();
+    await screen.findByText('courage');
+
+    await act(async () => (flatListProps().onRefresh as () => void)());
+    await waitFor(() => expect(screen.getByText(t('refresh.failedUsingSaved'))).toBeTruthy());
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(3));
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    expect(apiGetRecordings).toHaveBeenCalledTimes(3);
+    await act(async () => {
+      resolveRetry({ items: [recording()], nextCursor: null });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(screen.queryByText(t('refresh.failedUsingSaved'))).toBeNull());
   });
 });

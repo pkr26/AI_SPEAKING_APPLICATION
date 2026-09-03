@@ -499,6 +499,8 @@ describe('change password screen', () => {
     expect(screen.getByLabelText(t('cp.confirmLabel')).props.value).toBe('');
     expect(screen.queryByText(t('password.tooShort'))).toBeNull();
     expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
+    // Empty fields are not "the same as the current password".
+    expect(screen.queryByText(t('cp.sameAsCurrent'))).toBeNull();
     expect(flattenedStyle(updateButton())).toMatchObject({
       alignItems: 'center',
       backgroundColor: colors.primary,
@@ -509,6 +511,7 @@ describe('change password screen', () => {
 
     await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
     expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
+    expect(screen.queryByText(t('cp.sameAsCurrent'))).toBeNull();
     expect(updateButton().props.accessibilityState.disabled).toBe(false);
     expect(flattenedStyle(updateButton()).opacity).toBeUndefined();
     await expectPressFeedback(

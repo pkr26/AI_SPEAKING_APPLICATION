@@ -522,6 +522,9 @@ describe('diagnostic screen', () => {
   });
 
   it('seeds a nonfinal cold replay before canonical next state and keeps it visible', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
     const canonical = deferred<ReturnType<typeof nextPayload> & { answers: [typeof ANSWER_1] }>();
     const replayResult: DiagnosticAnswerResult = {
       passed: true,
@@ -543,10 +546,14 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
     expect(mockRecorderProps).toBeNull();
+    // The seeded card is not an error state and still owns the account exits.
+    expect(screen.queryByRole('alert')).toBeNull();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
 
     await act(async () => {
       canonical.resolve({
-        ...nextPayload(QUESTION_2, 1),
+        ...nextPayload(QUESTION_2, 2),
         answers: [ANSWER_1],
       });
       await canonical.promise;
@@ -557,13 +564,20 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
     expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
-    expect(await screen.findByText(t('diag.progress', { current: 1, max: 3 }))).toBeTruthy();
+    expect(await screen.findByText(t('diag.progress', { current: 2, max: 3 }))).toBeTruthy();
 
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
     expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
     expect(mockAssessmentReplayValue.clearDiagnosticReplay).toHaveBeenCalledWith(
       DIAGNOSTIC_REQUEST_ID,
     );
+    // Advancing rewinds canonical progress one step behind the card, so the
+    // next question announces with the replay-adjusted count.
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.progress', { current: 3, max: 3 })}. ${QUESTION_2.promptWord}. ${QUESTION_2.questionText}`,
+      { queue: true },
+    );
+    announceSpy.mockRestore();
   });
 
   it('adopts a new replay that arrives while the same diagnostic route remains mounted', async () => {
@@ -643,6 +657,9 @@ describe('diagnostic screen', () => {
   });
 
   it('rejects a replay object retained across an account boundary', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
     const retainedReplay: DiagnosticFeedbackReplay = {
       requestId: DIAGNOSTIC_REQUEST_ID,
       question: QUESTION_1,
@@ -659,6 +676,7 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockReturnValue(new Promise(() => undefined));
     const rendered = await renderScreen();
     expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+    announceSpy.mockClear();
 
     mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
     await rendered.rerenderScreen();
@@ -666,6 +684,10 @@ describe('diagnostic screen', () => {
     expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
     expect(screen.queryByText(QUESTION_1.questionText)).toBeNull();
     expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    // Crossing the boundary leaves the screen without an announced step; the
+    // effect must reset its dedupe key rather than queue a null announcement.
+    expect(announceSpy).not.toHaveBeenCalled();
+    announceSpy.mockRestore();
     expect(mockAssessmentReplayValue.clearDiagnosticReplay).not.toHaveBeenCalled();
   });
 
@@ -1004,6 +1026,23 @@ describe('diagnostic screen', () => {
     expect(
       screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
     ).toMatchObject({ disabled: false });
+
+    // The exit-lock channel is fenced by the same ownership check: a stale
+    // Recorder may not release the current owner's exit lock.
+    await act(async () => currentCallbacks.onExitLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => staleCallbacks.onExitLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () => currentCallbacks.onExitLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
   });
 
   it.each(['blur', 'session lease'] as const)(
@@ -1093,6 +1132,10 @@ describe('diagnostic screen', () => {
       expect(screen.queryByText('Tell me about a memorable journey.')).toBeNull();
       expect(screen.queryByText(t('diag.answerCheckedTitle'))).toBeNull();
       expect(mockApiFetch).toHaveBeenCalledTimes(callsBeforeStaleAdvance);
+      // The stale handler may not even start the durable acknowledgement, so
+      // the replay pointer can never be cleared under the previous identity.
+      expect(mockAcknowledgePendingFeedback).not.toHaveBeenCalled();
+      expect(mockAssessmentReplayValue.clearDiagnosticReplay).not.toHaveBeenCalled();
       expect(nextSetUser).not.toHaveBeenCalled();
       expect(mockRouter.replace).not.toHaveBeenCalled();
     },
@@ -1240,6 +1283,8 @@ describe('diagnostic screen', () => {
     };
     await act(async () => recorderProps().onResult(result));
 
+    expect(screen.queryByRole('alert')).toBeNull();
+
     expect(announceSpy).toHaveBeenLastCalledWith(
       `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
         score: 88,
@@ -1277,6 +1322,34 @@ describe('diagnostic screen', () => {
       { queue: true },
     );
     expect(scrollToTopSpy).toHaveBeenLastCalledWith({ y: 0, animated: false });
+
+    // A second scored result on a different question is its own announced
+    // step: the result step key keeps the question id, so VoiceOver hears it.
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 75,
+        transcript: 'A second answer.',
+        feedback: 'Second feedback.',
+        done: false,
+        nextQuestion: QUESTION_1,
+      }),
+    );
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
+        score: 75,
+        result: t('diag.passed'),
+      })}`,
+      { queue: true },
+    );
+
+    // Completing an advance releases the busy latch that fences account exits.
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(await screen.findByText(QUESTION_1.questionText)).toBeTruthy();
+    mockRouter.navigate.mockClear();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+
     announceSpy.mockRestore();
     scrollToTopSpy.mockRestore();
   });
@@ -1287,6 +1360,14 @@ describe('diagnostic screen', () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
     await renderScreen();
     await screen.findByText(QUESTION_1.questionText);
+    // The determinate bar reports the asked fraction to assistive tech and is
+    // spaced by its own token block off the progress line above it.
+    const bar = screen.getByRole('progressbar', { name: t('header.diagnostic') });
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 33 });
+    expect(flattenedStyle(parentOf(bar))).toEqual({
+      marginTop: spacing.xs,
+      marginBottom: spacing.sm,
+    });
     await act(async () =>
       recorderProps().onResult(
         {
@@ -1301,15 +1382,22 @@ describe('diagnostic screen', () => {
       ),
     );
     const nextQuestion = capturedPressHandler(t('diag.nextQuestion'));
+    const openSettingsDuringAck = capturedPressHandler(t('header.settings'));
 
     await act(async () => {
       nextQuestion();
       nextQuestion();
+      openSettingsDuringAck();
       await Promise.resolve();
     });
 
     expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
     expect(mockAcknowledgePendingFeedback).toHaveBeenCalledWith(USER.id, DIAGNOSTIC_REQUEST_ID);
+    // Claiming the card is not an error: the busy card shows no retry banner.
+    expect(screen.queryByRole('alert')).toBeNull();
+    // The ref-backed busy latch fences a queued exit even though the captured
+    // press handler bypasses the disabled control.
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
     expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
     expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
     expect(
@@ -1324,6 +1412,10 @@ describe('diagnostic screen', () => {
       await acknowledgement.promise;
     });
     expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+    // The advance releases the busy latch for the next card's account exits.
+    mockRouter.navigate.mockClear();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
   });
 
   it('does not advance after durable acknowledgement resolves off-focus', async () => {
@@ -1359,6 +1451,10 @@ describe('diagnostic screen', () => {
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
     expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
     expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
+    // The rearmed card releases its busy latch once the advance commits.
+    mockRouter.navigate.mockClear();
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
   });
 
   it.each(['false result', 'rejection'] as const)(
@@ -1389,6 +1485,13 @@ describe('diagnostic screen', () => {
 
       await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
       expect(await screen.findByRole('alert')).toHaveTextContent(t('boundary.body'));
+      expect(flattenedStyle(screen.getByRole('alert'))).toEqual({
+        marginTop: spacing.md,
+        color: colors.danger,
+        fontSize: 15,
+        lineHeight: 22,
+        textAlign: 'center',
+      });
       expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
       expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
       expect(screen.queryByText(QUESTION_2.questionText)).toBeNull();
@@ -1400,6 +1503,9 @@ describe('diagnostic screen', () => {
   );
 
   it('keeps diagnostic silence on the same question without advancing progress', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
     await renderScreen();
     await screen.findByText(QUESTION_1.questionText);
@@ -1416,7 +1522,17 @@ describe('diagnostic screen', () => {
       }),
     );
 
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.noSpeechTitle')}. Please speak clearly and try again.`,
+      { queue: true },
+    );
     expect(screen.getByRole('header', { name: t('diag.noSpeechTitle') })).toBeTruthy();
+    expect(flattenedStyle(screen.getByText('Please speak clearly and try again.'))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.muted,
+    });
     expect(
       screen.getByText('Please speak clearly and try again.').props.accessibilityLanguage,
     ).toBe('en-US');
@@ -1434,6 +1550,7 @@ describe('diagnostic screen', () => {
     expect(screen.getByText(QUESTION_1.questionText)).toBeTruthy();
     expect(screen.getByText(t('diag.progress', { current: 2, max: 3 }))).toBeTruthy();
     expect(recorderProps().questionId).toBe(QUESTION_1.id);
+    announceSpy.mockRestore();
   });
 
   it('rejects callbacks retained by the previous question Recorder after advancing', async () => {
@@ -1668,6 +1785,9 @@ describe('diagnostic screen', () => {
   });
 
   it('stores per-answer outcomes during the test and reveals them only on completion', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
     await renderScreen();
     await startFreshTest();
@@ -1681,6 +1801,13 @@ describe('diagnostic screen', () => {
         done: false,
         nextQuestion: QUESTION_2,
       }),
+    );
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
+        score: 35,
+        result: t('diag.notPassed'),
+      })}`,
+      { queue: true },
     );
     // Every answer is explained immediately, before the learner moves on.
     expect(screen.getByText('first answer')).toBeTruthy();
@@ -1704,6 +1831,13 @@ describe('diagnostic screen', () => {
         level: 'A2',
       }),
     );
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.answerCheckedTitle')}. ${t('diag.scoreLine', {
+        score: 82,
+        result: t('diag.passed'),
+      })}`,
+      { queue: true },
+    );
     await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
 
     expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
@@ -1714,6 +1848,7 @@ describe('diagnostic screen', () => {
     expect(
       screen.getByText(t('diag.answerLine', { number: 2, score: 82, mark: '✓' })),
     ).toBeTruthy();
+    announceSpy.mockRestore();
   });
 
   it('does not complete the profile when the user disappears before acknowledgement', async () => {
@@ -1742,7 +1877,9 @@ describe('diagnostic screen', () => {
 
   it('keeps the current result visible when an incomplete result has no next question', async () => {
     mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
-    await renderScreen();
+    const queryClient = makeQueryClient();
+    const invalidateSpy = jest.spyOn(queryClient, 'invalidateQueries');
+    await renderScreen(queryClient);
     await startFreshTest();
 
     await act(async () =>
@@ -1754,6 +1891,8 @@ describe('diagnostic screen', () => {
         done: false,
       }),
     );
+    // Nothing was retained, so the recordings cache is left untouched.
+    expect(invalidateSpy).not.toHaveBeenCalledWith({ queryKey: ['recordings', USER.id] });
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
 
     expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
@@ -1844,7 +1983,7 @@ describe('diagnostic screen', () => {
     // advanced server state (answer committed, next question current). The
     // card must survive until the learner continues; advance() applies the
     // next question locally.
-    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_2, 1));
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_2, 2));
     await act(async () => {
       await queryClient.invalidateQueries({ queryKey: ['diagnostic-next'] });
       // Let the refetch settle and the batched query notification fire.
@@ -1853,6 +1992,10 @@ describe('diagnostic screen', () => {
 
     expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+    // A locally recorded answer is not a replay: canonical progress must not
+    // rewind behind the unacknowledged card.
+    expect(screen.getByText(t('diag.progress', { current: 1, max: 3 }))).toBeTruthy();
+    expect(screen.queryByText(t('diag.progress', { current: 2, max: 3 }))).toBeNull();
 
     // Continuing still advances locally from the acknowledged result.
     await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
@@ -2588,6 +2731,448 @@ describe('diagnostic screen', () => {
     await rendered.unmount();
     expect(backSubscriptionRemove).toHaveBeenCalled();
   });
+
+  it('queues the VoiceOver announcement for the level reveal', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2' });
+    await renderScreen();
+
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${t('diag.completeTitle')}. ${t('diag.levelIntro')} B2.`,
+      { queue: true },
+    );
+    announceSpy.mockRestore();
+  });
+
+  it('announces each step once and scrolls only between steps', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
+    const scrollToTopSpy = jest
+      .spyOn(ScrollView.prototype, 'scrollTo')
+      .mockImplementation(() => undefined);
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockResolvedValue(nextPayload(QUESTION_1, 1));
+    const { queryClient } = await renderScreen();
+
+    const start = await screen.findByRole('button', { name: t('diag.introStart') });
+    // The first announced step has no previous step, so nothing scrolls yet.
+    expect(announceSpy).toHaveBeenCalledTimes(1);
+    expect(scrollToTopSpy).not.toHaveBeenCalled();
+
+    await fireEvent.press(start);
+    expect(announceSpy).toHaveBeenCalledTimes(2);
+    expect(scrollToTopSpy).toHaveBeenCalledTimes(1);
+    announceSpy.mockClear();
+    scrollToTopSpy.mockClear();
+
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['diagnostic-next'] });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The refetch recomputes the announcement for the SAME step key; the
+    // dedupe keeps VoiceOver from hearing the same question twice.
+    expect(screen.getByText(t('diag.progress', { current: 2, max: 3 }))).toBeTruthy();
+    expect(announceSpy).not.toHaveBeenCalled();
+    expect(scrollToTopSpy).not.toHaveBeenCalled();
+    announceSpy.mockRestore();
+    scrollToTopSpy.mockRestore();
+  });
+
+  it('fences exit-lock callbacks behind the visible result card', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    const callbacks = recorderProps();
+
+    await act(async () => callbacks.onExitLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+
+    await act(async () =>
+      callbacks.onResult({
+        passed: true,
+        score: 88,
+        transcript: 'An answer.',
+        feedback: 'Great answer.',
+        done: false,
+        nextQuestion: QUESTION_2,
+      }),
+    );
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+
+    // A recorded result outranks the exit lock: unlocking must reach the
+    // account exits again, and a late lock may not strand the card.
+    await act(async () => callbacks.onExitLockChange?.(false));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    await act(async () => callbacks.onExitLockChange?.(true));
+    expect(
+      screen.getByRole('button', { name: t('header.settings') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+  });
+
+  it('advances a replayed final result before canonical state to an answer-free completion', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: ANSWER_1.score,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: true,
+        level: 'B2',
+      },
+    };
+    await renderScreen();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).toHaveBeenCalledWith(
+      DIAGNOSTIC_REQUEST_ID,
+    );
+    // The replay seed starts from the learner's empty answer list; the reveal
+    // stays answer-free until canonical state hydrates it.
+    expect(screen.queryByText(t('diag.answersTitle'))).toBeNull();
+    expect(
+      screen.queryByText(t('diag.answerLine', { number: 1, score: ANSWER_1.score, mark: '✓' })),
+    ).toBeNull();
+  });
+
+  it('keeps a replayed completion answer-free when canonical state carries no answers', async () => {
+    const canonical = deferred<{ done: true; level: 'B2' }>();
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: ANSWER_1.score,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: true,
+        level: 'B2',
+      },
+    };
+    mockApiFetch.mockReturnValue(canonical.promise);
+    await renderScreen();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+
+    await act(async () => {
+      canonical.resolve({ done: true, level: 'B2' });
+      await canonical.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('diag.answersTitle'))).toBeNull();
+  });
+
+  it('resumes the next question directly after advancing a replay without canonical state', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    mockAssessmentReplayValue.diagnosticReplay = {
+      requestId: DIAGNOSTIC_REQUEST_ID,
+      question: QUESTION_1,
+      result: {
+        passed: true,
+        score: 88,
+        transcript: ANSWER_1.transcript,
+        feedback: ANSWER_1.feedback,
+        done: false,
+        nextQuestion: QUESTION_2,
+      },
+    };
+    await renderScreen();
+    expect(screen.getByText(t('diag.answerCheckedTitle'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(await screen.findByText(QUESTION_2.questionText)).toBeTruthy();
+    // The replay already taught this screen about the test: the next question
+    // is served straight to the Recorder, never behind a second intro.
+    expect(screen.queryByText(t('diag.introTitle'))).toBeNull();
+    expect(recorderProps()).toMatchObject({
+      ownerId: USER.id,
+      questionId: QUESTION_2.id,
+    });
+    // Canonical progress never arrived, so the resumed question announces
+    // itself without a progress prefix.
+    expect(announceSpy).toHaveBeenLastCalledWith(
+      `${QUESTION_2.promptWord}. ${QUESTION_2.questionText}`,
+      { queue: true },
+    );
+    announceSpy.mockRestore();
+  });
+
+  it('keeps account exits reachable while a new identity question is still loading', async () => {
+    let resolveOtherQuestion!: (value: ReturnType<typeof nextPayload>) => void;
+    const otherQuestion = new Promise<ReturnType<typeof nextPayload>>((resolve) => {
+      resolveOtherQuestion = resolve;
+    });
+    mockApiFetch
+      .mockResolvedValueOnce(nextPayload(QUESTION_1, 0))
+      .mockReturnValueOnce(otherQuestion);
+    const rendered = await renderScreen();
+    await startFreshTest();
+    expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    mockRecorderProps = null;
+    await rendered.rerenderScreen();
+
+    expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    // The identity reset re-falses the recorder exit latch, so the account
+    // exits stay reachable while the new identity's question is still loading.
+    await fireEvent.press(screen.getByRole('button', { name: t('header.settings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/settings');
+
+    resolveOtherQuestion(nextPayload(QUESTION_2, 0));
+  });
+
+  it('does not append a silent no-speech take to the completion reveal', async () => {
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: false,
+        score: 0,
+        transcript: '',
+        feedback: 'Please speak clearly and try again.',
+        noSpeech: true,
+        done: false,
+        nextQuestion: QUESTION_1,
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.recordAgain') }));
+
+    await act(async () =>
+      recorderProps().onResult({
+        passed: true,
+        score: 91,
+        transcript: 'A clear answer.',
+        feedback: 'Clear feedback.',
+        done: true,
+        level: 'B2',
+      }),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.seeLevel') }));
+
+    expect(await screen.findByText(t('diag.completeTitle'))).toBeTruthy();
+    expect(
+      screen.getByText(t('diag.answerLine', { number: 1, score: 91, mark: '✓' })),
+    ).toBeTruthy();
+    expect(screen.queryByText(t('diag.answerLine', { number: 1, score: 0, mark: '✗' }))).toBeNull();
+    expect(
+      screen.queryByText(t('diag.answerLine', { number: 2, score: 91, mark: '✓' })),
+    ).toBeNull();
+  });
+
+  it('holds the logout failure alert behind focus ownership', async () => {
+    let rejectLogout!: (reason: Error) => void;
+    const pendingLogout = new Promise<void>((_resolve, reject) => {
+      rejectLogout = reject;
+    });
+    const logout = jest.fn(() => pendingLogout);
+    mockAuthValue = makeAuth({ logout });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(logout).toHaveBeenCalledTimes(1);
+    await blurScreen();
+    await act(async () => {
+      rejectLogout(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('reports a logout failure through the identity-only lease view', async () => {
+    const renderLease = { owner: 'identity-only-logout' } as never;
+    let currentLease: unknown = renderLease;
+    let rejectLogout!: (reason: Error) => void;
+    const pendingLogout = new Promise<void>((_resolve, reject) => {
+      rejectLogout = reject;
+    });
+    const logout = jest.fn(() => pendingLogout);
+    mockAuthValue = makeAuth({
+      logout,
+      captureSessionLease: jest.fn(() => currentLease as never),
+      isSessionLeaseCurrent: jest.fn(
+        (lease: SessionLease, options?: { identityOnly?: boolean }) =>
+          options?.identityOnly === true || lease === currentLease,
+      ),
+    });
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 0));
+    await renderScreen();
+    await startFreshTest();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    expect(logout).toHaveBeenCalledTimes(1);
+    currentLease = { owner: 'replacement-session' };
+    await act(async () => {
+      rejectLogout(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    // The strict render lease is gone, but the same identity may still hear
+    // the failure through the identity-only view of the captured lease.
+    expect(alertSpy).toHaveBeenCalledWith(t('logout.failedTitle'), t('logout.failedBody'));
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('drops the acknowledgement continuation when the session identity changes mid-flight', async () => {
+    const acknowledgement = deferred<boolean>();
+    mockAcknowledgePendingFeedback.mockReturnValue(acknowledgement.promise);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    const rendered = await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    await act(async () =>
+      recorderProps().onResult(
+        {
+          passed: true,
+          score: 88,
+          transcript: 'A durable answer.',
+          feedback: 'Durable feedback.',
+          done: false,
+          nextQuestion: QUESTION_2,
+        },
+        { requestId: DIAGNOSTIC_REQUEST_ID },
+      ),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    expect(mockAcknowledgePendingFeedback).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+    await act(async () => {
+      acknowledgement.resolve(true);
+      await acknowledgement.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText(t('diag.preparing'))).toBeTruthy();
+    // The durable pointer belongs to the old session and must survive for its
+    // recovery path rather than being cleared under the new identity.
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).not.toHaveBeenCalled();
+  });
+
+  it('drops the acknowledgement continuation when the screen unmounts mid-flight', async () => {
+    const acknowledgement = deferred<boolean>();
+    mockAcknowledgePendingFeedback.mockReturnValue(acknowledgement.promise);
+    mockApiFetch.mockResolvedValue(nextPayload(QUESTION_1, 1));
+    const rendered = await renderScreen();
+    await screen.findByText(QUESTION_1.questionText);
+    await act(async () =>
+      recorderProps().onResult(
+        {
+          passed: true,
+          score: 88,
+          transcript: 'A durable answer.',
+          feedback: 'Durable feedback.',
+          done: false,
+          nextQuestion: QUESTION_2,
+        },
+        { requestId: DIAGNOSTIC_REQUEST_ID },
+      ),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.nextQuestion') }));
+    await rendered.unmount();
+
+    await act(async () => {
+      acknowledgement.resolve(true);
+      await acknowledgement.promise;
+    });
+
+    expect(mockAssessmentReplayValue.clearDiagnosticReplay).not.toHaveBeenCalled();
+  });
+
+  it('keeps the completion acknowledgement fenced across an in-flight identity change', async () => {
+    const acknowledgement = deferred<void>();
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
+    mockAcknowledgeDiagnostic.mockReturnValue(acknowledgement.promise);
+    const queryClient = makeQueryClient();
+    const removeSpy = jest.spyOn(queryClient, 'removeQueries');
+    const rendered = await renderScreen(queryClient);
+    await screen.findByText(t('diag.completeTitle'));
+    const startPracticing = capturedPressHandler(t('diag.startPracticing'));
+    const originalSetUser = mockAuthValue.setUser;
+
+    await act(async () => {
+      void startPracticing();
+      await Promise.resolve();
+    });
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+
+    await act(async () => {
+      acknowledgement.resolve(undefined);
+      await acknowledgement.promise;
+      await Promise.resolve();
+    });
+
+    expect(mockAcknowledgeDiagnostic).toHaveBeenCalledTimes(1);
+    expect(originalSetUser).not.toHaveBeenCalled();
+    expect(removeSpy).not.toHaveBeenCalledWith({ queryKey: ['practice-stats'] });
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('holds the completion failure alert behind ownership after an in-flight identity change', async () => {
+    const acknowledgement = deferred<void>();
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
+    mockAcknowledgeDiagnostic.mockReturnValue(acknowledgement.promise);
+    const rendered = await renderScreen();
+    await screen.findByText(t('diag.completeTitle'));
+    const startPracticing = capturedPressHandler(t('diag.startPracticing'));
+    alertSpy.mockClear();
+
+    await act(async () => {
+      void startPracticing();
+      await Promise.resolve();
+    });
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await rendered.rerenderScreen();
+
+    await act(async () => {
+      acknowledgement.reject(new Error('offline'));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(alertSpy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the generic acknowledgement message for non-API failures', async () => {
+    mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
+    mockAcknowledgeDiagnostic.mockRejectedValueOnce(new Error('offline'));
+    await renderScreen();
+    await screen.findByText(t('diag.completeTitle'));
+
+    await fireEvent.press(screen.getByRole('button', { name: t('diag.startPracticing') }));
+
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(t('diag.ackFailedTitle'), t('diag.ackFailed')),
+    );
+    expect(screen.getByText(t('diag.completeTitle'))).toBeTruthy();
+  });
 });
 
 describe('diagnostic presentation', () => {
@@ -2812,6 +3397,20 @@ describe('diagnostic presentation', () => {
       lineHeight: 27,
       color: colors.text,
     });
+    // Both detail sections are named for screen readers on the shared label
+    // token block.
+    const transcriptLabel = screen.getByText(t('diag.transcriptLabel'));
+    expect(flattenedStyle(transcriptLabel)).toEqual({
+      marginTop: spacing.lg,
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.muted,
+      textTransform: 'uppercase',
+      letterSpacing: 0.8,
+    });
+    expect(flattenedStyle(screen.getByText(t('feedback.feedbackLabel')))).toEqual(
+      flattenedStyle(transcriptLabel),
+    );
     expect(flattenedStyle(screen.getByText('Great answer.'))).toEqual({
       marginTop: spacing.xs,
       fontSize: 16,
@@ -2922,6 +3521,42 @@ describe('diagnostic presentation', () => {
       fontSize: 15,
       color: colors.text,
     });
+    // Each stored answer keeps its own summary block, question line, and
+    // labelled transcript/feedback details on the reveal card.
+    const answerLine = screen.getByText(t('diag.answerLine', { number: 1, score: 91, mark: '✓' }));
+    expect(flattenedStyle(parentOf(answerLine))).toEqual({
+      marginTop: spacing.md,
+      paddingTop: spacing.md,
+      borderTopWidth: 1,
+      borderTopColor: colors.border,
+    });
+    expect(
+      flattenedStyle(
+        screen.getByText(
+          t('diag.answerQuestion', {
+            word: QUESTION_1.promptWord,
+            question: QUESTION_1.questionText,
+          }),
+        ),
+      ),
+    ).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 15,
+      fontWeight: '600',
+      lineHeight: 22,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText(t('diag.transcriptLabel')))).toBeTruthy();
+    expect(flattenedStyle(screen.getByText('transcript'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 15,
+      lineHeight: 22,
+      color: colors.text,
+    });
+    expect(screen.getByText(t('feedback.feedbackLabel'))).toBeTruthy();
+    expect(flattenedStyle(screen.getByText('feedback'))).toEqual(
+      flattenedStyle(screen.getByText('transcript')),
+    );
 
     expect(flattenedStyle(screen.getByText(t('diag.levelHint')))).toEqual({
       marginTop: spacing.ml,

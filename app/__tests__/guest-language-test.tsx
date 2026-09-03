@@ -1,9 +1,11 @@
 import * as SecureStore from 'expo-secure-store';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
 import React, { useEffect } from 'react';
-import { Text } from 'react-native';
+import { StyleSheet, Text } from 'react-native';
 
 import UiLanguagePicker from '../src/components/UiLanguagePicker';
+import { NATIVE_LANGUAGE_OPTIONS, UI_LANGUAGE_OPTIONS } from '../src/lib/language-options';
+import { useTheme } from '../src/lib/theme';
 import {
   GuestLanguageProvider,
   guestLanguageStorage,
@@ -16,8 +18,15 @@ import {
   translateFor,
   useI18n,
 } from '../src/lib/i18n';
-import { UI_LANGUAGE_OPTIONS } from '../src/lib/language-options';
 import type { UiLanguage } from '../src/lib/types';
+
+// Snapshot of UI_LANGUAGE_OPTIONS' codes: the each-table (and every test title
+// it generates) must stay invariant while Stryker mutates language-options.ts.
+// A title interpolating mutated production data renames the test under the
+// mutant, leaving killedBy references that match no dry-run test ID and failing
+// the strict lane merge. Lookup-based assertions still kill every code mutant
+// because the picker renders from the mutated production list.
+const EXPECTED_UI_LANGUAGE_CODES: readonly UiLanguage[] = ['en', 'te', 'hi', 'es', 'zh'];
 
 jest.mock('expo-secure-store', () => ({
   WHEN_UNLOCKED_THIS_DEVICE_ONLY: 'device-only',
@@ -295,7 +304,7 @@ describe('GuestLanguageProvider restore and persistence', () => {
 });
 
 describe('public app-language picker', () => {
-  it.each(UI_LANGUAGE_OPTIONS.map(({ code }) => [code]))(
+  it.each(EXPECTED_UI_LANGUAGE_CODES.map((code) => [code]))(
     'switches, announces, and persists %s independently',
     async (language) => {
       await render(provider(<PickerHarness />));
@@ -384,5 +393,295 @@ describe('public app-language picker', () => {
       preference!.mirrorAccountLanguage('hi');
     });
     expect(mockSetItem).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Language catalog pins: the exported option tables are contracts (codes,
+// stable English names, autonyms) consumed by pickers and tests alike.
+// ---------------------------------------------------------------------------
+
+// Probe the live light theme for token values; call BEFORE rendering (a later
+// renderHook detaches earlier trees in this RNTL version).
+const lightTheme = async () => (await renderHook(() => useTheme())).result.current;
+
+describe('language option tables', () => {
+  it('pins the mother-tongue catalog exactly', () => {
+    expect(NATIVE_LANGUAGE_OPTIONS).toEqual([
+      { code: 'te', english: 'Telugu', native: 'తెలుగు' },
+      { code: 'hi', english: 'Hindi', native: 'हिन्दी' },
+      { code: 'es', english: 'Spanish', native: 'Español' },
+      { code: 'zh', english: 'Chinese (Simplified)', native: '简体中文' },
+    ]);
+  });
+
+  it('offers the five interface languages as English plus the mother tongues', () => {
+    expect(UI_LANGUAGE_OPTIONS).toEqual([
+      { code: 'en', english: 'English', native: 'English' },
+      ...NATIVE_LANGUAGE_OPTIONS,
+    ]);
+    expect(UI_LANGUAGE_OPTIONS.map(({ code }) => code)).toEqual(['en', 'te', 'hi', 'es', 'zh']);
+  });
+});
+
+describe('guest language storage contract', () => {
+  it('pins the key, keychain service, and device-unlocked accessibility', () => {
+    expect(guestLanguageStorage.key).toBe('ui_language_preference');
+    expect(guestLanguageStorage.options).toEqual({
+      keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
+      keychainService: 'ai-english-coach.ui-language',
+    });
+  });
+});
+
+describe('guest-language ordering and mirror contracts', () => {
+  it('lets a newer explicit choice win over the restore it interrupts', async () => {
+    const gate = deferred<string | null>();
+    mockGetItem.mockReturnValueOnce(gate.promise);
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('true'));
+    preference?.setLanguage('es');
+    await act(async () => {
+      gate.resolve('te');
+    });
+    await waitFor(() => expect(screen.getByTestId('guest-language')).toHaveTextContent('es'));
+    expect(mockSetItem).toHaveBeenCalledWith(
+      guestLanguageStorage.key,
+      'es',
+      guestLanguageStorage.options,
+    );
+  });
+
+  it('never rewrites an already-confirmed account language', async () => {
+    mockGetItem.mockResolvedValueOnce('te');
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+    mockSetItem.mockClear();
+    await act(async () => {
+      await preference?.mirrorAccountLanguage('te');
+    });
+    expect(mockSetItem).not.toHaveBeenCalled();
+  });
+
+  it('writes an unconfirmed same-language device fallback exactly once', async () => {
+    mockGetItem.mockResolvedValueOnce(null);
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('en');
+    mockSetItem.mockClear();
+    await act(async () => {
+      await preference?.mirrorAccountLanguage('en');
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(1);
+    expect(mockSetItem).toHaveBeenCalledWith(
+      guestLanguageStorage.key,
+      'en',
+      guestLanguageStorage.options,
+    );
+  });
+
+  it('joins an identical in-flight mirror instead of issuing a second write', async () => {
+    mockGetItem.mockResolvedValueOnce(null);
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+    const gate = deferred<void>();
+    mockSetItem.mockReturnValueOnce(gate.promise);
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    await act(async () => {
+      first = preference!.mirrorAccountLanguage('te');
+      second = preference!.mirrorAccountLanguage('te');
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      gate.resolve();
+      await first;
+      await second;
+    });
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('te');
+    // The pending mirror is cleared, so a later different mirror still runs.
+    mockSetItem.mockClear();
+    await act(async () => {
+      await preference?.mirrorAccountLanguage('hi');
+    });
+    expect(mockSetItem).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a mirror value outside the five supported languages', async () => {
+    mockGetItem.mockResolvedValueOnce('te');
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+    mockSetItem.mockClear();
+    await act(async () => {
+      await preference?.mirrorAccountLanguage('fr' as UiLanguage);
+    });
+    expect(mockSetItem).not.toHaveBeenCalled();
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('te');
+  });
+
+  it('falls back to the device language when the stored read rejects', async () => {
+    mockGetItem.mockRejectedValueOnce(new Error('keychain locked'));
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('en');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent('none');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Picker presentation: radiogroup semantics, spoken names, chip styling.
+// ---------------------------------------------------------------------------
+function StyledPickerHarness({
+  value,
+  disabled = false,
+  error = null,
+}: {
+  value: UiLanguage;
+  disabled?: boolean;
+  error?: string | null;
+}) {
+  return (
+    <I18nProvider accountLanguage={null} guestLanguage="en">
+      <UiLanguagePicker value={value} onChange={jest.fn()} disabled={disabled} error={error} />
+    </I18nProvider>
+  );
+}
+
+describe('UiLanguagePicker presentation', () => {
+  it('labels the group and every option with a spoken, readable name', async () => {
+    const theme = await lightTheme();
+    await render(<StyledPickerHarness value="te" />);
+    const group = screen.getByTestId('ui-language-te').parent!;
+    expect(group?.props.accessibilityRole).toBe('radiogroup');
+    expect(group?.props.accessibilityLabel).toBe('App language');
+    expect(group?.props.accessibilityHint).toBe(
+      'Choose the language used by the app on this device.',
+    );
+    expect(screen.getByText('Choose the language used by the app on this device.')).toBeTruthy();
+    expect(screen.getByText('App language')).toBeTruthy();
+
+    // The autonym-only option (English) carries no second line; every other
+    // chip speaks its localized name and autonym together.
+    expect(screen.getByRole('radio', { name: 'App language: English' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'App language: Telugu, తెలుగు' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'App language: Hindi, हिन्दी' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'App language: Spanish, Español' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'App language: Chinese, 简体中文' })).toBeTruthy();
+
+    const te = screen.getByTestId('ui-language-te');
+    expect(te.props.accessibilityState).toEqual({ checked: true, selected: true, disabled: false });
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toEqual({
+      checked: false,
+      selected: false,
+      disabled: false,
+    });
+    // Exactly the selected chip wears the selected fill and border.
+    expect(StyleSheet.flatten(te.props.style)).toMatchObject({
+      borderColor: theme.colors.primary,
+      backgroundColor: theme.colors.primaryLight,
+    });
+    const en = screen.getByTestId('ui-language-en');
+    expect(StyleSheet.flatten(en.props.style)).toMatchObject({
+      borderColor: theme.colors.inputBorder,
+      backgroundColor: theme.colors.card,
+      borderWidth: 1.5,
+      borderRadius: theme.radii.input,
+      minHeight: theme.layout.minimumTarget,
+      minWidth: theme.layout.minimumTarget,
+      flexGrow: 1,
+      flexBasis: '30%',
+      maxWidth: '48%',
+      paddingHorizontal: theme.spacing.sm,
+      paddingVertical: theme.spacing.sm,
+    });
+    // Grid and container composition.
+    expect(StyleSheet.flatten(group.props.style)).toMatchObject({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'center',
+      gap: theme.spacing.sm,
+      marginTop: theme.spacing.sm,
+    });
+    expect(StyleSheet.flatten(group.parent!.props.style)).toMatchObject({
+      marginTop: theme.spacing.lg,
+      width: '100%',
+    });
+    // Label and help copy styles.
+    expect(StyleSheet.flatten(screen.getByText('App language').props.style)).toMatchObject({
+      color: theme.colors.text,
+      fontSize: 14,
+      fontWeight: '700',
+      textAlign: 'center',
+    });
+    expect(
+      StyleSheet.flatten(
+        screen.getByText('Choose the language used by the app on this device.').props.style,
+      ),
+    ).toMatchObject({
+      marginTop: 4,
+      color: theme.colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
+      textAlign: 'center',
+    });
+  });
+
+  it('shows the localized second line only where it differs from the autonym', async () => {
+    const theme = await lightTheme();
+    await render(<StyledPickerHarness value="en" />);
+    const en = screen.getByTestId('ui-language-en');
+    expect(en.children).toHaveLength(1);
+    expect(screen.getByText('English')).toBeTruthy();
+    const te = screen.getByTestId('ui-language-te');
+    // The Telugu chip shows autonym first, localized name second.
+    expect(te.children).toHaveLength(2);
+    expect(
+      StyleSheet.flatten(
+        (te.children[0] as unknown as { props: { style: unknown[] } }).props.style,
+      ),
+    ).toMatchObject({
+      color: theme.colors.text,
+      fontSize: 14,
+      fontWeight: '700',
+      textAlign: 'center',
+    });
+    expect(
+      StyleSheet.flatten(
+        (te.children[1] as unknown as { props: { style: unknown[] } }).props.style,
+      ),
+    ).toMatchObject({ marginTop: 1, color: theme.colors.muted, fontSize: 11, textAlign: 'center' });
+    // The selected English chip inks both names with the primary color.
+    expect(
+      StyleSheet.flatten(
+        (en.children[0] as unknown as { props: { style: unknown[] } }).props.style,
+      ),
+    ).toMatchObject({ color: theme.colors.primary });
+  });
+
+  it('dims every chip while disabled and reports the state', async () => {
+    const theme = await lightTheme();
+    await render(<StyledPickerHarness value="te" disabled />);
+    const te = screen.getByTestId('ui-language-te');
+    expect(te.props.accessibilityState).toEqual({ checked: true, selected: true, disabled: true });
+    expect(StyleSheet.flatten(te.props.style)).toMatchObject({ opacity: 0.5 });
+    expect(StyleSheet.flatten(screen.getByTestId('ui-language-en').props.style)).toMatchObject({
+      opacity: 0.5,
+      borderColor: theme.colors.inputBorder,
+      backgroundColor: theme.colors.card,
+    });
+  });
+
+  it('styles the persistence error as a centered danger alert', async () => {
+    const theme = await lightTheme();
+    await render(<StyledPickerHarness value="en" error="Could not save" />);
+    const alert = screen.getByRole('alert');
+    expect(alert.props.children).toBe('Could not save');
+    expect(StyleSheet.flatten(alert.props.style)).toMatchObject({
+      marginTop: theme.spacing.sm,
+      color: theme.colors.danger,
+      fontSize: 13,
+      lineHeight: 18,
+      textAlign: 'center',
+    });
   });
 });

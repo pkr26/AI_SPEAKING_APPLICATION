@@ -37,8 +37,13 @@ import {
 jest.setTimeout(30_000);
 
 // Assertion self-count: the wrapper below counts every expect() invocation in
-// this file and afterAll pins the exact total, so the suite fails if the
-// deterministic corpora ever change shape silently.
+// this file and the trailing test at the very end of this file pins the exact
+// total, so the suite fails if the deterministic corpora ever change shape
+// silently. The pin must live in a regular test — not afterAll — because a
+// self-count mismatch under a Stryker mutant has to fail inside a test for the
+// kill to attribute to this file's test IDs; an afterAll failure is a
+// suite-level error Stryker scores as RuntimeError, which the strict mutation
+// gate rejects as unresolved.
 const EXPECTED_ASSERTIONS = 21_909;
 const originalExpect = expect;
 let assertionCount = 0;
@@ -52,7 +57,6 @@ beforeAll(() => {
 
 afterAll(() => {
   (globalThis as unknown as { expect: typeof expect }).expect = originalExpect;
-  originalExpect(assertionCount).toBe(EXPECTED_ASSERTIONS);
 });
 
 // ---------------------------------------------------------------------------
@@ -2751,4 +2755,10 @@ describe('prototype pollution probe', () => {
     expect(Object.hasOwn(Object.prototype, 'polluted')).toBe(false);
     expect(({} as Record<string, unknown>).polluted).toBeUndefined();
   });
+});
+
+// Declared last so it executes after every corpus above. originalExpect keeps
+// this pin out of the wrapped count, so EXPECTED_ASSERTIONS stays exact.
+test('assertion self-count stays pinned', () => {
+  originalExpect(assertionCount).toBe(EXPECTED_ASSERTIONS);
 });

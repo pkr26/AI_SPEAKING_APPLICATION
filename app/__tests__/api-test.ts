@@ -4476,3 +4476,313 @@ describe('typed endpoint helpers', () => {
     expect(consumePage).not.toHaveBeenCalled();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Deep mutation-hardening probes: status-dispatch boundaries for Retry-After,
+// export-walker page/cursor bounds with exact fetch accounting, extension
+// regex edges, presigned file-state gates, and timezone resolution.
+// ---------------------------------------------------------------------------
+describe('retry-hint status dispatch boundaries', () => {
+  async function errorProbe(status: number, headers: Record<string, string>, body: unknown) {
+    fetchMock.mockResolvedValue(
+      fakeResponse({ ok: false, status, headers, json: async () => body }),
+    );
+    const outcome = await catchSync(() => undefined);
+    expect(outcome).toBeUndefined();
+    return api.apiFetch('/probe').catch((error: { retryAfterSeconds?: number }) => error);
+  }
+
+  it('caps a 429 Retry-After header at exactly 24h', async () => {
+    const atCap = await errorProbe(429, { 'Retry-After': '86400' }, {});
+    expect(atCap).toMatchObject({ status: 429, retryAfterSeconds: 86_400 });
+    const pastCap = await errorProbe(429, { 'Retry-After': '86401' }, {});
+    expect(pastCap).toMatchObject({ status: 429, retryAfterSeconds: undefined });
+  });
+
+  it('caps a 503 Retry-After header at exactly 120s', async () => {
+    const atCap = await errorProbe(503, { 'Retry-After': '120' }, {});
+    expect(atCap).toMatchObject({ status: 503, retryAfterSeconds: 120 });
+    const pastCap = await errorProbe(503, { 'Retry-After': '121' }, {});
+    expect(pastCap).toMatchObject({ status: 503, retryAfterSeconds: undefined });
+  });
+
+  it('caps a REQUEST_IN_FLIGHT 409 hint at exactly 120s', async () => {
+    const atCap = await errorProbe(
+      409,
+      { 'Retry-After': '120' },
+      {
+        code: 'REQUEST_IN_FLIGHT',
+      },
+    );
+    expect(atCap).toMatchObject({ status: 409, retryAfterSeconds: 120 });
+    const pastCap = await errorProbe(
+      409,
+      { 'Retry-After': '121' },
+      {
+        code: 'REQUEST_IN_FLIGHT',
+      },
+    );
+    expect(pastCap).toMatchObject({ status: 409, retryAfterSeconds: undefined });
+  });
+
+  it('parses no retry hint for statuses outside the three-contract set', async () => {
+    // A 500 or 408 carrying a Retry-After look-alike must not surface one:
+    // only 429/503/REQUEST_IN_FLIGHT define the wait contract.
+    for (const status of [500, 408, 403]) {
+      const error = await errorProbe(status, { 'Retry-After': '30' }, {});
+      expect(error).toMatchObject({ status, retryAfterSeconds: undefined });
+    }
+  });
+
+  it('caps a 429 body retryAfterHours at exactly 48 and prefers the header', async () => {
+    const atCap = await errorProbe(429, {}, { retryAfterHours: 48, retryAfterSeconds: 60 });
+    expect(atCap).toMatchObject({ status: 429, retryAfterSeconds: 60, retryAfterHours: 48 });
+    const pastCap = await errorProbe(429, {}, { retryAfterHours: 48.5 });
+    expect(pastCap).toMatchObject({ status: 429, retryAfterHours: undefined });
+    const headerWins = await errorProbe(429, { 'Retry-After': '90' }, { retryAfterSeconds: 10 });
+    expect(headerWins).toMatchObject({ status: 429, retryAfterSeconds: 90 });
+  });
+
+  it('treats non-string error codes as absent rather than trusting the set lookup', async () => {
+    const error = await errorProbe(400, {}, { code: 42 });
+    expect(error).toMatchObject({ status: 400, code: undefined });
+  });
+});
+
+describe('audioFileDescriptor extension edges', () => {
+  it('treats a URI whose only dot-run is interrupted as extension-less M4A', async () => {
+    // '.a!' fails the trailing lowercase-alphanumeric run, so the descriptor
+    // falls back to the configured recorder's container instead of a 415.
+    expect(api.audioFileDescriptor('file:///rec/audio.a!')).toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+    });
+    // An uppercase extension lowercases into a known-format run, so it fails
+    // closed exactly like its lowercase spelling.
+    const lowered = catchSync(() => api.audioFileDescriptor('file:///rec/x.OK1')) as {
+      status: number;
+    };
+    expect(lowered.status).toBe(415);
+  });
+
+  it('fails closed with the local 415 for an unknown lowercase extension', async () => {
+    const error = catchSync(() => api.audioFileDescriptor('file:///rec/audio.bin')) as {
+      status: number;
+      message: string;
+    };
+    expect(error.status).toBe(415);
+    expect(error.message).toBe('Unsupported recording format');
+  });
+});
+
+describe('presigned file-state gate', () => {
+  const presignedCall = () =>
+    api.apiPostPresignedAudio(
+      'https://bucket.s3.amazonaws.com/',
+      { 'Content-Type': 'audio/mp4', key: 'k', policy: 'p', signature: 's' },
+      'file:///rec/audio.m4a',
+      'audio/mp4',
+      10,
+    );
+
+  it('rejects an evicted native recording with the definite local 400', async () => {
+    mockFileState.exists = false;
+    await expect(presignedCall()).rejects.toMatchObject({
+      status: 400,
+      message: 'The recording is unavailable',
+    });
+  });
+
+  it('rejects a zero, non-number, or non-finite snapshot size', async () => {
+    mockFileState.size = 0;
+    await expect(presignedCall()).rejects.toMatchObject({ status: 400 });
+    mockFileState.size = Number.NaN;
+    await expect(presignedCall()).rejects.toMatchObject({ status: 400 });
+  });
+});
+
+describe('practice-stats timezone resolution', () => {
+  const originalResolvedOptions = Intl.DateTimeFormat.prototype.resolvedOptions;
+
+  afterEach(() => {
+    Intl.DateTimeFormat.prototype.resolvedOptions = originalResolvedOptions;
+    fetchMock.mockReset();
+  });
+
+  it('encodes the resolved zone into the query', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
+    const spy = jest
+      .spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions')
+      .mockReturnValue({ timeZone: 'Asia/Kolkata' } as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      'http://localhost:4000/practice/stats?timeZone=Asia%2FKolkata',
+    );
+    spy.mockRestore();
+  });
+
+  it('keeps the explicit UTC default for blank, overlong, or failing resolution', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
+    const spy = jest.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions');
+    spy.mockReturnValue({ timeZone: '' } as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    spy.mockReturnValue({ timeZone: '  ' } as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    spy.mockReturnValue({
+      timeZone: `${'z'.repeat(101)}`,
+    } as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    spy.mockImplementation(() => {
+      throw new Error('no tzdata');
+    });
+    await api.apiGetPracticeStats();
+    for (const [url] of fetchMock.mock.calls) {
+      expect(url).toBe('http://localhost:4000/practice/stats?timeZone=UTC');
+    }
+    spy.mockRestore();
+  });
+});
+
+describe('export walker bounds and cursor accounting', () => {
+  beforeEach(async () => {
+    await api.saveToken('walker-token');
+  });
+
+  function uuidFor(index: number): string {
+    return `550e8400-e29b-41d4-a716-44665544${String(index).padStart(4, '0')}`;
+  }
+
+  function attemptsPage(cursor: string | null) {
+    return userExportPage({
+      attempts: cursor === null ? [] : [{}],
+      attemptsDone: false,
+      practiceCyclesDone: true,
+      nextCursor: cursor,
+      nextPracticeCycleCursor: null,
+    });
+  }
+
+  it('stops the attempts walk at exactly the page bound before consuming it', async () => {
+    let fetched = 0;
+    fetchMock.mockImplementation(async () => {
+      fetched += 1;
+      return fakeResponse({ json: async () => attemptsPage(uuidFor(fetched)) });
+    });
+    const consumeUser = jest.fn();
+    const consumeRecordings = jest.fn();
+    await expect(
+      api.apiConsumeAccountExportPages(consumeUser, consumeRecordings),
+    ).rejects.toThrow();
+    expect(fetched).toBe(10_000);
+    expect(consumeUser).toHaveBeenCalledTimes(9_999);
+    expect(consumeRecordings).not.toHaveBeenCalled();
+  }, 60_000);
+
+  it('rejects a repeated practice-cycle cursor without consuming the cycle page', async () => {
+    fetchMock
+      .mockImplementationOnce(async () =>
+        fakeResponse({ json: async () => attemptsPage(uuidFor(1)) }),
+      )
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              attemptsDone: true,
+              practiceCyclesDone: true,
+              nextCursor: null,
+              nextPracticeCycleCursor: null,
+            }),
+        }),
+      )
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              attemptsDone: true,
+              practiceCycles: [{}],
+              practiceCyclesDone: false,
+              nextCursor: null,
+              nextPracticeCycleCursor: '550e8400-e29b-41d4-a716-446655447777',
+            }),
+        }),
+      )
+      .mockImplementation(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              attemptsDone: true,
+              practiceCycles: [{}],
+              practiceCyclesDone: false,
+              nextCursor: null,
+              nextPracticeCycleCursor: '550e8400-e29b-41d4-a716-446655447777',
+            }),
+        }),
+      );
+    const consumeUser = jest.fn();
+    await expect(api.apiConsumeAccountExportPages(consumeUser, jest.fn())).rejects.toThrow();
+    // First cycle page consumes; the repeated cursor on the second rejects
+    // before that page is emitted.
+    expect(consumeUser).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('walks a bounded terminal export with exactly the contracted fetches', async () => {
+    fetchMock
+      .mockImplementationOnce(async () =>
+        fakeResponse({ json: async () => attemptsPage(uuidFor(2)) }),
+      )
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              attemptsDone: true,
+              practiceCyclesDone: true,
+              nextCursor: null,
+              nextPracticeCycleCursor: null,
+            }),
+        }),
+      )
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              attemptsDone: true,
+              practiceCyclesDone: true,
+              nextCursor: null,
+              nextPracticeCycleCursor: null,
+            }),
+        }),
+      )
+      .mockResolvedValueOnce(
+        fakeResponse({
+          json: async () => ({ recordings: [], nextCursor: null }),
+        }),
+      );
+    const consumeUser = jest.fn();
+    const consumeRecordings = jest.fn();
+    await api.apiConsumeAccountExportPages(consumeUser, consumeRecordings);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true',
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=false&practiceCyclesDone=true&cursor=550e8400-e29b-41d4-a716-446655440002',
+      'http://localhost:4000/auth/me/data?limit=500&attemptsDone=true&practiceCyclesDone=false',
+      'http://localhost:4000/recordings/export?limit=500',
+    ]);
+    expect(consumeUser).toHaveBeenCalledTimes(3);
+    expect(consumeRecordings).toHaveBeenCalledTimes(1);
+  });
+
+  it('surfaces the caller abort reason after a consumed user page', async () => {
+    const reason = new Error('learner cancelled');
+    const controller = new AbortController();
+    fetchMock.mockImplementation(async () =>
+      fakeResponse({ json: async () => attemptsPage(uuidFor(1)) }),
+    );
+    const consumeUser = jest.fn(() => controller.abort(reason));
+    await expect(
+      api.apiConsumeAccountExportPages(consumeUser, jest.fn(), controller.signal),
+    ).rejects.toBe(reason);
+    // The recordings walk never starts after the abort.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

@@ -11,6 +11,7 @@ import {
   MAX_NAME_LENGTH,
   MAX_PASSWORD_UTF8_BYTES,
   RegistrationCompletedLoginRequiredError,
+  emailAddressError,
   isValidEmailAddress,
   type useAuth,
 } from '../src/lib/auth';
@@ -2056,5 +2057,119 @@ describe('signup screen', () => {
     await fireEvent.press(signUpButton('te'));
     await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
     expect(mockAuthValue.register).toHaveBeenCalledTimes(2);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deep mutation-hardening: form-gate conjunct boundaries, mismatch copy,
+// email-touch wrappers, busy control styling, and login notice separation.
+// ---------------------------------------------------------------------------
+
+const AT_MAX_EMAIL = `${'a'.repeat(64)}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+
+describe('identity-validation boundaries', () => {
+  it('accepts exactly the server length bound around the pinned pattern', () => {
+    expect(AT_MAX_EMAIL).toHaveLength(MAX_EMAIL_LENGTH);
+    expect(isValidEmailAddress(AT_MAX_EMAIL)).toBe(true);
+    expect(isValidEmailAddress(`${AT_MAX_EMAIL}a`)).toBe(false);
+    expect(isValidEmailAddress('')).toBe(false);
+    // An over-length entry still reads as an invalid address to the field —
+    // the shared length bound lives inside the validator.
+    expect(emailAddressError(`${AT_MAX_EMAIL}a`, t)).toBe(t('email.invalid'));
+    expect(emailAddressError('not-an-email', t)).toBe(t('email.invalid'));
+    expect(emailAddressError('', t)).toBeNull();
+  });
+});
+
+describe('login deep contracts', () => {
+  it('shows only the registered-notice banner for that notice', async () => {
+    mockSearchParams = { notice: 'registered' };
+    await render(<LoginScreen />);
+    expect(screen.getByText(t('signup.createdLoginBanner'))).toBeTruthy();
+    expect(screen.queryByText(t('reset.doneBanner'))).toBeNull();
+  });
+
+  it('shows only the reset banner for the reset notice', async () => {
+    mockSearchParams = { notice: 'reset' };
+    await render(<LoginScreen />);
+    expect(screen.getByText(t('reset.doneBanner'))).toBeTruthy();
+    expect(screen.queryByText(t('signup.createdLoginBanner'))).toBeNull();
+  });
+
+  it('submits at exactly the maximum email length and blocks one past it', async () => {
+    mockSearchParams = {};
+    await render(<LoginScreen />);
+    await fillLogin(AT_MAX_EMAIL, 'password1');
+    await fireEvent.press(logInButton());
+    expect(mockAuthValue.login).toHaveBeenCalledTimes(1);
+
+    const { unmount } = await render(<LoginScreen />);
+    await fillLogin(`${AT_MAX_EMAIL}a`, 'password1');
+    await fireEvent.press(logInButton());
+    expect(mockAuthValue.login).toHaveBeenCalledTimes(1);
+    unmount();
+  });
+});
+
+describe('signup deep contracts', () => {
+  async function fillConfirm(value: string) {
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(translateFor('en', 'password.confirmPlaceholder')),
+      value,
+    );
+  }
+  function signupButton() {
+    return screen.getByRole('button', { name: translateFor('en', 'signup.submit') });
+  }
+
+  it('shows the mismatch copy only while a mismatched confirmation is present', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Priya', 'priya@example.com', 'password1');
+    await fillConfirm('password2');
+    expect(screen.getByText(translateFor('en', 'password.mismatch'))).toBeTruthy();
+    // An empty confirmation is not a mismatch — the required-field copy owns it.
+    await fillConfirm('');
+    expect(screen.queryByText(translateFor('en', 'password.mismatch'))).toBeNull();
+    await fillConfirm('password1');
+    expect(screen.queryByText(translateFor('en', 'password.mismatch'))).toBeNull();
+  });
+
+  it('blocks registration without a confirmation and past the email bound', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Priya', 'priya@example.com', 'password1');
+    await fireEvent.press(signupButton());
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+
+    await fillSignup('Priya', `${AT_MAX_EMAIL}a`, 'password1');
+    await fillConfirm('password1');
+    await fireEvent.press(signupButton());
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+  });
+
+  it('registers at exactly the maximum email length with a matching confirmation', async () => {
+    await render(<SignupScreen />);
+    await fillSignup('Priya', AT_MAX_EMAIL, 'password1');
+    await fillConfirm('password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.press(signupButton());
+    await waitFor(() => expect(mockAuthValue.register).toHaveBeenCalledTimes(1));
+  });
+
+  it('keeps the confirmation field uncorrected and the CTA dimmed while busy', async () => {
+    const gate = deferred<User>();
+    mockAuthValue = makeAuth({ register: jest.fn(() => gate.promise) });
+    await render(<SignupScreen />);
+    await fillSignup('Priya', 'priya@example.com', 'password1');
+    await fillConfirm('password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    const confirmField = screen.getByPlaceholderText(
+      translateFor('en', 'password.confirmPlaceholder'),
+    );
+    expect(confirmField.props.autoCorrect).toBe(false);
+    const cta = signupButton();
+    await fireEvent.press(cta);
+    await waitFor(() => expect(mockAuthValue.register).toHaveBeenCalledTimes(1));
+    expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ opacity: 0.5 });
+    gate.resolve(USER);
   });
 });

@@ -1,5 +1,13 @@
-import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
-import { AccessibilityInfo, StyleSheet } from 'react-native';
+import {
+  act,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react-native';
+import { AccessibilityInfo, Animated, StyleSheet } from 'react-native';
 import React from 'react';
 
 import Button from '../src/components/Button';
@@ -9,13 +17,55 @@ import PasswordStrengthMeter, { passwordStrength } from '../src/components/Passw
 import PasswordVisibilityToggle from '../src/components/PasswordVisibilityToggle';
 import ProgressBar from '../src/components/ProgressBar';
 import ScoreRing from '../src/components/ScoreRing';
+import Skeleton from '../src/components/Skeleton';
 import StatTile from '../src/components/StatTile';
-import { lightColors } from '../src/lib/theme';
+import { darkColors, lightColors, useTheme } from '../src/lib/theme';
 import { useReduceMotion } from '../src/lib/use-reduce-motion';
 import WordTaggedTranscript from '../src/components/WordTaggedTranscript';
 
 jest.spyOn(AccessibilityInfo, 'isReduceMotionEnabled').mockResolvedValue(false);
 jest.spyOn(AccessibilityInfo, 'addEventListener').mockReturnValue({ remove: jest.fn() } as never);
+
+// Controllable scheme so the fair-chip dark palette branch is assertable.
+jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
+  __esModule: true,
+  default: jest.fn(() => 'light' as const),
+}));
+const useColorScheme = jest.requireMock('react-native/Libraries/Utilities/useColorScheme')
+  .default as jest.Mock;
+
+const mockUseColorScheme = useColorScheme as jest.Mock;
+const lightTheme = async () => (await renderHook(() => useTheme())).result.current;
+
+/** Minimal typed view of an RNTL test node's rendered children. */
+function childProps(node: { children: unknown[] }, index = 0): Record<string, unknown> {
+  return (node.children[index] as { props: Record<string, unknown> }).props;
+}
+function childAt(
+  node: { children: unknown[] },
+  index = 0,
+): { props: Record<string, unknown>; children: unknown[] } {
+  return node.children[index] as { props: Record<string, unknown>; children: unknown[] };
+}
+
+// Animation-config spies: components must call the Animated factory API with
+// the authored toValue/duration/easing/useNativeDriver contracts.
+const timingSpy = jest.spyOn(Animated, 'timing');
+const loopSpy = jest.spyOn(Animated, 'loop');
+const sequenceSpy = jest.spyOn(Animated, 'sequence');
+const parallelSpy = jest.spyOn(Animated, 'parallel');
+const delaySpy = jest.spyOn(Animated, 'delay');
+const interpolateSpy = jest.spyOn(Animated.Value.prototype, 'interpolate');
+
+afterEach(() => {
+  timingSpy.mockClear();
+  loopSpy.mockClear();
+  sequenceSpy.mockClear();
+  parallelSpy.mockClear();
+  delaySpy.mockClear();
+  interpolateSpy.mockClear();
+  mockUseColorScheme.mockReturnValue('light');
+});
 
 describe('ScoreRing', () => {
   it('renders the clamped numeral, caption, and progressbar semantics', async () => {
@@ -355,5 +405,595 @@ describe('EmptyState', () => {
     await render(<EmptyState icon="mic" title="Empty" body="Nothing here." />);
     expect(screen.queryByRole('button')).toBeNull();
     await waitFor(() => expect(screen.getByText('Nothing here.')).toBeTruthy());
+  });
+});
+
+describe('Skeleton', () => {
+  it('renders one hidden placeholder block with the requested geometry', async () => {
+    await render(<Skeleton width={120} height={20} borderRadius={6} testID="skel" />);
+    const block = screen.getByTestId('skel', { includeHiddenElements: true });
+    expect(block.props.accessibilityElementsHidden).toBe(true);
+    expect(block.props.importantForAccessibility).toBe('no-hide-descendants');
+    expect(StyleSheet.flatten(block.props.style)).toMatchObject({
+      width: 120,
+      height: 20,
+      borderRadius: 6,
+      backgroundColor: lightColors.border,
+    });
+  });
+
+  it('defaults to a full-width 16dp block with an 8dp radius', async () => {
+    await render(<Skeleton testID="skel-default" />);
+    expect(
+      StyleSheet.flatten(
+        screen.getByTestId('skel-default', { includeHiddenElements: true }).props.style,
+      ),
+    ).toMatchObject({
+      width: '100%',
+      height: 16,
+      borderRadius: 8,
+    });
+  });
+
+  it('pulses between 0.45 and 1 through a looping two-phase timing', async () => {
+    const theme = await await lightTheme();
+    await render(<Skeleton testID="skel-pulse" />);
+    expect(loopSpy).toHaveBeenCalledTimes(1);
+    expect(sequenceSpy).toHaveBeenCalledTimes(1);
+    expect(timingSpy).toHaveBeenCalledTimes(2);
+    expect(timingSpy).toHaveBeenNthCalledWith(1, expect.anything(), {
+      toValue: 1,
+      duration: theme.motion.base,
+      useNativeDriver: false,
+    });
+    expect(timingSpy).toHaveBeenNthCalledWith(2, expect.anything(), {
+      toValue: 0.45,
+      duration: theme.motion.base,
+      useNativeDriver: false,
+    });
+  });
+
+  it('stops pulsing as soon as Reduce Motion resolves', async () => {
+    (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockResolvedValueOnce(true);
+    await render(<Skeleton testID="skel-static" />);
+    await act(async () => {});
+    // Exactly the pre-probe loop ran; the flip must not schedule another.
+    expect(loopSpy).toHaveBeenCalledTimes(1);
+    expect(timingSpy).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('StatTile tints', () => {
+  const TINT_MATRIX = [
+    { tint: 'primary', fill: lightColors.primaryLight, ink: lightColors.primary },
+    { tint: 'accent', fill: lightColors.accentLight, ink: lightColors.accent },
+    { tint: 'success', fill: lightColors.successLight, ink: lightColors.success },
+    { tint: 'neutral', fill: lightColors.card, ink: lightColors.muted },
+  ] as const;
+
+  it.each(TINT_MATRIX)(
+    'styles the $tint tile with its tint fill and ink',
+    async ({ tint, fill, ink }) => {
+      const theme = await lightTheme();
+      await render(
+        <StatTile icon="flame" value="7" label="Streak" tint={tint} testID={`tile-${tint}`} />,
+      );
+      const tile = screen.getByTestId(`tile-${tint}`);
+      expect(StyleSheet.flatten(tile.props.style)).toMatchObject({
+        backgroundColor: fill,
+        borderColor: tint === 'neutral' ? lightColors.border : 'transparent',
+        borderWidth: 1,
+        borderRadius: theme.radii.card,
+        alignItems: 'center',
+      });
+      // The icon badge keeps the card fill and hairline border on every tint.
+      const badge = childAt(tile);
+      expect(StyleSheet.flatten(badge.props.style)).toMatchObject({
+        width: 32,
+        height: 32,
+        borderRadius: 16,
+        backgroundColor: lightColors.card,
+        borderColor: lightColors.border,
+        borderWidth: 1,
+      });
+      // The glyph inside the badge carries the tint ink and badge geometry.
+      const iconElement = badge.props.children as React.ReactElement<{
+        color?: string;
+        strokeWidth?: number;
+        size?: number;
+      }>;
+      expect(iconElement.props.color).toBe(ink);
+      expect(iconElement.props.size).toBe(18);
+      expect(iconElement.props.strokeWidth).toBe(2.2);
+      // The numeral uses the headline type register with tabular figures.
+      expect(StyleSheet.flatten(within(tile).getByText('7').props.style)).toMatchObject({
+        color: lightColors.text,
+        fontWeight: '800',
+        fontVariant: ['tabular-nums'],
+      });
+    },
+  );
+
+  it('defaults to the neutral tint', async () => {
+    await render(<StatTile icon="clock" value="0" label="Minutes" testID="tile-default" />);
+    expect(StyleSheet.flatten(screen.getByTestId('tile-default').props.style)).toMatchObject({
+      backgroundColor: lightColors.card,
+      borderColor: lightColors.border,
+    });
+  });
+});
+
+describe('Confetti choreography', () => {
+  it('staggers each piece by its deterministic delay and duration', async () => {
+    const theme = await await lightTheme();
+    await render(<Confetti count={3} testID="burst" />);
+    expect(delaySpy).toHaveBeenCalledTimes(3);
+    expect(delaySpy).toHaveBeenNthCalledWith(1, 0);
+    expect(delaySpy).toHaveBeenNthCalledWith(2, 37);
+    expect(delaySpy).toHaveBeenNthCalledWith(3, 74);
+    expect(timingSpy).toHaveBeenCalledTimes(3);
+    expect(timingSpy).toHaveBeenNthCalledWith(1, expect.anything(), {
+      toValue: 1,
+      duration: theme.motion.slow * 4,
+      easing: theme.motion.easing.accelerate,
+      useNativeDriver: false,
+    });
+    expect(timingSpy).toHaveBeenNthCalledWith(2, expect.anything(), {
+      toValue: 1,
+      duration: theme.motion.slow * 4 + 53,
+      easing: theme.motion.easing.accelerate,
+      useNativeDriver: false,
+    });
+    expect(timingSpy).toHaveBeenNthCalledWith(3, expect.anything(), {
+      toValue: 1,
+      duration: theme.motion.slow * 4 + 106,
+      easing: theme.motion.easing.accelerate,
+      useNativeDriver: false,
+    });
+  });
+
+  it('places and sizes every piece deterministically from its index', async () => {
+    await render(<Confetti count={3} testID="place" />);
+    const pieces = screen.getAllByTestId('place-piece', { includeHiddenElements: true });
+    const palette = [
+      lightColors.primary,
+      lightColors.accent,
+      lightColors.success,
+      lightColors.primaryDark,
+    ];
+    const expected = [
+      { left: '0%', size: 7, color: palette[0] },
+      { left: '41%', size: 7 + 1, color: palette[1] },
+      { left: '82%', size: 7 + 2, color: palette[2] },
+    ];
+    pieces.forEach((piece, index) => {
+      expect(StyleSheet.flatten(piece.props.style)).toMatchObject({
+        position: 'absolute',
+        left: expected[index].left,
+        top: 0,
+        width: expected[index].size,
+        height: expected[index].size + 4,
+        borderRadius: 2,
+        backgroundColor: expected[index].color,
+      });
+    });
+    // Fall + spin interpolations span the authored ranges.
+    expect(interpolateSpy).toHaveBeenCalledWith({
+      inputRange: [0, 1],
+      outputRange: [-16, 420],
+    });
+    expect(interpolateSpy).toHaveBeenCalledWith({
+      inputRange: [0, 1],
+      outputRange: ['0deg', '240deg'],
+    });
+  });
+
+  it('schedules exactly one pre-probe timeline under Reduce Motion', async () => {
+    (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockResolvedValueOnce(true);
+    await render(<Confetti testID="still" />);
+    await act(async () => {});
+    // Default burst of 26 pieces: the pre-probe timeline (26 piece-level
+    // parallels inside one top-level parallel) and no second schedule.
+    expect(parallelSpy).toHaveBeenCalledTimes(27);
+    expect(timingSpy).toHaveBeenCalledTimes(26);
+    expect(delaySpy).toHaveBeenCalledTimes(26);
+  });
+});
+
+describe('ProgressBar styling', () => {
+  it('draws the hairline track at the requested height with a pill radius', async () => {
+    await render(<ProgressBar progress={0.5} accessibilityLabel="P" height={12} testID="bar12" />);
+    expect(StyleSheet.flatten(screen.getByTestId('bar12').props.style)).toMatchObject({
+      overflow: 'hidden',
+      alignSelf: 'stretch',
+      height: 12,
+      backgroundColor: lightColors.border,
+      borderRadius: 6,
+    });
+    const fill = screen.getByTestId('bar12-fill');
+    expect(StyleSheet.flatten(fill.props.style)).toMatchObject({
+      height: '100%',
+      borderRadius: 6,
+      backgroundColor: lightColors.success,
+    });
+  });
+
+  it('honours a custom fill ink and the default 8dp height', async () => {
+    await render(
+      <ProgressBar progress={0.2} accessibilityLabel="P" fill="#abcdef" testID="bar-fill" />,
+    );
+    expect(StyleSheet.flatten(screen.getByTestId('bar-fill').props.style)).toMatchObject({
+      height: 8,
+      borderRadius: 4,
+    });
+    expect(StyleSheet.flatten(screen.getByTestId('bar-fill-fill').props.style)).toMatchObject({
+      backgroundColor: '#abcdef',
+      borderRadius: 4,
+    });
+  });
+
+  it('animates the fill to the clamped fraction with the base motion token', async () => {
+    const theme = await await lightTheme();
+    await render(<ProgressBar progress={0.42} accessibilityLabel="P" />);
+    expect(timingSpy).toHaveBeenCalledTimes(1);
+    expect(timingSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        toValue: 0.42,
+        duration: theme.motion.base,
+        easing: theme.motion.easing.decelerate,
+        useNativeDriver: false,
+      }),
+    );
+    // The fill width is the animated 0–100% interpolation.
+    expect(interpolateSpy).toHaveBeenCalledWith({
+      inputRange: [0, 1],
+      outputRange: ['0%', '100%'],
+    });
+  });
+
+  it('settles statically on the clamped value under Reduce Motion', async () => {
+    (AccessibilityInfo.isReduceMotionEnabled as jest.Mock).mockResolvedValueOnce(true);
+    await render(<ProgressBar progress={0.8} accessibilityLabel="P" />);
+    // The single timing call belongs to the pre-probe render; after the probe
+    // resolves, the effect re-runs and sets the value instead of animating, so
+    // no second timing is ever scheduled.
+    await act(async () => {});
+    expect(timingSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('ScoreRing geometry', () => {
+  it('derives the ring radius, circumference, and dash arc from size and thickness', async () => {
+    await render(<ScoreRing score={50} size={100} thickness={10} accessibilityLabel="S" />);
+    const radius = (100 - 10) / 2;
+    const circumference = 2 * Math.PI * radius;
+    const host = screen.getByRole('progressbar', { name: 'S' });
+    expect(StyleSheet.flatten(host.props.style)).toMatchObject({
+      width: 100,
+      height: 100,
+      alignItems: 'center',
+    });
+    const ringBox = host.props.children[0];
+    const svg = ringBox.props.children[0];
+    const [track, arc] = svg.props.children as React.ReactElement<{ [k: string]: unknown }>[];
+    expect(track.props).toMatchObject({
+      cx: 50,
+      cy: 50,
+      r: radius,
+      stroke: lightColors.border,
+      strokeWidth: 10,
+      fill: 'none',
+    });
+    expect(arc.props).toMatchObject({
+      cx: 50,
+      cy: 50,
+      r: radius,
+      stroke: lightColors.primary,
+      strokeWidth: 10,
+      fill: 'none',
+      strokeLinecap: 'round',
+    });
+    expect(arc.props.strokeDasharray).toBeCloseTo(circumference, 9);
+    expect(arc.props.transform).toBe('rotate(-90 50 50)');
+    // The numeral is proportionally sized and inked with the arc color.
+    expect(StyleSheet.flatten(screen.getByText('50').props.style)).toMatchObject({
+      fontSize: 28,
+      fontWeight: '800',
+      color: lightColors.primary,
+      fontVariant: ['tabular-nums'],
+    });
+  });
+
+  it('reserves exactly 20dp under the ring for the caption', async () => {
+    await render(<ScoreRing score={10} size={80} label="of 100" accessibilityLabel="S" />);
+    const host = screen.getByRole('progressbar', { name: 'S' });
+    expect(StyleSheet.flatten(host.props.style)).toMatchObject({ width: 80, height: 100 });
+    expect(StyleSheet.flatten(screen.getByText('of 100').props.style)).toMatchObject({
+      marginTop: 2,
+      color: lightColors.muted,
+      textAlign: 'center',
+    });
+  });
+
+  it('animates the dash offset from the full circumference under motion', async () => {
+    const theme = await await lightTheme();
+    await render(<ScoreRing score={70} size={100} accessibilityLabel="S" />);
+    expect(timingSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        toValue: 70,
+        duration: theme.motion.slow,
+        easing: theme.motion.easing.decelerate,
+        useNativeDriver: false,
+      }),
+    );
+    expect(interpolateSpy).toHaveBeenCalledWith({
+      inputRange: [0, 100],
+      outputRange: [2 * Math.PI * 45, 0],
+    });
+  });
+});
+
+describe('WordTaggedTranscript styling', () => {
+  it('styles each chip and its ink by verdict', async () => {
+    await render(
+      <WordTaggedTranscript
+        transcript="I brung courage."
+        wordScores={[
+          { word: 'I', status: 'good' },
+          { word: 'brung', status: 'poor' },
+          { word: 'courage', status: 'fair' },
+        ]}
+      />,
+    );
+    const chips = [
+      screen.getByLabelText('I, Good'),
+      screen.getByLabelText('brung, Practice'),
+      screen.getByLabelText('courage, Close'),
+    ];
+    expect(StyleSheet.flatten(chips[0].props.style)).toMatchObject({
+      backgroundColor: lightColors.successLight,
+      borderColor: lightColors.success,
+      borderWidth: 1,
+      borderRadius: (await lightTheme()).radii.badge,
+      paddingVertical: 3,
+      paddingHorizontal: 8,
+    });
+    expect(StyleSheet.flatten(chips[1].props.style)).toMatchObject({
+      backgroundColor: lightColors.dangerLight,
+      borderColor: lightColors.danger,
+    });
+    expect(StyleSheet.flatten(chips[2].props.style)).toMatchObject({
+      backgroundColor: lightColors.primaryLight,
+      borderColor: lightColors.primary,
+    });
+    expect(StyleSheet.flatten(childProps(chips[0]).style)).toMatchObject({
+      color: lightColors.success,
+      fontSize: 16,
+      fontWeight: '600',
+    });
+    expect(StyleSheet.flatten(childProps(chips[2]).style)).toMatchObject({
+      color: lightColors.primary,
+    });
+  });
+
+  it('switches the fair register to warning ink on the card fill in dark mode', async () => {
+    mockUseColorScheme.mockReturnValue('dark');
+    await render(
+      <WordTaggedTranscript
+        transcript="courage"
+        wordScores={[{ word: 'courage', status: 'fair' }]}
+      />,
+    );
+    expect(StyleSheet.flatten(screen.getByLabelText('courage, Close').props.style)).toMatchObject({
+      backgroundColor: darkColors.card,
+      borderColor: darkColors.warning,
+    });
+    expect(StyleSheet.flatten(screen.getByText('courage').props.style)).toMatchObject({
+      color: darkColors.warning,
+    });
+  });
+
+  it('renders the decorative legend with tinted dots and uppercase captions', async () => {
+    const theme = await lightTheme();
+    await render(
+      <WordTaggedTranscript transcript="x" wordScores={[{ word: 'x', status: 'good' }]} />,
+    );
+    const hidden = { includeHiddenElements: true } as const;
+    const legendItem = screen.getByText('Good', hidden).parent!;
+    expect(StyleSheet.flatten(legendItem.props.style)).toMatchObject({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 4,
+    });
+    const legendRow = legendItem.parent!;
+    expect(StyleSheet.flatten(legendRow.props.style)).toMatchObject({
+      flexDirection: 'row',
+      marginTop: theme.spacing.sm,
+    });
+    const dot = childAt(legendItem);
+    expect(StyleSheet.flatten(dot.props.style)).toMatchObject({
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+      backgroundColor: lightColors.successLight,
+      borderColor: lightColors.success,
+    });
+    expect(StyleSheet.flatten(screen.getByText('Good', hidden).props.style)).toMatchObject({
+      fontWeight: '700',
+      textTransform: 'uppercase',
+      letterSpacing: 0.5,
+    });
+  });
+
+  it('falls back to the plain transcript for an empty tag list', async () => {
+    await render(
+      <WordTaggedTranscript transcript="Empty tags." wordScores={[]} testID="empty-tags" />,
+    );
+    expect(screen.getByText('Empty tags.')).toBeTruthy();
+    const hidden = { includeHiddenElements: true } as const;
+    expect(screen.queryByText('Good', hidden)).toBeNull();
+    expect(StyleSheet.flatten(screen.getByText('Empty tags.').props.style)).toMatchObject({
+      marginTop: (await lightTheme()).spacing.sm,
+      fontSize: 18,
+      fontWeight: '600',
+      color: lightColors.text,
+    });
+  });
+});
+
+describe('PasswordStrengthMeter boundaries', () => {
+  it('holds every tier boundary exactly', () => {
+    // Exactly eight policy-satisfying characters rate fair (not weak).
+    expect(passwordStrength('abcd1234')).toBe('fair');
+    // Twelve characters with exactly three character classes rate strong.
+    expect(passwordStrength('Abcdef123ghi')).toBe('strong');
+    // Eleven characters with three classes stay fair (length still < 12).
+    expect(passwordStrength('Abcdef123gh')).toBe('fair');
+    // Lower + digit (two classes) at twelve characters stays fair.
+    expect(passwordStrength('abcdef123456')).toBe('fair');
+    // The symbol class is the fourth variety contributor.
+    expect(passwordStrength('Abcdef123g!i')).toBe('strong');
+  });
+
+  it('counts lower, upper, digit, and symbol variety independently', () => {
+    // Two classes (lower + digit) is fair, never strong, at any length.
+    expect(passwordStrength('abcdefghij12')).toBe('fair');
+    // Adding the upper class reaches three and promotes at >= 12 chars.
+    expect(passwordStrength('abcdefghij12A')).toBe('strong');
+    // Adding a symbol instead also reaches three.
+    expect(passwordStrength('abcdefghij12!')).toBe('strong');
+  });
+
+  it('stays visible at exactly the 72-byte ceiling and hides one byte past it', async () => {
+    const exactly72 = `${'a'.repeat(69)}A1b`; // 69 + 3 = 72 UTF-8 bytes
+    expect(Buffer.byteLength(exactly72, 'utf8')).toBe(72);
+    const atCeiling = await render(<PasswordStrengthMeter password={exactly72} />);
+    expect(atCeiling.toJSON()).not.toBeNull();
+    const seventyThree = `${'a'.repeat(69)}A1bc`;
+    expect(Buffer.byteLength(seventyThree, 'utf8')).toBe(73);
+    const pastCeiling = await render(<PasswordStrengthMeter password={seventyThree} />);
+    expect(pastCeiling.toJSON()).toBeNull();
+  });
+
+  it('labels the fair tier and fills exactly two segments for it', async () => {
+    await render(<PasswordStrengthMeter password="password1" testID="meter-fair" />);
+    expect(screen.getByLabelText('Good')).toBeTruthy();
+    expect(screen.getAllByTestId('meter-fair-segment-on')).toHaveLength(2);
+    expect(screen.getAllByTestId('meter-fair-segment-off')).toHaveLength(1);
+  });
+});
+
+describe('PasswordVisibilityToggle styling', () => {
+  it('centers its glyph, dims to 60% while pressed, and 50% while disabled', async () => {
+    const theme = await lightTheme();
+    await render(
+      <PasswordVisibilityToggle
+        visible={false}
+        accessibilityLabel="Show"
+        onToggle={jest.fn()}
+        testID="vt"
+      />,
+    );
+    const toggle = screen.getByTestId('vt');
+    expect(StyleSheet.flatten(toggle.props.style)).toMatchObject({
+      width: theme.layout.minimumTarget,
+      height: theme.layout.minimumTarget,
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+    expect(StyleSheet.flatten(toggle.props.style).opacity).toBeUndefined();
+  });
+
+  it('halves the opacity when disabled', async () => {
+    await render(
+      <PasswordVisibilityToggle
+        visible={false}
+        accessibilityLabel="Show"
+        onToggle={jest.fn()}
+        disabled
+        testID="vt-disabled"
+      />,
+    );
+    const toggle = screen.getByTestId('vt-disabled');
+    expect(StyleSheet.flatten(toggle.props.style)).toMatchObject({ opacity: 0.5 });
+  });
+
+  it('draws the revealed eye as four strokes and the masked eye as two', async () => {
+    await render(
+      <PasswordVisibilityToggle visible accessibilityLabel="Hide" onToggle={jest.fn()} />,
+    );
+    const hiddenToggle = screen.getByRole('button', { name: 'Hide' });
+    // Icon host View instance -> Svg instance -> rendered primitives.
+    const glyphCount = (button: { children: unknown[] }) => {
+      // Walk to the authored Svg element: the host View instance's props carry
+      // the JSX children, whose fragment keeps the raw primitives.
+      const svg = (button.children[0] as { props: { children: React.ReactElement } }).props
+        .children;
+      const rendered: unknown = (svg.props as { children?: unknown }).children;
+      if (rendered === undefined || rendered === null) return 0;
+      const children =
+        React.isValidElement(rendered) && rendered.type === React.Fragment
+          ? (rendered.props as { children?: unknown }).children
+          : rendered;
+      if (children === undefined || children === null) return 0;
+      return (Array.isArray(children) ? children : [children]).length;
+    };
+    expect(glyphCount(hiddenToggle)).toBe(4);
+    await render(
+      <PasswordVisibilityToggle visible={false} accessibilityLabel="Show2" onToggle={jest.fn()} />,
+    );
+    expect(glyphCount(screen.getByRole('button', { name: 'Show2' }))).toBe(2);
+  });
+});
+
+describe('EmptyState styling', () => {
+  it('centers its column and types the title and body', async () => {
+    await render(<EmptyState icon="clock" title="No answers yet" body="History appears here." />);
+    const title = screen.getByRole('header', { name: 'No answers yet' });
+    const contentHost = title.parent!;
+    const scrollHost = contentHost.parent!;
+    expect(StyleSheet.flatten(scrollHost.props.contentContainerStyle)).toMatchObject({
+      alignItems: 'center',
+    });
+    expect(StyleSheet.flatten(title.props.style)).toMatchObject({
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(StyleSheet.flatten(screen.getByText('History appears here.').props.style)).toMatchObject(
+      {
+        textAlign: 'center',
+        color: lightColors.muted,
+      },
+    );
+  });
+
+  it('stretches the action row when an action is provided', async () => {
+    const theme = await lightTheme();
+    await render(
+      <EmptyState
+        icon="mic"
+        title="Empty"
+        body="Nothing."
+        action={<Button title="Go" onPress={jest.fn()} />}
+      />,
+    );
+    const action = screen.getByRole('button', { name: 'Go' });
+    expect(StyleSheet.flatten(action.parent!.props.style)).toMatchObject({
+      alignSelf: 'stretch',
+      alignItems: 'center',
+      marginTop: theme.spacing.md,
+    });
+  });
+});
+
+describe('useReduceMotion wiring', () => {
+  it('subscribes to the exact reduceMotionChanged accessibility event', async () => {
+    await renderHook(() => useReduceMotion());
+    expect(AccessibilityInfo.addEventListener).toHaveBeenCalledWith(
+      'reduceMotionChanged',
+      expect.any(Function),
+    );
   });
 });

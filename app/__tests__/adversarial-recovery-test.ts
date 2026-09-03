@@ -323,6 +323,13 @@ describe('adversarial recovery audit', () => {
 
       const creatingFirst = mod.ensurePendingAssessment(first, generation);
       const creatingSecond = mod.ensurePendingAssessment(second, generation);
+      // Observe early rejections immediately: under a validation mutant these
+      // promises reject during the flush below while Promise.all is not yet
+      // attached, and Node treats that as an unhandled rejection, killing the
+      // worker before Jest can fail the test — Stryker would then score an
+      // unattributable RuntimeError instead of the kill this suite proves.
+      creatingFirst.catch(() => undefined);
+      creatingSecond.catch(() => undefined);
       await flushMicrotasks();
       expect(getItem).toHaveBeenCalledTimes(1); // Exactly one in-flight read.
       read.resolve(null);
@@ -397,6 +404,8 @@ describe('adversarial recovery audit', () => {
       const candidate = { ...basePending, stage: 'prepared' as const };
 
       const creating = mod.ensurePendingAssessment(candidate, generation);
+      // Same early-rejection observation as the concurrency invariant above.
+      creating.catch(() => undefined);
       await flushMicrotasks();
       expect(getItem).toHaveBeenCalledTimes(1);
 

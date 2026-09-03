@@ -8,7 +8,7 @@ import LoginScreen from '../src/app/(auth)/login';
 import ResetPasswordScreen from '../src/app/(auth)/reset-password';
 import { ApiError, apiForgotPassword, apiResetPassword } from '../src/lib/api';
 import { MAX_EMAIL_LENGTH, MAX_PASSWORD_UTF8_BYTES, useAuth } from '../src/lib/auth';
-import { translateFor, type MessageKey } from '../src/lib/i18n';
+import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
 import { colors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -1557,5 +1557,137 @@ describe('reset-password screen', () => {
 
     await render(<ResetPasswordScreen />);
     expect(screen.getByText(t('reset.backToLogin')).props.href).toBe('/login');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Deep mutation-hardening: reset-form gate conjuncts at their exact bounds,
+// mismatch copy visibility, untouched confirm state, and busy control styling.
+// ---------------------------------------------------------------------------
+const AT_MAX_EMAIL = `${'a'.repeat(64)}@${'b'.repeat(63)}.${'c'.repeat(63)}.${'d'.repeat(61)}`;
+
+describe('reset-password deep contracts', () => {
+  beforeEach(() => {
+    // Earlier suites deliberately move the active language; pin it back so
+    // these English-copy probes stay deterministic.
+    setActiveLanguage('en');
+  });
+
+  async function fillReset(code: string, password: string, confirm: string) {
+    await fireEvent.changeText(screen.getByPlaceholderText(t('reset.codePlaceholder')), code);
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('signup.passwordPlaceholder')),
+      password,
+    );
+    await fireEvent.changeText(screen.getByPlaceholderText(t('cp.confirmPlaceholder')), confirm);
+  }
+  function resetButton() {
+    return screen.getByRole('button', { name: t('reset.submitNew') });
+  }
+
+  it('starts the confirmation field empty with autocorrect off and labelled copy', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    const confirm = screen.getByPlaceholderText(t('cp.confirmPlaceholder'));
+    expect(confirm.props.value).toBe('');
+    expect(confirm.props.autoCorrect).toBe(false);
+    expect(screen.getByText(t('cp.confirmLabel'))).toBeTruthy();
+  });
+
+  it('shows the mismatch copy only while a mismatched confirmation is present', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillReset('123456', 'password1', 'password2');
+    expect(screen.getByText(t('cp.mismatch'))).toBeTruthy();
+    await fireEvent.changeText(screen.getByPlaceholderText(t('cp.confirmPlaceholder')), '');
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('cp.confirmPlaceholder')),
+      'password1',
+    );
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
+  });
+
+  it('submits at the exact email bound and blocks one past it', async () => {
+    mockReset.mockResolvedValue(undefined);
+    mockSearchParams = { email: AT_MAX_EMAIL };
+    await render(<ResetPasswordScreen />);
+    await fillReset('123456', 'password1', 'password1');
+    await fireEvent.press(resetButton());
+    await waitFor(() => expect(mockReset).toHaveBeenCalledTimes(1));
+
+    mockSearchParams = { email: `${AT_MAX_EMAIL}a` };
+    await render(<ResetPasswordScreen />);
+    await fillReset('123456', 'password1', 'password1');
+    await fireEvent.press(resetButton());
+    expect(mockReset).toHaveBeenCalledTimes(1);
+  });
+
+  it('never submits without a confirmation, with a policy-failing password, or without a code', async () => {
+    mockReset.mockResolvedValue(undefined);
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillReset('123456', 'password1', '');
+    await fireEvent.press(resetButton());
+    await fillReset('123456', 'allletters', 'allletters');
+    await fireEvent.press(resetButton());
+    await fillReset('', 'password1', 'password1');
+    await fireEvent.press(resetButton());
+    expect(mockReset).not.toHaveBeenCalled();
+  });
+
+  it('dims the submit control while the reset request is busy', async () => {
+    const gate = deferred<void>();
+    mockReset.mockReturnValue(gate.promise);
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillReset('123456', 'password1', 'password1');
+    const cta = resetButton();
+    await fireEvent.press(cta);
+    await waitFor(() => expect(mockReset).toHaveBeenCalledTimes(1));
+    expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ opacity: 0.5 });
+    gate.resolve(undefined);
+  });
+});
+
+describe('forgot-password deep contracts', () => {
+  beforeEach(() => {
+    setActiveLanguage('en');
+  });
+
+  it('sends at the exact email bound and blocks one past it', async () => {
+    mockForgot.mockResolvedValue(undefined);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('login.emailPlaceholder')),
+      AT_MAX_EMAIL,
+    );
+    const send = screen.getByRole('button', { name: t('reset.submitRequest') });
+    await fireEvent.press(send);
+    await waitFor(() => expect(mockForgot).toHaveBeenCalledTimes(1));
+
+    // A fresh visit with an over-bound address never issues the request.
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('login.emailPlaceholder')),
+      `${AT_MAX_EMAIL}a`,
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    expect(mockForgot).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores a second tap while a request is already in flight', async () => {
+    const gate = deferred<void>();
+    mockForgot.mockReturnValue(gate.promise);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(
+      screen.getByPlaceholderText(t('login.emailPlaceholder')),
+      'ada@example.com',
+    );
+    const send = screen.getByRole('button', { name: t('reset.submitRequest') });
+    await fireEvent.press(send);
+    await fireEvent.press(send);
+    expect(mockForgot).toHaveBeenCalledTimes(1);
+    gate.resolve(undefined);
   });
 });

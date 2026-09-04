@@ -283,13 +283,28 @@ describe('bottom tab layout', () => {
       await act(async () => {
         keyboardHandlers['keyboardDidShow']?.();
       });
-      const hiddenBar = captured.capturedTabProps.at(-1)?.tabBar as () => null;
-      expect(hiddenBar()).toBeNull();
+      expect(typeof captured.capturedTabProps.at(-1)?.tabBar).toBe('function');
+      // Call the hidden renderer with the same shape the restored bar asserts
+      // against below: a wiring mutant that leaves the themed bar installed
+      // must fail this null assertion, not crash on missing props.
+      const hiddenBar = captured.capturedTabProps.at(-1)?.tabBar as unknown as (props: {
+        state: { index: number; routes: { key: string; name: string }[] };
+        descriptors: Record<string, { options?: { title?: string } }>;
+        navigation: { emit: jest.Mock; navigate: jest.Mock };
+      }) => React.ReactElement | null;
+      expect(
+        hiddenBar({
+          state: { index: 0, routes: [{ key: 'home-route', name: 'home' }] },
+          descriptors: { 'home-route': { options: { title: translateFor('en', 'header.home') } } },
+          navigation: { emit: jest.fn(), navigate: jest.fn() },
+        } as never),
+      ).toBeNull();
 
       // keyboardDidHide restores the themed bar.
       await act(async () => {
         keyboardHandlers['keyboardDidHide']?.();
       });
+      expect(typeof captured.capturedTabProps.at(-1)?.tabBar).toBe('function');
       const restoredBar = captured.capturedTabProps.at(-1)?.tabBar as unknown as (props: {
         state: { index: number; routes: { key: string; name: string }[] };
         descriptors: Record<string, { options?: { title?: string } }>;

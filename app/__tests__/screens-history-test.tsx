@@ -286,12 +286,19 @@ function centeredStateStyle(node: TestInstance): SemanticStyle {
   );
   if (scrollView) return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
   let current: TestInstance | null = node.parent;
+  let centered: ReturnType<typeof flattenedStyle> | undefined;
   while (current) {
     const style = flattenedStyle(current);
-    if (style.flexGrow === 1 && style.justifyContent === 'center') return style;
+    if (style.flexGrow === 1 && style.justifyContent === 'center') {
+      centered = style;
+      break;
+    }
     current = current.parent;
   }
-  throw new Error('Centered scroll content was not found');
+  // Assert instead of throwing raw so a wiring mutant that drops the centered
+  // content container dies as a kill, never an infrastructure error.
+  expect(centered).toBeDefined();
+  return centered ?? {};
 }
 
 function committedPressHandler(node: TestInstance): () => void {
@@ -301,14 +308,19 @@ function committedPressHandler(node: TestInstance): () => void {
     type: unknown;
   };
   let fiber = (node as unknown as { unstable_fiber: Fiber | null }).unstable_fiber;
+  let handler: (() => void) | undefined;
   while (fiber) {
     if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.onPress as () => void;
+      handler = fiber.memoizedProps.onPress as () => void;
+      break;
     }
     if (fiber.return === null || typeof fiber.return.type === 'string') break;
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => void;
 }
 
 async function blurHistory(): Promise<void> {
@@ -345,7 +357,12 @@ function refreshHandler(): () => void {
     (candidate) => typeof candidate.props.refreshControl?.props?.onRefresh === 'function',
   );
   const onRefresh = scroll?.props.refreshControl?.props?.onRefresh;
-  if (typeof onRefresh !== 'function') throw new Error('No RefreshControl rendered');
+  if (typeof onRefresh !== 'function') {
+    // Assert instead of throwing raw so a wiring mutant that never mounts the
+    // refresh control dies as a kill, never an infrastructure error.
+    expect(onRefresh).toBeInstanceOf(Function);
+    return () => undefined;
+  }
   return onRefresh as () => void;
 }
 

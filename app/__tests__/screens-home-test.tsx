@@ -222,13 +222,18 @@ function committedPressHandler(node: TestInstance): () => unknown {
     return: Fiber | null;
   };
   let fiber = node.unstable_fiber as Fiber | null;
+  let handler: (() => unknown) | undefined;
   while (fiber) {
     if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.onPress as () => unknown;
+      handler = fiber.memoizedProps.onPress as () => unknown;
+      break;
     }
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => unknown;
 }
 
 async function blurHome(): Promise<void> {
@@ -265,7 +270,12 @@ function refreshHandler(): () => void {
     (candidate) => typeof candidate.props.refreshControl?.props?.onRefresh === 'function',
   );
   const onRefresh = scroll?.props.refreshControl?.props?.onRefresh;
-  if (typeof onRefresh !== 'function') throw new Error('No RefreshControl rendered');
+  if (typeof onRefresh !== 'function') {
+    // Assert instead of throwing raw so a wiring mutant that never mounts the
+    // refresh control dies as a kill, never an infrastructure error.
+    expect(onRefresh).toBeInstanceOf(Function);
+    return () => undefined;
+  }
   return onRefresh as () => void;
 }
 

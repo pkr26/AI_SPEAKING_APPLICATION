@@ -180,6 +180,7 @@ export async function executeJestMutationProcess({
   deadlineMs,
   outputFile,
   environment,
+  forceExit = false,
 }) {
   const jestEntrypoint = path.join(appDir, 'node_modules', 'jest', 'bin', 'jest.js');
   const args = [
@@ -198,6 +199,12 @@ export async function executeJestMutationProcess({
     '--runTestsByPath',
     ...testFiles,
   ];
+  // Opt-in: a killed-by-assertion mutant can strand long real-timer deadlines
+  // (for example the 150s audio-fetch abort) whose native timers keep the Jest
+  // process alive long after the JSON report with every test verdict is
+  // complete. forceExit ends that post-verdict drain without changing any
+  // test outcome; the mutant's status still comes only from the report.
+  if (forceExit) args.push('--forceExit');
   const startedAt = Date.now();
   let child;
   try {
@@ -375,29 +382,40 @@ export function classifyJestMutationRun(run, { expectedTestFiles, appDir }) {
   } catch (error) {
     return { status: 'Error', reason: `Invalid Jest result: ${error.message}` };
   }
-  if (inspection.wasInterrupted) return { status: 'Error', reason: 'Jest reported interruption' };
-  if (inspection.timeoutAssertions.length > 0) {
-    return { status: 'Timeout', reason: 'At least one Jest assertion timed out' };
-  }
-  if (inspection.counts.runtimeErrorSuites > 0 || inspection.runtimeSuiteNames.length > 0) {
-    return { status: 'Error', reason: 'Jest reported a runtime test-suite failure' };
-  }
-  if (inspection.nonAssertionFailures.length > 0) {
-    return {
-      status: 'Error',
-      reason: 'At least one failed Jest test lacked matcher or Testing Library query evidence',
-    };
-  }
   const failedTestNames = inspection.failedAssertions.map((assertion) =>
     Array.isArray(assertion.ancestorTitles)
       ? [...assertion.ancestorTitles, assertion.title].filter(Boolean).join(' > ')
       : assertion.title || '(unnamed test)',
   );
+  const evidenceFailureCount = inspection.failedAssertions.filter((assertion) =>
+    jestFailureHasAssertionEvidence(assertion.failureMessages),
+  ).length;
+  const withEvidence = (result) => ({ ...result, failedTestNames, evidenceFailureCount });
+  if (inspection.wasInterrupted) {
+    return withEvidence({ status: 'Error', reason: 'Jest reported interruption' });
+  }
+  if (inspection.timeoutAssertions.length > 0) {
+    return withEvidence({ status: 'Timeout', reason: 'At least one Jest assertion timed out' });
+  }
+  if (inspection.counts.runtimeErrorSuites > 0 || inspection.runtimeSuiteNames.length > 0) {
+    return withEvidence({ status: 'Error', reason: 'Jest reported a runtime test-suite failure' });
+  }
+  if (inspection.nonAssertionFailures.length > 0) {
+    return withEvidence({
+      status: 'Error',
+      reason: 'At least one failed Jest test lacked matcher or Testing Library query evidence',
+    });
+  }
   if (run.exitCode === 0) {
     return run.report.success &&
       inspection.counts.failedSuites === 0 &&
       inspection.counts.failedTests === 0
-      ? { status: 'Survived', reason: 'All owning assertions passed', failedTestNames }
+      ? {
+          status: 'Survived',
+          reason: 'All owning assertions passed',
+          failedTestNames,
+          evidenceFailureCount,
+        }
       : { status: 'Error', reason: 'Jest exited successfully but reported failures' };
   }
   if (
@@ -407,7 +425,12 @@ export function classifyJestMutationRun(run, { expectedTestFiles, appDir }) {
     inspection.counts.failedTests > 0 &&
     inspection.counts.failedSuites > 0
   ) {
-    return { status: 'Killed', reason: 'An owning test assertion failed', failedTestNames };
+    return {
+      status: 'Killed',
+      reason: 'An owning test assertion failed',
+      failedTestNames,
+      evidenceFailureCount,
+    };
   }
   return {
     status: 'Error',

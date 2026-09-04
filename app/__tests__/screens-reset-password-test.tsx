@@ -220,13 +220,18 @@ function committedPressHandler(node: TestInstance): () => unknown {
     return: Fiber | null;
   };
   let fiber = node.unstable_fiber as Fiber | null;
+  let handler: (() => unknown) | undefined;
   while (fiber) {
     if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.onPress as () => unknown;
+      handler = fiber.memoizedProps.onPress as () => unknown;
+      break;
     }
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => unknown;
 }
 
 /** The host view a control is laid out in (the reveal-overlay input row). */

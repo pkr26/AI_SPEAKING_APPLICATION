@@ -364,13 +364,20 @@ function parentOf(node: TestInstance): TestInstance {
  */
 function committedPressHandler(node: TestInstance): () => unknown {
   let fiber: Fiber | null = node.unstable_fiber;
+  let handler: (() => unknown) | undefined;
   while (fiber) {
     const props = fiber.memoizedProps as { onPress?: unknown } | null;
-    if (typeof props?.onPress === 'function') return props.onPress as () => unknown;
+    if (typeof props?.onPress === 'function') {
+      handler = props.onPress as () => unknown;
+      break;
+    }
     if (fiber.return === null || typeof fiber.return.type === 'string') break;
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => unknown;
 }
 
 /**
@@ -520,6 +527,36 @@ describe('formatReminderHour', () => {
 });
 
 describe('settings profile card', () => {
+  it('renders the full idle initial surface: no busy copy, no error, no confirmation', async () => {
+    await renderSettings();
+
+    // The name draft starts at the canonical name with every profile flag
+    // idle: the save action shows its resting title, the field shows no
+    // validation or save error, and no saved confirmation is present.
+    expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe(USER.name);
+    const saveName = screen.getByRole('button', { name: t('settings.saveName') });
+    expect(saveName.props.accessibilityState).toMatchObject({ disabled: true });
+    expect(screen.queryByRole('button', { name: t('settings.saveNameBusy') })).toBeNull();
+    expect(screen.queryByText(t('settings.saved'))).toBeNull();
+    expect(screen.queryAllByRole('alert')).toEqual([]);
+
+    // Every destructive and secondary control starts enabled and unlatched:
+    // export offers its resting copy, the level-test retake row is pressable,
+    // and the language radios are neither busy nor dimmed.
+    expect(
+      screen.getByRole('button', { name: t('settings.export') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('button', { name: t('settings.retake') }).props.accessibilityState,
+    ).toMatchObject({ disabled: false });
+    expect(
+      screen.getByRole('radio', { name: 'Telugu, తెలుగు' }).props.accessibilityState,
+    ).toMatchObject({ checked: true, disabled: false });
+
+    // No hostile state sentinel or failure copy leaks into the first render.
+    expect(screen.queryByText('StrykerStateForce')).toBeNull();
+  });
+
   it('shows name, email, level with its explainer, and the selected language', async () => {
     await renderSettings();
 

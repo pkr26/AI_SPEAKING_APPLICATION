@@ -63,13 +63,18 @@ function committedPressHandler(node: TestInstance): () => void {
     return: Fiber | null;
   };
   let fiber = node.unstable_fiber as Fiber | null;
+  let handler: (() => void) | undefined;
   while (fiber) {
     if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.onPress as () => void;
+      handler = fiber.memoizedProps.onPress as () => void;
+      break;
     }
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => void;
 }
 
 let openUrlSpy: jest.SpiedFunction<typeof Linking.openURL>;

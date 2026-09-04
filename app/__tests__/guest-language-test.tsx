@@ -94,6 +94,12 @@ function provider(child: React.ReactNode) {
 beforeEach(() => {
   jest.clearAllMocks();
   preference = null;
+  // Reset (not just clear) the SecureStore mocks: a test aborted mid-flight by
+  // a mutation kill must not leak a queued once-return deferred into the next
+  // test, where an awaited write would hang the suite forever.
+  mockGetItem.mockReset();
+  mockSetItem.mockReset();
+  mockDeleteItem.mockReset();
   mockGetItem.mockResolvedValue(null);
   mockSetItem.mockResolvedValue(undefined);
   mockDeleteItem.mockResolvedValue(undefined);

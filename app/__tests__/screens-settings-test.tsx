@@ -324,13 +324,20 @@ function spyOnTextInputFocus(element: TestInstance): jest.Mock {
  */
 function committedPressHandler(node: TestInstance): () => unknown {
   let fiber: Fiber | null = node.unstable_fiber;
+  let handler: (() => unknown) | undefined;
   while (fiber) {
     const props = fiber.memoizedProps as { onPress?: unknown } | null;
-    if (typeof props?.onPress === 'function') return props.onPress as () => unknown;
+    if (typeof props?.onPress === 'function') {
+      handler = props.onPress as () => unknown;
+      break;
+    }
     if (fiber.return === null || typeof fiber.return.type === 'string') break;
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler found');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => unknown;
 }
 
 function responderEvent() {

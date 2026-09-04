@@ -212,10 +212,10 @@ function rawPressHandlers(renderer: TestRendererRoot, label: string): (() => unk
       type PressFiber = { memoizedProps?: { onPress?: unknown }; return: PressFiber | null };
       let fiber = node.unstable_fiber as PressFiber | null;
       while (fiber && typeof fiber.memoizedProps?.onPress !== 'function') fiber = fiber.return;
-      if (typeof fiber?.memoizedProps?.onPress !== 'function') {
-        throw new Error(`No committed press handler for ${label}`);
-      }
-      return fiber.memoizedProps.onPress as () => unknown;
+      // Assert instead of throwing raw: a missing handler is the observable
+      // behavior under a wiring mutant and must fail as a kill, never an error.
+      expect(fiber?.memoizedProps?.onPress).toBeInstanceOf(Function);
+      return fiber?.memoizedProps?.onPress as () => unknown;
     });
 }
 
@@ -612,7 +612,12 @@ describe('Recorder audio-owner mutation contract', () => {
     const operations: Promise<unknown>[] = [];
     const press = (label: string) => () => {
       const handler = rawPressHandlers(renderer, label)[0];
-      if (typeof handler !== 'function') throw new Error(`No committed press handler for ${label}`);
+      if (typeof handler !== 'function') {
+        // A missing handler is the observable behavior under a wiring mutant and
+        // must fail as a kill, never an infrastructure error.
+        expect(handler).toBeInstanceOf(Function);
+        return;
+      }
       operations.push(Promise.resolve(handler()));
     };
     try {

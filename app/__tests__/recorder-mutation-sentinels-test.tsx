@@ -421,13 +421,18 @@ type PressFiber = { memoizedProps?: { onPress?: unknown }; return: PressFiber | 
 
 function committedNodePress(node: { unstable_fiber?: unknown }): () => unknown {
   let fiber = node.unstable_fiber as PressFiber | null;
+  let handler: (() => unknown) | undefined;
   while (fiber) {
     if (typeof fiber.memoizedProps?.onPress === 'function') {
-      return fiber.memoizedProps.onPress as () => unknown;
+      handler = fiber.memoizedProps.onPress as () => unknown;
+      break;
     }
     fiber = fiber.return;
   }
-  throw new Error('No committed press handler');
+  // Assert instead of throwing raw: a missing handler is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(handler).toBeInstanceOf(Function);
+  return handler as () => unknown;
 }
 
 function committedPress(label: string): () => unknown {

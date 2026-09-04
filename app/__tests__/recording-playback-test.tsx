@@ -428,10 +428,46 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await cleanup();
+  // A test aborted mid-operation by a mutation kill can leave bounded
+  // preparation deadlines scheduled on fake timers; jest.useRealTimers()
+  // abandons those events without firing them, wedging the serialized
+  // audio-mode queue forever for every later test. Expire them first.
+  if (jest.isMockFunction(globalThis.setTimeout)) {
+    await jest.advanceTimersByTimeAsync(65_000);
+    await Promise.resolve();
+  }
   for (const client of queryClients.splice(0)) client.clear();
   jest.restoreAllMocks();
   jest.useRealTimers();
 });
+
+/**
+ * Races a queue await against a real-timer bound so a mutant that wedges the
+ * serialized audio-mode/ownership queues behind an abandoned fake-timer
+ * deadline or a never-settling stop fails these unit assertions with matcher
+ * evidence instead of hanging Jest at the suite-level timeout.
+ */
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs = 1_500): Promise<boolean> {
+  let timeout: ReturnType<typeof nativeSetTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then(
+        () => true,
+        () => false,
+      ),
+      // The bound must fire even while fake timers are installed, so it uses
+      // the native timer captured at module load, before any test fakes them.
+      new Promise<boolean>((resolve) => {
+        timeout = nativeSetTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) nativeClearTimeout(timeout);
+  }
+}
 
 describe('recording playback primitives', () => {
   it('formats whole, fractional, negative, and non-finite native times', () => {
@@ -745,7 +781,10 @@ describe('RecordingPlayback', () => {
       await flushMicrotasks();
     });
     expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1);
-    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+    // A wiring mutant that never started the download must fail here as a kill.
+    expect(downloadCall).toBeDefined();
+    const signal = downloadCall[2] as AbortSignal;
     await act(async () => jest.advanceTimersByTimeAsync(29_999));
     expect(signal.aborted).toBe(false);
     expect(screen.getByText(t('recordings.sharing'))).toBeTruthy();
@@ -796,7 +835,10 @@ describe('RecordingPlayback', () => {
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
     await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
-    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+    // A wiring mutant that never started the download must fail here as a kill.
+    expect(downloadCall).toBeDefined();
+    const signal = downloadCall[2] as AbortSignal;
 
     await emitAppState('background');
     expect(signal.aborted).toBe(true);
@@ -818,7 +860,10 @@ describe('RecordingPlayback', () => {
     await renderPlayback();
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
     await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
-    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+    // A wiring mutant that never started the download must fail here as a kill.
+    expect(downloadCall).toBeDefined();
+    const signal = downloadCall[2] as AbortSignal;
 
     await emitAppState('inactive');
     expect(signal.aborted).toBe(false);
@@ -839,7 +884,10 @@ describe('RecordingPlayback', () => {
       const view = await renderPlayback();
       await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
       await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
-      const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+      const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+      // A wiring mutant that never started the download must fail here as a kill.
+      expect(downloadCall).toBeDefined();
+      const signal = downloadCall[2] as AbortSignal;
 
       if (boundary === 'blur') {
         await act(async () => focusRegistrations[0].cleanup?.());
@@ -1228,6 +1276,9 @@ describe('RecordingPlayback', () => {
       await flushMicrotasks();
     });
     const player = players[0];
+    // A wiring mutant that never creates the native instance must fail this
+    // assertion instead of crashing on a missing mock.
+    expect(player).toBeDefined();
     await act(async () => {
       player.emit({
         currentTime: 0,
@@ -1265,6 +1316,9 @@ describe('RecordingPlayback', () => {
       await flushMicrotasks();
     });
     const player = players[0];
+    // A wiring mutant that never creates the native instance must fail this
+    // assertion instead of crashing on a missing mock.
+    expect(player).toBeDefined();
     await act(async () => {
       // Loaded (so play() is requested), then decoding advances — but some
       // Android decoders report playing=false irregularly even while audible.
@@ -1919,6 +1973,8 @@ describe('RecordingPlayback', () => {
     await view.unmount();
     expect(getSubmittedRecordingPlaybackActive()).toBe(false);
     expect(listener).toHaveBeenCalledTimes(2);
+    // A wiring mutant that never prepared the file must fail here as a kill.
+    expect(playbackFiles[0]).toBeDefined();
     expect(playbackFiles[0].release).toHaveBeenCalledTimes(1);
     unsubscribe();
   });
@@ -1950,7 +2006,10 @@ describe('RecordingPlayback', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
     await waitFor(() => expect(downloadPrivatePlaybackFile).toHaveBeenCalledTimes(1));
-    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+    // A wiring mutant that never started the download must fail here as a kill.
+    expect(downloadCall).toBeDefined();
+    const signal = downloadCall[2] as AbortSignal;
     expect(signal.aborted).toBe(false);
 
     await emitAppState('background');
@@ -1974,7 +2033,10 @@ describe('RecordingPlayback', () => {
       fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
       await flushMicrotasks();
     });
-    const signal = asMock(downloadPrivatePlaybackFile).mock.calls[0][2] as AbortSignal;
+    const downloadCall = asMock(downloadPrivatePlaybackFile).mock.calls[0];
+    // A wiring mutant that never started the download must fail here as a kill.
+    expect(downloadCall).toBeDefined();
+    const signal = downloadCall[2] as AbortSignal;
     await act(async () => jest.advanceTimersByTimeAsync(29_999));
     expect(signal.aborted).toBe(false);
     expect(screen.getByText(t('recordings.preparing'))).toBeTruthy();
@@ -2998,6 +3060,9 @@ it('resumes a paused player audibly and finishes without stranding the next Play
   await renderPlayback();
   await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
   const player = players[0];
+  // A wiring mutant that never creates the native instance must fail this
+  // assertion instead of crashing on a missing mock.
+  expect(player).toBeDefined();
   await waitFor(() => expect(player.play).toHaveBeenCalledTimes(1));
 
   await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
@@ -3375,8 +3440,8 @@ describe('submitted-recording audio session', () => {
   });
 
   it('configures the exact playback and recording audio modes', async () => {
-    await configurePlaybackAudioMode();
-    await configureRecordingAudioMode();
+    expect(await settlesWithin(configurePlaybackAudioMode())).toBe(true);
+    expect(await settlesWithin(configureRecordingAudioMode())).toBe(true);
     expect(mockSetAudioModeAsync.mock.calls).toEqual([
       [
         {
@@ -3413,14 +3478,14 @@ describe('submitted-recording audio session', () => {
       await jest.advanceTimersByTimeAsync(AUDIO_MODE_OPERATION_TIMEOUT_MS - 1);
       expect(settled).toBe('pending');
       await jest.advanceTimersByTimeAsync(1);
-      await configured;
+      expect(await settlesWithin(configured)).toBe(true);
       expect(settled).toMatchObject({
         message: 'audio mode operation did not settle in time',
       });
 
       // The serialized queue recovers: the next mutation still runs.
       mockSetAudioModeAsync.mockResolvedValue(undefined);
-      await configureRecordingAudioMode();
+      expect(await settlesWithin(configureRecordingAudioMode())).toBe(true);
       expect(mockSetAudioModeAsync).toHaveBeenLastCalledWith(
         expect.objectContaining({ allowsRecording: true }),
       );

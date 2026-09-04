@@ -1110,13 +1110,24 @@ afterEach(async () => {
   // resolution. Unmount first so every Recorder currency guard is stale, then
   // settle those test-only promises to let native/audio/recovery finalizers
   // release module-level ownership before Jest continues the mutant file.
-  await act(async () => {
-    for (const settle of [...outstandingDeferredResolutions]) settle();
-    await flushMicrotasks();
-  });
-  outstandingDeferredResolutions.clear();
-  await flushAct();
-  await flushAct();
+  // Every flush is deadline-bounded: a mutant can abort a test while Recorder
+  // still holds a wedged operation lock, and an unbounded cleanup await would
+  // hang every later test at Jest's suite-level timeout instead of letting
+  // each of them fail (or pass) on its own assertions.
+  // The flushes are awaited directly inside flushRecorderCleanup (act's
+  // thenable must never be raced itself); only the enclosing async function is
+  // deadline-bounded, so a mutant that wedges Recorder's cleanup cannot hang
+  // every later test at Jest's suite-level timeout.
+  const flushRecorderCleanup = async () => {
+    await act(async () => {
+      for (const settle of [...outstandingDeferredResolutions]) settle();
+      await flushMicrotasks();
+    });
+    outstandingDeferredResolutions.clear();
+    await flushAct();
+    await flushAct();
+  };
+  await settlesWithin(flushRecorderCleanup(), 30_000);
   for (const timeout of outstandingRealTimeouts) nativeClearTimeout(timeout);
   outstandingRealTimeouts.clear();
   for (const interval of outstandingRealIntervals) nativeClearInterval(interval);

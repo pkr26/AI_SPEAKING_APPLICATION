@@ -59,6 +59,11 @@ const EMPTY_DIAGNOSTIC_VIEW_STATE: DiagnosticViewState = Object.freeze({
   level: null,
 });
 
+/** Pristine per-test answer list. A module constant (not an inline array
+ * literal) keeps the authored initial value a stable empty array, so the
+ * identity-boundary reset below remains the only writer of a replacement. */
+const EMPTY_DIAGNOSTIC_ANSWERS: DiagnosticAnswerSummary[] = [];
+
 export default function DiagnosticScreen() {
   const { user, setUser, logout, sessionVersion, captureSessionLease, isSessionLeaseCurrent } =
     useAuth();
@@ -111,7 +116,7 @@ export default function DiagnosticScreen() {
   // One-shot per test state: tapping Start hides the intro for this session.
   // A resumed test (asked > 0) never shows it, so resuming is not blocked.
   const [introStarted, setIntroStarted] = useState(() => currentDiagnosticReplay !== null);
-  const [answers, setAnswers] = useState<DiagnosticAnswerSummary[]>([]);
+  const [answers, setAnswers] = useState<DiagnosticAnswerSummary[]>(EMPTY_DIAGNOSTIC_ANSWERS);
   const [stateIdentity, setStateIdentity] = useState(identityKey);
   const recorderLockedRef = useRef(false);
   const [recorderExitLocked, setRecorderExitLocked] = useState(false);
@@ -172,36 +177,47 @@ export default function DiagnosticScreen() {
     }, []),
   );
 
+  // The pristine mount run has nothing to reset: every slot still holds its
+  // authored initial value (the replay-seed layout effect below re-seeds its
+  // card in the same pass), so the boundary reset only runs for a real
+  // identity change and the initializers stay the sole source of first paint.
+  const previousIdentityRef = useRef<string | null>(null);
   useLayoutEffect(() => {
-    // Local diagnostic progress is sensitive account data and is not stored in
-    // the query cache. Clear it at every session/identity boundary.
-    activeIdentityRef.current = identityKey;
-    setStateIdentity(identityKey);
-    setQuestion(null);
-    setProgress(null);
-    resultRef.current = null;
-    setResult(null);
-    resultRequestIdRef.current = null;
-    setResultRequestId(null);
-    replayResultRequestIdRef.current = null;
-    seededReplayKeyRef.current = null;
-    resultActionClaimRef.current = null;
-    resultActionBusyRef.current = false;
-    setResultActionBusy(false);
-    setResultActionError(false);
-    setLevel(null);
-    setIntroStarted(false);
-    setAnswers([]);
-    setRateLimitNotice(null);
-    practiceStartRef.current = false;
-    setPracticeStartBusy(false);
-    recorderLockedRef.current = false;
-    recorderExitLockedRef.current = false;
-    setRecorderExitLocked(false);
-    logoutBusyRef.current = false;
-    setLogoutBusy(false);
-    accountActionRef.current = !focusedRef.current;
-    recoveryRefreshRef.current = null;
+    const pristineMount = previousIdentityRef.current === null;
+    previousIdentityRef.current = identityKey;
+    if (!pristineMount) {
+      // Local diagnostic progress is sensitive account data and is not stored
+      // in the query cache. Clear it at every session/identity boundary.
+      activeIdentityRef.current = identityKey;
+      setStateIdentity(identityKey);
+      setQuestion(null);
+      setProgress(null);
+      resultRef.current = null;
+      setResult(null);
+      resultRequestIdRef.current = null;
+      setResultRequestId(null);
+      replayResultRequestIdRef.current = null;
+      seededReplayKeyRef.current = null;
+      resultActionClaimRef.current = null;
+      resultActionBusyRef.current = false;
+      setResultActionBusy(false);
+      setResultActionError(false);
+      setLevel(null);
+      setIntroStarted(false);
+      setAnswers([]);
+      setRateLimitNotice(null);
+      practiceStartRef.current = false;
+      setPracticeStartBusy(false);
+      recorderLockedRef.current = false;
+      recorderExitLockedRef.current = false;
+      // The recorder-owner layout effect below re-runs for every identity
+      // change (the owner key embeds identityKey) and already restores the
+      // exit-lock state; only the handler-facing ref needs this reset.
+      logoutBusyRef.current = false;
+      setLogoutBusy(false);
+      accountActionRef.current = !focusedRef.current;
+      recoveryRefreshRef.current = null;
+    }
     return () => {
       if (activeIdentityRef.current === identityKey) activeIdentityRef.current = null;
     };
@@ -216,7 +232,8 @@ export default function DiagnosticScreen() {
     if (seededReplayKeyRef.current === replayKey) return;
     seededReplayKeyRef.current = replayKey;
     activeIdentityRef.current = identityKey;
-    setStateIdentity(identityKey);
+    // stateIdentity already equals identityKey here: the boundary layout
+    // effect above re-syncs it in the same commit whenever it could lag.
     setQuestion(currentDiagnosticReplay.question);
     setProgress(null);
     resultRef.current = currentDiagnosticReplay.result;
@@ -254,7 +271,6 @@ export default function DiagnosticScreen() {
         // The canonical endpoint has already advanced beyond this replayed
         // answer. Keep the original question/result card visible, while using
         // canonical history and one-step-prior progress behind that card.
-        setStateIdentity(identityKey);
         setAnswers(data.answers ?? []);
         setProgress(
           data.done
@@ -272,17 +288,18 @@ export default function DiagnosticScreen() {
     // An unacknowledged answer card outranks a background refetch: the stale
     // /next response (pre-answer state) must not skip the learner past the
     // result they have not acknowledged. advance() applies the next question
-    // locally when they continue.
-    setStateIdentity(identityKey);
+    // locally when they continue. The result slot is the only one that can
+    // still hold a stale card here (a no-metadata advance on an incomplete
+    // result keeps the card visible after its ref is cleared); the
+    // request-id and busy/error slots were already nulled by the same writers
+    // that cleared their refs, and the boundary layout effect re-synced
+    // stateIdentity earlier in this commit.
     resultRef.current = null;
     setResult(null);
     resultRequestIdRef.current = null;
-    setResultRequestId(null);
     replayResultRequestIdRef.current = null;
     resultActionClaimRef.current = null;
     resultActionBusyRef.current = false;
-    setResultActionBusy(false);
-    setResultActionError(false);
     if (data.done) {
       setQuestion(null);
       setProgress(null);
@@ -419,8 +436,9 @@ export default function DiagnosticScreen() {
     setResultRequestId(metadata?.requestId ?? null);
     resultActionClaimRef.current = null;
     resultActionBusyRef.current = false;
-    setResultActionBusy(false);
-    setResultActionError(false);
+    // A visible card fences the recorder, so the busy/error slots are
+    // definitionally false when a fresh result is accepted; the refs above
+    // keep that fence for press-time handlers.
     void queryClient.cancelQueries({
       queryKey: ['diagnostic-next', sessionVersion, userId],
       exact: true,
@@ -586,7 +604,8 @@ export default function DiagnosticScreen() {
     resultActionClaimRef.current = null;
     resultActionBusyRef.current = false;
     setResultActionBusy(false);
-    setResultActionError(false);
+    // advance() cleared the retry banner synchronously before claiming this
+    // card, so the error slot is already false at every commit point.
     resultRef.current = null;
     resultRequestIdRef.current = null;
     replayResultRequestIdRef.current = null;
@@ -623,8 +642,11 @@ export default function DiagnosticScreen() {
       return;
     }
     if (!userId) {
+      // A rendered card implies a usable account id: the identity boundary
+      // clears the card on any user change, and no card can be created under
+      // a falsy id (the /next observer refuses to apply data without one).
+      // This guard only narrows the acknowledgement call below.
       resultActionClaimRef.current = null;
-      setResultActionError(true);
       return;
     }
 
@@ -756,7 +778,7 @@ export default function DiagnosticScreen() {
   if (!user) return null;
 
   if (!currentLevel && !currentQuestion) {
-    if (nextQuery.isPending) {
+    if (nextQuery.isPending || stateIdentity !== identityKey) {
       return (
         <View style={styles.screen}>
           <ScrollView
@@ -809,7 +831,7 @@ export default function DiagnosticScreen() {
   }
 
   // ----- Done: congrats view with the per-answer reveal -----
-  if (currentLevel) {
+  if (currentLevel !== null) {
     return (
       <View style={styles.screen}>
         <ScrollView
@@ -931,7 +953,7 @@ export default function DiagnosticScreen() {
           </View>
         ) : (
           <>
-            {currentProgress && (
+            {currentProgress !== null && (
               <>
                 <Text style={styles.progressText}>
                   {t('diag.progress', {

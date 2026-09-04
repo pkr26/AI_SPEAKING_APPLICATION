@@ -547,6 +547,32 @@ function committedPressHandler(node: TestInstance): () => unknown {
   return handler as () => unknown;
 }
 
+/**
+ * Authored props of the labelled Pressable that rendered a control. React
+ * Native's Pressable synthesizes the host view's accessibilityState from the
+ * disabled prop, so an authored accessibilityState={{ disabled }} wiring is
+ * invisible on the host element (identical synthesized object either way) and
+ * is only observable on the composite Pressable element itself — reached by
+ * walking the fiber chain above the host view, the same traversal
+ * committedPressHandler uses to resolve handlers.
+ */
+function authoredPressableProps(node: TestInstance, label: string) {
+  let fiber: Fiber | null = node.unstable_fiber;
+  let props: Record<string, unknown> | undefined;
+  while (fiber) {
+    const candidate = fiber.memoizedProps as Record<string, unknown> | null;
+    if (candidate?.accessibilityLabel === label && typeof candidate.onPress === 'function') {
+      props = candidate;
+      break;
+    }
+    fiber = fiber.return;
+  }
+  // A control whose authored Pressable props cannot be found is itself the
+  // observable wiring failure; fail on assertion evidence, never a crash.
+  expect(props).toBeDefined();
+  return props as Record<string, unknown>;
+}
+
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
   let reject!: (reason?: unknown) => void;
@@ -654,7 +680,126 @@ function buttonContainerPaddingBottom(name: string): unknown {
     if (paddingBottom !== undefined) return paddingBottom;
     ancestor = ancestor.parent;
   }
-  throw new Error(`Button "${name}" has no padded container`);
+  // Fail through a matcher so a removed bar-style wiring dies on assertion
+  // evidence instead of a helper TypeError.
+  expect(ancestor).not.toBeNull();
+}
+
+/**
+ * Authored props of the shared Button that rendered the named control, found
+ * the same way RNT's own fireEvent resolves handlers: by walking the fiber
+ * chain above the host element. Reading the call-site attributes keeps
+ * prop-wiring assertions on exactly what the state/prop supplements force.
+ */
+function buttonProps(name: string): Record<string, unknown> {
+  const node = screen.getByRole('button', { name });
+  let fiber: Fiber | null = node.unstable_fiber;
+  let props: Record<string, unknown> | undefined;
+  while (fiber) {
+    const candidate = fiber.memoizedProps as Record<string, unknown> | null;
+    if (
+      candidate &&
+      typeof candidate.title === 'string' &&
+      typeof candidate.onPress === 'function'
+    ) {
+      props = candidate;
+      break;
+    }
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  // A control whose authored Button props cannot be found is itself the
+  // observable wiring failure; fail on assertion evidence, never a crash.
+  expect(props).toBeDefined();
+  return props!;
+}
+
+/** Authored props of the Pressable control that rendered `node`. */
+function pressableProps(node: TestInstance): Record<string, unknown> {
+  let fiber: Fiber | null = node.unstable_fiber;
+  let props: Record<string, unknown> | undefined;
+  while (fiber) {
+    const candidate = fiber.memoizedProps as Record<string, unknown> | null;
+    if (candidate && typeof candidate.onPress === 'function' && 'disabled' in candidate) {
+      props = candidate;
+      break;
+    }
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  expect(props).toBeDefined();
+  return props!;
+}
+
+type StateHookNode = { memoizedState: unknown; next: unknown; queue: unknown };
+
+/**
+ * Current useState values of the named screen component. Some pinned state
+ * sentinels (idle `null` notices, lock mirrors, the focus epoch) are never
+ * published through the render tree, so the hook chain itself is the
+ * observable: the auth/flow providers are module mocks, leaving the screen's
+ * own state hooks (plus TanStack query reducer states, which no call site
+ * shape-matches) carrying queues.
+ */
+function screenStateValues(node: TestInstance, componentName: string): unknown[] {
+  let fiber: Fiber | null = node.unstable_fiber;
+  while (fiber && (typeof fiber.type !== 'function' || fiber.type.name !== componentName)) {
+    fiber = fiber.return;
+  }
+  expect(fiber).not.toBeNull();
+  const values: unknown[] = [];
+  let hook =
+    ((fiber as (Fiber & { memoizedState: StateHookNode | null }) | null)?.memoizedState as
+      StateHookNode | null | undefined) ?? null;
+  while (hook) {
+    if (hook.queue) values.push(hook.memoizedState);
+    hook = hook.next as StateHookNode | null;
+  }
+  return values;
+}
+
+/** Renders every ActivityIndicator host on the current screen. */
+function activityIndicators(): TestInstance[] {
+  return screen.container.queryAll((candidate) => candidate.type === 'ActivityIndicator');
+}
+
+/** Authored child elements of a rendered host element (array-normalized). */
+function childElements(
+  node: TestInstance | { props: { children?: unknown } },
+): React.ReactElement<{ [prop: string]: unknown }>[] {
+  const children = node.props.children;
+  if (children === undefined || children === null) return [];
+  return (Array.isArray(children) ? children : [children]) as React.ReactElement<{
+    [prop: string]: unknown;
+  }>[];
+}
+
+/**
+ * Authored SVG primitives of an Icon's Svg element (fragment unwrapped).
+ * Reading the authored elements keeps ink assertions on the call-site color
+ * strings; rendered hosts re-encode colors into platform payloads.
+ */
+function svgPrimitives(
+  svg: React.ReactElement<{ children?: unknown }>,
+): React.ReactElement<{ [prop: string]: unknown }>[] {
+  const rendered: unknown = svg.props.children;
+  if (rendered === undefined || rendered === null) return [];
+  const children =
+    React.isValidElement(rendered) && rendered.type === React.Fragment
+      ? (rendered.props as { children?: unknown }).children
+      : rendered;
+  if (children === undefined || children === null) return [];
+  return (Array.isArray(children) ? children : [children]) as React.ReactElement<{
+    [prop: string]: unknown;
+  }>[];
+}
+
+/** The two recorder lock-mirror state values (owner/locked shaped). */
+function lockShapedStates(values: readonly unknown[]): { owner: unknown; locked: unknown }[] {
+  return values.filter(
+    (value): value is { owner: unknown; locked: unknown } =>
+      typeof value === 'object' && value !== null && 'owner' in value && 'locked' in value,
+  );
 }
 
 beforeEach(() => {
@@ -3377,6 +3522,14 @@ describe('skip word', () => {
     expect(screen.getByLabelText(t('practice.helpLabel')).props.accessibilityState).toMatchObject({
       disabled: true,
     });
+    // The disabled state is authored on the Pressable itself, not just
+    // synthesized from its disabled prop by React Native's Pressable host.
+    expect(
+      authoredPressableProps(
+        screen.getByLabelText(t('practice.helpLabel')),
+        t('practice.helpLabel'),
+      ).accessibilityState,
+    ).toEqual({ disabled: true });
     expect(
       screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }).props
         .accessibilityState,
@@ -3941,7 +4094,12 @@ describe('skip word busy state', () => {
     expect(busySkip().props.accessibilityState).toEqual({ disabled: true, busy: true });
     expect(flattenedStyle(busySkip())).toMatchObject({ opacity: 0.5 });
     // The busy label swaps in with a decorative, screen-reader-hidden spinner.
-    expect(screen.getByTestId('practice-skip-busy-indicator', hidden)).toBeTruthy();
+    const busyIndicator = screen.getByTestId('practice-skip-busy-indicator', hidden);
+    expect(busyIndicator).toBeTruthy();
+    // The spinner is hidden from assistive tech on both platforms: the busy
+    // state plus the "Skipping…" label already carry the meaning.
+    expect(busyIndicator.props.accessibilityElementsHidden).toBe(true);
+    expect(busyIndicator.props.importantForAccessibility).toBe('no-hide-descendants');
     expect(screen.getByText(t('practice.skipBusy'))).toBeTruthy();
     expect(screen.queryByText(t('practice.skipWord'))).toBeNull();
 
@@ -5661,5 +5819,912 @@ describe('practice feedback presentation', () => {
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.backToPractice') })),
     ).toMatchObject({ marginTop: spacing.lg });
+  });
+});
+
+describe('practice feedback wiring sentinels', () => {
+  const SUBTITLE = {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    color: colors.mutedTint,
+    textAlign: 'center',
+  };
+  const TITLE_BASE = {
+    marginTop: spacing.md,
+    fontSize: 24,
+    lineHeight: 30,
+    fontWeight: '800',
+    textAlign: 'center',
+  };
+  const CARD_LABEL = {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginTop: 14,
+  };
+  const QUESTION_CARD = {
+    marginTop: spacing.xl,
+    alignSelf: 'stretch',
+    backgroundColor: colors.card,
+    borderRadius: radii.card,
+    padding: spacing.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+  };
+
+  const NATIVE_UNDERSTOOD: NativeAttemptResult = {
+    mode: 'native',
+    nativeLanguage: 'te',
+    cycleId: CYCLE_ID,
+    understood: true,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    transcript: 'ఆమె పనిలో ధైర్యం చూపింది.',
+    translatedTranscript: 'She was brave at her job.',
+    modelAnswer: 'She showed courage at work.',
+    feedback: 'You understood the question.',
+  };
+  const NATIVE_SILENCE: NativeAttemptResult = {
+    mode: 'native',
+    nativeLanguage: 'te',
+    cycleId: CYCLE_ID,
+    understood: false,
+    attemptNo: 1,
+    attemptsLeft: 3,
+    transcript: '',
+    translatedTranscript: '',
+    modelAnswer: '',
+    feedback: 'We could not detect any speech.',
+  };
+  const NATIVE_FINAL: NativeAttemptResult = {
+    mode: 'native',
+    nativeLanguage: 'te',
+    cycleId: CYCLE_ID,
+    understood: false,
+    attemptNo: 3,
+    attemptsLeft: 0,
+    transcript: 'మాట్లాడలేదు.',
+    translatedTranscript: 'Nothing was said.',
+    modelAnswer: 'She showed courage at work.',
+    feedback: 'Better luck with the next word.',
+  };
+  const NOSPEECH_RESULT: AttemptResult = {
+    cycleId: CYCLE_ID,
+    passed: false,
+    mastered: false,
+    noSpeech: true,
+    attemptNo: 1,
+    attemptsLeft: 3,
+    score: 0,
+    transcript: '',
+    feedback: 'We could not detect any speech.',
+  };
+  const RETRY_RESULT: AttemptResult = {
+    cycleId: CYCLE_ID,
+    passed: false,
+    mastered: false,
+    attemptNo: 1,
+    attemptsLeft: 2,
+    score: 40,
+    transcript: 'I tried.',
+    feedback: 'Keep going.',
+  };
+  const FINAL_RESULT: AttemptResult = {
+    cycleId: CYCLE_ID,
+    passed: false,
+    mastered: false,
+    attemptNo: 3,
+    attemptsLeft: 0,
+    score: 30,
+    transcript: 'last try',
+    feedback: 'Regular feedback.',
+  };
+  const LEVELUP_RESULT: AttemptResult = {
+    cycleId: CYCLE_ID,
+    passed: true,
+    mastered: true,
+    attemptNo: 1,
+    attemptsLeft: 0,
+    score: 90,
+    transcript: 'A detailed answer.',
+    feedback: 'Excellent.',
+    levelUp: { from: 'B1', to: 'B2' },
+  };
+  const MASTERED_RESULT: AttemptResult = {
+    ...PASSED_RESULT,
+    mastered: true,
+    score: 88,
+  };
+
+  interface FeedbackExtras {
+    question?: Question;
+    requestId?: string;
+  }
+
+  async function renderFeedbackCard(
+    result: PracticeOutcome,
+    extras: FeedbackExtras = {},
+  ): Promise<void> {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result, ...extras },
+    });
+    await renderScreen(<FeedbackScreen />);
+  }
+
+  it('pins the outcome badge glyph name, size, ink, and stroke weight', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    const badge = screen.getByTestId('feedback-outcome-badge', { includeHiddenElements: true });
+    const iconView = badge.children[0] as TestInstance;
+    const [svg] = childElements(iconView);
+    expect(svg).toBeDefined();
+    // The passed card's art is the check glyph at the badge size.
+    expect(svg.props.width).toBe(38);
+    expect(svg.props.height).toBe(38);
+    const primitives = svgPrimitives(svg);
+    expect(primitives).toHaveLength(1);
+    expect(primitives[0]!.props.d).toBe('M4.5 12.5 9.5 17.5 19.5 6.5');
+    // The glyph ink is the card fill, distinct from the Icon fallback ink.
+    expect(colors.text).not.toBe(colors.card);
+    expect(primitives[0]!.props.stroke).toBe(colors.card);
+    expect(primitives[0]!.props.strokeWidth).toBe(2.1);
+  });
+
+  it('keeps the no-result scroll view content-inset adjusting', async () => {
+    await renderScreen(<FeedbackScreen />);
+    expect(screen.getByRole('header', { name: t('feedback.noResultTitle') })).toBeTruthy();
+    expect(scrollView().props.contentInsetAdjustmentBehavior).toBe('automatic');
+  });
+
+  it('keeps the result scroll view content-inset adjusting', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    expect(scrollView().props.contentInsetAdjustmentBehavior).toBe('automatic');
+  });
+
+  it('pins the no-result back-to-practice button wiring', async () => {
+    await renderScreen(<FeedbackScreen />);
+    const props = buttonProps(t('common.backToPractice'));
+    expect(props.fullWidth).toBe(true);
+    expect(props.size).toBe('md');
+  });
+
+  it.each([
+    ['native verdict', NATIVE_UNDERSTOOD, t('feedback.nativeUnderstoodBody')],
+    ['native silence', NATIVE_SILENCE, t('feedback.nativeNoSpeechBody')],
+    ['native final try', NATIVE_FINAL, t('feedback.nativeFinalBody')],
+    ['english silence', NOSPEECH_RESULT, t('feedback.noSpeechBody')],
+    ['level-up progress', LEVELUP_RESULT, t('levelUp.progress', { from: 'B1', to: 'B2' })],
+    ['level-up level name', LEVELUP_RESULT, t('cefr.B2')],
+    [
+      'mastered body',
+      MASTERED_RESULT,
+      t('feedback.masteredBody', { score: PRACTICE_MASTER_SCORE }),
+    ],
+    ['retry body', RETRY_RESULT, t('feedback.retryBodyMany', { count: 2 })],
+    ['final body', FINAL_RESULT, t('feedback.finalBody')],
+  ] as const)('sets the %s subtitle on the on-tint ink', async (_name, result, copy) => {
+    await renderFeedbackCard(result);
+    expect(flattenedStyle(screen.getByText(copy))).toEqual(SUBTITLE);
+  });
+
+  it('titles the final native verdict in danger ink', async () => {
+    await renderFeedbackCard(NATIVE_FINAL);
+    expect(
+      flattenedStyle(screen.getByRole('header', { name: t('feedback.nativeFinalTitle') })),
+    ).toEqual({ ...TITLE_BASE, color: colors.danger });
+  });
+
+  it('pins the shared attempt-line chip', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    expect(
+      flattenedStyle(
+        screen.getByText(t('feedback.attemptLine', { current: 1, max: PRACTICE_MAX_ATTEMPTS })),
+      ),
+    ).toEqual({
+      marginTop: spacing.md,
+      paddingVertical: 3,
+      paddingHorizontal: 10,
+      borderRadius: radii.badge,
+      backgroundColor: colors.primaryLight,
+      color: colors.primary,
+      fontSize: 12,
+      fontWeight: '700',
+    });
+  });
+
+  it('pins the score ring diameter and stroke thickness', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    const ring = screen.getByTestId('feedback-score-ring');
+    expect(flattenedStyle(ring)).toMatchObject({ width: 132, height: 152 });
+    const ringBox = ring.children[0] as TestInstance;
+    expect(flattenedStyle(ringBox)).toEqual({ width: 132, height: 132 });
+    const svg = ringBox.children.find(
+      (child): child is TestInstance =>
+        typeof child !== 'string' && String(child.type) === 'RNSVGSvgView',
+    );
+    expect(svg).toBeDefined();
+    expect(svg!.props.width).toBe(132);
+    expect(svg!.props.height).toBe(132);
+    const [svgElement] = childElements(ringBox);
+    const [track] = svgPrimitives(svgElement);
+    expect(track).toBeDefined();
+    expect(track.props.strokeWidth).toBe(11);
+    expect(track.props.r).toBe((132 - 11) / 2);
+    expect(track.props.stroke).toBe(colors.border);
+  });
+
+  it('lays the question summary card out from the tokens', async () => {
+    await renderFeedbackCard(PASSED_RESULT, { question: QUESTION });
+    expect(flattenedStyle(parentOf(screen.getByText('Nice work.')))).toEqual(QUESTION_CARD);
+    const wordLabel = screen.getByText(t('label.word'));
+    expect(flattenedStyle(parentOf(wordLabel))).toEqual({
+      paddingBottom: spacing.md,
+      borderBottomWidth: 1,
+      borderBottomColor: colors.border,
+    });
+    expect(flattenedStyle(wordLabel)).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText('courage'))).toEqual({
+      marginTop: spacing.xs,
+      color: colors.primary,
+      fontSize: 20,
+      fontWeight: '800',
+    });
+    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(CARD_LABEL);
+    expect(flattenedStyle(screen.getByText(QUESTION.questionText))).toEqual({
+      marginTop: spacing.xs,
+      color: colors.text,
+      fontSize: 17,
+      lineHeight: 24,
+    });
+  });
+
+  it('renders scored answers as tagged chips under the transcript wrapper', async () => {
+    await renderFeedbackCard({
+      ...PASSED_RESULT,
+      wordScores: [
+        { word: 'I', status: 'good' },
+        { word: 'reading', status: 'poor' },
+      ],
+    });
+    expect(screen.getByTestId('feedback-word-transcript')).toBeTruthy();
+    expect(screen.getByLabelText(`I, ${t('feedback.wordGood')}`)).toBeTruthy();
+    // The tagged view replaces the plain quoted fallback for scored answers.
+    expect(screen.queryByText('“I enjoy reading.”')).toBeNull();
+  });
+
+  it('renders the native translation section and model answer from the tokens', async () => {
+    await renderFeedbackCard(NATIVE_UNDERSTOOD);
+    const translationLabel = screen.getByText(t('feedback.englishTranslation'));
+    expect(flattenedStyle(parentOf(translationLabel))).toEqual({
+      marginTop: spacing.md,
+      padding: spacing.md,
+      borderRadius: radii.input,
+      backgroundColor: colors.background,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+    expect(flattenedStyle(translationLabel)).toEqual({
+      fontSize: 13,
+      fontWeight: '800',
+      color: colors.text,
+      textTransform: 'uppercase',
+      letterSpacing: 0.8,
+    });
+    expect(flattenedStyle(screen.getByText('She was brave at her job.'))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 18,
+      lineHeight: 27,
+      color: colors.text,
+    });
+    expect(flattenedStyle(screen.getByText(t('feedback.exampleEnglishAnswer')))).toEqual(
+      CARD_LABEL,
+    );
+    expect(flattenedStyle(screen.getByText('She showed courage at work.'))).toEqual({
+      marginTop: spacing.xs,
+      fontSize: 16,
+      lineHeight: 23,
+      color: colors.primary,
+      fontWeight: '600',
+    });
+  });
+
+  it('labels the prose feedback with the shared card label style', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    expect(flattenedStyle(screen.getByText(t('feedback.feedbackLabel')))).toEqual(CARD_LABEL);
+  });
+
+  it('labels a retained recording with the shared card label style', async () => {
+    await renderFeedbackCard({
+      ...PASSED_RESULT,
+      recordingId: '550e8400-e29b-41d4-a716-446655440077',
+    });
+    expect(flattenedStyle(screen.getByText(t('recordings.yourRecording')))).toEqual(CARD_LABEL);
+  });
+
+  it('styles the durable-pointer retry note as the boundary error', async () => {
+    mockAcknowledgePendingFeedback.mockResolvedValueOnce(false);
+    await renderFeedbackCard(RETRY_RESULT, { requestId: FEEDBACK_REQUEST_ID });
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    const note = await screen.findByRole('alert');
+    expect(note).toHaveTextContent(t('boundary.body'));
+    expect(flattenedStyle(note)).toEqual({
+      marginBottom: spacing.md,
+      color: colors.danger,
+      fontSize: 15,
+      lineHeight: 21,
+      textAlign: 'center',
+    });
+  });
+
+  it('pins the retry card primary action wiring', async () => {
+    await renderFeedbackCard(RETRY_RESULT);
+    const props = buttonProps(t('common.tryAgain'));
+    expect(props.fullWidth).toBe(true);
+    expect(props.size).toBe('lg');
+    expect(props.disabled).toBe(false);
+    expect(props.loading).toBe(false);
+  });
+
+  it('pins the next-question action wiring', async () => {
+    await renderFeedbackCard(PASSED_RESULT);
+    const props = buttonProps(t('feedback.nextQuestion'));
+    expect(props.fullWidth).toBe(true);
+    expect(props.size).toBe('lg');
+    expect(props.disabled).toBe(false);
+    expect(props.loading).toBe(false);
+  });
+
+  it('pins the native card two-action wiring', async () => {
+    await renderFeedbackCard(NATIVE_UNDERSTOOD);
+    const english = buttonProps(t('feedback.tryInEnglish'));
+    expect(english.fullWidth).toBe(true);
+    expect(english.size).toBe('lg');
+    expect(english.disabled).toBe(false);
+    const again = buttonProps(t('feedback.tryAgainNative'));
+    expect(again.variant).toBe('secondary');
+    expect(again.fullWidth).toBe(true);
+    expect(again.size).toBe('md');
+    expect(again.disabled).toBe(false);
+  });
+
+  it('pins the native silence single-action wiring', async () => {
+    await renderFeedbackCard(NATIVE_SILENCE);
+    const props = buttonProps(t('feedback.tryAgainNative'));
+    expect(props.fullWidth).toBe(true);
+    expect(props.size).toBe('lg');
+    expect(props.disabled).toBe(false);
+    expect(props.loading).toBe(false);
+  });
+
+  it('pins the silence card two-action wiring', async () => {
+    await renderFeedbackCard(NOSPEECH_RESULT);
+    const again = buttonProps(t('common.tryAgain'));
+    expect(again.fullWidth).toBe(true);
+    expect(again.size).toBe('lg');
+    expect(again.disabled).toBe(false);
+    const help = buttonProps(t('feedback.seeHelp'));
+    expect(help.variant).toBe('secondary');
+    expect(help.fullWidth).toBe(true);
+    expect(help.size).toBe('md');
+    expect(help.disabled).toBe(false);
+    expect(help.loading).toBe(false);
+  });
+
+  it('marks the primary card action busy while the durable pointer is acknowledged', async () => {
+    const acknowledgement = deferred<boolean>();
+    mockAcknowledgePendingFeedback.mockReturnValue(acknowledgement.promise);
+    await renderFeedbackCard(RETRY_RESULT, { requestId: FEEDBACK_REQUEST_ID });
+    await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+    const busy = buttonProps(t('common.tryAgain'));
+    expect(busy.disabled).toBe(true);
+    expect(busy.loading).toBe(true);
+    expect(
+      screen.getByRole('button', { name: t('common.tryAgain') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+    expect(
+      screen.getByTestId('button-loading-indicator', { includeHiddenElements: true }),
+    ).toBeTruthy();
+    await act(async () => {
+      acknowledgement.resolve(true);
+      await acknowledgement.promise;
+    });
+    expect(mockRouter.dismissTo).toHaveBeenCalledWith('/practice');
+  });
+});
+
+describe('practice feedback state wiring sentinels', () => {
+  it('starts the card action state at the idle null sentinel', async () => {
+    mockPracticeFlow = makePracticeFlow({
+      feedback: { questionId: QUESTION.id, result: PASSED_RESULT },
+    });
+    await renderScreen(<FeedbackScreen />);
+    await screen.findByText(t('feedback.passedTitle'));
+    const values = screenStateValues(
+      screen.getByTestId('feedback-outcome-badge', { includeHiddenElements: true }),
+      'FeedbackScreen',
+    );
+    // A card is mounted, so `card` initializes to an object and the single
+    // null-valued state hook is the idle cardActionState sentinel.
+    expect(
+      values.some(
+        (value) =>
+          typeof value === 'object' && value !== null && 'questionId' in value && 'result' in value,
+      ),
+    ).toBe(true);
+    expect(values.filter((value) => value === null)).toHaveLength(1);
+  });
+});
+
+describe('practice help wiring sentinels', () => {
+  const SECTION = {
+    backgroundColor: colors.card,
+    borderRadius: radii.card,
+    padding: spacing.lg,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.md,
+  };
+  const SECTION_LABEL = {
+    fontSize: 12,
+    fontWeight: '700',
+    color: colors.muted,
+    textTransform: 'uppercase',
+    letterSpacing: 0.8,
+    marginBottom: spacing.sm,
+  };
+  const ENGLISH_TEXT = { fontSize: 17, lineHeight: 24, color: colors.text };
+  const NATIVE_TEXT = { marginTop: 6, fontSize: 16, lineHeight: 23, color: colors.muted };
+
+  async function renderLoadedHelp(): Promise<void> {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockResolvedValue(HELP_CONTENT);
+    await renderScreen(<HelpScreen />);
+    await screen.findByText(t('label.word'));
+  }
+
+  it('keeps the broken-link scroll inset-adjusting and styles its title', async () => {
+    mockSearchParams = { questionId: 'not-a-uuid' };
+    await renderScreen(<HelpScreen />);
+    const title = screen.getByRole('header', { name: t('help.invalidLinkTitle') });
+    expect(flattenedStyle(title)).toEqual({ fontSize: 20, fontWeight: '700', color: colors.text });
+    expect(scrollView().props.contentInsetAdjustmentBehavior).toBe('automatic');
+  });
+
+  it('keeps the loading scroll inset-adjusting with a large primary spinner', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<HelpScreen />);
+    const scroll = scrollView();
+    expect(scroll.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(StyleSheet.flatten(scroll.props.style)).toEqual({ flex: 1 });
+    const spinners = activityIndicators();
+    expect(spinners).toHaveLength(1);
+    expect(spinners[0]!.props.size).toBe('large');
+    expect(spinners[0]!.props.color).toBe(colors.primary);
+  });
+
+  it('keeps the failure scroll inset-adjusting and its retry full width', async () => {
+    mockSearchParams = { questionId: QUESTION.id };
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<HelpScreen />);
+    await screen.findByRole('header', { name: t('help.loadFailedTitle') });
+    const scroll = scrollView();
+    expect(scroll.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(StyleSheet.flatten(scroll.props.style)).toEqual({ flex: 1 });
+    expect(buttonProps(t('common.tryAgain')).fullWidth).toBe(true);
+  });
+
+  it('pins the content scroll, its refresh control, and the updating notice', async () => {
+    await renderLoadedHelp();
+    const scroll = scrollView();
+    expect(scroll.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    // The control element itself must exist before its props are read, so a
+    // removed refreshControl wiring dies on this matcher, never a deref.
+    expect(scroll.props.refreshControl).toBeDefined();
+    expect(scroll.props.refreshControl.props.tintColor).toBe(colors.primary);
+
+    const pending = deferred<unknown>();
+    mockApiFetch.mockReturnValue(pending.promise);
+    await act(async () => {
+      refreshHandler()();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(scrollView().props.refreshControl).toBeDefined();
+    expect(scrollView().props.refreshControl.props.refreshing).toBe(true);
+    expect(screen.getByText(t('refresh.updating'))).toBeTruthy();
+    await act(async () => {
+      pending.resolve(HELP_CONTENT);
+      await pending.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+  });
+
+  it('sets the second and third help sections from the shared tokens', async () => {
+    await renderLoadedHelp();
+    expect(flattenedStyle(parentOf(screen.getByText(HELP_CONTENT.questionText)))).toEqual(SECTION);
+    expect(flattenedStyle(screen.getByText(t('label.question')))).toEqual(SECTION_LABEL);
+    expect(flattenedStyle(screen.getByText(HELP_CONTENT.questionTextNative))).toEqual(NATIVE_TEXT);
+    const firstExample = screen.getByText(t('help.exampleNumber', { number: 1 }));
+    expect(flattenedStyle(parentOf(parentOf(firstExample)))).toEqual(SECTION);
+    expect(flattenedStyle(screen.getByText(t('help.examplesLabel')))).toEqual(SECTION_LABEL);
+    expect(flattenedStyle(screen.getByText('She showed courage at work.'))).toEqual(ENGLISH_TEXT);
+    expect(flattenedStyle(screen.getByText(HELP_CONTENT.examples[0]!.native))).toEqual(NATIVE_TEXT);
+  });
+});
+
+describe('practice home wiring sentinels', () => {
+  async function renderLoadedHome(payload: PracticeQuestionPayload = PRACTICE_QUESTION) {
+    mockApiFetch.mockResolvedValue(payload);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(payload.question.questionText);
+  }
+
+  it('keeps the practice scroll inset-adjusting and keeps taps handled', async () => {
+    await renderLoadedHome();
+    expect(scrollView().props.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(scrollView().props.keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('mirrors the loading card as a skeleton of badge, hero, and line blocks', async () => {
+    mockApiFetch.mockReturnValue(new Promise(() => undefined));
+    await renderScreen(<PracticeScreen />);
+    const hidden = { includeHiddenElements: true } as const;
+    const skeleton = screen.getByTestId('practice-question-skeleton', hidden);
+    expect(flattenedStyle(skeleton)).toEqual({
+      alignSelf: 'stretch',
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      borderWidth: 1,
+      borderColor: colors.border,
+      padding: spacing.lg,
+      gap: spacing.md,
+    });
+    expect(flattenedStyle(screen.getByText(t('practice.loadingQuestion'), hidden))).toEqual({
+      height: 0,
+      opacity: 0,
+    });
+    const children = skeleton.children;
+    const badgeRow = children[1] as TestInstance;
+    expect(flattenedStyle(badgeRow)).toEqual({ flexDirection: 'row', gap: spacing.sm });
+    const [badgeA, badgeB, badgeC] = badgeRow.children as TestInstance[];
+    expect(flattenedStyle(badgeA!)).toMatchObject({ width: 44, height: 22, borderRadius: 8 });
+    expect(flattenedStyle(badgeB!)).toMatchObject({ width: 72, height: 22, borderRadius: 8 });
+    expect(flattenedStyle(badgeC!)).toMatchObject({ width: 64, height: 22, borderRadius: 8 });
+    expect(flattenedStyle(screen.getByTestId('practice-skeleton-word', hidden))).toMatchObject({
+      width: '55%',
+      height: 40,
+      borderRadius: 10,
+    });
+    expect(flattenedStyle(children[3] as TestInstance)).toMatchObject({ height: 18 });
+    expect(flattenedStyle(children[4] as TestInstance)).toMatchObject({ height: 18, width: '82%' });
+    expect(flattenedStyle(children[5] as TestInstance)).toMatchObject({ height: 18, width: '70%' });
+  });
+
+  it('keeps the load-failure retry action full width', async () => {
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderScreen(<PracticeScreen />);
+    await screen.findByRole('header', { name: t('practice.loadFailedTitle') });
+    expect(buttonProps(t('common.tryAgain')).fullWidth).toBe(true);
+  });
+
+  it('centres the intro wait on a large primary spinner and a muted line', async () => {
+    const introRead = deferred<boolean>();
+    mockPracticeIntro.hasSeenPracticeIntro.mockReturnValue(introRead.promise);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+
+    // The skeleton's own hidden wait line disappears once the question data
+    // lands; only the intro wait's line remains while the read is pending.
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId('practice-question-skeleton', { includeHiddenElements: true }),
+      ).toBeNull(),
+    );
+    const waitLine = screen.getByText(t('practice.loadingQuestion'));
+    expect(waitLine.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(parentOf(waitLine))).toEqual({
+      flex: 1,
+      minHeight: 320,
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+    expect(flattenedStyle(waitLine)).toEqual({
+      marginTop: spacing.md,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+    const spinners = activityIndicators();
+    expect(spinners).toHaveLength(1);
+    expect(spinners[0]!.props.size).toBe('large');
+    expect(spinners[0]!.props.color).toBe(colors.primary);
+
+    await act(async () => {
+      introRead.resolve(true);
+      await introRead.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText(QUESTION.questionText)).toBeTruthy();
+  });
+
+  it('sets the explainer lines on the shared intro text style', async () => {
+    mockPracticeIntro.hasSeenPracticeIntro.mockResolvedValue(false);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(t('practiceIntro.title'));
+    const introLine = {
+      marginTop: spacing.sm,
+      fontSize: 15,
+      lineHeight: 21,
+      color: colors.text,
+    };
+    expect(
+      flattenedStyle(screen.getByText(t('practiceIntro.master', { score: PRACTICE_MASTER_SCORE }))),
+    ).toEqual(introLine);
+    expect(
+      flattenedStyle(screen.getByText(t('practiceIntro.tries', { count: PRACTICE_MAX_ATTEMPTS }))),
+    ).toEqual(introLine);
+    expect(flattenedStyle(screen.getByText(t('practiceIntro.native')))).toEqual(introLine);
+  });
+
+  it('pins the help affordance icon and its control wiring', async () => {
+    await renderLoadedHome();
+    const help = screen.getByLabelText(t('practice.helpLabel'));
+    expect(pressableProps(help).disabled).toBe(false);
+    expect(pressableProps(help).hitSlop).toBe(4);
+    const iconView = help.children[0] as TestInstance;
+    const [svg] = childElements(iconView);
+    expect(svg).toBeDefined();
+    // The help glyph: outlined question circle, question hook, inked dot.
+    expect(svg.props.width).toBe(22);
+    expect(svg.props.height).toBe(22);
+    const [outline, questionMark, dot] = svgPrimitives(svg);
+    expect(outline).toBeDefined();
+    expect(questionMark).toBeDefined();
+    expect(dot).toBeDefined();
+    // Outlined question circle in the on-primary ink at the authored weight.
+    expect(outline!.props.r).toBe(9);
+    expect(outline!.props.stroke).toBe(colors.onPrimary);
+    expect(outline!.props.strokeWidth).toBe(2.2);
+    expect(questionMark!.props.d).toBe('M9.2 9.2a2.9 2.9 0 1 1 4.3 2.6c-.9.6-1.5 1.1-1.5 2.2');
+    expect(questionMark!.props.stroke).toBe(colors.onPrimary);
+    expect(dot!.props.r).toBe(0.9);
+    expect(dot!.props.fill).toBe(colors.onPrimary);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(pressableProps(screen.getByLabelText(t('practice.helpLabel'))).disabled).toBe(true);
+  });
+
+  it('pins the native-mode switch and skip control wiring', async () => {
+    await renderLoadedHome();
+    const toggle = screen.getByRole('switch', { name: t('practice.answerInMyLanguage') });
+    expect(pressableProps(toggle).disabled).toBe(false);
+    const skip = screen.getByRole('button', { name: t('practice.skipWord') });
+    expect(pressableProps(skip).disabled).toBe(false);
+    expect(pressableProps(skip).hitSlop).toBe(4);
+    await act(async () => recorderProps().onInteractionLockChange?.(true));
+    expect(
+      pressableProps(screen.getByRole('switch', { name: t('practice.answerInMyLanguage') }))
+        .disabled,
+    ).toBe(true);
+    expect(
+      pressableProps(screen.getByRole('button', { name: t('practice.skipWord') })).disabled,
+    ).toBe(true);
+  });
+
+  it('passes the durable cycle id to the recorder', async () => {
+    await renderLoadedHome();
+    expect(recorderProps().cycleId).toBe(CYCLE_ID);
+  });
+
+  it('pins the skip busy row, its spinner, and label while parking a word', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockResolvedValueOnce(NEXT_PRACTICE_QUESTION);
+    let settleSkip: (() => void) | undefined;
+    mockSkipWord.mockReturnValue(
+      new Promise<void>((resolve) => {
+        settleSkip = () => resolve();
+      }),
+    );
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    const hidden = { includeHiddenElements: true } as const;
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
+    });
+    const busyLabel = screen.getByText(t('practice.skipBusy'));
+    expect(flattenedStyle(parentOf(busyLabel))).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.xs,
+    });
+    expect(flattenedStyle(busyLabel)).toEqual({
+      fontSize: 14,
+      color: colors.muted,
+      textDecorationLine: 'underline',
+    });
+    const spinner = screen.getByTestId('practice-skip-busy-indicator', hidden)
+      .children[0] as TestInstance;
+    expect(spinner.props.size).toBe('small');
+    expect(spinner.props.color).toBe(colors.primary);
+
+    await act(async () => {
+      settleSkip?.();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText(NEXT_QUESTION.questionText)).toBeTruthy();
+  });
+});
+
+describe('practice home state wiring sentinels', () => {
+  const WAIT_MESSAGE = `${t('error.dailyLimit')} ${t('wait.hours', { count: 7 })}`;
+
+  async function renderLoadedHome() {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+  }
+
+  function practiceStateValues(anchor?: TestInstance): unknown[] {
+    // While the intro read is pending the recorder is not mounted yet, so the
+    // wait line stands in as the fiber anchor inside the Practice screen.
+    return screenStateValues(anchor ?? screen.getByTestId('recorder'), 'PracticeScreen');
+  }
+
+  it('starts both recorder lock mirrors unlocked and unowned', async () => {
+    await renderLoadedHome();
+    const locks = lockShapedStates(practiceStateValues());
+    expect(locks).toHaveLength(2);
+    for (const state of locks) {
+      expect(state).toEqual({ owner: null, locked: false });
+    }
+  });
+
+  it('starts the rate-limit notice empty and records the intro read', async () => {
+    // While the SecureStore intro read is still pending, BOTH idle sentinels
+    // are null: the empty wait line and the not-yet-read explainer state.
+    const introRead = deferred<boolean>();
+    mockPracticeIntro.hasSeenPracticeIntro.mockReturnValue(introRead.promise);
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId('practice-question-skeleton', { includeHiddenElements: true }),
+      ).toBeNull(),
+    );
+    expect(
+      practiceStateValues(screen.getByText(t('practice.loadingQuestion'))).filter(
+        (value) => value === null,
+      ),
+    ).toHaveLength(2);
+
+    await act(async () => {
+      introRead.resolve(true);
+      await introRead.promise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText(QUESTION.questionText)).toBeTruthy();
+
+    const values = practiceStateValues();
+    // The read replaced the intro sentinel, leaving only the wait line null.
+    expect(values.filter((value) => value === null)).toHaveLength(1);
+    const intro = values.find(
+      (value) =>
+        typeof value === 'object' && value !== null && 'userId' in value && 'seen' in value,
+    ) as { userId: string; seen: boolean } | undefined;
+    expect(intro).toBeDefined();
+    expect(intro).toEqual({ userId: USER.id, seen: true });
+  });
+
+  it('advances the focus epoch when the route gains focus', async () => {
+    await renderLoadedHome();
+    const epochs = practiceStateValues().filter((value) => typeof value === 'number');
+    expect(epochs).toHaveLength(1);
+    expect(epochs[0]).toBe(1);
+  });
+
+  it('re-announces a replaced question once the route regains focus', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibilityWithOptions')
+      .mockImplementation(() => undefined);
+    const scrollToTopSpy = jest
+      .spyOn(ScrollView.prototype, 'scrollTo')
+      .mockImplementation(() => undefined);
+    const queryClient = makeQueryClient();
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />, queryClient);
+    await screen.findByText(QUESTION.questionText);
+    expect(announceSpy).toHaveBeenCalledWith(`${QUESTION.promptWord}. ${QUESTION.questionText}`, {
+      queue: true,
+    });
+    announceSpy.mockClear();
+    scrollToTopSpy.mockClear();
+
+    await blurScreen();
+    await act(async () => {
+      queryClient.setQueryData(
+        ['practice-question', USER.id, USER.cefrLevel],
+        NEXT_PRACTICE_QUESTION,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByText(NEXT_QUESTION.questionText)).toBeTruthy();
+    expect(announceSpy).not.toHaveBeenCalled();
+
+    await focusScreen();
+    expect(announceSpy).toHaveBeenCalledWith(
+      `${NEXT_QUESTION.promptWord}. ${NEXT_QUESTION.questionText}`,
+      { queue: true },
+    );
+    expect(scrollToTopSpy).toHaveBeenCalledWith({ y: 0, animated: false });
+    announceSpy.mockRestore();
+    scrollToTopSpy.mockRestore();
+  });
+
+  it('mirrors the recorder exit lock into render state', async () => {
+    await renderLoadedHome();
+    await act(async () => recorderProps().onExitLockChange?.(true));
+    const locks = lockShapedStates(practiceStateValues());
+    expect(locks).toHaveLength(2);
+    expect(locks[0]).toEqual({ owner: null, locked: false });
+    expect(locks[1]).toEqual({ owner: expect.any(String), locked: true });
+    expect(String(locks[1]!.owner)).toContain(QUESTION.id);
+  });
+
+  it('clears the inline wait line when a graded result takes over the surface', async () => {
+    mockApiFetch.mockResolvedValue(PRACTICE_QUESTION);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
+    expect(screen.getByText(WAIT_MESSAGE)).toBeTruthy();
+
+    await act(async () => {
+      recorderProps().onResult(PASSED_RESULT);
+    });
+    expect(mockPracticeFlow.showFeedback).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(WAIT_MESSAGE)).toBeNull();
+  });
+
+  it('clears the inline wait line after a successful skip', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockResolvedValueOnce(NEXT_PRACTICE_QUESTION);
+    mockSkipWord.mockResolvedValue(undefined);
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText(NEXT_QUESTION.questionText)).toBeTruthy();
+    expect(screen.queryByText(WAIT_MESSAGE)).toBeNull();
+  });
+
+  it('clears the inline wait line after a closed-cycle skip conflict', async () => {
+    mockApiFetch
+      .mockResolvedValueOnce(PRACTICE_QUESTION)
+      .mockResolvedValueOnce(NEXT_PRACTICE_QUESTION);
+    mockSkipWord.mockRejectedValue(
+      new ApiError(409, 'stale serving cycle', undefined, {
+        code: 'PRACTICE_CYCLE_CLOSED',
+      }),
+    );
+    await renderScreen(<PracticeScreen />);
+    await screen.findByText(QUESTION.questionText);
+    await act(async () => recorderProps().onRateLimited?.(WAIT_MESSAGE));
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
+      confirmSkipAlert();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(await screen.findByText(NEXT_QUESTION.questionText)).toBeTruthy();
+    expect(screen.queryByText(WAIT_MESSAGE)).toBeNull();
   });
 });

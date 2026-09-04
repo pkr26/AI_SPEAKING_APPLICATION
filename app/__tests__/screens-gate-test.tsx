@@ -34,7 +34,8 @@ import Gate from '../src/app/index';
 import { ApiError, apiFetch } from '../src/lib/api';
 import type { SessionLease, useAuth } from '../src/lib/auth';
 import { refreshDailyReminderLanguage } from '../src/lib/daily-reminder';
-import { setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
+import { dictionaries, setActiveLanguage, translateFor, type MessageKey } from '../src/lib/i18n';
+import { UI_LANGUAGE_LOCALES } from '../src/lib/language-options';
 import { resetNetworkStatusModuleForTests } from '../src/lib/network-status';
 import { colors, darkColors, layout, radii, spacing } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -727,6 +728,19 @@ describe('root layout route guards', () => {
     }
   });
 
+  it('stretches the localized root behind the signed-in navigators', async () => {
+    await render(<RootLayout />);
+
+    // The signed-in Hindi user marks the localized root: it carries the
+    // rendered locale for assistive tech and fills the window so every
+    // localized screen lays out in a full-height container.
+    const localizedRoot = screen.container.queryAll(
+      (node) => node.props.accessibilityLanguage === UI_LANGUAGE_LOCALES.hi,
+    );
+    expect(localizedRoot).toHaveLength(1);
+    expect(flattenedStyle(localizedRoot[0])).toEqual({ flex: 1 });
+  });
+
   it('tracks native foreground state and removes the focus bridge on unmount', async () => {
     const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
     Object.defineProperty(AppState, 'currentState', {
@@ -846,6 +860,8 @@ describe('root fallback screens', () => {
         minHeight: layout.minimumTarget,
         // The call-site override that separates the CTA from the body copy.
         marginTop: spacing.xl,
+        // The recovery CTA stretches across the card, not just its label.
+        alignSelf: 'stretch',
       },
       { backgroundColor: colors.primaryDark },
     );
@@ -1198,6 +1214,10 @@ describe('index gate', () => {
     expect(screen.getByLabelText(t('gate.restoring')).props.accessibilityLabel).toBe(
       t('gate.restoring'),
     );
+    // The restoring spinner is the large platform indicator in brand ink.
+    const spinner = hostNode('ActivityIndicator');
+    expect(spinner.props.size).toBe('large');
+    expect(spinner.props.color).toBe(colors.primary);
     expect(screen.queryByTestId('redirect')).toBeNull();
     expect(mockApiFetch).not.toHaveBeenCalled();
   });
@@ -1291,6 +1311,13 @@ describe('index gate', () => {
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('gate.resetSession') })),
     ).toMatchObject({ marginTop: spacing.ml });
+    // Both session-recovery CTAs stretch across the card.
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })).alignSelf,
+    ).toBe('stretch');
+    expect(
+      flattenedStyle(screen.getByRole('button', { name: t('gate.resetSession') })).alignSelf,
+    ).toBe('stretch');
   });
 
   it('centers the loading state in the same safe scroll container', async () => {
@@ -1369,6 +1396,30 @@ describe('index gate', () => {
       expect.objectContaining({ signal: expect.anything() }),
     );
     expect(queryClient.getQueryCache().find({ queryKey: ['me', 1], exact: true })).toBeDefined();
+  });
+
+  it('titles the offline gate from the gate copy rather than the generic network default', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    onlineManager.setOnline(false);
+    // The gate and network banner copies happen to share a title string in
+    // every locale today. Diverge the generic default in one locale so the
+    // assertion pins the gate's own wiring, not today's duplicated data.
+    const savedNetworkTitle = dictionaries.te['network.offlineTitle'];
+    const divergedNetworkTitle = 'సాధారణ నెట్‌వర్క్ శీర్షిక';
+    dictionaries.te['network.offlineTitle'] = divergedNetworkTitle;
+    setActiveLanguage('te');
+    try {
+      await renderGate();
+
+      expect(
+        screen.getByRole('header', { name: translateFor('te', 'gate.offlineTitle') }),
+      ).toBeTruthy();
+      expect(screen.getByRole('header')).not.toHaveTextContent(divergedNetworkTitle);
+    } finally {
+      dictionaries.te['network.offlineTitle'] = savedNetworkTitle;
+      setActiveLanguage('en');
+      onlineManager.setOnline(true);
+    }
   });
 
   it('keeps the restored token and waits for an automatic reconnect when profile loading is paused', async () => {
@@ -1530,6 +1581,31 @@ describe('index gate', () => {
 
     expect(await screen.findByText(t('gate.serverErrorTitle'))).toBeTruthy();
     expect(screen.queryByText(t('gate.signingOut'))).toBeNull();
+  });
+
+  it('lays the server-error copy and its retry CTA on the shared tokens', async () => {
+    mockAuthValue = makeAuth({ user: null });
+    mockApiFetch.mockRejectedValue(new ApiError(500, 'boom'));
+    await renderGate();
+
+    const title = await screen.findByRole('header', { name: t('gate.serverErrorTitle') });
+    expect(flattenedStyle(title)).toEqual({
+      fontSize: 20,
+      fontWeight: '700',
+      color: colors.text,
+      marginBottom: spacing.sm,
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual({
+      marginTop: spacing.md,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+    const retry = screen.getByRole('button', { name: t('common.tryAgain') });
+    expect(flattenedStyle(retry)).toMatchObject({ marginTop: spacing.xl });
+    // The retry CTA stretches across the card.
+    expect(flattenedStyle(retry).alignSelf).toBe('stretch');
   });
 
   it('shows a retryable error when the profile fetch fails', async () => {

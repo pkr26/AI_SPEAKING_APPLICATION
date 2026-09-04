@@ -6,7 +6,7 @@ import {
 } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { BackHandler, StyleSheet } from 'react-native';
+import { Animated, BackHandler, StyleSheet } from 'react-native';
 import type { TestInstance } from 'test-renderer';
 
 import HomeScreen from '../src/app/(tabs)/home';
@@ -214,6 +214,38 @@ function parentOf(node: TestInstance): TestInstance {
   const parent = node.parent;
   if (!parent) throw new Error('Element is not laid out inside a parent view');
   return parent;
+}
+
+/** The nth child of a host view, asserted so a dropped layout piece dies as a kill. */
+function childViewAt(node: TestInstance, index: number): TestInstance {
+  const child = node.children[index];
+  // Assert, never dereference: a wiring mutant that removes the layout this
+  // pin walks into must fail on the matcher, not on a raw TypeError.
+  expect(child && typeof child).toBe('object');
+  return child as TestInstance;
+}
+
+type SvgGlyphElement = React.ReactElement<{ width?: number; height?: number; children?: unknown }>;
+
+/** The Svg element an Icon host view renders — the authored glyph wiring surface. */
+function svgOf(host: TestInstance): SvgGlyphElement {
+  const svg: unknown = host.props.children;
+  expect(React.isValidElement(svg)).toBe(true);
+  return svg as SvgGlyphElement;
+}
+
+/** Authored SVG primitives of a glyph (fragment unwrapped), as in icon-test. */
+function svgPrimitives(svg: SvgGlyphElement): React.ReactElement<{ [prop: string]: unknown }>[] {
+  const rendered: unknown = svg.props.children;
+  if (rendered === undefined || rendered === null) return [];
+  const children =
+    React.isValidElement(rendered) && rendered.type === React.Fragment
+      ? (rendered.props as { children?: unknown }).children
+      : rendered;
+  if (children === undefined || children === null) return [];
+  return (Array.isArray(children) ? children : [children]) as React.ReactElement<{
+    [prop: string]: unknown;
+  }>[];
 }
 
 function committedPressHandler(node: TestInstance): () => unknown {
@@ -501,6 +533,51 @@ describe('home screen', () => {
     expect(mockGetStats).toHaveBeenCalledTimes(2);
   });
 
+  it('pins the dashboard scroll container and idle refresh control wiring', async () => {
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+
+    const [scroll] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
+    expect(scroll?.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    // The mounted pull-to-refresh control carries the brand tint and sits idle
+    // (refreshing false) while nothing is in flight.
+    const control = scroll?.props.refreshControl as
+      { props?: { refreshing?: unknown; tintColor?: unknown } } | undefined;
+    expect(control?.props?.refreshing).toBe(false);
+    expect(control?.props?.tintColor).toBe(colors.primary);
+  });
+
+  it('marks the refresh control and freshness notice while a background refresh is in flight', async () => {
+    const client = makeQueryClient();
+    client.setQueryData(['practice-stats', USER.id], STATS);
+    mockGetStats.mockReturnValue(new Promise(() => undefined));
+    await renderHome(client);
+
+    expect(screen.getByText('B1')).toBeTruthy();
+    const [scroll] = screen.container.queryAll((candidate) => candidate.type === 'RCTScrollView');
+    expect(scroll?.props.refreshControl?.props?.refreshing).toBe(true);
+    // The nonblocking notice announces the update without replacing the data.
+    expect(screen.getByText(t('refresh.updating'))).toBeTruthy();
+  });
+
+  it('drives the mastery bar fill from the mastered share of the level total', async () => {
+    // The RN jest preset resolves the Reduce Motion probe to false, so the bar
+    // takes its animated path deterministically.
+    const timingSpy = jest.spyOn(Animated, 'timing');
+    mockGetStats.mockResolvedValue(STATS);
+    await renderHome();
+    await screen.findByText('B1');
+
+    // 3 of 10 words mastered: the bar animates to the 0.3 fraction. A dropped
+    // progress prop collapses the bar to 0 instead.
+    expect(timingSpy).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ toValue: 0.3, useNativeDriver: false }),
+    );
+    timingSpy.mockRestore();
+  });
+
   it('renders level, mastery progress, streak, due chip, and today line from stats', async () => {
     mockGetStats.mockResolvedValue(STATS);
     await renderHome();
@@ -623,6 +700,37 @@ describe('home screen', () => {
     expect(client.getQueryData(['unrelated-sentinel'])).toEqual({ keep: true });
   });
 
+  it('pins the placement-reset wait surface wiring', async () => {
+    mockGetStats.mockResolvedValue({
+      level: null,
+      progress: { masteredCount: 0, learningCount: 0, totalAtLevel: 0, dueCount: 0 },
+      streakDays: 0,
+      practicedToday: 0,
+      totalAttempts: 0,
+      lastPracticedAt: null,
+    });
+    await renderHome();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // The wait surface scrolls with automatic content insets, centres a large
+    // brand spinner, and captions it with the shared muted body style.
+    const [gateScroll] = screen.container.queryAll(
+      (candidate) => candidate.type === 'RCTScrollView',
+    );
+    expect(gateScroll?.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    const spinner = screen.getByLabelText(t('gate.loadingProfile'));
+    expect(spinner.props.size).toBe('large');
+    expect(spinner.props.color).toBe(colors.primary);
+    expect(flattenedStyle(screen.getByText(t('gate.loadingProfile')))).toEqual({
+      marginTop: spacing.md,
+      fontSize: 15,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+  });
+
   it('does not adopt a cross-device placement reset after its auth lease goes stale', async () => {
     let leaseCurrent = true;
     mockAuthValue = makeAuth({ isSessionLeaseCurrent: jest.fn(() => leaseCurrent) });
@@ -708,6 +816,12 @@ describe('home screen', () => {
     expect(await screen.findByText(t('home.streakNone'))).toBeTruthy();
     expect(screen.getByText(t('home.practicedNoneToday'))).toBeTruthy();
     expect(screen.getByText(t('home.dueNone'))).toBeTruthy();
+    // The all-caught-up line shares the muted today-line style.
+    expect(flattenedStyle(screen.getByText(t('home.dueNone')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 14,
+      color: colors.muted,
+    });
     expect(screen.queryByText(t('home.dueChip', { count: 0 }))).toBeNull();
   });
 
@@ -906,6 +1020,13 @@ describe('home screen presentation', () => {
     textAlign: 'center',
   };
 
+  const SUMMARY_LINE = {
+    marginTop: spacing.sm,
+    fontSize: 15,
+    lineHeight: 21,
+    color: colors.text,
+  };
+
   async function renderLoadedHome(stats: PracticeStats = STATS) {
     mockGetStats.mockResolvedValue(stats);
     await renderHome();
@@ -930,10 +1051,11 @@ describe('home screen presentation', () => {
       color: colors.text,
       marginBottom: spacing.md,
     });
-    // The CTA keeps its own gap from the card above it and wears the hero size.
+    // The CTA keeps its own gap from the card above it, wears the hero size,
+    // and stretches across the content column (fullWidth).
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
-    ).toMatchObject({ marginTop: spacing.xl, paddingVertical: spacing.ml });
+    ).toMatchObject({ marginTop: spacing.xl, paddingVertical: spacing.ml, alignSelf: 'stretch' });
     // Peer destinations moved to the bottom tab bar; the surface ends at the CTA.
     for (const label of [t('header.history'), t('header.recordings'), t('header.settings')]) {
       expect(screen.queryByRole('button', { name: label })).toBeNull();
@@ -947,12 +1069,33 @@ describe('home screen presentation', () => {
     const hidden = { includeHiddenElements: true } as const;
     const message = screen.getByText(t('home.loading'), hidden);
     expect(message.props.accessibilityLiveRegion).toBe('polite');
+    // The wait line itself is visually hidden (zero height and opacity) while
+    // staying in the accessibility tree.
+    expect(flattenedStyle(message)).toEqual({ height: 0, opacity: 0 });
+    expect(flattenedStyle(parentOf(message))).toEqual({
+      alignSelf: 'stretch',
+      gap: spacing.md,
+    });
 
     // The skeleton previews the loaded structure: the tile row, then the card.
     expect(screen.getByTestId('home-skeleton-card', hidden)).toBeTruthy();
-    expect(flattenedStyle(parentOf(screen.getByTestId('home-skeleton-tile', hidden)))).toEqual({
+    const tileRow = parentOf(screen.getByTestId('home-skeleton-tile', hidden));
+    expect(flattenedStyle(tileRow)).toEqual({
       flexDirection: 'row',
       gap: spacing.sm,
+    });
+    // Every tile block previews a 96dp stat tile with the card radius; the
+    // trailing block previews the 120dp detail card.
+    const tiles = tileRow.children.filter(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    expect(tiles).toHaveLength(3);
+    for (const tile of tiles) {
+      expect(flattenedStyle(tile)).toMatchObject({ height: 96, borderRadius: 16 });
+    }
+    expect(flattenedStyle(screen.getByTestId('home-skeleton-card', hidden))).toMatchObject({
+      height: 120,
+      borderRadius: 16,
     });
   });
 
@@ -971,9 +1114,10 @@ describe('home screen presentation', () => {
     expect(message.props.accessibilityLiveRegion).toBe('assertive');
     expect(flattenedStyle(message)).toEqual(MUTED_BODY);
     expect(flattenedStyle(parentOf(message))).toEqual(CENTERED_STATE);
+    // The full-width retry action owns the centered error column.
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
-    ).toMatchObject({ marginTop: spacing.xl });
+    ).toMatchObject({ marginTop: spacing.xl, alignSelf: 'stretch' });
   });
 
   it('renders the stat tiles, detail card, and due chip on the shared tokens', async () => {
@@ -1014,6 +1158,80 @@ describe('home screen presentation', () => {
       paddingHorizontal: spacing.md,
       marginTop: spacing.md,
     });
+
+    // The glanceable row lays its three tiles out as a spaced strip.
+    expect(flattenedStyle(parentOf(screen.getByTestId('home-level-tile')))).toEqual({
+      flexDirection: 'row',
+      gap: spacing.sm,
+      marginBottom: spacing.md,
+    });
+
+    // Tile tints: level primary, streak accent, mastery success — each a tinted
+    // fill carrying a transparent hairline.
+    expect(flattenedStyle(screen.getByTestId('home-level-tile'))).toMatchObject({
+      backgroundColor: colors.primaryLight,
+      borderColor: 'transparent',
+    });
+    expect(flattenedStyle(screen.getByTestId('home-streak-tile'))).toMatchObject({
+      backgroundColor: colors.accentLight,
+      borderColor: 'transparent',
+    });
+    expect(flattenedStyle(screen.getByTestId('home-mastery-tile'))).toMatchObject({
+      backgroundColor: colors.successLight,
+      borderColor: 'transparent',
+    });
+
+    // Each tile badge carries its own glyph in its tint ink: target (three
+    // circles), flame (one path), trophy (three paths).
+    const badgeGlyph = (tile: TestInstance) =>
+      svgPrimitives(svgOf(childViewAt(childViewAt(tile, 0), 0)));
+    const levelGlyph = badgeGlyph(screen.getByTestId('home-level-tile'));
+    expect(levelGlyph).toHaveLength(3);
+    // The bullseye's innermost dot is filled, not stroked.
+    for (const primitive of levelGlyph) {
+      if (primitive.props.stroke !== undefined) {
+        expect(primitive.props.stroke).toBe(colors.primary);
+      }
+    }
+    const streakGlyph = badgeGlyph(screen.getByTestId('home-streak-tile'));
+    expect(streakGlyph).toHaveLength(1);
+    expect(streakGlyph[0]?.props.stroke).toBe(colors.accent);
+    const masteryGlyph = badgeGlyph(screen.getByTestId('home-mastery-tile'));
+    expect(masteryGlyph).toHaveLength(3);
+    for (const primitive of masteryGlyph) expect(primitive.props.stroke).toBe(colors.success);
+
+    // The detail card nests the level summary row with the shared card tokens.
+    expect(flattenedStyle(parentOf(explain))).toEqual({
+      flexGrow: 1,
+      flexShrink: 1,
+      minWidth: 160,
+    });
+    expect(flattenedStyle(parentOf(parentOf(explain)))).toEqual({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      justifyContent: 'space-between',
+      alignItems: 'flex-start',
+      gap: spacing.sm,
+    });
+    expect(flattenedStyle(parentOf(parentOf(parentOf(explain))))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: layout.screenPadding,
+      borderWidth: 1,
+      borderColor: colors.border,
+    });
+
+    // The due chip leads with the small refresh glyph in brand ink.
+    const dueChip = parentOf(screen.getByText(t('home.dueChip', { count: 4 })));
+    const refreshSvg = svgOf(childViewAt(dueChip, 0));
+    expect(refreshSvg.props.width).toBe(13);
+    expect(refreshSvg.props.height).toBe(13);
+    const refreshGlyph = svgPrimitives(refreshSvg);
+    expect(refreshGlyph).toHaveLength(4);
+    for (const primitive of refreshGlyph) {
+      expect(primitive.props.stroke).toBe(colors.primary);
+      expect(primitive.props.strokeWidth).toBe(2.4);
+    }
   });
 
   it('renders the mastery bar, streak row, and today line on the shared tokens', async () => {
@@ -1047,6 +1265,15 @@ describe('home screen presentation', () => {
     const flame = screen.getByTestId('home-streak-flame', { includeHiddenElements: true });
     expect(flame.props.accessibilityElementsHidden).toBe(true);
     expect(flame.props.importantForAccessibility).toBe('no-hide-descendants');
+    // Its glyph scales to the authored 22dp square in accent ink at the
+    // authored stroke weight (one path).
+    const flameSvg = svgOf(flame);
+    expect(flameSvg.props.width).toBe(22);
+    expect(flameSvg.props.height).toBe(22);
+    const flameGlyph = svgPrimitives(flameSvg);
+    expect(flameGlyph).toHaveLength(1);
+    expect(flameGlyph[0]?.props.stroke).toBe(colors.accent);
+    expect(flameGlyph[0]?.props.strokeWidth).toBe(2.2);
     expect(flattenedStyle(parentOf(flame))).toEqual({
       marginTop: spacing.lg,
       flexDirection: 'row',
@@ -1083,12 +1310,18 @@ describe('home screen presentation', () => {
       borderWidth: 1,
       borderColor: colors.success,
     });
-    expect(flattenedStyle(screen.getByText(t('summary.attempts', { count: 5 })))).toEqual({
-      marginTop: spacing.sm,
-      fontSize: 15,
-      lineHeight: 21,
-      color: colors.text,
-    });
+    expect(flattenedStyle(screen.getByText(t('summary.attempts', { count: 5 })))).toEqual(
+      SUMMARY_LINE,
+    );
+    expect(flattenedStyle(screen.getByText(t('summary.passed', { count: 3 })))).toEqual(
+      SUMMARY_LINE,
+    );
+    expect(flattenedStyle(screen.getByText(t('summary.mastered', { count: 2 })))).toEqual(
+      SUMMARY_LINE,
+    );
+    expect(flattenedStyle(screen.getByText(t('summary.levelUps', { count: 1 })))).toEqual(
+      SUMMARY_LINE,
+    );
     // The dismiss control is the shared quiet Button: primary text, no fill.
     const dismiss = () => screen.getByRole('button', { name: t('summary.dismiss') });
     expect(flattenedStyle(screen.getByText(t('summary.dismiss')))).toEqual({

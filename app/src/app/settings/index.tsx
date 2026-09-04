@@ -779,8 +779,9 @@ export default function SettingsScreen() {
     recordingsDeleteControllerRef.current = controller;
     publishNavigationLock();
     setRecordingsDeleteBusy(true);
-    setRecordingsDeleteSucceeded(false);
-    setRecordingsDeleteError(null);
+    // The confirmation flow that reaches here already retracted both outcome
+    // notes when the alert opened, and the busy latch blocks every path that
+    // could make either truthy again before the deletion settles.
     void (async () => {
       const operationIsCurrent = () =>
         recordingsDeleteBusyRef.current === operation &&

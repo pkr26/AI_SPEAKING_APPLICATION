@@ -50,6 +50,15 @@ export const expectedTimeoutSites = Object.freeze([
     reason:
       'Disconnecting the operation latch release strands later tests behind never-settling native promises; unwedged runs fail 640 tests with assertion evidence.',
   }),
+  Object.freeze({
+    id: 'sp:state:src/app/diagnostic.tsx:initializer:question:106:4-106:51',
+    expectedStatus: 'Error',
+    file: 'src/app/diagnostic.tsx',
+    kind: 'initializer',
+    siteSourceSha256: 'eeeb428d40d65fb6c4a748b6b562163656ee72df7b05d19361615254750914bf',
+    reason:
+      'Forcing the lazy question seed to undefined makes the first fresh render dereference currentQuestion.id while !== null treats it as present; the two offline/intro render crashes precede any assertion, while 130+ sibling tests detect the mutant with matcher evidence.',
+  }),
   // Required-prop removals: each one crashes the component's render before
   // any assertion can run, so the strict classifier reports an infrastructure
   // Error even though the owning test detects the removal. Every entry still
@@ -91,7 +100,7 @@ export const expectedTimeoutSites = Object.freeze([
       'The field component dereferences the required value (password.length); removal crashes render before any assertion can run.',
   }),
   Object.freeze({
-    id: 'sp:prop:src/app/settings/index.tsx:expression:options:1218:10-1218:39',
+    id: 'sp:prop:src/app/settings/index.tsx:expression:options:1219:10-1219:39',
     expectedStatus: 'Error',
     file: 'src/app/settings/index.tsx',
     kind: 'expression',
@@ -100,7 +109,7 @@ export const expectedTimeoutSites = Object.freeze([
       'The picker component iterates the required options array (options.map); removal crashes render before any assertion can run.',
   }),
   Object.freeze({
-    id: 'sp:prop:src/app/settings/index.tsx:expression:options:1252:10-1252:43',
+    id: 'sp:prop:src/app/settings/index.tsx:expression:options:1253:10-1253:43',
     expectedStatus: 'Error',
     file: 'src/app/settings/index.tsx',
     kind: 'expression',
@@ -145,6 +154,24 @@ export const expectedTimeoutSites = Object.freeze([
       'The list implementation calls props.renderItem; removal throws before any assertion can run.',
   }),
   Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/history.tsx:expression:item:455:22-455:33',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/history.tsx',
+    kind: 'expression',
+    siteSourceSha256: '22b4baf880e79923d2f8f330e20c30edc7edd1679ee8f734ce658928f7ef00cb',
+    reason:
+      'HistoryRow dereferences the required item (item.context) inside renderItem; removal crashes render before any assertion can run.',
+  }),
+  Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/history.tsx:expression:t:455:52-455:57',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/history.tsx',
+    kind: 'expression',
+    siteSourceSha256: 'c55c2211c889f3e66ecbb3896bb64f07b9c96cd16d5fa8fc34be87ea30a6e9a9',
+    reason:
+      'HistoryRow calls the required t translator inside renderItem; removal crashes render before any assertion can run.',
+  }),
+  Object.freeze({
     id: 'sp:prop:src/app/(tabs)/recordings.tsx:expression:data:291:6-291:18',
     expectedStatus: 'Error',
     file: 'src/app/(tabs)/recordings.tsx',
@@ -172,6 +199,15 @@ export const expectedTimeoutSites = Object.freeze([
       'The list implementation calls props.renderItem; removal throws before any assertion can run.',
   }),
   Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/recordings.tsx:expression:item:294:23-294:34',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/recordings.tsx',
+    kind: 'expression',
+    siteSourceSha256: '22b4baf880e79923d2f8f330e20c30edc7edd1679ee8f734ce658928f7ef00cb',
+    reason:
+      'RecordingCard dereferences the required item (item.context) inside renderItem; removal crashes render before any assertion can run.',
+  }),
+  Object.freeze({
     id: 'sp:prop:src/app/_layout.tsx:expression:client:309:31-309:51',
     expectedStatus: 'Error',
     file: 'src/app/_layout.tsx',
@@ -190,6 +226,33 @@ export const expectedTimeoutSites = Object.freeze([
       'Context consumers dereference the required provider value; removal crashes render before any assertion can run.',
   }),
   Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/_layout.tsx:string:name:135:10-135:21',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/_layout.tsx',
+    kind: 'string',
+    siteSourceSha256: '3c6a9f0135e96ab2a8519319b7050b65116e4bfddf871a0cb1c5d579ab2bf590',
+    reason:
+      'The empty route name makes the tab entry unrenderable (invalid element type) before its owning assertions can run; six sibling tests still detect the removal through matchers.',
+  }),
+  Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/_layout.tsx:expression:options:136:10-139:12',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/_layout.tsx',
+    kind: 'expression',
+    siteSourceSha256: 'b0c018c814c5f31ed87f997b2060dc5fa290eb7f55012fb5b0f0defd5e18e609',
+    reason:
+      'Removing the home tab options object leaves headerRight undefined where the navigator renders it (invalid element type); the crash precedes any assertion, while sibling tests detect the removal through matchers.',
+  }),
+  Object.freeze({
+    id: 'sp:prop:src/app/(tabs)/practice/feedback.tsx:expression:art:430:36-430:62',
+    expectedStatus: 'Error',
+    file: 'src/app/(tabs)/practice/feedback.tsx',
+    kind: 'expression',
+    siteSourceSha256: 'e182d2ec43dd71c9d76ba53b8902d814241ab8460b9112f4de960b53a42b9d18',
+    reason:
+      'The vector-art consumer dereferences art.ink; removal crashes render before any assertion can run.',
+  }),
+  Object.freeze({
     id: 'sp:prop:src/lib/practice-flow.tsx:expression:value:200:39-200:52',
     expectedStatus: 'Error',
     file: 'src/lib/practice-flow.tsx',
@@ -197,15 +260,6 @@ export const expectedTimeoutSites = Object.freeze([
     siteSourceSha256: 'f97ea738823c2657ed74f57d1411dec4c07ff30360b3b8a9250a2980744b1666',
     reason:
       'Context consumers dereference the required provider value; removal crashes render before any assertion can run.',
-  }),
-  Object.freeze({
-    id: 'sp:prop:src/app/(tabs)/practice/feedback.tsx:expression:art:421:36-421:62',
-    expectedStatus: 'Error',
-    file: 'src/app/(tabs)/practice/feedback.tsx',
-    kind: 'expression',
-    siteSourceSha256: 'e182d2ec43dd71c9d76ba53b8902d814241ab8460b9112f4de960b53a42b9d18',
-    reason:
-      'The vector-art consumer dereferences art.ink; removal crashes render before any assertion can run.',
   }),
   Object.freeze({
     id: 'sp:prop:src/app/(tabs)/practice/index.tsx:expression:parseResult:835:16-839:17',
@@ -231,24 +285,6 @@ export const expectedTimeoutSites = Object.freeze([
     file: 'src/components/StatTile.tsx',
     kind: 'expression',
     siteSourceSha256: '1f21edb7366623aef5e9b5db4a806a43847a39189bad5d308894f90cffbb0b85',
-    reason:
-      'The owning assertion chain dereferences the removed style before a matcher can run; the crash is the detected behavior.',
-  }),
-  Object.freeze({
-    id: 'sp:prop:src/components/NetworkStatusBanner.tsx:expression:style:46:14-46:82',
-    expectedStatus: 'Error',
-    file: 'src/components/NetworkStatusBanner.tsx',
-    kind: 'expression',
-    siteSourceSha256: 'd8d189eae65c0fd52756a8aa4e571e8764c76eb8a0023f8a528f83dfbd14887f',
-    reason:
-      'The owning assertion chain dereferences the removed style before a matcher can run; the crash is the detected behavior.',
-  }),
-  Object.freeze({
-    id: 'sp:prop:src/app/(tabs)/practice/feedback.tsx:expression:style:650:12-650:86',
-    expectedStatus: 'Error',
-    file: 'src/app/(tabs)/practice/feedback.tsx',
-    kind: 'expression',
-    siteSourceSha256: '4c6f04e041afe8b7f78b7b9189c081c391949289e8484de3027f22a65d0733e2',
     reason:
       'The owning assertion chain dereferences the removed style before a matcher can run; the crash is the detected behavior.',
   }),
@@ -284,78 +320,7 @@ export const expectedTimeoutSites = Object.freeze([
   // re-writes the state in the same first commit), with the reason pinned in
   // scripts/mutation-equivalents.mjs. Each entry cites that review; source
   // drift fails closed exactly like every other pin.
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:resultRequestId:108:4-108:52',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '52b2a39cb52bdc02a24f82d9cdbc4d58abcbdfe16ca9e7a123e894b12cd7adbd',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (ArrowFunction on diagnostic.tsx:108): The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:level:110:55-110:59',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (ArrowFunction on diagnostic.tsx:110): The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:introStarted:113:51-113:89',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '1319c80753c8bf74045928e12894a10d960f1b696a3c259083f6569ce813bcf5',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:113): The identity-reset layout effect re-falses the exit-lock state in the same first commit, so the useState initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:answers:114:68-114:70',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:114): The identity-reset layout effect re-falses the exit-lock state in the same first commit, so the useState initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:stateIdentity:115:53-115:64',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: 'c8438d5257c0983d6cee904f6e4f7b8b43141492f7171d17e98c169ebe8f4da5',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:115): The identity-reset layout effect re-falses the exit-lock state in the same first commit, so the useState initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:recorderExitLocked:117:63-117:68',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: 'fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:117): The identity-reset layout effect re-falses the logout busy state in the same first commit, so the useState initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:logoutBusy:120:47-120:52',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: 'fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:120): The identity-reset layout effect re-falses the practice-start busy state in the same first commit, so the useState initializer never reaches an observable render.",
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:practiceStartBusy:122:61-122:66',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: 'fcbcf165908dd18a9e49f7ff27810176db8e9f63b4352213741664245224f8aa',
-    reason:
-      "Ported from the general campaign's reviewed equivalence for the same file/line (BooleanLiteral on diagnostic.tsx:122): Focus plus identity/Recorder layout effects reset the Recorder locks, exit lock, logout latch, practice-start latch, and focus seed before asynchronous diagnostic state can expose any actionable view.",
-  }),
+
   Object.freeze({
     id: 'sp:state:src/app/settings/change-password.tsx:initializer:currentPassword:38:57-38:59',
     expectedStatus: 'Survived',
@@ -631,42 +596,7 @@ export const expectedTimeoutSites = Object.freeze([
     reason:
       'No scalar hostile for a null initializer is both observable and safe: falsy hostiles are unobservable through falsy-gated rendering by construction, and truthy hostiles crash Jest result serialization through cyclic element diffs (verified).',
   }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:replayBinding:85:12-85:16',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b',
-    reason:
-      'No scalar hostile for a null initializer is both observable and safe: falsy hostiles are unobservable through falsy-gated rendering by construction, and truthy hostiles crash Jest result serialization through cyclic element diffs (verified).',
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:question:101:4-101:51',
-    expectedStatus: 'Error',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: 'eeeb428d40d65fb6c4a748b6b562163656ee72df7b05d19361615254750914bf',
-    reason:
-      'The hostile arrow initializer for this object-typed state dereferences a field before any assertion can run; the crash is the detected behavior but the strict classifier counts raw render crashes as infrastructure errors.',
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:progress:103:70-103:74',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b',
-    reason:
-      'No scalar hostile for a null initializer is both observable and safe: falsy hostiles are unobservable through falsy-gated rendering by construction, and truthy hostiles crash Jest result serialization through cyclic element diffs (verified).',
-  }),
-  Object.freeze({
-    id: 'sp:state:src/app/diagnostic.tsx:initializer:rateLimitNotice:146:72-146:76',
-    expectedStatus: 'Survived',
-    file: 'src/app/diagnostic.tsx',
-    kind: 'initializer',
-    siteSourceSha256: '74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b',
-    reason:
-      'No scalar hostile for a null initializer is both observable and safe: falsy hostiles are unobservable through falsy-gated rendering by construction, and truthy hostiles crash Jest result serialization through cyclic element diffs (verified).',
-  }),
+
   Object.freeze({
     id: 'sp:state:src/app/settings/change-password.tsx:initializer:focusedField:46:69-46:73',
     expectedStatus: 'Survived',

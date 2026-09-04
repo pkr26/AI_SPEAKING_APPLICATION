@@ -8,6 +8,7 @@ import ChangePasswordScreen from '../src/app/settings/change-password';
 import DeleteAccountScreen from '../src/app/settings/delete-account';
 import PrivacyPolicyScreen from '../src/app/settings/privacy';
 import TermsScreen from '../src/app/settings/terms';
+import PasswordVisibilityToggle from '../src/components/PasswordVisibilityToggle';
 import { ApiError } from '../src/lib/api';
 import {
   AccountDeletionUnconfirmedError,
@@ -222,6 +223,17 @@ function scrollContentStyle(): SemanticStyle {
   return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
 }
 
+/**
+ * The same host ScrollView keeps its native scroll configuration as props:
+ * the automatic content insets and handled keyboard taps are screen wiring,
+ * not layout tokens, so they are asserted straight off the host node.
+ */
+function scrollViewProps(): Record<string, unknown> {
+  const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  if (!scrollView) throw new Error('No ScrollView rendered');
+  return scrollView.props as Record<string, unknown>;
+}
+
 /** The card shell shared by the change-password and delete-account forms. */
 const FORM_CARD_STYLE: SemanticStyle = {
   backgroundColor: colors.card,
@@ -346,6 +358,26 @@ function responderEvent() {
     nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
     persist: () => undefined,
   };
+}
+
+/**
+ * RNTL's element tree only exposes host components, so a rendered child
+ * component's own props are read from its fiber (the same walking technique
+ * as committedPressHandler above). A missing fiber fails the expect() — the
+ * matcher failure is the kill evidence, never a raw dereference crash.
+ */
+function compositePropsOf(element: TestInstance, component: unknown): Record<string, unknown> {
+  let props: Record<string, unknown> | undefined;
+  let fiber: Fiber | null = element.unstable_fiber;
+  while (fiber) {
+    if (fiber.type === component) {
+      props = fiber.memoizedProps as Record<string, unknown>;
+      break;
+    }
+    fiber = fiber.return;
+  }
+  expect(props).toBeDefined();
+  return props!;
 }
 
 async function expectPressFeedback(
@@ -574,6 +606,69 @@ describe('change password screen', () => {
       expect(flattenedStyle(screen.getByText(t(key)))).toEqual(FIELD_LABEL_STYLE);
     }
     expect(flattenedStyle(updateButton())).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('pins the change-password ScrollView automatic insets and handled keyboard taps', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    expect(scrollViewProps().contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(scrollViewProps().keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('pins placeholder ink and return-key wiring on every password field', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    for (const [labelKey, returnKey] of [
+      ['cp.currentLabel', 'next'],
+      ['cp.newLabel', 'next'],
+      ['cp.confirmLabel', 'done'],
+    ] as const) {
+      const input = screen.getByLabelText(t(labelKey));
+      expect(input.props.placeholderTextColor).toBe(colors.muted);
+      expect(input.props.returnKeyType).toBe(returnKey);
+    }
+  });
+
+  it('pins the shared field-error style on every inline validation note', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    await fillChangePassword('oldpass1', 'short', 'short');
+    expect(flattenedStyle(screen.getByText(t('password.tooShort')))).toEqual(FIELD_ERROR_STYLE);
+    await fillChangePassword('samepass1', 'samepass1', 'samepass1');
+    expect(flattenedStyle(screen.getByText(t('cp.sameAsCurrent')))).toEqual(FIELD_ERROR_STYLE);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass2');
+    expect(flattenedStyle(screen.getByText(t('cp.mismatch')))).toEqual(FIELD_ERROR_STYLE);
+  });
+
+  it('rests every reveal control on an explicitly false visible prop', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    for (const field of Object.keys(CHANGE_PASSWORD_FIELD_LABEL_KEYS) as ChangePasswordField[]) {
+      const toggle = screen.getByRole('button', { name: visibilityControlLabel(field) });
+      // The masked rest is an exact boolean: a mistyped default object would
+      // arrive as undefined, and undefined must never impersonate false here.
+      expect(compositePropsOf(toggle, PasswordVisibilityToggle).visible).toBe(false);
+    }
+  });
+
+  it('rests every focus-ring style slot on null before a field is focused', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    for (const label of [t('cp.currentLabel'), t('cp.newLabel'), t('cp.confirmLabel')]) {
+      // The unfocused ring slot is authored as null (never a bare false), so
+      // the resting state cannot be forged by a mistyped focused-field default.
+      expect(screen.getByLabelText(label).props.style?.[2]).toBeNull();
+    }
+  });
+
+  it('rests the summary-error slot on null so no stale failure renders', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    const formChildren = parentOf(screen.getByText(t('cp.currentLabel'))).props
+      .children as unknown[];
+    // Only the boolean `saved` flag rests as a literal false; the error slot
+    // renders null while no failure is showing, never false.
+    expect(formChildren.filter((child) => child === false)).toHaveLength(1);
   });
 
   it('places a responsive reveal action beside every password field', async () => {
@@ -889,6 +984,31 @@ describe('change password screen', () => {
       'otherpass1',
     );
     expect(screen.queryByText(t('cp.wrongCurrent'))).toBeNull();
+  });
+
+  it('clears the stale summary error the moment a retried update starts', async () => {
+    const change = deferred<void>();
+    mockAuthValue.changePassword = jest
+      .fn()
+      .mockRejectedValueOnce(new ApiError(429, 'slow down'))
+      .mockImplementationOnce(() => change.promise);
+    await renderScreen(<ChangePasswordScreen />);
+    await fillChangePassword('oldpass1', 'newpass1', 'newpass1');
+    await fireEvent.press(updateButton());
+    expect(await screen.findByText(t('error.tooMany'))).toBeTruthy();
+
+    const retryPress = fireEvent.press(updateButton());
+    try {
+      expect(await screen.findByRole('button', { name: t('cp.submitBusy') })).toBeTruthy();
+      // Submitting retracts the stale failure up front, so the busy form never
+      // shows the previous error beside the in-flight request.
+      expect(screen.queryByText(t('error.tooMany'))).toBeNull();
+    } finally {
+      await act(async () => change.resolve(undefined));
+      await retryPress;
+    }
+    expect(await screen.findByText(t('cp.updatedBody'))).toBeTruthy();
+    expect(screen.queryByText(t('error.tooMany'))).toBeNull();
   });
 
   it('preserves opaque whitespace and accepts a legacy current password', async () => {
@@ -1222,6 +1342,33 @@ describe('delete account screen', () => {
     expect(flattenedStyle(parentOf(passwordLabel))).toEqual(FORM_CARD_STYLE);
     expect(flattenedStyle(passwordLabel)).toEqual(FIELD_LABEL_STYLE);
     expect(flattenedStyle(deleteButton())).toMatchObject({ marginTop: spacing.lg });
+  });
+
+  it('pins the delete-account ScrollView automatic insets and handled keyboard taps', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    expect(scrollViewProps().contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(scrollViewProps().keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('pins the typed password value and placeholder ink on the field', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    const input = screen.getByLabelText(t('da.passwordLabel'));
+    expect(input.props.placeholderTextColor).toBe(colors.muted);
+    expect(input.props.value).toBe('');
+    await typePassword('password1');
+    expect(screen.getByLabelText(t('da.passwordLabel')).props.value).toBe('password1');
+  });
+
+  it('rests the summary-error slot on null so no stale failure renders', async () => {
+    await renderScreen(<DeleteAccountScreen />);
+
+    const formChildren = parentOf(screen.getByText(t('da.passwordLabel'))).props
+      .children as unknown[];
+    // Every conditional slot on this form renders null while resting; a bare
+    // false would mean a mistyped error default slipped into the wiring.
+    expect(formChildren.filter((child) => child === false)).toHaveLength(0);
   });
 
   it('places the reveal action beside the password field', async () => {
@@ -1635,6 +1782,40 @@ describe('delete account screen', () => {
     await pressAlertButton(t('common.cancel'));
   });
 
+  it('clears the stale summary error the moment a retried deletion starts', async () => {
+    const deletion = deferred<void>();
+    mockAuthValue.deleteAccount = jest
+      .fn()
+      .mockRejectedValueOnce(new ApiError(500, 'boom'))
+      .mockImplementationOnce(() => deletion.promise);
+    await renderScreen(<DeleteAccountScreen />);
+    await typePassword('password1');
+    await fireEvent.press(deleteButton());
+    await pressAlertButton(t('da.confirmDelete'));
+    expect(await screen.findByText(t('error.serverBusy'))).toBeTruthy();
+
+    await fireEvent.press(deleteButton());
+    const retryConfirm = pressAlertButton(t('da.confirmDelete'));
+    try {
+      expect(
+        (await screen.findByRole('button', { name: t('da.submitBusy') })).props.accessibilityState,
+      ).toEqual({ disabled: true, busy: true });
+      // Deleting retracts the stale failure up front, so the busy form never
+      // shows the previous error beside the in-flight request.
+      expect(screen.queryByText(t('error.serverBusy'))).toBeNull();
+    } finally {
+      await retryConfirm;
+      await act(async () => deletion.resolve(undefined));
+    }
+    await waitFor(() =>
+      expect(alertSpy).toHaveBeenCalledWith(
+        t('da.deletedTitle'),
+        expect.any(String),
+        expect.any(Array),
+      ),
+    );
+  });
+
   it('shows a credential error on 401', async () => {
     mockAuthValue.deleteAccount = jest.fn().mockRejectedValue(new ApiError(401, 'unauthorized'));
     await renderScreen(<DeleteAccountScreen />);
@@ -1785,6 +1966,7 @@ function expectLegalLayout(paragraphKeys: readonly MessageKey[]): void {
     alignSelf: 'center',
     backgroundColor: colors.background,
   });
+  expect(scrollViewProps().contentInsetAdjustmentBehavior).toBe('automatic');
   expect(screen.queryByRole('header')).toBeNull();
 
   const note = screen.getByText(t('legal.placeholderNote'));

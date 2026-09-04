@@ -16,6 +16,7 @@ import {
   AccountDeletionUnconfirmedError,
   AccountDeletedCleanupError,
   AuthProvider,
+  getLastRestoreAttempt,
   LocalSignOutUnconfirmedError,
   LogoutCleanupError,
   RegistrationCompletedLoginRequiredError,
@@ -355,10 +356,48 @@ describe('AuthProvider session restore', () => {
 
     expect(text('isRestoring')).toBe('true');
     expect(text('token')).toBe('null');
+    // Before any restore settles, the authored initial session state is
+    // exactly no-user — not an unnamed falsy stand-in.
+    expect(auth!.user).toBeNull();
     expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledTimes(1);
     expect(mockedCleanupPrivateArtifacts).toHaveBeenCalledWith();
     await act(async () => stored.resolve(null));
     await waitFor(() => expect(text('isRestoring')).toBe('false'));
+  });
+
+  it('clears the restored token from memory when a retried restore cannot read storage', async () => {
+    await renderAuth('tok-stored');
+    expect(text('token')).toBe('tok-stored');
+
+    mockedGetToken.mockRejectedValueOnce(new Error('keychain locked'));
+    await act(async () => {
+      auth!.retrySessionRestore();
+    });
+    await waitFor(() => expect(mockedGetToken).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(text('token')).toBe('null');
+    expect(text('isRestoring')).toBe('false');
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
+  });
+
+  it('clears a restore error when a replaced query client re-runs a successful restore', async () => {
+    mockedGetToken.mockRejectedValueOnce(new Error('keychain locked'));
+    const rendered = await renderTree(new QueryClient());
+    await waitFor(() => expect(text('isRestoring')).toBe('false'));
+    expect(text('restoreError')).toBe(t('auth.restoreUnavailable'));
+
+    mockedGetToken.mockResolvedValueOnce('tok-recovered');
+    await act(async () => {
+      await rendered.rerender(tree(new QueryClient()));
+    });
+    await waitFor(() => expect(mockedGetToken).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(text('token')).toBe('tok-recovered');
+    expect(text('restoreError')).toBe('null');
   });
 
   it('restores a persisted token and bumps sessionVersion', async () => {
@@ -1788,6 +1827,15 @@ describe('session leases', () => {
     expect(auth!.isSessionLeaseCurrent(lease)).toBe(true);
     return lease;
   }
+
+  it('captures the first lease at revision zero before any transition', async () => {
+    await renderAuth(null);
+
+    // A fresh provider's first lease belongs to revision zero of both the
+    // lease re-arm and the SecureStore-restore attempt counters.
+    expect((renderedSessionLease as unknown as { leaseRevision?: number }).leaseRevision).toBe(0);
+    expect(getLastRestoreAttempt()).toBe(0);
+  });
 
   it.each(['logout', 'changePassword', 'deleteAccount'] as const)(
     'rearms mounted leases after a failed signed-in %s transition',

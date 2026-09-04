@@ -183,7 +183,7 @@ export default function ChangePasswordScreen() {
               style={[
                 styles.input,
                 styles.passwordInput,
-                focusedField === 'current' && styles.inputFocused,
+                focusedField === null ? null : focusedField === 'current' && styles.inputFocused,
               ]}
               value={currentPassword}
               onChangeText={(value) => handleFieldEdit('current', value)}
@@ -217,7 +217,7 @@ export default function ChangePasswordScreen() {
               style={[
                 styles.input,
                 styles.passwordInput,
-                focusedField === 'next' && styles.inputFocused,
+                focusedField === null ? null : focusedField === 'next' && styles.inputFocused,
               ]}
               value={newPassword}
               onChangeText={(value) => handleFieldEdit('next', value)}
@@ -257,7 +257,7 @@ export default function ChangePasswordScreen() {
               style={[
                 styles.input,
                 styles.passwordInput,
-                focusedField === 'confirm' && styles.inputFocused,
+                focusedField === null ? null : focusedField === 'confirm' && styles.inputFocused,
               ]}
               value={confirmPassword}
               onChangeText={(value) => handleFieldEdit('confirm', value)}

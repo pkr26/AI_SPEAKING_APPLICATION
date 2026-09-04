@@ -187,7 +187,10 @@ function SettingsHeaderAction() {
       }}
       style={({ pressed }) => [styles.settingsAction, pressed && styles.settingsActionPressed]}
     >
-      <Icon name="sliders" size={22} color={theme.colors.text} />
+      {/* The glyph intentionally takes Icon's own theme-text ink default; an
+          explicit color here would restate the same value the fallback
+          already derives from the identical theme context. */}
+      <Icon name="sliders" size={22} />
     </Pressable>
   );
 }

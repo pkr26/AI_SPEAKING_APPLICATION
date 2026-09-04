@@ -98,12 +98,16 @@ jest.mock('../src/lib/session-notice', () => ({
 }));
 
 const mockSetGuestLanguage = jest.fn();
+let mockGuestLanguageState: {
+  language: 'en' | 'te' | 'hi' | 'es' | 'zh';
+  persistenceError: string | null;
+} = { language: 'en', persistenceError: null };
 
 jest.mock('../src/lib/guest-language', () => ({
   useGuestLanguage: () => ({
-    language: 'en',
+    language: mockGuestLanguageState.language,
     isRestoring: false,
-    persistenceError: null,
+    persistenceError: mockGuestLanguageState.persistenceError,
     setLanguage: mockSetGuestLanguage,
     mirrorAccountLanguage: jest.fn(),
   }),
@@ -366,15 +370,21 @@ function fiberOf(node: TestInstance): unknown {
 /**
  * The never-disabled Pressable wrapping a validation-gated submit Button: a
  * real tap on the blocked CTA lands on its host view (marked
- * accessible=false), revealing the hidden field error.
+ * accessible=false), revealing the hidden field error. The walk asserts
+ * existence instead of throwing: a missing accessible=false marking is the
+ * observable wiring failure and must die on matcher evidence, never a helper
+ * throw.
  */
 function revealWrapperOf(node: TestInstance): TestInstance {
-  let current: TestInstance | null = node;
-  while (current) {
-    if (current.props.accessible === false) return current;
-    current = current.parent;
+  let wrapper: TestInstance | null = null;
+  for (let current: TestInstance | null = node; current; current = current.parent) {
+    if (current.props.accessible === false) {
+      wrapper = current;
+      break;
+    }
   }
-  throw new Error('No reveal wrapper found');
+  expect(wrapper?.props.accessible).toBe(false);
+  return wrapper as TestInstance;
 }
 
 beforeEach(() => {
@@ -387,6 +397,7 @@ beforeEach(() => {
     addListener: mockAddNavigationListener,
   };
   mockAuthValue = makeAuth();
+  mockGuestLanguageState = { language: 'en', persistenceError: null };
   mockForgot.mockReset().mockResolvedValue(undefined);
   mockReset.mockReset().mockResolvedValue(undefined);
   mockedConsumeNotice.mockReset().mockResolvedValue(false);
@@ -1782,5 +1793,418 @@ describe('forgot-password deep contracts', () => {
     await fireEvent.press(send);
     expect(mockForgot).toHaveBeenCalledTimes(1);
     gate.resolve(undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// State/prop wiring pins: the authored initial states (null vs any hostile
+// boolean, 0-keyed note), the stale-error clearing setters, and the exact
+// chrome/field prop wiring the deep styles above do not reach.
+// ---------------------------------------------------------------------------
+
+/** The host ScrollView, which keeps contentContainerStyle as a prop. */
+function scrollViewHost(): TestInstance {
+  const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  if (!scrollView) throw new Error('No ScrollView rendered');
+  return scrollView;
+}
+
+/**
+ * The React key committed on a keyed element: RNT hands back the inner text
+ * host fiber, so the authored key lives one fiber up.
+ */
+function elementKey(node: TestInstance): string | null {
+  const fiber = fiberOf(node) as { key?: string | null; return?: { key?: string | null } | null };
+  return fiber.return?.key ?? fiber.key ?? null;
+}
+
+/** Fills the reset form with a valid code and matching passwords. */
+async function fillResetForm() {
+  await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'somecode');
+  await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+  await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
+}
+
+const fieldErrorInk: SemanticStyle = { marginTop: spacing.sm, color: colors.danger, fontSize: 13 };
+
+const formLabel: SemanticStyle = {
+  fontSize: 14,
+  fontWeight: '600',
+  color: colors.text,
+  marginBottom: spacing.sm,
+  marginTop: spacing.md,
+};
+
+describe('forgot-password state wiring', () => {
+  it('renders the request form — not the sent state or any alert — before a send', async () => {
+    await render(<ForgotPasswordScreen />);
+
+    expect(screen.getByRole('header', { name: t('reset.requestTitle') })).toBeTruthy();
+    expect(screen.queryByText(t('reset.sentTitle'))).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('remounts the neutral note under key 1 after the first accepted send', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+
+    const note = await screen.findByText(t('reset.sentBody'));
+    // The note key starts at 0 and the accepted send bumps it exactly once, so
+    // the keyed remount (and its polite re-announcement) is wired to the send.
+    expect(elementKey(note)).toBe('1');
+  });
+
+  it('clears a stale transport error once a retry is accepted', async () => {
+    mockForgot
+      .mockReset()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(undefined);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+    expect(await screen.findByText(t('reset.requestFailed'))).toBeTruthy();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
+    expect(screen.queryByText(t('reset.requestFailed'))).toBeNull();
+  });
+
+  it('clears a stale resend error once a resend is accepted', async () => {
+    mockForgot
+      .mockReset()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(undefined);
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    });
+    expect(await screen.findByText(t('reset.sentTitle'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(await screen.findByText(t('reset.requestFailed'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(await screen.findByText(t('reset.sentBody'))).toBeTruthy();
+    expect(screen.queryByText(t('reset.requestFailed'))).toBeNull();
+  });
+});
+
+describe('reset-password state wiring', () => {
+  it('starts with no focused field, no summary alert, and a null focus slot', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+
+    expect(screen.queryByRole('alert')).toBeNull();
+    const passwordStyle = screen.getByLabelText(t('cp.newLabel')).props.style as unknown[];
+    // The style array itself must exist before its null focus slot is read, so
+    // a removed style wiring dies on this matcher instead of a raw deref.
+    expect(passwordStyle).toBeDefined();
+    expect(passwordStyle[2]).toBeNull();
+    const confirmStyle = screen.getByLabelText(t('cp.confirmLabel')).props.style as unknown[];
+    expect(confirmStyle).toBeDefined();
+    expect(confirmStyle[2]).toBeNull();
+  });
+
+  it('marks the email touched when a blocked return-key submit fires', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('reset.codeLabel')), 'somecode');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+
+    await fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'submitEditing');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(mockReset).not.toHaveBeenCalled();
+  });
+
+  it('clears the summary error on a successful retry', async () => {
+    mockReset
+      .mockReset()
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce(undefined);
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fillResetForm();
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+    });
+    expect(await screen.findByText(t('cp.failed'))).toBeTruthy();
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+    });
+    await waitFor(() =>
+      expect(mockRouter.dismissTo).toHaveBeenCalledWith({
+        pathname: '/login',
+        params: { notice: 'reset' },
+      }),
+    );
+    expect(screen.queryByText(t('cp.failed'))).toBeNull();
+  });
+
+  it.each(['email', 'password', 'confirm'] as const)(
+    'clears the summary error when the %s field is edited',
+    async (field) => {
+      mockReset.mockReset().mockRejectedValue(new Error('offline'));
+      mockSearchParams = { email: 'ada@example.com' };
+      await render(<ResetPasswordScreen />);
+      await fillResetForm();
+      await act(async () => {
+        await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+      });
+      expect(await screen.findByText(t('cp.failed'))).toBeTruthy();
+
+      if (field === 'email') {
+        await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'new@example.com');
+      } else if (field === 'password') {
+        await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass124');
+      } else {
+        await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'NewPass124');
+      }
+
+      expect(screen.queryByText(t('cp.failed'))).toBeNull();
+    },
+  );
+});
+
+describe('reset-password prop wiring', () => {
+  it('pins the screen chrome and the keyboard-persistent scroll container', async () => {
+    await render(<ResetPasswordScreen />);
+
+    expect(flattenedStyle(parentOf(screen.getByTestId('keyboard-avoiding-view')))).toEqual(
+      screenChrome,
+    );
+    expect(scrollViewHost().props.keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('pins the app-language picker value, busy lock, and persistence error', async () => {
+    await render(<ResetPasswordScreen />);
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+
+    const pending = deferred<void>();
+    mockReset.mockReset().mockReturnValue(pending.promise);
+    mockSearchParams = { email: 'ada@example.com' };
+    const second = await render(<ResetPasswordScreen />);
+    await fillResetForm();
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitNew') }));
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: true,
+    });
+    await act(async () => {
+      pending.resolve(undefined);
+      await pending.promise;
+    });
+    await second.unmount();
+
+    mockGuestLanguageState = { language: 'en', persistenceError: 'Secure storage unavailable' };
+    await render(<ResetPasswordScreen />);
+    expect(screen.getByText('Secure storage unavailable').props.accessibilityRole).toBe('alert');
+  });
+
+  it('pins the field labels, the confirm row, and the confirm field configuration', async () => {
+    await render(<ResetPasswordScreen />);
+
+    expect(flattenedStyle(screen.getByText(t('login.emailLabel')))).toEqual(formLabel);
+    expect(flattenedStyle(screen.getByText(t('cp.newLabel')))).toEqual(formLabel);
+    expect(flattenedStyle(screen.getByText(t('cp.confirmLabel')))).toEqual(formLabel);
+    const confirm = screen.getByLabelText(t('cp.confirmLabel'));
+    expect(flattenedStyle(parentOf(confirm))).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
+    });
+    expect(confirm.props).toMatchObject({
+      placeholderTextColor: colors.muted,
+      autoCapitalize: 'none',
+      autoComplete: 'new-password',
+      textContentType: 'newPassword',
+      returnKeyType: 'go',
+      maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
+
+    await fireEvent.changeText(confirm, 'NewPass123');
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.value).toBe('NewPass123');
+  });
+
+  it('pins the inline field-error ink for the email and confirmation complaints', async () => {
+    mockSearchParams = { email: 'ada@example.com' };
+    await render(<ResetPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
+    expect(flattenedStyle(screen.getByText(t('email.invalid')))).toEqual(fieldErrorInk);
+
+    await fireEvent.changeText(screen.getByLabelText(t('cp.newLabel')), 'NewPass123');
+    await fireEvent.changeText(screen.getByLabelText(t('cp.confirmLabel')), 'Different123');
+    expect(flattenedStyle(screen.getByText(t('cp.mismatch')))).toEqual(fieldErrorInk);
+  });
+});
+
+/** Props of the shared Button component that rendered a queried host button. */
+function sharedButtonProps(node: TestInstance): Record<string, unknown> {
+  type Fiber = { memoizedProps?: Record<string, unknown>; return: Fiber | null };
+  let fiber = node.unstable_fiber as Fiber | null;
+  let owner: Record<string, unknown> | null = null;
+  while (fiber) {
+    const props = fiber.memoizedProps;
+    if (props && typeof props.title === 'string' && 'onPress' in props && 'style' in props) {
+      owner = props;
+      break;
+    }
+    fiber = fiber.return;
+  }
+  // A control with no shared Button above it is the observable behavior under
+  // a wiring mutant and must fail as a kill, never a raw infrastructure error.
+  expect(owner).not.toBeNull();
+  return owner as Record<string, unknown>;
+}
+
+async function arriveAtSentState() {
+  await render(<ForgotPasswordScreen />);
+  await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+  await act(async () => {
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+  });
+  await screen.findByText(t('reset.sentTitle'));
+}
+
+describe('forgot-password prop wiring', () => {
+  it('pins the request chrome, scroll persistence, and email field-error ink', async () => {
+    await render(<ForgotPasswordScreen />);
+
+    expect(flattenedStyle(parentOf(screen.getByTestId('keyboard-avoiding-view')))).toEqual(
+      screenChrome,
+    );
+    expect(scrollViewHost().props.keyboardShouldPersistTaps).toBe('handled');
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
+    expect(flattenedStyle(screen.getByText(t('email.invalid')))).toEqual(fieldErrorInk);
+  });
+
+  it('pins the request-state picker value, busy lock, and persistence error', async () => {
+    await render(<ForgotPasswordScreen />);
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+
+    const pending = deferred<void>();
+    mockForgot.mockReset().mockReturnValue(pending.promise);
+    const busy = await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: true,
+    });
+    await act(async () => {
+      pending.resolve(undefined);
+      await pending.promise;
+    });
+    await busy.unmount();
+
+    mockGuestLanguageState = { language: 'en', persistenceError: 'Secure storage unavailable' };
+    await render(<ForgotPasswordScreen />);
+    expect(screen.getByText('Secure storage unavailable').props.accessibilityRole).toBe('alert');
+  });
+
+  it('pins the sent-state chrome and copy styles', async () => {
+    await arriveAtSentState();
+
+    expect(flattenedStyle(parentOf(scrollViewHost()))).toEqual(screenChrome);
+    expect(scrollContentStyle()).toEqual(formContainer);
+    expect(flattenedStyle(screen.getByRole('header', { name: t('reset.sentTitle') }))).toEqual(
+      screenTitle,
+    );
+    expect(flattenedStyle(screen.getByText(t('reset.sentBody')))).toEqual({
+      marginTop: spacing.sm,
+      fontSize: 16,
+      lineHeight: 23,
+      color: colors.muted,
+      textAlign: 'center',
+    });
+  });
+
+  it('pins the sent-state picker value and persistence error', async () => {
+    await arriveAtSentState();
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+    const first = screen.getByTestId('ui-language-en');
+    expect(first).toBeTruthy();
+
+    const resend = deferred<void>();
+    mockForgot.mockReset().mockReturnValue(resend.promise);
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: true,
+    });
+    await act(async () => {
+      resend.resolve(undefined);
+      await resend.promise;
+    });
+
+    mockGuestLanguageState = { language: 'en', persistenceError: 'Secure storage unavailable' };
+    await arriveAtSentState();
+    expect(screen.getByText('Secure storage unavailable').props.accessibilityRole).toBe('alert');
+  });
+
+  it('pins the Continue and Resend button wiring in the sent state', async () => {
+    await arriveAtSentState();
+
+    const continueButton = screen.getByRole('button', { name: t('reset.continue') });
+    expect(flattenedStyle(continueButton)).toMatchObject({ marginTop: spacing.lg });
+    const resendButton = screen.getByRole('button', { name: t('reset.resend') });
+    expect(flattenedStyle(resendButton)).toMatchObject({ marginTop: spacing.sm });
+    // The resend action is the outlined secondary variant, not a second filled
+    // CTA, and both controls carry their idle disabled/loading wiring to the
+    // shared Button even though `loading` alone would also block presses.
+    expect(sharedButtonProps(resendButton)).toMatchObject({
+      variant: 'secondary',
+      disabled: false,
+      loading: false,
+    });
+    expect(sharedButtonProps(continueButton)).toMatchObject({ disabled: false });
+
+    const resend = deferred<void>();
+    mockForgot.mockReset().mockReturnValue(resend.promise);
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    expect(sharedButtonProps(screen.getByRole('button', { name: t('reset.resendBusy') }))).toEqual(
+      expect.objectContaining({ disabled: true, loading: true }),
+    );
+    expect(
+      screen.getByRole('button', { name: t('reset.continue') }).props.accessibilityState,
+    ).toMatchObject({ disabled: true });
+    await act(async () => {
+      resend.resolve(undefined);
+      await resend.promise;
+    });
+  });
+
+  it('pins the sent-state summary-error ink after a failed resend', async () => {
+    await arriveAtSentState();
+    mockForgot.mockReset().mockRejectedValueOnce(new Error('offline'));
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+
+    const error = await screen.findByText(t('reset.requestFailed'));
+    expect(flattenedStyle(error)).toEqual(formError);
   });
 });

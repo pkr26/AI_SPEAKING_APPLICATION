@@ -46,13 +46,13 @@ const sessionLeaseBrand: unique symbol = Symbol('SessionLease');
 export interface SessionLease {
   readonly [sessionLeaseBrand]: true;
 }
-
 interface SessionLeaseSnapshot extends SessionLease {
   readonly epoch: number;
   readonly token: string | null;
   readonly userId: string | null;
+  /** Lease re-arm generation captured alongside the identity fields. */
+  readonly leaseRevision: number;
 }
-
 interface AuthContextValue {
   token: string | null;
   user: User | null;
@@ -166,7 +166,6 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     userRef.current = resolved;
     setUserState(resolved);
   }, []);
-
   const captureSessionLease = useCallback((): SessionLease => {
     void leaseRevision;
     return Object.freeze({
@@ -174,6 +173,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       epoch: epochRef.current,
       token: tokenRef.current,
       userId: userRef.current?.id ?? null,
+      leaseRevision,
     }) satisfies SessionLeaseSnapshot;
   }, [leaseRevision]);
 
@@ -697,7 +697,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       verifySessionAfterCredentialError,
     ],
   );
-
+  lastRestoreAttempt = restoreAttempt; // mirror for getLastRestoreAttempt()
   const value = useMemo(
     () => ({
       token,
@@ -746,4 +746,14 @@ export function useAuth(): AuthContextValue {
     throw new Error('useAuth must be used within an AuthProvider');
   }
   return ctx;
+}
+
+/**
+ * Latest SecureStore-restore attempt generation mirrored by any mounted
+ * AuthProvider during render; zero until the learner retries a failed restore.
+ * Non-React diagnostics and tests read this instead of React state.
+ */
+let lastRestoreAttempt = 0;
+export function getLastRestoreAttempt(): number {
+  return lastRestoreAttempt;
 }

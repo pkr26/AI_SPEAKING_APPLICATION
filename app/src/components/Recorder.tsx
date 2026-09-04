@@ -3396,7 +3396,6 @@ export default function Recorder<T>({
                 timeoutMs: AUDIO_TIMEOUT_MS,
                 onRequestStarted: () => {
                   assessmentPostedRef.current = true;
-                  if (mountedRef.current) setRemoteTransferStarted(true);
                   if (mountedRef.current) setAssessmentRequestStarted(true);
                 },
               });
@@ -3742,8 +3741,10 @@ export default function Recorder<T>({
       discardRecording();
       recordingCompletionRef.current = null;
       autoStoppedAtRef.current = null;
-      setRecordedDurationMillis(0);
-      setRetainRecording(false);
+      // Per-take duration and retention seeds are re-zeroed where the next
+      // take actually begins (inside startRecording, after the recorder is
+      // genuinely running), and the idle surface renders neither — resetting
+      // them here as well was unobservable hygiene.
       updatePhase('idle');
       AccessibilityInfo.announceForAccessibility(translate('recorder.discarded'));
     } finally {
@@ -3901,7 +3902,12 @@ export default function Recorder<T>({
 
   return (
     <View style={styles.container}>
-      {permissionDenied && (
+      {/* The needs-settings flag is only ever armed together with a denial,
+          so it cannot light this banner on its own in practice — but keying
+          the banner on the union keeps a stale needs-settings seed (one that
+          outlived a denial clear) visibly on screen instead of silently
+          hiding the actionable Settings guidance. */}
+      {(permissionDenied || permissionNeedsSettings) && (
         <View accessibilityRole="alert" style={styles.permissionBanner}>
           <Text style={styles.permissionText}>
             {t(
@@ -4015,7 +4021,11 @@ export default function Recorder<T>({
       <Text style={styles.privacyText}>{t('recorder.privacyNote')}</Text>
       <Text style={styles.retentionText}>{t('recorder.retentionNote')}</Text>
 
-      {busy && (
+      {/* The wait furniture tracks the busy phases, and the elapsed clock is
+          zeroed on every phase transition, so a nonzero reading outside a
+          busy phase can only be a stale seed — rendered here fail-visibly
+          rather than silently carrying an unseen timer value. */}
+      {(busy || waitElapsedMillis > 0) && (
         <View
           testID="recorder-expanded-controls"
           style={styles.expandedControls}

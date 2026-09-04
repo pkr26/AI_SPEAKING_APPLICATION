@@ -280,25 +280,36 @@ function parentOf(node: TestInstance): TestInstance {
   return parent;
 }
 
-/** Path data of the expand chevron beside the show/hide-details toggle. */
-function expandChevronPath(): string {
+interface ExpandChevronParts {
+  /** Props of the chevron's Svg host (its square size), when rendered. */
+  svgProps: Record<string, unknown> | null;
+  /** Props of the drawn chevron glyph (path data and ink), when rendered. */
+  glyphProps: Record<string, unknown> | null;
+}
+
+/**
+ * The expand chevron beside the show/hide-details toggle. Missing pieces stay
+ * null so a wiring mutant that drops the glyph or its host dies as a matcher
+ * failure at the caller, never as a helper throw.
+ */
+function expandChevronParts(): ExpandChevronParts {
   const toggleText =
     screen.queryByText(t('history.hideDetails')) ?? screen.queryByText(t('history.showDetails'));
-  if (!toggleText) throw new Error('No expand toggle text rendered');
+  if (!toggleText) return { svgProps: null, glyphProps: null };
   const hintRow = parentOf(toggleText);
   // Row markup: <Text>toggle</Text><Icon chevron/> — the glyph host is the
   // second child, after the toggle text.
   const iconHost = hintRow.children[1];
-  if (!iconHost) throw new Error('Expand chevron icon not found');
-  const svg = (iconHost as unknown as { children: unknown[] }).children.find(
+  const svg = (iconHost as unknown as { children?: unknown[] } | undefined)?.children?.find(
     (child) => typeof child !== 'string',
-  ) as unknown as { props: { children?: unknown } };
-  let path: string | null = null;
+  ) as unknown as { props: { children?: unknown } } | undefined;
+  if (!svg) return { svgProps: null, glyphProps: null };
+  let glyph: Record<string, unknown> | null = null;
   const visit = (value: unknown): void => {
-    if (path !== null || !React.isValidElement(value)) return;
+    if (glyph !== null || !React.isValidElement(value)) return;
     const props = value.props as Record<string, unknown>;
     if (typeof props.d === 'string') {
-      path = props.d;
+      glyph = props;
       return;
     }
     const children = props.children;
@@ -306,8 +317,53 @@ function expandChevronPath(): string {
     else visit(children);
   };
   visit(svg.props.children);
-  if (path === null) throw new Error('Expand chevron glyph path not found');
-  return path;
+  return { svgProps: svg.props as Record<string, unknown>, glyphProps: glyph };
+}
+
+/** Path data of the expand chevron beside the show/hide-details toggle. */
+function expandChevronPath(): string | null {
+  const { glyphProps } = expandChevronParts();
+  const d = glyphProps?.d;
+  return typeof d === 'string' ? d : null;
+}
+
+/**
+ * Counts distinct rendered React elements under `from` whose props satisfy
+ * `pred`. Walks both host-instance children and element-valued props.children,
+ * the two layers svg glyphs render across, and dedupes by identity because one
+ * glyph is reachable through several parent paths.
+ */
+function countElementsUnder(
+  from: TestInstance,
+  pred: (props: Record<string, unknown>) => boolean,
+): number {
+  const matches = new Set<unknown>();
+  const visitValue = (value: unknown): void => {
+    if (value === null || value === undefined || typeof value === 'string') return;
+    if (React.isValidElement(value)) {
+      const props = value.props as Record<string, unknown>;
+      if (pred(props)) matches.add(value);
+      const children = props.children;
+      if (Array.isArray(children)) children.forEach(visitValue);
+      else visitValue(children);
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach(visitValue);
+      return;
+    }
+    const instance = value as TestInstance;
+    const props = instance.props as Record<string, unknown> | undefined;
+    if (props) {
+      if (pred(props)) matches.add(value);
+      const children = props.children;
+      if (Array.isArray(children)) children.forEach(visitValue);
+      else visitValue(children);
+    }
+    if (Array.isArray(instance.children)) instance.children.forEach(visitValue);
+  };
+  visitValue(from);
+  return matches.size;
 }
 
 function centeredStateStyle(node: TestInstance): SemanticStyle {
@@ -394,6 +450,18 @@ function refreshHandler(): () => void {
     return () => undefined;
   }
   return onRefresh as () => void;
+}
+
+/** Props of the pull-to-refresh control a centered empty state mounts. */
+function refreshControlProps(): Record<string, unknown> {
+  const [scroll] = screen.container.queryAll(
+    (candidate) => candidate.props.refreshControl !== undefined,
+  );
+  const control = scroll?.props.refreshControl as { props?: Record<string, unknown> } | undefined;
+  // Assert instead of throwing raw: a missing control is the observable
+  // behavior under a wiring mutant and must fail as a kill, never an error.
+  expect(control?.props).toBeInstanceOf(Object);
+  return control?.props ?? {};
 }
 
 function sectionListProps(): Record<string, unknown> {
@@ -602,14 +670,33 @@ describe('history screen', () => {
     mockGetHistory.mockReturnValue(new Promise(() => undefined));
     await renderHistory();
     const hidden = { includeHiddenElements: true } as const;
-    expect(screen.getByText(t('history.loading'), hidden).props.accessibilityLiveRegion).toBe(
-      'polite',
-    );
+    const hiddenLoading = screen.getByText(t('history.loading'), hidden);
+    expect(hiddenLoading.props.accessibilityLiveRegion).toBe('polite');
+    // The wait sits in the shared centered state slot and the announcing line
+    // is visually hidden but kept in the accessibility tree.
+    expect(listView().props.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(centeredStateStyle(hiddenLoading)).toEqual(CENTER_STATE);
+    expect(flattenedStyle(hiddenLoading)).toEqual({ height: 0, opacity: 0 });
     // Day header + three answer-card blocks mirror the loaded list.
-    expect(screen.getByTestId('history-skeleton-header', hidden)).toBeTruthy();
-    expect(
-      flattenedStyle(parentOf(screen.getByTestId('history-skeleton-header', hidden))),
-    ).toMatchObject({ gap: spacing.sm });
+    const headerBlock = screen.getByTestId('history-skeleton-header', hidden);
+    expect(flattenedStyle(headerBlock)).toMatchObject({
+      width: 120,
+      height: 16,
+      borderRadius: 4,
+      backgroundColor: colors.border,
+    });
+    expect(flattenedStyle(parentOf(headerBlock))).toMatchObject({ gap: spacing.sm });
+    const skeletonBlocks = parentOf(headerBlock).children.filter(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    expect(skeletonBlocks).toHaveLength(5);
+    for (const block of skeletonBlocks.slice(2)) {
+      expect(flattenedStyle(block)).toMatchObject({
+        height: 84,
+        borderRadius: 16,
+        backgroundColor: colors.border,
+      });
+    }
   });
 
   it('shows a retryable error when the first page fails', async () => {
@@ -626,6 +713,7 @@ describe('history screen', () => {
     expect(flattenedStyle(screen.getByText(t('history.loadFailedTitle')))).toEqual(STATE_TITLE);
     expect(flattenedStyle(screen.getByText(t('error.serverBusy')))).toEqual(MUTED_TEXT);
     expect(centeredStateStyle(screen.getByText(t('error.serverBusy')))).toEqual(CENTER_STATE);
+    expect(listView().props.contentInsetAdjustmentBehavior).toBe('automatic');
     // The full-screen retry is a full-width primary action under the message.
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('common.tryAgain') })),
@@ -763,6 +851,17 @@ describe('history screen', () => {
 
     // The shared EmptyState carries the illustrated mark beside the copy.
     expect(screen.getByTestId('history-empty')).toBeTruthy();
+    // The mark is the clock glyph: a circle face with two clock hands.
+    expect(
+      countElementsUnder(
+        screen.getByTestId('history-empty'),
+        (props) => props.points === '12,7 12,12 15.5,14',
+      ),
+    ).toBe(1);
+    // Emptiness stays live through the mounted pull-to-refresh control.
+    const emptyRefreshControl = refreshControlProps();
+    expect(emptyRefreshControl.refreshing).toBe(false);
+    expect(emptyRefreshControl.tintColor).toBe(colors.primary);
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('home.startPractice') })),
     ).toMatchObject({
@@ -794,6 +893,42 @@ describe('history screen', () => {
     jest.mocked(mockAuthValue.isSessionLeaseCurrent).mockReturnValue(false);
     onRefresh();
     expect(mockGetHistory).toHaveBeenCalledTimes(2);
+  });
+
+  it('announces a background refresh politely while loaded answers stay on screen', async () => {
+    const client = makeQueryClient(Infinity);
+    client.setQueryData(['practice-history', USER.id], {
+      pages: [{ items: [historyItem()], nextCursor: null }],
+      pageParams: [undefined],
+    });
+    let releaseRefresh!: () => void;
+    mockGetHistory.mockReturnValue(
+      new Promise((resolve) => {
+        releaseRefresh = () => resolve({ items: [historyItem()], nextCursor: null });
+      }),
+    );
+    await render(
+      <QueryClientProvider client={client}>
+        <HistoryScreen />
+      </QueryClientProvider>,
+    );
+    expect(screen.getByText('courage')).toBeTruthy();
+
+    await act(async () => {
+      (sectionListProps().onRefresh as () => void)();
+      await Promise.resolve();
+    });
+    const notice = await screen.findByText(t('refresh.updating'));
+    expect(notice.props.accessibilityLiveRegion).toBe('polite');
+    // The loaded answers stay on screen while the refresh is in flight.
+    expect(screen.getByText('courage')).toBeTruthy();
+
+    await act(async () => {
+      releaseRefresh();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await waitFor(() => expect(screen.queryByText(t('refresh.updating'))).toBeNull());
+    expect(screen.getByText('courage')).toBeTruthy();
   });
 
   it('retries a failed refresh without replacing a cached answer list', async () => {
@@ -1039,6 +1174,12 @@ describe('history screen', () => {
       fontWeight: '600',
       color: colors.primary,
     });
+    // The hint line and its chevron share one row-aligned hint strip.
+    expect(flattenedStyle(parentOf(screen.getByText(t('history.showDetails'))))).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 2,
+    });
   });
 
   it('tints the row header only while it is pressed', async () => {
@@ -1219,6 +1360,10 @@ describe('history screen', () => {
     expect(screen.queryByText('Nice detail.')).toBeNull();
     // The collapsed affordance points down until the row expands.
     expect(expandChevronPath()).toBe('M5.5 9 12 15.5 18.5 9');
+    // The chevron glyph is an 18-point square drawn in the brand ink.
+    const collapsedChevron = expandChevronParts();
+    expect(collapsedChevron.svgProps).toMatchObject({ width: 18, height: 18 });
+    expect(collapsedChevron.glyphProps).toMatchObject({ stroke: colors.primary, fill: 'none' });
 
     const row = screen.getByRole('button', { expanded: false });
     await fireEvent.press(row);
@@ -1228,8 +1373,11 @@ describe('history screen', () => {
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText(t('history.hideDetails'))).toBeTruthy();
     expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
-    // Expanding flips the chevron to point up.
+    // Expanding flips the chevron to point up with the same size and ink.
     expect(expandChevronPath()).toBe('M5.5 15 12 8.5 18.5 15');
+    const expandedChevron = expandChevronParts();
+    expect(expandedChevron.svgProps).toMatchObject({ width: 18, height: 18 });
+    expect(expandedChevron.glyphProps).toMatchObject({ stroke: colors.primary });
 
     // Each answer is labelled so the transcript and feedback are not orphaned.
     expect(screen.getByText(t('label.question'))).toBeTruthy();
@@ -1291,6 +1439,44 @@ describe('history screen', () => {
       });
     },
   );
+
+  it('styles the native-only detail blocks with the shared detail label and text', async () => {
+    mockGetHistory.mockResolvedValue({
+      items: [
+        historyItem({
+          context: 'practice-native',
+          nativeLanguage: 'te',
+          score: null,
+          passed: null,
+          understood: true,
+          transcript: 'ఆమె ధైర్యంగా ఉంది.',
+          translatedTranscript: 'She was brave.',
+          modelAnswer: 'She showed courage when she spoke up.',
+          feedback: 'You understood the question.',
+          recordingId: '550e8400-e29b-41d4-a716-446655440093',
+          recordingStatus: 'available',
+        }),
+      ],
+      nextCursor: null,
+    });
+    await renderHistory();
+    await screen.findByText('courage');
+    await fireEvent.press(screen.getByRole('button', { expanded: false }));
+
+    // The translation, example answer, and recording slots reuse the same
+    // label/text pairing every other detail block in the row uses.
+    expect(flattenedStyle(screen.getByText(t('feedback.englishTranslation')))).toEqual(
+      DETAIL_LABEL,
+    );
+    expect(flattenedStyle(screen.getByText('She was brave.'))).toEqual(DETAIL_TEXT);
+    expect(flattenedStyle(screen.getByText(t('feedback.exampleEnglishAnswer')))).toEqual(
+      DETAIL_LABEL,
+    );
+    expect(flattenedStyle(screen.getByText('She showed courage when she spoke up.'))).toEqual(
+      DETAIL_TEXT,
+    );
+    expect(flattenedStyle(screen.getByText(t('recordings.yourRecording')))).toEqual(DETAIL_LABEL);
+  });
 
   it('inserts one native ad only after the eighth real history item', async () => {
     const items = Array.from({ length: 8 }, (_, index) =>
@@ -1465,7 +1651,13 @@ describe('history screen', () => {
     expect(mockGetHistory).toHaveBeenCalledWith(undefined, expect.anything());
     expect(
       flattenedStyle(screen.getByRole('button', { name: t('history.loadMore') })),
-    ).toMatchObject({ marginTop: spacing.md });
+    ).toMatchObject({
+      marginTop: spacing.md,
+      // Load More is a full-width outlined secondary action.
+      borderWidth: 1,
+      borderColor: colors.primary,
+      alignSelf: 'stretch',
+    });
 
     await act(async () => {
       await fireEvent.press(screen.getByRole('button', { name: t('history.loadMore') }));
@@ -1536,6 +1728,11 @@ describe('history screen', () => {
     expect(screen.getByText('courage')).toBeTruthy();
     const terminal = screen.getByText(t('pagination.safetyStop'));
     expect(terminal.props.accessibilityLiveRegion).toBe('polite');
+    expect(flattenedStyle(terminal)).toEqual(MUTED_TEXT);
+    expect(flattenedStyle(parentOf(terminal))).toEqual({
+      paddingVertical: spacing.lg,
+      alignItems: 'center',
+    });
     expect(screen.queryByText(t('history.loadMore'))).toBeNull();
     await fireEvent(listView(), 'endReached', { distanceFromEnd: 0 });
     expect(mockGetHistory).not.toHaveBeenCalled();
@@ -1759,6 +1956,12 @@ describe('history screen', () => {
       paddingVertical: spacing.lg,
       alignItems: 'center',
     });
+    // The footer spinner is tinted with the brand ink.
+    expect(
+      screen.container
+        .queryAll((candidate) => candidate.props.color !== undefined)
+        .map((node) => node.props.color),
+    ).toEqual([colors.primary]);
 
     // Reaching the end again while that page is in flight must not re-request it.
     await act(async () => {

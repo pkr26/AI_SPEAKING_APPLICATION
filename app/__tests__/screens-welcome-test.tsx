@@ -288,3 +288,100 @@ describe('welcome screen deep contracts', () => {
     expect(asMock(router.navigate).mock.calls).toEqual([['/login'], ['/signup']]);
   });
 });
+
+// ---------------------------------------------------------------------------
+// State/prop wiring pins: screen chrome, scroll-container persistence, brand
+// and feature icon wiring, picker value, copy-column layout, and the CTA's
+// fullWidth/size/style wiring.
+// ---------------------------------------------------------------------------
+
+describe('welcome wiring contracts', () => {
+  it('pins the screen chrome and the keyboard-persistent scroll container', async () => {
+    const theme = await lightTheme();
+    await render(<WelcomeScreen />);
+
+    const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+    if (!scrollView) throw new Error('No ScrollView rendered');
+    expect(StyleSheet.flatten(scrollView.parent?.props.style)).toEqual({
+      flex: 1,
+      backgroundColor: lightColors.background,
+    });
+    expect(StyleSheet.flatten(scrollView.props.contentContainerStyle)).toEqual({
+      flexGrow: 1,
+      justifyContent: 'center',
+      padding: theme.layout.screenPadding,
+      width: '100%',
+      maxWidth: theme.layout.formMaxWidth,
+      alignSelf: 'center',
+      gap: theme.spacing.md,
+    });
+    expect(scrollView.props.keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('pins the brand icon glyph, square, ink, and stroke', async () => {
+    const theme = await lightTheme();
+    await render(<WelcomeScreen />);
+
+    const header = screen.getByRole('header', { name: t('login.title') });
+    const brandMark = nodeChild(header.parent!, 0);
+    const children = brandMark.props.children as
+      | React.ReactElement<{
+          name?: string;
+          size?: number;
+          color?: string;
+          strokeWidth?: number;
+        }>
+      | React.ReactElement<{
+          name?: string;
+          size?: number;
+          color?: string;
+          strokeWidth?: number;
+        }>[];
+    const icon = Array.isArray(children) ? children[0] : children;
+    if (!icon) throw new Error('No brand icon rendered');
+    expect(icon.props.name).toBe('mic');
+    expect(icon.props.size).toBe(34);
+    expect(icon.props.color).toBe(theme.colors.primary);
+    expect(icon.props.strokeWidth).toBe(2.1);
+  });
+
+  it('pins the app-language picker value to the device preference', async () => {
+    await render(<WelcomeScreen />);
+
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+  });
+
+  it.each([
+    ['welcome-feature-mic', 'mic'],
+    ['welcome-feature-sparkle', 'sparkle'],
+    ['welcome-feature-trending-up', 'trending-up'],
+  ] as const)('pins the %s glyph name and copy column', async (testID, glyph) => {
+    await render(<WelcomeScreen />);
+    const card = screen.getByTestId(testID, { includeHiddenElements: true });
+
+    const badge = nodeChild(card, 0);
+    const children = badge.props.children as
+      React.ReactElement<{ name?: string }> | React.ReactElement<{ name?: string }>[];
+    const icon = Array.isArray(children) ? children[0] : children;
+    if (!icon) throw new Error(`No icon rendered inside ${testID}`);
+    expect(icon.props.name).toBe(glyph);
+
+    const copyColumn = nodeChild(card, card.children.length - 1);
+    expect(StyleSheet.flatten(copyColumn.props.style)).toEqual({ flexShrink: 1 });
+  });
+
+  it('pins the primary CTA full-width large layout and action margin', async () => {
+    const theme = await lightTheme();
+    await render(<WelcomeScreen />);
+
+    const cta = screen.getByRole('button', { name: t('welcome.getStarted') });
+    expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ alignSelf: 'stretch' });
+    expect(StyleSheet.flatten(cta.props.style)).toMatchObject({
+      paddingVertical: theme.spacing.ml,
+    });
+    expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ marginTop: theme.spacing.lg });
+  });
+});

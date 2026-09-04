@@ -988,6 +988,158 @@ describe('RecordingPlayback', () => {
     ).toEqual({ disabled: true, busy: true });
   });
 
+  it('pins the authored initial playback surface before any lifecycle normalization', async () => {
+    await renderPlayback({ recordingStatus: 'retention_pending' });
+
+    // The pending line renders only while the phase seed is exactly 'idle',
+    // the share action title only while the sharing seed is false, and the
+    // detail slot stays alert-free only while the error seed is null.
+    expect(screen.getByTestId('recording-playback-pending')).toHaveTextContent(
+      t('recordings.pending'),
+    );
+    expect(screen.getByText(t('recordings.shareAction'))).toBeTruthy();
+    expect(screen.queryByRole('alert')).toBeNull();
+    // The clock seeds must both read zero: a carried position or duration on
+    // the very first paint would render the idle progress row.
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+    expect(screen.queryByText('0:01 / 0:00')).toBeNull();
+  });
+
+  it('retires the progress readout with its clock when playback stops', async () => {
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    await act(async () => {
+      players[0].emit({
+        currentTime: 2,
+        duration: 8,
+        playing: true,
+        isLoaded: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByText('0:02 / 0:08')).toBeTruthy();
+
+    // Backgrounding stops playback: the shared reset must clear BOTH clock
+    // readings together with the phase, so no idle row survives with a stale
+    // position or duration.
+    await emitAppState('background');
+    expect(screen.getByTestId('recording-playback-container')).toBeTruthy();
+    expect(screen.queryByTestId('recording-playback-progress')).toBeNull();
+    expect(screen.queryByText('0:02 / 0:08')).toBeNull();
+    expect(screen.queryByText('0:02 / 0:00')).toBeNull();
+    expect(screen.queryByText('0:00 / 0:08')).toBeNull();
+  });
+
+  it('marks the share action busy while its owned operation is in flight', async () => {
+    const grantPending = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(grantPending.promise);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    expect(
+      screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: true, busy: true });
+
+    grantPending.resolve(grant());
+    await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+    expect(
+      screen.getByRole('button', { name: t('recordings.shareLabel') }).props.accessibilityState,
+    ).toEqual({ disabled: false, busy: false });
+  });
+
+  it('clears a stale share error as soon as a new share starts', async () => {
+    asMock(Sharing.isAvailableAsync).mockResolvedValueOnce(false);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(t('recordings.shareUnavailable')),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.shareLabel') }));
+    await waitFor(() => expect(Sharing.shareAsync).toHaveBeenCalledTimes(1));
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('clears a stale playback error the moment a delete starts', async () => {
+    asMock(apiGetRecordingPlaybackGrant).mockRejectedValueOnce(new Error('grant failed'));
+    const deletePending = deferred<void>();
+    asMock(apiDeleteRecording).mockReturnValue(deletePending.promise);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(screen.getByRole('alert')).toBeTruthy());
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.deleteAction') }));
+    const destructive = alertActions().find(
+      (action) => (action as { text?: string }).text === t('recordings.deleteAction'),
+    );
+    await act(async () => {
+      void destructive?.onPress?.();
+      await flushMicrotasks();
+    });
+    // The deleting phase reuses the shared detail slot, so the stale playback
+    // error must be gone before the deletion's own outcome can replace it.
+    expect(screen.queryByTestId('recording-playback-error')).toBeNull();
+
+    deletePending.resolve(undefined);
+    await waitFor(() => expect(screen.getByTestId('recording-playback-deleted')).toBeTruthy());
+  });
+
+  it('republishes the paused player as playing without a fresh status event', async () => {
+    // Without auto-emitting play(), the resume path is the only thing that
+    // can flip the paused surface back to playing.
+    mockAutoLoadPlayer = false;
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    await waitFor(() => expect(players).toHaveLength(1));
+    await act(async () => {
+      players[0].emit({
+        currentTime: 2,
+        duration: 8,
+        playing: true,
+        isLoaded: true,
+        didJustFinish: false,
+        error: null,
+      });
+    });
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.pauseLabel') }));
+    expect(screen.getByText(t('recorder.play'))).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-progress')).toBeTruthy();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    expect(players[0].play).toHaveBeenCalledTimes(2);
+    expect(screen.getByText(t('recorder.pause'))).toBeTruthy();
+    expect(screen.getByTestId('recording-playback-progress')).toBeTruthy();
+  });
+
+  it('pins the preparing status copy with its exact muted style', async () => {
+    const grantPending = deferred<ReturnType<typeof grant>>();
+    asMock(apiGetRecordingPlaybackGrant).mockReturnValue(grantPending.promise);
+    await renderPlayback();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.playLabel') }));
+    expect(screen.getByTestId('recording-playback-preparing')).toHaveTextContent(
+      t('recordings.preparing'),
+    );
+    expect(
+      StyleSheet.flatten(screen.getByTestId('recording-playback-preparing').props.style),
+    ).toEqual({
+      marginTop: spacing.sm,
+      color: lightColors.muted,
+      fontSize: 14,
+    });
+
+    grantPending.resolve(grant());
+    await waitFor(() => expect(players).toHaveLength(1));
+  });
+
   it('fetches a short-lived URL only after Play and handles play, progress, pause, and rewind', async () => {
     await renderPlayback();
     expect(apiGetRecordingPlaybackGrant).not.toHaveBeenCalled();

@@ -1,7 +1,7 @@
 import * as SecureStore from 'expo-secure-store';
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
 import React, { useEffect } from 'react';
-import { StyleSheet, Text } from 'react-native';
+import { Pressable, StyleSheet, Text } from 'react-native';
 
 import UiLanguagePicker from '../src/components/UiLanguagePicker';
 import { NATIVE_LANGUAGE_OPTIONS, UI_LANGUAGE_OPTIONS } from '../src/lib/language-options';
@@ -35,6 +35,18 @@ jest.mock('expo-secure-store', () => ({
   deleteItemAsync: jest.fn(),
 }));
 
+// The provider derives its restore fallback from the device language. The real
+// helper caches for the process lifetime, so the fallback-change tests steer a
+// controllable stand-in instead; every other i18n export stays real.
+let deviceLanguageForProvider: UiLanguage = 'en';
+function mockDeviceLanguage(): UiLanguage {
+  return deviceLanguageForProvider;
+}
+jest.mock('../src/lib/i18n', () => ({
+  ...jest.requireActual('../src/lib/i18n'),
+  deviceLanguage: mockDeviceLanguage,
+}));
+
 const mockGetItem = jest.mocked(SecureStore.getItemAsync);
 const mockSetItem = jest.mocked(SecureStore.setItemAsync);
 const mockDeleteItem = jest.mocked(SecureStore.deleteItemAsync);
@@ -61,6 +73,8 @@ function PreferenceProbe() {
       <Text testID="guest-language">{guest.language}</Text>
       <Text testID="guest-restoring">{String(guest.isRestoring)}</Text>
       <Text testID="guest-error">{guest.persistenceError ?? 'none'}</Text>
+      {/* Raw value distinguishes the authored `null` from a falsy hostile. */}
+      <Text testID="guest-error-raw">{String(guest.persistenceError)}</Text>
     </>
   );
 }
@@ -72,11 +86,13 @@ function PickerHarness({ accountLanguage = null }: { accountLanguage?: UiLanguag
   }, [guest]);
   return (
     <I18nProvider accountLanguage={accountLanguage} guestLanguage={guest.language}>
-      <UiLanguagePicker
-        value={guest.language}
-        onChange={guest.setLanguage}
-        error={guest.persistenceError}
-      />
+      <RenderCrashBoundary>
+        <UiLanguagePicker
+          value={guest.language}
+          onChange={guest.setLanguage}
+          error={guest.persistenceError}
+        />
+      </RenderCrashBoundary>
       <LocalizedCopyProbe />
     </I18nProvider>
   );
@@ -85,6 +101,33 @@ function PickerHarness({ accountLanguage = null }: { accountLanguage?: UiLanguag
 function LocalizedCopyProbe() {
   const { language, t } = useI18n();
   return <Text testID="localized-language">{`${language}:${t('login.submit')}`}</Text>;
+}
+
+/**
+ * Renders fallback copy when a child render throws. The picker's language
+ * grid calls its required accessibilityLabelFor prop at render time, so a
+ * wiring mutant that drops that attribute would crash the reconciler and fail
+ * every owning test with a raw TypeError (classified Error, not a kill). The
+ * boundary swaps the crash for fallback copy, so those tests fail on Testing
+ * Library query evidence — including the chip-label assertions that pin the
+ * authored labelFor output — instead.
+ */
+class RenderCrashBoundary extends React.Component<
+  { children: React.ReactNode },
+  { crashed: boolean }
+> {
+  state = { crashed: false };
+
+  static getDerivedStateFromError() {
+    return { crashed: true };
+  }
+
+  render() {
+    if (this.state.crashed) {
+      return <Text testID="render-crash-fallback">render crashed</Text>;
+    }
+    return this.props.children;
+  }
 }
 
 function provider(child: React.ReactNode) {
@@ -103,6 +146,7 @@ beforeEach(() => {
   mockGetItem.mockResolvedValue(null);
   mockSetItem.mockResolvedValue(undefined);
   mockDeleteItem.mockResolvedValue(undefined);
+  deviceLanguageForProvider = 'en';
   setActiveLanguage('en');
 });
 
@@ -118,6 +162,9 @@ describe('GuestLanguageProvider restore and persistence', () => {
 
     expect(screen.getByTestId('guest-restoring')).toHaveTextContent('true');
     expect(screen.getByTestId('guest-language')).toHaveTextContent(deviceLanguage());
+    // No restore has settled yet, so the authored initial state is exactly
+    // null — not an unnamed falsy value that renders the same.
+    expect(screen.getByTestId('guest-error-raw')).toHaveTextContent('null');
     expect(mockGetItem).toHaveBeenCalledWith(
       guestLanguageStorage.key,
       guestLanguageStorage.options,
@@ -358,12 +405,14 @@ describe('public app-language picker', () => {
       }, [guest]);
       return (
         <I18nProvider accountLanguage={null} guestLanguage={guest.language}>
-          <UiLanguagePicker
-            value={guest.language}
-            onChange={guest.setLanguage}
-            disabled={disabled}
-            error={guest.persistenceError}
-          />
+          <RenderCrashBoundary>
+            <UiLanguagePicker
+              value={guest.language}
+              onChange={guest.setLanguage}
+              disabled={disabled}
+              error={guest.persistenceError}
+            />
+          </RenderCrashBoundary>
         </I18nProvider>
       );
     }
@@ -437,6 +486,106 @@ describe('guest language storage contract', () => {
       keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY,
       keychainService: 'ai-english-coach.ui-language',
     });
+  });
+});
+
+describe('guest language restore reruns on fallback changes', () => {
+  /**
+   * Re-renders the provider with a changed device-language fallback without
+   * remounting it, so the restore effect's success/catch paths run against
+   * state that already carries a learner's choice and a prior save error.
+   */
+  function ProviderRerenderHost() {
+    const [nonce, setNonce] = React.useState(0);
+    return (
+      <GuestLanguageProvider>
+        <PreferenceProbe />
+        <Text testID="provider-nonce">{String(nonce)}</Text>
+        <Pressable
+          accessibilityRole="button"
+          testID="rerender-provider"
+          onPress={() => setNonce((value) => value + 1)}
+        >
+          <Text>Rerender provider</Text>
+        </Pressable>
+      </GuestLanguageProvider>
+    );
+  }
+
+  it('clears a failed-save error when a fallback change re-runs a successful restore', async () => {
+    mockSetItem.mockRejectedValueOnce(new Error('store unavailable'));
+    await render(<ProviderRerenderHost />);
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+
+    await act(async () => {
+      preference!.setLanguage('zh');
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('guest-error')).toHaveTextContent(
+        translateFor('zh', 'language.saveFailed'),
+      ),
+    );
+
+    deviceLanguageForProvider = 'es';
+    await fireEvent.press(screen.getByTestId('rerender-provider'));
+    await waitFor(() => expect(mockGetItem).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('es');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent('none');
+    expect(screen.getByTestId('guest-error-raw')).toHaveTextContent('null');
+  });
+
+  it('falls back to the new device language and clears the error when a re-run restore cannot read storage', async () => {
+    mockSetItem.mockRejectedValueOnce(new Error('store unavailable'));
+    await render(<ProviderRerenderHost />);
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+
+    await act(async () => {
+      preference!.setLanguage('zh');
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('guest-error')).toHaveTextContent(
+        translateFor('zh', 'language.saveFailed'),
+      ),
+    );
+
+    deviceLanguageForProvider = 'es';
+    mockGetItem.mockRejectedValueOnce(new Error('keychain locked'));
+    await fireEvent.press(screen.getByTestId('rerender-provider'));
+    await waitFor(() => expect(mockGetItem).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('es');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent('none');
+    expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false');
+  });
+
+  it('clears a stale save error the moment the next choice starts saving', async () => {
+    mockSetItem.mockRejectedValueOnce(new Error('store unavailable'));
+    await render(provider(<PreferenceProbe />));
+    await waitFor(() => expect(screen.getByTestId('guest-restoring')).toHaveTextContent('false'));
+
+    await act(async () => {
+      preference!.setLanguage('zh');
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('guest-error')).toHaveTextContent(
+        translateFor('zh', 'language.saveFailed'),
+      ),
+    );
+
+    await act(async () => {
+      preference!.setLanguage('te');
+    });
+    await waitFor(() => expect(mockSetItem).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('guest-language')).toHaveTextContent('te');
+    expect(screen.getByTestId('guest-error')).toHaveTextContent('none');
+    expect(screen.getByTestId('guest-error-raw')).toHaveTextContent('null');
   });
 });
 
@@ -548,7 +697,9 @@ function StyledPickerHarness({
 }) {
   return (
     <I18nProvider accountLanguage={null} guestLanguage="en">
-      <UiLanguagePicker value={value} onChange={jest.fn()} disabled={disabled} error={error} />
+      <RenderCrashBoundary>
+        <UiLanguagePicker value={value} onChange={jest.fn()} disabled={disabled} error={error} />
+      </RenderCrashBoundary>
     </I18nProvider>
   );
 }
@@ -565,6 +716,12 @@ describe('UiLanguagePicker presentation', () => {
     );
     expect(screen.getByText('Choose the language used by the app on this device.')).toBeTruthy();
     expect(screen.getByText('App language')).toBeTruthy();
+    // The two headings carry stable native ids so other controls can reference
+    // them without depending on localized copy.
+    expect(screen.getByText('App language').props.nativeID).toBe('ui-language-label');
+    expect(
+      screen.getByText('Choose the language used by the app on this device.').props.nativeID,
+    ).toBe('ui-language-help');
 
     // The autonym-only option (English) carries no second line; every other
     // chip speaks its localized name and autonym together.

@@ -7,7 +7,7 @@ import {
   waitFor,
   within,
 } from '@testing-library/react-native';
-import { AccessibilityInfo, Animated, StyleSheet } from 'react-native';
+import { AccessibilityInfo, Animated, RefreshControl, StyleSheet } from 'react-native';
 import React from 'react';
 
 import Button from '../src/components/Button';
@@ -46,6 +46,22 @@ function childAt(
   index = 0,
 ): { props: Record<string, unknown>; children: unknown[] } {
   return node.children[index] as { props: Record<string, unknown>; children: unknown[] };
+}
+
+/** Authored SVG primitives of an Icon host's Svg element (fragment unwrapped). */
+function svgPrimitives(
+  svg: React.ReactElement<{ children?: unknown }>,
+): React.ReactElement<{ [prop: string]: unknown }>[] {
+  const rendered: unknown = svg.props.children;
+  if (rendered === undefined || rendered === null) return [];
+  const children =
+    React.isValidElement(rendered) && rendered.type === React.Fragment
+      ? (rendered.props as { children?: unknown }).children
+      : rendered;
+  if (children === undefined || children === null) return [];
+  return (Array.isArray(children) ? children : [children]) as React.ReactElement<{
+    [prop: string]: unknown;
+  }>[];
 }
 
 // Animation-config spies: components must call the Animated factory API with
@@ -175,14 +191,18 @@ describe('ProgressBar', () => {
     );
     expect(toJSON()).not.toBeNull();
     const bar = screen.getByRole('progressbar', { name: 'Progress' });
-    expect(bar.props.accessibilityValue.now).toBe(80);
+    // Assert the whole value object: reading `.now` off a removed value would
+    // crash the test instead of failing on matcher evidence.
+    expect(bar.props.accessibilityValue).toEqual({ min: 0, max: 100, now: 80 });
   });
 
   it('clamps non-finite and out-of-range progress', async () => {
     await render(<ProgressBar progress={Number.NaN} accessibilityLabel="Progress" />);
-    expect(screen.getByRole('progressbar', { name: 'Progress' }).props.accessibilityValue.now).toBe(
-      0,
-    );
+    expect(screen.getByRole('progressbar', { name: 'Progress' }).props.accessibilityValue).toEqual({
+      min: 0,
+      max: 100,
+      now: 0,
+    });
   });
 
   it('exposes count semantics instead of a percent when counts are supplied', async () => {
@@ -229,6 +249,9 @@ describe('WordTaggedTranscript', () => {
       <WordTaggedTranscript transcript="I showed courage." accessibilityLanguage="en-US" />,
     );
     expect(screen.getByText('I showed courage.')).toBeTruthy();
+    // The fallback text itself carries the spoken content's language tag so a
+    // screen reader pronounces the untagged transcript with the right voice.
+    expect(screen.getByText('I showed courage.').props.accessibilityLanguage).toBe('en-US');
     expect(screen.queryByTestId('word-chip-row')).toBeNull();
   });
 
@@ -256,8 +279,10 @@ describe('WordTaggedTranscript', () => {
   it('names each chip with its word and localized status for screen readers', async () => {
     await render(<WordTaggedTranscript transcript="I brung courage." wordScores={TAGS} />);
     // Status is not color-only for assistive tech: the legend is hidden, so
-    // the chip's own accessible name carries the verdict.
-    expect(screen.getByLabelText('I, Good')).toBeTruthy();
+    // the chip's own accessible name carries the verdict. Each chip View is
+    // itself the focusable element carrying that merged name.
+    const chip = screen.getByLabelText('I, Good');
+    expect(chip.props.accessible).toBe(true);
     expect(screen.getByLabelText('brung, Practice')).toBeTruthy();
     expect(screen.getByLabelText('courage, Close')).toBeTruthy();
   });
@@ -812,6 +837,10 @@ describe('WordTaggedTranscript styling', () => {
       flexDirection: 'row',
       marginTop: theme.spacing.sm,
     });
+    // The legend is pure visual redundancy for the chip names, so it hides
+    // from assistive tech entirely on both platforms.
+    expect(legendRow.props.accessibilityElementsHidden).toBe(true);
+    expect(legendRow.props.importantForAccessibility).toBe('no-hide-descendants');
     const dot = childAt(legendItem);
     expect(StyleSheet.flatten(dot.props.style)).toMatchObject({
       width: 8,
@@ -1063,5 +1092,289 @@ describe('optional testID and slot wiring', () => {
     // mounted below the ring when no label is supplied.
     expect(host.props.children[1]).toBeNull();
     expect(screen.getByText('50')).toBeTruthy();
+  });
+});
+
+describe('Confetti overlay wiring', () => {
+  it('pins the overlay pointer-events, testID, and full-bleed style', async () => {
+    await render(<Confetti count={2} testID="burst-overlay" />);
+    const overlay = screen.getByTestId('burst-overlay', { includeHiddenElements: true });
+    // Celebration is decoration: the overlay never intercepts touches and
+    // stays fully hidden from assistive tech.
+    expect(overlay.props.pointerEvents).toBe('none');
+    expect(overlay.props.accessibilityElementsHidden).toBe(true);
+    expect(overlay.props.importantForAccessibility).toBe('no-hide-descendants');
+    expect(StyleSheet.flatten(overlay.props.style)).toMatchObject({
+      position: 'absolute',
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: 0,
+      overflow: 'hidden',
+      zIndex: 10,
+    });
+  });
+});
+
+describe('EmptyState scroll wiring', () => {
+  it('forwards the automatic inset behavior and the live refresh control', async () => {
+    const onRefresh = jest.fn();
+    await render(
+      <EmptyState
+        icon="clock"
+        title="No answers yet"
+        body="History appears here."
+        refreshControl={<RefreshControl refreshing={false} onRefresh={onRefresh} />}
+        testID="empty-scroll"
+      />,
+    );
+    const scroll = screen.getByTestId('empty-scroll');
+    expect(scroll.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    const forwarded = scroll.props.refreshControl as
+      { props: { refreshing: boolean; onRefresh: typeof onRefresh } } | undefined;
+    expect(forwarded).toBeDefined();
+    expect(forwarded?.props.onRefresh).toBe(onRefresh);
+    expect(forwarded?.props.refreshing).toBe(false);
+  });
+
+  it('draws the mark glyph at the authored badge size', async () => {
+    await render(<EmptyState icon="home" title="No answers yet" body="Nothing here." />);
+    const contentHost = screen.getByRole('header', { name: 'No answers yet' }).parent!;
+    const markBadge = childAt(contentHost, 0);
+    const iconHost = childAt(markBadge, 0);
+    const svg = iconHost.props.children as React.ReactElement<{
+      width?: number;
+      height?: number;
+      children?: unknown;
+    }>;
+    // The home glyph draws as three stroked paths at the friendly-mark size.
+    const primitives = svgPrimitives(svg);
+    expect(primitives).toHaveLength(3);
+    expect(primitives[0].props.d).toBe('M3.5 10.5 12 3.5l8.5 7');
+    expect(svg.props.width).toBe(30);
+    expect(svg.props.height).toBe(30);
+  });
+
+  it('caps dynamic type growth on the title and body', async () => {
+    await render(<EmptyState icon="clock" title="No answers yet" body="Nothing here." />);
+    expect(screen.getByRole('header', { name: 'No answers yet' }).props.maxFontSizeMultiplier).toBe(
+      1.8,
+    );
+    expect(screen.getByText('Nothing here.').props.maxFontSizeMultiplier).toBe(1.8);
+  });
+});
+
+describe('PasswordStrengthMeter wiring', () => {
+  it('pins the row testID and strip layout', async () => {
+    const theme = await lightTheme();
+    await render(<PasswordStrengthMeter password="short" testID="meter-wired" />);
+    const row = screen.getByTestId('meter-wired');
+    // The row itself is the screen-reader element: the merged tier label is
+    // announced once for the whole strip, not per decorative segment.
+    expect(row.props.accessible).toBe(true);
+    expect(StyleSheet.flatten(row.props.style)).toMatchObject({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: theme.spacing.md,
+      marginTop: theme.spacing.xs,
+    });
+  });
+
+  it('pins the segment strip geometry and the weak tier fills', async () => {
+    const theme = await lightTheme();
+    await render(<PasswordStrengthMeter password="short" />);
+    const row = screen.getByLabelText('Weak');
+    const segmentsHost = childAt(row, 0);
+    expect(StyleSheet.flatten(segmentsHost.props.style)).toMatchObject({
+      flexDirection: 'row',
+      gap: theme.spacing.xs,
+      flex: 1,
+    });
+    expect(segmentsHost.children).toHaveLength(3);
+    for (let index = 0; index < 3; index += 1) {
+      const segment = childAt(segmentsHost, index);
+      const segmentStyle = StyleSheet.flatten(
+        segment.props.style as { backgroundColor?: string },
+      ) as { backgroundColor?: string } | undefined;
+      expect(segmentStyle).toMatchObject({
+        flex: 1,
+        height: 5,
+        borderRadius: theme.radii.pill,
+      });
+      expect(segmentStyle?.backgroundColor).toBe(
+        index === 0 ? lightColors.danger : lightColors.border,
+      );
+    }
+    expect(StyleSheet.flatten(screen.getByText('Weak').props.style)).toMatchObject({
+      color: lightColors.danger,
+      fontSize: theme.type.caption.fontSize,
+      fontWeight: '700',
+    });
+  });
+});
+
+describe('PasswordVisibilityToggle wiring', () => {
+  it('widens the tap target around the glyph with a hit slop', async () => {
+    await render(
+      <PasswordVisibilityToggle
+        visible={false}
+        accessibilityLabel="Show password"
+        onToggle={jest.fn()}
+        testID="vt-wired"
+      />,
+    );
+    expect(screen.getByTestId('vt-wired').props.hitSlop).toBe(4);
+  });
+
+  it('draws the masked eye at the affordance size in primary ink', async () => {
+    await render(
+      <PasswordVisibilityToggle
+        visible={false}
+        accessibilityLabel="Show password"
+        onToggle={jest.fn()}
+      />,
+    );
+    const toggle = screen.getByRole('button', { name: 'Show password' });
+    const iconHost = childAt(toggle, 0);
+    const svg = iconHost.props.children as React.ReactElement<{
+      width?: number;
+      height?: number;
+      children?: unknown;
+    }>;
+    expect(svg.props.width).toBe(22);
+    expect(svg.props.height).toBe(22);
+    const primitives = svgPrimitives(svg);
+    expect(primitives).toHaveLength(2);
+    for (const primitive of primitives) {
+      expect(primitive.props.stroke).toBe(lightColors.primary);
+    }
+  });
+});
+
+describe('ScoreRing wiring', () => {
+  it('tags the ring host and pins the ring box square', async () => {
+    await render(
+      <ScoreRing score={50} size={100} accessibilityLabel="Wired ring" testID="ring-wired" />,
+    );
+    const host = screen.getByTestId('ring-wired');
+    const ringBox = host.props.children[0];
+    expect(StyleSheet.flatten(ringBox.props.style)).toMatchObject({ width: 100, height: 100 });
+  });
+
+  it('scales the svg canvas to the requested diameter', async () => {
+    await render(<ScoreRing score={50} size={100} accessibilityLabel="Canvas ring" />);
+    const host = screen.getByRole('progressbar', { name: 'Canvas ring' });
+    const ringBox = host.props.children[0];
+    const svg = ringBox.props.children[0];
+    expect(svg.props.width).toBe(100);
+    expect(svg.props.height).toBe(100);
+  });
+
+  it('wires the arc dash offset to the animated progress value', async () => {
+    await render(<ScoreRing score={50} size={100} accessibilityLabel="Offset ring" />);
+    const host = screen.getByRole('progressbar', { name: 'Offset ring' });
+    const ringBox = host.props.children[0];
+    const svg = ringBox.props.children[0];
+    const arc = svg.props.children[1];
+    expect(arc.props.strokeDashoffset).toBeDefined();
+  });
+
+  it('pins the centered numeral overlay pointer-events and geometry', async () => {
+    await render(<ScoreRing score={50} size={100} accessibilityLabel="Overlay ring" />);
+    const host = screen.getByRole('progressbar', { name: 'Overlay ring' });
+    const ringBox = host.props.children[0];
+    const overlay = ringBox.props.children[1];
+    expect(overlay.props.pointerEvents).toBe('none');
+    expect(StyleSheet.flatten(overlay.props.style)).toMatchObject({
+      position: 'absolute',
+      left: 0,
+      top: 0,
+      right: 0,
+      bottom: 0,
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+  });
+
+  it('caps dynamic type growth on the numeral and caption', async () => {
+    await render(<ScoreRing score={50} label="of 100" accessibilityLabel="Capped ring" />);
+    expect(screen.getByText('50').props.maxFontSizeMultiplier).toBe(1.4);
+    expect(screen.getByText('of 100').props.maxFontSizeMultiplier).toBe(1.4);
+  });
+});
+
+describe('StatTile wiring', () => {
+  it('pins the badge glyph name and the clamped, type-capped texts', async () => {
+    await render(<StatTile icon="flame" value="7" label="Day streak" testID="tile-wired" />);
+    const tile = screen.getByTestId('tile-wired');
+    const badge = childAt(tile, 0);
+    const iconElement = badge.props.children as React.ReactElement<{ name?: string }>;
+    expect(iconElement.props.name).toBe('flame');
+    const value = within(tile).getByText('7');
+    expect(value.props.numberOfLines).toBe(1);
+    expect(value.props.maxFontSizeMultiplier).toBe(1.4);
+    const caption = within(tile).getByText('Day streak');
+    expect(caption.props.numberOfLines).toBe(2);
+    expect(caption.props.maxFontSizeMultiplier).toBe(1.6);
+  });
+});
+
+describe('WordTaggedTranscript wiring', () => {
+  it('keeps the plain fallback transcript selectable', async () => {
+    await render(<WordTaggedTranscript transcript="Plain words." />);
+    expect(screen.getByText('Plain words.').props.selectable).toBe(true);
+  });
+
+  it('pins the tagged wrapper testID and the chip row layout', async () => {
+    const theme = await lightTheme();
+    await render(
+      <WordTaggedTranscript
+        transcript="I try."
+        wordScores={[{ word: 'I', status: 'good' }]}
+        accessibilityLanguage="en-US"
+        testID="tagged-wired"
+      />,
+    );
+    const wrap = screen.getByTestId('tagged-wired');
+    expect(StyleSheet.flatten(wrap.props.style)).toMatchObject({
+      marginTop: theme.spacing.sm,
+      alignSelf: 'stretch',
+    });
+    const chipRow = wrap.props.children[0];
+    expect(StyleSheet.flatten(chipRow.props.style)).toMatchObject({
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      gap: theme.spacing.xs,
+      alignItems: 'center',
+    });
+    // The spoken words sit on the chip row itself, so every chip inherits the
+    // authored language tag instead of announcing in the UI language.
+    expect(chipRow.props.accessibilityLanguage).toBe('en-US');
+  });
+
+  it('keeps each chip word selectable with the simple break strategy', async () => {
+    await render(
+      <WordTaggedTranscript transcript="I try." wordScores={[{ word: 'I', status: 'good' }]} />,
+    );
+    const chip = screen.getByLabelText('I, Good');
+    const word = within(chip).getByText('I');
+    expect(word.props.selectable).toBe(true);
+    expect(word.props.textBreakStrategy).toBe('simple');
+  });
+
+  it('pins the good-chip check glyph name, size, ink, and weight', async () => {
+    await render(
+      <WordTaggedTranscript transcript="I try." wordScores={[{ word: 'I', status: 'good' }]} />,
+    );
+    const chip = screen.getByLabelText('I, Good');
+    const iconElement = (
+      chip.props.children as React.ReactElement<{
+        [prop: string]: unknown;
+      }>[]
+    )[1];
+    expect(iconElement.props.name).toBe('check');
+    expect(iconElement.props.size).toBe(11);
+    expect(iconElement.props.color).toBe(lightColors.success);
+    expect(iconElement.props.strokeWidth).toBe(3);
   });
 });

@@ -394,9 +394,39 @@ function makeQueryClient(): QueryClient {
   return client;
 }
 
+/**
+ * Renders fallback copy when a child render throws. The settings and signup
+ * screens call their language grids' required accessibilityLabelFor prop at
+ * render time, so a wiring mutant that drops that attribute would crash the
+ * reconciler and fail every owning test with a raw TypeError (classified
+ * Error, not a kill). The boundary swaps the crash for fallback copy, so those
+ * tests fail on Testing Library query evidence instead.
+ */
+class RenderCrashBoundary extends React.Component<
+  { children: React.ReactNode },
+  { crashed: boolean }
+> {
+  state = { crashed: false };
+
+  static getDerivedStateFromError() {
+    return { crashed: true };
+  }
+
+  render() {
+    if (this.state.crashed) {
+      return <Text testID="render-crash-fallback">render crashed</Text>;
+    }
+    return this.props.children;
+  }
+}
+
 async function renderWithQueryClient(ui: React.ReactElement) {
   const client = makeQueryClient();
-  return render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>);
+  return render(
+    <QueryClientProvider client={client}>
+      <RenderCrashBoundary>{ui}</RenderCrashBoundary>
+    </QueryClientProvider>,
+  );
 }
 
 async function renderSettings(user: User = USER): Promise<void> {

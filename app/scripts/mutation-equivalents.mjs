@@ -54,7 +54,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['""'],
     reason:
       "identityKey is an internal React-only scoping key consumed by refs and effect dependencies; the 'anonymous' fallback spelling never reaches rendered output, and every observable transition already keys on identity through sessionVersion/userId equality.",
-    locations: exactLocations(67, 54, 67, 65),
+    locations: exactLocations(72, 54, 72, 65),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -63,7 +63,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The replay-binding chain is repaired synchronously in the render body before this expression evaluates: a non-null diagnosticReplay always has a fresh binding, and a null replay short-circuits the operand so the optional chain and equality can never diverge observably.',
-    locations: exactLocations(89, 5, 89, 53),
+    locations: exactLocations(94, 5, 94, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -72,7 +72,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['activeReplayBinding.replay'],
     reason:
       'The replay-binding chain is repaired synchronously in the render body before this expression evaluates: a non-null diagnosticReplay always has a fresh binding, and a null replay short-circuits the operand so the optional chain and equality can never diverge observably.',
-    locations: exactLocations(89, 5, 89, 32),
+    locations: exactLocations(94, 5, 94, 32),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -85,7 +85,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['() => undefined'],
     reason:
       "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
-    locations: exactLocations(101, 5, 101, 50, 104, 5, 104, 53),
+    locations: exactLocations(106, 5, 106, 50, 109, 5, 109, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -94,7 +94,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay?.result && null'],
     reason:
       "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
-    locations: exactLocations(101, 11, 101, 50),
+    locations: exactLocations(106, 11, 106, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -103,7 +103,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay?.requestId && null'],
     reason:
       "Both replay-seed and identity-reset layout effects run in the same first commit and overwrite result/resultRequestId state from the replay pointer, so the lazy initializer's value never reaches an observable render.",
-    locations: exactLocations(104, 11, 104, 53),
+    locations: exactLocations(109, 11, 109, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -114,7 +114,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['() => undefined'],
     reason:
       'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
-    locations: exactLocations(109, 52, 109, 90),
+    locations: exactLocations(114, 52, 114, 90),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -125,7 +125,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
-    locations: exactLocations(109, 58, 109, 90),
+    locations: exactLocations(114, 58, 114, 90),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -136,7 +136,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
-    locations: exactLocations(109, 58, 109, 90),
+    locations: exactLocations(114, 58, 114, 90),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -147,7 +147,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay === null'],
     reason:
       'The identity-reset layout effect re-initializes introStarted in the same first commit (false, or true via the replay seed), so the lazy initializer never reaches an observable render.',
-    locations: exactLocations(109, 58, 109, 90),
+    locations: exactLocations(114, 58, 114, 90),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -156,7 +156,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['["Stryker was here"]'],
     reason:
       'The identity-reset layout effect resets answers in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(110, 69, 110, 71),
+    locations: exactLocations(115, 69, 115, 71),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -165,7 +165,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses recorderLockedRef in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(112, 36, 112, 41),
+    locations: exactLocations(117, 36, 117, 41),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -174,7 +174,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses the exit-lock state in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(113, 64, 113, 69),
+    locations: exactLocations(118, 64, 118, 69),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -183,7 +183,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect and the recorder-owner layout effect both re-falses this ref in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(114, 40, 114, 45),
+    locations: exactLocations(119, 40, 119, 45),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -192,7 +192,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses logoutBusyRef in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(115, 32, 115, 37),
+    locations: exactLocations(120, 32, 120, 37),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -201,7 +201,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses the logout busy state in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(116, 48, 116, 53),
+    locations: exactLocations(121, 48, 121, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -210,7 +210,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses practiceStartRef in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(117, 35, 117, 40),
+    locations: exactLocations(122, 35, 122, 40),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -219,7 +219,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses the practice-start busy state in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(118, 62, 118, 67),
+    locations: exactLocations(123, 62, 123, 67),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -228,7 +228,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The mount layout effect sets mountedRef true in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(119, 29, 119, 33),
+    locations: exactLocations(124, 29, 124, 33),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -237,7 +237,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The focus effect sets focusedRef true in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(120, 29, 120, 34),
+    locations: exactLocations(125, 29, 125, 34),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -246,7 +246,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The identity-reset layout effect assigns accountActionRef on the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(121, 35, 121, 39),
+    locations: exactLocations(126, 35, 126, 39),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -257,7 +257,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay?.result && null'],
     reason:
       'The replay-seed and identity-reset layout effects overwrite resultRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(130, 59, 130, 98),
+    locations: exactLocations(135, 59, 135, 98),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -268,7 +268,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay?.requestId && null'],
     reason:
       'The replay-seed and identity-reset layout effects overwrite resultRequestIdRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(131, 52, 131, 94),
+    locations: exactLocations(136, 52, 136, 94),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -277,7 +277,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentDiagnosticReplay?.requestId && null'],
     reason:
       'The replay-seed and identity-reset layout effects overwrite replayResultRequestIdRef from the replay pointer in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(133, 5, 133, 47),
+    locations: exactLocations(138, 5, 138, 47),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -286,7 +286,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses resultActionBusyRef in the same first commit, so the useRef initializer never reaches an observable read.',
-    locations: exactLocations(137, 38, 137, 43),
+    locations: exactLocations(142, 38, 142, 43),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -295,7 +295,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses the action-busy state in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(138, 60, 138, 65),
+    locations: exactLocations(143, 60, 143, 65),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -304,7 +304,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity-reset layout effect re-falses the action-error state in the same first commit, so the useState initializer never reaches an observable render.',
-    locations: exactLocations(139, 62, 139, 67),
+    locations: exactLocations(144, 62, 144, 67),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -315,7 +315,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'The body only writes mountedRef/focusedRef inits that already hold those values on the first commit; the observable ownership checks read the same refs the reset effects keep current.',
-    locations: exactLocations(146, 25, 155, 4),
+    locations: exactLocations(151, 25, 160, 4),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -326,7 +326,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'The cleanup only falses refs on unmount; every callback guarded by those refs is additionally fenced by mounted/identity/lease checks, and React discards post-unmount state writes.',
-    locations: exactLocations(148, 18, 154, 6),
+    locations: exactLocations(153, 18, 159, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -335,7 +335,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'Writing mountedRef true instead of false only affects post-unmount continuations, which every caller additionally fences with identity and lease checks whose values are already stale at that point.',
-    locations: exactLocations(149, 28, 149, 33),
+    locations: exactLocations(154, 28, 154, 33),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -344,7 +344,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'Writing focusedRef true instead of false only affects post-blur continuations, which renderOwnsWork already rejects through the same focused check that would have read true.',
-    locations: exactLocations(150, 28, 150, 33),
+    locations: exactLocations(155, 28, 155, 33),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -353,7 +353,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'On blur the focus cleanup sets accountActionRef true; a queued account action is still fenced by the focused conjunct inside renderOwnsWork, so the latch write cannot change any reachable decision.',
-    locations: exactLocations(151, 34, 151, 38),
+    locations: exactLocations(156, 34, 156, 38),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -362,7 +362,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['["Stryker was here"]'],
     reason:
       "The mount effect's dependency literal is empty and its callback identity is stable for the process lifetime; a constant element compares equal on every render and the setup/cleanup lifetimes are unchanged.",
-    locations: exactLocations(155, 6, 155, 8),
+    locations: exactLocations(160, 6, 160, 8),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -371,7 +371,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       "The focus cleanup's accountActionRef=true latches actions while blurred, but renderOwnsWork's focused conjunct already rejects every such action; forcing the latch false cannot let a blurred action run.",
-    locations: exactLocations(163, 36, 163, 40),
+    locations: exactLocations(168, 36, 168, 40),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -380,7 +380,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['["Stryker was here"]'],
     reason:
       "The focus effect's dependency literal is empty and its callback identity is stable for the process lifetime; a constant element compares equal on every render and the setup/cleanup lifetimes are unchanged.",
-    locations: exactLocations(165, 8, 165, 10),
+    locations: exactLocations(170, 8, 170, 10),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -389,7 +389,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "Every path that renders a result card (recorder result, replay seed, /next effect, advance claim) re-falses the error flag in the same commit that shows the card, so the reset's mutated value is always overwritten before an alert could render.",
-    locations: exactLocations(184, 26, 184, 31),
+    locations: exactLocations(186, 26, 186, 31),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -398,7 +398,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['["Stryker was here"]'],
     reason:
       "Every path that re-establishes a completion level after an identity reset funnels through the /next done branch, which overwrites answers in the same commit, so the reset's seeded array never reaches the reveal.",
-    locations: exactLocations(187, 16, 187, 18),
+    locations: exactLocations(186, 16, 186, 18),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -407,7 +407,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The recorder-owner layout effect re-falses recorderLockedRef in the same commit whenever an owner exists, and the only ownerless states reset it before any lock read is reachable.',
-    locations: exactLocations(190, 33, 190, 38),
+    locations: exactLocations(186, 33, 186, 38),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -416,7 +416,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The recorder-owner layout effect re-falses this ref in the same commit whenever an owner exists; crossing into an ownerless state always changes the owner key, which re-runs that effect and re-falses the ref before an exit action can read it.',
-    locations: exactLocations(191, 37, 191, 42),
+    locations: exactLocations(186, 37, 186, 42),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -425,7 +425,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The recorder-owner layout effect re-falses the exit-lock state in the same commit whenever an owner exists, and the only ownerless states reset it before any exit read is reachable.',
-    locations: exactLocations(192, 27, 192, 32),
+    locations: exactLocations(186, 27, 186, 32),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -436,7 +436,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'The cleanup only nulls identity refs after unmount; every continuation guarded by them is additionally fenced by mounted/lease checks, and React discards post-unmount state writes.',
-    locations: exactLocations(197, 18, 199, 6),
+    locations: exactLocations(186, 18, 186, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -445,7 +445,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -454,7 +454,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -463,7 +463,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['activeIdentityRef.current !== identityKey'],
     reason:
       'The identity key is already stale at cleanup time in every reachable unmount, so whether the ref is nulled or left pointing at the departing key, no surviving callback can satisfy the identity conjunct that would read it.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -472,7 +472,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'A re-published replay with the same requestId reseeds identical state in the same commit; the dedupe only suppresses a redundant identical commit, and the answers reset it guards is re-derived from the same replay pointer.',
-    locations: exactLocations(208, 9, 208, 49),
+    locations: exactLocations(224, 9, 224, 49),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -483,7 +483,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The identity-scoped view selector hides any state a stale data effect commits: stateIdentity is reset to the new identity in the same layout pass, so processing or rejecting the response writes only dead state the selector never renders.',
-    locations: exactLocations(238, 9, 238, 50),
+    locations: exactLocations(255, 9, 255, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -492,7 +492,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The second conjunct is already true for metadata-less recorder results (both refs null) and exactly mirrors the first conjunct for seeded replays; forcing it true cannot admit a case the first conjunct does not already gate.',
-    locations: exactLocations(244, 9, 244, 72),
+    locations: exactLocations(261, 9, 261, 72),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -501,7 +501,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'No result card is mounted on the fresh-/next path that runs this reset; every later result resets the flag in the same commit that shows its card.',
-    locations: exactLocations(277, 26, 277, 31),
+    locations: exactLocations(297, 26, 297, 31),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -512,7 +512,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'When the identity selector rejects the state, currentResult is null and advance() returns before reading the leaked requestId, so the guarded value has no reader.',
-    locations: exactLocations(305, 34, 305, 63),
+    locations: exactLocations(322, 34, 322, 63),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -521,7 +521,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The only reader of showIntro sits behind a non-null currentQuestion in the same expression chain; forcing the conjunct true cannot change any rendered branch.',
-    locations: exactLocations(309, 5, 309, 29),
+    locations: exactLocations(326, 5, 326, 29),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -530,7 +530,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentProgress.asked'],
     reason:
       'The progress operand short-circuits behind introStarted for replayed states (the seed latches it true), and a canonical question always carries non-null progress, so the optional chain never dereferences null.',
-    locations: exactLocations(312, 6, 312, 28),
+    locations: exactLocations(329, 6, 329, 28),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -541,7 +541,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['""'],
     reason:
       'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
-    locations: exactLocations(316, 57, 316, 63),
+    locations: exactLocations(333, 57, 333, 63),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -552,7 +552,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ["currentQuestion?.id && 'none'"],
     reason:
       'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
-    locations: exactLocations(316, 34, 316, 63),
+    locations: exactLocations(333, 34, 333, 63),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -563,7 +563,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentQuestion.id'],
     reason:
       'The result step key is a dedupe-only identity: every production path that renders a result card carries a non-null question (the recorder requires one and the replay seeds one), and no rendered output reads the key.',
-    locations: exactLocations(316, 34, 316, 53),
+    locations: exactLocations(333, 34, 333, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -573,7 +573,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['""'],
     reason:
       'The intro/question step-key literals are dedupe-only identities that stay distinct within their branch and are never rendered; swapping the literal cannot change which transitions announce or scroll.',
-    locations: exactLocations(318, 41, 318, 48, 318, 51, 318, 61),
+    locations: exactLocations(335, 41, 335, 48, 335, 51, 335, 61),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -582,7 +582,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['questionScrollRef.current.scrollTo'],
     reason:
       'The optional chain only guards a null scroll ref that cannot coexist with an announced step: the only refless branches (loading/error) have a null step key, and the announced branches mount the scroll view before the effect runs.',
-    locations: exactLocations(349, 7, 349, 42),
+    locations: exactLocations(366, 7, 366, 42),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -591,7 +591,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "The Jest React Native preset reports Platform.OS 'ios', so the true-forcing mutant is behaviorally identical on the test platform while the false-forcing mutant is killed by the announcement assertions.",
-    locations: exactLocations(354, 9, 354, 30),
+    locations: exactLocations(371, 9, 371, 30),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -600,7 +600,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "Every callback invoked while the owner key is null is additionally rejected by renderOwnsWork's identity/lease conjuncts, which fail in every reachable ownerless interleaving (unmount, identity change, or user loss).",
-    locations: exactLocations(381, 7, 381, 21),
+    locations: exactLocations(398, 7, 398, 21),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -609,7 +609,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'No registered query key extends the cancelled diagnostic-next prefix, so exact and prefix cancellation address the same single query; the flag cannot change which fetch is aborted.',
-    locations: exactLocations(400, 14, 400, 18),
+    locations: exactLocations(417, 14, 417, 18),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -618,7 +618,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['previous.length - 1'],
     reason:
       'attemptNo is only a React list key here: the reveal numbers rows by index, and the mutated sequence stays unique within a session, so no duplicate-key or rendering difference can be observed.',
-    locations: exactLocations(410, 22, 410, 41),
+    locations: exactLocations(427, 22, 427, 41),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -627,7 +627,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The logoutBusyRef latch set by the same synchronous block already blocks the account action; the accountAction latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
-    locations: exactLocations(494, 32, 494, 36),
+    locations: exactLocations(512, 32, 512, 36),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -636,7 +636,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "rearm only re-arms accountActionRef after a same-identity logout failure; on the success path the route replaces away from this screen, so the initializer's value never reaches a reachable decision.",
-    locations: exactLocations(497, 17, 497, 22),
+    locations: exactLocations(515, 17, 515, 22),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -645,7 +645,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'Reaching the forced conjunct requires an account swap mid-logout while this route keeps focus; every identity transition that swaps the account also reroutes or resets the identity refs the surrounding conjuncts check, so the mutated condition can never differ observably.',
-    locations: exactLocations(507, 9, 507, 50),
+    locations: exactLocations(525, 9, 525, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -655,7 +655,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "The finally's post-boundary setLogoutBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
-    locations: exactLocations(518, 11, 518, 74, 518, 33, 518, 74),
+    locations: exactLocations(536, 11, 536, 74, 536, 33, 536, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -664,7 +664,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
     reason:
       "The finally's post-boundary setLogoutBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
-    locations: exactLocations(518, 11, 518, 74),
+    locations: exactLocations(536, 11, 536, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -673,7 +673,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'rearm only re-arms accountActionRef after a same-identity logout failure the catch already localized; forcing it true cannot let a stale handler run because renderOwnsWork re-checks focus and identity synchronously.',
-    locations: exactLocations(520, 13, 520, 18),
+    locations: exactLocations(538, 13, 538, 18),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -688,7 +688,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
-    locations: exactLocations(530, 7, 532, 55, 530, 7, 531, 43, 531, 7, 531, 43, 532, 7, 532, 55),
+    locations: exactLocations(548, 7, 550, 55, 548, 7, 549, 43, 549, 7, 549, 43, 550, 7, 550, 55),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -701,7 +701,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     ],
     reason:
       'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
-    locations: exactLocations(530, 7, 532, 55),
+    locations: exactLocations(548, 7, 550, 55),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -710,7 +710,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['!renderOwnsWork() && resultRef.current !== expectedResult'],
     reason:
       'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
-    locations: exactLocations(530, 7, 531, 43),
+    locations: exactLocations(548, 7, 549, 43),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -719,7 +719,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'Defense-in-depth behind its only callers: advance() and the acknowledgement continuation re-validate the same refs immediately before commitAdvance, so the duplicated conjunction can never disagree in a reachable interleaving.',
-    locations: exactLocations(533, 7, 535, 6),
+    locations: exactLocations(551, 7, 553, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -728,7 +728,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'No result card is mounted after commitAdvance clears the result; the alert renders only inside the card, and every later card resets the flag before rendering.',
-    locations: exactLocations(542, 26, 542, 31),
+    locations: exactLocations(560, 26, 560, 31),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -741,7 +741,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
-    locations: exactLocations(564, 7, 566, 42, 564, 7, 565, 21),
+    locations: exactLocations(582, 7, 584, 42, 582, 7, 583, 21),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -752,7 +752,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['(!renderOwnsWork() || !currentResult) && resultRef.current !== currentResult'],
     reason:
       "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
-    locations: exactLocations(564, 7, 566, 42),
+    locations: exactLocations(582, 7, 584, 42),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -761,7 +761,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['!renderOwnsWork() && !currentResult'],
     reason:
       "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose !renderOwnsWork() conjunct still returns before any observable write, and the durable acknowledgement its path would start is pinned by the not-called assertions.",
-    locations: exactLocations(564, 7, 565, 21),
+    locations: exactLocations(582, 7, 583, 21),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -770,7 +770,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       "Shadowed by commitAdvance's own entry guard: a stale advance that passes this weakened check reaches a commitAdvance whose identity re-validation still returns before any observable write.",
-    locations: exactLocations(566, 7, 566, 42),
+    locations: exactLocations(584, 7, 584, 42),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -781,7 +781,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
-    locations: exactLocations(578, 18, 582, 6),
+    locations: exactLocations(596, 18, 600, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -790,7 +790,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
-    locations: exactLocations(578, 9, 578, 16),
+    locations: exactLocations(596, 9, 596, 16),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -799,7 +799,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'A null userId unmounts every interactive surface before a result card can exist (the screen returns null), so the branch is unreachable behind the render guard.',
-    locations: exactLocations(580, 28, 580, 32),
+    locations: exactLocations(598, 28, 598, 32),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -808,7 +808,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
     reason:
       'The regroup only matters when the first conjuncts disagree in an unreachable direction: the unmount sweep nulls activeIdentityRef before any continuation runs, and the result/request refs are stable across the acknowledgement await because no setter runs between claim and settlement.',
-    locations: exactLocations(595, 9, 596, 50),
+    locations: exactLocations(614, 9, 615, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -817,7 +817,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The identity conjunct is shadowed by the mounted conjunct in every reachable interleaving: unmount nulls the ref in the same sweep that falses mountedRef, and identity changes rerender the route before the continuation settles.',
-    locations: exactLocations(596, 9, 596, 50),
+    locations: exactLocations(615, 9, 615, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -826,7 +826,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'resultRef cannot change between the advance claim and the acknowledgement settlement: the recorder is unmounted while the card shows, and every refetch path that could clear it also fails the identity/lease conjuncts checked in the same expression.',
-    locations: exactLocations(598, 9, 598, 44),
+    locations: exactLocations(617, 9, 617, 44),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -835,7 +835,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'resultRequestIdRef cannot change between the advance claim and the acknowledgement settlement: no setter runs in that window, and every path that could clear it also fails the identity/lease conjuncts checked in the same expression.',
-    locations: exactLocations(599, 9, 599, 49),
+    locations: exactLocations(618, 9, 618, 49),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -844,7 +844,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "The acknowledgement path's busy-ref write is immediately re-falsed by commitAdvance's own write in the same synchronous block, so a stuck-true value never reaches a reader.",
-    locations: exactLocations(603, 39, 603, 44),
+    locations: exactLocations(622, 39, 622, 44),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -853,7 +853,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'The rearm branch runs only after focus loss; every account action is already fenced by the focused conjunct until refocus, and the refocused advance re-falses the ref in the same commit that resumes the card.',
-    locations: exactLocations(617, 39, 617, 44),
+    locations: exactLocations(636, 39, 636, 44),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -862,7 +862,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['practiceStartRef.current && accountActionRef.current'],
     reason:
       'Every interleaving where the practice/account latches differ also fails a later conjunct: blur sets accountActionRef while dropping focus, and failures reset both flags together, so the regrouped pair cannot change the decision.',
-    locations: exactLocations(627, 7, 628, 31),
+    locations: exactLocations(649, 7, 650, 31),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -871,7 +871,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The practiceStart latch set in the same synchronous block already blocks every account action; the accountAction latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
-    locations: exactLocations(637, 32, 637, 36),
+    locations: exactLocations(659, 32, 659, 36),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -880,7 +880,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The accountAction latch set in the same synchronous block already blocks every account action; the practiceStart latch is a deliberately redundant second fence whose removal cannot admit the guarded action.',
-    locations: exactLocations(638, 32, 638, 36),
+    locations: exactLocations(660, 32, 660, 36),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -890,7 +890,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "The finally's post-boundary setPracticeStartBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
-    locations: exactLocations(665, 11, 665, 74, 665, 33, 665, 74),
+    locations: exactLocations(687, 11, 687, 74, 687, 33, 687, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -899,7 +899,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
     reason:
       "The finally's post-boundary setPracticeStartBusy(false) either targets an unmounted tree (discarded by React) or writes the same false the identity-reset layout effect already applied in the same pass.",
-    locations: exactLocations(665, 11, 665, 74),
+    locations: exactLocations(687, 11, 687, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -908,7 +908,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       "The English catalog copy for diag.introCount is a fixed 'You will answer 2 or 3 questions.' with no count placeholder, so the params object never reaches the rendered string in any locale.",
-    locations: exactLocations(852, 37, 852, 76),
+    locations: exactLocations(874, 37, 874, 76),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -917,7 +917,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       "parseDiagnosticNext rejects maxQuestions < 1, so a committed progress always satisfies maxQuestions > 0; the guard's false direction is killed by the asked-fraction assertion while the true direction cannot diverge.",
-    locations: exactLocations(877, 21, 877, 53),
+    locations: exactLocations(899, 21, 899, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -926,7 +926,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentProgress.maxQuestions >= 0'],
     reason:
       "parseDiagnosticNext rejects maxQuestions < 1, so a committed progress always satisfies maxQuestions > 0; the guard's false direction is killed by the asked-fraction assertion while the true direction cannot diverge.",
-    locations: exactLocations(877, 21, 877, 53),
+    locations: exactLocations(899, 21, 899, 53),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -937,7 +937,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       "Dead style key: the word-tagged transcript component replaced this style's only historical consumer, and no JSX in the file references transcriptText.",
-    locations: exactLocations(1087, 19, 1092, 4),
+    locations: exactLocations(1109, 19, 1114, 4),
   },
 
   {
@@ -1113,7 +1113,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['""'],
     reason:
       'The placeholder is only distinguishable if a real userId collides with it, but User.id is uuid-validated by parseUser, so it is never "" or "anonymous". The key is only ever compared against itself, and both variants stay distinct from every signed-in key.',
-    locations: exactLocations(67, 54, 67, 65),
+    locations: exactLocations(72, 54, 72, 65),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -1122,7 +1122,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['["Stryker was here"]'],
     reason:
       'Answers are rendered only in the completed-level view, which can be reached only after the identity layout effect has reset this initial array before passive or network publication.',
-    locations: exactLocations(110, 69, 110, 71),
+    locations: exactLocations(115, 69, 115, 71),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -1131,7 +1131,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'On an identity refresh the ref still equals the closing identity; on unmount the earlier outer layout cleanup has already nulled it. Assigning null in either case is immediately overwritten by the next setup or repeats the existing unmount state.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/lib/pending-assessment.ts',
@@ -1568,7 +1568,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'applyReminder repeats the render fence, and hour-step handlers are rendered only while the captured reminder is enabled.',
-    locations: exactLocations(900, 9, 900, 47),
+    locations: exactLocations(902, 9, 902, 47),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1577,7 +1577,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['!renderCanHandle() && !current.enabled'],
     reason:
       'The render fence is repeated by applyReminder and a disabled reminder has no hour-step handler, so weakening this pair is unobservable.',
-    locations: exactLocations(900, 9, 900, 47),
+    locations: exactLocations(902, 9, 902, 47),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1586,7 +1586,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'retakeTest is invoked only by the confirmation callback immediately after owner and render checks; no await permits busy/logout ownership to change between them.',
-    locations: exactLocations(928, 9, 928, 77),
+    locations: exactLocations(930, 9, 930, 77),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1594,7 +1594,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
     replacements: ['(!renderCanHandle() || retakeBusyRef.current) && logoutBusyRef.current'],
     reason: 'Same unreachable defensive retake guard as the whole conditional entry.',
-    locations: exactLocations(928, 9, 928, 77),
+    locations: exactLocations(930, 9, 930, 77),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1602,7 +1602,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
     replacements: ['false'],
     reason: 'Same unreachable defensive retake guard, for its render/busy prefix node.',
-    locations: exactLocations(928, 9, 928, 52),
+    locations: exactLocations(930, 9, 930, 52),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1610,7 +1610,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
     replacements: ['!renderCanHandle() && retakeBusyRef.current'],
     reason: 'Same unreachable defensive retake guard, for its render/busy operator node.',
-    locations: exactLocations(928, 9, 928, 52),
+    locations: exactLocations(930, 9, 930, 52),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1620,7 +1620,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     ],
     replacements: ['{}'],
     reason: 'The guarded return is unreachable on retakeTest’s sole call path.',
-    locations: exactLocations(928, 79, 930, 6),
+    locations: exactLocations(930, 79, 932, 6),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1628,7 +1628,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     originals: ['return false;'],
     replacements: ['true'],
     reason: 'The guarded return is unreachable on retakeTest’s sole call path.',
-    locations: exactLocations(929, 14, 929, 19),
+    locations: exactLocations(931, 14, 931, 19),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1637,7 +1637,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The false return only asks the confirmation callback to publish the already-locked header once more; retakeBusyRef is already true.',
-    locations: exactLocations(976, 12, 976, 16),
+    locations: exactLocations(978, 12, 978, 16),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1646,7 +1646,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'Identity and unmount cleanup clear retakeConfirmingRef first, so the preceding owner check rejects every stale close callback before this guard.',
-    locations: exactLocations(995, 11, 995, 32),
+    locations: exactLocations(997, 11, 997, 32),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1655,7 +1655,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'The confirmation owner is cleared on identity loss, so the preceding owner check rejects stale confirm callbacks before this guard.',
-    locations: exactLocations(1010, 17, 1010, 38),
+    locations: exactLocations(1012, 17, 1012, 38),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1664,7 +1664,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['retakeTest()'],
     reason:
       'On the only reachable path retakeTest returns true; the mutation performs one redundant publish of the already-locked header.',
-    locations: exactLocations(1012, 17, 1012, 30),
+    locations: exactLocations(1014, 17, 1014, 30),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1673,7 +1673,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['userRef.current.name'],
     reason:
       'renderCanHandle on a rendered TextInput implies the current session still has a non-null user, so optional chaining cannot short-circuit.',
-    locations: exactLocations(1108, 49, 1108, 70),
+    locations: exactLocations(1110, 49, 1110, 70),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1682,7 +1682,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['"Stryker was here!"'],
     reason:
       'The null-user fallback is unreachable after renderCanHandle succeeds for a rendered profile input.',
-    locations: exactLocations(1108, 74, 1108, 76),
+    locations: exactLocations(1110, 74, 1110, 76),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1691,7 +1691,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['userRef.current.name'],
     reason:
       'renderOwnsIdentity on a rendered profile input implies userRef.current is non-null, so optional chaining cannot short-circuit.',
-    locations: exactLocations(1122, 37, 1122, 58),
+    locations: exactLocations(1124, 37, 1124, 58),
   },
   {
     file: 'src/app/settings/index.tsx',
@@ -1700,7 +1700,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['"Stryker was here!"'],
     reason:
       'The null-user fallback is unreachable after renderOwnsIdentity succeeds for a rendered profile input.',
-    locations: exactLocations(1122, 62, 1122, 64),
+    locations: exactLocations(1124, 62, 1124, 64),
   },
   {
     file: 'src/app/settings/change-password.tsx',
@@ -2070,37 +2070,37 @@ const redesignRePinnedEquivalents = Object.freeze([
     reason:
       'Focus plus identity/Recorder layout effects reset the Recorder locks, exit lock, logout latch, practice-start latch, and focus seed before asynchronous diagnostic state can expose any actionable view.',
     locations: exactLocations(
-      112,
+      117,
       36,
-      112,
+      117,
       41,
-      113,
+      118,
       64,
-      113,
+      118,
       69,
-      114,
+      119,
       40,
-      114,
+      119,
       45,
-      115,
+      120,
       32,
-      115,
+      120,
       37,
-      116,
+      121,
       48,
-      116,
+      121,
       53,
-      117,
+      122,
       35,
-      117,
+      122,
       40,
-      118,
+      123,
       62,
-      118,
+      123,
       67,
-      120,
+      125,
       29,
-      120,
+      125,
       34,
     ),
   },
@@ -2112,7 +2112,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'The mount and focus/identity effects overwrite both seeds before any rendered action or async continuation reads them.',
-    locations: exactLocations(119, 29, 119, 33, 121, 35, 121, 39),
+    locations: exactLocations(124, 29, 124, 33, 126, 35, 126, 39),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2125,7 +2125,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'mountedRef is seeded true, while the identity layout cleanup and focus cleanup independently make render ownership false on unmount; deleting either outer block cannot admit a callback.',
-    locations: exactLocations(146, 25, 155, 4, 148, 18, 154, 6),
+    locations: exactLocations(151, 25, 160, 4, 153, 18, 159, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2135,7 +2135,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'Each mutated cleanup still leaves the sibling mounted/focus fence false and clears active identity and Recorder ownership.',
-    locations: exactLocations(149, 28, 149, 33, 150, 28, 150, 33),
+    locations: exactLocations(154, 28, 154, 33, 155, 28, 155, 33),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2145,7 +2145,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'At both cleanup sites focusedRef is already false, so renderOwnsWork rejects every account action; refocus setup writes the latch false deliberately.',
-    locations: exactLocations(151, 34, 151, 38, 163, 36, 163, 40),
+    locations: exactLocations(156, 34, 156, 38, 168, 36, 168, 40),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2155,7 +2155,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'The mount layout effect and focus callback each receive a constant dependency literal, preserving their lifetimes.',
-    locations: exactLocations(155, 6, 155, 8, 165, 8, 165, 10),
+    locations: exactLocations(160, 6, 160, 8, 170, 8, 170, 10),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2165,7 +2165,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'The identity reset writes the interaction-lock ref and visible exit-lock state before a Recorder owner can publish. The later owner layout effect repeats the same reset before controls become actionable.',
-    locations: exactLocations(190, 33, 190, 38, 192, 27, 192, 32),
+    locations: exactLocations(186, 33, 186, 38, 186, 27, 186, 32),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2176,7 +2176,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['{}'],
     reason:
       'An identity refresh immediately runs the replacement setup, while unmount has already nulled the ref in the outer layout cleanup.',
-    locations: exactLocations(197, 18, 199, 6),
+    locations: exactLocations(186, 18, 186, 6),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2185,7 +2185,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'Skipping the dependency cleanup is immediately overwritten by the next setup; on unmount the outer layout cleanup already holds null.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2194,7 +2194,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['activeIdentityRef.current !== identityKey'],
     reason:
       'Reversing the cleanup comparison only changes a transient value that the replacement setup immediately overwrites, and repeats null on unmount.',
-    locations: exactLocations(198, 11, 198, 52),
+    locations: exactLocations(186, 11, 186, 52),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2205,7 +2205,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'Whenever a mounted render has crossed an Auth identity boundary, its captured SessionLease is stale and the remaining lease half rejects publication; unmount cannot run this passive publication effect.',
-    locations: exactLocations(238, 9, 238, 50),
+    locations: exactLocations(255, 9, 255, 50),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2214,7 +2214,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'Recorder callbacks are supplied only by the branch with a non-null currentQuestion, so every callback closure captures a non-null owner.',
-    locations: exactLocations(381, 7, 381, 21),
+    locations: exactLocations(398, 7, 398, 21),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2223,7 +2223,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'Every production diagnostic-next key is the complete three-element session/user tuple; the app creates no descendant key that prefix cancellation could additionally match.',
-    locations: exactLocations(400, 14, 400, 18),
+    locations: exactLocations(417, 14, 417, 18),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2232,7 +2232,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'logoutBusyRef independently claims the synchronous logout window before accountActionRef is read, so removing this duplicate assignment cannot admit another observable action.',
-    locations: exactLocations(494, 32, 494, 36),
+    locations: exactLocations(512, 32, 512, 36),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2241,7 +2241,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'rearm remains at its seed only after success or LogoutCleanupError, and Auth logout resets the in-memory session before either outcome settles, removing the protected screen before another action.',
-    locations: exactLocations(497, 17, 497, 22),
+    locations: exactLocations(515, 17, 515, 22),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2251,7 +2251,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'A stale finalizer can only repeat setLogoutBusy(false), which is discarded or already reset. rearm can be true only after renderOwnsWork succeeded in the immediately preceding synchronous catch, so both ownership clauses are then true.',
-    locations: exactLocations(518, 11, 518, 74, 518, 33, 518, 74),
+    locations: exactLocations(536, 11, 536, 74, 536, 33, 536, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2260,7 +2260,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['mountedRef.current || activeIdentityRef.current === identityKey'],
     reason:
       'As at the paired forced-true sites, the only extra stale state write is discarded/reset and no async boundary separates a rearming catch from this finally.',
-    locations: exactLocations(518, 11, 518, 74),
+    locations: exactLocations(536, 11, 536, 74),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2269,7 +2269,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['true'],
     reason:
       'When rearm is false, logout already synchronously removed the protected session; writing the route-local action latch cannot enable an observable action.',
-    locations: exactLocations(520, 13, 520, 18),
+    locations: exactLocations(538, 13, 538, 18),
   },
   {
     file: 'src/app/diagnostic.tsx',
@@ -2278,7 +2278,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['currentProgress.asked'],
     reason:
       'showIntro now first requires a non-null currentQuestion. The diagnostic-next contract always couples that question with progress, and local advancement preserves it, so currentProgress is non-null whenever this optional access is evaluated.',
-    locations: exactLocations(312, 6, 312, 28),
+    locations: exactLocations(329, 6, 329, 28),
   },
   {
     file: 'src/app/settings/change-password.tsx',
@@ -2652,7 +2652,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     replacements: ['false'],
     reason:
       'toggleReminder immediately delegates to applyReminder, whose first synchronous guard repeats renderCanHandle before any ref, state, notification, or native side effect. The wrapper guard is redundant.',
-    locations: exactLocations(895, 9, 895, 27),
+    locations: exactLocations(897, 9, 897, 27),
   },
   {
     file: 'src/lib/api.ts',
@@ -2685,7 +2685,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     count: 2,
     reason:
       'languageBusy and its non-null languageTarget are installed and cleared in the same React batches. The leading languageBusy conjunction prevents either direct property access while the target may be null.',
-    locations: exactLocations(1176, 31, 1176, 52, 1228, 15, 1228, 36),
+    locations: exactLocations(1178, 31, 1178, 52, 1230, 15, 1230, 36),
   },
   {
     file: 'src/app/(tabs)/practice/help.tsx',
@@ -2916,7 +2916,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3215',
     reason:
       'Both callbacks close over stable refs only. Replacing either empty dependency array with the same constant string element preserves callback identity and lifetime across every render.',
-    locations: exactLocations(3913, 6, 3913, 8),
+    locations: exactLocations(3919, 6, 3919, 8),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -3506,7 +3506,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3016',
     reason:
       'Callers consume these catch results only in boolean positions. Removing return false yields undefined, which is equally falsy; the cancellation catch likewise takes the same branch for false and undefined.',
-    locations: exactLocations(3715, 71, 3715, 82),
+    locations: exactLocations(3714, 71, 3714, 82),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4434,7 +4434,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3122',
     reason:
       'Recorded phase is established only after adopting a non-null active URI, and every URI-clearing path leaves recorded. These documented fail-closed branches are unreachable, so deleting or changing their body cannot affect a valid state.',
-    locations: exactLocations(3823, 11, 3823, 15),
+    locations: exactLocations(3824, 11, 3824, 15),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4482,7 +4482,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2828',
     reason:
       'These errors are handled solely through controller.signal.aborted and cancellation currency; no catch reads the message, name, or thrown object. Falsy-reason operator differences and string changes are unobservable.',
-    locations: exactLocations(3499, 32, 3499, 60),
+    locations: exactLocations(3498, 32, 3498, 60),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4492,7 +4492,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2829',
     reason:
       'These errors are handled solely through controller.signal.aborted and cancellation currency; no catch reads the message, name, or thrown object. Falsy-reason operator differences and string changes are unobservable.',
-    locations: exactLocations(3499, 62, 3499, 74),
+    locations: exactLocations(3498, 62, 3498, 74),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4502,7 +4502,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2779',
     reason:
       'The fixed retry loop reaches its terminal throw only after assigning the caught capacity error on every consumed attempt. lastCapacityError is therefore truthy and both fallback operators throw that same object.',
-    locations: exactLocations(3456, 15, 3456, 47),
+    locations: exactLocations(3455, 15, 3455, 47),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4512,7 +4512,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2826',
     reason:
       'A cancel can reach these post-request branches only through cancelUpload after assessmentPosted and requestId are set, which creates cancelPersistence. The null and fallback arms are unreachable.',
-    locations: exactLocations(3498, 13, 3498, 30),
+    locations: exactLocations(3497, 13, 3497, 30),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4524,7 +4524,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2877',
     reason:
       'A cancel can reach these post-request branches only through cancelUpload after assessmentPosted and requestId are set, which creates cancelPersistence. The null and fallback arms are unreachable.',
-    locations: exactLocations(3549, 86, 3549, 91),
+    locations: exactLocations(3548, 86, 3548, 91),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4534,7 +4534,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2878',
     reason:
       'Before any later submission reads the marker, submit synchronously resets cancelRequestedRef to false; lifecycle and recovery currency own the current exit. Leaving these cleanup assignments true cannot leak into an observable next operation.',
-    locations: exactLocations(3550, 40, 3550, 45),
+    locations: exactLocations(3549, 40, 3549, 45),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4544,7 +4544,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2890',
     reason:
       'Before any later submission reads the marker, submit synchronously resets cancelRequestedRef to false; lifecycle and recovery currency own the current exit. Leaving these cleanup assignments true cannot leak into an observable next operation.',
-    locations: exactLocations(3567, 38, 3567, 43),
+    locations: exactLocations(3566, 38, 3566, 43),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4554,7 +4554,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2889',
     reason:
       'Submit assigns requestIdRef before its first network await, and every site that clears it returns immediately. These continuing cancellation or recovery branches therefore always have a requestId, so their fallback and guard are unreachable.',
-    locations: exactLocations(3566, 77, 3566, 81),
+    locations: exactLocations(3565, 77, 3565, 81),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4564,7 +4564,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2954',
     reason:
       'Submit assigns requestIdRef before its first network await, and every site that clears it returns immediately. These continuing cancellation or recovery branches therefore always have a requestId, so their fallback and guard are unreachable.',
-    locations: exactLocations(3579, 13, 3579, 22),
+    locations: exactLocations(3578, 13, 3578, 22),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4574,7 +4574,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2969',
     reason:
       'Only one submission operation can exist. Its controller remains the unique ref value until this finally, or lifecycle cleanup has already set the ref to null; assigning null under either identity outcome produces the same state.',
-    locations: exactLocations(3655, 11, 3655, 53),
+    locations: exactLocations(3654, 11, 3654, 53),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4584,7 +4584,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '2993',
     reason:
       'startRecording begins by evaluating the same startIsBlocked condition before acquiring an operation or touching native state. The press handler check is a duplicate and cannot change effects.',
-    locations: exactLocations(3688, 9, 3688, 25),
+    locations: exactLocations(3687, 9, 3687, 25),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4594,7 +4594,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3008',
     reason:
       'Uploading phase is entered only after installing this submission controller, and finally leaves or hands off the phase when detaching it. The documented null-controller return is unreachable.',
-    locations: exactLocations(3709, 9, 3709, 20),
+    locations: exactLocations(3708, 9, 3708, 20),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4606,7 +4606,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3103',
     reason:
       'The rewind promise owner handles rejection by releasing the player and reporting once. After finally clears the request flag, the following identity and playability guard returns, so this duplicate catch return has no effect.',
-    locations: exactLocations(3801, 15, 3804, 8),
+    locations: exactLocations(3802, 15, 3805, 8),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4616,7 +4616,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3112',
     reason:
       'A pending rewind is created only for the installed preview player. The preceding identity check requires the ref still equal that captured player, so the non-null operand is guaranteed.',
-    locations: exactLocations(3812, 11, 3812, 44),
+    locations: exactLocations(3813, 11, 3813, 44),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4628,7 +4628,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3124',
     reason:
       'If createAudioPlayer throws, continuing reaches addListener on the unset local; the second catch performs best-effort cleanup and emits the same single play-failed callback. The two paths converge.',
-    locations: exactLocations(3827, 15, 3830, 8),
+    locations: exactLocations(3828, 15, 3831, 8),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4638,7 +4638,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3143',
     reason:
       'releasePreviewPlayer clears rewind and player refs together, while installation associates both with the same player. Their equality predicates move in lockstep, so weakening either alone or changing and to or cannot select another cleanup target.',
-    locations: exactLocations(3847, 17, 3847, 52),
+    locations: exactLocations(3848, 17, 3848, 52),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4648,7 +4648,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3157',
     reason:
       'releasePreviewPlayer clears rewind and player refs together, while installation associates both with the same player. Their equality predicates move in lockstep, so weakening either alone or changing and to or cannot select another cleanup target.',
-    locations: exactLocations(3862, 17, 3862, 59),
+    locations: exactLocations(3863, 17, 3863, 59),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4662,7 +4662,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3156',
     reason:
       'releasePreviewPlayer clears rewind and player refs together, while installation associates both with the same player. Their equality predicates move in lockstep, so weakening either alone or changing and to or cannot select another cleanup target.',
-    locations: exactLocations(3862, 17, 3863, 52),
+    locations: exactLocations(3863, 17, 3864, 52),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4672,7 +4672,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3159',
     reason:
       'releasePreviewPlayer clears rewind and player refs together, while installation associates both with the same player. Their equality predicates move in lockstep, so weakening either alone or changing and to or cannot select another cleanup target.',
-    locations: exactLocations(3863, 17, 3863, 52),
+    locations: exactLocations(3864, 17, 3864, 52),
   },
   {
     file: 'src/components/Recorder.tsx',
@@ -4682,7 +4682,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '3175',
     reason:
       'After pending-rewind handling, a null player enters the creation branch, which either returns on failure or assigns previewPlayerRef. The final local player is non-null whenever execution reaches play.',
-    locations: exactLocations(3887, 9, 3887, 16),
+    locations: exactLocations(3888, 9, 3888, 16),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4702,7 +4702,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '23',
     reason:
       'While mounted active is true; after cleanup the extra setter targets a detached component instance and React discards it without a visible effect.',
-    locations: exactLocations(63, 11, 63, 17),
+    locations: exactLocations(66, 11, 66, 17),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4712,7 +4712,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '33',
     reason:
       "adUnitIdFor is a closed binary selector: only 'homeBanner' selects the Home key, so every other value selects the same History key.",
-    locations: exactLocations(68, 34, 68, 49),
+    locations: exactLocations(79, 34, 79, 49),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4722,7 +4722,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '35',
     reason:
       'A true history activation has just required the same cached native module and validated unit ID; neither can disappear in production before these synchronous reads.',
-    locations: exactLocations(69, 11, 69, 29),
+    locations: exactLocations(80, 11, 80, 29),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4732,7 +4732,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '36',
     reason:
       'Both operands are false after a successful provider activation, so OR and AND produce the same result.',
-    locations: exactLocations(69, 11, 69, 29),
+    locations: exactLocations(80, 11, 80, 29),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4744,7 +4744,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '39',
     reason:
       'A true activation has synchronously cached the native module and validated the same History unit ID; neither can disappear before these reads, so this defensive block is unreachable.',
-    locations: exactLocations(69, 31, 72, 8),
+    locations: exactLocations(80, 31, 83, 8),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4754,7 +4754,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '40',
     reason:
       'This statement is inside the unreachable post-activation capability fallback, so changing its nested active guard cannot alter behavior.',
-    locations: exactLocations(70, 13, 70, 19),
+    locations: exactLocations(81, 13, 81, 19),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4764,7 +4764,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '41',
     reason:
       'This statement is inside the unreachable post-activation capability fallback, so changing its nested active guard cannot alter behavior.',
-    locations: exactLocations(70, 13, 70, 19),
+    locations: exactLocations(81, 13, 81, 19),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4774,7 +4774,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '42',
     reason:
       'This setter is inside the unreachable post-activation capability fallback, so changing its assigned value cannot alter behavior.',
-    locations: exactLocations(70, 35, 70, 39),
+    locations: exactLocations(81, 35, 81, 39),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4784,7 +4784,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '50',
     reason:
       'While mounted active is true; after cleanup the extra failure setter targets a detached component instance and React discards it without a visible effect.',
-    locations: exactLocations(85, 13, 85, 19),
+    locations: exactLocations(96, 13, 96, 19),
   },
   {
     file: 'src/components/HistoryNativeAdCard.tsx',
@@ -4794,7 +4794,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '83',
     reason:
       'nativeAd is assigned only after reading a non-null cached native module; production has no cache-reset operation between that assignment and render.',
-    locations: exactLocations(126, 7, 126, 14),
+    locations: exactLocations(140, 7, 140, 14),
   },
   {
     file: 'src/components/HomeBannerAd.tsx',
@@ -4804,7 +4804,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '129',
     reason:
       'While mounted the latch is true; after cleanup the continuation can only target a detached component instance, whose state update React 19 discards without a visible effect.',
-    locations: exactLocations(34, 11, 34, 17),
+    locations: exactLocations(40, 11, 40, 17),
   },
   {
     file: 'src/components/HomeBannerAd.tsx',
@@ -4814,7 +4814,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '131',
     reason:
       'Removing this cleanup only permits the same post-unmount update to a detached component; it cannot validate the newly mounted focus-cycle instance.',
-    locations: exactLocations(36, 18, 38, 6),
+    locations: exactLocations(42, 18, 44, 6),
   },
   {
     file: 'src/components/HomeBannerAd.tsx',
@@ -4824,7 +4824,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '132',
     reason:
       'Leaving the detached instance latch true has the same unobservable post-unmount state-update behavior as removing its cleanup block.',
-    locations: exactLocations(37, 16, 37, 21),
+    locations: exactLocations(43, 16, 43, 21),
   },
   {
     file: 'src/components/HomeBannerAd.tsx',
@@ -4834,7 +4834,7 @@ const redesignRePinnedEquivalents = Object.freeze([
     reviewedMutantId: '159',
     reason:
       'When current equals measured, returning measured is the same primitive value as returning current; when unequal, both the original and mutant return measured.',
-    locations: exactLocations(53, 46, 53, 66),
+    locations: exactLocations(59, 46, 59, 66),
   },
   {
     file: 'src/lib/ads.tsx',
@@ -5208,39 +5208,39 @@ const redesignRePinnedEquivalents = Object.freeze([
 
 export const equivalentMutantSourceHashes = Object.freeze({
   'src/app/(auth)/forgot-password.tsx':
-    '04a04ff536d058fdc04a497584134239e8d22666a748306f4ea688c4689f405b',
-  'src/app/(auth)/login.tsx': '3f3a7b61c934f8157e1bdb14e917671dfcd2b77b3ef57f1864a4cee45691dc31',
+    'a0fddf6b1d65ebbed3f255cf5416440d0c0a967d22cc5502dfeb041f55e19754',
+  'src/app/(auth)/login.tsx': '7a6e2418de6cc2204a937da5f5da0a7625d73fb0cbf59c441a4df6647fbe5b61',
   'src/app/(auth)/reset-password.tsx':
-    'dd5218dbe0f2a6cddc52e7b831d943fac061c6c01f3a5a8405767062c0a310e6',
-  'src/app/(auth)/signup.tsx': '43d01b18d18a3e66196608349fb49c2444dea392305912c8f761c96880741464',
-  'src/app/(tabs)/history.tsx': 'bf2b9583ceb92d94dac9acacd11322f8be5544dd49fd1ecb6fbaaa4cb66c9cd5',
-  'src/app/(tabs)/home.tsx': 'f58828b066e1995b399da32a69cb7a010cffb2c80877a99fd5d911881d051608',
+    'c8938621fd8bc2ae02438f752f328fc4238689b98c4031ce8ebe1caa08398e5f',
+  'src/app/(auth)/signup.tsx': '1b88c666afaaf05026ea559fdf4377cc588af0db9951b7d082b41c2fdda0b689',
+  'src/app/(tabs)/history.tsx': '4ffa8e061912aaef2e2e9bbdff5d962d8a4f72ab24c42bb618688e44c7f5b373',
+  'src/app/(tabs)/home.tsx': '09c18806b28331b2e29eb73e8e4e9521799cd162b1c58f7ec0340f183893388b',
   'src/app/(tabs)/practice/feedback.tsx':
-    '4835379e7f8e332aad6f1b2563ea0a935e7204a32e2ca5c7dcbc04bc11be84ac',
+    'd0ba7b42d037009c4c0dbb00afaaed580930acf4bfded5a87b2714328d06b202',
   'src/app/(tabs)/practice/help.tsx':
-    '9711de185fba2e5a81aa62066ea69d4ad8af063d5238d8ae364021714925b562',
+    '8f0ff56562e81985faeafdc1b6b8ba81982ed22fa60a6b155b1fc2ff20f51bad',
   'src/app/(tabs)/practice/index.tsx':
-    '407cedcfcdfeb740fee06fb5cc2aab29ca7b1341f0c87bbc9abc3fdcf9f3f6fc',
+    '02cd47d82764229d17c975daa31526de32ea2b02dbc64bfbfb9acf91d62b092e',
   'src/app/(tabs)/recordings.tsx':
-    'bfee55f01a13b5db64f3d69c4a30fa74970057c764bdda4bf2e337e36f29d9ab',
-  'src/app/_layout.tsx': 'a88a9601e77be315ae6fc1a1ea5769792fe9847e59603f668b20b18f448bad5c',
-  'src/app/diagnostic.tsx': '8b4b807c35eaaff3aa95ee3349ffb8559874d9ec9d4e3af3444be9130a0cf8e0',
-  'src/app/index.tsx': 'fa7ed31cce2df2f60b280b78ae62dbbb5882fce0af591ecb8d44c7ef7d76ee3a',
+    '7742b348571da4e2218529916d470144cedb53fa422317d75412063fd9add6d0',
+  'src/app/_layout.tsx': '56e012e920b05dcc46aa7289dd53e858b6d9a9072bce948f3901de250c97045b',
+  'src/app/diagnostic.tsx': 'a145d406ad725ab35af3e1fe23ec4506afe19c72052efd34d8ae71f30834e429',
+  'src/app/index.tsx': 'a923ac178e06ae0add27e4d2285e2265328a7869630eb9856f1433895c693ae0',
   'src/app/settings/change-password.tsx':
-    '4bc072df7153fb2c4cb9ba1c6fd7c43666ad381951457331856d086b9fbd44f1',
+    '8c3d1393a002d7b6e3b757d380149448c9ed0290a3dfc8ea884c3ba511e6480d',
   'src/app/settings/delete-account.tsx':
-    '2bf5661a5e11267e07e1c8eeecb38e36f29c909194b37b128d0ca2a1e35185ef',
-  'src/app/settings/index.tsx': '7ad66f0b715cab4e767ba3bdfba1abb85bced5007ceba8017b37a5ce920712a3',
+    '5ddf63d3356cce3a3b50f125d0f5e88f76bcf8dbb6e8e16b58bf5dd39ed17c6a',
+  'src/app/settings/index.tsx': 'd47c4c6ec4f07f3e7bd62b414d71635c2f6952e49e0ca0a1b5459fd05f562f79',
   'src/components/HistoryNativeAdCard.tsx':
-    'd59b6004911e90c3699b6231fc9324df6b22d87202c32c914c0f478b36f9e283',
+    '87d2fc93c03d95785de6fb8563faa233b563510de176d1a9024445454250087c',
   'src/components/HomeBannerAd.tsx':
-    'cfe7eb99363fcb307402dc6a61787f16c0461d5efc9322b653abf1996e17ce9a',
-  'src/components/Recorder.tsx': '0f546b93d66d9475e5bb603c1ab18612ecbb1d5f5cea72e56c2b8ac20a5338f9',
+    'fadfbcf5d14fe6fcd0a223d395b39bae3c8a52635c89ba61eb2e1bb4744f9e05',
+  'src/components/Recorder.tsx': '0ecebb5c66cdc45ec371cc25627763a7c064f54474cc1300e914637adc9061eb',
   'src/components/RecordingPlayback.tsx':
-    '182f5fa26ce1ba7a32a39cb39b99bcb5a5d6f47483373ec51585195f40aa4988',
+    'baf1575320795ec38eb9c1cdf1b4975422927af033d36cc7637b7778c710e29e',
   'src/lib/ads.tsx': '4db444735e7e7e675332e7d6f86dfa98def9afa941b49099d19dc929b6bd2854',
   'src/lib/api.ts': 'ffefee6a126b87aa0d7982dd8e2dda3f938356f13d4b26ff6419a29323b168e5',
-  'src/lib/auth.tsx': 'c8a37c8fc85f5529c26288aedd3eb8e2e3310628207c84ebd058c85d528b2c4f',
+  'src/lib/auth.tsx': '13dd2b33dbd74df5f777612ceb64329b541f6cb40f340d117a52c895710f4e3b',
   'src/lib/daily-reminder.ts': '32f19351ab462674902f1ac99a9c24e7f0ff0081582530573da3a34ba9000853',
   'src/lib/pending-assessment.ts':
     'bcd9c6c647b1cf76750b59773384ab7d04e0068f625d763d1aa65a7c8aebd8da',

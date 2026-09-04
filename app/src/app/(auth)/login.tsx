@@ -232,7 +232,7 @@ export default function LoginScreen() {
                 style={[
                   styles.input,
                   styles.inputWithAction,
-                  focusedField === 'password' && styles.inputFocused,
+                  focusedField && focusedField === 'password' && styles.inputFocused,
                 ]}
                 value={password}
                 onChangeText={(value) => {
@@ -268,7 +268,7 @@ export default function LoginScreen() {
               </Text>
             )}
 
-            {error && (
+            {error !== null && (
               <Text accessibilityRole="alert" style={styles.error}>
                 {error}
               </Text>

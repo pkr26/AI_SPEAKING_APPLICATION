@@ -5,6 +5,7 @@ import {
   QueryClientProvider,
 } from '@tanstack/react-query';
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
+import type { TestInstance } from 'test-renderer';
 import React from 'react';
 import { BackHandler, FlatList, StyleSheet } from 'react-native';
 
@@ -1009,6 +1010,352 @@ describe('recordings library', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(screen.queryByText(t('refresh.failedUsingSaved'))).toBeNull());
+  });
+});
+
+describe('recordings visual and control wiring', () => {
+  const hidden = { includeHiddenElements: true } as const;
+  // StyleSheet.create caches per scheme, so the test reuses the exact style
+  // objects the rendered screen passes to its hosts.
+  const styles = recordingsThemedStyles({
+    scheme: 'light',
+    colors: lightColors,
+    layout,
+    radii,
+    spacing,
+    type,
+    motion,
+    elevation: elevations.light,
+  });
+  const createdAt = recording().createdAt;
+  const localeDate = (locale: string) => new Date(createdAt).toLocaleString(locale);
+
+  it('pins the recording card styles from the shared tokens', async () => {
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
+    await renderRecordings();
+    await waitFor(() => expect(screen.getByText('courage')).toBeTruthy());
+
+    const promptWord = screen.getByText('courage');
+    expect(promptWord.props.style).toBe(styles.promptWord);
+    const titleWrap = promptWord.parent;
+    expect(titleWrap?.props.style).toBe(styles.cardTitleWrap);
+    expect(screen.getByText('Describe a time you showed courage.').props.style).toBe(
+      styles.question,
+    );
+    const cardHeader = titleWrap?.parent;
+    expect(cardHeader?.props.style).toBe(styles.cardHeader);
+    const card = cardHeader?.parent;
+    expect(card?.props.style).toBe(styles.card);
+
+    const levelBadgeText = screen.getByText('B1');
+    expect(levelBadgeText.props.style).toBe(styles.levelBadgeText);
+    expect(levelBadgeText.parent?.props.style).toBe(styles.levelBadge);
+
+    const contextRow = screen.getByText(t('recordings.contextPractice')).parent;
+    expect(contextRow?.props.style).toBe(styles.metadataRow);
+    expect(screen.getByText(t('recordings.contextPractice')).props.style).toBe(styles.metadataText);
+    expect(screen.getByText(localeDate('en-US')).props.style).toBe(styles.metadataText);
+
+    const statusRow = screen.getByText(t('recordings.statusAvailable')).parent;
+    expect(statusRow?.props.style).toBe(styles.metadataRow);
+    expect(screen.getByText(t('recordings.statusAvailable')).props.style).toBe(styles.metadataText);
+    expect(screen.getByText('0:08 · 2 KB').props.style).toBe(styles.metadataText);
+  });
+
+  it('pins the loading skeleton dimensions and hidden loading copy style', async () => {
+    asMock(apiGetRecordings).mockReturnValue(new Promise(() => undefined));
+    await renderRecordings();
+
+    const loadingText = screen.getByText(t('recordings.loading'), hidden);
+    expect(loadingText.props.style).toBe(styles.hiddenLoadingText);
+    expect(loadingText.parent?.props.style).toBe(styles.listSkeleton);
+
+    const headerSkeleton = screen.getByTestId('recordings-skeleton-header', hidden);
+    expect(StyleSheet.flatten(headerSkeleton.props.style)).toMatchObject({
+      width: 120,
+      height: 16,
+      borderRadius: 4,
+    });
+    const cardSkeleton = screen.getAllByTestId('recordings-skeleton-card', hidden)[0];
+    expect(StyleSheet.flatten(cardSkeleton.props.style)).toMatchObject({
+      height: 84,
+      borderRadius: 16,
+    });
+  });
+
+  it('pins the load-failure title and copy styles', async () => {
+    asMock(apiGetRecordings).mockRejectedValue(new Error('internal detail'));
+    await renderRecordings();
+    await waitFor(() =>
+      expect(screen.getByText(t('recordings.loadFailedTitle')).props.accessibilityRole).toBe(
+        'header',
+      ),
+    );
+
+    expect(screen.getByText(t('recordings.loadFailedTitle')).props.style).toBe(styles.title);
+    expect(screen.getByText(t('recordings.loadFailed')).props.style).toBe(styles.muted);
+  });
+
+  it('pins the empty-state glyph and pull-to-refresh control wiring', async () => {
+    let resolveRefresh!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [], nextCursor: null })
+      .mockReturnValue(pending);
+    await renderRecordings();
+    await waitFor(() => expect(screen.getByTestId('recordings-empty')).toBeTruthy());
+
+    // The empty state draws the audio-lines glyph: five vertical strokes.
+    // Every step of the positional walk asserts existence first so any
+    // rewiring (a removed refresh control shifts the host's children) dies
+    // on a matcher instead of a raw dereference.
+    const emptyHost = screen.getByTestId('recordings-empty');
+    const contentWrap = emptyHost.children.filter(
+      (child): child is TestInstance => typeof child !== 'string',
+    )[1];
+    expect(contentWrap).toBeDefined();
+    const markBadge = contentWrap.children.find(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    expect(markBadge).toBeDefined();
+    const iconView = markBadge?.children.find(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    expect(iconView).toBeDefined();
+    const glyph = iconView?.children.find(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    const strokes = glyph?.children.find(
+      (child): child is TestInstance => typeof child !== 'string',
+    );
+    expect(strokes?.children).toHaveLength(5);
+    expect((strokes?.children[0] as TestInstance | undefined)?.props?.x1).toBe(4);
+
+    const refreshControl = emptyHost.props.refreshControl as React.ReactElement<
+      Record<string, unknown>
+    >;
+    // The control element itself must exist before its props are read, so a
+    // removed refreshControl wiring dies on this matcher, never a deref.
+    expect(refreshControl).toBeDefined();
+    expect(refreshControl.props.refreshing).toBe(false);
+    expect(refreshControl.props.tintColor).toBe(lightColors.primary);
+
+    await act(async () => {
+      refreshHandler()();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(
+        (emptyHost.props.refreshControl as React.ReactElement<Record<string, unknown>>).props
+          .refreshing,
+      ).toBe(true),
+    );
+    await act(async () => {
+      resolveRefresh({ items: [], nextCursor: null });
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(
+        (emptyHost.props.refreshControl as React.ReactElement<Record<string, unknown>>).props
+          .refreshing,
+      ).toBe(false),
+    );
+  });
+
+  it('pins the list surface styles and the FlatList refresh wiring', async () => {
+    let resolveRefresh!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: null })
+      .mockReturnValueOnce(pending);
+    await renderRecordings();
+    await screen.findByText('courage');
+
+    expect(flatListProps().style).toBe(styles.list);
+    expect(flatListProps().contentContainerStyle).toBe(styles.listContent);
+    expect(flatListProps().refreshing).toBe(false);
+
+    await act(async () => {
+      (flatListProps().onRefresh as () => void)();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(flatListProps().refreshing).toBe(true));
+    await act(async () => {
+      resolveRefresh({ items: [recording()], nextCursor: null });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(flatListProps().refreshing).toBe(false));
+  });
+
+  it('pins the header refresh notice and intro card wiring', async () => {
+    let resolveRefresh!: (value: RecordingPage) => void;
+    const pending = new Promise<RecordingPage>((resolve) => {
+      resolveRefresh = resolve;
+    });
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({
+        items: [recording({ status: 'retention_pending', availableAt: null })],
+        nextCursor: null,
+      })
+      .mockReturnValueOnce(pending);
+    await renderRecordings();
+    await screen.findByText('courage');
+
+    const header = flatListProps().ListHeaderComponent as React.ReactElement<{
+      children: React.ReactElement<Record<string, unknown>>[];
+    }>;
+    // The header slot itself must exist before its children are read, so a
+    // removed ListHeaderComponent wiring dies on this matcher, never a deref.
+    expect(header).toBeDefined();
+    const [notice, intro] = header.props.children;
+    expect(notice.props.updating).toBe(false);
+    expect(notice.props.failed).toBe(false);
+    expect(intro.props.style).toBe(styles.intro);
+    const introChildren = intro.props.children as React.ReactElement<Record<string, unknown>>[];
+    expect(introChildren[0].props.style).toBe(styles.introText);
+    expect(introChildren[0].props.children).toBe(t('recordings.intro'));
+    expect(introChildren[1].props.title).toBe(t('recordings.checkPending'));
+    expect(introChildren[1].props.variant).toBe('quiet');
+    expect(introChildren[1].props.size).toBe('sm');
+
+    await act(async () => {
+      (flatListProps().onRefresh as () => void)();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(apiGetRecordings).toHaveBeenCalledTimes(2));
+    await waitFor(() => {
+      const updatingHeader = flatListProps().ListHeaderComponent as React.ReactElement<{
+        children: React.ReactElement<Record<string, unknown>>[];
+      }>;
+      expect(updatingHeader.props.children[0].props.updating).toBe(true);
+      expect(updatingHeader.props.children[0].props.failed).toBe(false);
+    });
+    await act(async () => {
+      resolveRefresh({
+        items: [recording({ status: 'retention_pending', availableAt: null })],
+        nextCursor: null,
+      });
+      await Promise.resolve();
+    });
+  });
+
+  it('pins the fetching footer spinner and copy wiring', async () => {
+    let resolveOlder!: (value: RecordingPage) => void;
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: RECORDING_ID })
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          resolveOlder = resolve;
+        }),
+      );
+    await renderRecordings();
+    await screen.findByText('courage');
+    await act(async () => asMock(FlatList).mock.calls.at(-1)?.[0].onEndReached());
+    await waitFor(() => expect(screen.getByText(t('recordings.loadingMore'))).toBeTruthy());
+
+    const footer = flatListProps().ListFooterComponent as React.ReactElement<{
+      style?: unknown;
+      children: React.ReactElement<Record<string, unknown>>[];
+    }>;
+    // The footer slot itself must exist before its style and children are
+    // read, so a removed ListFooterComponent wiring dies on this matcher.
+    expect(footer).toBeDefined();
+    expect(footer.props.style).toBe(styles.footer);
+    expect(footer.props.children[0].props.color).toBe(lightColors.primary);
+    expect(footer.props.children[1].props.style).toBe(styles.muted);
+    expect(footer.props.children[1].props.accessibilityLiveRegion).toBe('polite');
+    await act(async () => {
+      resolveOlder({ items: [recording({ id: SECOND_ID })], nextCursor: null });
+      await Promise.resolve();
+    });
+  });
+
+  it('pins the failed-page footer retry wiring', async () => {
+    asMock(apiGetRecordings)
+      .mockResolvedValueOnce({ items: [recording()], nextCursor: RECORDING_ID })
+      .mockRejectedValueOnce(new Error('page failure'));
+    await renderRecordings();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t('recordings.loadMore') })).toBeTruthy(),
+    );
+    await fireEvent.press(screen.getByRole('button', { name: t('recordings.loadMore') }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t('common.tryAgain') })).toBeTruthy(),
+    );
+
+    const footer = flatListProps().ListFooterComponent as React.ReactElement<{
+      style?: unknown;
+      children: React.ReactElement<Record<string, unknown>>[];
+    }>;
+    // The footer slot itself must exist before its style and children are
+    // read, so a removed ListFooterComponent wiring dies on this matcher.
+    expect(footer).toBeDefined();
+    expect(footer.props.style).toBe(styles.footer);
+    expect(footer.props.children[0].props.style).toBe(styles.muted);
+    expect(footer.props.children[0].props.accessibilityLiveRegion).toBe('assertive');
+    const retry = footer.props.children[1];
+    expect(retry.props.title).toBe(t('common.tryAgain'));
+    expect(retry.props.variant).toBe('secondary');
+    expect(retry.props.fullWidth).toBe(true);
+  });
+
+  it('pins the safety-stop footer styles', async () => {
+    const pages: RecordingPage[] = Array.from({ length: RECORDING_MAX_PAGES }, (_, index) => ({
+      items: index === 0 ? [recording()] : [],
+      nextCursor: `cursor-${index}`,
+    }));
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    client.setQueryData(['recordings', USER.id], {
+      pages,
+      pageParams: Array.from({ length: RECORDING_MAX_PAGES }, () => undefined),
+    });
+
+    await renderRecordings(client);
+
+    const footer = flatListProps().ListFooterComponent as React.ReactElement<{
+      style?: unknown;
+      children: unknown;
+    }>;
+    // The footer slot itself must exist before its props are read, so a
+    // removed ListFooterComponent wiring dies on this matcher, never a deref.
+    expect(footer).toBeDefined();
+    expect(footer.props.style).toBe(styles.footer);
+    expect(React.Children.toArray(footer.props.children as React.ReactNode)[0]).toMatchObject({
+      props: { style: styles.muted },
+    });
+  });
+
+  it('pins the load-more action wiring with a next page', async () => {
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: RECORDING_ID });
+    await renderRecordings();
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t('recordings.loadMore') })).toBeTruthy(),
+    );
+
+    const loadMore = flatListProps().ListFooterComponent as React.ReactElement<
+      Record<string, unknown>
+    >;
+    expect(loadMore.props.title).toBe(t('recordings.loadMore'));
+    expect(loadMore.props.variant).toBe('secondary');
+    expect(loadMore.props.fullWidth).toBe(true);
+    expect(loadMore.props.style).toBe(styles.action);
+  });
+
+  it('formats card dates in the active UI locale', async () => {
+    asMock(apiGetRecordings).mockResolvedValue({ items: [recording()], nextCursor: null });
+    await renderRecordings(undefined, 'te');
+    await waitFor(() => expect(screen.getByText('courage')).toBeTruthy());
+
+    expect(screen.getByText(localeDate('te-IN'))).toBeTruthy();
+    expect(screen.queryByText(localeDate('en-US'))).toBeNull();
   });
 });
 

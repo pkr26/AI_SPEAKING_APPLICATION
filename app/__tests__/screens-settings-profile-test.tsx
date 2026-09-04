@@ -3,7 +3,14 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { Directory, File, Paths } from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
 import React from 'react';
-import { AccessibilityInfo, Alert, AppState, type AppStateStatus, StyleSheet } from 'react-native';
+import {
+  AccessibilityInfo,
+  Alert,
+  AppState,
+  type AppStateStatus,
+  StyleSheet,
+  Text,
+} from 'react-native';
 import type { Fiber, TestInstance } from 'test-renderer';
 
 import SettingsScreen, {
@@ -11,6 +18,8 @@ import SettingsScreen, {
   emptyRecordingPages,
   formatReminderHour,
 } from '../src/app/settings/index';
+import Button from '../src/components/Button';
+import Icon from '../src/components/Icon';
 import {
   ApiError,
   apiConsumeAccountExportPages,
@@ -313,9 +322,38 @@ function makeQueryClient() {
   return client;
 }
 
+/**
+ * Renders fallback copy when a child render throws. Both settings language
+ * grids call their required accessibilityLabelFor prop at render time, so a
+ * wiring mutant that drops that attribute would crash the reconciler and fail
+ * every owning test with a raw TypeError (classified Error, not a kill). The
+ * boundary swaps the crash for fallback copy, so those tests fail on Testing
+ * Library query evidence — including the chip-label assertions that pin the
+ * authored labelFor output — instead.
+ */
+class RenderCrashBoundary extends React.Component<
+  { children: React.ReactNode },
+  { crashed: boolean }
+> {
+  state = { crashed: false };
+
+  static getDerivedStateFromError() {
+    return { crashed: true };
+  }
+
+  render() {
+    if (this.state.crashed) {
+      return <Text testID="render-crash-fallback">render crashed</Text>;
+    }
+    return this.props.children;
+  }
+}
+
 const settingsTree = (client: QueryClient) => (
   <QueryClientProvider client={client}>
-    <SettingsScreen />
+    <RenderCrashBoundary>
+      <SettingsScreen />
+    </RenderCrashBoundary>
   </QueryClientProvider>
 );
 
@@ -386,13 +424,105 @@ function committedPressHandler(node: TestInstance): () => unknown {
  */
 function scrollContentStyle(): SemanticStyle {
   const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
-  if (!scrollView) throw new Error('No ScrollView rendered');
-  return StyleSheet.flatten(scrollView.props.contentContainerStyle) ?? {};
+  // A missing scroll host is itself the observable wiring failure; fail on
+  // matcher evidence instead of a helper throw.
+  expect(scrollView).toBeDefined();
+  return StyleSheet.flatten(scrollView?.props.contentContainerStyle) ?? {};
 }
 
 /** The language-change spinner is the only ActivityIndicator on this screen. */
 function languageSpinners(): TestInstance[] {
   return screen.container.queryAll((node) => node.type === 'ActivityIndicator');
+}
+
+type HookListNode = { memoizedState?: unknown; queue?: unknown; next?: HookListNode | null };
+
+/**
+ * The committed useState slots of the mounted SettingsScreen, in declaration
+ * order. Null-typed error/target states are hostile-mutated to `false`, which
+ * renders identically inside `x && <Node/>` guards; the authored slot values
+ * themselves are the only distinguishing observable for that wiring.
+ */
+function settingsStateSlots(): unknown[] {
+  let fiber: Fiber | null = screen.getByText(t('settings.profileTitle')).unstable_fiber;
+  while (fiber !== null && fiber.type !== SettingsScreen) fiber = fiber.return;
+  expect(fiber).not.toBeNull();
+  const values: unknown[] = [];
+  let hook = (fiber?.memoizedState ?? null) as HookListNode | null;
+  while (hook) {
+    // useState (and useReducer) hooks carry a live update queue; effect, ref,
+    // memo, and callback hooks do not.
+    if (hook.queue) values.push(hook.memoizedState);
+    hook = hook.next ?? null;
+  }
+  return values;
+}
+
+/** Declaration-order indexes into settingsStateSlots(). */
+const SLOT = {
+  nameDraft: 0,
+  nameFocused: 1,
+  nameTouched: 2,
+  nameBusy: 3,
+  nameSaved: 4,
+  nameError: 5,
+  languageBusy: 6,
+  languageTarget: 7,
+  languageError: 8,
+  languageErrorScope: 9,
+  exportBusy: 10,
+  exportError: 11,
+  recordingsDeleteBusy: 12,
+  recordingsDeleteConfirming: 13,
+  recordingsDeleteSucceeded: 14,
+  recordingsDeleteError: 15,
+  reminder: 16,
+  reminderBusy: 17,
+  reminderError: 18,
+  privacyBusy: 19,
+  privacyError: 20,
+  retakeBusy: 21,
+  retakeConfirming: 22,
+  retakeError: 23,
+  logoutBusy: 24,
+} as const;
+
+/** The props a composite component received, read from its committed fiber. */
+function descendantCompositeProps(
+  root: TestInstance,
+  componentType: unknown,
+): Record<string, unknown>[] {
+  const found: Record<string, unknown>[] = [];
+  const visit = (fiber: Fiber | null): void => {
+    while (fiber) {
+      if (fiber.type === componentType) {
+        found.push((fiber.memoizedProps ?? {}) as Record<string, unknown>);
+      }
+      visit(fiber.child);
+      fiber = fiber.sibling;
+    }
+  };
+  visit(root.unstable_fiber?.child ?? null);
+  return found;
+}
+
+/**
+ * The authored props of the Pressable wrapper that owns a queried pressable
+ * row. The jest-expo platform mock exposes a different Pressable binding than
+ * the screen's module graph resolves, so the wrapper is identified by owning
+ * both an onPress handler and the disabled prop on that exact element.
+ */
+function pressablePropsOf(node: TestInstance): Record<string, unknown> {
+  let fiber: Fiber | null = node.unstable_fiber;
+  while (fiber !== null) {
+    const props = (fiber.memoizedProps ?? {}) as Record<string, unknown>;
+    if (typeof props.onPress === 'function' && 'disabled' in props) return props;
+    fiber = fiber.return;
+  }
+  // A row whose Pressable wiring lost its disabled prop has no owner to read:
+  // fail as a matcher, never as a raw dereference.
+  expect(fiber).not.toBeNull();
+  return {};
 }
 
 function languageChip(index: number): TestInstance {
@@ -5204,5 +5334,683 @@ describe('settings async race fences', () => {
     restart.reject(new Error('late restart failure'));
     await act(async () => Promise.resolve());
     expect(screen.queryByText(t('retake.failed'))).toBeNull();
+  });
+});
+
+describe('settings state wiring pins', () => {
+  it('pins the exact idle useState vector before hydration resolves', async () => {
+    // The stored-reminder read never settles, so every slot still holds its
+    // authored initializer: error/target slots must be null — a hostile `false`
+    // renders identically behind `x && <Node/>` but is a different state value.
+    mockGetReminder.mockReturnValue(new Promise(() => undefined));
+    await renderSettings();
+
+    expect(settingsStateSlots()).toEqual([
+      // nameDraft, nameFocused, nameTouched, nameBusy, nameSaved, nameError
+      USER.name,
+      false,
+      false,
+      false,
+      false,
+      null,
+      // languageBusy, languageTarget, languageError, languageErrorScope
+      false,
+      null,
+      null,
+      null,
+      // exportBusy, exportError
+      false,
+      null,
+      // recordingsDeleteBusy, -Confirming, -Succeeded, -Error
+      false,
+      false,
+      false,
+      null,
+      // reminder, reminderBusy, reminderError
+      null,
+      false,
+      null,
+      // privacyBusy, privacyError
+      false,
+      null,
+      // retakeBusy, retakeConfirming, retakeError
+      false,
+      false,
+      null,
+      // logoutBusy
+      false,
+    ]);
+  });
+
+  it('clears the in-flight learning-language target once the change settles', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    await renderSettings();
+
+    await fireEvent.press(languageChip(1));
+    expect(settingsStateSlots()[SLOT.languageTarget]).toEqual({ scope: 'native', code: 'hi' });
+
+    await act(async () => {
+      update.resolve({ ...USER, nativeLanguage: 'hi' });
+    });
+    expect(settingsStateSlots()[SLOT.languageTarget]).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageBusy]).toBe(false);
+  });
+
+  it('clears the in-flight app-language target once the change settles', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(1));
+    expect(settingsStateSlots()[SLOT.languageTarget]).toEqual({ scope: 'ui', code: 'te' });
+
+    await act(async () => {
+      update.resolve({ ...USER, uiLanguage: 'hi' });
+    });
+    expect(settingsStateSlots()[SLOT.languageTarget]).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageBusy]).toBe(false);
+  });
+
+  it('clears an in-flight language target for a replacement identity', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    const view = await renderSettings();
+
+    await fireEvent.press(languageChip(1));
+    expect(settingsStateSlots()[SLOT.languageTarget]).toEqual({ scope: 'native', code: 'hi' });
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(settingsStateSlots()[SLOT.languageTarget]).toBeNull();
+  });
+
+  it('clears the language error and its scope for a replacement identity', async () => {
+    mockUpdateProfile.mockRejectedValue(new Error('offline'));
+    const view = await renderSettings();
+
+    await fireEvent.press(languageChip(1));
+    expect(await screen.findByText(t('settings.updateFailed'))).toBeTruthy();
+    expect(settingsStateSlots()[SLOT.languageErrorScope]).toBe('native');
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageError]).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageErrorScope]).toBeNull();
+  });
+
+  it('retracts a stale learning-language error and its scope when a new change starts', async () => {
+    const retry = deferred<User>();
+    mockUpdateProfile.mockRejectedValueOnce(new Error('offline')).mockReturnValue(retry.promise);
+    await renderSettings();
+
+    await fireEvent.press(languageChip(1));
+    expect(await screen.findByText(t('settings.updateFailed'))).toBeTruthy();
+
+    await fireEvent.press(languageChip(1));
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageError]).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageErrorScope]).toBeNull();
+  });
+
+  it('retracts a stale app-language error and its scope when a new change starts', async () => {
+    const retry = deferred<User>();
+    mockUpdateProfile.mockRejectedValueOnce(new Error('offline')).mockReturnValue(retry.promise);
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(2));
+    expect(await screen.findByText(t('settings.updateFailed'))).toBeTruthy();
+
+    await fireEvent.press(uiLanguageChip(2));
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageError]).toBeNull();
+    expect(settingsStateSlots()[SLOT.languageErrorScope]).toBeNull();
+  });
+});
+
+describe('stale outcome retraction', () => {
+  it('retracts a stale name failure as soon as the next save starts', async () => {
+    const retry = deferred<User>();
+    mockUpdateProfile.mockRejectedValueOnce(new Error('offline')).mockReturnValue(retry.promise);
+    await renderSettings();
+    const save = () => screen.getByRole('button', { name: t('settings.saveName') });
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'Ada King');
+    await fireEvent.press(save());
+    expect(await screen.findByText(t('settings.updateFailed'))).toBeTruthy();
+
+    await fireEvent.press(save());
+    expect(screen.queryByText(t('settings.updateFailed'))).toBeNull();
+  });
+
+  it('retracts the saved note while the next name save is in flight', async () => {
+    const first = deferred<User>();
+    const second = deferred<User>();
+    mockUpdateProfile.mockReturnValue(first.promise);
+    const { rerenderSettings } = await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+    const save = () => screen.getByRole('button', { name: t('settings.saveName') });
+
+    await fireEvent.changeText(input(), 'Ada King');
+    await fireEvent.press(save());
+    await act(async () => {
+      first.resolve({ ...USER, name: 'Ada King' });
+    });
+    expect(await screen.findByText(t('settings.saved'))).toBeTruthy();
+
+    // A focused field keeps its adopted draft through an external canonical
+    // change, so Save re-arms without re-typing — re-typing would clear the
+    // note through the change handler instead of the save-start reset.
+    await act(async () => {
+      await fireEvent(input(), 'focus');
+    });
+    const setUser = mockAuthValue.setUser;
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada Byron' }, setUser });
+    await rerenderSettings();
+    expect(input().props.value).toBe('Ada King');
+
+    mockUpdateProfile.mockReturnValue(second.promise);
+    await fireEvent.press(save());
+    expect(screen.queryByText(t('settings.saved'))).toBeNull();
+
+    await act(async () => {
+      second.resolve({ ...USER, name: 'Ada King' });
+    });
+    expect(await screen.findByText(t('settings.saved'))).toBeTruthy();
+  });
+
+  it('adopts the server-normalized name into the field after saving', async () => {
+    mockUpdateProfile.mockResolvedValue({ ...USER, name: 'Ada King' });
+    await renderSettings();
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), '  Ada King ');
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.saveName') }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText(t('signup.nameLabel')).props.value).toBe('Ada King'),
+    );
+  });
+
+  it('retracts a stale export failure as soon as the next export starts', async () => {
+    const retry = deferred<unknown>();
+    mockExportData.mockRejectedValueOnce(new Error('offline')).mockReturnValue(retry.promise);
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.export') });
+
+    await fireEvent.press(row());
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+
+    await fireEvent.press(row());
+    expect(screen.queryByText(t('settings.exportFailed'))).toBeNull();
+  });
+
+  it('retracts the previous bulk-delete success as soon as the confirmation opens', async () => {
+    mockDeleteAllRecordings.mockResolvedValueOnce(undefined);
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+
+    await fireEvent.press(row());
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(await screen.findByText(t('settings.recordingsDeleteAllSuccess'))).toBeTruthy();
+
+    await fireEvent.press(row());
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    expect(latestAlertCall()[0]).toBe(t('settings.recordingsDeleteAllTitle'));
+  });
+
+  it('retracts a stale bulk-delete failure as soon as the confirmation opens', async () => {
+    mockDeleteAllRecordings.mockRejectedValueOnce(new Error('offline'));
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+
+    await fireEvent.press(row());
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(await screen.findByText(t('settings.recordingsDeleteAllFailed'))).toBeTruthy();
+
+    await fireEvent.press(row());
+    expect(screen.queryByText(t('settings.recordingsDeleteAllFailed'))).toBeNull();
+  });
+
+  it('retracts a stale reminder failure as soon as scheduling restarts', async () => {
+    const retry = deferred<string>();
+    mockEnableReminder.mockRejectedValueOnce(new Error('os')).mockReturnValue(retry.promise);
+    await renderSettings();
+    const toggle = () => screen.getByRole('switch', { name: t('reminder.toggleLabel') });
+
+    await fireEvent.press(toggle());
+    expect(await screen.findByText(t('reminder.failed'))).toBeTruthy();
+
+    await fireEvent.press(toggle());
+    expect(screen.queryByText(t('reminder.failed'))).toBeNull();
+  });
+
+  it('retracts a stale UMP privacy failure when the options reopen', async () => {
+    const retry = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions
+      .mockResolvedValueOnce(false)
+      .mockReturnValueOnce(retry.promise)
+      .mockResolvedValue(true);
+    await renderSettings();
+    const button = () => screen.getByRole('button', { name: t('ads.privacyOptions') });
+
+    await fireEvent.press(button());
+    expect(await screen.findByText(t('ads.privacyFailed'))).toBeTruthy();
+
+    await fireEvent.press(button());
+    expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+  });
+
+  it('retracts a stale retake failure as soon as the next restart starts', async () => {
+    const retry = deferred<void>();
+    mockRestartDiagnostic
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockReturnValue(retry.promise);
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.retake') });
+
+    await fireEvent.press(row());
+    await pressAlertButton(t('retake.confirm'));
+    expect(await screen.findByText(t('retake.failed'))).toBeTruthy();
+
+    await fireEvent.press(row());
+    await pressAlertButton(t('retake.confirm'));
+    expect(screen.queryByText(t('retake.failed'))).toBeNull();
+  });
+
+  it('unlocks the destructive row for a replacement identity mid-confirmation', async () => {
+    const view = await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+
+    await fireEvent.press(row());
+    expect(alertSpy).toHaveBeenCalledTimes(1);
+    expect(row().props.accessibilityState).toEqual({ busy: false, disabled: true });
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(row().props.accessibilityState).toEqual({ busy: false, disabled: false });
+  });
+
+  it('drops a completed bulk-delete success banner for a replacement identity', async () => {
+    mockDeleteAllRecordings.mockResolvedValueOnce(undefined);
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(await screen.findByText(t('settings.recordingsDeleteAllSuccess'))).toBeTruthy();
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+  });
+
+  it('drops a bulk-delete failure for a replacement identity', async () => {
+    mockDeleteAllRecordings.mockRejectedValueOnce(new Error('offline'));
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(await screen.findByText(t('settings.recordingsDeleteAllFailed'))).toBeTruthy();
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('drops a UMP privacy failure for a replacement identity', async () => {
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockResolvedValueOnce(false);
+    const view = await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    expect(await screen.findByText(t('ads.privacyFailed'))).toBeTruthy();
+
+    await crossSettingsOwnershipBoundary(view, 'identity');
+    expect(screen.queryByText(t('ads.privacyFailed'))).toBeNull();
+  });
+});
+
+describe('settings surface prop pins', () => {
+  it('pins the ScrollView inset adjustment and keyboard tap behavior', async () => {
+    await renderSettings();
+
+    const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+    expect(scrollView).toBeDefined();
+    expect(scrollView.props.contentInsetAdjustmentBehavior).toBe('automatic');
+    expect(scrollView.props.keyboardShouldPersistTaps).toBe('handled');
+  });
+
+  it('pins the name field text-entry props', async () => {
+    await renderSettings();
+    const input = screen.getByLabelText(t('signup.nameLabel'));
+
+    expect(input.props.autoCapitalize).toBe('words');
+    expect(input.props.autoComplete).toBe('name');
+    expect(input.props.textContentType).toBe('name');
+    expect(input.props.returnKeyType).toBe('done');
+  });
+
+  it('pins the Save button compact size prop', async () => {
+    await renderSettings();
+
+    const nameRow = parentOf(screen.getByLabelText(t('signup.nameLabel')));
+    const buttons = descendantCompositeProps(nameRow, Button);
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]).toMatchObject({ size: 'sm' });
+  });
+
+  it('pins every profile-card label and value style', async () => {
+    await renderSettings();
+
+    const labelStyle = {
+      fontSize: 12,
+      fontWeight: '700',
+      color: colors.muted,
+      textTransform: 'uppercase',
+      letterSpacing: 0.8,
+      marginTop: spacing.lg,
+      marginBottom: 6,
+    };
+    expect(flattenedStyle(screen.getByText(t('signup.nameLabel')))).toEqual(labelStyle);
+    expect(flattenedStyle(screen.getByText(t('settings.levelLabel')))).toEqual(labelStyle);
+    expect(flattenedStyle(screen.getByText(t('settings.appLanguageLabel')))).toEqual(labelStyle);
+    expect(flattenedStyle(screen.getByText(t('settings.learningLanguageLabel')))).toEqual(
+      labelStyle,
+    );
+    expect(flattenedStyle(screen.getByText(`B1 — ${t('cefr.B1')}`))).toEqual({
+      fontSize: 16,
+      color: colors.text,
+    });
+  });
+
+  it('pins the reminder card and its title style', async () => {
+    await renderSettings();
+
+    const title = screen.getByRole('header', { name: t('reminder.toggleLabel') });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginBottom: spacing.lg,
+    });
+    expect(flattenedStyle(title)).toEqual({ fontSize: 17, fontWeight: '800', color: colors.text });
+  });
+
+  it('pins the UMP privacy card and its title style', async () => {
+    mockPrivacyOptionsRequired = true;
+    await renderSettings();
+
+    const title = screen.getByRole('header', { name: t('ads.privacyOptions') });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginBottom: spacing.lg,
+    });
+    expect(flattenedStyle(title)).toEqual({ fontSize: 17, fontWeight: '800', color: colors.text });
+  });
+
+  it('pins the account card and its title style', async () => {
+    await renderSettings();
+
+    const title = screen.getByRole('header', { name: t('menu.accountTitle') });
+    expect(flattenedStyle(parentOf(title))).toEqual({
+      backgroundColor: colors.card,
+      borderRadius: radii.card,
+      padding: spacing.lg,
+      borderWidth: 1,
+      borderColor: colors.border,
+      marginBottom: spacing.lg,
+    });
+    expect(flattenedStyle(title)).toEqual({ fontSize: 17, fontWeight: '800', color: colors.text });
+  });
+
+  it('pins the scoped language-error styles', async () => {
+    mockUpdateProfile.mockRejectedValue(new Error('offline'));
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(2));
+    const uiError = await screen.findByRole('alert');
+    expect(uiError).toHaveTextContent(t('settings.updateFailed'));
+    expect(flattenedStyle(uiError)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.danger,
+      fontSize: 13,
+    });
+
+    await fireEvent.press(languageChip(1));
+    const nativeError = await screen.findByRole('alert');
+    expect(nativeError).toHaveTextContent(t('settings.updateFailed'));
+    expect(flattenedStyle(nativeError)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.danger,
+      fontSize: 13,
+    });
+  });
+
+  it('pins the UMP privacy-error style', async () => {
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockResolvedValueOnce(false);
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent(t('ads.privacyFailed'));
+    expect(flattenedStyle(error)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.danger,
+      fontSize: 13,
+    });
+  });
+
+  it('pins the bulk-delete hint, success, and failure styles', async () => {
+    await renderSettings();
+
+    expect(flattenedStyle(screen.getByText(t('settings.recordingsDeleteAllHint')))).toEqual({
+      marginTop: spacing.sm,
+      marginBottom: spacing.sm,
+      color: colors.muted,
+      fontSize: 13,
+      lineHeight: 18,
+    });
+
+    mockDeleteAllRecordings.mockRejectedValueOnce(new Error('offline'));
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    const failure = await screen.findByRole('alert');
+    expect(failure).toHaveTextContent(t('settings.recordingsDeleteAllFailed'));
+    expect(flattenedStyle(failure)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.danger,
+      fontSize: 13,
+    });
+
+    mockDeleteAllRecordings.mockResolvedValueOnce(undefined);
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    const success = await screen.findByText(t('settings.recordingsDeleteAllSuccess'));
+    expect(flattenedStyle(success)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.success,
+      fontSize: 13,
+    });
+  });
+
+  it('pins the export-error style', async () => {
+    mockExportData.mockRejectedValueOnce(new Error('offline'));
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    const error = await screen.findByRole('alert');
+    expect(error).toHaveTextContent(t('settings.exportFailed'));
+    expect(flattenedStyle(error)).toEqual({
+      marginTop: spacing.sm,
+      color: colors.danger,
+      fontSize: 13,
+    });
+  });
+
+  it('pins every account action-row icon exactly', async () => {
+    await renderSettings();
+
+    const expectIcon = (
+      row: TestInstance,
+      index: number,
+      expected: { name: string; size: number; color: string },
+    ): void => {
+      const icons = descendantCompositeProps(row, Icon);
+      expect(icons[index]).toMatchObject(expected);
+    };
+    const recordingsRow = screen.getByRole('button', { name: t('header.recordings') });
+    expectIcon(recordingsRow, 0, { name: 'audio-lines', size: 20, color: colors.text });
+    expectIcon(recordingsRow, 1, { name: 'chevron-right', size: 18, color: colors.muted });
+
+    const passwordRow = screen.getByRole('button', { name: t('header.changePassword') });
+    expectIcon(passwordRow, 0, { name: 'lock', size: 20, color: colors.text });
+    expectIcon(passwordRow, 1, { name: 'chevron-right', size: 18, color: colors.muted });
+
+    const exportRow = screen.getByRole('button', { name: t('settings.export') });
+    expectIcon(exportRow, 0, { name: 'download', size: 20, color: colors.text });
+    expect(descendantCompositeProps(exportRow, Icon)).toHaveLength(1);
+
+    const retakeRow = screen.getByRole('button', { name: t('settings.retake') });
+    expectIcon(retakeRow, 0, { name: 'target', size: 20, color: colors.text });
+
+    const privacyRow = screen.getByRole('button', { name: t('header.privacy') });
+    expectIcon(privacyRow, 0, { name: 'user', size: 20, color: colors.text });
+    expectIcon(privacyRow, 1, { name: 'chevron-right', size: 18, color: colors.muted });
+
+    const termsRow = screen.getByRole('button', { name: t('header.terms') });
+    expectIcon(termsRow, 0, { name: 'book', size: 20, color: colors.text });
+    expectIcon(termsRow, 1, { name: 'chevron-right', size: 18, color: colors.muted });
+  });
+
+  it('pins the app-language chip spinner and its status overlay', async () => {
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    await renderSettings();
+
+    await fireEvent.press(uiLanguageChip(1));
+    expect(languageSpinners()).toHaveLength(1);
+    const spinner = languageSpinners()[0];
+    expect(spinner.props.size).toBe('small');
+    expect(spinner.props.color).toBe(colors.primary);
+    expect(parentOf(spinner).props.testID).toBe('app-language-status-te');
+    expect(flattenedStyle(parentOf(spinner))).toEqual({
+      height: spacing.lg,
+      marginTop: spacing.xs,
+      alignItems: 'center',
+      justifyContent: 'center',
+    });
+
+    await act(async () => {
+      update.resolve({ ...USER, uiLanguage: 'te' });
+    });
+    expect(languageSpinners()).toHaveLength(0);
+  });
+
+  it('pins the action-text styles across the account card', async () => {
+    mockPrivacyOptionsRequired = true;
+    await renderSettings();
+
+    const actionTextStyle = { fontSize: 16, fontWeight: '600', color: colors.primary };
+    expect(
+      flattenedStyle(
+        within(screen.getByRole('button', { name: t('ads.privacyOptions') })).getByText(
+          t('ads.privacyOptions'),
+        ),
+      ),
+    ).toEqual(actionTextStyle);
+    expect(
+      flattenedStyle(
+        within(screen.getByRole('button', { name: t('settings.export') })).getByText(
+          t('settings.export'),
+        ),
+      ),
+    ).toEqual(actionTextStyle);
+    expect(
+      flattenedStyle(
+        within(screen.getByRole('button', { name: t('settings.retake') })).getByText(
+          t('settings.retake'),
+        ),
+      ),
+    ).toEqual(actionTextStyle);
+    expect(
+      flattenedStyle(
+        within(screen.getByRole('button', { name: t('header.privacy') })).getByText(
+          t('header.privacy'),
+        ),
+      ),
+    ).toEqual(actionTextStyle);
+    expect(
+      flattenedStyle(
+        within(screen.getByRole('button', { name: t('header.terms') })).getByText(
+          t('header.terms'),
+        ),
+      ),
+    ).toEqual(actionTextStyle);
+  });
+
+  it('pins the UMP privacy spinner color', async () => {
+    const request = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockReturnValueOnce(request.promise).mockResolvedValue(true);
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    const spinners = screen.container.queryAll(
+      (node) =>
+        node.type === 'ActivityIndicator' &&
+        node.props.accessibilityLabel === t('ads.privacyOptions'),
+    );
+    expect(spinners).toHaveLength(1);
+    expect(spinners[0].props.color).toBe(colors.primary);
+
+    await act(async () => {
+      request.resolve(true);
+    });
+  });
+
+  it('keeps rows genuinely disabled while a sibling operation is busy', async () => {
+    mockConsumeExportPages.mockImplementation(() => new Promise(() => undefined));
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+    await waitFor(() =>
+      expect(screen.getByRole('button', { name: t('settings.exportBusy') })).toBeTruthy(),
+    );
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('header.recordings') })).disabled,
+    ).toBe(true);
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }))
+        .disabled,
+    ).toBe(true);
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('settings.exportBusy') })).disabled,
+    ).toBe(true);
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('common.logOut') })).disabled,
+    ).toBe(true);
+  });
+
+  it('keeps the UMP privacy and retake rows genuinely disabled while busy', async () => {
+    const privacyRequest = deferred<boolean>();
+    mockPrivacyOptionsRequired = true;
+    mockShowAdPrivacyOptions.mockReturnValueOnce(privacyRequest.promise).mockResolvedValue(true);
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('ads.privacyOptions') }));
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('ads.privacyOptions') })).disabled,
+    ).toBe(true);
+    await act(async () => {
+      privacyRequest.resolve(true);
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.retake') }));
+    expect(
+      pressablePropsOf(screen.getByRole('button', { name: t('settings.retake') })).disabled,
+    ).toBe(true);
   });
 });

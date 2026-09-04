@@ -27,7 +27,13 @@ function FocusedHomeBannerAd() {
   const [validatedForFocus, setValidatedForFocus] = useState(false);
   const [measuredSlotWidth, setMeasuredSlotWidth] = useState<number | null>(null);
   const slotWidth = measuredSlotWidth ?? homeBannerContentWidth(windowWidth);
-  const failed = failedConsentVersion === ads.consentVersion;
+  // The failure record is either the null sentinel (never failed) or the
+  // consent version it failed under; any other value can only be corrupted
+  // state, and the slot fails closed instead of requesting under an unknown
+  // failure history.
+  const failed =
+    (failedConsentVersion !== null && typeof failedConsentVersion !== 'number') ||
+    failedConsentVersion === ads.consentVersion;
   useEffect(() => {
     let active = true;
     void activatePlacement('homeBanner').then((ready) => {

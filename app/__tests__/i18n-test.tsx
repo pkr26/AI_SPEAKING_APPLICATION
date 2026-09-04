@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react-native';
+import { fireEvent, render, screen } from '@testing-library/react-native';
 import React from 'react';
-import { Text } from 'react-native';
+import { Pressable, Text } from 'react-native';
 
 import {
   deviceLanguage,
@@ -508,6 +508,45 @@ describe('I18nProvider language selection', () => {
     );
     expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.en['login.submit']);
     expect(getActiveLanguage()).toBe('en');
+  });
+
+  it('pins the rendered language to the provider value after another provider moves the module language', async () => {
+    function ReRenderProbe() {
+      const [nonce, setNonce] = React.useState(0);
+      const { language, t } = useI18n();
+      return (
+        <>
+          <Text testID="lang">{language}</Text>
+          <Text testID="msg">{t('login.submit')}</Text>
+          <Pressable
+            accessibilityRole="button"
+            testID="bump-language-probe"
+            onPress={() => setNonce((value) => value + 1)}
+          >
+            <Text>Bump probe</Text>
+          </Pressable>
+          <Text>{nonce}</Text>
+        </>
+      );
+    }
+
+    await render(
+      <I18nProvider accountLanguage={null} guestLanguage="en">
+        <ReRenderProbe />
+        <I18nProvider accountLanguage={null} guestLanguage="es">
+          <Text>inner provider mounted</Text>
+        </I18nProvider>
+      </I18nProvider>,
+    );
+    expect(screen.getByTestId('lang')).toHaveTextContent('en');
+
+    // A later sibling provider now owns the module-level active language. When
+    // this provider's consumer re-renders for its own reasons it must keep
+    // reading its own memoized context value — never the module fallback's
+    // call-time translator, which would silently relocalize the subtree.
+    await fireEvent.press(screen.getByTestId('bump-language-probe'));
+    expect(screen.getByTestId('lang')).toHaveTextContent('en');
+    expect(screen.getByTestId('msg')).toHaveTextContent(dictionaries.en['login.submit']);
   });
 
   it('translates same-commit layout-effect and event-time copy with the new language', async () => {

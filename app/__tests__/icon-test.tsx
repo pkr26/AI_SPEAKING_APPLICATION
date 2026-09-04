@@ -287,15 +287,55 @@ describe('Icon glyph geometry', () => {
       const svg = host.props.children as React.ReactElement;
       for (const primitive of primitivesOf(svg)) {
         const props = primitive.props as Record<string, unknown>;
+        // Every authored primitive carries an explicit fill — 'none' on the
+        // stroked outlines, the ink on the filled marks — so a dropped fill
+        // never silently falls through both branches.
+        expect(props.fill).toBeDefined();
         if (props.stroke !== undefined) {
           expect(props.stroke).toBe('#135713');
           expect(props.fill).toBe('none');
-        } else if (props.fill !== undefined) {
+        } else {
           // Filled marks (stop/play/pause and the dot accents) carry the ink
           // through fill instead of stroke.
           expect(props.fill).toBe('#135713');
         }
       }
     }
+  });
+});
+
+describe('Icon stroke and canvas wiring', () => {
+  it("pins the slider knob circles' explicit stroke width alongside the rails", async () => {
+    await render(<Icon name="sliders" strokeWidth={3.5} color="#246810" testID="sliders-wired" />);
+    const host = screen.getByTestId('sliders-wired', { includeHiddenElements: true });
+    const svg = host.props.children as React.ReactElement;
+    const primitives = primitivesOf(svg);
+    const knobs = primitives.filter((primitive) => primitive.type === Circle);
+    // The two slider knobs spell their stroke props out individually.
+    expect(knobs).toHaveLength(2);
+    for (const knob of knobs) {
+      expect(knob.props.stroke).toBe('#246810');
+      expect(knob.props.strokeWidth).toBe(3.5);
+      expect(knob.props.fill).toBe('none');
+    }
+    // The two rails share the same width through the common spread.
+    const rails = primitives.filter((primitive) => primitive.type === Line);
+    expect(rails).toHaveLength(2);
+    for (const rail of rails) {
+      expect(rail.props.strokeWidth).toBe(3.5);
+    }
+  });
+
+  it('draws on the fixed 24-unit canvas with round stroke caps and joins', async () => {
+    await render(<Icon name="check" testID="canvas-icon" />);
+    const host = screen.getByTestId('canvas-icon', { includeHiddenElements: true });
+    const svg = host.props.children as React.ReactElement<{
+      viewBox?: string;
+      strokeLinecap?: string;
+      strokeLinejoin?: string;
+    }>;
+    expect(svg.props.viewBox).toBe('0 0 24 24');
+    expect(svg.props.strokeLinecap).toBe('round');
+    expect(svg.props.strokeLinejoin).toBe('round');
   });
 });

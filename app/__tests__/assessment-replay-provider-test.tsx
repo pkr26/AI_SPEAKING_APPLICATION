@@ -1,7 +1,7 @@
 import { onlineManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react-native';
 import React from 'react';
-import { AppState, type AppStateStatus, Pressable, Text } from 'react-native';
+import { AppState, type AppStateStatus, Pressable, StyleSheet, Text } from 'react-native';
 
 import {
   AssessmentReplayProvider,
@@ -9,6 +9,7 @@ import {
 } from '../src/lib/assessment-replay-provider';
 import { apiFetch, ApiError } from '../src/lib/api';
 import { useAuth } from '../src/lib/auth';
+import { colors, layout, spacing } from '../src/lib/theme';
 import {
   clearPendingAssessmentIfRequestMatches,
   loadPendingAssessment,
@@ -56,6 +57,10 @@ const pending = {
 
 jest.mock('expo-router', () => ({
   router: { replace: jest.fn() },
+}));
+jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
+  __esModule: true,
+  default: jest.fn(() => 'light'),
 }));
 jest.mock('../src/lib/api', () => ({
   ...jest.requireActual('../src/lib/api'),
@@ -137,6 +142,29 @@ describe('AssessmentReplayProvider', () => {
     expect(apiFetch).not.toHaveBeenCalled();
   });
 
+  it('starts the durable-replay retry generation at zero', async () => {
+    await render(tree());
+    const anchor = await screen.findByText('protected app');
+    // The retry generation is provider state that never reaches rendered
+    // output, so the pristine value is pinned on the provider's own hook
+    // chain: retryVersion is its first useState slot.
+    type ProviderFiber = {
+      type?: unknown;
+      memoizedState?: unknown;
+      return: ProviderFiber | null;
+    };
+    let fiber = anchor.unstable_fiber as ProviderFiber | null;
+    while (fiber && fiber.type !== AssessmentReplayProvider) fiber = fiber.return;
+    expect(fiber).not.toBeNull();
+    type StateHookSlot = { queue?: unknown; memoizedState?: unknown; next?: StateHookSlot };
+    const firstSlot = (fiber as (ProviderFiber & { memoizedState: StateHookSlot | null }) | null)
+      ?.memoizedState;
+    expect(firstSlot?.queue).toBeDefined();
+    // The initial check belongs to retry generation zero: a fresh mount must
+    // never count phantom re-arms it did not perform.
+    expect(firstSlot?.memoizedState).toBe(0);
+  });
+
   it('reacts in the same session when Recorder promotes route-mismatched completed feedback', async () => {
     await render(tree());
     expect(await screen.findByText('protected app')).toBeTruthy();
@@ -184,6 +212,54 @@ describe('AssessmentReplayProvider', () => {
     expect(screen.getByText('Checking your saved answer').props.accessibilityLiveRegion).toBe(
       'polite',
     );
+  });
+
+  it('lays the checking surface on the shared recovery tokens', async () => {
+    jest.mocked(loadPendingAssessment).mockReturnValue(new Promise(() => undefined));
+    await render(tree());
+
+    const title = screen.getByText('Checking your saved answer');
+    expect(StyleSheet.flatten(title.props.style)).toEqual({
+      marginTop: spacing.md,
+      color: colors.text,
+      fontSize: 22,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(
+      StyleSheet.flatten(
+        screen.getByText('Your answer is safe. We are restoring your feedback.').props.style,
+      ),
+    ).toEqual({
+      marginTop: spacing.sm,
+      color: colors.muted,
+      fontSize: 16,
+      lineHeight: 23,
+      textAlign: 'center',
+    });
+    // The centered column sits inside a full-height safe screen.
+    const center = title.parent;
+    expect(center).not.toBeNull();
+    expect(StyleSheet.flatten(center!.props.style)).toEqual({
+      flexGrow: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'center',
+      padding: spacing.xl,
+    });
+    const safeArea = center!.parent;
+    expect(safeArea).not.toBeNull();
+    expect(StyleSheet.flatten(safeArea!.props.style)).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    // The restoring spinner is the large platform indicator in brand ink.
+    const spinner = screen.container.queryAll((node) => node.type === 'ActivityIndicator')[0];
+    expect(spinner).toBeDefined();
+    expect(spinner.props.size).toBe('large');
+    expect(spinner.props.color).toBe(colors.primary);
   });
 
   it('restores a practice card without incrementing the session tally', async () => {
@@ -390,6 +466,105 @@ describe('AssessmentReplayProvider', () => {
     expect(apiFetch).not.toHaveBeenCalled();
   });
 
+  it('surfaces a retryable error when terminal retirement of an expired pointer fails', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'replay expired'));
+    jest
+      .mocked(clearPendingAssessmentIfRequestMatches)
+      .mockRejectedValue(new Error('secure storage unavailable'));
+    await render(tree());
+
+    await waitFor(() =>
+      expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID),
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(screen.getByRole('header', { name: 'We could not restore your feedback' })).toBeTruthy();
+  });
+
+  it('lays the recovery choice on the shared retry tokens', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(markPendingAssessmentFeedbackPending).mockResolvedValue(false);
+    jest.mocked(apiFetch).mockResolvedValue({
+      status: 'completed',
+      context: 'practice',
+      questionId: QUESTION_ID,
+      cycleId: CYCLE_ID,
+      question,
+      response: {
+        cycleId: CYCLE_ID,
+        passed: false,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 45,
+        transcript: 'I tried.',
+        feedback: 'Add detail.',
+      },
+    });
+    await render(tree());
+
+    const title = await screen.findByRole('header', {
+      name: 'We could not restore your feedback',
+    });
+    expect(StyleSheet.flatten(title.props.style)).toEqual({
+      marginTop: spacing.md,
+      color: colors.text,
+      fontSize: 22,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(
+      StyleSheet.flatten(
+        screen.getByText('Your saved answer is still safe. Try again now or check later.').props
+          .style,
+      ),
+    ).toEqual({
+      marginTop: spacing.sm,
+      color: colors.muted,
+      fontSize: 16,
+      lineHeight: 23,
+      textAlign: 'center',
+    });
+    // The choice scrolls in a centered safe screen so both actions stay
+    // reachable on small devices.
+    let scroller = title.parent;
+    while (scroller && scroller.props.contentContainerStyle === undefined) {
+      scroller = scroller.parent;
+    }
+    expect(scroller).not.toBeNull();
+    expect(StyleSheet.flatten(scroller!.props.contentContainerStyle)).toEqual({
+      flexGrow: 1,
+      alignItems: 'center',
+      justifyContent: 'center',
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'center',
+      padding: spacing.xl,
+    });
+    const safeArea = scroller!.parent;
+    expect(StyleSheet.flatten(safeArea!.props.style)).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    const retry = screen.getByRole('button', { name: 'Try again' });
+    expect(StyleSheet.flatten(retry.props.style)).toMatchObject({
+      marginTop: spacing.xl,
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'stretch',
+    });
+    const checkLater = screen.getByRole('button', { name: 'Check later' });
+    expect(StyleSheet.flatten(checkLater.props.style)).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.primary,
+      marginTop: spacing.md,
+      maxWidth: layout.formMaxWidth,
+      alignSelf: 'stretch',
+    });
+  });
+
   it('keeps a same-session Check Now path after Check Later without deleting the pointer', async () => {
     jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
     jest
@@ -428,6 +603,71 @@ describe('AssessmentReplayProvider', () => {
     await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
     expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('lays the deferred banner over the protected app on the shared tokens', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValueOnce(new ApiError(0, 'offline'));
+    await render(tree());
+
+    await fireEvent.press(await screen.findByRole('button', { name: 'Check later' }));
+    expect(await screen.findByText('protected app')).toBeTruthy();
+
+    // The protected app keeps its full-height host behind the banner.
+    const appContent = screen.getByText('protected app').parent;
+    expect(appContent).not.toBeNull();
+    expect(StyleSheet.flatten(appContent!.props.style)).toEqual({ flex: 1 });
+
+    // The banner hugs only the bottom safe edge, lets touches through to the
+    // app behind it, and centers its card.
+    const title = screen.getByRole('header', { name: 'Saved answer waiting' });
+    const card = title.parent;
+    expect(card).not.toBeNull();
+    expect(StyleSheet.flatten(card!.props.style)).toMatchObject({
+      width: '100%',
+      maxWidth: layout.formMaxWidth,
+      borderWidth: 1,
+      borderColor: colors.primary,
+      padding: spacing.md,
+    });
+    const host = card!.parent;
+    expect(host).not.toBeNull();
+    // The library normalizes the authored bottom-only edges onto the host.
+    expect((host!.props as { edges?: unknown }).edges).toEqual({
+      top: 'off',
+      right: 'off',
+      bottom: 'additive',
+      left: 'off',
+    });
+    expect((host!.props as { pointerEvents?: unknown }).pointerEvents).toBe('box-none');
+    expect(StyleSheet.flatten(host!.props.style)).toEqual({
+      width: '100%',
+      alignItems: 'center',
+      paddingHorizontal: spacing.md,
+    });
+    expect(StyleSheet.flatten(title.props.style)).toEqual({
+      color: colors.text,
+      fontSize: 17,
+      fontWeight: '800',
+      textAlign: 'center',
+    });
+    expect(
+      StyleSheet.flatten(
+        screen.getByText('Your answer is safe. Check again to restore feedback when it is ready.')
+          .props.style,
+      ),
+    ).toEqual({
+      marginTop: spacing.xs,
+      color: colors.muted,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
+    const checkNow = screen.getByRole('button', { name: 'Check now' });
+    expect(StyleSheet.flatten(checkNow.props.style)).toMatchObject({
+      marginTop: spacing.sm,
+      alignSelf: 'stretch',
+    });
   });
 
   it('keeps processing delivered feedback visible and retries it after reconnect', async () => {

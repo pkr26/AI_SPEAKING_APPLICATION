@@ -26,6 +26,11 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
   const [nativeAd, setNativeAd] = useState<NativeAd | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const nativeAdRef = useRef<NativeAd | null>(null);
+  // True once the focus effect has run at least once: the deferred
+  // load-failure reset below only has work to do on a REfocus after a
+  // collapsed no-fill, because the mount-time value of loadFailed is
+  // definitionally the pristine authored false.
+  const hadFocusRef = useRef(false);
   // Declared before the effects below so its unmount cleanup runs first: the
   // deferred/cleanup setState calls then skip cleanly once unmounted instead
   // of writing state on a gone component (harmless in RN, but inconsistent
@@ -58,10 +63,16 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
     let loaded: NativeAd | null = null;
     // A new focus is a new bounded request opportunity. Publish the visual
     // reset after the effect commit so it cannot cause a synchronous effect
-    // render loop and a prior no-fill remains collapsed while blurred.
-    void Promise.resolve().then(() => {
-      if (active) setLoadFailed(false);
-    });
+    // render loop and a prior no-fill remains collapsed while blurred. The
+    // first focus skips the reset: loadFailed still holds its initial false
+    // there, so the authored initial value remains the only source of the
+    // first ready paint's collapsed-or-reserved outcome.
+    if (hadFocusRef.current) {
+      void Promise.resolve().then(() => {
+        if (active) setLoadFailed(false);
+      });
+    }
+    hadFocusRef.current = true;
     void (async () => {
       if (!(await activatePlacement('historyNative')) || !active) return;
       const native = adsNativeModuleWhenReady();
@@ -103,7 +114,10 @@ export default function HistoryNativeAdCard({ focused }: { focused: boolean }) {
 
   if (!focused || playbackActive || ads.statuses.historyNative === 'blocked' || loadFailed)
     return null;
-  if (!nativeAd) {
+  // The reserved placeholder is keyed to the null sentinel itself: only the
+  // un-requested state reserves the slot, and only a loaded creative renders
+  // the card, so no other value can silently render an assetless card.
+  if (nativeAd === null) {
     return (
       <Text
         style={[styles.placeholder, { minHeight: reservedHeight }]}

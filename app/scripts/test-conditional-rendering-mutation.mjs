@@ -207,13 +207,15 @@ test('instrumentation selects every nested source predicate exactly once after B
   assert.equal(occurrences(generatedOutput, SITE_ENV), 0);
 });
 
-test('the checked-in campaign discovers the expected 115 sites and 230 forced mutants', async () => {
+test('the checked-in campaign discovers the expected 113 sites and 226 forced mutants', async () => {
   const sites = await discoverCampaignSites({ appDir: appDirectory });
   // Eight new ternary sites shipped with the audit remediation (tab-bar lock
   // gating, chip markers, meter gating, submit-reveal wrappers); the deleted
-  // orphaned attempt screen contributed the two sites this count dropped by.
-  assert.equal(sites.length, 115);
-  assert.equal(sites.length * 2, 230);
+  // orphaned attempt screen contributed the first drop, and the feedback panel
+  // later lost its two dead defensive ternaries (the !result early return
+  // already proved variant set), taking the count 115 -> 113.
+  assert.equal(sites.length, 113);
+  assert.equal(sites.length * 2, 226);
   assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
   assert.ok(sites.every(({ file }) => file.endsWith('.tsx')));
   assert.ok(sites.every(({ testFiles }) => testFiles.length > 0));

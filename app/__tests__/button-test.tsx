@@ -205,6 +205,8 @@ describe('shared Button', () => {
     });
     expect(spinner.props.accessibilityElementsHidden).toBe(true);
     expect(spinner.props.importantForAccessibility).toBe('no-hide-descendants');
+    // The busy spinner is the compact platform size, never the hero spinner.
+    expect(spinner.props.size).toBe('small');
     expect(spinner.props.color).toBe(colors.onPrimary);
     await fireEvent.press(button('Signing in…'));
     expect(onPress).not.toHaveBeenCalled();

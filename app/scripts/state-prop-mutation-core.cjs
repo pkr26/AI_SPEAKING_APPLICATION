@@ -711,37 +711,54 @@ function statePropMutationInstrumentationPlugin(api, options = {}) {
             },
           }
         : {
-            JSXAttribute(attributePath, state) {
-              const node = attributePath.node;
-              if (touchedNodes.has(node) || node[instrumentedNode]) return;
-              const site = selectorId(node, state, (relativeFile, code) =>
-                propSiteForNode(node, code, relativeFile),
-              );
-              if (!site) return;
-              touchedNodes.add(node);
-              Object.defineProperty(node, instrumentedNode, { value: true });
-
-              if (site.kind === 'expression') {
-                const originalProperty = types.objectProperty(
-                  types.identifier(site.attributeName),
-                  propValueNode(types, node),
+            // Instrument on the way OUT of the attribute. Replacing an
+            // expression-valued attribute with its conditional spread during
+            // enter discards Babel's queued visits for JSX attributes nested
+            // inside the attribute's value (renderItem={...},
+            // refreshControl={...}, action slots, ListHeaderComponent...),
+            // silently turning every nested discovered site into a no-op
+            // mutant: discovery (raw-source traversal) and instrumentation
+            // then disagree. At exit time every nested attribute has already
+            // been instrumented in place, so the value clone embedded in the
+            // spread's fallback branch carries those nested selectors.
+            JSXAttribute: {
+              exit(attributePath, state) {
+                const node = attributePath.node;
+                if (touchedNodes.has(node) || node[instrumentedNode]) return;
+                const site = selectorId(node, state, (relativeFile, code) =>
+                  propSiteForNode(node, code, relativeFile),
                 );
-                const spread = types.jsxSpreadAttribute(
-                  types.conditionalExpression(
-                    selectedSiteExpression(types, site.id),
-                    types.objectExpression([]),
-                    types.objectExpression([originalProperty]),
-                  ),
-                );
-                Object.defineProperty(spread, instrumentedNode, { value: true });
-                attributePath.replaceWith(spread);
-                return;
-              }
+                if (!site) return;
+                touchedNodes.add(node);
+                Object.defineProperty(node, instrumentedNode, { value: true });
 
-              const literal = literalForPropKind(types, node, site.kind);
-              const hostile = hostilePropNode(types, site.kind, literal);
-              const selector = selectorFor(types, site.id, hostile, types.cloneNode(literal, true));
-              attributePath.node.value = types.jsxExpressionContainer(selector);
+                if (site.kind === 'expression') {
+                  const originalProperty = types.objectProperty(
+                    types.identifier(site.attributeName),
+                    propValueNode(types, node),
+                  );
+                  const spread = types.jsxSpreadAttribute(
+                    types.conditionalExpression(
+                      selectedSiteExpression(types, site.id),
+                      types.objectExpression([]),
+                      types.objectExpression([originalProperty]),
+                    ),
+                  );
+                  Object.defineProperty(spread, instrumentedNode, { value: true });
+                  attributePath.replaceWith(spread);
+                  return;
+                }
+
+                const literal = literalForPropKind(types, node, site.kind);
+                const hostile = hostilePropNode(types, site.kind, literal);
+                const selector = selectorFor(
+                  types,
+                  site.id,
+                  hostile,
+                  types.cloneNode(literal, true),
+                );
+                attributePath.node.value = types.jsxExpressionContainer(selector);
+              },
             },
           },
   };

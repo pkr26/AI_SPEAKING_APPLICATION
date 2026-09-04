@@ -1713,6 +1713,121 @@ describe('ad surfaces', () => {
     );
     await waitFor(() => expect(mockNativeAdCreate).toHaveBeenCalledTimes(1));
     expect(screen.queryByLabelText('Advertisement')).toBeNull();
+    // The no-fill collapse must also retire the reserved placeholder rather
+    // than parking the slot on screen with no creative behind it.
+    expect(screen.queryByTestId('history-native-ad-reserved')).toBeNull();
+  });
+
+  it('collapses the History card instead of reserving when the native module is unavailable', async () => {
+    jest.mocked(apiFetch).mockResolvedValue({
+      ads: {
+        enabled: true,
+        audienceMode: 'adult-only',
+        placements: { homeBanner: false, historyNative: true },
+      },
+    });
+    let resolveInitialize!: (value: unknown[]) => void;
+    mockInitialize.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveInitialize = resolve;
+      }),
+    );
+    await render(
+      <AdsProvider>
+        <Probe />
+        <HistoryNativeAdCard focused />
+      </AdsProvider>,
+    );
+    // Let the placement activation commit its capability checks, then retire
+    // the cached native module before initialization resolves so the
+    // component's post-activation gate observes a missing module.
+    await waitFor(() => expect(mockInitialize).toHaveBeenCalledTimes(1));
+    resetAdsModuleForTests();
+    await act(async () => {
+      resolveInitialize([]);
+    });
+    await waitFor(() => expect(screen.getByTestId('history-status')).toHaveTextContent('ready'));
+    await act(async () => {});
+    await act(async () => {});
+    // The capability failure collapses the card without parking the reserved
+    // placeholder on screen.
+    expect(mockNativeAdCreate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('history-native-ad-reserved')).toBeNull();
+    expect(screen.queryByText('Advertisement')).toBeNull();
+  });
+
+  it('clears a loaded History creative in the same commit that blurs the surface', async () => {
+    jest.mocked(apiFetch).mockResolvedValue({
+      ads: {
+        enabled: true,
+        audienceMode: 'adult-only',
+        placements: { homeBanner: false, historyNative: true },
+      },
+    });
+    const firstAd = {
+      headline: 'Blur ad',
+      body: null,
+      callToAction: null,
+      destroy: jest.fn(),
+    };
+    let resolveSecond!: (ad: {
+      headline: string;
+      body: null;
+      callToAction: null;
+      destroy: jest.Mock;
+    }) => void;
+    mockNativeAdCreate.mockResolvedValueOnce(firstAd).mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolveSecond = resolve;
+      }),
+    );
+    const view = await render(
+      <AdsProvider>
+        <HistoryNativeAdCard focused />
+      </AdsProvider>,
+    );
+    expect(await screen.findByText('Blur ad')).toBeTruthy();
+
+    await view.rerender(
+      <AdsProvider>
+        <HistoryNativeAdCard focused={false} />
+      </AdsProvider>,
+    );
+    expect(screen.queryByText('Blur ad')).toBeNull();
+
+    await view.rerender(
+      <AdsProvider>
+        <HistoryNativeAdCard focused />
+      </AdsProvider>,
+    );
+    await waitFor(() => expect(mockNativeAdCreate).toHaveBeenCalledTimes(2));
+    // The refocused surface reserves fresh space instead of keeping the
+    // blurred creative mounted until its replacement resolves.
+    expect(screen.getByTestId('history-native-ad-reserved')).toBeTruthy();
+    expect(screen.queryByText('Blur ad')).toBeNull();
+
+    await act(async () =>
+      resolveSecond({
+        headline: 'Refocus ad',
+        body: null,
+        callToAction: null,
+        destroy: jest.fn(),
+      }),
+    );
+    expect(await screen.findByText('Refocus ad')).toBeTruthy();
+    await view.unmount();
+  });
+
+  it('reserves the Home slot before any consent failure can be recorded', async () => {
+    jest.mocked(apiFetch).mockResolvedValue(remoteEnabled);
+    await render(
+      <AdsProvider>
+        <HomeBannerAd focused />
+      </AdsProvider>,
+    );
+    // The focused slot is reserved while policy and consent resolve; only a
+    // recorded failure under the current consent version collapses it.
+    expect(screen.getByLabelText('Advertisement')).toBeTruthy();
   });
 
   it('retries a History native request on the next focus after no fill', async () => {

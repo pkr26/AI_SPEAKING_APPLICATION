@@ -209,6 +209,12 @@ export default function RecordingPlayback({
   const deletedRef = useRef<boolean | null>(null);
   const releaseOwnerRef = useRef<(() => void) | null>(null);
   const committedIdentityRef = useRef(identityToken);
+  // Arms after the identity effect's first run. The mount pass only seeds
+  // refs: every useState seed still holds its authored initial value, so
+  // re-setting it there would mask an initializer regression behind a
+  // pre-paint reset. Later identity/lease changes must still synchronously
+  // discard account-scoped UI before paint.
+  const identityResetArmedRef = useRef(false);
   const onDeletedRef = useRef(onDeleted);
   const recordingLabelRef = useRef(recordingLabel);
   const playbackUnavailableRef = useRef(recordingStatus === 'unavailable');
@@ -316,13 +322,17 @@ export default function RecordingPlayback({
     committedIdentityRef.current = identityToken;
     lifecycleRef.current = Symbol();
     cancelDelete();
-    cancelShare();
     deletedRef.current = false;
     releasePlayer();
-    // Identity changes must synchronously discard account-scoped UI before paint.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setErrorMessage(null);
-    resetPlaybackUi();
+    if (identityResetArmedRef.current) {
+      // Identity changes must synchronously discard account-scoped UI before
+      // paint. On the mount pass every seed still holds its authored initial
+      // value, so resetting here would only mask an initializer regression.
+      cancelShare();
+      setErrorMessage(null);
+      resetPlaybackUi();
+    }
+    identityResetArmedRef.current = true;
   }, [cancelDelete, cancelShare, identityToken, releasePlayer, resetPlaybackUi, sessionLease]);
 
   useLayoutEffect(() => {
@@ -731,14 +741,16 @@ export default function RecordingPlayback({
         setErrorMessage(userMessageForError(error, t('recordings.deleteFailed')));
         // A delete failure says nothing about playback. Restore the ordinary
         // Play action instead of relabeling it "Try Again" (which retries
-        // playback and was misleading beside a delete error message).
-        setPhase('idle');
+        // playback and was misleading beside a delete error message). The
+        // shared reset also retires any carried position/duration from the
+        // playback that preceded the delete attempt.
+        resetPlaybackUi();
       } finally {
         if (deleteControllerRef.current === controller) deleteControllerRef.current = null;
         if (deleteOperationRef.current === operation) deleteOperationRef.current = null;
       }
     },
-    [contextIsCurrent, ownerId, queryClient, recordingId, releasePlayer, t],
+    [contextIsCurrent, ownerId, queryClient, recordingId, releasePlayer, resetPlaybackUi, t],
   );
 
   const confirmDelete = () => {
@@ -848,31 +860,36 @@ export default function RecordingPlayback({
             {t('recordings.preparing')}
           </Text>
         )}
-        {(phase === 'playing' || phase === 'paused') &&
+        {/* Mid-session the row tracks the live player. At 'idle' it renders
+            only when a carried position or duration survived a reset — an
+            invariant every reset path maintains — so stale seeds or a reset
+            that skipped the clock surfaces here instead of hiding silently. */}
+        {((phase === 'playing' || phase === 'paused') &&
           Number.isFinite(duration) &&
-          duration > 0 && (
-            <View
-              accessible
-              accessibilityRole="progressbar"
-              accessibilityLabel={t('recordings.progressLabel')}
-              accessibilityValue={{ min: 0, max: progressMax, now: progressNow }}
-              style={styles.progressRow}
-              testID="recording-playback-progress"
-            >
-              <View testID="recording-playback-progress-track" style={styles.progressTrack}>
-                <View
-                  testID="recording-playback-progress-fill"
-                  style={[
-                    styles.progressFill,
-                    { width: `${Math.round((progressNow / progressMax) * 100)}%` },
-                  ]}
-                />
-              </View>
-              <Text testID="recording-playback-time" style={styles.timeText}>
-                {formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}
-              </Text>
+          duration > 0) ||
+        (phase === 'idle' && (currentTime > 0 || duration > 0)) ? (
+          <View
+            accessible
+            accessibilityRole="progressbar"
+            accessibilityLabel={t('recordings.progressLabel')}
+            accessibilityValue={{ min: 0, max: progressMax, now: progressNow }}
+            style={styles.progressRow}
+            testID="recording-playback-progress"
+          >
+            <View testID="recording-playback-progress-track" style={styles.progressTrack}>
+              <View
+                testID="recording-playback-progress-fill"
+                style={[
+                  styles.progressFill,
+                  { width: `${Math.round((progressNow / progressMax) * 100)}%` },
+                ]}
+              />
             </View>
-          )}
+            <Text testID="recording-playback-time" style={styles.timeText}>
+              {formatPlaybackTime(currentTime)} / {formatPlaybackTime(duration)}
+            </Text>
+          </View>
+        ) : null}
         {showStatus && recordingStatus === 'retention_pending' && phase === 'idle' && (
           <Text
             accessibilityLiveRegion="polite"
@@ -891,7 +908,7 @@ export default function RecordingPlayback({
             {t('recordings.unavailable')}
           </Text>
         )}
-        {errorMessage && (
+        {errorMessage !== null && (
           <Text
             accessibilityRole="alert"
             style={styles.errorText}

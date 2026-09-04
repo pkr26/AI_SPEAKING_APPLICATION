@@ -37,19 +37,59 @@ function responderEvent() {
   };
 }
 
+/** Glyph Svg element of an icon-bearing control; undefined-safe by design. */
+function iconSvgElement(host: { children: unknown[] }): unknown {
+  const iconHost = host.children[0] as { props: { children?: unknown } } | undefined;
+  return iconHost?.props?.children;
+}
+
+/** Drawn glyph inside that Svg (a fragment of stroked primitives). */
+function iconGlyphElement(host: { children: unknown[] }): unknown {
+  return (iconSvgElement(host) as { props?: { children?: unknown } } | undefined)?.props?.children;
+}
+
+/** Pressable's responder-negotiation gate (false while the control is disabled). */
+function responderGate(node: { props: unknown }) {
+  return (node.props as { onStartShouldSetResponder?: () => boolean }).onStartShouldSetResponder;
+}
+
+/**
+ * Authored props of the Pressable that rendered a labelled control. React
+ * Native's Pressable synthesizes the host view's accessibilityState from the
+ * disabled prop, so an authored accessibilityState={{ disabled }} wiring is
+ * invisible on the host element (identical synthesized object either way) and
+ * is only observable on the composite Pressable element itself — reached by
+ * walking the fiber chain above the host view, the same traversal fireEvent
+ * uses to resolve handlers.
+ */
+function authoredPressableProps(node: { unstable_fiber?: unknown }, label: string) {
+  type Fiber = { memoizedProps?: Record<string, unknown> | null; return: Fiber | null };
+  let fiber = node.unstable_fiber as Fiber | null;
+  let props: Record<string, unknown> | undefined;
+  while (fiber) {
+    const candidate = fiber.memoizedProps;
+    if (candidate?.accessibilityLabel === label && typeof candidate.onPress === 'function') {
+      props = candidate;
+      break;
+    }
+    fiber = fiber.return;
+  }
+  // A control whose authored Pressable props cannot be found is itself the
+  // observable wiring failure; fail on assertion evidence, never a crash.
+  expect(props).toBeDefined();
+  return props as Record<string, unknown>;
+}
+
 /** Ink of a tab button's glyph: the first stroked primitive inside its Svg. */
-function tabIconInk(tab: { children: unknown[] }): string {
-  const iconHost = tab.children[0] as { props: { children: React.ReactElement } };
-  const svg = iconHost.props.children;
-  const rendered: unknown = (svg.props as { children?: unknown }).children;
+function tabIconInk(tab: { children: unknown[] }): string | undefined {
+  const rendered: unknown = iconGlyphElement(tab);
   const primitives =
     React.isValidElement(rendered) && rendered.type === React.Fragment
       ? (rendered.props as { children?: unknown }).children
       : rendered;
-  const first = (Array.isArray(primitives) ? primitives[0] : primitives) as {
-    props: { stroke?: string };
-  };
-  return first.props.stroke as string;
+  const first = (Array.isArray(primitives) ? primitives[0] : primitives) as
+    { props?: { stroke?: string } } | undefined;
+  return first?.props?.stroke;
 }
 
 jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
@@ -249,6 +289,12 @@ describe('bottom tab layout', () => {
     const settings = header.getByRole('button', {
       name: translateFor('en', 'header.settings'),
     });
+    // The unlocked state is authored, not merely synthesized from the disabled
+    // prop: assistive tech reads the control as enabled either way, but the
+    // explicit state is the screen-reader contract this header pins.
+    expect(
+      authoredPressableProps(settings, translateFor('en', 'header.settings')).accessibilityState,
+    ).toEqual({ disabled: false });
     // An unlocked Settings action carries no exit-lock hint: the hint exists
     // only while the practice flow holds its exit lock.
     expect(settings.props.accessibilityHint).toBeUndefined();
@@ -259,6 +305,12 @@ describe('bottom tab layout', () => {
       marginRight: spacing.xs,
       borderRadius: 20,
     });
+    // The action keeps its generous touch target and draws the sliders glyph
+    // at the header's compact size, inked with the theme's text color.
+    expect(settings.props.hitSlop).toBe(6);
+    expect(React.isValidElement(iconGlyphElement(settings))).toBe(true);
+    expect((iconSvgElement(settings) as { props?: { width?: number } })?.props?.width).toBe(22);
+    expect(tabIconInk(settings)).toBe(colors.text);
     await fireEvent(settings, 'responderGrant', responderEvent());
     expect(StyleSheet.flatten(settings.props.style)).toMatchObject({ opacity: 0.6 });
     await fireEvent(settings, 'responderTerminate', responderEvent());
@@ -294,9 +346,19 @@ describe('bottom tab layout', () => {
       name: translateFor('en', 'header.settings'),
     });
     // While the practice flow holds its exit lock, the Settings action is
-    // disabled for both touch and assistive tech and names the reason.
+    // disabled for both touch and assistive tech and names the reason. The
+    // closed responder gate must actually swallow a press, not just announce
+    // the state.
+    expect(responderGate(settings)?.()).toBe(false);
+    await fireEvent.press(settings);
+    expect(asMock(ExpoRouter.router.navigate)).not.toHaveBeenCalled();
     expect(settings.props.accessibilityHint).toBe(translateFor('en', 'hint.finishRecordingFirst'));
     expect(settings.props.accessibilityState).toEqual({ disabled: true });
+    // The disabled state is authored on the Pressable itself, not just
+    // synthesized from its disabled prop by React Native's Pressable host.
+    expect(
+      authoredPressableProps(settings, translateFor('en', 'header.settings')).accessibilityState,
+    ).toEqual({ disabled: true });
   });
 
   it('hides the custom tab bar while the Android soft keyboard is shown', async () => {
@@ -397,6 +459,9 @@ describe('bottom tab layout', () => {
     expect(bar).not.toBeNull();
     const barView = await render(bar as React.ReactElement);
     const homeTab = barView.getByRole('tab', { name: translateFor('en', 'header.home') });
+    // The accessible name is the authored label on the tab control itself, so
+    // VoiceOver/TalkBack announce the section even when its text is clamped.
+    expect(homeTab.props.accessibilityLabel).toBe(translateFor('en', 'header.home'));
     expect(homeTab.props.accessibilityState).toEqual({ selected: true, disabled: false });
     expect(
       barView.getByRole('tab', { name: translateFor('en', 'header.recordings') }).props
@@ -417,6 +482,18 @@ describe('bottom tab layout', () => {
     expect(
       tabIconInk(barView.getByRole('tab', { name: translateFor('en', 'header.recordings') })),
     ).toBe(colors.muted);
+
+    // Glyph and label wiring: the home tab draws its named glyph at the
+    // authored size, stays touch-enabled, and clamps its label to one
+    // non-scaling line.
+    expect(React.isValidElement(iconGlyphElement(homeTab))).toBe(true);
+    expect((iconSvgElement(homeTab) as { props?: { width?: number } })?.props?.width).toBe(24);
+    expect(responderGate(homeTab)?.()).toBe(true);
+    const homeLabel = homeTab.children[1] as unknown as {
+      props: { numberOfLines?: number; maxFontSizeMultiplier?: number };
+    };
+    expect(homeLabel.props.numberOfLines).toBe(1);
+    expect(homeLabel.props.maxFontSizeMultiplier).toBe(1.3);
 
     // Tapping the unfocused tab navigates; tapping the focused tab does not.
     await fireEvent.press(
@@ -459,8 +536,11 @@ describe('bottom tab layout', () => {
     expect(bar).not.toBeNull();
     const barView = await render(bar as React.ReactElement);
     const homeTab = barView.getByRole('tab', { name: translateFor('en', 'header.home') });
-    // The locked-away tab is disabled for both touch and assistive tech, and
+    // The locked-away tab is disabled for assistive tech AND for touch: its
+    // responder gate stays closed while the exit lock is held (the release
+    // handler's own guard is a second line of defense, not the only one), and
     // a press cannot navigate away from the focused practice flow.
+    expect(responderGate(homeTab)?.()).toBe(false);
     expect(homeTab.props.accessibilityState).toEqual({ selected: false, disabled: true });
     expect(homeTab.props.accessibilityHint).toBe(translateFor('en', 'hint.finishRecordingFirst'));
     expect(StyleSheet.flatten(homeTab.props.style)).toMatchObject({ opacity: 0.5 });
@@ -585,6 +665,8 @@ it('lays the custom tab bar out on the shared tokens with focused and locked sta
 
   const barList = barView.getByRole('tab', { name: translateFor('en', 'header.home') }).parent;
   expect(barList).not.toBeNull();
+  // The bar itself announces as the tab list container for platform traversal.
+  expect(barList!.props.accessibilityRole).toBe('tablist');
   expect(StyleSheet.flatten(barList!.props.style)).toMatchObject({
     flexDirection: 'row',
     alignItems: 'stretch',

@@ -60,12 +60,14 @@ function flattenedStyle(node: TestInstance): Record<string, unknown> {
 }
 
 function statusDot(): TestInstance {
-  const [dot] = screen.container.queryAll((node) => {
+  const dots = screen.container.queryAll((node) => {
     const style = flattenedStyle(node);
     return style.width === 8 && style.height === 8 && style.borderRadius === 4;
   });
-  if (!dot) throw new Error('network status dot was not rendered');
-  return dot;
+  // Fail through a matcher so a banner-style wiring mutant dies on assertion
+  // evidence instead of a helper TypeError.
+  expect(dots.length).toBe(1);
+  return dots[0];
 }
 
 beforeEach(() => {
@@ -124,6 +126,8 @@ it('subscribes before sampling, ignores a stale sample, and announces reconnect 
   expect(flattenedStyle(statusDot()).backgroundColor).toBe(darkColors.onWarning);
   expect(flattenedStyle(screen.getByText(offlineMessage)).color).toBe(darkColors.onWarning);
   const bannerHost = screen.getByTestId('network-status-banner');
+  // The floating banner never intercepts touches over the app below it.
+  expect(bannerHost.props.pointerEvents).toBe('none');
   expect(flattenedStyle(bannerHost)).toMatchObject({
     flexShrink: 0,
     paddingHorizontal: spacing.md,

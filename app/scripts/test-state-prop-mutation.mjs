@@ -259,27 +259,67 @@ test('prop instrumentation forces scalar values, spreads expression removals, an
   assert.equal(occurrences(transformed, MODE_ENV), 0);
 });
 
+test('prop instrumentation reaches JSX attributes nested inside expression attribute values', () => {
+  const source = [
+    '<FlatList',
+    '  data={rows}',
+    '  renderItem={({ item }) => (',
+    '    <HistoryRow item={item} ownerId={owner} t={t} focused style={styles.row} variant="card" />',
+    '  )}',
+    '  refreshControl={<RefreshControl refreshing={busy} tintColor={ink} />}',
+    '/>;',
+  ].join('\n');
+  const sites = discoverPropMutationSites(source, { relativeFile: 'src/example.tsx' });
+  const transformed = transform(source, 'prop');
+  // Every discovered site — including those nested inside renderItem and
+  // refreshControl values — must carry exactly one selector. Replacing an
+  // expression-valued attribute during enter used to discard Babel's queued
+  // visits for those nested attributes, silently no-oping their mutants.
+  assert.equal(occurrences(transformed, SITE_ENV), sites.length);
+  for (const site of sites) {
+    assert.equal(occurrences(transformed, site.id), 1, `missing selector for ${site.id}`);
+  }
+  assert.ok(sites.some(({ id }) => id.includes(':expression:item:')));
+  assert.ok(sites.some(({ id }) => id.includes(':expression:refreshing:')));
+  assert.ok(sites.some(({ id }) => id.includes(':string:variant:')));
+  // The nested removals spread inside the cloned renderItem/refreshControl
+  // values (each cloned property becomes its own conditional spread), nested
+  // under the outer attribute's selector rather than at the element's top
+  // level.
+  const renderItemIndex = transformed.indexOf('renderItem:');
+  const refreshControlIndex = transformed.indexOf('refreshControl:');
+  assert.ok(renderItemIndex > 0 && refreshControlIndex > renderItemIndex);
+  assert.ok(transformed.indexOf('item: item') > renderItemIndex);
+  assert.ok(transformed.indexOf('ownerId: owner') > renderItemIndex);
+  assert.ok(transformed.indexOf('t: t') > renderItemIndex);
+  assert.ok(transformed.indexOf('refreshing: busy') > refreshControlIndex);
+  assert.ok(transformed.indexOf('tintColor: ink') > refreshControlIndex);
+});
+
 test('checked-in discovery is exhaustive and lane-owned for both modes', async () => {
   const stateSites = await discoverCampaignSites({ appDir: appDirectory, mode: 'state' });
   const propSites = await discoverCampaignSites({ appDir: appDirectory, mode: 'prop' });
-  // 461 authored setter calls plus 150 initializers (the useState inventory:
-  // 63 boolean, 39 null, 17 string, 12 number literals and 19 computed
-  // initializers), including value kinds Stryker already owns on purpose.
-  assert.equal(stateSites.length, 611);
-  // 1210 expression removals, 338 string forces, 188 number forces, 51
-  // shorthand flips, and 17 boolean-literal flips.
-  assert.equal(propSites.length, 1804);
+  // 444 authored setter calls plus 150 initializers (the useState inventory),
+  // including value kinds Stryker already owns on purpose. The wiring-campaign
+  // close removed 17 dead defensive setter calls (settings bulk-delete
+  // retraction pair, diagnostic boundary/replay/advance resets, recorder
+  // discard/transfer markers) from the original 461.
+  assert.equal(stateSites.length, 594);
+  // 1209 expression removals, 338 string forces, 188 number forces, 51
+  // shorthand flips, and 17 boolean-literal flips; the tab-bar settings glyph
+  // dropped the one color prop that restated Icon's own theme-text default.
+  assert.equal(propSites.length, 1803);
   for (const sites of [stateSites, propSites]) {
     assert.equal(new Set(sites.map(({ id }) => id)).size, sites.length);
     assert.ok(sites.every(({ testFiles }) => testFiles.length > 0));
     assert.ok(sites.every(({ laneName }) => typeof laneName === 'string' && laneName.length > 0));
   }
   const stateKinds = countBy(stateSites, 'kind');
-  assert.deepEqual(stateKinds, { initializer: 150, setter: 461 });
+  assert.deepEqual(stateKinds, { initializer: 150, setter: 444 });
   const propKinds = countBy(propSites, 'kind');
   assert.deepEqual(propKinds, {
     boolean: 17,
-    expression: 1210,
+    expression: 1209,
     number: 188,
     shorthand: 51,
     string: 338,

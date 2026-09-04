@@ -155,7 +155,7 @@ export default function ForgotPasswordScreen() {
     router.navigate({ pathname: '/reset-password', params: { email: sentEmail } });
   };
 
-  if (sentEmail) {
+  if (sentEmail !== null) {
     return (
       <SafeAreaView style={styles.flex}>
         <ScrollView contentContainerStyle={styles.container}>
@@ -188,7 +188,7 @@ export default function ForgotPasswordScreen() {
             onPress={() => void handleResend()}
             style={styles.resendButton}
           />
-          {error && (
+          {error !== null && (
             <Text accessibilityRole="alert" style={styles.error}>
               {error}
             </Text>
@@ -255,7 +255,7 @@ export default function ForgotPasswordScreen() {
             </Text>
           )}
 
-          {error && (
+          {error !== null && (
             <Text accessibilityRole="alert" style={styles.error}>
               {error}
             </Text>

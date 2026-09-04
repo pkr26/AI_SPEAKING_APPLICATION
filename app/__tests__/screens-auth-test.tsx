@@ -78,12 +78,16 @@ jest.mock('../src/lib/session-notice', () => ({
 
 const mockedConsumeSessionExpiredNotice = jest.mocked(consumeSessionExpiredNotice);
 const mockSetGuestLanguage = jest.fn();
+let mockGuestLanguageState: {
+  language: 'en' | 'te' | 'hi' | 'es' | 'zh';
+  persistenceError: string | null;
+} = { language: 'en', persistenceError: null };
 
 jest.mock('../src/lib/guest-language', () => ({
   useGuestLanguage: () => ({
-    language: 'en',
+    language: mockGuestLanguageState.language,
     isRestoring: false,
-    persistenceError: null,
+    persistenceError: mockGuestLanguageState.persistenceError,
     setLanguage: mockSetGuestLanguage,
     mirrorAccountLanguage: jest.fn(),
   }),
@@ -273,6 +277,7 @@ beforeEach(() => {
     addListener: mockAddNavigationListener,
   };
   mockAuthValue = makeAuth();
+  mockGuestLanguageState = { language: 'en', persistenceError: null };
   mockedConsumeSessionExpiredNotice.mockResolvedValue(false);
   // The preview test below mounts the real I18nProvider, whose effect moves the
   // module-level language; pin it back so every test starts in English.
@@ -330,6 +335,41 @@ function textNode(node: TestInstance, text: string): TestInstance {
   const match = node.queryAll((candidate) => candidate.children.includes(text))[0];
   if (!match) throw new Error(`Text "${text}" not found inside rendered control`);
   return match;
+}
+
+/**
+ * Renders fallback copy when a child render throws. The signup screen's
+ * language grid calls its required accessibilityLabelFor prop at render time,
+ * so a wiring mutant that drops that attribute would crash the reconciler and
+ * fail every owning test with a raw TypeError (classified Error, not a kill).
+ * The boundary swaps the crash for fallback copy, so those tests fail on
+ * Testing Library query evidence — no screen content can be found — instead.
+ */
+class RenderCrashBoundary extends React.Component<
+  { children: React.ReactNode },
+  { crashed: boolean }
+> {
+  state = { crashed: false };
+
+  static getDerivedStateFromError() {
+    return { crashed: true };
+  }
+
+  render() {
+    if (this.state.crashed) {
+      return <Text testID="render-crash-fallback">render crashed</Text>;
+    }
+    return this.props.children;
+  }
+}
+
+/** The signup screen mounted behind the render-crash boundary. */
+function CrashBoundedSignupScreen() {
+  return (
+    <RenderCrashBoundary>
+      <SignupScreen />
+    </RenderCrashBoundary>
+  );
 }
 
 /** The host view a control is laid out in (form card, input row, footer row). */
@@ -442,6 +482,10 @@ describe('login screen', () => {
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
     const submit = screen.getByRole('button', { name: t('login.submit') });
     expect(submit.props.accessibilityState.disabled).toBe(true);
+    // The wrapper around the disabled Button is deliberately not an
+    // accessibility element: its tap is pure validation feedback, so the
+    // screen-reader focus stays on the disabled submit it explains.
+    expect(parentOf(submit).props.accessible).toBe(false);
     // The accessible={false} wrapper around the disabled Button receives the
     // tap and marks the email field touched, so the blocked submit explains
     // itself instead of failing silently.
@@ -1143,7 +1187,7 @@ function LanguageProbe() {
 
 describe('signup screen', () => {
   it('navigates to login once per tap burst', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     const login = screen.getByRole('link', { name: t('signup.footerLink') });
     await fireEvent.press(login);
@@ -1155,13 +1199,17 @@ describe('signup screen', () => {
   });
 
   it('reveals the email and name errors when the blocked submit wrapper is pressed', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
     // A control character in the name is the only authored name complaint;
     // an empty name stays silent, so the reveal needs a polluted value.
     await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'bad\u0007name');
     const submit = screen.getByRole('button', { name: t('signup.submit') });
     expect(submit.props.accessibilityState.disabled).toBe(true);
+    // The wrapper around the disabled Button is deliberately not an
+    // accessibility element: its tap is pure validation feedback, so the
+    // screen-reader focus stays on the disabled submit it explains.
+    expect(parentOf(submit).props.accessible).toBe(false);
     // The accessible={false} wrapper around the disabled Button receives the
     // tap and marks both fields touched, so the blocked submit explains
     // itself instead of failing silently.
@@ -1171,7 +1219,7 @@ describe('signup screen', () => {
   });
 
   it('links to the public Privacy Policy and Terms of Use before account creation', async () => {
-    const first = await render(<SignupScreen />);
+    const first = await render(<CrashBoundedSignupScreen />);
 
     await fireEvent.press(screen.getByRole('link', { name: t('header.privacy') }));
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
@@ -1182,7 +1230,7 @@ describe('signup screen', () => {
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     await first.unmount();
 
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fireEvent.press(screen.getByRole('link', { name: t('header.terms') }));
     expect(mockRouter.navigate).toHaveBeenCalledTimes(2);
     expect(mockRouter.navigate).toHaveBeenLastCalledWith('/settings/terms');
@@ -1191,12 +1239,12 @@ describe('signup screen', () => {
   it('resubscribes the signup removal guard when navigation identity changes', async () => {
     const first = navigationHarness();
     mockNavigation = first.navigation;
-    const rendered = await render(<SignupScreen />);
+    const rendered = await render(<CrashBoundedSignupScreen />);
     expect(first.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
 
     const second = navigationHarness();
     mockNavigation = second.navigation;
-    await rendered.rerender(<SignupScreen />);
+    await rendered.rerender(<CrashBoundedSignupScreen />);
 
     expect(first.remove).toHaveBeenCalledTimes(1);
     expect(second.addListener).toHaveBeenCalledWith('beforeRemove', expect.any(Function));
@@ -1204,7 +1252,7 @@ describe('signup screen', () => {
   });
 
   it('renders all fields and language choices', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     expect(screen.getByText(t('signup.title'))).toBeTruthy();
     expect(screen.getByText(t('signup.subtitle'))).toBeTruthy();
     expect(screen.getByLabelText('Telugu, తెలుగు')).toBeTruthy();
@@ -1230,7 +1278,7 @@ describe('signup screen', () => {
   });
 
   it('sends an app-language choice to the guest-language preference', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     await fireEvent.press(screen.getByTestId('ui-language-hi'));
 
@@ -1239,7 +1287,7 @@ describe('signup screen', () => {
   });
 
   it('lays out the signup screen on the shared token scale', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     expect(flattenedStyle(screen.getByTestId('keyboard-avoiding-view'))).toEqual({
       flex: 1,
@@ -1293,7 +1341,7 @@ describe('signup screen', () => {
   });
 
   it('lays the reveal control beside a flexible signup password field', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     const passwordInput = screen.getByLabelText(t('login.passwordLabel'));
 
     expect(flattenedStyle(parentOf(passwordInput))).toEqual({
@@ -1322,7 +1370,7 @@ describe('signup screen', () => {
   });
 
   it('wraps the language chips in a row and spaces the submit and login footer', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     expect(flattenedStyle(parentOf(screen.getByLabelText('Telugu, తెలుగు')))).toEqual({
       flexDirection: 'row',
@@ -1368,14 +1416,14 @@ describe('signup screen', () => {
     ['android', undefined],
   ] as const)('uses the %s keyboard-avoidance behavior', async (os, expectedBehavior) => {
     await withPlatformOS(os, async () => {
-      await render(<SignupScreen />);
+      await render(<CrashBoundedSignupScreen />);
 
       expect(screen.getByTestId('keyboard-avoiding-view').props.behavior).toBe(expectedBehavior);
     });
   });
 
   it('requires every field plus a language before enabling Create account', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     expect(flattenedStyle(signUpButton())).toMatchObject({
       alignItems: 'center',
@@ -1405,7 +1453,7 @@ describe('signup screen', () => {
   });
 
   it('requires a matching password confirmation and a valid email', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'not-an-email', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     // The inline email error waits for blur (erroring mid-typing is a hostile
@@ -1425,7 +1473,7 @@ describe('signup screen', () => {
   });
 
   it('keeps language selection mutually exclusive and exposed to accessibility', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     const telugu = screen.getByLabelText('Telugu, తెలుగు');
     const spanish = screen.getByLabelText('Spanish, Español');
 
@@ -1521,7 +1569,7 @@ describe('signup screen', () => {
   it('keeps signed-out UI English when a learning language is selected', async () => {
     await render(
       <I18nProvider accountLanguage={null}>
-        <SignupScreen />
+        <CrashBoundedSignupScreen />
         <LanguageProbe />
       </I18nProvider>,
     );
@@ -1532,7 +1580,7 @@ describe('signup screen', () => {
   });
 
   it('enforces trimmed name and email boundaries', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     // The live preview renders the whole screen in Telugu after the chip press.
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
@@ -1560,7 +1608,7 @@ describe('signup screen', () => {
   });
 
   it('measures the name limit in UTF-16 code units like the server contract', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
     await fillSignup('😀'.repeat(50), 'ada@example.com', 'password1', 'te');
@@ -1571,7 +1619,7 @@ describe('signup screen', () => {
   });
 
   it('configures signup fields for identity entry and password privacy', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     expect(screen.getByLabelText(t('signup.nameLabel')).props).toMatchObject({
       autoCapitalize: 'words',
@@ -1603,7 +1651,7 @@ describe('signup screen', () => {
   });
 
   it('chains name to email to password confirmation and submits from confirmation', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const emailFocus = spyOnTextInputFocus(screen.getByLabelText(t('login.emailLabel')));
@@ -1632,7 +1680,7 @@ describe('signup screen', () => {
   });
 
   it('ignores a return-key submit until the form and a language are complete', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
 
     // Every field is filled, but no language has been chosen yet.
@@ -1650,7 +1698,7 @@ describe('signup screen', () => {
   });
 
   it('keeps the name and email return keys harmless once the screen is gone', async () => {
-    const view = await render(<SignupScreen />);
+    const view = await render(<CrashBoundedSignupScreen />);
     const submitFromName = screen.getByLabelText(t('signup.nameLabel')).props
       .onSubmitEditing as () => void;
     const submitFromEmail = screen.getByLabelText(t('login.emailLabel')).props
@@ -1667,7 +1715,7 @@ describe('signup screen', () => {
   });
 
   it('changes only the focused signup border color so focus does not move the form', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
 
     for (const label of [
       t('signup.nameLabel'),
@@ -1696,7 +1744,7 @@ describe('signup screen', () => {
   });
 
   it('reveals and hides the signup password from the accessible toggle', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     expect(screen.getByLabelText(t('login.passwordLabel')).props.secureTextEntry).toBe(true);
 
     expect(screen.getAllByTestId('password-toggle-show')).toHaveLength(2);
@@ -1719,7 +1767,7 @@ describe('signup screen', () => {
   });
 
   it('rejects names over the maximum length client-side', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('A'.repeat(101), 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
@@ -1727,7 +1775,7 @@ describe('signup screen', () => {
   });
 
   it('shows the length policy error for short passwords', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'abc1');
     const fieldError = screen.getByText(t('password.tooShort'));
     expect(fieldError.props.accessibilityLiveRegion).toBe('polite');
@@ -1740,7 +1788,7 @@ describe('signup screen', () => {
   });
 
   it('rejects a control-character name locally before registration', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Priya\n', 'ada@example.com', 'password1');
 
     // The submit gate blocks live on the control-character name...
@@ -1755,14 +1803,14 @@ describe('signup screen', () => {
   });
 
   it('shows the letter+number policy error for passwords without digits', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'abcdefgh');
     expect(screen.getByText(t('password.needsLetterAndNumber'))).toBeTruthy();
     expect(signUpButton().props.accessibilityState.disabled).toBe(true);
   });
 
   it('rejects signup passwords over the shared UTF-8 byte limit', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', `a1${'é'.repeat(36)}`);
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
@@ -1772,7 +1820,7 @@ describe('signup screen', () => {
   });
 
   it('does not use a learning-language chip as the app language', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     expect(screen.getByText(t('signup.title'))).toBeTruthy();
     expect(screen.getByText(t('signup.submit'))).toBeTruthy();
 
@@ -1786,7 +1834,7 @@ describe('signup screen', () => {
   });
 
   it('keeps inline password-policy errors in signed-out English', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
 
     await fireEvent.changeText(screen.getByPlaceholderText(t('signup.passwordPlaceholder')), 'ab1');
@@ -1797,7 +1845,7 @@ describe('signup screen', () => {
   });
 
   it('registers and navigates home on success', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('  Ada  ', '  ada@example.com ', 'password1');
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
     await fireEvent.press(signUpButton('es'));
@@ -1813,7 +1861,7 @@ describe('signup screen', () => {
   });
 
   it('preserves leading and trailing whitespace in a new password', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', ' Password1 ');
     await fireEvent.press(screen.getByLabelText('Spanish, Español'));
     await fireEvent.press(signUpButton('es'));
@@ -1832,7 +1880,7 @@ describe('signup screen', () => {
     ['Hindi, हिन्दी', 'hi'],
     ['Chinese, 简体中文', 'zh'],
   ] as const)('submits the exact server language code for %s', async (label, code) => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText(label));
     await fireEvent.press(signUpButton(code));
@@ -1851,7 +1899,7 @@ describe('signup screen', () => {
   it('shows the busy state while registering', async () => {
     const registration = deferred<User>();
     mockAuthValue.register = jest.fn(() => registration.promise);
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     // fireEvent.press awaits the async handler; keep it pending while busy.
@@ -1915,7 +1963,7 @@ describe('signup screen', () => {
       .mockReturnValueOnce(firstRegistration.promise)
       .mockResolvedValueOnce(USER);
     mockAuthValue.register = register;
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const submit = committedPressHandler(signUpButton('te'));
@@ -1967,7 +2015,7 @@ describe('signup screen', () => {
     async (outcome) => {
       const registration = deferred<User>();
       mockAuthValue.register = jest.fn(() => registration.promise);
-      const view = await render(<SignupScreen />);
+      const view = await render(<CrashBoundedSignupScreen />);
       await fillSignup('Ada', 'ada@example.com', 'password1');
       await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
       const submit = committedPressHandler(signUpButton('te'));
@@ -1995,7 +2043,7 @@ describe('signup screen', () => {
   it('submits registration once for two same-render activations', async () => {
     const registration = deferred<User>();
     mockAuthValue.register = jest.fn(() => registration.promise);
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     const press = committedPressHandler(signUpButton('te'));
@@ -2015,7 +2063,7 @@ describe('signup screen', () => {
 
   it('shows a duplicate-account error on 409', async () => {
     mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(409, 'exists'));
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     await fireEvent.press(signUpButton('te'));
@@ -2036,7 +2084,7 @@ describe('signup screen', () => {
     'clears a stale registration error when the %s value changes',
     async (field) => {
       mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(409, 'exists'));
-      await render(<SignupScreen />);
+      await render(<CrashBoundedSignupScreen />);
       await fillSignup('Ada', 'ada@example.com', 'password1');
       await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
       await fireEvent.press(signUpButton('te'));
@@ -2065,7 +2113,7 @@ describe('signup screen', () => {
     mockAuthValue.register = jest
       .fn()
       .mockRejectedValue(new RegistrationCompletedLoginRequiredError());
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     await fireEvent.press(signUpButton());
@@ -2081,7 +2129,7 @@ describe('signup screen', () => {
 
   it('maps a 429 through userMessageForError', async () => {
     mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(429, 'slow down'));
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     await fireEvent.press(signUpButton('te'));
@@ -2093,7 +2141,7 @@ describe('signup screen', () => {
 
   it('maps service failures to safe shared copy', async () => {
     mockAuthValue.register = jest.fn().mockRejectedValue(new ApiError(500, 'private detail'));
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     await fireEvent.press(signUpButton('te'));
@@ -2106,7 +2154,7 @@ describe('signup screen', () => {
       .fn()
       .mockRejectedValueOnce(new Error('network down'))
       .mockResolvedValueOnce(USER);
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Ada', 'ada@example.com', 'password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
     await fireEvent.press(signUpButton('te'));
@@ -2184,7 +2232,7 @@ describe('signup deep contracts', () => {
   }
 
   it('shows the mismatch copy only while a mismatched confirmation is present', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Priya', 'priya@example.com', 'password1');
     await fillConfirm('password2');
     expect(screen.getByText(translateFor('en', 'cp.mismatch'))).toBeTruthy();
@@ -2196,7 +2244,7 @@ describe('signup deep contracts', () => {
   });
 
   it('blocks registration without a confirmation and past the email bound', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Priya', 'priya@example.com', 'password1');
     await fireEvent.press(signupButton());
     expect(mockAuthValue.register).not.toHaveBeenCalled();
@@ -2208,7 +2256,7 @@ describe('signup deep contracts', () => {
   });
 
   it('registers at exactly the maximum email length with a matching confirmation', async () => {
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Priya', AT_MAX_EMAIL, 'password1');
     await fillConfirm('password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
@@ -2219,7 +2267,7 @@ describe('signup deep contracts', () => {
   it('keeps the confirmation field uncorrected and the CTA dimmed while busy', async () => {
     const gate = deferred<User>();
     mockAuthValue = makeAuth({ register: jest.fn(() => gate.promise) });
-    await render(<SignupScreen />);
+    await render(<CrashBoundedSignupScreen />);
     await fillSignup('Priya', 'priya@example.com', 'password1');
     await fillConfirm('password1');
     await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
@@ -2232,5 +2280,408 @@ describe('signup deep contracts', () => {
     await waitFor(() => expect(mockAuthValue.register).toHaveBeenCalledTimes(1));
     expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ opacity: 0.5 });
     gate.resolve(USER);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// State/prop wiring pins: authored null initial states (vs any hostile
+// boolean), stale-error clearing setters, and the chrome/field/child-component
+// prop wiring the style-scale tests above do not reach.
+// ---------------------------------------------------------------------------
+
+/** The host ScrollView, which keeps contentContainerStyle as a prop. */
+function scrollViewHost(): TestInstance {
+  const [scrollView] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  if (!scrollView) throw new Error('No ScrollView rendered');
+  return scrollView;
+}
+
+/** A rendered child test instance by position (screen-content order). */
+function childInstance(node: TestInstance, index: number): TestInstance {
+  const child = node.children[index];
+  if (!child) throw new Error(`No child ${index} on the laid-out element`);
+  return child as unknown as TestInstance;
+}
+
+type IconElementProps = { name?: string; size?: number; color?: string; strokeWidth?: number };
+
+/** The authored Icon element inside a brand-mark host view. */
+function brandIconElement(screenTitle: string): React.ReactElement<IconElementProps> {
+  const header = screen.getByRole('header', { name: screenTitle });
+  const brandMark = childInstance(parentOf(header), 0);
+  const children = brandMark.props.children as
+    React.ReactElement<IconElementProps> | React.ReactElement<IconElementProps>[];
+  const icon = Array.isArray(children) ? children[0] : children;
+  if (!icon) throw new Error('No icon element inside the brand mark');
+  return icon;
+}
+
+const wiringFieldError: SemanticStyle = {
+  marginTop: spacing.sm,
+  color: colors.danger,
+  fontSize: 13,
+};
+
+const wiringFormLabel: SemanticStyle = {
+  fontSize: 14,
+  fontWeight: '600',
+  color: colors.text,
+  marginBottom: spacing.sm,
+  marginTop: spacing.md,
+};
+
+describe('login state wiring', () => {
+  it('starts with no focused field and no summary alert', async () => {
+    await render(<LoginScreen />);
+
+    expect(screen.queryByRole('alert')).toBeNull();
+    const passwordStyle = screen.getByLabelText(t('login.passwordLabel')).props.style as unknown[];
+    // The style array itself must exist before its null focus slot is read, so
+    // a removed style wiring dies on this matcher instead of a raw deref.
+    expect(passwordStyle).toBeDefined();
+    expect(passwordStyle[2]).toBeNull();
+  });
+
+  it('marks the email touched when a blocked return-key submit fires', async () => {
+    await render(<LoginScreen />);
+    await fillLogin('not-an-email', 'password1');
+
+    await fireEvent(screen.getByLabelText(t('login.passwordLabel')), 'submitEditing');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(mockAuthValue.login).not.toHaveBeenCalled();
+  });
+
+  it('clears a stale credential error on a successful retry', async () => {
+    mockAuthValue.login = jest
+      .fn()
+      .mockRejectedValueOnce(new ApiError(401, 'unauthorized'))
+      .mockResolvedValueOnce(USER);
+    await render(<LoginScreen />);
+    await fillLogin('ada@example.com', 'password1');
+    await fireEvent.press(logInButton());
+    expect(await screen.findByText(t('error.wrongCredentials'))).toBeTruthy();
+
+    await fireEvent.press(logInButton());
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(screen.queryByText(t('error.wrongCredentials'))).toBeNull();
+  });
+});
+
+describe('signup state wiring', () => {
+  it('starts with an empty confirmation, no mismatch copy, no focus, and no alert', async () => {
+    await render(<CrashBoundedSignupScreen />);
+
+    expect(screen.getByLabelText(t('password.confirmLabel')).props.value).toBe('');
+    expect(screen.queryByText(t('cp.mismatch'))).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    const passwordStyle = screen.getByLabelText(t('login.passwordLabel')).props.style as unknown[];
+    // The style array itself must exist before its null focus slot is read, so
+    // a removed style wiring dies on this matcher instead of a raw deref.
+    expect(passwordStyle).toBeDefined();
+    expect(passwordStyle[2]).toBeNull();
+    const confirmStyle = screen.getByLabelText(t('password.confirmLabel')).props.style as unknown[];
+    expect(confirmStyle).toBeDefined();
+    expect(confirmStyle[2]).toBeNull();
+  });
+
+  it('marks the email and name touched when a blocked return-key submit fires', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'bad\u0007name');
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+
+    await fireEvent(screen.getByLabelText(t('password.confirmLabel')), 'submitEditing');
+
+    expect(screen.getByText(t('email.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(screen.getByText(t('name.invalid')).props.accessibilityLiveRegion).toBe('polite');
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+  });
+
+  it('clears a stale registration error on a successful retry', async () => {
+    mockAuthValue.register = jest
+      .fn()
+      .mockRejectedValueOnce(new ApiError(409, 'exists'))
+      .mockResolvedValueOnce(USER);
+    await render(<CrashBoundedSignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.press(signUpButton('te'));
+    expect(await screen.findByText(t('error.emailTaken'))).toBeTruthy();
+
+    await fireEvent.press(signUpButton('te'));
+    await waitFor(() => expect(mockRouter.replace).toHaveBeenCalledWith('/'));
+    expect(screen.queryByText(t('error.emailTaken'))).toBeNull();
+  });
+});
+
+describe('signup prop wiring', () => {
+  it('pins the screen chrome, brand badge, and brand icon ink', async () => {
+    await render(<CrashBoundedSignupScreen />);
+
+    expect(flattenedStyle(parentOf(screen.getByTestId('keyboard-avoiding-view')))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollViewHost().props.keyboardShouldPersistTaps).toBe('handled');
+
+    const header = screen.getByRole('header', { name: t('signup.title') });
+    expect(flattenedStyle(childInstance(parentOf(header), 0))).toEqual({
+      width: layout.brandMark,
+      height: layout.brandMark,
+      borderRadius: layout.brandMark / 2,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.primaryLight,
+      marginBottom: spacing.md,
+      alignSelf: 'center',
+    });
+    expect(brandIconElement(t('signup.title')).props).toMatchObject({
+      name: 'mic',
+      size: 26,
+      color: colors.primary,
+      strokeWidth: 2.1,
+    });
+  });
+
+  it('pins the app-language picker value, busy lock, and persistence error', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+
+    const registration = deferred<User>();
+    mockAuthValue.register = jest.fn(() => registration.promise);
+    await render(<CrashBoundedSignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.press(signUpButton('te'));
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: true,
+    });
+    await act(async () => {
+      registration.resolve(USER);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    mockGuestLanguageState = { language: 'en', persistenceError: 'Secure storage unavailable' };
+    await render(<CrashBoundedSignupScreen />);
+    expect(screen.getByText('Secure storage unavailable').props.accessibilityRole).toBe('alert');
+  });
+
+  it('pins the field labels, confirm row, and confirm field configuration', async () => {
+    await render(<CrashBoundedSignupScreen />);
+
+    expect(flattenedStyle(screen.getByText(t('login.emailLabel')))).toEqual(wiringFormLabel);
+    expect(flattenedStyle(screen.getByText(t('login.passwordLabel')))).toEqual(wiringFormLabel);
+    expect(flattenedStyle(screen.getByText(t('password.confirmLabel')))).toEqual(wiringFormLabel);
+    expect(flattenedStyle(screen.getByText(t('signup.languageLabel')))).toEqual(wiringFormLabel);
+    const confirm = screen.getByLabelText(t('password.confirmLabel'));
+    expect(flattenedStyle(parentOf(confirm))).toEqual({
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: spacing.sm,
+    });
+    expect(confirm.props).toMatchObject({
+      placeholderTextColor: colors.muted,
+      autoCapitalize: 'none',
+      autoComplete: 'new-password',
+      textContentType: 'newPassword',
+      returnKeyType: 'go',
+      maxLength: MAX_PASSWORD_UTF8_BYTES,
+    });
+
+    await fireEvent.changeText(confirm, 'password1');
+    expect(screen.getByLabelText(t('password.confirmLabel')).props.value).toBe('password1');
+
+    // Placeholder ink is pinned for every text field on the form.
+    expect(screen.getByLabelText(t('signup.nameLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+    expect(screen.getByLabelText(t('login.emailLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+    expect(screen.getByLabelText(t('login.passwordLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+    expect(screen.getByLabelText(t('password.confirmLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+  });
+
+  it('pins the strength meter testID under the password field', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    expect(screen.queryByTestId('signup-strength')).toBeNull();
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.passwordLabel')), 'password1');
+    expect(screen.getByTestId('signup-strength')).toBeTruthy();
+  });
+
+  it('pins the inline field-error ink for the name, email, and confirmation complaints', async () => {
+    await render(<CrashBoundedSignupScreen />);
+
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'bad\u0007name');
+    await fireEvent(screen.getByLabelText(t('signup.nameLabel')), 'blur');
+    expect(flattenedStyle(screen.getByText(t('name.invalid')))).toEqual(wiringFieldError);
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
+    expect(flattenedStyle(screen.getByText(t('email.invalid')))).toEqual(wiringFieldError);
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.passwordLabel')), 'password1');
+    await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'password2');
+    expect(flattenedStyle(screen.getByText(t('cp.mismatch')))).toEqual(wiringFieldError);
+  });
+
+  it('pins the language chip prefix and the selected check glyph wiring', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    expect(screen.getByTestId('signup-language-te')).toBeTruthy();
+
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    const check = screen.getByTestId('signup-language-check-te', {
+      includeHiddenElements: true,
+    });
+    expect(check).toHaveTextContent('✓');
+    expect(flattenedStyle(check)).toEqual({
+      position: 'absolute',
+      top: spacing.sm,
+      right: spacing.sm,
+      color: colors.primary,
+      fontSize: 16,
+      fontWeight: '800',
+    });
+  });
+
+  it('pins the legal link row, press styling, and ink', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    const privacy = screen.getByRole('link', { name: t('header.privacy') });
+    const terms = screen.getByRole('link', { name: t('header.terms') });
+
+    expect(flattenedStyle(parentOf(privacy))).toEqual({
+      marginTop: spacing.sm,
+      minHeight: layout.minimumTarget,
+      flexDirection: 'row',
+      flexWrap: 'wrap',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: spacing.lg,
+    });
+    for (const link of [privacy, terms]) {
+      expect(flattenedStyle(link)).toEqual({
+        minHeight: layout.minimumTarget,
+        alignItems: 'center',
+        justifyContent: 'center',
+        paddingVertical: spacing.md,
+      });
+      // The authored Pressable style is a pressed-state callback; the resting
+      // flatten must not carry the pressed ink.
+      expect(flattenedStyle(link)).not.toMatchObject({ opacity: 0.6 });
+    }
+    expect(flattenedStyle(textNode(privacy, t('header.privacy')))).toEqual({
+      fontSize: 15,
+      color: colors.primary,
+      fontWeight: '600',
+      textAlign: 'center',
+    });
+    expect(flattenedStyle(textNode(terms, t('header.terms')))).toEqual({
+      fontSize: 15,
+      color: colors.primary,
+      fontWeight: '600',
+      textAlign: 'center',
+    });
+  });
+});
+
+describe('login prop wiring', () => {
+  it('pins the screen chrome, brand badge, and brand icon ink', async () => {
+    await render(<LoginScreen />);
+
+    expect(flattenedStyle(parentOf(screen.getByTestId('keyboard-avoiding-view')))).toEqual({
+      flex: 1,
+      backgroundColor: colors.background,
+    });
+    expect(scrollViewHost().props.keyboardShouldPersistTaps).toBe('handled');
+
+    const header = screen.getByRole('header', { name: t('login.title') });
+    expect(flattenedStyle(childInstance(parentOf(header), 0))).toEqual({
+      width: layout.brandMark,
+      height: layout.brandMark,
+      borderRadius: layout.brandMark / 2,
+      alignItems: 'center',
+      justifyContent: 'center',
+      backgroundColor: colors.primaryLight,
+      marginBottom: spacing.md,
+      alignSelf: 'center',
+    });
+    expect(brandIconElement(t('login.title')).props).toMatchObject({
+      name: 'mic',
+      size: 30,
+      color: colors.primary,
+      strokeWidth: 2.1,
+    });
+  });
+
+  it('pins the app-language picker value, busy lock, and persistence error', async () => {
+    await render(<LoginScreen />);
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: false,
+    });
+
+    const login = deferred<User>();
+    mockAuthValue.login = jest.fn(() => login.promise);
+    const busy = await render(<LoginScreen />);
+    await fillLogin('ada@example.com', 'password1');
+    await fireEvent.press(logInButton());
+    expect(screen.getByTestId('ui-language-en').props.accessibilityState).toMatchObject({
+      checked: true,
+      disabled: true,
+    });
+    await act(async () => {
+      login.resolve(USER);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await busy.unmount();
+
+    mockGuestLanguageState = { language: 'en', persistenceError: 'Secure storage unavailable' };
+    await render(<LoginScreen />);
+    expect(screen.getByText('Secure storage unavailable').props.accessibilityRole).toBe('alert');
+  });
+
+  it('pins the registered-notice banner ink', async () => {
+    mockSearchParams = { notice: 'registered' };
+    await render(<LoginScreen />);
+
+    expect(flattenedStyle(screen.getByText(t('signup.createdLoginBanner')))).toEqual({
+      marginTop: spacing.lg,
+      backgroundColor: colors.successLight,
+      borderColor: colors.success,
+      borderWidth: 1,
+      borderRadius: radii.input,
+      padding: spacing.md,
+      color: colors.success,
+      fontSize: 14,
+      lineHeight: 20,
+      textAlign: 'center',
+    });
+  });
+
+  it('pins the field labels, placeholder ink, and the email field-error ink', async () => {
+    await render(<LoginScreen />);
+
+    expect(flattenedStyle(screen.getByText(t('login.passwordLabel')))).toEqual(wiringFormLabel);
+    expect(screen.getByLabelText(t('login.emailLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+    expect(screen.getByLabelText(t('login.passwordLabel')).props.placeholderTextColor).toBe(
+      colors.muted,
+    );
+
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
+    expect(flattenedStyle(screen.getByText(t('email.invalid')))).toEqual(wiringFieldError);
   });
 });

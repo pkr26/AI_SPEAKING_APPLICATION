@@ -259,7 +259,7 @@ export default function SignupScreen() {
                 style={[
                   styles.input,
                   styles.inputWithAction,
-                  focusedField === 'password' && styles.inputFocused,
+                  focusedField && focusedField === 'password' && styles.inputFocused,
                 ]}
                 value={password}
                 onChangeText={(value) => {
@@ -304,7 +304,7 @@ export default function SignupScreen() {
                 style={[
                   styles.input,
                   styles.inputWithAction,
-                  focusedField === 'confirmPassword' && styles.inputFocused,
+                  focusedField && focusedField === 'confirmPassword' && styles.inputFocused,
                 ]}
                 value={confirmPassword}
                 onChangeText={(value) => {
@@ -368,7 +368,7 @@ export default function SignupScreen() {
               }
             />
 
-            {error && (
+            {error !== null && (
               <Text accessibilityRole="alert" style={styles.error}>
                 {error}
               </Text>

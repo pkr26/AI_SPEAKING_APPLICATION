@@ -96,6 +96,8 @@ import Recorder, {
   waitForForeground,
   type RecorderResultMetadata,
 } from '../src/components/Recorder';
+import Icon from '../src/components/Icon';
+import Button from '../src/components/Button';
 import {
   ApiError,
   apiFetch,
@@ -695,6 +697,35 @@ function IdentityLayoutHarness<T>({
     <>
       <Recorder {...recorderProps} />
       <AfterRecorderLayout onLayout={onRecorderLayout} />
+    </>
+  );
+}
+
+/**
+ * Renders the Recorder beside a raw-host marker whose callback ref receives
+ * the test renderer's own TestInstance. The ref attaches during the mount
+ * commit — before ANY passive effect runs — and hands that TestInstance to
+ * `onMarker`, letting a test walk the Recorder fiber's hook chain inside the
+ * pristine first commit. `screen` queries cannot run that early because RNTL
+ * binds them only once `render()` completes.
+ */
+function RecorderSlotCaptureHarness<T>({
+  recorderProps,
+  onMarker,
+}: {
+  recorderProps: IdentityHarnessRecorderProps<T>;
+  onMarker: (marker: TestInstance | null) => void;
+}) {
+  return (
+    <>
+      <Recorder {...recorderProps} />
+      {React.createElement('View', {
+        ref: (instance: unknown) => {
+          // Ref callbacks also fire with null when the element unmounts; only
+          // the mount attach carries the marker worth walking.
+          if (instance != null) onMarker(instance as TestInstance);
+        },
+      })}
     </>
   );
 }
@@ -17563,6 +17594,595 @@ describe('Recorder', () => {
       expect(recordIconSvg()).toMatchObject({ width: 34, height: 34 });
       expect(flattenedStyle(screen.getByText(IDLE_TEXT)).color).toBe(darkColors.muted);
       expect(darkColors.danger).not.toBe(colors.danger);
+    });
+  });
+
+  describe('state and prop wiring pins', () => {
+    /**
+     * Walks from a rendered Button host up to the Button component fiber so
+     * authored presentation props (variant/size) stay directly assertable.
+     * The fiber is identified by the Button component itself, never by the
+     * presence of a prop under test: a prop-removal mutant must fail an
+     * assertion here, not wedge the helper into a raw throw.
+     */
+    function buttonComponentProps(node: TestInstance): Record<string, unknown> {
+      type ButtonFiber = {
+        type?: unknown;
+        memoizedProps?: Record<string, unknown>;
+        return: ButtonFiber | null;
+      };
+      let fiber = node.unstable_fiber as ButtonFiber | null;
+      while (fiber) {
+        if (fiber.type === Button) {
+          const props = fiber.memoizedProps;
+          if (props) return props;
+        }
+        fiber = fiber.return;
+      }
+      throw new Error('Button component fiber not found');
+    }
+
+    /** Processed stroke values of an icon glyph, in draw order. */
+    function iconStrokePayloads(node: TestInstance): unknown[] {
+      const svg = node.children.find((child) => typeof child !== 'string');
+      const group = svg?.children.find((child) => typeof child !== 'string');
+      return (group?.children ?? [])
+        .filter((child) => typeof child !== 'string')
+        .map((line) => (line as TestInstance).props.stroke);
+    }
+
+    async function denyPermissionOnce(canAskAgain = false): Promise<void> {
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValueOnce({
+        granted: false,
+        canAskAgain,
+      });
+      asMock(AudioModule.requestRecordingPermissionsAsync).mockResolvedValue({
+        granted: false,
+        canAskAgain,
+      });
+    }
+
+    /**
+     * The Recorder's committed useState-family slots in authored call order,
+     * read straight off the mounted fiber's hook chain — the same
+     * `unstable_fiber` access `buttonComponentProps` uses for prop closures.
+     * The anchor is the sibling raw-host marker rendered by
+     * `RecorderSlotCaptureHarness`: `screen` queries cannot run during the
+     * mount commit (RNTL binds them only once `render()` completes), but the
+     * marker's callback ref fires with the marker's TestInstance before any
+     * passive effect runs. Every failure path below is a matcher failure, so
+     * a walk problem can never poison a mutant run into a raw-error
+     * classification.
+     */
+    function recorderHookSlotValuesFromMarker(marker: TestInstance | null): unknown[] {
+      type HookNode = {
+        memoizedState: unknown;
+        queue?: { lastRenderedState?: unknown } | null;
+        next: HookNode | null;
+      };
+      type ComponentFiber = {
+        type: unknown;
+        memoizedState: HookNode | null;
+        child: ComponentFiber | null;
+        sibling: ComponentFiber | null;
+        return: ComponentFiber | null;
+      };
+      expect(marker).not.toBeNull();
+      const markerFiber = (marker?.unstable_fiber ?? null) as unknown as ComponentFiber | null;
+      expect(markerFiber).not.toBeNull();
+      // One level up is the fragment parenting the marker beside the Recorder;
+      // the Recorder's composite fiber is that fragment's first child.
+      const fragmentFiber = markerFiber?.return ?? null;
+      expect(fragmentFiber).not.toBeNull();
+      let recorderFiber = fragmentFiber?.child ?? null;
+      while (recorderFiber !== null && recorderFiber.type !== Recorder) {
+        recorderFiber = recorderFiber.sibling;
+      }
+      expect(recorderFiber).not.toBeNull();
+      const values: unknown[] = [];
+      let hook = recorderFiber?.memoizedState ?? null;
+      while (hook !== null) {
+        if (hook.queue && typeof hook.queue === 'object' && 'lastRenderedState' in hook.queue) {
+          values.push(hook.memoizedState);
+        }
+        hook = hook.next;
+      }
+      return values;
+    }
+
+    it('renders the idle surface with no permission banner from either seed', async () => {
+      await renderRecorder();
+
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.permissionRetryBody'))).toBeNull();
+      expect(screen.queryByRole('alert')).toBeNull();
+      // The wait clock must seed at zero: a nonzero seed would render the wait
+      // furniture on the idle surface before any phase transition zeroes it.
+      expect(screen.queryByText(waitingForText('0:00'))).toBeNull();
+      expect(screen.queryByLabelText(t('recorder.a11yUploading'))).toBeNull();
+    });
+
+    it('pins the pristine first-commit useState seeds before mount effects run', async () => {
+      // Several seed slots never reach the idle surface on their own, and the
+      // mount passive effect that releases the preview player rewrites
+      // previewPlaying(false) before any post-render assertion could observe
+      // the authored false. The harness below captures the pristine vector
+      // from a sibling layout effect — after Recorder's own layout effects
+      // but before ANY passive effect — through the sibling marker's fiber.
+      let firstCommitSlots: unknown[] | undefined;
+      await render(
+        <RecorderSlotCaptureHarness
+          recorderProps={recorderTestProps()}
+          onMarker={(marker) => {
+            firstCommitSlots = recorderHookSlotValuesFromMarker(marker);
+          }}
+        />,
+      );
+      await flushAct();
+      await flushAct();
+      expect(screen.getByRole('button', { name: START_LABEL })).toBeTruthy();
+      // The full authored-order vector of useState-family slots (Recorder's
+      // own seeds interleaved with the shared useReduceMotion seed and the
+      // scoped native-snapshot seed): a hostile same-family default (0↔1, a
+      // boolean flip, or a forced-undefined lazy seed) must never occupy a
+      // pristine seed slot.
+      expect(firstCommitSlots).toEqual([
+        0, // recordingStatusVersion
+        'idle', // phase
+        // The scoped recorder snapshot seed: useScopedAudioRecorderState's
+        // lazy first getStatus() read of the fresh mock recorder.
+        {
+          canRecord: true,
+          isRecording: false,
+          durationMillis: 0,
+          url: null,
+          mediaServicesDidReset: false,
+        },
+        false, // operationActive
+        false, // recoveryRetryNeeded
+        false, // permissionDenied
+        false, // permissionNeedsSettings
+        false, // reduceMotion (shared useReduceMotion seed)
+        0, // recordedDurationMillis
+        0, // waitElapsedMillis
+        false, // remoteTransferStarted
+        false, // assessmentRequestStarted
+        false, // previewPlaying
+        false, // retainRecording
+      ]);
+    });
+
+    it('pins the authored disabled wiring on the mic Pressable', async () => {
+      const { view } = await renderRecorder();
+      expect(compositePressableProps(view, START_LABEL).disabled).toBe(false);
+
+      const { view: locked, props } = await renderRecorder({ disabled: true });
+      expect(compositePressableProps(locked, START_LABEL).disabled).toBe(true);
+      await locked.rerender(<Recorder {...props} disabled={false} />);
+      expect(compositePressableProps(locked, START_LABEL).disabled).toBe(false);
+    });
+
+    it('inks the mic glyph with the on-danger color from the danger surface', async () => {
+      const reference = await render(
+        <Icon name="mic" color={colors.onDanger} size={34} accessibilityLabel="reference mic" />,
+      );
+
+      await renderRecorder();
+
+      expect(recordIconSvg()).toMatchObject({ width: 34, height: 34 });
+      expect(iconStrokePayloads(recordIconNode())).toEqual(
+        iconStrokePayloads(reference.getByLabelText('reference mic')),
+      );
+    });
+
+    it('pins the retention note style beside the privacy note', async () => {
+      await renderRecorder();
+
+      expect(flattenedStyle(screen.getByText(t('recorder.retentionNote')))).toEqual({
+        marginTop: spacing.xs,
+        fontSize: 12,
+        lineHeight: 17,
+        color: colors.muted,
+        textAlign: 'center',
+      });
+    });
+
+    it('pins the recorded review furniture from the shared tokens', async () => {
+      const { view, props } = await renderRecorder();
+      await recordAndStop();
+
+      const retentionSwitch = screen.getByRole('switch', {
+        name: t('recorder.saveRecordingLabel'),
+      });
+      expect(flattenedStyle(retentionSwitch)).toEqual({
+        minWidth: layout.minimumTarget,
+        minHeight: layout.minimumTarget,
+        alignSelf: 'flex-start',
+      });
+      // The Switch host mock drops trackColor, so the authored palette is
+      // pinned through the switch's own composite fiber props.
+      type SwitchFiber = {
+        memoizedProps?: Record<string, unknown>;
+        return: SwitchFiber | null;
+      };
+      let switchFiber = retentionSwitch.unstable_fiber as SwitchFiber | null;
+      let authoredTrackColor: { false?: unknown; true?: unknown } | undefined;
+      while (switchFiber) {
+        const candidate = switchFiber.memoizedProps?.trackColor as
+          { false?: unknown; true?: unknown } | undefined;
+        if (candidate && 'false' in candidate && 'true' in candidate) {
+          authoredTrackColor = candidate;
+          break;
+        }
+        switchFiber = switchFiber.return;
+      }
+      expect(authoredTrackColor).toEqual({ false: colors.border, true: colors.primary });
+      const choiceRow = retentionSwitch.parent ?? null;
+      // Missing layout parents must fail as matchers, never as a raw dereference.
+      expect(choiceRow).not.toBeNull();
+      expect(flattenedStyle(choiceRow!)).toEqual({
+        minHeight: layout.minimumTarget,
+        flexDirection: 'row',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        gap: spacing.md,
+      });
+      const choice = choiceRow?.parent ?? null;
+      expect(choice).not.toBeNull();
+      expect(flattenedStyle(choice!)).toEqual({
+        borderWidth: 1,
+        borderColor: colors.border,
+        borderRadius: radii.input,
+        padding: spacing.md,
+        gap: spacing.xs,
+      });
+      expect(flattenedStyle(screen.getByText(t('recorder.saveRecordingLabel')))).toEqual({
+        flex: 1,
+        color: colors.text,
+        fontSize: 16,
+        fontWeight: '600',
+      });
+      expect(flattenedStyle(screen.getByText(t('recorder.saveRecordingHint')))).toEqual({
+        color: colors.muted,
+        fontSize: 13,
+        lineHeight: 18,
+      });
+
+      const play = screen.getByRole('button', { name: t('recorder.playLabel') });
+      // The visible title is distinct from the accessible name here; pin it so
+      // a removed title prop fails the matcher instead of only renaming.
+      expect(buttonComponentProps(play).title).toBe(t('recorder.play'));
+      expect(buttonComponentProps(play).variant).toBe('secondary');
+      expect(
+        buttonComponentProps(screen.getByRole('button', { name: RERECORD_TEXT })).variant,
+      ).toBe('quiet');
+      expect(buttonComponentProps(screen.getByRole('button', { name: DISCARD_TEXT })).variant).toBe(
+        'danger',
+      );
+
+      await view.rerender(<Recorder {...props} disabled />);
+      for (const name of [t('recorder.playLabel'), SUBMIT_TEXT, RERECORD_TEXT, DISCARD_TEXT]) {
+        expect(screen.getByRole('button', { name }).props.accessibilityState).toEqual({
+          disabled: true,
+          busy: false,
+        });
+      }
+    });
+
+    it('pins the uploading cancel action wiring and its disabled passthrough', async () => {
+      const upload = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(upload.promise);
+      const { view, props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
+      const cancel = screen.getByRole('button', { name: CANCEL_TEXT });
+      expect(buttonComponentProps(cancel).variant).toBe('secondary');
+      expect(buttonComponentProps(cancel).size).toBe('sm');
+
+      await view.rerender(<Recorder {...props} disabled />);
+      expect(screen.getByRole('button', { name: CANCEL_TEXT }).props.accessibilityState).toEqual({
+        disabled: true,
+        busy: false,
+      });
+
+      await act(async () => {
+        upload.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+    });
+
+    it('pins the recovery Try Again wiring and its disabled passthrough', async () => {
+      asMock(loadPendingAssessment).mockRejectedValue(new Error('keychain unavailable'));
+      const { view, props } = await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+
+      const retry = screen.getByRole('button', { name: t('common.tryAgain') });
+      expect(buttonComponentProps(retry).variant).toBe('secondary');
+      expect(buttonComponentProps(retry).size).toBe('sm');
+      expect(flattenedStyle(retry)).toMatchObject({ marginTop: spacing.md, alignSelf: 'center' });
+
+      await view.rerender(<Recorder {...props} disabled />);
+      expect(
+        screen.getByRole('button', { name: t('common.tryAgain') }).props.accessibilityState,
+      ).toEqual({ disabled: true, busy: false });
+    });
+
+    it('restarts the recovery clock per wait and pins the parked escape wiring', async () => {
+      jest.useFakeTimers();
+      asMock(loadPendingAssessment).mockResolvedValue(pendingRecord());
+      asMock(apiFetch).mockReturnValue(new Promise(() => undefined));
+      await renderRecorder();
+
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+      await act(async () => {
+        await jest.advanceTimersByTimeAsync(16_000);
+      });
+      expect(screen.getByText(waitingForText('0:16'))).toBeTruthy();
+
+      const checkLater = screen.getByRole('button', { name: t('replay.checkLater') });
+      expect(buttonComponentProps(checkLater).variant).toBe('secondary');
+      expect(buttonComponentProps(checkLater).size).toBe('sm');
+      expect(buttonComponentProps(checkLater).disabled).toBe(false);
+      expect(flattenedStyle(checkLater)).toMatchObject({ marginTop: spacing.md });
+
+      await fireEvent.press(checkLater);
+      await waitFor(() =>
+        expect(screen.getAllByText(t('replay.failedBody')).length).toBeGreaterThan(0),
+      );
+      expect(flattenedStyle(screen.getByTestId('recorder-expanded-controls'))).toEqual({
+        alignSelf: 'stretch',
+        alignItems: 'center',
+      });
+      const failedBodies = screen.getAllByText(t('replay.failedBody'));
+      // The parked copy appears twice: the status line and the expanded
+      // controls' alert, each on its own shared-token style.
+      expect(failedBodies).toHaveLength(2);
+      for (const failedBody of failedBodies) {
+        expect([
+          { marginTop: spacing.ml, fontSize: 15, color: colors.muted, textAlign: 'center' },
+          { marginTop: spacing.md, fontSize: 14, color: colors.muted, textAlign: 'center' },
+        ]).toContainEqual(flattenedStyle(failedBody));
+      }
+
+      const parkedTryAgain = screen.getByRole('button', { name: t('common.tryAgain') });
+      expect(buttonComponentProps(parkedTryAgain).variant).toBe('secondary');
+      expect(buttonComponentProps(parkedTryAgain).size).toBe('sm');
+      expect(buttonComponentProps(parkedTryAgain).disabled).toBe(false);
+      expect(flattenedStyle(parkedTryAgain)).toMatchObject({ marginTop: spacing.md });
+
+      await fireEvent.press(screen.getByRole('button', { name: t('common.tryAgain') }));
+      await waitFor(() => expect(screen.getByText(RECOVERING_TEXT)).toBeTruthy());
+      // A brand-new wait phase restarts its elapsed clock from zero instead of
+      // carrying the previous wait's reading.
+      expect(screen.getByText(waitingForText('0:00'))).toBeTruthy();
+    });
+
+    it('clears the permission banner when a fresh start is granted', async () => {
+      await denyPermissionOnce(true);
+      await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy());
+
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: true });
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy());
+      expect(screen.queryByText(t('recorder.permissionRetryBody'))).toBeNull();
+    });
+
+    it('clears the settings banner after Settings grants permission on foreground', async () => {
+      await denyPermissionOnce();
+      const announce = jest
+        .spyOn(AccessibilityInfo, 'announceForAccessibility')
+        .mockImplementation(() => undefined);
+      await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+
+      // The Settings affordance in the needs-settings banner forwards the
+      // host's disabled wiring (not its own busy state).
+      const settings = screen.getByRole('button', { name: t('recorder.openSettings') });
+      expect(buttonComponentProps(settings).disabled).toBe(false);
+
+      asMock(AudioModule.getRecordingPermissionsAsync).mockResolvedValue({ granted: true });
+      await act(async () => {
+        for (const handler of appStateHandlers) handler('active');
+        await flushMicrotasks();
+      });
+
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.permissionRetryBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.openSettings'))).toBeNull();
+      expect(announce).toHaveBeenCalledWith(t('recorder.permissionGranted'));
+      announce.mockRestore();
+    });
+
+    it('clears the permission banner when the assessment identity changes', async () => {
+      await denyPermissionOnce(true);
+      const { view, props } = await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionRetryBody'))).toBeTruthy());
+
+      await view.rerender(
+        <Recorder {...props} questionId="550e8400-e29b-41d4-a716-446655440099" />,
+      );
+      await flushAct();
+
+      expect(screen.queryByText(t('recorder.permissionRetryBody'))).toBeNull();
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+    });
+
+    it('clears the needs-settings banner when the assessment identity changes', async () => {
+      await denyPermissionOnce();
+      const { view, props } = await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+      expect(screen.getByRole('button', { name: t('recorder.openSettings') })).toBeTruthy();
+
+      await view.rerender(
+        <Recorder {...props} questionId="550e8400-e29b-41d4-a716-446655440099" />,
+      );
+      await flushAct();
+
+      // Both banner seeds must clear together: a lingering needs-settings
+      // value would keep the actionable Settings guidance on screen for a
+      // question that never prompted.
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByRole('button', { name: t('recorder.openSettings') })).toBeNull();
+    });
+
+    it('clears the needs-settings banner the moment a fresh start begins', async () => {
+      await denyPermissionOnce();
+      const prompt = deferred<{ granted: boolean; canAskAgain: boolean }>();
+      const { view } = await renderRecorder();
+      await fireEvent.press(screen.getByLabelText(START_LABEL));
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+
+      // The mic handler returns the start promise, and this press must stay
+      // in flight while its permission recheck is pending, so the handler is
+      // invoked directly instead of through fireEvent's act chain.
+      asMock(AudioModule.getRecordingPermissionsAsync).mockReturnValue(prompt.promise);
+      let freshStart!: Promise<void>;
+      await act(() => {
+        freshStart = invokePressHandler(view, START_LABEL);
+      });
+
+      // The start path synchronously retires both banner seeds before it
+      // awaits the permission bridge, so the guidance disappears even while
+      // the recheck is still in flight.
+      expect(screen.queryByText(t('recorder.permissionBody'))).toBeNull();
+      expect(screen.queryByRole('button', { name: t('recorder.openSettings') })).toBeNull();
+
+      await act(async () => {
+        prompt.resolve({ granted: false, canAskAgain: false });
+        await freshStart;
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(screen.getByText(t('recorder.permissionBody'))).toBeTruthy());
+    });
+
+    it('re-arms the wait action and its after-transfer hint while backing off a capacity refusal', async () => {
+      const firstAttempt = deferred<never>();
+      asMock(apiUploadAudio)
+        .mockImplementationOnce(
+          (
+            _endpoint: string,
+            _uri: string,
+            _fields: unknown,
+            options?: { onRequestStarted?: () => void },
+          ) => {
+            options?.onRequestStarted?.();
+            return firstAttempt.promise;
+          },
+        )
+        .mockResolvedValueOnce({ ok: true });
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: t('recorder.stopWaiting') })).toBeTruthy(),
+      );
+
+      // The received 503 is a definite pre-commit refusal: the wait action
+      // returns to Cancel sending, and the hint stays honest that the audio
+      // transfer itself already happened.
+      await act(async () => {
+        firstAttempt.reject(new ApiError(503, 'capacity busy', 1, { code: 'CAPACITY_BUSY' }));
+        await flushMicrotasks();
+      });
+      const cancel = screen.getByRole('button', { name: t('recorder.cancelSending') });
+      expect(cancel.props.accessibilityHint).toBe(t('recorder.cancelAfterTransferHint'));
+
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }), {
+        timeout: 4_000,
+      });
+    });
+
+    it('re-arms the cancel affordance for a fresh submission after a completed one', async () => {
+      const first = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockImplementation(
+        (
+          _endpoint: string,
+          _uri: string,
+          _fields: unknown,
+          options?: { onRequestStarted?: () => void },
+        ) => {
+          options?.onRequestStarted?.();
+          return first.promise;
+        },
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: t('recorder.stopWaiting') })).toBeTruthy(),
+      );
+      await act(async () => {
+        first.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+
+      const second = deferred<{ ok: boolean }>();
+      asMock(apiUploadAudio).mockReturnValue(second.promise);
+      await recordAndStop();
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(screen.getByText(t('recorder.stageUploading'))).toBeTruthy());
+      const cancel = screen.getByRole('button', { name: t('recorder.cancelSending') });
+      expect(cancel.props.accessibilityHint).toBe(t('recorder.cancelBeforeTransferHint'));
+
+      await act(async () => {
+        second.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
+    });
+
+    it('relabels the wait action once the S3 assessment request itself starts', async () => {
+      const objectUpload = deferred<void>();
+      asMock(apiRequestAudioUpload).mockResolvedValue({
+        mode: 's3',
+        assessmentEndpoint: ENDPOINT,
+        uploadUrl: 'https://s3.example.com/upload',
+        uploadFields: { key: S3_AUDIO_KEY },
+        audioKey: S3_AUDIO_KEY,
+        contentType: 'audio/mp4',
+        expiresIn: 300,
+        maxBytes: 25 * 1024 * 1024,
+      });
+      asMock(apiPostPresignedAudio).mockReturnValue(objectUpload.promise);
+      const assessment = deferred<{ ok: boolean }>();
+      asMock(apiFetch).mockImplementation(
+        (_path: string, options?: { onRequestStarted?: () => void }) => {
+          options?.onRequestStarted?.();
+          return assessment.promise;
+        },
+      );
+      const { props } = await renderRecorder();
+      await recordAndStop();
+
+      await fireEvent.press(screen.getByRole('button', { name: SUBMIT_TEXT }));
+      await waitFor(() => expect(apiPostPresignedAudio).toHaveBeenCalledTimes(1));
+      expect(screen.getByRole('button', { name: t('recorder.cancelSending') })).toBeTruthy();
+
+      await act(async () => {
+        objectUpload.resolve(undefined);
+        await flushMicrotasks();
+      });
+      await waitFor(() =>
+        expect(screen.getByRole('button', { name: t('recorder.stopWaiting') })).toBeTruthy(),
+      );
+      expect(screen.queryByRole('button', { name: t('recorder.cancelSending') })).toBeNull();
+
+      await act(async () => {
+        assessment.resolve({ ok: true });
+        await flushMicrotasks();
+      });
+      await waitFor(() => expect(props.onResult).toHaveBeenCalledWith({ parsed: { ok: true } }));
     });
   });
 });

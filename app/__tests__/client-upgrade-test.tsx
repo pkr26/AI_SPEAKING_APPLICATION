@@ -15,7 +15,7 @@ import {
   subscribeToClientUpgrade,
 } from '../src/lib/client-upgrade-store';
 import { I18nProvider, translateFor } from '../src/lib/i18n';
-import { darkColors, lightColors } from '../src/lib/theme';
+import { darkColors, lightColors, spacing } from '../src/lib/theme';
 
 const useColorScheme = jest.requireMock('react-native/Libraries/Utilities/useColorScheme')
   .default as jest.Mock;
@@ -75,6 +75,40 @@ function committedPressHandler(node: TestInstance): () => void {
   // behavior under a wiring mutant and must fail as a kill, never an error.
   expect(handler).toBeInstanceOf(Function);
   return handler as () => void;
+}
+
+/**
+ * Authored props of the shared Button that rendered the named control, found
+ * the same way RNT's own fireEvent resolves handlers: by walking the fiber
+ * chain above the host element. Reading the call-site attributes keeps
+ * prop-wiring assertions on exactly what the state/prop supplements force.
+ */
+function buttonProps(name: string): Record<string, unknown> {
+  type Fiber = {
+    memoizedProps?: Record<string, unknown> | null;
+    type?: unknown;
+    return: Fiber | null;
+  };
+  const node = screen.getByRole('button', { name });
+  let fiber = node.unstable_fiber as Fiber | null;
+  let props: Record<string, unknown> | undefined;
+  while (fiber) {
+    const candidate = fiber.memoizedProps as Record<string, unknown> | null;
+    if (
+      candidate &&
+      typeof candidate.title === 'string' &&
+      typeof candidate.onPress === 'function'
+    ) {
+      props = candidate;
+      break;
+    }
+    if (fiber.return === null || typeof fiber.return.type === 'string') break;
+    fiber = fiber.return;
+  }
+  // A control whose authored Button props cannot be found is itself the
+  // observable wiring failure; fail on assertion evidence, never a crash.
+  expect(props).toBeDefined();
+  return props!;
 }
 
 let openUrlSpy: jest.SpiedFunction<typeof Linking.openURL>;
@@ -312,11 +346,19 @@ it('draws the scrim and the scheme-aware card shadow from the theme tokens', asy
   );
   await act(async () => latchClientUpgradeRequired());
 
-  const modalCard = () =>
-    screen.container.queryAll((node) => node.props.accessibilityViewIsModal === true)[0];
+  // Assert-existence-first: reading the card off an empty query (a wiring
+  // mutant that drops accessibilityViewIsModal) must fail on matcher evidence,
+  // never crash a deref.
+  const modalCard = () => {
+    const [card] = screen.container.queryAll(
+      (node) => node.props.accessibilityViewIsModal === true,
+    );
+    expect(card).toBeDefined();
+    return card as TestInstance;
+  };
   const backdrop = modalCard().parent;
-  if (!backdrop) throw new Error('modal backdrop was not rendered');
-  expect(StyleSheet.flatten(backdrop.props.style)).toMatchObject({
+  expect(backdrop).toBeDefined();
+  expect(StyleSheet.flatten(backdrop!.props.style)).toMatchObject({
     backgroundColor: lightColors.scrim,
   });
   expect(StyleSheet.flatten(modalCard().props.style)).toMatchObject({
@@ -355,6 +397,14 @@ it('keeps the modal latched and reports a localized store-opening failure', asyn
   const alert = await screen.findByRole('alert');
   expect(alert).toHaveTextContent(translateFor('zh', 'upgrade.openFailed'));
   expect(alert.props.accessibilityLiveRegion).toBe('assertive');
+  // The failure note uses the shared error styling, not the body copy.
+  expect(StyleSheet.flatten(alert.props.style)).toMatchObject({
+    marginTop: spacing.ml,
+    color: lightColors.danger,
+    fontSize: 15,
+    lineHeight: 21,
+    textAlign: 'center',
+  });
   await waitFor(() =>
     expect(
       screen.getByRole('button', { name: translateFor('zh', 'upgrade.action') }).props
@@ -362,4 +412,104 @@ it('keeps the modal latched and reports a localized store-opening failure', asyn
     ).toEqual({ disabled: false, busy: false }),
   );
   expect(visibleModalNode().props.visible).toBe(true);
+});
+
+it('retires the stale store-opening failure when a retry succeeds', async () => {
+  openUrlSpy.mockRejectedValueOnce(new Error('native store unavailable'));
+  await renderModal();
+  await act(async () => latchClientUpgradeRequired());
+
+  const storeButton = () =>
+    screen.getByRole('button', { name: translateFor('en', 'upgrade.action') });
+  await fireEvent.press(storeButton());
+  expect(await screen.findByRole('alert')).toHaveTextContent(
+    translateFor('en', 'upgrade.openFailed'),
+  );
+
+  await fireEvent.press(storeButton());
+  await waitFor(() => expect(openUrlSpy).toHaveBeenCalledTimes(2));
+  // Each attempt starts from a clean slate: a successful retry must clear the
+  // previous failure note instead of leaving a stale error on screen.
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+it('retires the stale local sign-out failure when a retry succeeds', async () => {
+  const onLocalSignOut = jest.fn().mockRejectedValueOnce(new Error('secure token remains'));
+  await render(
+    <I18nProvider accountLanguage="en">
+      <ClientUpgradeModal onLocalSignOut={onLocalSignOut} />
+    </I18nProvider>,
+  );
+  await act(async () => latchClientUpgradeRequired());
+
+  const signOutButton = () =>
+    screen.getByRole('button', { name: translateFor('en', 'logout.thisDevice') });
+  await fireEvent.press(signOutButton());
+  const failure = await screen.findByRole('alert');
+  expect(failure).toHaveTextContent(translateFor('en', 'error.internal'));
+  // The local retry note shares the store failure's error styling.
+  expect(StyleSheet.flatten(failure.props.style)).toMatchObject({
+    marginTop: spacing.ml,
+    color: lightColors.danger,
+    fontSize: 15,
+    lineHeight: 21,
+    textAlign: 'center',
+  });
+
+  await fireEvent.press(signOutButton());
+  await waitFor(() => expect(onLocalSignOut).toHaveBeenCalledTimes(2));
+  // A later successful local sign-out retires the retry note entirely.
+  expect(screen.queryByRole('alert')).toBeNull();
+});
+
+it('pins the overlay surface, scroll, typography, and action wiring', async () => {
+  await render(
+    <I18nProvider accountLanguage="en">
+      <ClientUpgradeModal onLocalSignOut={jest.fn()} />
+    </I18nProvider>,
+  );
+  await act(async () => latchClientUpgradeRequired());
+
+  // The overlay fades in over the app without dimming the status bar.
+  const modal = visibleModalNode();
+  expect(modal.props.animationType).toBe('fade');
+  expect(modal.props.presentationStyle).toBe('overFullScreen');
+  expect(modal.props.statusBarTranslucent).toBe(true);
+  expect(modal.props.transparent).toBe(true);
+
+  // The card scrolls without bounce or scrollbar chrome and centers content.
+  const [scroll] = screen.container.queryAll((node) => node.type === 'RCTScrollView');
+  expect(scroll).toBeDefined();
+  expect(scroll!.props.bounces).toBe(false);
+  expect(scroll!.props.showsVerticalScrollIndicator).toBe(false);
+  expect(StyleSheet.flatten(scroll!.props.contentContainerStyle)).toEqual({
+    padding: spacing.xl,
+    alignItems: 'center',
+  });
+
+  const title = screen.getByRole('header', { name: translateFor('en', 'upgrade.title') });
+  expect(StyleSheet.flatten(title.props.style)).toEqual({
+    color: lightColors.text,
+    fontSize: 24,
+    lineHeight: 30,
+    fontWeight: '800',
+    textAlign: 'center',
+  });
+  const body = screen.getByText(translateFor('en', 'upgrade.body'));
+  expect(StyleSheet.flatten(body.props.style)).toEqual({
+    marginTop: spacing.md,
+    color: lightColors.muted,
+    fontSize: 16,
+    lineHeight: 23,
+    textAlign: 'center',
+  });
+
+  const store = buttonProps(translateFor('en', 'upgrade.action'));
+  expect(store.fullWidth).toBe(true);
+  expect(StyleSheet.flatten(store.style)).toEqual({ marginTop: spacing.xl });
+
+  const signOut = buttonProps(translateFor('en', 'logout.thisDevice'));
+  expect(signOut.fullWidth).toBe(true);
+  expect(signOut.variant).toBe('secondary');
+  expect(StyleSheet.flatten(signOut.style)).toEqual({ marginTop: spacing.md });
 });

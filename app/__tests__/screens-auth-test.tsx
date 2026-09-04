@@ -428,6 +428,27 @@ describe('login screen', () => {
     expect(mockRouter.navigate).toHaveBeenCalledWith('/forgot-password');
   });
 
+  it('navigates to the signup screen from the footer link', async () => {
+    await render(<LoginScreen />);
+
+    await fireEvent.press(screen.getByRole('link', { name: t('login.footerLink') }));
+
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/signup');
+  });
+
+  it('reveals the email error when the blocked submit wrapper is pressed', async () => {
+    await render(<LoginScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    const submit = screen.getByRole('button', { name: t('login.submit') });
+    expect(submit.props.accessibilityState.disabled).toBe(true);
+    // The accessible={false} wrapper around the disabled Button receives the
+    // tap and marks the email field touched, so the blocked submit explains
+    // itself instead of failing silently.
+    await fireEvent.press(parentOf(submit));
+    expect(screen.getByText(t('email.invalid'))).toBeTruthy();
+  });
+
   it('sends an app-language choice to the guest-language preference', async () => {
     await render(<LoginScreen />);
 
@@ -1131,6 +1152,22 @@ describe('signup screen', () => {
 
     expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
     expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
+  });
+
+  it('reveals the email and name errors when the blocked submit wrapper is pressed', async () => {
+    await render(<SignupScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
+    // A control character in the name is the only authored name complaint;
+    // an empty name stays silent, so the reveal needs a polluted value.
+    await fireEvent.changeText(screen.getByLabelText(t('signup.nameLabel')), 'bad\u0007name');
+    const submit = screen.getByRole('button', { name: t('signup.submit') });
+    expect(submit.props.accessibilityState.disabled).toBe(true);
+    // The accessible={false} wrapper around the disabled Button receives the
+    // tap and marks both fields touched, so the blocked submit explains
+    // itself instead of failing silently.
+    await fireEvent.press(parentOf(submit));
+    expect(screen.getByText(t('email.invalid'))).toBeTruthy();
+    expect(screen.getByText(t('name.invalid'))).toBeTruthy();
   });
 
   it('links to the public Privacy Policy and Terms of Use before account creation', async () => {

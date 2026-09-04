@@ -428,14 +428,14 @@ type MockAlertButton = { text: string; style?: string; onPress?: () => void };
 
 /** Confirms the most recent skip-confirmation alert exactly as the OS would. */
 function confirmSkipAlert(): void {
-  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as [
-    string,
-    string,
-    MockAlertButton[],
-  ];
-  const confirm = (call[2] ?? []).find((button) => button.text === t('practice.skipWord'));
-  if (!confirm?.onPress) throw new Error('No skip confirmation button in the last alert');
-  confirm.onPress();
+  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as
+    [string, string, MockAlertButton[]] | undefined;
+  // A missing alert must fail as a matcher so a disconnected skip wiring
+  // mutant dies on assertion evidence instead of a helper TypeError.
+  expect(call).toBeDefined();
+  const confirm = (call?.[2] ?? []).find((button) => button.text === t('practice.skipWord'));
+  expect(typeof confirm?.onPress).toBe('function');
+  confirm!.onPress!();
 }
 
 function dispatchBeforeRemove(type = 'GO_BACK'): jest.Mock {
@@ -3213,11 +3213,8 @@ describe('skip word', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('practice.skipWord') }));
     expect(mockSkipWord).not.toHaveBeenCalled();
-    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
-      string,
-      string,
-      MockAlertButton[],
-    ];
+    // Assert the alert through the matcher before destructuring it, so a
+    // disconnected skip wiring fails on assertion evidence here too.
     expect(alertSpy).toHaveBeenLastCalledWith(
       t('practice.skipConfirmTitle'),
       t('practice.skipConfirmBody'),
@@ -3226,6 +3223,11 @@ describe('skip word', () => {
         expect.objectContaining({ text: t('practice.skipWord') }),
       ],
     );
+    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
+      string,
+      string,
+      MockAlertButton[],
+    ];
 
     buttons[0]!.onPress?.();
     expect(mockSkipWord).not.toHaveBeenCalled();

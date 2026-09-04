@@ -1007,3 +1007,61 @@ describe('useReduceMotion wiring', () => {
     );
   });
 });
+
+describe('optional testID and slot wiring', () => {
+  it('leaves Confetti pieces untagged when no testID is supplied', async () => {
+    await render(<Confetti count={2} />);
+    // The overlay host is the root; its children are the burst pieces.
+    const root = screen.root;
+    expect(root).not.toBeNull();
+    const pieces = root!.children;
+    expect(pieces).toHaveLength(2);
+    for (const piece of pieces) {
+      expect((piece as { props: { testID?: string } }).props.testID).toBeUndefined();
+    }
+  });
+
+  it('renders no EmptyState action row without an action', async () => {
+    await render(<EmptyState icon="mic" title="Empty" body="Nothing here." />);
+    const contentHost = screen.getByText('Nothing here.').parent!;
+    // Mark badge, title, and body only — no trailing action-row container.
+    expect(contentHost.children).toHaveLength(3);
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('leaves PasswordStrengthMeter segments untagged when no testID is supplied', async () => {
+    await render(<PasswordStrengthMeter password="short" />);
+    const row = screen.getByLabelText('Weak');
+    const segments = (row.children[0] as unknown as { children: unknown[] }).children;
+    expect(segments).toHaveLength(3);
+    for (const segment of segments) {
+      expect((segment as { props: { testID?: string } }).props.testID).toBeUndefined();
+    }
+  });
+
+  it('reports the revealed password-toggle testID without a custom override', async () => {
+    await render(
+      <PasswordVisibilityToggle visible accessibilityLabel="Hide password" onToggle={jest.fn()} />,
+    );
+    expect(screen.getByRole('button', { name: 'Hide password' }).props.testID).toBe(
+      'password-toggle-hide',
+    );
+  });
+
+  it('leaves the ProgressBar fill untagged when no testID is supplied', async () => {
+    await render(<ProgressBar progress={0.5} accessibilityLabel="Untagged progress" />);
+    const bar = screen.getByRole('progressbar', { name: 'Untagged progress' });
+    const fill = bar.children[0] as unknown as { props: { testID?: string } };
+    expect(fill).toBeTruthy();
+    expect(fill.props.testID).toBeUndefined();
+  });
+
+  it('renders no ScoreRing caption slot without a label', async () => {
+    await render(<ScoreRing score={50} accessibilityLabel="Untitled ring" />);
+    const host = screen.getByRole('progressbar', { name: 'Untitled ring' });
+    // The caption slot after the ring box stays null: no caption Text is
+    // mounted below the ring when no label is supplied.
+    expect(host.props.children[1]).toBeNull();
+    expect(screen.getByText('50')).toBeTruthy();
+  });
+});

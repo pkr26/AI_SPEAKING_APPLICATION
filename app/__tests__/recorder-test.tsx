@@ -552,6 +552,33 @@ function recordIconSvg(): { width?: number; height?: number } {
   return (svg as { props: { width?: number; height?: number } }).props;
 }
 
+/** Props of the record glyph's drawn primitives, identifying mic vs stop. */
+function recordIconPrimitives(): Record<string, unknown>[] {
+  const svg = recordIconNode().children.find((child) => typeof child !== 'string') as unknown as {
+    props: { children?: unknown };
+  };
+  // Walk composed children (Svg element, fragment, bare primitive) down to
+  // the leaves that actually draw: stroked paths for the mic, one filled
+  // rect for the stop square.
+  const leaves: Record<string, unknown>[] = [];
+  const visit = (value: unknown): void => {
+    if (!React.isValidElement(value)) return;
+    const props = value.props as Record<string, unknown>;
+    if (
+      typeof props.d === 'string' ||
+      (typeof props.x === 'number' && typeof props.width === 'number')
+    ) {
+      leaves.push(props);
+      return;
+    }
+    const children = props.children;
+    if (Array.isArray(children)) children.forEach(visit);
+    else visit(children);
+  };
+  visit(svg.props.children);
+  return leaves;
+}
+
 /** The fixed-size wrap that reserves room for the pulse ring behind the mic. */
 function recordButtonWrapNode(): TestInstance {
   const wrap = screen.getByLabelText(RECORD_BUTTON_LABEL).parent;
@@ -792,10 +819,14 @@ function RecoveryModeHarness({
 async function startRecording(): Promise<void> {
   expect(screen.queryByText(SUBMIT_TEXT)).toBeNull();
   const startControl = screen.getByLabelText(START_LABEL);
+  // Only the pre-press idle hint is asserted here: failing before the press
+  // aborts nothing. The stop-state hint lives in a dedicated test that stops
+  // its take in a finally, because a mid-recording assertion failure strands
+  // the live session into the serialized audio queue and can wedge a later
+  // fake-timer test's acquisition forever.
   expect(startControl.props.accessibilityHint).toBe(t('recorder.startHint'));
   await fireEvent.press(startControl);
-  const stopControl = screen.getByLabelText(STOP_LABEL);
-  expect(stopControl.props.accessibilityHint).toBe(t('recorder.stopHint'));
+  expect(screen.getByLabelText(STOP_LABEL)).toBeTruthy();
 }
 
 async function recordAndStop(durationMillis = 5000): Promise<void> {
@@ -3253,6 +3284,47 @@ describe('Recorder', () => {
         backgroundColor: colors.dangerPulse,
       });
       expect(flattenedStyle(ring).transform).toEqual([{ scale: expect.anything() }]);
+    });
+
+    it('hints and glyphs the record control for both idle and recording states', async () => {
+      await renderRecorder();
+      const idleControl = screen.getByLabelText(START_LABEL);
+      expect(idleControl.props.accessibilityHint).toBe(t('recorder.startHint'));
+      // The idle glyph is the outlined microphone: exactly three stroked
+      // paths, never the stop square.
+      const idlePrimitives = recordIconPrimitives();
+      expect(idlePrimitives).toHaveLength(3);
+      expect(idlePrimitives[0]).toMatchObject({ fill: 'none' });
+      expect(String(idlePrimitives[0].d)).toBe(
+        'M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3Z',
+      );
+
+      try {
+        await fireEvent.press(idleControl);
+        const stopControl = screen.getByLabelText(STOP_LABEL);
+        expect(stopControl.props.accessibilityHint).toBe(t('recorder.stopHint'));
+        // While recording the glyph swaps to the single filled stop square.
+        const activePrimitives = recordIconPrimitives();
+        expect(activePrimitives).toHaveLength(1);
+        expect(activePrimitives[0]).toMatchObject({
+          x: 7,
+          y: 7,
+          width: 10,
+          height: 10,
+          fill: expect.any(String),
+        });
+      } finally {
+        // Stop the take even when an assertion above fails: a mutant kill
+        // must never strand the live recording into the serialized
+        // audio-session queue that a later fake-timer test then awaits
+        // forever.
+        mockRecorderState = { ...mockRecorderState, durationMillis: 5_000 };
+        const stopControl = screen.queryByLabelText(STOP_LABEL);
+        if (stopControl) {
+          await fireEvent.press(stopControl);
+          await flushAct();
+        }
+      }
     });
 
     it('starts recording when permission is already granted', async () => {

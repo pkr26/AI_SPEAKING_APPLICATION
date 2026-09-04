@@ -371,14 +371,14 @@ type MockAlertButton = { text: string; style?: string; onPress?: () => void };
 
 /** Confirms the most recent logout-confirmation alert exactly as the OS would. */
 function confirmLogoutAlert(): void {
-  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as [
-    string,
-    string,
-    MockAlertButton[],
-  ];
-  const confirm = (call[2] ?? []).find((button) => button.text === t('common.logOut'));
-  if (!confirm?.onPress) throw new Error('No logout confirmation button in the last alert');
-  confirm.onPress();
+  const call = alertSpy.mock.calls[alertSpy.mock.calls.length - 1] as unknown as
+    [string, string, MockAlertButton[]] | undefined;
+  // A missing alert must fail as a matcher so a disconnected logout wiring
+  // mutant dies on assertion evidence instead of a helper TypeError.
+  expect(call).toBeDefined();
+  const confirm = (call?.[2] ?? []).find((button) => button.text === t('common.logOut'));
+  expect(typeof confirm?.onPress).toBe('function');
+  confirm!.onPress!();
 }
 
 function responderEvent() {
@@ -2608,11 +2608,8 @@ describe('diagnostic screen', () => {
 
     await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
     expect(mockAuthValue.logout).not.toHaveBeenCalled();
-    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
-      string,
-      string,
-      MockAlertButton[],
-    ];
+    // Assert the alert through the matcher before destructuring it, so a
+    // disconnected logout wiring fails on assertion evidence here too.
     expect(alertSpy).toHaveBeenLastCalledWith(
       t('settings.logOutConfirmTitle'),
       t('settings.logOutConfirmBody'),
@@ -2621,6 +2618,11 @@ describe('diagnostic screen', () => {
         expect.objectContaining({ text: t('common.logOut'), style: 'destructive' }),
       ],
     );
+    const [, , buttons] = alertSpy.mock.calls[alertSpy.mock.calls.length - 1]! as unknown as [
+      string,
+      string,
+      MockAlertButton[],
+    ];
 
     // Cancelling keeps the session signed in.
     buttons[0]!.onPress?.();
@@ -3301,6 +3303,10 @@ describe('diagnostic screen', () => {
     const acknowledgement = deferred<void>();
     mockApiFetch.mockResolvedValue({ done: true, level: 'B2', answers: [] });
     mockAcknowledgeDiagnostic.mockReturnValue(acknowledgement.promise);
+    // The test also observes the rejection so a wiring mutant that never
+    // starts the acknowledgement flow cannot leak it as an unhandled
+    // rejection; the ownership assertion below still gates the real behavior.
+    acknowledgement.promise.catch(() => undefined);
     const rendered = await renderScreen();
     await screen.findByText(t('diag.completeTitle'));
     const startPracticing = capturedPressHandler(t('diag.startPracticing'));

@@ -280,6 +280,36 @@ function parentOf(node: TestInstance): TestInstance {
   return parent;
 }
 
+/** Path data of the expand chevron beside the show/hide-details toggle. */
+function expandChevronPath(): string {
+  const toggleText =
+    screen.queryByText(t('history.hideDetails')) ?? screen.queryByText(t('history.showDetails'));
+  if (!toggleText) throw new Error('No expand toggle text rendered');
+  const hintRow = parentOf(toggleText);
+  // Row markup: <Text>toggle</Text><Icon chevron/> — the glyph host is the
+  // second child, after the toggle text.
+  const iconHost = hintRow.children[1];
+  if (!iconHost) throw new Error('Expand chevron icon not found');
+  const svg = (iconHost as unknown as { children: unknown[] }).children.find(
+    (child) => typeof child !== 'string',
+  ) as unknown as { props: { children?: unknown } };
+  let path: string | null = null;
+  const visit = (value: unknown): void => {
+    if (path !== null || !React.isValidElement(value)) return;
+    const props = value.props as Record<string, unknown>;
+    if (typeof props.d === 'string') {
+      path = props.d;
+      return;
+    }
+    const children = props.children;
+    if (Array.isArray(children)) children.forEach(visit);
+    else visit(children);
+  };
+  visit(svg.props.children);
+  if (path === null) throw new Error('Expand chevron glyph path not found');
+  return path;
+}
+
 function centeredStateStyle(node: TestInstance): SemanticStyle {
   const [scrollView] = screen.container.queryAll(
     (candidate) => candidate.props.contentContainerStyle !== undefined,
@@ -1187,6 +1217,8 @@ describe('history screen', () => {
 
     expect(screen.queryByText('“I was brave at work.”')).toBeNull();
     expect(screen.queryByText('Nice detail.')).toBeNull();
+    // The collapsed affordance points down until the row expands.
+    expect(expandChevronPath()).toBe('M5.5 9 12 15.5 18.5 9');
 
     const row = screen.getByRole('button', { expanded: false });
     await fireEvent.press(row);
@@ -1196,6 +1228,8 @@ describe('history screen', () => {
     expect(screen.getByText('Describe a time you showed courage.')).toBeTruthy();
     expect(screen.getByText(t('history.hideDetails'))).toBeTruthy();
     expect(screen.getByRole('button', { expanded: true })).toBeTruthy();
+    // Expanding flips the chevron to point up.
+    expect(expandChevronPath()).toBe('M5.5 15 12 8.5 18.5 15');
 
     // Each answer is labelled so the transcript and feedback are not orphaned.
     expect(screen.getByText(t('label.question'))).toBeTruthy();

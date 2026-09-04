@@ -401,6 +401,12 @@ export default function FeedbackScreen() {
     );
   }
 
+  // A parsed native outcome never carries word tags (the native parser's
+  // strict whitelist has no wordScores field), so narrowing the union once
+  // here keeps the transcript plain on native cards while scored English
+  // answers keep their tags.
+  const transcriptWordScores = isNativeOutcome(result) ? undefined : result.wordScores;
+
   return (
     <View style={styles.container}>
       <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={styles.content}>
@@ -412,7 +418,10 @@ export default function FeedbackScreen() {
           accessibilityLiveRegion="polite"
           style={[
             styles.outcomePanel,
-            variant ? styles[`panel_${OUTCOME_ART[variant].ink}`] : null,
+            // The !result early return above guarantees the derivation assigned
+            // a variant, so the panel art lookup is total; TypeScript cannot
+            // correlate those two facts itself.
+            styles[`panel_${OUTCOME_ART[variant!].ink}`],
           ]}
         >
           {(variant === 'mastered' || variant === 'levelup') && (
@@ -596,7 +605,7 @@ export default function FeedbackScreen() {
               <WordTaggedTranscript
                 transcript={result.transcript}
                 quoted
-                wordScores={isNativeOutcome(result) ? undefined : result.wordScores}
+                wordScores={transcriptWordScores}
                 accessibilityLanguage={
                   isNativeOutcome(result) ? NATIVE_LANGUAGE_LOCALES[result.nativeLanguage] : 'en-US'
                 }

@@ -37,6 +37,21 @@ function responderEvent() {
   };
 }
 
+/** Ink of a tab button's glyph: the first stroked primitive inside its Svg. */
+function tabIconInk(tab: { children: unknown[] }): string {
+  const iconHost = tab.children[0] as { props: { children: React.ReactElement } };
+  const svg = iconHost.props.children;
+  const rendered: unknown = (svg.props as { children?: unknown }).children;
+  const primitives =
+    React.isValidElement(rendered) && rendered.type === React.Fragment
+      ? (rendered.props as { children?: unknown }).children
+      : rendered;
+  const first = (Array.isArray(primitives) ? primitives[0] : primitives) as {
+    props: { stroke?: string };
+  };
+  return first.props.stroke as string;
+}
+
 jest.mock('react-native/Libraries/Utilities/useColorScheme', () => ({
   __esModule: true,
   default: jest.fn(() => 'light'),
@@ -234,6 +249,9 @@ describe('bottom tab layout', () => {
     const settings = header.getByRole('button', {
       name: translateFor('en', 'header.settings'),
     });
+    // An unlocked Settings action carries no exit-lock hint: the hint exists
+    // only while the practice flow holds its exit lock.
+    expect(settings.props.accessibilityHint).toBeUndefined();
     // The gear's chrome lives in the themed styles, not inline numbers, and it
     // dims while pressed.
     expect(StyleSheet.flatten(settings.props.style)).toEqual({
@@ -262,6 +280,23 @@ describe('bottom tab layout', () => {
     });
     await fireEvent.press(settings);
     expect(asMock(ExpoRouter.router.navigate)).toHaveBeenCalledTimes(2);
+  });
+
+  it('locks the Home header settings action behind the practice exit lock', async () => {
+    setPracticeExitLocked(true);
+    await renderWithProviders(<TabLayout />);
+    const homeOptions = captured.capturedTabScreenProps.find(
+      (props) => props?.name === 'home',
+    )?.options;
+    const HeaderRight = homeOptions?.headerRight as () => React.ReactElement;
+    const header = await render(React.createElement(HeaderRight));
+    const settings = header.getByRole('button', {
+      name: translateFor('en', 'header.settings'),
+    });
+    // While the practice flow holds its exit lock, the Settings action is
+    // disabled for both touch and assistive tech and names the reason.
+    expect(settings.props.accessibilityHint).toBe(translateFor('en', 'hint.finishRecordingFirst'));
+    expect(settings.props.accessibilityState).toEqual({ disabled: true });
   });
 
   it('hides the custom tab bar while the Android soft keyboard is shown', async () => {
@@ -367,6 +402,21 @@ describe('bottom tab layout', () => {
       barView.getByRole('tab', { name: translateFor('en', 'header.recordings') }).props
         .accessibilityState,
     ).toEqual({ selected: false, disabled: false });
+
+    // An unlocked tab carries no exit-lock hint: the hint exists only while
+    // the practice flow holds its exit lock.
+    expect(homeTab.props.accessibilityHint).toBeUndefined();
+    expect(
+      barView.getByRole('tab', { name: translateFor('en', 'header.recordings') }).props
+        .accessibilityHint,
+    ).toBeUndefined();
+
+    // The focused tab's glyph wears the primary ink and an unfocused tab's the
+    // muted ink, so selection stays readable without the label alone.
+    expect(tabIconInk(homeTab)).toBe(colors.primary);
+    expect(
+      tabIconInk(barView.getByRole('tab', { name: translateFor('en', 'header.recordings') })),
+    ).toBe(colors.muted);
 
     // Tapping the unfocused tab navigates; tapping the focused tab does not.
     await fireEvent.press(

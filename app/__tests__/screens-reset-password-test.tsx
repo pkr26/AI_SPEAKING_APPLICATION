@@ -426,6 +426,18 @@ describe('login entry points', () => {
 });
 
 describe('forgot-password screen', () => {
+  it('returns to the login screen from the sent-state back-to-login link', async () => {
+    await render(<ForgotPasswordScreen />);
+    await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'ada@example.com');
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.submitRequest') }));
+    await screen.findByText(t('reset.sentBody'));
+
+    await fireEvent.press(screen.getByRole('link', { name: t('reset.backToLogin') }));
+
+    expect(mockRouter.navigate).toHaveBeenCalledTimes(1);
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/login');
+  });
+
   it('shows the email error only after blur or submit, never mid-typing', async () => {
     await render(<ForgotPasswordScreen />);
     const email = screen.getByLabelText(t('login.emailLabel'));

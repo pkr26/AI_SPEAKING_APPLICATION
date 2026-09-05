@@ -2415,6 +2415,15 @@ describe('data export', () => {
     expect(lastFileContents).toBe(JSON.stringify(expected));
     expect(parsedExportContents()).toEqual(expected);
     expect(mockWrite).toHaveBeenCalledTimes(8);
+    // Practice-cycle appends ride the same append/utf8 contract as attempts.
+    expect(mockWrite).toHaveBeenNthCalledWith(5, '{"id":"c1"},{"id":"c2"}', {
+      append: true,
+      encoding: 'utf8',
+    });
+    expect(mockWrite).toHaveBeenNthCalledWith(6, ',{"id":"c3"}', {
+      append: true,
+      encoding: 'utf8',
+    });
     expect(mockShareAsync).toHaveBeenCalledTimes(1);
     expect(mockDelete).toHaveBeenCalledTimes(1);
   });
@@ -6012,5 +6021,502 @@ describe('settings surface prop pins', () => {
     expect(
       pressablePropsOf(screen.getByRole('button', { name: t('settings.retake') })).disabled,
     ).toBe(true);
+  });
+});
+
+describe('settings profile lane kill fences', () => {
+  it('falls back to zero-padded 24-hour copy when Intl formatting throws', () => {
+    // The catch arm is the only defense when Intl rejects the resolved locale
+    // (unavailable ICU data, hostile runtime); it must still produce HH:00.
+    const formatter = jest.spyOn(Intl, 'DateTimeFormat').mockImplementation(() => {
+      throw new RangeError('locale data unavailable');
+    });
+    try {
+      expect(formatReminderHour(9, 'en')).toBe('09:00');
+      expect(formatReminderHour(23, 'zh')).toBe('23:00');
+    } finally {
+      formatter.mockRestore();
+    }
+  });
+
+  it('rejects an unserializable practice cycle before writing or sharing it', async () => {
+    const invalidCycle = { toJSON: () => undefined };
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await emitTerminalUserExport(consumePage);
+      await consumePage(userExportPage({ practiceCycles: [invalidCycle] as never }), 2);
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    // The invalid cycle must never reach the document, even though the walker
+    // kept going and the recordings consumer wrote its own section afterwards.
+    expect(lastFileContents).not.toContain('undefined');
+    expect(mockShareAsync).not.toHaveBeenCalled();
+    expect(mockDelete).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unserializable practice-progress snapshot before creating a file', async () => {
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage(
+        userExportPage({ practiceProgress: { toJSON: () => undefined } as never }),
+        0,
+      );
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('rejects an unserializable diagnostic-state snapshot before creating a file', async () => {
+    mockConsumeExportPages.mockImplementation(async (consumePage) => {
+      await consumePage(
+        userExportPage({ diagnosticState: { toJSON: () => undefined } as never }),
+        0,
+      );
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockWrite).not.toHaveBeenCalled();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('never re-encodes the attempts collection on a practice-cycle page', async () => {
+    const invalidAttempt = { toJSON: () => undefined };
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await consumePage(userExportPage({ attempts: [{ id: 'a1' }] }), 0);
+      await consumePage(
+        userExportPage({
+          attempts: [invalidAttempt] as never,
+          practiceCycles: [{ id: 'c1' }],
+          practiceCyclesDone: false,
+        }),
+        1,
+      );
+      await consumePage(userExportPage({ practiceCycles: [{ id: 'c2' }] }), 2);
+      await consumeRecordings({ recordings: [], nextCursor: null }, 0);
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(mockShareAsync).toHaveBeenCalledTimes(1);
+    expect(parsedExportContents()).toEqual({
+      user: USER,
+      practiceProgress: EXPORT_PROGRESS,
+      diagnosticState: EXPORT_DIAGNOSTIC,
+      attempts: [{ id: 'a1' }],
+      practiceCycles: [{ id: 'c1' }, { id: 'c2' }],
+      recordings: [],
+    });
+  });
+
+  it.each([
+    ['returns without ever emitting a page', async () => undefined],
+    [
+      'stops before the attempt collection finishes',
+      async (consumePage: (page: UserDataPage, index: number) => Promise<void>) => {
+        await consumePage(
+          userExportPage({
+            attempts: [{ id: 'a1' }],
+            attemptsDone: false,
+            nextCursor: '550e8400-e29b-41d4-a716-446655440041',
+          }),
+          0,
+        );
+      },
+    ],
+    [
+      'stops before the practice-cycle collection finishes',
+      async (consumePage: (page: UserDataPage, index: number) => Promise<void>) => {
+        await consumePage(userExportPage({ practiceCyclesDone: false }), 0);
+      },
+    ],
+  ])('rejects a walker that %s', async (_name, walk) => {
+    mockConsumeExportPages.mockImplementation(async (consumePage, consumeRecordings) => {
+      await walk(consumePage);
+      void consumeRecordings;
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.export') }));
+
+    expect(await screen.findByText(t('settings.exportFailed'))).toBeTruthy();
+    expect(mockShareAsync).not.toHaveBeenCalled();
+  });
+
+  it('refuses a bulk delete confirmed while an export is already in flight and still republishes the lock', async () => {
+    mockConsumeExportPages.mockImplementation(() => new Promise<void>(() => undefined));
+    await renderSettings();
+    const deleteRow = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+    const staleExport = committedPressHandler(
+      screen.getByRole('button', { name: t('settings.export') }),
+    );
+
+    // The confirmation is already open when a stale committed export handler
+    // starts the export; the destructive confirm must still be fenced off.
+    await fireEvent.press(deleteRow());
+    await act(async () => {
+      staleExport();
+    });
+    await waitFor(() => expect(screen.getByText(t('settings.exportBusy'))).toBeTruthy());
+    mockSetOptions.mockClear();
+    mockDeleteAllRecordings.mockClear();
+
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    expect(mockDeleteAllRecordings).not.toHaveBeenCalled();
+    // The refused delete still publishes the (already locked) header state so
+    // the confirmation exit cannot leave a stale unlock behind.
+    expect(mockSetOptions).toHaveBeenCalledTimes(1);
+    expect(mockSetOptions).toHaveBeenLastCalledWith({
+      headerBackVisible: false,
+      gestureEnabled: false,
+    });
+  });
+
+  it('reconciles the reminder through the newest render lease and the change event', async () => {
+    const originalCurrentState = Object.getOwnPropertyDescriptor(AppState, 'currentState');
+    Object.defineProperty(AppState, 'currentState', { configurable: true, value: 'active' });
+    let onAppStateChange: ((state: AppStateStatus) => void) | undefined;
+    const remove = jest.fn();
+    const listener = jest.spyOn(AppState, 'addEventListener').mockImplementation((_event, next) => {
+      onAppStateChange = next;
+      return { remove } as ReturnType<typeof AppState.addEventListener>;
+    });
+    const leases: object[] = [];
+    mockAuthValue = makeAuth({
+      captureSessionLease: jest.fn(() => {
+        const lease = { seq: leases.length };
+        leases.push(lease);
+        return lease as never;
+      }),
+      // Any post-mount render's lease is current; the mount-time capture is
+      // exactly the stale lease the ref must not still hold.
+      isSessionLeaseCurrent: jest.fn((lease: unknown) => leases.indexOf(lease as object) > 0),
+    });
+    mockGetReminder
+      .mockReturnValueOnce(new Promise(() => undefined))
+      .mockResolvedValue({ hour: 6 });
+
+    try {
+      const view = await renderSettings();
+      // A later commit mints a newer lease; the mount-time one is now stale.
+      await act(async () => {
+        view.rerenderSettings();
+      });
+      expect(leases.length).toBeGreaterThanOrEqual(2);
+
+      // The OS foreground reconciliation must be subscribed on 'change' itself.
+      expect(AppState.addEventListener).toHaveBeenCalledWith('change', expect.any(Function));
+      await act(async () => {
+        onAppStateChange?.('background');
+        onAppStateChange?.('active');
+        await Promise.resolve();
+      });
+
+      await waitFor(() =>
+        expect(
+          screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+        ).toMatchObject({ checked: true }),
+      );
+      expect(screen.getByText(reminderTimeText(6))).toBeTruthy();
+    } finally {
+      listener.mockRestore();
+      if (originalCurrentState) {
+        Object.defineProperty(AppState, 'currentState', originalCurrentState);
+      } else {
+        delete (AppState as unknown as { currentState?: AppStateStatus }).currentState;
+      }
+    }
+  });
+
+  it('drops a reminder snapshot resolved after the screen changed identity', async () => {
+    const mountSnapshot = deferred<{ hour: number } | null>();
+    mockGetReminder
+      .mockReturnValueOnce(mountSnapshot.promise)
+      .mockReturnValue(new Promise(() => undefined));
+    const view = await renderSettings();
+    expect(mockGetReminder).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await act(async () => {
+      view.rerenderSettings();
+    });
+    expect(mockGetReminder).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      mountSnapshot.resolve({ hour: 5 });
+    });
+    expect(screen.queryByRole('switch', { name: t('reminder.toggleLabel') })).toBeNull();
+  });
+
+  it('re-reads the stored reminder for a replacement identity', async () => {
+    mockGetReminder.mockResolvedValueOnce({ hour: 19 }).mockResolvedValueOnce(null);
+    const view = await renderSettings();
+    await waitFor(() =>
+      expect(
+        screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+      ).toMatchObject({ checked: true }),
+    );
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await act(async () => {
+      view.rerenderSettings();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('switch', { name: t('reminder.toggleLabel') }).props.accessibilityState,
+      ).toMatchObject({ checked: false }),
+    );
+  });
+
+  it('keeps the reminder latch held by an in-flight toggle through a language re-schedule', async () => {
+    mockGetReminder.mockResolvedValue({ hour: 19 });
+    const disableRequest = deferred<void>();
+    mockDisableReminder.mockReturnValue(disableRequest.promise);
+    const update = deferred<User>();
+    mockUpdateProfile.mockReturnValue(update.promise);
+    const refresh = deferred<{ hour: number } | null>();
+    mockRefreshReminderLanguage.mockReturnValue(refresh.promise);
+    mockMirrorAccountLanguage.mockResolvedValue(undefined);
+    await renderSettings();
+    const toggle = () => screen.getByRole('switch', { name: t('reminder.toggleLabel') });
+
+    await act(async () => {
+      await fireEvent.press(toggle());
+    });
+    await act(async () => {
+      await fireEvent.press(appLanguageChip(1));
+    });
+    await act(async () => {
+      update.resolve({ ...USER, uiLanguage: 'te' });
+    });
+    await act(async () => {
+      refresh.resolve(null);
+    });
+
+    // The disable is still in flight and owns the latch: a queued toggle press
+    // must not start a second reminder mutation on top of it.
+    await act(async () => {
+      committedPressHandler(toggle())();
+    });
+    expect(mockDisableReminder).toHaveBeenCalledTimes(1);
+    expect(mockEnableReminder).not.toHaveBeenCalled();
+
+    await act(async () => {
+      disableRequest.resolve(undefined);
+    });
+  });
+
+  it('lets a replacement identity run its own bulk delete while an older one settles', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibility')
+      .mockImplementation(() => undefined);
+    const firstRequest = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValueOnce(firstRequest.promise);
+    const client = makeQueryClient();
+    const view = await renderSettings(client);
+    const deleteRow = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+
+    await fireEvent.press(deleteRow());
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(1);
+
+    mockAuthValue = makeAuth({ user: OTHER_USER, sessionVersion: 2 });
+    await act(async () => {
+      view.rerenderSettings();
+    });
+    const secondRequest = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValueOnce(secondRequest.promise);
+    await fireEvent.press(deleteRow());
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+    expect(mockDeleteAllRecordings).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      firstRequest.resolve(undefined);
+    });
+    await act(async () => {
+      secondRequest.resolve(undefined);
+    });
+
+    // The settling first operation must not retire the replacement's refs.
+    expect(await screen.findByText(t('settings.recordingsDeleteAllSuccess'))).toBeTruthy();
+    expect(mockClearRecordingReferences).toHaveBeenCalledTimes(1);
+    expect(announceSpy).toHaveBeenCalledWith(t('settings.recordingsDeleteAllSuccess'));
+    announceSpy.mockRestore();
+  });
+
+  it('drops a bulk delete that loses focus mid-flight before touching query caches', async () => {
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    const client = makeQueryClient();
+    const cancel = jest.spyOn(client, 'cancelQueries');
+    await renderSettings(client);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    const focus = mockFocusCallback;
+    if (!focus) throw new Error('Settings did not register its focus lifecycle');
+    await act(async () => {
+      const cleanup = focus();
+      cleanup?.();
+    });
+
+    await act(async () => {
+      request.resolve(undefined);
+    });
+
+    expect(cancel).not.toHaveBeenCalled();
+    expect(mockClearRecordingReferences).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+  });
+
+  it('drops a bulk delete whose query cancellation straddles a focus loss', async () => {
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    const client = makeQueryClient();
+    const cancellation = deferred<void>();
+    jest.spyOn(client, 'cancelQueries').mockImplementation(() => cancellation.promise);
+    await renderSettings(client);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    await act(async () => {
+      request.resolve(undefined);
+    });
+    await waitFor(() => expect(cancellation.promise).toBeDefined());
+
+    const focus = mockFocusCallback;
+    if (!focus) throw new Error('Settings did not register its focus lifecycle');
+    await act(async () => {
+      const cleanup = focus();
+      cleanup?.();
+    });
+    await act(async () => {
+      cancellation.resolve(undefined);
+    });
+
+    expect(mockClearRecordingReferences).not.toHaveBeenCalled();
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+  });
+
+  it('drops a bulk delete whose cache invalidation straddles a focus loss', async () => {
+    const announceSpy = jest
+      .spyOn(AccessibilityInfo, 'announceForAccessibility')
+      .mockImplementation(() => undefined);
+    const request = deferred<void>();
+    mockDeleteAllRecordings.mockReturnValue(request.promise);
+    const client = makeQueryClient();
+    const invalidation = deferred<void>();
+    jest.spyOn(client, 'invalidateQueries').mockImplementation(() => invalidation.promise);
+    await renderSettings(client);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('settings.recordingsDeleteAll') }));
+    await pressAlertButton(t('settings.recordingsDeleteAllConfirm'));
+
+    await act(async () => {
+      request.resolve(undefined);
+    });
+    await waitFor(() =>
+      expect(jest.mocked(client.invalidateQueries).mock.calls.length).toBeGreaterThanOrEqual(1),
+    );
+
+    const focus = mockFocusCallback;
+    if (!focus) throw new Error('Settings did not register its focus lifecycle');
+    await act(async () => {
+      const cleanup = focus();
+      cleanup?.();
+    });
+    await act(async () => {
+      invalidation.resolve(undefined);
+    });
+
+    expect(screen.queryByText(t('settings.recordingsDeleteAllSuccess'))).toBeNull();
+    expect(announceSpy).not.toHaveBeenCalled();
+    announceSpy.mockRestore();
+  });
+
+  it('releases the logout latch after a local sign-out settles and allows navigation again', async () => {
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
+    mockAuthValue = makeAuth({
+      logout: jest.fn().mockRejectedValue(new Error('network down')),
+      signOutThisDevice,
+    });
+    await renderSettings();
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
+    await pressAlertButton(t('logout.thisDevice'));
+    await waitFor(() => expect(signOutThisDevice).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('header.recordings') }));
+    expect(mockRouter.navigate).toHaveBeenCalledWith('/recordings');
+  });
+
+  it('offers the local sign-out exit with the current token closure, not the mount-time one', async () => {
+    const signOutThisDevice = jest.fn().mockResolvedValue(undefined);
+    const logout = jest.fn().mockRejectedValue(new Error('network down'));
+    mockAuthValue = makeAuth({ logout, signOutThisDevice });
+    const view = await renderSettings();
+
+    // A same-identity commit rotates the bearer without touching the user.
+    mockAuthValue = makeAuth({ token: 'token-two', logout, signOutThisDevice });
+    await act(async () => {
+      view.rerenderSettings();
+    });
+
+    await fireEvent.press(screen.getByRole('button', { name: t('common.logOut') }));
+    await pressAlertButton(t('common.logOut'));
+
+    await waitFor(() => expect(alertSpy).toHaveBeenCalledTimes(2));
+    expect(alertSpy).toHaveBeenLastCalledWith(
+      t('logout.failedTitle'),
+      t('logout.localBody'),
+      expect.any(Array),
+    );
+  });
+
+  it('shows the pressed highlight on the destructive bulk-delete row', async () => {
+    await renderSettings();
+    const row = () => screen.getByRole('button', { name: t('settings.recordingsDeleteAll') });
+    await expectPressFeedback(
+      row,
+      { borderBottomWidth: 1 },
+      { backgroundColor: colors.background },
+    );
+  });
+
+  it('re-syncs a never-edited focused draft on blur after an external name change', async () => {
+    const view = await renderSettings();
+    const input = () => screen.getByLabelText(t('signup.nameLabel'));
+
+    await act(async () => {
+      await fireEvent(input(), 'focus');
+    });
+    mockAuthValue = makeAuth({ user: { ...USER, name: 'Ada King' } });
+    await act(async () => {
+      view.rerenderSettings();
+    });
+    await act(async () => {
+      await fireEvent(input(), 'blur');
+    });
+
+    expect(input().props.value).toBe('Ada King');
   });
 });

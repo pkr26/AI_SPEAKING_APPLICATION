@@ -23,6 +23,7 @@ import {
   type MessageKey,
   type UiLanguage,
 } from '../src/lib/i18n';
+import { nameError } from '../src/lib/identity-validation';
 import { consumeSessionExpiredNotice } from '../src/lib/session-notice';
 import { colors, layout, radii, spacing, type as typeScale } from '../src/lib/theme';
 import type { User } from '../src/lib/types';
@@ -2683,5 +2684,126 @@ describe('login prop wiring', () => {
     await fireEvent.changeText(screen.getByLabelText(t('login.emailLabel')), 'not-an-email');
     await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'blur');
     expect(flattenedStyle(screen.getByText(t('email.invalid')))).toEqual(wiringFieldError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pressed-link dimming, cross-field focus isolation, detached-ref submits,
+// submit-gate conjunct boundaries, and identity-validator anchors.
+// ---------------------------------------------------------------------------
+
+describe('login link press contracts', () => {
+  it('dims the forgot link only while pressed', async () => {
+    await render(<LoginScreen />);
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('login.forgot') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+
+  it('dims the signup footer link only while pressed', async () => {
+    await render(<LoginScreen />);
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('login.footerLink') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+});
+
+describe('signup link press contracts', () => {
+  it('dims the legal and login links only while pressed', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('header.privacy') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('header.terms') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('signup.footerLink') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+});
+
+describe('signup focus and submit-gate boundaries', () => {
+  it('keeps the password and confirmation borders unfocused while another field has focus', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'focus');
+
+    // Focus treatment belongs to the focused field alone: the password and
+    // confirmation rows keep the resting field border while the email is
+    // the focused field.
+    expect(flattenedStyle(screen.getByLabelText(t('login.passwordLabel')))).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+    });
+    expect(flattenedStyle(screen.getByLabelText(t('password.confirmLabel')))).toMatchObject({
+      borderWidth: 1,
+      borderColor: colors.inputBorder,
+    });
+  });
+
+  it('keeps a control-character name blocking signup even with everything else valid', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    await fillSignup('bad\u0007name', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+
+    expect(signUpButton('te').props.accessibilityState.disabled).toBe(true);
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+  });
+
+  it('does not submit a mismatched confirmation through the return key once a language is chosen', async () => {
+    await render(<CrashBoundedSignupScreen />);
+    await fillSignup('Ada', 'ada@example.com', 'password1');
+    await fireEvent.press(screen.getByLabelText('Telugu, తెలుగు'));
+    await fireEvent.changeText(screen.getByLabelText(t('password.confirmLabel')), 'different1');
+
+    await fireEvent(screen.getByLabelText(t('password.confirmLabel')), 'submitEditing');
+
+    expect(mockAuthValue.register).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('keeps the password return key harmless once the screen is gone', async () => {
+    const view = await render(<CrashBoundedSignupScreen />);
+    const submitFromPassword = screen.getByLabelText(t('login.passwordLabel')).props
+      .onSubmitEditing as () => void;
+    const confirmFocus = spyOnTextInputFocus(screen.getByLabelText(t('password.confirmLabel')));
+    await view.unmount();
+
+    // The confirmation ref is detached on unmount, so chaining must not reach it.
+    expect(submitFromPassword).not.toThrow();
+    expect(confirmFocus).not.toHaveBeenCalled();
+  });
+});
+
+describe('identity-validation anchors', () => {
+  it('requires the address to end at the final domain label', () => {
+    expect(isValidEmailAddress('ada@example.com.')).toBe(false);
+    expect(isValidEmailAddress('ada@example.com!')).toBe(false);
+    expect(isValidEmailAddress('ada@example.com extra')).toBe(false);
+  });
+
+  it('enforces the shared length bound even when the pattern itself matches', () => {
+    expect(isValidEmailAddress(`${'a'.repeat(300)}@example.com`)).toBe(false);
+  });
+
+  it('treats whitespace-only input as an untouched email field', () => {
+    expect(isValidEmailAddress('   ')).toBe(false);
+    expect(emailAddressError('   ', t)).toBeNull();
+  });
+
+  it('stays silent for blank and clean names', () => {
+    expect(nameError('', t)).toBeNull();
+    expect(nameError('Ada', t)).toBeNull();
+    expect(nameError('bad\u0007name', t)).toBe(t('name.invalid'));
   });
 });

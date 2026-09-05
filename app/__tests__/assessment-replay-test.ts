@@ -148,6 +148,21 @@ describe('assessment replay response validation', () => {
     null,
     {},
     { status: 'unknown' },
+    Object.assign(() => true, {
+      status: 'processing',
+      context: 'practice',
+      questionId: QUESTION_ID,
+      cycleId: CYCLE_ID,
+      question,
+    }),
+    {
+      status: 'queued',
+      context: 'practice',
+      questionId: QUESTION_ID,
+      cycleId: CYCLE_ID,
+      question,
+      response: practiceResult,
+    },
     {
       status: 'processing',
       context: 'practice-native',

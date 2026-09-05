@@ -5,6 +5,7 @@ import {
   claimPendingAssessmentRecoveryPost,
   clearPendingAssessment,
   clearPendingAssessmentIfRequestMatches,
+  getPendingAssessmentReplayRevision,
   loadPendingAssessment,
   markPendingAssessmentCancelled,
   markPendingAssessmentFeedbackPending,
@@ -13,6 +14,7 @@ import {
   notifyPendingAssessmentReplayReady,
   parsePendingAssessment,
   pendingAssessmentFeedbackIsExpired,
+  pendingAssessmentIsForwardIncompatible,
   PENDING_ASSESSMENT_ENDPOINTS,
   PENDING_ASSESSMENT_STAGES,
   PENDING_ASSESSMENT_SCHEMA_VERSION,
@@ -99,6 +101,16 @@ describe('durable assessment handoff', () => {
     );
   });
 
+  it('advances the in-process replay revision for every replay-ready notify', () => {
+    const before = getPendingAssessmentReplayRevision();
+
+    notifyPendingAssessmentReplayReady(pending.requestId);
+    expect(getPendingAssessmentReplayRevision()).toBe(before + 1);
+
+    notifyPendingAssessmentReplayReady(pending.requestId);
+    expect(getPendingAssessmentReplayRevision()).toBe(before + 2);
+  });
+
   // The module keeps an in-memory copy, so reset through the public API:
   // clearing only the SecureStore mock would leave stale cached state behind.
   beforeEach(async () => {
@@ -160,6 +172,9 @@ describe('durable assessment handoff', () => {
       ),
     ).resolves.toBe(false);
     await expect(
+      acknowledgePendingAssessmentFeedback(pending.ownerId, '550e8400-e29b-41d4-a716-446655440098'),
+    ).resolves.toBe(false);
+    await expect(
       acknowledgePendingAssessmentFeedback(pending.ownerId, pending.requestId),
     ).resolves.toBe(true);
     expect(await loadPendingAssessment()).toBeNull();
@@ -210,6 +225,24 @@ describe('durable assessment handoff', () => {
       pendingAssessmentFeedbackIsExpired(feedbackPending, readyAt + PENDING_FEEDBACK_RETENTION_MS),
     ).toBe(true);
     expect(pendingAssessmentFeedbackIsExpired(pending, Number.MAX_SAFE_INTEGER)).toBe(false);
+  });
+
+  it('pins the retention budget to the 48-hour server replay SLA', () => {
+    // Mirror the server's completed-assessment replay retention with literals,
+    // not the exported constant, so a miscomputed budget cannot self-justify.
+    expect(PENDING_FEEDBACK_RETENTION_MS).toBe(172_800_000);
+    const feedbackPending: PendingAssessment = {
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: pending.createdAt + 1,
+    };
+
+    expect(
+      pendingAssessmentFeedbackIsExpired(feedbackPending, pending.createdAt + 172_800_000 - 1),
+    ).toBe(false);
+    expect(
+      pendingAssessmentFeedbackIsExpired(feedbackPending, pending.createdAt + 172_800_000),
+    ).toBe(true);
   });
 
   it('preserves durable cancellation and recovery claims through stage and reconciliation updates', async () => {
@@ -429,6 +462,46 @@ describe('pending assessment edge cases', () => {
     },
   );
 
+  it('rejects a diagnostic handoff that carries a practice cycle id', () => {
+    // A cycle id is only ever assigned with a served practice cycle, so its
+    // presence on a diagnostic record is structural corruption, not a newer
+    // schema: the record must be healed away rather than preserved.
+    expect(
+      parsePendingAssessment({
+        ...pendingForEndpoint('/diagnostic/answer'),
+        cycleId: pending.cycleId,
+      }),
+    ).toBeNull();
+  });
+
+  it('treats an unknown endpoint without a cycle id as a newer-schema handoff', () => {
+    // No cycle id is present to invalidate the record, so the unknown endpoint
+    // string may be a future enum member and the slot must be preserved.
+    expect(
+      pendingAssessmentIsForwardIncompatible({
+        ...pendingForEndpoint('/diagnostic/answer'),
+        endpoint: '/practice/attempt/mnemonic',
+      }),
+    ).toBe(true);
+  });
+
+  it('treats an unknown endpoint paired with a malformed cycle id as corruption', () => {
+    // The cycle id is present but not a UUID, which no schema version can ever
+    // make valid: this is corruption, not a forward-incompatible enum.
+    expect(
+      pendingAssessmentIsForwardIncompatible({
+        ...pendingForEndpoint('/diagnostic/answer'),
+        endpoint: '/practice/attempt/mnemonic',
+        cycleId: 'not-a-uuid',
+      }),
+    ).toBe(false);
+  });
+
+  it('treats a non-string stage as corruption rather than a newer enum member', () => {
+    expect(pendingAssessmentIsForwardIncompatible({ ...pending, stage: 7 })).toBe(false);
+    expect(parsePendingAssessment({ ...pending, stage: 7 })).toBeNull();
+  });
+
   it('upgrades a legacy pending delivery marker', () => {
     const { stage: _stage, ...legacy } = pending;
     expect(parsePendingAssessment({ ...legacy, delivery: 'pending' })).toEqual(pending);
@@ -461,6 +534,18 @@ describe('pending assessment edge cases', () => {
         recoveryPostAttempts,
       });
     }
+  });
+
+  it('omits absent optional fields instead of storing undefined own properties', () => {
+    // toEqual ignores undefined-valued keys, so the whitelist normalization is
+    // asserted through key presence: a diagnostic handoff must not gain a
+    // cycleId, feedbackReadyAt, or audioKey key at all.
+    const diagnostic = pendingForEndpoint('/diagnostic/answer');
+    const parsed = parsePendingAssessment(diagnostic);
+    expect(parsed).toEqual(diagnostic);
+    expect(Object.hasOwn(parsed!, 'cycleId')).toBe(false);
+    expect(Object.hasOwn(parsed!, 'feedbackReadyAt')).toBe(false);
+    expect(Object.hasOwn(parsed!, 'audioKey')).toBe(false);
   });
 
   it.each(['prepared', 'direct-posting', 'reconcile'] as const)(
@@ -620,6 +705,31 @@ describe('pending assessment edge cases', () => {
     expect(mockStorage.has(STORAGE_KEY)).toBe(true);
   });
 
+  it('rejects a malformed conditional-retirement request id before touching storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    jest.mocked(secureStore.getItemAsync).mockClear();
+    jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+    await expect(mod.clearPendingAssessmentIfRequestMatches('not-a-uuid')).resolves.toBe(false);
+
+    expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('keeps a successful conditional retirement authoritative in the module cache', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment(pending);
+
+    await expect(mod.clearPendingAssessmentIfRequestMatches(pending.requestId)).resolves.toBe(true);
+
+    // A completed conditional clear is authoritative for this process; a later
+    // external write to the same keychain slot must not resurrect the record.
+    mockStorage.set(STORAGE_KEY, JSON.stringify(pending));
+    jest.mocked(secureStore.getItemAsync).mockClear();
+    expect(await mod.loadPendingAssessment()).toBeNull();
+    expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+  });
+
   it('does not delete or throw when an expected request id has no pending record', async () => {
     const { secureStore, mod } = loadFresh();
 
@@ -737,6 +847,23 @@ describe('pending assessment edge cases', () => {
     });
   });
 
+  it('refuses to persist a feedback pointer the normalizer cannot make valid', async () => {
+    // createdAt only has to be a finite positive number, so a fractional value
+    // can survive saving; clamping a smaller readyAt up to it then produces a
+    // feedbackReadyAt that violates the safe-integer invariant and must fail
+    // closed instead of persisting a pointer no reader can trust.
+    const { secureStore, mod } = loadFresh();
+    const fractionalCreation = { ...pending, createdAt: 1_700_000_000_000.5 };
+    await mod.savePendingAssessment(fractionalCreation);
+    jest.mocked(secureStore.setItemAsync).mockClear();
+
+    await expect(mod.markPendingAssessmentFeedbackPending(pending.requestId, 1)).rejects.toThrow(
+      'Invalid pending assessment metadata',
+    );
+    expect(secureStore.setItemAsync).not.toHaveBeenCalled();
+    expect(await mod.loadPendingAssessment()).toEqual(fractionalCreation);
+  });
+
   it('conditionally acknowledges only a feedback-pending request', async () => {
     const { secureStore, mod } = loadFresh();
     await mod.savePendingAssessment(pending);
@@ -749,6 +876,42 @@ describe('pending assessment edge cases', () => {
       mod.acknowledgePendingAssessmentFeedback('not-a-user', pending.requestId),
     ).resolves.toBe(false);
     expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed acknowledgement identities before touching secure storage', async () => {
+    const { secureStore, mod } = loadFresh();
+    jest.mocked(secureStore.getItemAsync).mockClear();
+    jest.mocked(secureStore.deleteItemAsync).mockClear();
+
+    await expect(
+      mod.acknowledgePendingAssessmentFeedback('not-a-user', pending.requestId),
+    ).resolves.toBe(false);
+    await expect(
+      mod.acknowledgePendingAssessmentFeedback(pending.ownerId, 'not-a-request'),
+    ).resolves.toBe(false);
+
+    expect(secureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(secureStore.deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('keeps a successful feedback acknowledgement authoritative in the module cache', async () => {
+    const { secureStore, mod } = loadFresh();
+    await mod.savePendingAssessment({
+      ...pending,
+      stage: 'feedback-pending',
+      feedbackReadyAt: pending.createdAt + 1,
+    });
+
+    await expect(
+      mod.acknowledgePendingAssessmentFeedback(pending.ownerId, pending.requestId),
+    ).resolves.toBe(true);
+
+    // The acknowledged retirement stays authoritative even if another writer
+    // repopulates the keychain slot afterwards.
+    mockStorage.set(STORAGE_KEY, JSON.stringify(pending));
+    jest.mocked(secureStore.getItemAsync).mockClear();
+    expect(await mod.loadPendingAssessment()).toBeNull();
+    expect(secureStore.getItemAsync).not.toHaveBeenCalled();
   });
 
   it('marks feedback only for the matching request and treats a repeat as idempotent', async () => {

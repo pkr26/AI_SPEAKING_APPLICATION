@@ -20,11 +20,12 @@ import { darkColors, lightColors, spacing } from '../src/lib/theme';
 const useColorScheme = jest.requireMock('react-native/Libraries/Utilities/useColorScheme')
   .default as jest.Mock;
 
-const mockExpoExtra: { value: unknown } = { value: undefined };
+/** Whole-manifest stub: `undefined` models a build with no expoConfig at all. */
+const mockExpoConfig: { value: unknown } = { value: { extra: undefined } };
 
 jest.mock('expo-constants', () => ({
   get expoConfig() {
-    return { extra: mockExpoExtra.value };
+    return mockExpoConfig.value;
   },
 }));
 
@@ -116,7 +117,7 @@ let openUrlSpy: jest.SpiedFunction<typeof Linking.openURL>;
 beforeEach(() => {
   cleanup();
   resetClientUpgradeModuleForTests();
-  mockExpoExtra.value = undefined;
+  mockExpoConfig.value = { extra: undefined };
   openUrlSpy = jest.spyOn(Linking, 'openURL').mockResolvedValue(undefined as never);
 });
 
@@ -140,6 +141,14 @@ it('is a stable one-way latch and notifies each subscriber only once', () => {
   expect(getClientUpgradeSnapshot()).toBe(after);
   expect(listener).toHaveBeenCalledTimes(1);
   unsubscribe();
+});
+
+it('stops delivering change notifications to an unsubscribed listener', () => {
+  const listener = jest.fn();
+  const unsubscribe = subscribeToClientUpgrade(listener);
+  unsubscribe();
+  latchClientUpgradeRequired();
+  expect(listener).not.toHaveBeenCalled();
 });
 
 it.each([
@@ -198,6 +207,111 @@ it.each([
   expect(clientUpgradeStoreUrl(platform, urls)).toBe(expected);
 });
 
+it('pins the reviewed last-resort store destinations byte for byte', () => {
+  // Literal expectations, never the exported constants: these two strings are
+  // the security-reviewed destinations a hostile or missing manifest must land
+  // on, so a mutated fallback constant has to fail on its own text.
+  expect(IOS_STORE_SEARCH_FALLBACK).toBe(
+    'https://apps.apple.com/us/search?term=AI%20English%20Coach',
+  );
+  expect(ANDROID_PLAY_STORE_FALLBACK).toBe(
+    'https://play.google.com/store/apps/details?id=com.aienglish.coach',
+  );
+  expect(clientUpgradeStoreUrl('ios', undefined)).toBe(
+    'https://apps.apple.com/us/search?term=AI%20English%20Coach',
+  );
+  expect(clientUpgradeStoreUrl('android', undefined)).toBe(
+    'https://play.google.com/store/apps/details?id=com.aienglish.coach',
+  );
+});
+
+it('treats hostile manifest shapes as no configured store URLs', () => {
+  // A build without an expoConfig manifest at all falls back instead of
+  // dereferencing undefined.
+  mockExpoConfig.value = undefined;
+  expect(clientUpgradeStoreUrl('ios')).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // `null` extra passes a typeof-object check, so only the falsy guard can
+  // reject it before the property read.
+  mockExpoConfig.value = { extra: null };
+  expect(clientUpgradeStoreUrl('android')).toBe(ANDROID_PLAY_STORE_FALLBACK);
+
+  // A callable carrier is not a plain-object manifest, whatever it carries:
+  // its cargo must be ignored, not opened.
+  const manifestCarrier = Object.assign(() => undefined, {
+    storeUrls: { ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890' },
+  });
+  mockExpoConfig.value = { extra: manifestCarrier };
+  expect(clientUpgradeStoreUrl('ios')).toBe(IOS_STORE_SEARCH_FALLBACK);
+});
+
+it('validates the configured listing itself as hostile input', () => {
+  // A null storeUrls value must fall back, not dereference null.
+  expect(clientUpgradeStoreUrl('ios', null)).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // A callable storeUrls carrier is not a storeUrls record; its listing is
+  // ignored even though property access would happily find it.
+  const listingCarrier = Object.assign(() => undefined, {
+    ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
+  });
+  expect(clientUpgradeStoreUrl('ios', listingCarrier)).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // Non-string listings never reach URL parsing.
+  expect(clientUpgradeStoreUrl('ios', { ios: 42 })).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // Surrounding whitespace is trimmed from the accepted destination.
+  expect(
+    clientUpgradeStoreUrl('ios', {
+      ios: '  https://apps.apple.com/us/app/ai-english-coach/id1234567890  ',
+    }),
+  ).toBe('https://apps.apple.com/us/app/ai-english-coach/id1234567890');
+
+  // Plain HTTP is refused even on the genuine host.
+  expect(
+    clientUpgradeStoreUrl('ios', {
+      ios: 'http://apps.apple.com/us/app/ai-english-coach/id1234567890',
+    }),
+  ).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // The product id must END the path: extra segments after it are refused.
+  expect(
+    clientUpgradeStoreUrl('ios', {
+      ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890/extra',
+    }),
+  ).toBe(IOS_STORE_SEARCH_FALLBACK);
+
+  // An Apple listing parked in the Android slot is not an Android listing.
+  expect(
+    clientUpgradeStoreUrl('android', {
+      android: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
+    }),
+  ).toBe(ANDROID_PLAY_STORE_FALLBACK);
+});
+
+it('accepts only the exact Play Store details page for the Android listing', () => {
+  // The host comparison runs on the URL-normalized (lowercased) hostname, so
+  // mixed-case input resolves to its own trimmed spelling, not the fallback.
+  expect(
+    clientUpgradeStoreUrl('android', {
+      android: 'https://Play.Google.Com/store/apps/details?id=com.aienglish.coach',
+    }),
+  ).toBe('https://Play.Google.Com/store/apps/details?id=com.aienglish.coach');
+
+  // A look-alike host with the exact path and package is still refused.
+  expect(
+    clientUpgradeStoreUrl('android', {
+      android: 'https://evil.test/store/apps/details?id=com.aienglish.coach',
+    }),
+  ).toBe(ANDROID_PLAY_STORE_FALLBACK);
+
+  // The genuine host on any other details page is refused as well.
+  expect(
+    clientUpgradeStoreUrl('android', {
+      android: 'https://play.google.com/store/apps/editorial?id=com.aienglish.coach',
+    }),
+  ).toBe(ANDROID_PLAY_STORE_FALLBACK);
+});
+
 it('latches a localized, non-dismissible modal without unmounting the active screen', async () => {
   const underlyingUnmounted = jest.fn();
   const announce = jest
@@ -237,12 +351,11 @@ it('latches a localized, non-dismissible modal without unmounting the active scr
 it('opens the validated platform store URL and blocks repeat taps while opening', async () => {
   const opening = deferred<void>();
   openUrlSpy.mockReturnValueOnce(opening.promise);
-  mockExpoExtra.value = {
-    storeUrls: {
-      ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
-      android: ANDROID_PLAY_STORE_FALLBACK,
-    },
+  const storeUrls = {
+    ios: 'https://apps.apple.com/us/app/ai-english-coach/id1234567890',
+    android: ANDROID_PLAY_STORE_FALLBACK,
   };
+  mockExpoConfig.value = { extra: { storeUrls } };
   await renderModal();
   await act(async () => latchClientUpgradeRequired());
 
@@ -256,9 +369,7 @@ it('opens the validated platform store URL and blocks repeat taps while opening'
   });
 
   expect(openUrlSpy).toHaveBeenCalledTimes(1);
-  expect(openUrlSpy).toHaveBeenCalledWith(
-    clientUpgradeStoreUrl(Platform.OS, (mockExpoExtra.value as { storeUrls: unknown }).storeUrls),
-  );
+  expect(openUrlSpy).toHaveBeenCalledWith(clientUpgradeStoreUrl(Platform.OS, storeUrls));
   expect(
     screen.getByRole('button', { name: translateFor('en', 'upgrade.action') }).props
       .accessibilityState,
@@ -360,8 +471,13 @@ it('draws the scrim and the scheme-aware card shadow from the theme tokens', asy
   expect(backdrop).toBeDefined();
   expect(StyleSheet.flatten(backdrop!.props.style)).toMatchObject({
     backgroundColor: lightColors.scrim,
+    alignItems: 'center',
+    justifyContent: 'center',
   });
   expect(StyleSheet.flatten(modalCard().props.style)).toMatchObject({
+    width: '100%',
+    maxHeight: '90%',
+    overflow: 'hidden',
     backgroundColor: lightColors.card,
     shadowOpacity: 0.3,
     shadowRadius: 16,

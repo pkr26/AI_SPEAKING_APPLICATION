@@ -1599,6 +1599,110 @@ describe('error response parsing', () => {
     }
   });
 
+  it.each([
+    ['45', 45],
+    ['121', undefined],
+  ])(
+    'bounds a 503 Retry-After header hint of %s when the error body hangs',
+    async (header, expected) => {
+      jest.useFakeTimers();
+      fetchMock.mockResolvedValueOnce(
+        fakeResponse({
+          ok: false,
+          status: 503,
+          headers: { 'Retry-After': header },
+          json: () => new Promise(() => undefined),
+        }),
+      );
+
+      try {
+        const request = catchAsync(api.apiFetch('/slow-busy', { timeoutMs: 10 }));
+        await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+        await expect(request).resolves.toMatchObject({
+          status: 503,
+          message: 'Request failed with status 503',
+          retryAfterSeconds: expected,
+        });
+      } finally {
+        jest.useRealTimers();
+      }
+    },
+  );
+
+  it('drops the header hint for a status outside the three-contract set when the error body hangs', async () => {
+    // The pre-body header capture must stay status-gated: a 500 carrying a
+    // Retry-After look-alike must not surface a wait hint merely because its
+    // error body outlives the read budget.
+    jest.useFakeTimers();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 500,
+        headers: { 'Retry-After': '60' },
+        json: () => new Promise(() => undefined),
+      }),
+    );
+
+    try {
+      const request = catchAsync(api.apiFetch('/slow-server-error', { timeoutMs: 10 }));
+      await jest.advanceTimersByTimeAsync(api.ERROR_BODY_READ_BUDGET_MS + 1);
+
+      await expect(request).resolves.toMatchObject({
+        status: 500,
+        message: 'Request failed with status 500',
+        retryAfterSeconds: undefined,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps the caller abort when it interrupts an error body read', async () => {
+    const controller = new AbortController();
+    const reason = new Error('learner cancelled mid-error-body');
+    const bodyReadStarted = deferred<void>();
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 503,
+        json: () => {
+          bodyReadStarted.resolve();
+          return new Promise(() => undefined);
+        },
+      }),
+    );
+
+    const request = api.apiFetch('/busy-abort', {
+      signal: controller.signal,
+      timeoutMs: 60_000,
+    });
+    await bodyReadStarted.promise;
+    controller.abort(reason);
+
+    // A cancelled error-body read keeps its transport meaning instead of
+    // degrading into the generic status ApiError.
+    await expect(request).rejects.toBe(reason);
+  });
+
+  it('swallows an unparseable error body without adopting the header retry hint', async () => {
+    fetchMock.mockResolvedValueOnce(
+      fakeResponse({
+        ok: false,
+        status: 409,
+        headers: { 'Retry-After': '45' },
+        json: async () => {
+          throw new SyntaxError('Unexpected token');
+        },
+      }),
+    );
+
+    const error = (await catchAsync(api.apiFetch('/conflict'))) as ApiErrorInstance;
+
+    expect(error).toBeInstanceOf(api.ApiError);
+    expect(error).toMatchObject({ status: 409, retryAfterSeconds: undefined });
+  });
+
   it('keeps the ok-response body timeout on the whole-request remainder', async () => {
     // A SUCCESSFUL response whose body stalls still becomes the local 408: no
     // real error outcome exists to preserve, and the request budget governs.
@@ -3988,6 +4092,29 @@ describe('typed endpoint helpers', () => {
     expect(consume.mock.calls.at(-1)?.[1]).toBe(9_998);
   });
 
+  it('consumes the ten-thousandth terminal recording-export page instead of rejecting its null cursor', async () => {
+    let request = 0;
+    const consume = jest.fn();
+    fetchMock.mockImplementation(async () => {
+      const index = request++;
+      if (index === 9_999) {
+        return fakeResponse({ json: async () => ({ recordings: [], nextCursor: null }) });
+      }
+      return fakeResponse({
+        json: async () => ({
+          recordings: [{ ...recordingBody, requestId: HISTORY_ITEM.questionId, attemptId: null }],
+          nextCursor: `550e8400-e29b-41d4-8000-${String(index).padStart(12, '0')}`,
+        }),
+      });
+    });
+
+    await api.apiConsumeRecordingExportPages(consume);
+
+    expect(fetchMock).toHaveBeenCalledTimes(10_000);
+    expect(consume).toHaveBeenCalledTimes(10_000);
+    expect(consume.mock.calls.at(-1)?.[1]).toBe(9_999);
+  }, 60_000);
+
   it.each([
     ['custom reason', new Error('export lease changed')],
     ['null reason', null],
@@ -4573,6 +4700,21 @@ describe('audioFileDescriptor extension edges', () => {
     expect(error.status).toBe(415);
     expect(error.message).toBe('Unsupported recording format');
   });
+
+  it('matches the rejected 3GP/AAC containers on the path suffix, not a leading segment', async () => {
+    // A leading '.3gp-cache'/'.aac-cache' directory segment is not the
+    // container. With no trailing extension at all the descriptor falls back
+    // to the configured recorder's container instead of the local 415, and
+    // only a path truly ENDING in .3gp/.aac is rejected.
+    expect(api.audioFileDescriptor('.3gp-cache/audio')).toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+    });
+    expect(api.audioFileDescriptor('.aac-cache/audio')).toEqual({
+      name: 'audio.m4a',
+      type: 'audio/mp4',
+    });
+  });
 });
 
 describe('presigned file-state gate', () => {
@@ -4639,6 +4781,32 @@ describe('practice-stats timezone resolution', () => {
     for (const [url] of fetchMock.mock.calls) {
       expect(url).toBe('http://localhost:4000/practice/stats?timeZone=UTC');
     }
+    spy.mockRestore();
+  });
+
+  it('keeps the UTC default for a non-primitive String-object zone', async () => {
+    // A polyfilled or shimmed Intl may hand back a boxed String. The resolver
+    // only accepts primitive strings, so the boxed value must not leak into
+    // the query through its coercing trim/length/encode members.
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
+    const spy = jest.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockReturnValue({
+      timeZone: new String('Asia/Kolkata'),
+    } as unknown as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    expect(fetchMock.mock.calls[0][0]).toBe('http://localhost:4000/practice/stats?timeZone=UTC');
+    spy.mockRestore();
+  });
+
+  it('honors a resolved zone of exactly the 100-character bound', async () => {
+    fetchMock.mockResolvedValue(fakeResponse({ json: async () => STATS_BODY }));
+    const zone = 'z'.repeat(100);
+    const spy = jest
+      .spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions')
+      .mockReturnValue({ timeZone: zone } as Intl.ResolvedDateTimeFormatOptions);
+    await api.apiGetPracticeStats();
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      `http://localhost:4000/practice/stats?timeZone=${zone}`,
+    );
     spy.mockRestore();
   });
 });
@@ -4785,4 +4953,162 @@ describe('export walker bounds and cursor accounting', () => {
     // The recordings walk never starts after the abort.
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+
+  it('accepts a one-page-per-phase export at exactly maxPages 1', async () => {
+    fetchMock
+      .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+      .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }));
+    const consumeUser = jest.fn();
+
+    await api.apiConsumeUserDataPages(consumeUser, undefined, 1);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumeUser.mock.calls.map(([, index]) => index)).toEqual([0, 1]);
+  });
+
+  it('bounds the practice-cycle walk at maxPages pages before consuming the over-bound page', async () => {
+    fetchMock
+      .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              practiceCyclesDone: false,
+              practiceCycles: [{}],
+              nextPracticeCycleCursor: uuidFor(7001),
+            }),
+        }),
+      )
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              practiceCyclesDone: false,
+              practiceCycles: [{}],
+              nextPracticeCycleCursor: uuidFor(7002),
+            }),
+        }),
+      )
+      .mockImplementation(async () => fakeResponse({ json: async () => userExportPage() }));
+    const consumeUser = jest.fn();
+
+    await expect(api.apiConsumeUserDataPages(consumeUser, undefined, 2)).rejects.toBeInstanceOf(
+      ContractError,
+    );
+    // Page 0 of the cycle walk is consumed; the over-bound second page hands
+    // out a fresh cursor and must be rejected before it reaches the consumer.
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(consumeUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('surfaces the DOMException abort fallback after a consumed practice-cycle page', async () => {
+    const controller = new AbortController();
+    fetchMock
+      .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+      .mockImplementationOnce(async () =>
+        fakeResponse({
+          json: async () =>
+            userExportPage({
+              practiceCyclesDone: false,
+              practiceCycles: [{}],
+              nextPracticeCycleCursor: uuidFor(7003),
+            }),
+        }),
+      );
+    const consumeUser = jest.fn((_page: unknown, index: number) => {
+      if (index === 1) controller.abort(null);
+      return undefined;
+    });
+
+    await expect(api.apiConsumeUserDataPages(consumeUser, controller.signal)).rejects.toMatchObject(
+      { name: 'AbortError', message: 'Aborted' },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(consumeUser).toHaveBeenCalledTimes(2);
+  });
+
+  it('forwards the caller signal to practice-cycle page fetches so a mid-walk abort stops the walk', async () => {
+    const controller = new AbortController();
+    const cycleFetchStarted = deferred<void>();
+    fetchMock
+      .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+      .mockImplementation((_input: unknown, init?: RequestInit) => {
+        const signal = init?.signal;
+        if (!signal) {
+          return Promise.reject(new Error('fetchWithTimeout must pass fetch an AbortSignal'));
+        }
+        cycleFetchStarted.resolve();
+        return new Promise<Response>((_resolve, reject) => {
+          const rejectAbort = () => reject(signal.reason);
+          if (signal.aborted) {
+            rejectAbort();
+            return;
+          }
+          signal.addEventListener('abort', rejectAbort, { once: true });
+        });
+      });
+    const consumeUser = jest.fn();
+
+    const outcome = settleWithin(
+      api.apiConsumeUserDataPages(consumeUser, controller.signal),
+      'practice-cycle page fetch abort',
+    );
+    await cycleFetchStarted.promise;
+    controller.abort();
+
+    await expect(outcome).rejects.toMatchObject({ name: 'AbortError' });
+  });
+
+  it.each([
+    ['custom reason', new Error('export lease changed')],
+    ['null reason', null],
+  ] as const)(
+    'stops between account-export stages for a %s resolved after the final user page',
+    async (_label: string, reason: Error | null) => {
+      const controller = new AbortController();
+      fetchMock
+        .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+        .mockImplementationOnce(async () =>
+          fakeResponse({
+            json: async () =>
+              userExportPage({
+                practiceCyclesDone: false,
+                practiceCycles: [{}],
+                nextPracticeCycleCursor: uuidFor(7004),
+              }),
+          }),
+        )
+        .mockImplementationOnce(async () => fakeResponse({ json: async () => userExportPage() }))
+        .mockImplementation(async () =>
+          fakeResponse({ json: async () => ({ recordings: [], nextCursor: null }) }),
+        );
+      const consumeRecordings = jest.fn();
+      const consumeUser = jest.fn((_page: unknown, index: number) => {
+        if (index !== 2) return undefined;
+        // Resolve the final consumer first, then land the abort in the
+        // microtask gap between the user-data walk's return and the
+        // between-stages abort check.
+        return {
+          then(onFulfilled: () => void) {
+            onFulfilled();
+            queueMicrotask(() => controller.abort(reason));
+          },
+        } as unknown as Promise<void>;
+      });
+
+      const outcome = api.apiConsumeAccountExportPages(
+        consumeUser,
+        consumeRecordings,
+        controller.signal,
+      );
+      if (reason) {
+        await expect(outcome).rejects.toBe(reason);
+      } else {
+        await expect(outcome).rejects.toMatchObject({ name: 'AbortError', message: 'Aborted' });
+      }
+      // The recordings stage never starts after the between-stages abort.
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(consumeRecordings).not.toHaveBeenCalled();
+    },
+  );
 });

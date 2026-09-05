@@ -671,6 +671,28 @@ describe('change password screen', () => {
     expect(formChildren.filter((child) => child === false)).toHaveLength(1);
   });
 
+  it('keeps each focus-ring conjunct exactly false for the fields that are not focused', async () => {
+    await renderScreen(<ChangePasswordScreen />);
+
+    // Focusing the current-password field must evaluate its own conjunct to
+    // the focused border style — never a stray truthy primitive — while the
+    // confirm field's unevaluated conjunct rests on the literal false.
+    await fireEvent(screen.getByLabelText(t('cp.currentLabel')), 'focus');
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.style?.[2]).toMatchObject({
+      borderColor: colors.primary,
+    });
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.style?.[2]).toBe(false);
+
+    // The same contract from the middle field: both outer rings stay false.
+    await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'focus');
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.style?.[2]).toBe(false);
+    expect(screen.getByLabelText(t('cp.confirmLabel')).props.style?.[2]).toBe(false);
+
+    // And from the confirmation field: the current-password ring stays false.
+    await fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'focus');
+    expect(screen.getByLabelText(t('cp.currentLabel')).props.style?.[2]).toBe(false);
+  });
+
   it('places a responsive reveal action beside every password field', async () => {
     await renderScreen(<ChangePasswordScreen />);
 

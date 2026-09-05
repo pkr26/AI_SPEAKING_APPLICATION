@@ -579,6 +579,34 @@ describe('refreshDailyReminderLanguage', () => {
     });
   });
 
+  it('falls back to the just-written preference when the post-enable re-read finds nothing', async () => {
+    // The durable write committed, but the immediate confirmation read comes
+    // back empty (a momentarily locked keychain, say): the return value must
+    // still describe the reminder that was just enabled.
+    withPersistedReminder({ hour: 8 });
+    setItemAsync.mockImplementation(async (_key: string, _value: string) => {
+      getItemAsync.mockResolvedValue(null);
+    });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toEqual({
+      hour: 8,
+      uiLanguage: 'hi',
+    });
+  });
+
+  it('returns null when the re-schedule is denied by the OS permission prompt', async () => {
+    // Permission was still granted at the reconcile read, but revoked by the
+    // time enable re-checked: the denied outcome must read as reminders off.
+    withPersistedReminder({ hour: 8 });
+    mockGetPermissionsAsync
+      .mockResolvedValueOnce({ granted: true })
+      .mockResolvedValueOnce({ granted: false });
+    mockRequestPermissionsAsync.mockResolvedValue({ granted: false });
+
+    await expect(refreshDailyReminderLanguage('hi')).resolves.toBeNull();
+    expect(mockScheduleNotificationAsync).not.toHaveBeenCalled();
+  });
+
   it('does not rebuild notification copy when the stored UI language already matches', async () => {
     withPersistedReminder({ hour: 8, uiLanguage: 'hi' });
 

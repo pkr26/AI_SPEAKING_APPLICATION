@@ -1797,6 +1797,179 @@ describe('forgot-password deep contracts', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Mutation-hardening pins: resend/continue busy guards, the keyed note bump,
+// the sent-state alert slot, pressed-link dimming, focus-style wiring, and the
+// detached password chaining ref.
+// ---------------------------------------------------------------------------
+
+describe('forgot-password resend and continue guards', () => {
+  it('spends one resend for two same-render activations', async () => {
+    await arriveAtSentState();
+    const pending = deferred<void>();
+    mockForgot.mockReset().mockReturnValue(pending.promise);
+
+    const resend = committedPressHandler(screen.getByRole('button', { name: t('reset.resend') }));
+    await act(async () => {
+      void resend();
+      void resend();
+    });
+
+    // The busy/sent guard swallows the impatient second activation before a
+    // second transport request can open.
+    expect(mockForgot).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pending.resolve(undefined);
+      await pending.promise;
+    });
+  });
+
+  it('remounts the neutral note under key 2 after an accepted resend', async () => {
+    await arriveAtSentState();
+    expect(elementKey(screen.getByText(t('reset.sentBody')))).toBe('1');
+
+    await act(async () => {
+      await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    });
+
+    // The resend bumps the same keyed counter the first send started, so the
+    // polite live region re-announces instead of sitting stale.
+    expect(elementKey(screen.getByText(t('reset.sentBody')))).toBe('2');
+  });
+
+  it('holds Continue while a resend is in flight', async () => {
+    await arriveAtSentState();
+    const continuePress = committedPressHandler(
+      screen.getByRole('button', { name: t('reset.continue') }),
+    );
+    const pending = deferred<void>();
+    mockForgot.mockReset().mockReturnValue(pending.promise);
+
+    await fireEvent.press(screen.getByRole('button', { name: t('reset.resend') }));
+    mockRouter.navigate.mockClear();
+    await act(async () => {
+      void continuePress();
+    });
+
+    // The pending resend owns the screen: the captured Continue activation
+    // must not carry the pinned email onward until the request settles.
+    expect(mockRouter.navigate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pending.resolve(undefined);
+      await pending.promise;
+    });
+  });
+
+  it('renders no alert in the neutral sent state before any resend failure', async () => {
+    await arriveAtSentState();
+
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+/**
+ * Pressed-state feedback contract: the link rests on the token style, dims
+ * only for the duration of the press, and releases the dim afterwards.
+ */
+async function expectPressFeedback(
+  getLink: () => TestInstance,
+  resting: SemanticStyle,
+  pressed: SemanticStyle,
+): Promise<void> {
+  expect(flattenedStyle(getLink())).toMatchObject(resting);
+  await fireEvent(getLink(), 'responderGrant', responderEvent());
+  expect(flattenedStyle(getLink())).toMatchObject(pressed);
+  await fireEvent(getLink(), 'responderTerminate', responderEvent());
+  await waitFor(() => {
+    const restored = flattenedStyle(getLink());
+    expect(restored).toMatchObject(resting);
+    for (const property of Object.keys(pressed)) {
+      if (!(property in resting)) expect(restored[property]).toBeUndefined();
+    }
+  });
+}
+
+describe('reset-flow link press contracts', () => {
+  it('dims the sent-state back-to-login link only while pressed', async () => {
+    await arriveAtSentState();
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('reset.backToLogin') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+
+  it('dims the request-state back-to-login link only while pressed', async () => {
+    await render(<ForgotPasswordScreen />);
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('reset.backToLogin') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+
+  it('dims the reset back-to-login link only while pressed', async () => {
+    await render(<ResetPasswordScreen />);
+    await expectPressFeedback(
+      () => screen.getByRole('link', { name: t('reset.backToLogin') }),
+      { minHeight: layout.minimumTarget },
+      { opacity: 0.6 },
+    );
+  });
+});
+
+describe('reset-password focus and chaining pins', () => {
+  const rowInput: SemanticStyle = { ...restingInput, flex: 1, minWidth: 0 };
+
+  it('keeps the password and confirmation borders resting while another field is focused', async () => {
+    await render(<ResetPasswordScreen />);
+    await fireEvent(screen.getByLabelText(t('login.emailLabel')), 'focus');
+
+    // Focus treatment belongs to the focused field alone: the reveal rows keep
+    // the exact resting field style while the email owns the focus slot.
+    expect(flattenedStyle(screen.getByLabelText(t('cp.newLabel')))).toEqual(rowInput);
+    expect(flattenedStyle(screen.getByLabelText(t('cp.confirmLabel')))).toEqual(rowInput);
+
+    // Focusing each reveal-row field still swaps only the border color.
+    await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'focus');
+    expect(flattenedStyle(screen.getByLabelText(t('cp.newLabel')))).toEqual({
+      ...rowInput,
+      borderColor: colors.primary,
+    });
+    await fireEvent(screen.getByLabelText(t('cp.newLabel')), 'blur');
+    expect(flattenedStyle(screen.getByLabelText(t('cp.newLabel')))).toEqual(rowInput);
+
+    await fireEvent(screen.getByLabelText(t('cp.confirmLabel')), 'focus');
+    expect(flattenedStyle(screen.getByLabelText(t('cp.confirmLabel')))).toEqual({
+      ...rowInput,
+      borderColor: colors.primary,
+    });
+  });
+
+  it('keeps the password return key harmless once the screen is gone', async () => {
+    const view = await render(<ResetPasswordScreen />);
+    const submitFromPassword = screen.getByLabelText(t('cp.newLabel')).props
+      .onSubmitEditing as () => void;
+    const confirmFocus = spyOnTextInputFocus(screen.getByLabelText(t('cp.confirmLabel')));
+    await view.unmount();
+
+    // The confirm ref is detached on unmount, so the chaining call must not
+    // dereference it.
+    expect(() => submitFromPassword()).not.toThrow();
+    expect(confirmFocus).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // State/prop wiring pins: the authored initial states (null vs any hostile
 // boolean, 0-keyed note), the stale-error clearing setters, and the exact
 // chrome/field prop wiring the deep styles above do not reach.

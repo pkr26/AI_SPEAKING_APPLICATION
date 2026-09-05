@@ -11,8 +11,9 @@ import {
   getNetworkStatusSnapshot,
   NetworkStatusBridge,
   resetNetworkStatusModuleForTests,
+  subscribeToNetworkStatus,
 } from '../src/lib/network-status';
-import { darkColors, elevations, spacing } from '../src/lib/theme';
+import { darkColors, elevations, layout, radii, spacing } from '../src/lib/theme';
 
 const asMock = (value: unknown) => value as jest.Mock;
 
@@ -119,9 +120,21 @@ it('subscribes before sampling, ignores a stale sample, and announces reconnect 
   expect(flattenedStyle(screen.getByRole('alert')).backgroundColor).toBe(darkColors.warning);
   // The floating banner consumes the scheme-aware raised elevation preset.
   expect(flattenedStyle(screen.getByRole('alert'))).toMatchObject(elevations.dark.raised);
+  // The banner row fills the host width and centers its dot plus message.
+  expect(flattenedStyle(screen.getByRole('alert'))).toMatchObject({
+    width: '100%',
+    maxWidth: layout.contentMaxWidth,
+    minHeight: layout.minimumTarget,
+    borderRadius: radii.input,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+  });
   expect(flattenedStyle(screen.getByText(offlineMessage))).toMatchObject({
     fontSize: 15,
     lineHeight: 21,
+    fontWeight: '700',
+    textAlign: 'center',
   });
   expect(flattenedStyle(statusDot()).backgroundColor).toBe(darkColors.onWarning);
   expect(flattenedStyle(screen.getByText(offlineMessage)).color).toBe(darkColors.onWarning);
@@ -173,6 +186,9 @@ it('uses explicit reachability first, falls back to connection state, and ignore
   const unknown = getNetworkStatusSnapshot();
   await act(async () => listener()({ type: Network.NetworkStateType.UNKNOWN }));
   expect(getNetworkStatusSnapshot()).toBe(unknown);
+  // An unusable observation must leave React Query's safe default untouched
+  // instead of pausing queries from evidence it just decided to drop.
+  expect(onlineManager.isOnline()).toBe(true);
 
   await act(async () => listener()({ isConnected: true }));
   expect(getNetworkStatusSnapshot().reachability).toBe('online');
@@ -191,6 +207,84 @@ it('uses explicit reachability first, falls back to connection state, and ignore
     await initial.promise;
   });
   expect(getNetworkStatusSnapshot().reachability).toBe('online');
+});
+
+it('reports offline when only the connected flag is false', async () => {
+  const rendered = await render(<NetworkStatusBridge />);
+  await waitFor(() => expect(addNetworkStateListener).toHaveBeenCalledTimes(1));
+
+  // No network type at all: the explicit false flag alone must decide.
+  await act(async () => {
+    listener()({ isConnected: false });
+  });
+  expect(getNetworkStatusSnapshot().reachability).toBe('offline');
+  expect(onlineManager.isOnline()).toBe(false);
+  await rendered.unmount();
+});
+
+it('still applies the initial sample after an unknown-only native event', async () => {
+  const initial = deferred<Network.NetworkState>();
+  getNetworkStateAsync.mockReturnValue(initial.promise);
+  const rendered = await render(<NetworkStatusBridge />);
+  await waitFor(() => expect(addNetworkStateListener).toHaveBeenCalledTimes(1));
+
+  // An unusable event is not evidence: it must not outrank the pending sample.
+  await act(async () => {
+    listener()({ type: Network.NetworkStateType.UNKNOWN });
+  });
+  expect(getNetworkStatusSnapshot()).toEqual({ reachability: 'unknown', reconnectCount: 0 });
+
+  await act(async () => {
+    initial.resolve({ isConnected: true });
+    await initial.promise;
+  });
+  expect(getNetworkStatusSnapshot().reachability).toBe('online');
+  await rendered.unmount();
+});
+
+it('does not count an initial online transition as a reconnect', async () => {
+  const rendered = await render(<NetworkStatusBridge />);
+  await waitFor(() => expect(addNetworkStateListener).toHaveBeenCalledTimes(1));
+
+  // Unknown -> online is fresh news, not a reconnect: only a known offline ->
+  // online transition increments the reconnect counter.
+  await act(async () => {
+    listener()({ isConnected: true });
+  });
+  expect(getNetworkStatusSnapshot()).toEqual({ reachability: 'online', reconnectCount: 0 });
+  await rendered.unmount();
+});
+
+it('discards the pending initial sample when monitoring stops', async () => {
+  const initial = deferred<Network.NetworkState>();
+  getNetworkStateAsync.mockReturnValue(initial.promise);
+  const rendered = await render(<NetworkStatusBridge />);
+  await waitFor(() => expect(addNetworkStateListener).toHaveBeenCalledTimes(1));
+
+  await rendered.unmount();
+  await act(async () => {
+    initial.resolve({ isConnected: false });
+    await initial.promise;
+  });
+  // Teardown deactivates the sampler, so a late sample cannot publish state
+  // after the single owner is gone.
+  expect(getNetworkStatusSnapshot()).toEqual({ reachability: 'unknown', reconnectCount: 0 });
+});
+
+it('removes a store subscriber when its unsubscribe runs', async () => {
+  const rendered = await render(<NetworkStatusBridge />);
+  const registered = listener();
+
+  const mine = jest.fn();
+  const unsubscribe = subscribeToNetworkStatus(mine);
+  unsubscribe();
+
+  await act(async () => {
+    registered({ isConnected: true });
+  });
+  expect(getNetworkStatusSnapshot().reachability).toBe('online');
+  expect(mine).not.toHaveBeenCalled();
+  await rendered.unmount();
 });
 
 it('falls back to the initial sample when listener registration throws', async () => {

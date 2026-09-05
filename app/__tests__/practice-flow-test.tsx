@@ -13,6 +13,7 @@ import type {
   AttemptResult,
   NativeAttemptResult,
   PracticeQuestionPayload,
+  Question,
   User,
 } from '../src/lib/types';
 
@@ -49,6 +50,13 @@ const RESULT: AttemptResult = {
   score: 88,
   transcript: 'she sells seashells',
   feedback: 'Nice pacing.',
+};
+
+const QUESTION: Question = {
+  id: '550e8400-e29b-41d4-a716-446655440001',
+  cefrLevel: 'B1',
+  promptWord: 'courage',
+  questionText: 'Describe a time you showed courage.',
 };
 
 let flow: ReturnType<typeof usePracticeFlow> | null = null;
@@ -121,6 +129,66 @@ describe('PracticeFlowProvider', () => {
     });
 
     expect(flow!.feedback).toEqual({ questionId: 'q-1', result: RESULT, requestId: REQUEST_ID });
+  });
+
+  it('stores an optional question payload and durable request identity together', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', RESULT, QUESTION, REQUEST_ID);
+    });
+
+    expect(flow!.feedback).toStrictEqual({
+      questionId: 'q-1',
+      result: RESULT,
+      question: QUESTION,
+      requestId: REQUEST_ID,
+    });
+  });
+
+  it('omits absent optional fields entirely from fresh feedback', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', RESULT);
+    });
+
+    // The optional fields must be absent, not present-as-undefined: screens
+    // and persistence treat the shape strictly.
+    expect(flow!.feedback).toStrictEqual({ questionId: 'q-1', result: RESULT });
+    expect(Object.hasOwn(flow!.feedback as object, 'question')).toBe(false);
+    expect(Object.hasOwn(flow!.feedback as object, 'requestId')).toBe(false);
+  });
+
+  it('restores a question payload and durable request identity together', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.restoreFeedback('q-1', RESULT, QUESTION, REQUEST_ID);
+    });
+
+    expect(flow!.answerMode).toBe('english');
+    expect(flow!.feedback).toStrictEqual({
+      questionId: 'q-1',
+      result: RESULT,
+      question: QUESTION,
+      requestId: REQUEST_ID,
+    });
+  });
+
+  it('omits absent optional fields entirely from restored feedback', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.restoreFeedback('q-1', RESULT, undefined, REQUEST_ID);
+    });
+
+    expect(flow!.feedback).toStrictEqual({
+      questionId: 'q-1',
+      result: RESULT,
+      requestId: REQUEST_ID,
+    });
+    expect(Object.hasOwn(flow!.feedback as object, 'question')).toBe(false);
   });
 
   it('restores mode and retry status without counting a replay twice', async () => {
@@ -410,6 +478,191 @@ describe('PracticeFlowProvider', () => {
     });
   });
 
+  it('does not pin attempt status for a passed English answer even when tries remain', async () => {
+    await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', {
+        cycleId: CYCLE_ID,
+        passed: true,
+        mastered: false,
+        attemptNo: 1,
+        attemptsLeft: 2,
+        score: 76,
+        transcript: 'a solid answer',
+        feedback: 'Good.',
+      });
+    });
+    // A pass closes the shared three-try cycle: the retry chip must not appear.
+    expect(flow!.attemptStatus).toBeNull();
+  });
+
+  describe('restoreFeedback attempt status', () => {
+    const failedWithTriesLeft: AttemptResult = {
+      cycleId: CYCLE_ID,
+      passed: false,
+      mastered: false,
+      attemptNo: 1,
+      attemptsLeft: 2,
+      score: 45,
+      transcript: 'I tried to answer.',
+      feedback: 'Add more detail.',
+    };
+    const failedExhausted: AttemptResult = {
+      ...failedWithTriesLeft,
+      attemptNo: 3,
+      attemptsLeft: 0,
+      finalFeedback: 'Work on word order.',
+    };
+    const passedWithTriesLeft: AttemptResult = {
+      ...failedWithTriesLeft,
+      passed: true,
+      score: 76,
+      attemptNo: 1,
+      feedback: 'Good.',
+    };
+    const silenceWithTriesLeft: AttemptResult = {
+      ...failedWithTriesLeft,
+      noSpeech: true,
+      attemptNo: 2,
+      attemptsLeft: 3,
+      score: 0,
+      transcript: '',
+      feedback: 'We could not detect any speech.',
+    };
+
+    it('restores the retry position for a failed English try with attempts remaining', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', failedWithTriesLeft, undefined);
+      });
+
+      expect(flow!.attemptStatus).toEqual({
+        questionId: 'q-1',
+        cycleId: CYCLE_ID,
+        attemptsLeft: 2,
+      });
+    });
+
+    it('restores the retry position for silence with attempts remaining', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', silenceWithTriesLeft, undefined);
+      });
+
+      expect(flow!.attemptStatus).toEqual({
+        questionId: 'q-1',
+        cycleId: CYCLE_ID,
+        attemptsLeft: 3,
+      });
+    });
+
+    it('does not restore attempt status for a passed English answer with attempts remaining', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', passedWithTriesLeft, undefined);
+      });
+
+      expect(flow!.attemptStatus).toBeNull();
+    });
+
+    it('does not restore attempt status for a failed try that exhausted the cycle', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', failedExhausted, undefined);
+      });
+
+      expect(flow!.attemptStatus).toBeNull();
+    });
+
+    it('omits the requestId key entirely when restoring without a durable request', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', failedWithTriesLeft, undefined);
+      });
+
+      expect(flow!.feedback).not.toBeNull();
+      expect(Object.hasOwn(flow!.feedback!, 'requestId')).toBe(false);
+    });
+
+    it('restores the retry position for a passed native answer with attempts remaining', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback(
+          'q-1',
+          {
+            mode: 'native',
+            nativeLanguage: 'te',
+            cycleId: CYCLE_ID,
+            understood: true,
+            attemptNo: 2,
+            attemptsLeft: 1,
+            transcript: 'నాకు ప్రయాణం ఇష్టం.',
+            translatedTranscript: 'I like travelling.',
+            modelAnswer: 'I enjoy travelling.',
+            feedback: 'On topic.',
+          } satisfies NativeAttemptResult,
+          undefined,
+        );
+      });
+
+      expect(flow!.attemptStatus).toEqual({
+        questionId: 'q-1',
+        cycleId: CYCLE_ID,
+        attemptsLeft: 1,
+      });
+    });
+
+    it('does not restore attempt status for a passed answer that closed the cycle', async () => {
+      await render(tree());
+
+      await act(async () => {
+        flow!.restoreFeedback('q-1', RESULT, undefined);
+      });
+
+      expect(flow!.attemptStatus).toBeNull();
+    });
+  });
+
+  it('is a no-op to clear recording references with no feedback card showing', async () => {
+    await render(tree());
+
+    await act(async () => flow!.clearRecordingReferences());
+
+    expect(flow!.feedback).toBeNull();
+  });
+
+  it('discards all flow state on a placement completion change without a token rotation', async () => {
+    const view = await render(tree());
+
+    await act(async () => {
+      flow!.showFeedback('q-1', RESULT);
+      flow!.setAnswerMode('native');
+    });
+    const oldFlow = flow!;
+
+    // Control: an identical placement phase keeps the mounted state owner.
+    await view.rerender(tree());
+    expect(flow).toBe(oldFlow);
+    expect(flow!.feedback).not.toBeNull();
+
+    // Same learner, same acknowledgement, but the diagnostic completion phase
+    // moved: the remount key must change so replay state cannot leak across.
+    setAuthState(0, { ...AUTH_USER, diagnosticCompleted: false });
+    await view.rerender(tree());
+
+    expect(flow).not.toBe(oldFlow);
+    expect(flow!.answerMode).toBe('english');
+    expect(flow!.feedback).toBeNull();
+    expect(flow!.attemptStatus).toBeNull();
+  });
+
   it('discards the attempt status when the auth sessionVersion changes', async () => {
     const { rerender } = await render(tree());
 
@@ -613,6 +866,20 @@ describe('applyFailedAttemptToQuestionCache', () => {
       attemptsLeft: 2,
       progress: { ...PAYLOAD.progress, learningCount: 2 },
     });
+  });
+
+  it('keeps a new word new after a passed attempt', () => {
+    const queryClient = seededClient();
+
+    applyFailedAttemptToQuestionCache(queryClient, USER, PAYLOAD.question.id, {
+      ...MISS,
+      passed: true,
+      attemptsLeft: 0,
+    } satisfies AttemptResult);
+
+    const cached = queryClient.getQueryData<PracticeQuestionPayload>(QUERY_KEY);
+    expect(cached?.kind).toBe('new');
+    expect(cached?.progress.learningCount).toBe(PAYLOAD.progress.learningCount);
   });
 
   it('does not double-count a word already in revision', () => {

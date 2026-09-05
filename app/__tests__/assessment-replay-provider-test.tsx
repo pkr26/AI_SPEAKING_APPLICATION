@@ -15,6 +15,7 @@ import {
   loadPendingAssessment,
   markPendingAssessmentFeedbackPending,
   notifyPendingAssessmentReplayReady,
+  type PendingAssessment,
 } from '../src/lib/pending-assessment';
 import { usePracticeFlow } from '../src/lib/practice-flow';
 import type { User } from '../src/lib/types';
@@ -55,6 +56,37 @@ const pending = {
   feedbackReadyAt: NOW,
 };
 
+const OTHER_REQUEST_ID = '550e8400-e29b-41d4-a716-446655440077';
+const FOREIGN_OWNER_ID = '550e8400-e29b-41d4-a716-446655440099';
+
+const practiceResponse = {
+  cycleId: CYCLE_ID,
+  passed: false,
+  mastered: false,
+  attemptNo: 1,
+  attemptsLeft: 2,
+  score: 45,
+  transcript: 'I tried.',
+  feedback: 'Add detail.',
+};
+
+const processingPracticeStatus = {
+  status: 'processing',
+  context: 'practice',
+  questionId: QUESTION_ID,
+  cycleId: CYCLE_ID,
+  question,
+};
+
+const completedPracticeStatus = {
+  status: 'completed',
+  context: 'practice',
+  questionId: QUESTION_ID,
+  cycleId: CYCLE_ID,
+  question,
+  response: { ...practiceResponse },
+};
+
 jest.mock('expo-router', () => ({
   router: { replace: jest.fn() },
 }));
@@ -90,11 +122,16 @@ function ReplayProbe() {
       >
         <Text>Clear replay</Text>
       </Pressable>
+      <Pressable accessibilityRole="button" onPress={() => clearDiagnosticReplay(OTHER_REQUEST_ID)}>
+        <Text>Clear other request</Text>
+      </Pressable>
     </>
   );
 }
 
-function tree(client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
+function tree(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } }),
+) {
   return (
     <QueryClientProvider client={client}>
       <AssessmentReplayProvider>
@@ -103,6 +140,22 @@ function tree(client = new QueryClient({ defaultOptions: { queries: { retry: fal
       </AssessmentReplayProvider>
     </QueryClientProvider>
   );
+}
+
+/**
+ * Reads the provider's durable-retry generation from its hook chain. The
+ * generation never reaches rendered output, so like the generation-zero pin it
+ * is read from the provider fiber's first useState slot.
+ */
+function readRetryGeneration(): unknown {
+  const anchor = screen.getByText('protected app');
+  type ProviderFiber = { type?: unknown; memoizedState?: unknown; return: ProviderFiber | null };
+  let fiber = anchor.unstable_fiber as ProviderFiber | null;
+  while (fiber && fiber.type !== AssessmentReplayProvider) fiber = fiber.return;
+  type StateHookSlot = { queue?: unknown; memoizedState?: unknown };
+  const firstSlot = (fiber as (ProviderFiber & { memoizedState?: StateHookSlot | null }) | null)
+    ?.memoizedState;
+  return firstSlot?.memoizedState;
 }
 
 beforeEach(() => {
@@ -140,6 +193,12 @@ describe('AssessmentReplayProvider', () => {
     expect(await screen.findByText('protected app')).toBeTruthy();
     expect(loadPendingAssessment).toHaveBeenCalledTimes(1);
     expect(apiFetch).not.toHaveBeenCalled();
+    expect(authValue.captureSessionLease).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+    expect(screen.queryByRole('header', { name: 'Saved answer waiting' })).toBeNull();
+    // Clearing with no published card is a guarded no-op, never a crash.
+    await fireEvent.press(screen.getByRole('button', { name: 'Clear replay' }));
+    expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent('none');
   });
 
   it('starts the durable-replay retry generation at zero', async () => {
@@ -295,6 +354,11 @@ describe('AssessmentReplayProvider', () => {
       REQUEST_ID,
       pending.feedbackReadyAt,
     );
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    expect(apiFetch).toHaveBeenCalledWith(
+      `/assessments/${REQUEST_ID}`,
+      expect.objectContaining({ signal: expect.anything() }),
+    );
     expect(mockRouter.replace).toHaveBeenCalledWith('/practice/feedback');
     expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
   });
@@ -333,6 +397,37 @@ describe('AssessmentReplayProvider', () => {
     expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent('none');
   });
 
+  it('keeps a published diagnostic replay when clearing names a different request', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue({
+      ...pending,
+      endpoint: '/diagnostic/answer' as const,
+      cycleId: undefined,
+    });
+    jest.mocked(apiFetch).mockResolvedValue({
+      status: 'completed',
+      context: 'diagnostic',
+      questionId: QUESTION_ID,
+      cycleId: null,
+      question,
+      response: {
+        passed: true,
+        score: 88,
+        transcript: 'I spoke up.',
+        feedback: 'Clear answer.',
+        done: true,
+        level: 'B1',
+      },
+    });
+    await render(tree());
+
+    await waitFor(() =>
+      expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent(REQUEST_ID),
+    );
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Clear other request' }));
+    expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent(REQUEST_ID);
+  });
+
   it('hands a non-delivered pending stage back to its owning Recorder', async () => {
     jest.mocked(loadPendingAssessment).mockResolvedValue({ ...pending, stage: 'prepared' });
     await render(tree());
@@ -349,12 +444,18 @@ describe('AssessmentReplayProvider', () => {
     expect(await screen.findByText('protected app')).toBeTruthy();
     expect(screen.queryByRole('alert')).toBeNull();
     expect(apiFetch).toHaveBeenCalledTimes(1);
+    // A reconcile pointer belongs to Recorder's bounded flow: a 404 here hands
+    // it back instead of terminally retiring the durable slot.
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
   });
 
   it('retires a delivered pointer after an authoritative 404 and refreshes canonical caches', async () => {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
     client.setQueryData(['diagnostic-next'], { stale: 'diagnostic' });
     client.setQueryData(['practice-question'], { stale: 'practice' });
+    client.setQueryData(['auth-me'], { stale: 'auth' });
     jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
     jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'replay expired'));
 
@@ -364,6 +465,9 @@ describe('AssessmentReplayProvider', () => {
     expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
     expect(client.getQueryData(['diagnostic-next'])).toBeUndefined();
     expect(client.getQueryData(['practice-question'])).toBeUndefined();
+    // Only the two assessment question caches are dropped; unrelated queries
+    // must survive the canonical refresh.
+    expect(client.getQueryData(['auth-me'])).toEqual({ stale: 'auth' });
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
@@ -387,6 +491,8 @@ describe('AssessmentReplayProvider', () => {
     expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
     expect(apiFetch).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('alert')).toBeNull();
+    // The replacement re-read is exactly one retry generation past mount.
+    await waitFor(() => expect(readRetryGeneration()).toBe(1));
   });
 
   it('re-reads a replacement pointer when terminal retirement loses the request race', async () => {
@@ -411,6 +517,8 @@ describe('AssessmentReplayProvider', () => {
     expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledWith(REQUEST_ID);
     expect(apiFetch).toHaveBeenCalledTimes(1);
     expect(screen.queryByRole('alert')).toBeNull();
+    // The lost-race re-read is exactly one retry generation past mount.
+    await waitFor(() => expect(readRetryGeneration()).toBe(1));
   });
 
   it('retires an incompatible saved result instead of blocking startup', async () => {
@@ -603,6 +711,8 @@ describe('AssessmentReplayProvider', () => {
     await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
     expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+    // The Check Now action advanced the durable generation by exactly one.
+    await waitFor(() => expect(readRetryGeneration()).toBe(1));
   });
 
   it('lays the deferred banner over the protected app on the shared tokens', async () => {
@@ -629,6 +739,10 @@ describe('AssessmentReplayProvider', () => {
       borderWidth: 1,
       borderColor: colors.primary,
       padding: spacing.md,
+      shadowColor: colors.shadow,
+      shadowOpacity: 0.18,
+      shadowRadius: 8,
+      shadowOffset: { width: 0, height: 3 },
     });
     const host = card!.parent;
     expect(host).not.toBeNull();
@@ -713,6 +827,7 @@ describe('AssessmentReplayProvider', () => {
     // The deferred-state subscription is installed in the passive effect
     // following the render that publishes the persistent banner.
     await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(appStateSpy).toHaveBeenCalledWith('change', expect.any(Function));
     await act(async () => {
       appStateListener?.('background');
       appStateListener?.('active');
@@ -730,6 +845,8 @@ describe('AssessmentReplayProvider', () => {
 
     await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    // The reconnect retry advanced the durable generation by exactly one.
+    await waitFor(() => expect(readRetryGeneration()).toBe(1));
     appStateSpy.mockRestore();
   });
 
@@ -760,6 +877,8 @@ describe('AssessmentReplayProvider', () => {
     await fireEvent.press(await screen.findByRole('button', { name: 'Try again' }));
     await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
     expect(apiFetch).toHaveBeenCalledTimes(2);
+    // The Try Again action advanced the durable generation by exactly one.
+    await waitFor(() => expect(readRetryGeneration()).toBe(1));
   });
 
   it('clears an expired pointer and resumes canonical routing', async () => {
@@ -806,12 +925,7 @@ describe('AssessmentReplayProvider', () => {
     current = false;
     await act(async () =>
       resolveStatus({
-        status: 'completed',
-        context: 'practice',
-        questionId: QUESTION_ID,
-        cycleId: CYCLE_ID,
-        question,
-        response: {},
+        ...completedPracticeStatus,
       }),
     );
     expect(restoreFeedback).not.toHaveBeenCalled();
@@ -834,5 +948,540 @@ describe('AssessmentReplayProvider', () => {
     await render(<OutsideProbe />);
     await fireEvent.press(screen.getByRole('button', { name: 'No replay outside' }));
     expect(screen.getByText('No replay outside')).toBeTruthy();
+  });
+
+  it('does no secure or network work without a bearer token even when a user snapshot remains', async () => {
+    authValue = { ...authValue, token: null };
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(loadPendingAssessment).not.toHaveBeenCalled();
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('does no secure or network work while the session is still restoring', async () => {
+    authValue = { ...authValue, isRestoring: true };
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(loadPendingAssessment).not.toHaveBeenCalled();
+    expect(apiFetch).not.toHaveBeenCalled();
+  });
+
+  it('recaptures the session lease when the identity rotates', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
+    const view = await render(tree(client));
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(authValue.captureSessionLease).toHaveBeenCalledTimes(1);
+
+    authValue = { ...authValue, sessionVersion: 2 };
+    view.rerender(tree(client));
+
+    await waitFor(() => expect(authValue.captureSessionLease).toHaveBeenCalledTimes(2));
+  });
+
+  it('returns to the checking surface while a manual retry re-runs the durable check', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest
+      .mocked(apiFetch)
+      .mockRejectedValueOnce(new ApiError(0, 'offline'))
+      .mockReturnValueOnce(new Promise(() => undefined));
+    await render(tree());
+
+    await fireEvent.press(await screen.findByRole('button', { name: 'Try again' }));
+
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+  });
+
+  it('drops a superseded status reply from a replaced check', async () => {
+    let resolveStatus!: (value: unknown) => void;
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    const view = await render(tree(client));
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
+
+    // Rotating the identity replaces the in-flight check: the old run's
+    // cleanup aborts its controller, and the replacement issues its own GET.
+    authValue = { ...authValue, sessionVersion: 2 };
+    view.rerender(tree(client));
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      resolveStatus({ ...completedPracticeStatus });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // Both runs shared the resolved reply, but only the current run may
+    // publish it exactly once.
+    expect(restoreFeedback).toHaveBeenCalledTimes(1);
+    expect(mockRouter.replace).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the checking surface when the lease expires while a foreign pointer retires', async () => {
+    let resolveClear!: (value: boolean) => void;
+    jest.mocked(loadPendingAssessment).mockResolvedValue({ ...pending, ownerId: FOREIGN_OWNER_ID });
+    jest.mocked(clearPendingAssessmentIfRequestMatches).mockReturnValue(
+      new Promise((resolve) => {
+        resolveClear = resolve;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      resolveClear(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+    expect(screen.queryByText('protected app')).toBeNull();
+  });
+
+  it('does not probe the network when the lease expires before the pointer resolves', async () => {
+    let resolvePending!: (value: PendingAssessment | null) => void;
+    jest.mocked(loadPendingAssessment).mockReturnValue(
+      new Promise<PendingAssessment | null>((resolve) => {
+        resolvePending = resolve;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      resolvePending(pending);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(apiFetch).not.toHaveBeenCalled();
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+  });
+
+  it('does not mark or publish a replay when the lease expires before the status reply lands', async () => {
+    let resolveStatus!: (value: unknown) => void;
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockReturnValue(
+      new Promise((resolve) => {
+        resolveStatus = resolve;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      resolveStatus({ ...completedPracticeStatus });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(markPendingAssessmentFeedbackPending).not.toHaveBeenCalled();
+    expect(restoreFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('does not publish a replay when the lease expires while marking feedback pending', async () => {
+    let resolveMark!: (value: boolean) => void;
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockResolvedValue({ ...completedPracticeStatus });
+    jest.mocked(markPendingAssessmentFeedbackPending).mockReturnValue(
+      new Promise((resolve) => {
+        resolveMark = resolve;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      resolveMark(true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(restoreFeedback).not.toHaveBeenCalled();
+    expect(mockRouter.replace).not.toHaveBeenCalled();
+  });
+
+  it('leaves the checking surface when the lease expires before a failed reply is handled', async () => {
+    let rejectStatus!: (reason?: unknown) => void;
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectStatus = reject;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      rejectStatus(new ApiError(0, 'offline'));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(loadPendingAssessment).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+    expect(screen.queryByRole('header', { name: 'We could not restore your feedback' })).toBeNull();
+  });
+
+  it('leaves the checking surface when the lease expires before the replacement pointer resolves', async () => {
+    let resolveReload!: (value: PendingAssessment | null) => void;
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockReturnValueOnce(
+        new Promise<PendingAssessment | null>((resolve) => {
+          resolveReload = resolve;
+        }),
+      );
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(0, 'offline'));
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(loadPendingAssessment).toHaveBeenCalledTimes(2));
+
+    leaseCurrent = false;
+    await act(async () => {
+      resolveReload(pending);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+    expect(screen.queryByRole('header', { name: 'We could not restore your feedback' })).toBeNull();
+  });
+
+  it('re-reads the pointer when the catch reload finds a replacement with a new request id', async () => {
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValue({ ...pending, requestId: OTHER_REQUEST_ID });
+    jest
+      .mocked(apiFetch)
+      .mockRejectedValueOnce(new ApiError(404, 'old replay expired'))
+      .mockResolvedValueOnce({ ...completedPracticeStatus });
+    await render(tree());
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+    expect(loadPendingAssessment).toHaveBeenCalledTimes(3);
+  });
+
+  it('re-reads the pointer when the catch reload finds a replacement in a new stage', async () => {
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockResolvedValue({ ...pending, stage: 'reconcile' as const });
+    jest
+      .mocked(apiFetch)
+      .mockRejectedValueOnce(new ApiError(404, 'old replay expired'))
+      .mockResolvedValueOnce({ ...completedPracticeStatus });
+    await render(tree());
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('still surfaces a recovery choice when the catch reload cannot re-read an in-flight pointer', async () => {
+    jest
+      .mocked(loadPendingAssessment)
+      .mockResolvedValueOnce(pending)
+      .mockRejectedValue(new Error('secure storage unavailable'));
+    jest.mocked(apiFetch).mockRejectedValueOnce(new ApiError(0, 'offline'));
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('exposes the app without the deferred banner when a reconcile pointer is still processing', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue({ ...pending, stage: 'reconcile' });
+    jest.mocked(apiFetch).mockResolvedValue({ ...processingPracticeStatus });
+    await render(tree());
+
+    expect(await screen.findByText('protected app')).toBeTruthy();
+    expect(screen.queryByRole('header', { name: 'Saved answer waiting' })).toBeNull();
+  });
+
+  it('stamps a freshly reconciled pointer with the current time', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue({
+      ...pending,
+      stage: 'reconcile',
+      feedbackReadyAt: NOW - 60_000,
+    });
+    jest.mocked(apiFetch).mockResolvedValue({ ...completedPracticeStatus });
+    await render(tree());
+
+    await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    expect(markPendingAssessmentFeedbackPending).toHaveBeenCalledWith(
+      REQUEST_ID,
+      expect.any(Number),
+    );
+    const stampedAt = jest.mocked(markPendingAssessmentFeedbackPending).mock.calls[0][1];
+    expect(stampedAt).toBeGreaterThan(NOW - 1_000);
+  });
+
+  it('keeps a 409 that is not the incompatible-result code retryable', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest
+      .mocked(apiFetch)
+      .mockRejectedValue(new ApiError(409, 'conflict', undefined, { code: 'EMAIL_TAKEN' }));
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('keeps an incompatible-result code on a non-409 status retryable', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValue(
+      new ApiError(500, 'odd server reply', undefined, {
+        code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+      }),
+    );
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('shows a recovery choice, not a terminal retirement, when the initial pointer read fails like an incompatible reply', async () => {
+    jest
+      .mocked(loadPendingAssessment)
+      .mockRejectedValueOnce(
+        new ApiError(409, 'odd secure-store reply', undefined, {
+          code: 'ASSESSMENT_RESULT_INCOMPATIBLE',
+        }),
+      )
+      .mockResolvedValue(pending);
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+    expect(clearPendingAssessmentIfRequestMatches).not.toHaveBeenCalled();
+  });
+
+  it('shows a recovery choice, never the app, when the pointer read itself fails with a 404-shaped error', async () => {
+    jest
+      .mocked(loadPendingAssessment)
+      .mockRejectedValue(new ApiError(404, 'secure storage unavailable'));
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+    expect(screen.queryByText('protected app')).toBeNull();
+  });
+
+  it('keeps a reconcile pointer retryable when its status reply fails without a 404', async () => {
+    jest.mocked(loadPendingAssessment).mockResolvedValue({ ...pending, stage: 'reconcile' });
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(500, 'server error'));
+    await render(tree());
+
+    expect(
+      await screen.findByRole('header', { name: 'We could not restore your feedback' }),
+    ).toBeTruthy();
+  });
+
+  it('keeps the checking surface when terminal retirement fails after the lease expired', async () => {
+    let rejectClear!: (reason?: unknown) => void;
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest.mocked(apiFetch).mockRejectedValue(new ApiError(404, 'replay expired'));
+    jest.mocked(clearPendingAssessmentIfRequestMatches).mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectClear = reject;
+      }),
+    );
+    let leaseCurrent = true;
+    authValue = { ...authValue, isSessionLeaseCurrent: jest.fn(() => leaseCurrent) };
+    await render(tree());
+    await waitFor(() => expect(clearPendingAssessmentIfRequestMatches).toHaveBeenCalledTimes(1));
+
+    leaseCurrent = false;
+    await act(async () => {
+      rejectClear(new Error('secure storage unavailable'));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByText('Checking your saved answer')).toBeTruthy();
+    expect(screen.queryByRole('header', { name: 'We could not restore your feedback' })).toBeNull();
+  });
+
+  it('keeps canonical question caches when a foreign pointer is retired', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
+    client.setQueryData(['diagnostic-next'], { stale: 'diagnostic' });
+    client.setQueryData(['practice-question'], { stale: 'practice' });
+    jest.mocked(loadPendingAssessment).mockResolvedValue({
+      ...pending,
+      ownerId: FOREIGN_OWNER_ID,
+    });
+    await render(tree(client));
+
+    await waitFor(() => expect(screen.getByText('protected app')).toBeTruthy());
+    expect(client.getQueryData(['diagnostic-next'])).toEqual({ stale: 'diagnostic' });
+    expect(client.getQueryData(['practice-question'])).toEqual({ stale: 'practice' });
+  });
+
+  it('retries a deferred check when connectivity alone returns', async () => {
+    const appStateSpy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_event, _listener) => ({ remove: jest.fn() }));
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest
+      .mocked(apiFetch)
+      .mockResolvedValueOnce({ ...processingPracticeStatus })
+      .mockResolvedValueOnce({ ...completedPracticeStatus });
+    await render(tree());
+
+    expect(await screen.findByRole('button', { name: 'Check now' })).toBeTruthy();
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    // Losing connectivity alone must never launch a re-check.
+    await act(async () => {
+      onlineManager.setOnline(false);
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      onlineManager.setOnline(true);
+    });
+    await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    expect(apiFetch).toHaveBeenCalledTimes(2);
+    appStateSpy.mockRestore();
+  });
+
+  it('retries a deferred check only on a genuine return to the foreground', async () => {
+    let appStateListener: ((state: AppStateStatus) => void) | undefined;
+    const appStateSpy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_event, listener) => {
+        appStateListener = listener;
+        return { remove: jest.fn() };
+      });
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest
+      .mocked(apiFetch)
+      .mockResolvedValueOnce({ ...processingPracticeStatus })
+      .mockResolvedValueOnce({ ...completedPracticeStatus });
+    await render(tree());
+
+    expect(await screen.findByRole('button', { name: 'Check now' })).toBeTruthy();
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(appStateSpy).toHaveBeenCalledWith('change', expect.any(Function));
+
+    // Neither an inactive transition nor a backgrounding re-checks.
+    await act(async () => {
+      appStateListener?.('inactive');
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      appStateListener?.('background');
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(apiFetch).toHaveBeenCalledTimes(1);
+
+    // A genuine background-to-foreground return re-checks exactly once.
+    await act(async () => {
+      appStateListener?.('active');
+    });
+    await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    expect(apiFetch).toHaveBeenCalledTimes(2);
+    appStateSpy.mockRestore();
+  });
+
+  it('stops listening for reconnects once the deferred check resolves', async () => {
+    const appStateSpy = jest
+      .spyOn(AppState, 'addEventListener')
+      .mockImplementation((_event, _listener) => ({ remove: jest.fn() }));
+    jest.mocked(loadPendingAssessment).mockResolvedValue(pending);
+    jest
+      .mocked(apiFetch)
+      .mockResolvedValueOnce({ ...processingPracticeStatus })
+      .mockResolvedValueOnce({ ...completedPracticeStatus });
+    await render(tree());
+
+    await fireEvent.press(await screen.findByRole('button', { name: 'Check now' }));
+    await waitFor(() => expect(restoreFeedback).toHaveBeenCalledTimes(1));
+    expect(apiFetch).toHaveBeenCalledTimes(2);
+
+    // After the deferred card resolves, its reconnect listener is gone, so a
+    // later connectivity flap cannot launch a third check.
+    await act(async () => {
+      onlineManager.setOnline(false);
+      onlineManager.setOnline(true);
+    });
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+    expect(apiFetch).toHaveBeenCalledTimes(2);
+    expect(restoreFeedback).toHaveBeenCalledTimes(1);
+    appStateSpy.mockRestore();
+  });
+
+  it('clears a diagnostic replay published after the identity rotates', async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: Infinity } },
+    });
+    const diagnosticPending = {
+      ...pending,
+      endpoint: '/diagnostic/answer' as const,
+      cycleId: undefined,
+    };
+    const diagnosticStatus = {
+      status: 'completed',
+      context: 'diagnostic',
+      questionId: QUESTION_ID,
+      cycleId: null,
+      question,
+      response: {
+        passed: true,
+        score: 88,
+        transcript: 'I spoke up.',
+        feedback: 'Clear answer.',
+        done: true,
+        level: 'B1',
+      },
+    };
+    jest.mocked(loadPendingAssessment).mockResolvedValue(diagnosticPending);
+    jest.mocked(apiFetch).mockResolvedValue(diagnosticStatus);
+    const view = await render(tree(client));
+    await waitFor(() =>
+      expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent(REQUEST_ID),
+    );
+
+    authValue = { ...authValue, sessionVersion: 2 };
+    view.rerender(tree(client));
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2));
+    expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent(REQUEST_ID);
+
+    await fireEvent.press(screen.getByRole('button', { name: 'Clear replay' }));
+    expect(screen.getByTestId('diagnostic-replay')).toHaveTextContent('none');
   });
 });

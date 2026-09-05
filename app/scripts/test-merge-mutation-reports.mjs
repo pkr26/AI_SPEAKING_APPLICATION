@@ -528,13 +528,14 @@ test('equivalence matching normalizes whitespace while retaining the exact locat
   assert.deepEqual(staleEntries, []);
 });
 
-test('504 checked-in equivalence entries pin 572 exact reviewed mutants', () => {
-  // Sixteen entries (20 reviewed mutants) were retired with the deleted
-  // orphaned attempt screen; a fresh campaign must re-review survivors.
-  assert.equal(equivalentMutants.length, 504);
+test('672 checked-in equivalence entries pin 741 exact reviewed mutants', () => {
+  // The Form & Validation and Network & Resilience campaigns re-reviewed
+  // every survivor in their lanes: new kills replaced some older pins and the
+  // re-review added exact replacements, so the census moved from 504/572.
+  assert.equal(equivalentMutants.length, 672);
   assert.equal(
     equivalentMutants.reduce((total, entry) => total + (entry.count ?? 1), 0),
-    572,
+    741,
   );
   for (const entry of equivalentMutants) {
     assert.match(entry.file, /^src\//, 'file must be a repo-relative source path');

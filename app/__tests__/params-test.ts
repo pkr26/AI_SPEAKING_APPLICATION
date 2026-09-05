@@ -78,6 +78,14 @@ describe('route parameter helpers', () => {
     }
   });
 
+  it('rejects a string-like object even when it coerces to the valid UUID form', () => {
+    // The type guard must reject the value itself: RegExp.test would coerce a
+    // hostile durable-blob field through toString and accept the UUID shape.
+    const stringLike = { toString: () => validUuid } as unknown as string;
+    expect(String(stringLike)).toBe(validUuid);
+    expect(isUuid(stringLike)).toBe(false);
+  });
+
   it.each(['', 'not-a-uuid', `${validUuid}\n`, `${validUuid}/smuggled`])(
     'does not search later repeated parameters when the first value is %p',
     (first) => {

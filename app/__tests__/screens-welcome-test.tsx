@@ -1,4 +1,4 @@
-import { fireEvent, render, renderHook, screen } from '@testing-library/react-native';
+import { fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react-native';
 import { router } from 'expo-router';
 import { StyleSheet } from 'react-native';
 import React from 'react';
@@ -383,5 +383,38 @@ describe('welcome wiring contracts', () => {
       paddingVertical: theme.spacing.ml,
     });
     expect(StyleSheet.flatten(cta.props.style)).toMatchObject({ marginTop: theme.spacing.lg });
+  });
+});
+
+function responderEvent() {
+  return {
+    currentTarget: { measure: () => undefined },
+    nativeEvent: { changedTouches: [], pageX: 0, pageY: 0, touches: [] },
+    persist: () => undefined,
+  };
+}
+
+describe('welcome link press contracts', () => {
+  it('dims the quiet login link only while pressed', async () => {
+    const theme = await lightTheme();
+    await render(<WelcomeScreen />);
+    const link = () =>
+      screen.getByRole('button', {
+        name: `${t('login.footerPrompt')}${t('login.footerLink')}`,
+      });
+
+    // Resting: the quiet-link layout without the pressed dimming.
+    expect(StyleSheet.flatten(link().props.style)).toMatchObject({
+      minHeight: theme.layout.minimumTarget,
+    });
+    expect(StyleSheet.flatten(link().props.style)).not.toMatchObject({ opacity: 0.6 });
+
+    await fireEvent(link(), 'responderGrant', responderEvent());
+    expect(StyleSheet.flatten(link().props.style)).toMatchObject({ opacity: 0.6 });
+
+    await fireEvent(link(), 'responderTerminate', responderEvent());
+    await waitFor(() => {
+      expect(StyleSheet.flatten(link().props.style)).not.toMatchObject({ opacity: 0.6 });
+    });
   });
 });

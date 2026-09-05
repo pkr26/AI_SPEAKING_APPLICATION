@@ -941,34 +941,6 @@ const redesignRePinnedEquivalents = Object.freeze([
   },
 
   {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'BlockStatement',
-    originals: ['return () => {\n      active = false;\n    };'],
-    replacements: ['{}'],
-    reason:
-      'Deleting the effect cleanup only allows setSessionNotice to run after unmount, and React 19 discards updates aimed at a detached fiber silently — no warning, no state change, nothing a test can observe. The latch stays rather than depending on that React internal.',
-    locations: exactLocations(90, 18, 92, 6),
-  },
-  {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['active = false;'],
-    replacements: ['true'],
-    reason:
-      'Same site as the cleanup BlockStatement: leaving the latch true only permits a post-unmount state update, which React 19 discards without any observable effect.',
-    locations: exactLocations(91, 16, 91, 21),
-  },
-  {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    count: 2,
-    reason:
-      'The login mount and notice effects each receive a dependency literal whose constant element compares equal on every render. Their setup and cleanup lifetimes are unchanged.',
-    locations: exactLocations(64, 6, 64, 8, 93, 6, 93, 8),
-  },
-  {
     file: 'src/lib/types.ts',
     mutator: 'ConditionalExpression',
     originals: ["typeof passed !== 'boolean' ||"],
@@ -1352,388 +1324,14 @@ const redesignRePinnedEquivalents = Object.freeze([
     locations: exactLocations(780, 49, 780, 57, 780, 60, 780, 69),
   },
   {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["const canonicalName = user?.name ?? '';"],
-    replacements: ['"Stryker was here!"'],
-    reason:
-      'The fallback is rendered only while user is null, when the screen returns null. When a user arrives, the canonical-name layout effect synchronously replaces the hidden seed before interaction.',
-    locations: exactLocations(127, 39, 127, 41),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const navigationStartedRef = useRef(false);'],
-    replacements: ['true'],
-    reason:
-      'The focus effect writes false before a committed screen can receive interaction, so the render-time seed is never the authoritative navigation latch.',
-    locations: exactLocations(179, 39, 179, 44),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const nameDirtyRef = useRef(false);'],
-    replacements: ['true'],
-    reason:
-      'The canonical-name layout effect writes false before the input can receive interaction, so this initial value is dead.',
-    locations: exactLocations(184, 31, 184, 36),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['[],'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'blockingOperationActive reads only refs whose objects are stable for the component lifetime. Either dependency literal is constant, so callback identity and captures are unchanged.',
-    locations: exactLocations(202, 5, 202, 7),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, [blockingOperationActive, navigation]);'],
-    replacements: ['[]'],
-    reason:
-      'blockingOperationActive and the navigator object are stable within the mounted route, so removing them cannot stale publishNavigationLock.',
-    locations: exactLocations(241, 6, 241, 43),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, [navigation, screenBusy]);'],
-    replacements: ['[]'],
-    reason:
-      'Every operation synchronously publishes lock and unlock state through its ref latch. This layout effect is a duplicate projection of the same busy state, so dependency-driven repeats cannot change header state.',
-    locations: exactLocations(233, 6, 233, 30),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, [blockingOperationActive, navigation]);'],
-    replacements: ['[]'],
-    reason:
-      'The beforeRemove effect captures the same stable ref reader and mounted navigator object, so its subscription behavior is unchanged.',
-    locations: exactLocations(212, 6, 212, 43),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []),'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The focus callback dependency literal is constant across renders, so the focus lifecycle is identical.',
-    locations: exactLocations(250, 8, 250, 10),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BlockStatement',
-    originals: [
-      'useLayoutEffect(() => {\n    navigationRef.current = navigation;\n  }, [navigation]);',
-    ],
-    replacements: ['{}'],
-    reason:
-      'navigationRef is initialized from the mounted navigator, whose identity is stable for this route. The defensive refresh never supplies a different object.',
-    locations: exactLocations(266, 25, 268, 4),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, [navigation]);'],
-    replacements: ['[]'],
-    reason: 'Same stable-navigation argument as the layout-effect block entry.',
-    locations: exactLocations(268, 6, 268, 18),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (activeIdentityRef.current !== activeIdentity) {'],
-    replacements: ['true'],
-    reason:
-      'The condition is false only on initial setup, where clearing null/false confirmation state and publishing the already-unlocked header are no-ops. Every later setup follows cleanup setting the identity ref null.',
-    locations: exactLocations(270, 9, 270, 53),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (ownsReminderLatch) {'],
-    replacements: ['true'],
-    reason:
-      'When another operation owns the latch, entering this setup body only writes the already-true state. The unchanged ownsReminderLatch remains false in finally, so this mutation cannot release the other owner.',
-    locations: exactLocations(536, 11, 536, 28),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['reminderBusyRef.current = true;'],
-    replacements: ['false'],
-    reason:
-      'This assignment runs only when the language change owns the reminder latch. languageBusyRef is already true for that entire interval and independently blocks reminder mutations and navigation, while setReminderBusy(true) still publishes the UI busy state; finally writes the reminder ref false in either version.',
-    locations: exactLocations(537, 35, 537, 39),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ObjectLiteral',
-    originals: ['const exportArtifact: { current: OwnedPrivateFile | null } = { current: null };'],
-    replacements: ['{}'],
-    reason:
-      'Undefined and null artifact current values are indistinguishable on every pre-file exit; a valid first export page assigns an OwnedPrivateFile before any required dereference.',
-    locations: exactLocations(589, 66, 589, 83),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["throw new DOMException('The export session expired.', 'AbortError');"],
-    replacements: ['""'],
-    reason:
-      'The abort message is never rendered or otherwise consumed; the already-aborted controller suppresses the UI error.',
-    locations: exactLocations(609, 36, 609, 65),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["throw new DOMException('The export session expired.', 'AbortError');"],
-    replacements: ['""'],
-    reason:
-      'The DOMException name is likewise unobserved because suppression keys off controller.signal.aborted.',
-    locations: exactLocations(609, 67, 609, 79),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["throw new Error('The export contains an invalid attempt.');"],
-    replacements: ['""'],
-    reason:
-      'The internal invalid-attempt serialization message is sanitized to the same localized export fallback.',
-    locations: exactLocations(615, 31, 615, 72),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["throw new Error('The export snapshots are invalid.');"],
-    replacements: ['""'],
-    reason:
-      'The internal invalid-snapshot serialization message is sanitized to the same localized export fallback.',
-    locations: exactLocations(627, 31, 627, 66),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ["if (!documentStarted) throw new Error('The export returned no pages.');"],
-    replacements: ['false'],
-    reason:
-      'Without an attempt page, the following attempt/practice-cycle/recording completion guards still throw the same sanitized export failure; with a page this condition is already false.',
-    locations: exactLocations(713, 11, 713, 27),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["if (!documentStarted) throw new Error('The export returned no pages.');"],
-    replacements: ['""'],
-    reason: 'The no-page Error text is sanitized to the same localized export fallback.',
-    locations: exactLocations(713, 45, 713, 76),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: [
-      "if (completedArtifact === null) throw new Error('The export file is unavailable.');",
-    ],
-    replacements: ['false'],
-    reason:
-      'documentStarted becomes true only after assigning and writing exportArtifact.current, so the completedArtifact null branch is unreachable.',
-    locations: exactLocations(720, 11, 720, 37),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: [
-      "if (completedArtifact === null) throw new Error('The export file is unavailable.');",
-    ],
-    replacements: ['""'],
-    reason: 'The missing-artifact Error text is unreachable and sanitized in any case.',
-    locations: exactLocations(720, 55, 720, 88),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'OptionalChaining',
-    originals: ['exportArtifact.current?.release();'],
-    replacements: ['exportArtifact.current.release'],
-    reason:
-      'When no artifact exists, direct dereference throws inside the surrounding best-effort catch; when one exists, both variants release it.',
-    locations: exactLocations(739, 9, 739, 40),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderCanHandle() || !current.enabled) return;'],
-    replacements: ['false'],
-    reason:
-      'applyReminder repeats the render fence, and hour-step handlers are rendered only while the captured reminder is enabled.',
-    locations: exactLocations(902, 9, 902, 47),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'LogicalOperator',
-    originals: ['if (!renderCanHandle() || !current.enabled) return;'],
-    replacements: ['!renderCanHandle() && !current.enabled'],
-    reason:
-      'The render fence is repeated by applyReminder and a disabled reminder has no hour-step handler, so weakening this pair is unobservable.',
-    locations: exactLocations(902, 9, 902, 47),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
-    replacements: ['false'],
-    reason:
-      'retakeTest is invoked only by the confirmation callback immediately after owner and render checks; no await permits busy/logout ownership to change between them.',
-    locations: exactLocations(930, 9, 930, 77),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'LogicalOperator',
-    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
-    replacements: ['(!renderCanHandle() || retakeBusyRef.current) && logoutBusyRef.current'],
-    reason: 'Same unreachable defensive retake guard as the whole conditional entry.',
-    locations: exactLocations(930, 9, 930, 77),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
-    replacements: ['false'],
-    reason: 'Same unreachable defensive retake guard, for its render/busy prefix node.',
-    locations: exactLocations(930, 9, 930, 52),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'LogicalOperator',
-    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
-    replacements: ['!renderCanHandle() && retakeBusyRef.current'],
-    reason: 'Same unreachable defensive retake guard, for its render/busy operator node.',
-    locations: exactLocations(930, 9, 930, 52),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BlockStatement',
-    originals: [
-      'if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {\n      return false;\n    }',
-    ],
-    replacements: ['{}'],
-    reason: 'The guarded return is unreachable on retakeTest’s sole call path.',
-    locations: exactLocations(930, 79, 932, 6),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['return false;'],
-    replacements: ['true'],
-    reason: 'The guarded return is unreachable on retakeTest’s sole call path.',
-    locations: exactLocations(931, 14, 931, 19),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['return true;'],
-    replacements: ['false'],
-    reason:
-      'The false return only asks the confirmation callback to publish the already-locked header once more; retakeBusyRef is already true.',
-    locations: exactLocations(978, 12, 978, 16),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderOwnsIdentity()) return;'],
-    replacements: ['false'],
-    reason:
-      'Identity and unmount cleanup clear retakeConfirmingRef first, so the preceding owner check rejects every stale close callback before this guard.',
-    locations: exactLocations(997, 11, 997, 32),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderOwnsIdentity()) return;'],
-    replacements: ['false'],
-    reason:
-      'The confirmation owner is cleared on identity loss, so the preceding owner check rejects stale confirm callbacks before this guard.',
-    locations: exactLocations(1012, 17, 1012, 38),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['if (!retakeTest()) publishNavigationLock();'],
-    replacements: ['retakeTest()'],
-    reason:
-      'On the only reachable path retakeTest returns true; the mutation performs one redundant publish of the already-locked header.',
-    locations: exactLocations(1014, 17, 1014, 30),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'OptionalChaining',
-    originals: ["nameDirtyRef.current = value !== (userRef.current?.name ?? '');"],
-    replacements: ['userRef.current.name'],
-    reason:
-      'renderCanHandle on a rendered TextInput implies the current session still has a non-null user, so optional chaining cannot short-circuit.',
-    locations: exactLocations(1110, 49, 1110, 70),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["nameDirtyRef.current = value !== (userRef.current?.name ?? '');"],
-    replacements: ['"Stryker was here!"'],
-    reason:
-      'The null-user fallback is unreachable after renderCanHandle succeeds for a rendered profile input.',
-    locations: exactLocations(1110, 74, 1110, 76),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'OptionalChaining',
-    originals: ["const currentName = userRef.current?.name ?? '';"],
-    replacements: ['userRef.current.name'],
-    reason:
-      'renderOwnsIdentity on a rendered profile input implies userRef.current is non-null, so optional chaining cannot short-circuit.',
-    locations: exactLocations(1124, 37, 1124, 58),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: ["const currentName = userRef.current?.name ?? '';"],
-    replacements: ['"Stryker was here!"'],
-    reason:
-      'The null-user fallback is unreachable after renderOwnsIdentity succeeds for a rendered profile input.',
-    locations: exactLocations(1124, 62, 1124, 64),
-  },
-  {
-    file: 'src/app/settings/change-password.tsx',
-    mutator: 'OptionalChaining',
-    originals: [
-      'onSubmitEditing={() => newPasswordRef.current?.focus()}',
-      'onSubmitEditing={() => confirmPasswordRef.current?.focus()}',
-    ],
-    replacements: ['newPasswordRef.current.focus', 'confirmPasswordRef.current.focus'],
-    count: 2,
-    reason:
-      'Both refs are attached to unconditionally rendered TextInputs in the same tree as the handler. onSubmitEditing can only fire from a committed, mounted tree, by which point React has assigned every ref, so .current is never null where the guard runs.',
-    locations: exactLocations(181, 38, 181, 67, 215, 38, 215, 71),
-  },
-  {
-    file: 'src/app/settings/change-password.tsx',
-    mutator: 'ObjectLiteral',
-    originals: [
-      'const [visibleFields, setVisibleFields] = useState<Record<FieldName, boolean>>({\n    current: false,\n    next: false,\n    confirm: false,\n  });',
-    ],
-    replacements: ['{}'],
-    reason:
-      'Every read of visibleFields is truthiness-coerced (secureTextEntry={!visibleFields.X}, and a ternary on the toggle), where undefined and false are interchangeable, and the updater !fields[field] yields true from either. The replacement is also not type-valid, so it could not exist in real source.',
-    locations: exactLocations(40, 82, 44, 4),
-  },
-  {
     file: 'src/lib/api.ts',
     mutator: 'Regex',
     originals: ["const bareHost = host.replace(/^\\[|\\]$/g, '');"],
     replacements: ['/\\[|\\]$/g', '/^\\[|\\]/g'],
+    count: 2,
     reason:
       'host comes from WHATWG URL.hostname, which permits brackets only as the outer delimiters of an IPv6 literal. Dropping either regex anchor therefore cannot change a replacement target.',
-    locations: exactLocations(66, 39, 66, 49),
+    locations: exactLocations(66, 39, 66, 49, 66, 39, 66, 49),
   },
   {
     file: 'src/lib/api.ts',
@@ -1821,159 +1419,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     reason:
       'Login synchronously sets mountedRef true in its mount layout effect before an event or async continuation can read the seed.',
     locations: exactLocations(57, 29, 57, 33),
-  },
-  {
-    file: 'src/app/(auth)/signup.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const mountedRef = useRef(true);'],
-    replacements: ['false'],
-    reason:
-      'Signup synchronously sets mountedRef true in its mount layout effect before an event or async continuation can read the seed.',
-    locations: exactLocations(64, 29, 64, 33),
-  },
-  {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'The login navigation-lock publisher is called initially while mounted, and its async-finalizer caller already sits inside an equivalent mountedRef guard.',
-    locations: exactLocations(66, 9, 66, 28),
-  },
-  {
-    file: 'src/app/(auth)/signup.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'The signup navigation-lock publisher is called initially while mounted, and its async-finalizer caller already sits inside an equivalent mountedRef guard.',
-    locations: exactLocations(73, 9, 73, 28),
-  },
-  {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'After unmount, weakening the login catch guard only computes safe copy and targets detached React state, which React discards without an external effect.',
-    locations: exactLocations(122, 11, 122, 30),
-  },
-  {
-    file: 'src/app/(auth)/signup.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'After unmount, weakening the signup catch guard only computes safe copy and targets detached React state, which React discards without an external effect.',
-    locations: exactLocations(127, 11, 127, 30),
-  },
-  {
-    file: 'src/app/(auth)/login.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (mountedRef.current) {'],
-    replacements: ['true'],
-    reason:
-      'In the login finalizer the nested navigation publisher rechecks mountedRef and the remaining setState targets a detached fiber, so forcing the outer guard true cannot publish after unmount.',
-    locations: exactLocations(130, 11, 130, 29),
-  },
-  {
-    file: 'src/app/(auth)/signup.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (mountedRef.current) {'],
-    replacements: ['true'],
-    reason:
-      'In the signup finalizer the nested navigation publisher rechecks mountedRef and the remaining setState targets a detached fiber, so forcing the outer guard true cannot publish after unmount.',
-    locations: exactLocations(137, 11, 137, 29),
-  },
-  {
-    file: 'src/app/(auth)/signup.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The signup mount effect receives a dependency literal whose constant element compares equal on every render, preserving its setup and cleanup lifetime.',
-    locations: exactLocations(71, 6, 71, 8),
-  },
-  {
-    file: 'src/app/(auth)/forgot-password.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const mountedRef = useRef(true);'],
-    replacements: ['false'],
-    reason:
-      'Forgot password overwrites the mounted seed to true in a layout effect before any user event or async continuation can observe it.',
-    locations: exactLocations(33, 29, 33, 33),
-  },
-  {
-    file: 'src/app/(auth)/reset-password.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const mountedRef = useRef(true);'],
-    replacements: ['false'],
-    reason:
-      'Reset password overwrites the mounted seed to true in a layout effect before any user event or async continuation can observe it.',
-    locations: exactLocations(54, 29, 54, 33),
-  },
-  {
-    file: 'src/app/(auth)/forgot-password.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The forgot-password mount layout effect receives a constant dependency literal, so setup and cleanup still run exactly once.',
-    locations: exactLocations(40, 6, 40, 8),
-  },
-  {
-    file: 'src/app/(auth)/reset-password.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The reset-password mount layout effect receives a constant dependency literal, so setup and cleanup still run exactly once.',
-    locations: exactLocations(61, 6, 61, 8),
-  },
-  {
-    file: 'src/app/(auth)/forgot-password.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'The forgot-password navigation-lock publisher is synchronous while mounted, and its async finalizer already guards invocation with mountedRef.',
-    locations: exactLocations(42, 9, 42, 28),
-  },
-  {
-    file: 'src/app/(auth)/reset-password.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'The reset-password navigation-lock publisher is synchronous while mounted, and its async finalizer already guards invocation with mountedRef.',
-    locations: exactLocations(63, 9, 63, 28),
-  },
-  {
-    file: 'src/app/(auth)/forgot-password.tsx',
-    mutator: 'ConditionalExpression',
-    originals: [
-      'if (mountedRef.current) setSentEmail(requestedEmail);',
-      "if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));",
-      'if (mountedRef.current) {',
-    ],
-    replacements: ['true'],
-    count: 3,
-    reason:
-      'Across forgot-password success, catch, and finally paths, forcing a late mounted check only targets detached React state; the nested navigation publisher retains its own mounted fence.',
-    locations: exactLocations(80, 11, 80, 29, 84, 11, 84, 29, 87, 11, 87, 29),
-  },
-  {
-    file: 'src/app/(auth)/reset-password.tsx',
-    mutator: 'ConditionalExpression',
-    originals: [
-      "if (mountedRef.current) setError(userMessageForError(err, t('cp.failed')));",
-      'if (mountedRef.current) {',
-    ],
-    replacements: ['true'],
-    count: 2,
-    reason:
-      'Across reset-password catch and finally paths, forcing a late mounted check only targets detached React state; the nested navigation publisher retains its own mounted fence.',
-    locations: exactLocations(115, 11, 115, 29, 118, 11, 118, 29),
   },
   {
     file: 'src/app/(tabs)/home.tsx',
@@ -2281,15 +1726,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     locations: exactLocations(329, 6, 329, 28),
   },
   {
-    file: 'src/app/settings/change-password.tsx',
-    mutator: 'BooleanLiteral',
-    originals: ['const mountedRef = useRef(false);'],
-    replacements: ['true'],
-    reason:
-      'Change password synchronously sets mountedRef true in its mount layout effect before events can read its seed.',
-    locations: exactLocations(51, 29, 51, 34),
-  },
-  {
     file: 'src/app/settings/delete-account.tsx',
     mutator: 'BooleanLiteral',
     originals: ['const mountedRef = useRef(false);'],
@@ -2299,15 +1735,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     locations: exactLocations(46, 29, 46, 34),
   },
   {
-    file: 'src/app/settings/change-password.tsx',
-    mutator: 'ArrayDeclaration',
-    originals: ['}, []);'],
-    replacements: ['["Stryker was here"]'],
-    reason:
-      'The change-password mount layout effect receives a constant dependency literal and retains the same setup/cleanup lifetime.',
-    locations: exactLocations(58, 6, 58, 8),
-  },
-  {
     file: 'src/app/settings/delete-account.tsx',
     mutator: 'ArrayDeclaration',
     originals: ['}, []);'],
@@ -2315,15 +1742,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     reason:
       'The delete-account mount layout effect receives a constant dependency literal and retains the same setup/cleanup lifetime.',
     locations: exactLocations(54, 6, 54, 8),
-  },
-  {
-    file: 'src/app/settings/change-password.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!mountedRef.current) return;'],
-    replacements: ['false'],
-    reason:
-      'After unmount, weakening the password-change catch guard only computes safe copy and targets detached React state; the finally navigation update remains mounted-guarded.',
-    locations: exactLocations(111, 11, 111, 30),
   },
   {
     file: 'src/app/settings/delete-account.tsx',
@@ -2608,55 +2026,6 @@ const redesignRePinnedEquivalents = Object.freeze([
   {
     file: 'src/lib/api.ts',
     mutator: 'ConditionalExpression',
-    originals: ['if (nextCursor !== null) {'],
-    replacements: ['true'],
-    reason:
-      'For a terminal null cursor, the private seenCursors set contains only validated UUID strings, so has(null) is false. The forced branch only adds null before the following null guard returns and discards the set.',
-    locations: exactLocations(1252, 9, 1252, 28),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'StringLiteral',
-    originals: [
-      "throw new DOMException('The export session expired.', 'AbortError');",
-      "throw new Error('The export contains an invalid recording.');",
-      "if (!recordingsStarted) throw new Error('The recording export returned no pages.');",
-    ],
-    replacements: ['""'],
-    count: 4,
-    reason:
-      'These locally constructed export failures are non-ApiError exceptions. userMessageForError always replaces them with localized fallback copy, so their message and DOMException name literals cannot reach UI or alter cleanup.',
-    locations: exactLocations(
-      683,
-      36,
-      683,
-      65,
-      683,
-      67,
-      683,
-      79,
-      694,
-      29,
-      694,
-      72,
-      718,
-      47,
-      718,
-      88,
-    ),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'ConditionalExpression',
-    originals: ['if (!renderCanHandle()) return;'],
-    replacements: ['false'],
-    reason:
-      'toggleReminder immediately delegates to applyReminder, whose first synchronous guard repeats renderCanHandle before any ref, state, notification, or native side effect. The wrapper guard is redundant.',
-    locations: exactLocations(897, 9, 897, 27),
-  },
-  {
-    file: 'src/lib/api.ts',
-    mutator: 'ConditionalExpression',
     originals: [
       "return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= maxSeconds",
     ],
@@ -2673,19 +2042,6 @@ const redesignRePinnedEquivalents = Object.freeze([
     reason:
       'The following Number.isFinite(hours) check independently rejects every non-number and non-finite value, so this explicit typeof check cannot decide acceptance.',
     locations: exactLocations(540, 7, 540, 32),
-  },
-  {
-    file: 'src/app/settings/index.tsx',
-    mutator: 'OptionalChaining',
-    originals: [
-      "languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === lang.code;",
-      "languageTarget?.scope === 'native' &&",
-    ],
-    replacements: ['languageTarget.scope'],
-    count: 2,
-    reason:
-      'languageBusy and its non-null languageTarget are installed and cleared in the same React batches. The leading languageBusy conjunction prevents either direct property access while the target may be null.',
-    locations: exactLocations(1178, 31, 1178, 52, 1230, 15, 1230, 36),
   },
   {
     file: 'src/app/(tabs)/practice/help.tsx',
@@ -5204,9 +4560,2237 @@ const redesignRePinnedEquivalents = Object.freeze([
       'When the optional callback is absent, the direct call throws inside the surrounding try and is swallowed; when present both forms invoke it, so the committed deletion and visible state are identical.',
     locations: exactLocations(721, 32, 721, 67),
   },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The latch re-arms in a useFocusEffect callback that both the real expo-router hook and the test mock execute at mount, before any press event can be dispatched, so the initial true is deterministically overwritten with false. No test can observe the pre-effect ref value because React flushes effects before user events reach the component.',
+    locations: exactLocations(60, 39, 60, 44),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useCallback(() => {\n      navigationStartedRef.current = false;\n      return () => undefined;\n    }, []),',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The callback body only re-arms the one-navigation latch on (re)focus. With the stable useCallback([]) identity the test mock (useEffect keyed on the callback) runs it exactly once at mount when the ref is already false, so removing the body is indistinguishable: the latch starts false either way and no test can trigger a genuine refocus of the same mounted instance.',
+    locations: exactLocations(62, 23, 65, 6),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      "The only dependency is a string literal that compares equal to itself across renders under React's Object.is dependency check, so the useCallback memo is preserved exactly as with [] and the focus effect never re-runs. No rerender can change behavior, making the mutant unobservable.",
+    locations: exactLocations(65, 8, 65, 10),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'Effect dependency literals that are stable strings keep the effect from re-running (equal under Object.is), so mountedRef bookkeeping is identical: set true at mount, false at unmount.',
+    locations: exactLocations(81, 6, 81, 8),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'Effect dependency literals that are stable strings keep the effect from re-running (equal under Object.is), so mountedRef bookkeeping is identical: set true at mount, false at unmount.',
+    locations: exactLocations(107, 6, 107, 8),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      'publishNavigationLock is called from exactly two sites: synchronously inside the press handler while mounted, and in the finally block already guarded by `if (mountedRef.current)`. The inner guard is therefore dead code — after an unmount the caller guard prevents the call, and before/during the request mountedRef is true, so forcing the condition false changes nothing any test can observe.',
+    locations: exactLocations(83, 9, 83, 28),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      'The async finalizer already sits inside an equivalent mountedRef guard at its call site, so weakening this inner early-return cannot publish a navigation lock after unmount.',
+    locations: exactLocations(136, 11, 136, 30),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'BlockStatement',
+    originals: ['return () => {\n      active = false;\n    };'],
+    replacements: ['{}'],
+    reason:
+      'The active flag only suppresses a setSessionNotice state write after unmount; the write would land on a detached fiber and produce no render, error, or mock call a test can inspect. Removing the cleanup is a React-internal post-unmount guard branch, not observable behavior.',
+    locations: exactLocations(104, 18, 106, 6),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['active = false;'],
+    replacements: ['true'],
+    reason:
+      'Mutating active to true in the cleanup leaves the flag true, which only permits a setSessionNotice write on an unmounted component whose state write hits a detached fiber. No assertion on rendered output, mocks, or navigation can distinguish it.',
+    locations: exactLocations(105, 16, 105, 21),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['email.trim().length <= MAX_EMAIL_LENGTH &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct in canSubmit: any email over MAX_EMAIL_LENGTH also fails emailAddressError, because isValidEmailAddress enforces the same length bound and the very next conjunct requires emailError === null. Forcing the conjunct true leaves the submit gate truth table unchanged for every input.',
+    locations: exactLocations(116, 5, 116, 44),
+  },
+  {
+    file: 'src/app/(auth)/login.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      'When this finally-block guard is false (post-unmount), publishNavigationLock is itself blocked by its own mountedRef guard before navigation.setOptions is reached, and setBusy(false) writes state on a detached fiber. The two existing unmount tests already prove setOptions is not called; forcing the branch true produces no new observable effect.',
+    locations: exactLocations(144, 11, 144, 29),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const mountedRef = useRef(true);'],
+    replacements: ['false'],
+    reason:
+      'The useLayoutEffect at mount sets mountedRef.current = true before any effect, event, or assertion can read it, so the initial false is deterministically overwritten. No test can observe the pre-layout-effect ref value.',
+    locations: exactLocations(68, 29, 68, 33),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The useFocusEffect callback (executed at mount by both real expo-router and the test mock) resets the latch to false before any press can be dispatched, so the initial true is unobservable.',
+    locations: exactLocations(71, 39, 71, 44),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useCallback(() => {\n      navigationStartedRef.current = false;\n      return () => undefined;\n    }, []),',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The body only re-arms the navigation latch on refocus; with the stable callback identity the mocked focus effect runs once at mount when the ref is already false. No test can produce a genuine refocus of the same mounted instance, so the emptied body is indistinguishable.',
+    locations: exactLocations(73, 23, 76, 6),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'A string-literal dependency array compares equal across renders under Object.is, preserving the useCallback memo exactly as [] does; the focus callback is never recreated and the effect never re-runs. Unobservable.',
+    locations: exactLocations(76, 8, 76, 10),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'Stable string deps keep the useLayoutEffect from re-running (equal under Object.is), so mountedRef lifecycle bookkeeping is identical.',
+    locations: exactLocations(92, 6, 92, 8),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      "publishNavigationLock's inner mounted guard is dead code: both call sites either run synchronously while mounted (the press handler) or sit behind the finally block's own `if (mountedRef.current)` guard. Forcing the guard false never lets navigation.setOptions run post-unmount.",
+    locations: exactLocations(94, 9, 94, 28),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      'The async finalizer already sits behind its own `if (mountedRef.current)` guard at the call site, so this inner early-return can never be the deciding fence after unmount.',
+    locations: exactLocations(148, 11, 148, 30),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['email.trim().length <= MAX_EMAIL_LENGTH &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct: an over-length email fails emailAddressError (isValidEmailAddress enforces the same bound), and the next conjunct requires emailError === null, so the canSubmit truth table is unchanged for every input.',
+    locations: exactLocations(125, 5, 125, 44),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['confirmPassword.length > 0 &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct: canSubmit already requires confirmPassword === password while passwordPolicyError(password) === null forces a nonempty password of at least 8 chars, so an empty confirmation can never pass the equality conjunct. Forcing true leaves the gate unchanged.',
+    locations: exactLocations(128, 5, 128, 31),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'EqualityOperator',
+    originals: ['confirmPassword.length > 0 &&'],
+    replacements: ['confirmPassword.length >= 0'],
+    reason:
+      'Same redundancy as the forced-true variant: the subsequent confirmPassword === password conjunct plus the nonempty-password policy guarantee the confirmation is nonempty whenever canSubmit is true, so >= 0 vs > 0 never decides the gate.',
+    locations: exactLocations(128, 5, 128, 31),
+  },
+  {
+    file: 'src/app/(auth)/signup.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      "Forced-true only matters post-unmount, where publishNavigationLock's own mounted guard still blocks navigation.setOptions and setBusy(false) writes to a detached fiber. The existing external-unmount tests prove no setOptions call escapes; nothing else is observable.",
+    locations: exactLocations(158, 11, 158, 29),
+  },
+  {
+    file: 'src/app/(auth)/welcome.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The welcome test mock invokes the useFocusEffect callback synchronously on every render including mount, and the real hook runs it on focus, so the latch is reset to false before any press event. The initial true is unobservable.',
+    locations: exactLocations(26, 39, 26, 44),
+  },
+  {
+    file: 'src/app/(auth)/welcome.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The test mock calls the focus effect unconditionally on every render regardless of callback identity, and the string-literal deps array preserves the useCallback memo anyway, so neither clean nor mutated code changes how often the latch-reset body runs. Unobservable.',
+    locations: exactLocations(31, 8, 31, 10),
+  },
+  {
+    file: 'src/app/(auth)/welcome.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["feature.tint === 'primary' && styles.badgePrimary,"],
+    replacements: ['true'],
+    reason:
+      'badgePrimary is the FIRST conditional entry in the badge style array, and every feature also appends its own tint style later (badgeSuccess/badgeAccent), which wins in StyleSheet.flatten for the shared backgroundColor property; for the primary feature the result is identical too. Only flattened styles are observable, so the always-present primary entry is dead weight.',
+    locations: exactLocations(86, 17, 86, 43),
+  },
+  // daily-reminder.ts — getDailyReminderUnsafe never rejects (every await is
+  // individually caught and parseDailyReminder is total), so the try/catch
+  // around the re-read in refreshDailyReminderLanguage is unreachable defense.
+  {
+    file: 'src/lib/daily-reminder.ts',
+    mutator: 'BlockStatement',
+    originals: ['} catch {\n    return { hour: stored.hour, uiLanguage: language };\n  }'],
+    replacements: ['{}'],
+    reason:
+      'The catch body guards a getDailyReminderUnsafe() rejection that cannot happen: getItemAsync is wrapped in its own catch, JSON.parse in another, and parseDailyReminder is total on object input. Unreachable defensive code; no test can execute it.',
+    locations: exactLocations(250, 13, 252, 6),
+  },
+  {
+    file: 'src/lib/daily-reminder.ts',
+    mutator: 'ObjectLiteral',
+    originals: ['return { hour: stored.hour, uiLanguage: language };'],
+    replacements: ['{}'],
+    reason:
+      'Same unreachable catch as the BlockStatement pin above: getDailyReminderUnsafe never rejects, so this return statement is dead defensive code.',
+    locations: exactLocations(251, 14, 251, 57),
+  },
+  {
+    file: 'src/lib/daily-reminder.ts',
+    mutator: 'BlockStatement',
+    originals: ['} catch {\n    return null;\n  }'],
+    replacements: ['{}'],
+    reason:
+      'The mutated catch falls through to return undefined instead of null, but every consumer of getDailyReminderUnsafe only applies a falsy check (!stored in getDailyReminder and refreshDailyReminderLanguage, `if (previous)` in disableDailyReminderUnsafe), and the exported getDailyReminder re-normalizes to null. undefined and null are indistinguishable through every exported path.',
+    locations: exactLocations(92, 11, 94, 4),
+  },
+  {
+    file: 'src/lib/daily-reminder.ts',
+    mutator: 'BooleanLiteral',
+    originals: ['let granted = false;'],
+    replacements: ['true'],
+    count: 2,
+    reason:
+      'Dead initializer: granted is read only after `granted = (await notifications().getPermissionsAsync()).granted` unconditionally overwrites it; when the await rejects, the catch returns before granted is ever read. The initial value is never observed.',
+    locations: exactLocations(108, 19, 108, 24, 228, 19, 228, 24),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'StringLiteral',
+    originals: ["? 'no-profile'"],
+    replacements: ['""'],
+    reason:
+      'The string feeds only the remount key `${sessionVersion}:${placementPhase}`. Under the mutant the no-profile key becomes `${v}:`, which is still distinct from every authenticated key (`${v}:${id}:...`, ids are non-empty), so remount semantics — the only observable behavior — are identical.',
+    locations: exactLocations(78, 7, 78, 19),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'EqualityOperator',
+    originals: ["user.diagnosticAcknowledged === false ? 'reveal-pending' : 'acknowledged'"],
+    replacements: ['user.diagnosticAcknowledged !== false'],
+    reason:
+      'Pure swap of the two remount-key labels (reveal-pending/acknowledged). The mapping stays injective over the (acknowledged) tuple, so every transition changes or preserves the key exactly as before; the string content is never rendered, asserted, or persisted.',
+    locations: exactLocations(80, 9, 80, 46),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["user.diagnosticAcknowledged === false ? 'reveal-pending' : 'acknowledged'"],
+    replacements: ['true'],
+    reason:
+      'Another injective relabel of the remount-key discriminator (undefined joins false in the else arm under both mappings where it matters). No key collision is possible, so no test can distinguish it through the only observable channel — remount-or-not.',
+    locations: exactLocations(80, 41, 80, 46),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'StringLiteral',
+    originals: ["user.diagnosticAcknowledged === false ? 'reveal-pending' : 'acknowledged'"],
+    replacements: ['""'],
+    reason:
+      'Injective relabel of the remount-key labels (false->"", true->"acknowledged"): the key still differs exactly when the acknowledged phase differs, and the label text is never observable outside the React key.',
+    locations: exactLocations(80, 49, 80, 65),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'StringLiteral',
+    originals: ["user.diagnosticAcknowledged === false ? 'reveal-pending' : 'acknowledged'"],
+    replacements: ['""'],
+    reason:
+      'Injective relabel of the remount-key labels (false->"reveal-pending", true->""): identical remount behavior; the label never reaches any output a test can read.',
+    locations: exactLocations(80, 68, 80, 82),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const mountedRef = useRef(true);'],
+    replacements: ['false'],
+    reason:
+      'Seed value is unobservable: the mount useLayoutEffect (lines 66-71) synchronously re-assigns mountedRef.current = true before any handler or continuation can run, so no code path ever reads the initial seed.',
+    locations: exactLocations(47, 29, 47, 33),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'Seed value is unobservable: the useFocusEffect callback runs after mount and resets navigationStartedRef.current = false before any press can spend the latch, so the initial true is never read.',
+    locations: exactLocations(50, 39, 50, 44),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useCallback(() => {\n      navigationStartedRef.current = false;\n      return () => undefined;\n    }, []),',
+    ],
+    replacements: ['{}'],
+    reason:
+      'Emptying the focus callback only matters if the latch re-arms after being spent within one mount. The latch starts false, so the first navigation is unaffected, and the mocked router/useFocusEffect in tests never replays a focus transition after the latch is spent (a real refocus requires a back gesture plus refocus the mock environment cannot produce).',
+    locations: exactLocations(52, 23, 55, 6),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The callback body reads no reactive values (only a ref write), so changing its identity only re-runs the focus effect, which re-executes the same ref-arms-false assignment already applied at mount; behavior is identical.',
+    locations: exactLocations(55, 8, 55, 10),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'useLayoutEffect with a constant (though non-empty) dep array still runs exactly once per mount and once per unmount for the cleanup; the effect only writes mountedRef, so no observable difference exists.',
+    locations: exactLocations(71, 6, 71, 8),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      'Dead defensive guard: every reachable caller of publishNavigationLock is either a user handler (component mounted) or a finally block already gated on mountedRef.current itself, so the guard is never evaluated while unmounted.',
+    locations: exactLocations(73, 9, 73, 28),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['trimmedEmail.length <= MAX_EMAIL_LENGTH &&'],
+    replacements: ['true'],
+    reason:
+      'Dead redundant conjunct: emailAddressError (lib/identity-validation.ts) returns a non-null complaint for any value whose trim is longer than MAX_EMAIL_LENGTH, and canSubmit already requires emailError === null, so the length conjunct can never change the result.',
+    locations: exactLocations(92, 5, 92, 44),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only: with the guard forced true, the only new behavior is setState on a detached fiber after external unmount, which React discards (no DOM, no observable output, no navigation/setOptions side effect).',
+    locations: exactLocations(112, 11, 112, 29),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));",
+    ],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only: forcing it true merely calls setError on a detached fiber after external unmount, which React discards with no observable output.',
+    locations: exactLocations(119, 11, 119, 29),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only: with it forced true, publishNavigationLock is still blocked by its own !mountedRef.current guard and setBusy(false) hits a detached fiber; neither is observable after unmount.',
+    locations: exactLocations(122, 11, 122, 29),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) setSentNoteKey((key) => key + 1);'],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only: forcing it true merely calls setSentNoteKey on a detached fiber after external unmount, which React discards with no observable output.',
+    locations: exactLocations(142, 11, 142, 29),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "if (mountedRef.current) setError(userMessageForError(err, t('reset.requestFailed')));",
+    ],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only (resend catch): forcing it true merely calls setError on a detached fiber after external unmount, which React discards with no observable output.',
+    locations: exactLocations(144, 11, 144, 29),
+  },
+  {
+    file: 'src/app/(auth)/forgot-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only (resend finally): publishNavigationLock remains blocked by its own !mountedRef.current guard and setBusy(false) hits a detached fiber; neither is observable after unmount.',
+    locations: exactLocations(147, 11, 147, 29),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const mountedRef = useRef(true);'],
+    replacements: ['false'],
+    reason:
+      'Seed value is unobservable: the mount useLayoutEffect (lines 82-87) synchronously re-assigns mountedRef.current = true before any handler or continuation can run.',
+    locations: exactLocations(63, 29, 63, 33),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'Seed value is unobservable: the useFocusEffect callback runs after mount and resets navigationStartedRef.current = false before any press can spend the latch.',
+    locations: exactLocations(66, 39, 66, 44),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useCallback(() => {\n      navigationStartedRef.current = false;\n      return () => undefined;\n    }, []),',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The latch starts false so the first navigation is unaffected; re-arming after a spent latch needs a refocus within one mount, which the mocked router/useFocusEffect cannot replay.',
+    locations: exactLocations(68, 23, 71, 6),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The callback reads no reactive values; a changed identity only re-runs the focus effect, re-applying the same ref-arms-false assignment already applied at mount.',
+    locations: exactLocations(71, 8, 71, 10),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'useLayoutEffect with a constant non-empty dep array still runs once per mount plus cleanup once per unmount; the effect only writes mountedRef, so behavior is identical.',
+    locations: exactLocations(87, 6, 87, 8),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      'Dead defensive guard: publishNavigationLock is only invoked from mounted handlers or finally blocks already gated on mountedRef.current, so the guard is never exercised while unmounted.',
+    locations: exactLocations(89, 9, 89, 28),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['trimmedEmail.length <= MAX_EMAIL_LENGTH &&'],
+    replacements: ['true'],
+    reason:
+      'Dead redundant conjunct: emailAddressError returns non-null for any trim longer than MAX_EMAIL_LENGTH and canSubmit already requires emailError === null, so this conjunct never changes the result.',
+    locations: exactLocations(112, 5, 112, 44),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['confirmPassword.length > 0 &&'],
+    replacements: ['true'],
+    reason:
+      'Dead redundant conjunct: canSubmit already requires passwordPolicyError(password) === null (so password is non-empty) and confirmPassword === password, which together imply confirmPassword.length > 0.',
+    locations: exactLocations(117, 5, 117, 31),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'EqualityOperator',
+    originals: ['confirmPassword.length > 0 &&'],
+    replacements: ['confirmPassword.length >= 0'],
+    reason:
+      'Same dead conjunct as above: confirmPassword === password with a policy-passing (non-empty) password already implies length > 0, so >= 0 never changes the gate result.',
+    locations: exactLocations(117, 5, 117, 31),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (mountedRef.current) setError(userMessageForError(err, t('cp.failed')));"],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only: forcing it true merely calls setError on a detached fiber after external unmount, which React discards with no observable output.',
+    locations: exactLocations(138, 11, 138, 29),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) {'],
+    replacements: ['true'],
+    reason:
+      'Post-unmount guard only (finally): publishNavigationLock remains blocked by its own !mountedRef.current guard and setBusy(false) hits a detached fiber; neither is observable after unmount.',
+    locations: exactLocations(141, 11, 141, 29),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ObjectLiteral',
+    originals: [
+      "inputAction: {\n    flexShrink: 1,\n    maxWidth: '45%',\n    minHeight: layout.minimumTarget,\n    minWidth: layout.minimumTarget,\n    justifyContent: 'center',\n    alignItems: 'center',\n    paddingHorizontal: spacing.sm,\n  },",
+    ],
+    replacements: ['{}'],
+    reason:
+      'Dead style: styles.inputAction is never referenced by this screen. The reveal control is the shared PasswordVisibilityToggle component, which brings its own styles; the entry is unreachable from any rendered element.',
+    locations: exactLocations(399, 16, 407, 4),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["maxWidth: '45%',"],
+    replacements: ['""'],
+    reason:
+      'Dead style value inside styles.inputAction, which no rendered element references (PasswordVisibilityToggle owns the reveal-control styles).',
+    locations: exactLocations(401, 15, 401, 20),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["justifyContent: 'center',"],
+    replacements: ['""'],
+    reason: 'Dead style value inside styles.inputAction, which no rendered element references.',
+    locations: exactLocations(404, 21, 404, 29),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["alignItems: 'center',"],
+    replacements: ['""'],
+    reason: 'Dead style value inside styles.inputAction, which no rendered element references.',
+    locations: exactLocations(405, 17, 405, 25),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ObjectLiteral',
+    originals: [
+      "inputActionText: {\n    flexShrink: 1,\n    color: colors.primary,\n    fontSize: 14,\n    fontWeight: '600',\n    textAlign: 'center',\n  },",
+    ],
+    replacements: ['{}'],
+    reason:
+      'Dead style: styles.inputActionText is never referenced by this screen; the reveal control is the shared PasswordVisibilityToggle with its own text styles.',
+    locations: exactLocations(408, 20, 414, 4),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["fontWeight: '600',"],
+    replacements: ['""'],
+    reason: 'Dead style value inside styles.inputActionText, which no rendered element references.',
+    locations: exactLocations(412, 17, 412, 22),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["textAlign: 'center',"],
+    replacements: ['""'],
+    reason: 'Dead style value inside styles.inputActionText, which no rendered element references.',
+    locations: exactLocations(413, 16, 413, 24),
+  },
+  {
+    file: 'src/app/(auth)/reset-password.tsx',
+    mutator: 'ObjectLiteral',
+    originals: ['controlDisabled: {\n    opacity: 0.5,\n  },'],
+    replacements: ['{}'],
+    reason:
+      'Dead style: styles.controlDisabled is never referenced by this screen; PasswordVisibilityToggle and the shared Button own their own disabled dimming, so this entry is unreachable from any rendered element.',
+    locations: exactLocations(415, 20, 417, 4),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const mountedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The useLayoutEffect below sets mountedRef.current = true in the same first commit, before any event handler can run, so the initial seed is unconditionally overwritten before it is ever read; no render, handler, or effect can observe the seed value.',
+    locations: exactLocations(56, 29, 56, 34),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      "The dependency array belongs to the mountedRef layout effect, whose deps are constant for the component's lifetime: with either literal the effect still runs exactly once on mount and its cleanup once on unmount, so no observable behavior can differ.",
+    locations: exactLocations(63, 6, 63, 8),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      "Removing the early return only lets the post-await success branch call setSaved/announce on a screen that has unmounted; React drops state writes to detached fibers with no rendered output, and the finally block's own mountedRef guard (line 138, unmutated) is what actually suppresses navigation option writes. The existing unmount tests already assert the observable side effects stay silent, and setSaved itself is unobservable once unmounted.",
+    locations: exactLocations(124, 11, 124, 30),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!mountedRef.current) return;'],
+    replacements: ['false'],
+    reason:
+      "Same detached-fiber argument for the catch branch: after unmount the setError write hits a detached fiber and renders nothing, and the finally block's own mountedRef guard still suppresses navigation options and busy-state writes. No test can observe an unmounted screen rendering an error string.",
+    locations: exactLocations(130, 11, 130, 30),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['onSubmitEditing={() => newPasswordRef.current?.focus()}'],
+    replacements: ['newPasswordRef.current.focus'],
+    reason:
+      'All three inputs mount in the same commit, so newPasswordRef.current is attached before the current field can ever receive an onSubmitEditing event; in the jest RN preset TextInput mocks as a class component whose ref is always the non-null instance. The optional-chaining guard is unreachable-defensive and no test can drive a null ref here without forking the preset mock.',
+    locations: exactLocations(200, 38, 200, 67),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['onSubmitEditing={() => confirmPasswordRef.current?.focus()}'],
+    replacements: ['confirmPasswordRef.current.focus'],
+    reason:
+      'Identical unreachable-defensive chaining: the confirmation input mounts in the same commit as the new-password input, so confirmPasswordRef.current is never null when onSubmitEditing can fire, and the mocked class TextInput always yields a non-null ref instance under jest.',
+    locations: exactLocations(234, 38, 234, 71),
+  },
+  {
+    file: 'src/app/settings/change-password.tsx',
+    mutator: 'StringLiteral',
+    originals: ["onChangeText={(value) => handleFieldEdit('confirm', value)}"],
+    replacements: ['""'],
+    reason:
+      "handleFieldEdit's branch chain ends in an unguarded else that sets the confirm password: with field === '' the 'current' and 'next' conditions are false and the else performs exactly the setConfirmPassword(value) + setError(null) sequence the 'confirm' label performs, so runtime behavior is byte-identical.",
+    locations: exactLocations(263, 56, 263, 65),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (mountedRef.current) setError(err.message);'],
+    replacements: ['true'],
+    reason:
+      "The guard only skips an setError when the screen has already unmounted (the AccountDeletionUnconfirmedError continuation after an await); a state write on a detached fiber produces no rendered output and no navigation option writes, and the finally block's own mountedRef guard (line 104, unmutated) still suppresses everything observable. No test can observe an unmounted screen rendering this message.",
+    locations: exactLocations(98, 13, 98, 31),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'ObjectLiteral',
+    originals: [
+      "  inputAction: {\n    flexShrink: 1,\n    maxWidth: '45%',\n    minHeight: layout.minimumTarget,\n    minWidth: layout.minimumTarget,\n    justifyContent: 'center',\n    alignItems: 'center',\n    paddingHorizontal: spacing.sm,\n  },",
+    ],
+    replacements: ['{}'],
+    reason:
+      'inputAction is a dead themedStyles entry: delete-account.tsx renders its reveal control through the shared PasswordVisibilityToggle component (which owns its own styles), and grep confirms no styles.inputAction reference anywhere in the file, so the object is never passed to StyleSheet.flatten or any element.',
+    locations: exactLocations(301, 16, 309, 4),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'StringLiteral',
+    originals: ["    maxWidth: '45%',"],
+    replacements: ['""'],
+    reason:
+      'A property of the dead, never-referenced styles.inputAction object (see the ObjectLiteral pin for the same block); no element in this file consumes it, so its value is unobservable.',
+    locations: exactLocations(303, 15, 303, 20),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'StringLiteral',
+    originals: ["    justifyContent: 'center',"],
+    replacements: ['""'],
+    reason:
+      'A property of the dead, never-referenced styles.inputAction object; it never reaches any rendered style, so the literal value is unobservable.',
+    locations: exactLocations(306, 21, 306, 29),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'StringLiteral',
+    originals: ["    alignItems: 'center',"],
+    replacements: ['""'],
+    reason:
+      'A property of the dead, never-referenced styles.inputAction object; it never reaches any rendered style, so the literal value is unobservable.',
+    locations: exactLocations(307, 17, 307, 25),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'ObjectLiteral',
+    originals: [
+      "  inputActionText: {\n    flexShrink: 1,\n    color: colors.primary,\n    fontSize: 14,\n    fontWeight: '600',\n    textAlign: 'center',\n  },",
+    ],
+    replacements: ['{}'],
+    reason:
+      'inputActionText is a dead themedStyles entry: no styles.inputActionText reference exists anywhere in delete-account.tsx (the reveal text glyph lives inside the shared PasswordVisibilityToggle), so the object is never consumed by any element or StyleSheet.flatten call.',
+    locations: exactLocations(310, 20, 316, 4),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'StringLiteral',
+    originals: ["    fontWeight: '600',"],
+    replacements: ['""'],
+    reason:
+      'A property of the dead, never-referenced styles.inputActionText object; it never reaches any rendered style, so the literal value is unobservable.',
+    locations: exactLocations(314, 17, 314, 22),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'StringLiteral',
+    originals: ["    textAlign: 'center',"],
+    replacements: ['""'],
+    reason:
+      'A property of the dead, never-referenced styles.inputActionText object; it never reaches any rendered style, so the literal value is unobservable.',
+    locations: exactLocations(315, 16, 315, 24),
+  },
+  {
+    file: 'src/app/settings/delete-account.tsx',
+    mutator: 'ObjectLiteral',
+    originals: ['  controlDisabled: {\n    opacity: 0.5,\n  },'],
+    replacements: ['{}'],
+    reason:
+      'controlDisabled is a dead themedStyles entry: delete-account.tsx disables its controls via component props (Button/PasswordVisibilityToggle disabled states) and never references styles.controlDisabled, so the object is never applied to any element.',
+    locations: exactLocations(317, 20, 319, 4),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The export contains an invalid practice cycle.');"],
+    replacements: ['""'],
+    reason:
+      'The message of a thrown non-ApiError never reaches the UI: exportData catches it and renders userMessageForError(error, t(settings.exportFailed)), which returns the fallback copy for every plain Error; nothing logs or asserts the text.',
+    locations: exactLocations(683, 29, 683, 77),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["if (!documentStarted) throw new Error('The export returned no pages.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: the thrown plain Error is always reshaped to the localized settings.exportFailed fallback by userMessageForError; the message text is never observable.',
+    locations: exactLocations(735, 45, 735, 76),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["if (!attemptsFinished) throw new Error('The attempt export did not finish.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error, so the message text is never observable.',
+    locations: exactLocations(736, 46, 736, 82),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The practice-cycle export did not finish.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error, so the message text is never observable.',
+    locations: exactLocations(738, 25, 738, 68),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "if (completedArtifact === null) throw new Error('The export file is unavailable.');",
+    ],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant, and the guard itself is unreachable-true (documentStarted implies exportArtifact.current was assigned in the same statement): the text is never observable.',
+    locations: exactLocations(742, 55, 742, 88),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new DOMException('The export session expired.', 'AbortError');"],
+    replacements: ['""'],
+    count: 2,
+    reason:
+      "Both the message and the DOMException name are unobservable: the throwing guard first calls controller.abort(), and exportData's catch suppresses every error while controller.signal.aborted is true, so no copy, log, or state ever reflects the exception's text or name (only the abort side effect, which this string does not touch).",
+    locations: exactLocations(631, 36, 631, 65, 705, 36, 705, 65),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new DOMException('The export session expired.', 'AbortError');"],
+    replacements: ['""'],
+    count: 2,
+    reason:
+      'The AbortError name is never inspected: the guard aborts the controller before throwing and the catch branch is suppressed by controller.signal.aborted, so the exception identity is entirely unobservable.',
+    locations: exactLocations(631, 67, 631, 79, 705, 67, 705, 79),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The export contains an invalid attempt.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error.',
+    locations: exactLocations(637, 31, 637, 72),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The export snapshots are invalid.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error.',
+    locations: exactLocations(649, 31, 649, 66),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The export contains an invalid recording.');"],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error.',
+    locations: exactLocations(716, 29, 716, 72),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "if (!recordingsStarted) throw new Error('The recording export returned no pages.');",
+    ],
+    replacements: ['""'],
+    reason:
+      'Message-only mutant: userMessageForError returns the localized settings.exportFailed fallback for every plain Error.',
+    locations: exactLocations(740, 47, 740, 88),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (!documentStarted) throw new Error('The export returned no pages.');"],
+    replacements: ['false'],
+    reason:
+      'Shadowed fail-closed chain: the only walker input that reaches this check with documentStarted false (no page callback ran) also leaves attemptsFinished/practiceCyclesStarted false, so line 736 throws identically (same exportFailed copy, no file claimed, no share) with or without this check.',
+    locations: exactLocations(735, 11, 735, 27),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (!attemptsFinished) throw new Error('The attempt export did not finish.');"],
+    replacements: ['false'],
+    reason:
+      'Shadowed: attemptsFinished can only be false here when the page callback never processed page.attemptsDone, which also leaves practiceCyclesStarted false, so line 737 throws the same user-visible exportFailed outcome; the recordings consumer is equally unreachable in both variants because its guard requires documentStarted and attemptsFinished.',
+    locations: exactLocations(736, 11, 736, 28),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!practiceCyclesStarted || !practiceCyclesFinished) {'],
+    replacements: ['false'],
+    reason:
+      'Shadowed: with either flag false the recordings consumer guard (line 695-705) rejects the session, so recordingsStarted stays false and line 740 throws the identical exportFailed outcome; no walker input can share a file through this branch because sharing requires the recordings section that only a finished practice-cycle walk writes.',
+    locations: exactLocations(737, 11, 737, 60),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!practiceCyclesStarted || !practiceCyclesFinished) {'],
+    replacements: ['!practiceCyclesStarted && !practiceCyclesFinished'],
+    reason:
+      "practiceCyclesStarted is set in the same statement that finishes the attempt section, so 'started true / finished false' is the only single-flag-false state, and it is already caught by the line-740 recordings check that fires identically for the && variant; 'started false / finished true' is unreachable because finished is only assigned inside the practice-cycle branch that requires started.",
+    locations: exactLocations(737, 11, 737, 60),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      "if (!practiceCyclesStarted || !practiceCyclesFinished) {\n        throw new Error('The practice-cycle export did not finish.');\n      }",
+    ],
+    replacements: ['{}'],
+    reason:
+      'Same shadowing as the condition mutant: any walk that reaches here with a flag false also fails the line-740 recordings-started check (the recordings consumer aborts on unfinished practice cycles), so the observable outcome (exportFailed, no share, file released) is identical.',
+    locations: exactLocations(737, 62, 739, 8),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "if (completedArtifact === null) throw new Error('The export file is unavailable.');",
+    ],
+    replacements: ['false'],
+    reason:
+      'Unreachable-true guard: exportArtifact.current is assigned in the same block that sets documentStarted and is never nulled before line 741, and the preceding checks already proved documentStarted, so completedArtifact is provably non-null here.',
+    locations: exactLocations(742, 11, 742, 37),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ObjectLiteral',
+    originals: ['const exportArtifact: { current: OwnedPrivateFile | null } = { current: null };'],
+    replacements: ['{}'],
+    reason:
+      'Every read of exportArtifact.current only distinguishes falsy vs truthy (the recordings-consumer guard and the finally release are skipped for null and undefined alike), and the only assignment (claimPrivateExportFile) happens before any truthy read; the initializer value is never otherwise observed.',
+    locations: exactLocations(611, 66, 611, 83),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['let practiceCyclesStarted = false;'],
+    replacements: ['true'],
+    reason:
+      'The flag is unconditionally reassigned in the same page callback that sets documentStarted and attemptsFinished (line 676) before any read (post-walker checks, recordings-consumer guard); when the walk ends earlier, an earlier check throws first, so the initializer is never read.',
+    locations: exactLocations(622, 35, 622, 40),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['let practiceCyclesFinished = false;'],
+    replacements: ['true'],
+    reason:
+      'The flag is reassigned on every practice-cycle page (line 692) before any read, and any walk that reaches the reads without processing such a page also fails the earlier attempts/practiceCycles-started checks, so the initializer value is never observed.',
+    locations: exactLocations(624, 36, 624, 41),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'OptionalChaining',
+    originals: [
+      "nameDirtyRef.current = value !== (userRef.current?.name ?? '');",
+      "const currentName = userRef.current?.name ?? '';",
+    ],
+    replacements: ['userRef.current.name'],
+    count: 2,
+    reason:
+      "userRef is initialized from the first render user and refreshed by a layout effect; both handlers only exist on committed renders where the screen's `if (!user) return null` gate guarantees user (and its name) is non-null, so the optional chain's null branch is dead code.",
+    locations: exactLocations(1149, 49, 1149, 70, 1167, 37, 1167, 58),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "nameDirtyRef.current = value !== (userRef.current?.name ?? '');",
+      "const currentName = userRef.current?.name ?? '';",
+    ],
+    replacements: ['"Stryker was here!"'],
+    count: 2,
+    reason:
+      "The ?? '' fallback only applies when userRef.current is nullish, which cannot happen on any committed render that mounts these handlers (the screen renders null first), so the fallback constant is dead.",
+    locations: exactLocations(1149, 74, 1149, 76, 1167, 62, 1167, 64),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'StringLiteral',
+    originals: ["const canonicalName = user?.name ?? '';"],
+    replacements: ['"Stryker was here!"'],
+    reason:
+      'The sentinel is only computed while user is null, and in exactly that state the screen returns null before rendering anything that consumes the name draft; the moment a user commits, the canonicalName effect resyncs the draft to the real name. No rendered output, save, or navigation ever reads the draft while user is null.',
+    locations: exactLocations(142, 39, 142, 41),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const navigationStartedRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The useFocusEffect callback resets navigationStartedRef.current to false synchronously on mount/focus before any user-event handler can run (the test mock and the real focus effect both invoke it during the mount commit), so the initializer value is never read by renderCanHandle.',
+    locations: exactLocations(196, 39, 196, 44),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ObjectLiteral',
+    originals: ['const accountSessionRef = useRef({ token, userId: accountUserId });'],
+    replacements: ['{}'],
+    reason:
+      'A layout effect overwrites accountSessionRef.current with { token, userId } on the very first commit, before any effect, promise continuation, or event handler can call renderedAccountSessionIsCurrent, so the initializer value is never read.',
+    locations: exactLocations(205, 36, 205, 68),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['[],'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'blockingOperationActive reads only stable useRef objects, so the [] deps already yield a stable callback identity; replacing them with an equally-constant literal array leaves the memoization (and every consumer) behaviorally identical.',
+    locations: exactLocations(219, 5, 219, 7),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, [blockingOperationActive, navigation]);'],
+    replacements: ['[]'],
+    count: 2,
+    reason:
+      'Both dependencies are themselves stable (blockingOperationActive has [] deps and reads only refs; the navigation object is one stable instance per mounted route in both the test harness and expo-router), so dropping them from the deps cannot change when publishNavigationLock / the beforeRemove subscriber is recreated or what closure they capture.',
+    locations: exactLocations(229, 6, 229, 43, 258, 6, 258, 43),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, [navigation, screenBusy]);'],
+    replacements: ['[]'],
+    reason:
+      'Every screenBusy transition is accompanied by an explicit publishNavigationLock() call inside the operation that flipped the flag (each busy setter is paired with a publish in its start/finally/close paths), and the identity-reset effect publishes its own unlock, so the layout effect never communicates a lock state that the synchronous publishes have not already published.',
+    locations: exactLocations(250, 6, 250, 30),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, []),'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The replacement is an equally-constant deps literal: React compares deps element-wise, so the useCallback still returns one stable identity across renders and useFocusEffect subscribes exactly once — identical behavior to [].',
+    locations: exactLocations(267, 8, 267, 10),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'useLayoutEffect(() => {\n    navigationRef.current = navigation;\n  }, [navigation]);',
+    ],
+    replacements: ['{}'],
+    reason:
+      "navigation is one stable object per mounted route (the test harness returns a constant mock and expo-router returns the same navigation instance for the route), so keeping the initial value instead of re-assigning the identical reference changes nothing for the only reader (the identity-reset effect's setOptions call).",
+    locations: exactLocations(283, 25, 285, 4),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ArrayDeclaration',
+    originals: ['}, [navigation]);'],
+    replacements: ['[]'],
+    reason:
+      'navigation is a stable instance per mounted route, so the effect never actually re-runs after mount in any reachable state; the deps contents are inert.',
+    locations: exactLocations(285, 6, 285, 18),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (activeIdentityRef.current !== activeIdentity) {'],
+    replacements: ['true'],
+    reason:
+      "The effect only re-runs when activeIdentity changes, and on every such run the guard is already true; the only extra execution is the mount commit, where the body is an idempotent no-op (every state is already at its rest value and the setOptions unlock duplicates the sibling screenBusy layout effect's unlock with identical arguments).",
+    locations: exactLocations(287, 9, 287, 53),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['!navigationStartedRef.current &&\n      activeIdentityRef.current !== null &&'],
+    replacements: ['!navigationStartedRef.current || activeIdentityRef.current !== null'],
+    reason:
+      "activeIdentityRef.current is null only inside the effect cleanup for a replaced identity or unmount; in the unmount case the focus cleanup has already set navigationStartedRef true, and the replacement case re-assigns the ref to the new identity within the same commit. The state 'identity ref null AND navigation not started' that the || variant would newly accept is therefore unreachable.",
+    locations: exactLocations(341, 7, 342, 41),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['activeIdentityRef.current !== null &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct: whenever this screen is mounted and a logout callback runs, the identity ref is non-null (it is null only transiently inside a cleanup that the same commit follows with either a new identity or full unmount, where navigationStartedRef is already true), so forcing it true cannot change the result.',
+    locations: exactLocations(342, 7, 342, 41),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['token !== null &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct: token is null only together with a null user, in which case the accountUserId !== null conjunct (or the navigation/identity conjuncts after an unmount) already returns false; a null token with a non-null user is not a reachable Auth state on this screen.',
+    locations: exactLocations(343, 7, 343, 21),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['accountUserId !== null &&'],
+    replacements: ['true'],
+    reason:
+      'Redundant conjunct: accountUserId is null only together with a null token (Auth never exposes a user without a bearer), so the token !== null conjunct already returns false in every state this mutant would newly accept.',
+    locations: exactLocations(344, 7, 344, 29),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['subscription?.remove?.();'],
+    replacements: ['subscription?.remove()'],
+    reason:
+      'AppState.addEventListener always returns a subscription whose remove is defined (the RN API contract, and every test double used here provides it), so the extra optional-call guard protects a state that cannot occur.',
+    locations: exactLocations(418, 7, 418, 31),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['reminderBusyRef.current = true;'],
+    replacements: ['false'],
+    reason:
+      "Every reader of reminderBusyRef inside the latch window is already blocked by languageBusyRef.current, which stays true for the whole window (applyReminder's guard checks it, blockingOperationActive includes it, and a second language change is fenced by languageBusyRef too); the outer finally clears the latch, so both variants converge to false with no observable divergence.",
+    locations: exactLocations(559, 35, 559, 39),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'recordingsDeleteBusyRef.current === operation &&\n        recordingsDeleteControllerRef.current === controller &&',
+    ],
+    replacements: ['true'],
+    reason:
+      "The two ref equalities are invariantly true between the operation's start and its finally (the refs are only overwritten by the finally itself or by the identity-reset effect, which also aborts the controller and so falsifies the remaining !aborted && renderCanHandle() conjuncts), so forcing them true cannot change operationIsCurrent on any reachable state.",
+    locations: exactLocations(787, 9, 788, 61),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['recordingsDeleteBusyRef.current === operation &&'],
+    replacements: ['true'],
+    reason:
+      'busyRef equals operation for the whole live window of the operation (cleared only in its own finally, after which operationIsCurrent is never called again, or by the identity reset, which also aborts the controller and falsifies the remaining conjuncts), so the conjunct is invariantly true wherever it is read.',
+    locations: exactLocations(787, 9, 787, 54),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['recordingsDeleteControllerRef.current === controller &&'],
+    replacements: ['true'],
+    reason:
+      'controllerRef equals controller for the whole live window of the operation (nulled only in its own finally or by the identity reset, both of which also make the busyRef or !aborted conjuncts false), so the conjunct is invariantly true wherever it is read.',
+    locations: exactLocations(788, 9, 788, 61),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      'recordingsDeleteBusyRef.current === operation &&\n        recordingsDeleteControllerRef.current === controller &&\n        !controller.signal.aborted &&',
+    ],
+    replacements: [
+      'recordingsDeleteBusyRef.current === operation && recordingsDeleteControllerRef.current === controller || !controller.signal.aborted',
+    ],
+    reason:
+      'Operator-reordering of conjuncts that are invariantly true together wherever the expression is read (both ref equalities hold for the entire live window of the operation; every state that falsifies one falsifies the others or the trailing !aborted/renderCanHandle conjuncts), so no reachable evaluation distinguishes the variants.',
+    locations: exactLocations(787, 9, 789, 35),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: [
+      'recordingsDeleteBusyRef.current === operation &&\n        recordingsDeleteControllerRef.current === controller &&',
+    ],
+    replacements: [
+      'recordingsDeleteBusyRef.current === operation || recordingsDeleteControllerRef.current === controller',
+    ],
+    reason:
+      'Both operands are invariantly equal-true (or equal-false together after the finally/identity reset, where the expression is no longer read), so || and && evaluate identically on every reachable state.',
+    locations: exactLocations(787, 9, 788, 61),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (recordingsDeleteControllerRef.current === controller) {'],
+    replacements: ['false'],
+    reason:
+      'Skipping the null-clear only leaves a settled AbortController reference that no later code observes differently: the next operation compares by identity against its own controller, the focus/identity cleanups abort and null unconditionally, and aborting an already-settled controller is a no-op.',
+    locations: exactLocations(829, 13, 829, 65),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'if (recordingsDeleteControllerRef.current === controller) {\n          recordingsDeleteControllerRef.current = null;\n        }',
+    ],
+    replacements: ['{}'],
+    reason:
+      'Same as the condition variants: the only effect of the block is nulling a controller reference that no reachable reader can distinguish once the operation has reached its finally.',
+    locations: exactLocations(829, 67, 831, 10),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['return true;'],
+    replacements: ['false'],
+    reason:
+      "deleteAllRecordings's only caller reacts to false by calling publishNavigationLock(), which re-issues the exact setOptions arguments the just-started (or just-refused) operation already published — an idempotent no-op with no rendered or navigated effect.",
+    locations: exactLocations(840, 12, 840, 16),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['return true;'],
+    replacements: ['false'],
+    reason:
+      "retakeTest's only caller reacts to false by calling publishNavigationLock(), which re-issues the identical locked setOptions the just-started restart already published; no observable output depends on the return value.",
+    locations: exactLocations(999, 12, 999, 16),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderOwnsIdentity()) return;'],
+    replacements: ['false'],
+    count: 4,
+    reason:
+      'Proceeding past a lost identity only re-asserts state the identity-reset layout effect has already committed (confirming/busy false, lock unlocked): setRetakeConfirming/setRecordingsDeleteConfirming(false) are no-ops and publishNavigationLock re-issues the identical unlock arguments, so no observable difference exists on any of these four close paths.',
+    locations: exactLocations(
+      854,
+      11,
+      854,
+      32,
+      869,
+      17,
+      869,
+      38,
+      1018,
+      11,
+      1018,
+      32,
+      1033,
+      17,
+      1033,
+      38,
+    ),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['if (!retakeTest()) publishNavigationLock();'],
+    replacements: ['retakeTest()'],
+    reason:
+      'Same idempotent-publish reasoning as the delete-all twin: the flipped condition only adds a redundant setOptions call with arguments identical to the one retakeTest already issued on the same lock state.',
+    locations: exactLocations(1035, 17, 1035, 30),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle()) return;'],
+    replacements: ['false'],
+    reason:
+      'toggleReminder immediately delegates to applyReminder, whose own guard re-checks renderCanHandle() (plus the busy refs), so weakening this entry check is fully masked.',
+    locations: exactLocations(918, 9, 918, 27),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle() || !current.enabled) return;'],
+    replacements: ['false'],
+    reason:
+      'applyReminder re-checks renderCanHandle(), and the !current.enabled arm is unreachable-different: the hour steppers only render while reminder.enabled is true, and every transition to enabled=false removes them in the same committed render (a stale committed handler still sees the guard pass exactly when clean code does, because reminder state cannot flip to disabled while the buttons exist).',
+    locations: exactLocations(923, 9, 923, 47),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!renderCanHandle() || !current.enabled) return;'],
+    replacements: ['!renderCanHandle() && !current.enabled'],
+    reason:
+      'Identical masking: applyReminder re-checks renderCanHandle(), and the enabled arm cannot diverge for the same unreachability of a disabled-reminder stepper press.',
+    locations: exactLocations(923, 9, 923, 47),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BlockStatement',
+    originals: [
+      'if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {\n      return false;\n    }',
+    ],
+    replacements: ['{}'],
+    reason:
+      'retakeTest has exactly one caller, reached only after the confirmation-owner check and a renderOwnsIdentity check with no intervening await, and every re-entrant route is fenced upstream: confirmRetake refuses while retakeBusyRef/retakeConfirmingRef/logoutBusyRef are set (line 1003-1007), and a second confirmation frame is rejected by the owner-symbol check. Each conjunct is therefore invariantly false/satisfied at entry, so emptying the guard cannot be observed.',
+    locations: exactLocations(951, 79, 953, 6),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['return false;'],
+    replacements: ['true'],
+    reason:
+      "This early return is unreachable in every reachable state (see the block-mutant twin: all entry paths are pre-guarded by confirmRetake's re-entrancy check and the confirmation-owner check), and even if reached, its only effect is one idempotent publishNavigationLock by the caller.",
+    locations: exactLocations(952, 14, 952, 19),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
+    replacements: ['false'],
+    reason:
+      "Same unreachable-conjunct masking as the block mutant: renderCanHandle can only be false at entry if it was equally false at the caller's renderOwnsIdentity check one synchronous step earlier, and the busy-ref conjuncts are fenced by confirmRetake's own guard before any confirmation frame can call through.",
+    locations: exactLocations(951, 9, 951, 77),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
+    replacements: ['(!renderCanHandle() || retakeBusyRef.current) && logoutBusyRef.current'],
+    reason:
+      'Every conjunct is invariantly false at the single reachable call site (see above), so any boolean re-association of them evaluates identically.',
+    locations: exactLocations(951, 9, 951, 77),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
+    replacements: ['false'],
+    reason:
+      "Partial-node twin of the full guard: the omitted logoutBusyRef conjunct is unreachable-true at entry (confirmLogout's alert-confirm guard at line 1122 refuses while any blocking operation runs), so the shortened condition still never diverges.",
+    locations: exactLocations(951, 9, 951, 52),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!renderCanHandle() || retakeBusyRef.current || logoutBusyRef.current) {'],
+    replacements: ['!renderCanHandle() && retakeBusyRef.current'],
+    reason:
+      'Both remaining conjuncts are invariantly false at the only reachable call site (upstream guards at 1003-1007 and the owner check), so the re-association cannot change any evaluation.',
+    locations: exactLocations(951, 9, 951, 52),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle() || blockingOperationActive()) return;'],
+    replacements: ['false'],
+    reason:
+      "handleLogout's only reachable caller is the logout alert's destructive onPress, whose own guard (line 1122) checks the identical renderCanHandle() || blockingOperationActive() condition one synchronous step earlier, so weakening this copy is fully masked.",
+    locations: exactLocations(1050, 9, 1050, 56),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!renderCanHandle() || blockingOperationActive()) return;'],
+    replacements: ['!renderCanHandle() && blockingOperationActive()'],
+    reason:
+      'Same masking by the alert-confirm guard at line 1122: no reachable state reaches handleLogout with either conjunct true, so the re-association is unobservable.',
+    locations: exactLocations(1050, 9, 1050, 56),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!renderCanHandle() || blockingOperationActive()) return;'],
+    replacements: ['false'],
+    reason:
+      'Letting a second press through only reaches handleLogout, whose own guard (line 1050) checks the identical condition; the pair is mutually redundant, so each mutant individually is masked by the other copy.',
+    locations: exactLocations(1122, 15, 1122, 62),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if (!renderCanHandle() || blockingOperationActive()) return;'],
+    replacements: ['!renderCanHandle() && blockingOperationActive()'],
+    reason: "Same mutual masking by handleLogout's identical guard at line 1050.",
+    locations: exactLocations(1122, 15, 1122, 62),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (renderedAccountSessionIsCurrent()) {'],
+    replacements: ['true'],
+    reason:
+      'When the session is no longer current, a completed signOutThisDevice has already invalidated the Auth session: the route tree switches away and this component unmounts or renders null (user null), so the extra publishNavigationLock/setLogoutBusy(false) land on a detached or blank surface; when the session is current the mutant equals the clean branch.',
+    locations: exactLocations(1093, 23, 1093, 56),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'OptionalChaining',
+    originals: ["languageBusy && languageTarget?.scope === 'ui' && languageTarget.code === code"],
+    replacements: ['languageTarget.scope'],
+    reason:
+      'languageTarget is set non-null in the same synchronous block that sets languageBusy and nulled in the same finally that clears it (and the identity reset clears both together), so the leading languageBusy && conjunct already proves languageTarget is non-null at every read; the optional chain never short-circuits.',
+    locations: exactLocations(1224, 29, 1224, 50),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'OptionalChaining',
+    originals: [
+      "languageBusy && languageTarget?.scope === 'native' && languageTarget.code === code",
+    ],
+    replacements: ['languageTarget.scope'],
+    reason:
+      'Same invariant as the UI grid: languageBusy true implies languageTarget non-null at every read, so removing the optional chaining cannot change the busy-chip selection.',
+    locations: exactLocations(1258, 29, 1258, 50),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['accessibilityState={{ busy: exportBusy, disabled: exportBusy || logoutBusy }}'],
+    replacements: ['true'],
+    reason:
+      'React Native Pressable overwrites accessibilityState.disabled with the separate disabled prop whenever it is provided, and this row always passes disabled={exportBusy || logoutBusy}; the accessibilityState copy of the same expression is therefore unreachable output.',
+    locations: exactLocations(1457, 61, 1457, 85),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['accessibilityState={{ busy: exportBusy, disabled: exportBusy || logoutBusy }}'],
+    replacements: ['false'],
+    reason:
+      "Same Pressable disabled-prop precedence: the authored accessibilityState.disabled value is always overwritten by the row's disabled prop, so its value is unobservable.",
+    locations: exactLocations(1457, 61, 1457, 85),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['accessibilityState={{ busy: exportBusy, disabled: exportBusy || logoutBusy }}'],
+    replacements: ['exportBusy && logoutBusy'],
+    reason:
+      'Same Pressable disabled-prop precedence: the rendered disabled state comes exclusively from the disabled prop at line 1458, so any mutation of the duplicated expression inside accessibilityState is unobservable.',
+    locations: exactLocations(1457, 61, 1457, 85),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['disabled: retakeBusy || retakeConfirming || logoutBusy,'],
+    replacements: ['true'],
+    reason:
+      "Pressable overwrites accessibilityState.disabled with the row's disabled prop (disabled={retakeBusy || retakeConfirming || logoutBusy}), so the accessibilityState copy is never rendered; only the prop value is observable and it is covered by its own assertions.",
+    locations: exactLocations(1482, 23, 1482, 67),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['disabled: retakeBusy || retakeConfirming || logoutBusy,'],
+    replacements: ['false'],
+    reason: 'Same Pressable disabled-prop precedence as the true-force twin.',
+    locations: exactLocations(1482, 23, 1482, 67),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['disabled: retakeBusy || retakeConfirming || logoutBusy,'],
+    replacements: ['(retakeBusy || retakeConfirming) && logoutBusy'],
+    reason:
+      'Same Pressable disabled-prop precedence: the rendered disabled state comes from the separate disabled prop, so re-associating the duplicated expression inside accessibilityState is unobservable.',
+    locations: exactLocations(1482, 23, 1482, 67),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['disabled: retakeBusy || retakeConfirming || logoutBusy,'],
+    replacements: ['false'],
+    reason:
+      'Partial-node twin (retakeBusy || retakeConfirming) of the same shadowed accessibilityState copy; the disabled prop at line 1484 owns the rendered state.',
+    locations: exactLocations(1482, 23, 1482, 53),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['disabled: retakeBusy || retakeConfirming || logoutBusy,'],
+    replacements: ['retakeBusy && retakeConfirming'],
+    reason: 'Partial-node twin of the same shadowed accessibilityState copy.',
+    locations: exactLocations(1482, 23, 1482, 53),
+  },
+  {
+    file: 'src/lib/identity-validation.ts',
+    mutator: 'ConditionalExpression',
+    originals: ['if (email.length === 0 || email.length > MAX_EMAIL_LENGTH) return false;'],
+    replacements: ['false'],
+    reason:
+      "The empty-email conjunct is redundant: with the conjunct forced false an empty trimmed email still reaches EMAIL_PATTERN.test(''), which requires an @-separated domain and rejects the empty string, so isValidEmailAddress returns false for every input either way. emailAddressError additionally guards the empty field with its own trim-length check.",
+    locations: exactLocations(19, 7, 19, 25),
+  },
+  {
+    file: 'src/lib/identity-validation.ts',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "return value.length > 0 && !hasNoControlCharacters(value) ? t('name.invalid') : null;",
+    ],
+    replacements: ['true'],
+    reason:
+      "Forcing the length conjunct true only changes the empty-string case: clean code short-circuits to null, and the mutant computes true && !hasNoControlCharacters('') where the control-character class matches nothing in the empty string, so it also evaluates to null. Every nonempty input takes the same branch in both variants, so no test can distinguish them.",
+    locations: exactLocations(41, 10, 41, 26),
+  },
+  {
+    file: 'src/lib/identity-validation.ts',
+    mutator: 'EqualityOperator',
+    originals: [
+      "return value.length > 0 && !hasNoControlCharacters(value) ? t('name.invalid') : null;",
+    ],
+    replacements: ['value.length >= 0'],
+    reason:
+      'The mutated length comparison is only false for the empty string, and (as with the forced-true twin) the empty string reaches the same null result through the hasNoControlCharacters branch in both variants, so the truth table is unchanged for every input.',
+    locations: exactLocations(41, 10, 41, 26),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'StringLiteral',
+    originals: [": `${user.id}:${user.diagnosticCompleted ? 'complete' : 'incomplete'}:${"],
+    replacements: ['""'],
+    reason:
+      "The label feeds only the placement remount key. Emptying just the 'complete' arm keeps the two diagnosticCompleted phases on distinct keys (`${id}::...` vs `${id}:incomplete:...`), so every transition still changes or preserves the key exactly as before and no other output reads the label.",
+    locations: exactLocations(79, 48, 79, 58),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'StringLiteral',
+    originals: [": `${user.id}:${user.diagnosticCompleted ? 'complete' : 'incomplete'}:${"],
+    replacements: ['""'],
+    reason:
+      "The label feeds only the placement remount key. Emptying just the 'incomplete' arm keeps the two diagnosticCompleted phases on distinct keys, so remount semantics — the only observable behavior — are identical.",
+    locations: exactLocations(79, 61, 79, 73),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["kind: isFailedAnswer && current.kind === 'new' ? 'revision' : current.kind,"],
+    replacements: ['true'],
+    reason:
+      "PracticeKind is the closed union 'new' | 'revision' (src/lib/types.ts), so forcing the kind comparison true yields kind = isFailedAnswer ? 'revision' : current.kind — which is exactly the clean result: a failed attempt maps to 'revision' whether the word was 'new' or already 'revision', and a passed/native answer keeps current.kind. The truth table is unchanged for every reachable cache entry.",
+    locations: exactLocations(229, 33, 229, 55),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if ((result.noSpeech || native || !result.passed) && result.attemptsLeft > 0) {'],
+    replacements: ['false'],
+    reason:
+      'The node is redundant inside its own condition: for a native outcome the trailing !result.passed is always true because NativeAttemptResult has no passed field, and an English AttemptResult with noSpeech=true is always scored passed=false, so (noSpeech || native) never changes the value of the surrounding disjunction on any reachable outcome.',
+    locations: exactLocations(143, 12, 143, 37),
+  },
+  {
+    file: 'src/lib/practice-flow.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['if ((result.noSpeech || native || !result.passed) && result.attemptsLeft > 0) {'],
+    replacements: ['result.noSpeech && native'],
+    reason:
+      'Same redundancy as the forced-false twin: the trailing !result.passed operand (always true for native outcomes, which lack a passed field, and true for every silent English outcome) already makes the disjunction true whenever the node is true, so replacing || with && cannot change the branch on any reachable outcome.',
+    locations: exactLocations(143, 12, 143, 37),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['exportArtifact.current?.release();'],
+    replacements: ['exportArtifact.current.release'],
+    reason:
+      'The direct call throws exactly where the optional chain short-circuits (exportArtifact.current null), and the surrounding try/catch exists precisely to swallow release failures so cleanup cannot mask the export outcome; both variants fall through to the same abort/cleanup tail with the same state transitions.',
+    locations: exactLocations(761, 9, 761, 40),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['const nameDirtyRef = useRef(false);'],
+    replacements: ['true'],
+    reason:
+      'The canonical-name useLayoutEffect runs on the very first commit (nameFocusedRef.current is false at mount) and unconditionally re-asserts nameDirtyRef.current = false before any blur or change handler can run, so the useRef seed value is never read.',
+    locations: exactLocations(201, 31, 201, 36),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'recordingsDeleteBusyRef.current === operation &&\n        recordingsDeleteControllerRef.current === controller &&\n        !controller.signal.aborted &&',
+    ],
+    replacements: ['true'],
+    reason:
+      'Every path that aborts the delete controller also falsifies a conjunct this mutant leaves behind: the focus cleanup sets navigationStartedRef true (renderCanHandle false), and both identity-effect cleanups either null the controller ref or clear activeIdentityRef (renderCanHandle false), so the abort conjunct is never the deciding fence; forcing the three leading conjuncts true cannot change operationIsCurrent on any reachable state.',
+    locations: exactLocations(787, 9, 789, 35),
+  },
+  {
+    file: 'src/app/settings/index.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (ownsReminderLatch) {'],
+    replacements: ['true'],
+    reason:
+      'Forcing the taken-latch branch true only re-assigns reminderBusyRef.current = true (already true, because ownsReminderLatch was false exactly when a reminder mutation holds the latch) and re-renders setReminderBusy(true) with the same already-true value. The finally still reads the unmutated ownsReminderLatch (false), so it skips the early latch release — the very divergence this branch could cause — and the owning reminder operation clears the latch itself.',
+    locations: exactLocations(558, 11, 558, 28),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'StringLiteral',
+    originals: ["source: 'external' | 'first-party-api' = 'external',"],
+    replacements: ['""'],
+    reason:
+      "The default is observable only through the single read of `source` in throwForStatus — the `source === 'first-party-api'` gate (line 517) that latches the 426 CLIENT_UPGRADE_REQUIRED modal. '' fails that equality exactly like 'external', and no other statement in throwForStatus or any caller reads the parameter, so the default's spelling cannot change any behavior.",
+    locations: exactLocations(478, 44, 478, 54),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: [': status === 503'],
+    replacements: ['true'],
+    reason:
+      'The ternary selects between MAX_RETRY_AFTER_SECONDS_503 and MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT, which are both the literal constant 120 (lines 383/385). Both arms yield the identical bound for every in-gate status, so no status, header, or body input can change maxSeconds or any field of the thrown ApiError.',
+    locations: exactLocations(527, 11, 527, 25),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: [': status === 503'],
+    replacements: ['false'],
+    reason:
+      'The ternary selects between MAX_RETRY_AFTER_SECONDS_503 and MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT, which are both the literal constant 120 (lines 383/385). Both arms yield the identical bound for every in-gate status, so no status, header, or body input can change maxSeconds or any field of the thrown ApiError.',
+    locations: exactLocations(527, 11, 527, 25),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'EqualityOperator',
+    originals: [': status === 503'],
+    replacements: ['status !== 503'],
+    reason:
+      'The ternary selects between MAX_RETRY_AFTER_SECONDS_503 and MAX_RETRY_AFTER_SECONDS_REQUEST_IN_FLIGHT, which are both the literal constant 120 (lines 383/385). Both arms yield the identical bound for every in-gate status, so no status, header, or body input can change maxSeconds or any field of the thrown ApiError.',
+    locations: exactLocations(527, 11, 527, 25),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["if (path.endsWith('.3gp') || path.endsWith('.aac')) {"],
+    replacements: ['false'],
+    reason:
+      "Disabling the branch cannot change any outcome: a lowercased path ending '.3gp' or '.aac' necessarily satisfies the trailing-extension regex at line 737 ( !/\\.[a-z0-9]+$/.test(path) is false), so execution reaches line 746 and throws a byte-identical new ApiError(415, 'Unsupported recording format') — same status, same message, no code or extras — and every other path never entered the branch.",
+    locations: exactLocations(731, 7, 731, 53),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'LogicalOperator',
+    originals: ["if (path.endsWith('.3gp') || path.endsWith('.aac')) {"],
+    replacements: ["path.endsWith('.3gp') && path.endsWith('.aac')"],
+    reason:
+      'A single path cannot end with both suffixes, so the condition is unsatisfiable and the branch is dead for every input; each URI resolves through the later branches exactly as before, and the previously-matching .3gp/.aac paths still get the identical 415 from line 746 (see the ConditionalExpression sibling).',
+    locations: exactLocations(731, 7, 731, 53),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'BlockStatement',
+    originals: [
+      "if (path.endsWith('.3gp') || path.endsWith('.aac')) {\n// The transcription endpoint does not document 3GP or raw AAC as accepted\n// inputs. Expo's configured native recorder emits M4A; fail locally if a\n// device ever returns either format instead.\nthrow new ApiError(415, 'Unsupported recording format');\n}",
+    ],
+    replacements: ['{}'],
+    reason:
+      "Emptying the block makes the matching .3gp/.aac paths fall through to line 737's extension check (which they always pass) and then line 746, which throws the byte-identical new ApiError(415, 'Unsupported recording format'); the returned/thrown values are indistinguishable through audioFileDescriptor or any caller.",
+    locations: exactLocations(731, 55, 736, 4),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'if (!Number.isSafeInteger(maxPages) || maxPages < 1 || maxPages > EXPORT_MAX_PAGES) {',
+    ],
+    replacements: ['false'],
+    reason:
+      'The only inputs whose classification changes are safe integers below 1 (0 and negatives). For those, both `for (let page = 0; page < maxPages; page += 1)` loops execute zero iterations and control reaches the terminal `throw new ContractError()` at line 1268 — the same rejection (identical name/message) with no fetch, consumer call, or intermediate await in either variant. Non-integer or over-capacity inputs are classified by the untouched first and third conjuncts.',
+    locations: exactLocations(1184, 42, 1184, 54),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: ['data.practiceCyclesDone !== true ||'],
+    replacements: ['false'],
+    reason:
+      'parseUserDataPage (src/lib/types.ts) rejects any page violating practiceCyclesDone === (nextPracticeCycleCursor === null) or the empty-practiceCycles-with-non-null-cursor rule, so a parseable page reaching this check with practiceCyclesDone !== true necessarily has a non-null cycle cursor and at least one cycle row; the intact sibling conjunct at line 1212 (data.practiceCycles.length !== 0) then throws the same ContractError before the page is consumed, with identical fetch and consumer counts.',
+    locations: exactLocations(1211, 7, 1211, 39),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: ['data.nextPracticeCycleCursor !== null'],
+    replacements: ['false'],
+    reason:
+      'To reach this conjunct as the deciding one, a page must already have practiceCyclesDone === true (line 1211) and practiceCycles.length === 0 (line 1212), but parseUserDataPage enforces practiceCyclesDone === true implies nextPracticeCycleCursor === null, so this conjunct can never be true for a page that survives parsing; every distinguishing input is rejected as a ContractError by the parser before the walker check runs.',
+    locations: exactLocations(1213, 7, 1213, 44),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'if (data.attemptsDone !== true || data.attempts.length !== 0 || data.nextCursor !== null) {',
+    ],
+    replacements: ['false'],
+    reason:
+      'parseUserDataPage enforces attemptsDone === (nextCursor === null) plus empty-attempts-implies-null-cursor, so a parseable cycles-phase page with attemptsDone !== true necessarily has non-empty attempts; the intact middle conjunct (data.attempts.length !== 0) throws the same ContractError before the page is emitted, with identical fetch and consumer counts.',
+    locations: exactLocations(1248, 9, 1248, 35),
+  },
+  {
+    file: 'src/lib/api.ts',
+    mutator: 'ConditionalExpression',
+    originals: [
+      'if (data.attemptsDone !== true || data.attempts.length !== 0 || data.nextCursor !== null) {',
+    ],
+    replacements: ['false'],
+    reason:
+      'To reach this conjunct as the deciding one, a page must already have attemptsDone === true and attempts.length === 0, but parseUserDataPage enforces attemptsDone === true implies nextCursor === null, so this conjunct can never be true for a page that survives parsing; every distinguishing input is rejected as a ContractError by the parser before the walker check runs.',
+    locations: exactLocations(1248, 69, 1248, 93),
+  },
+  {
+    file: 'src/components/ClientUpgradeModal.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!normalized) return null;'],
+    replacements: ['false'],
+    reason:
+      "normalized is a string, so !normalized is true exactly when it is ''. Skipping the guard then runs new URL('') inside the adjacent try, which throws and lands in the same `catch { return null; }` — identical null for every input, so no test can distinguish the paths.",
+    locations: exactLocations(35, 7, 35, 18),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (reachability !== 'online' || reconnectCount <= hiddenReconnectCount) return;"],
+    replacements: ['false'],
+    reason:
+      'The effect only schedules setHiddenReconnectCount(reconnectCount). hidden is read solely through `reachability === "online" && reconnectCount > hidden`, every value ever stored into hidden is a past-or-current reconnectCount, reconnectCount never decreases, and each offline-to-online transition increments it past every previously stored value. An extra timer can therefore only write a stale count that keeps the next online comparison true and is invisible while offline (the offline render is keyed on reachability alone); while online with count === hidden the write is a same-value no-op setState. The mutant still schedules the legit hide timer whenever the banner actually shows, so visible behavior is identical on every reachable state.',
+    locations: exactLocations(21, 9, 21, 76),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'LogicalOperator',
+    originals: ["if (reachability !== 'online' || reconnectCount <= hiddenReconnectCount) return;"],
+    replacements: ["reachability !== 'online' && reconnectCount <= hiddenReconnectCount"],
+    reason:
+      'Flipping to && makes the effect schedule in a superset of situations (any online state, or any count > hidden), but every additional scheduling writes a stale-or-current reconnectCount into hidden. Stale values are < the current count, so they can never make `reconnectCount > hiddenReconnectCount` false while the back-online banner shows (the legit hide timer is still scheduled exactly when the banner shows) nor true again after it hides; writes while offline are unobservable because the offline render is keyed on reachability alone, and writes while online with count === hidden are same-value no-ops.',
+    locations: exactLocations(21, 9, 21, 76),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (reachability !== 'online' || reconnectCount <= hiddenReconnectCount) return;"],
+    replacements: ['false'],
+    reason:
+      'Replacing only the first operand schedules the timer whenever reconnectCount > hiddenReconnectCount regardless of reachability. All such firings while offline set hidden to a stale count that the next offline-to-online transition still exceeds (reconnectCount is monotone and only stored values <= it ever enter hidden), and the offline render never reads hidden; the legit hide timer for a showing back-online banner is still scheduled. No reachable component state produces a different render or timer-visible transition.',
+    locations: exactLocations(21, 9, 21, 34),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (reachability !== 'online' || reconnectCount <= hiddenReconnectCount) return;"],
+    replacements: ['false'],
+    reason:
+      'Replacing only the second operand schedules the timer whenever reachability is online. The only added case is online with reconnectCount === hiddenReconnectCount (or <, impossible since hidden <= count always), where the timer writes the same value React already holds — a bail-out setState with no re-render, and the effect deps do not change. The banner-showing case still gets its identical hide timer.',
+    locations: exactLocations(21, 38, 21, 76),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'EqualityOperator',
+    originals: ["if (reachability !== 'online' || reconnectCount <= hiddenReconnectCount) return;"],
+    replacements: ['reconnectCount < hiddenReconnectCount'],
+    reason:
+      'The mutant still returns (no timer) exactly when reconnectCount <= hidden except for the boundary count === hidden while online, where it schedules setHiddenReconnectCount(reconnectCount) — a same-value no-op setState with unchanged effect deps. The banner-showing case (count > hidden) schedules the identical hide timer either way.',
+    locations: exactLocations(21, 38, 21, 76),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'ArrowFunction',
+    originals: ['return () => clearTimeout(timeout);'],
+    replacements: ['() => undefined'],
+    reason:
+      "A never-cleared timer fires setHiddenReconnectCount(reconnectCount-at-schedule), which is always <= the current count. It can never hide a showing banner early (that needs hidden >= count), never re-show a hidden one while online (it writes counts, keeping count > hidden false only when already false), and is invisible while offline since the offline render never reads hidden. After unmount the stale timer only setState's an unmounted component, a React 18 no-op with no observable effect.",
+    locations: exactLocations(26, 12, 26, 39),
+  },
+  {
+    file: 'src/components/NetworkStatusBanner.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "const showBackOnline = reachability === 'online' && reconnectCount > hiddenReconnectCount;",
+    ],
+    replacements: ['true'],
+    reason:
+      "The mutant differs only when reachability !== 'online' while reconnectCount > hiddenReconnectCount. With reachability 'offline' every rendered output (message, live region, styles, early return) is keyed on `offline` alone, so the render is byte-identical. With reachability 'unknown' the state is unreachable: the store drops unknown observations (publishNetworkState returns before writing) and the initial unknown snapshot has reconnectCount 0 === hidden, so no test can ever construct the divergent state.",
+    locations: exactLocations(30, 26, 30, 51),
+  },
+  {
+    file: 'src/lib/network-status.ts',
+    mutator: 'BooleanLiteral',
+    originals: ['if (snapshot.reachability === reachability) return true;'],
+    replacements: ['false'],
+    reason:
+      'The changed return value is consumed only by `if (publishNetworkState(state)) eventRevision += 1`. A redundant known observation (snapshot.reachability === reachability) implies an earlier transition already published and moved eventRevision off revisionBeforeSample, and eventRevision is read solely through `eventRevision === revisionBeforeSample` (captured before any event can fire, always 0). The redundant increment is therefore never observable, and the line-101 caller ignores the return value.',
+    locations: exactLocations(52, 54, 52, 58),
+  },
+  {
+    file: 'src/lib/network-status.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["snapshot.reachability === 'offline' && reachability === 'online'"],
+    replacements: ['true'],
+    reason:
+      "The ternary is reached only when reachability changed and is known ('offline'/'online'). snapshot.reachability === 'offline' happens only for offline-to-online transitions — the exact transition the clean code increments on — because unknown observations never publish and a transition into 'offline' never has an offline snapshot. Replacing the second operand with true is the identity on every reachable state.",
+    locations: exactLocations(57, 46, 57, 71),
+  },
+  {
+    file: 'src/lib/network-status.ts',
+    mutator: 'AssignmentOperator',
+    originals: ['if (publishNetworkState(state)) eventRevision += 1;'],
+    replacements: ['eventRevision -= 1'],
+    reason:
+      'eventRevision is only ever read through `eventRevision === revisionBeforeSample`, and revisionBeforeSample is captured immediately after subscription, before any listener can fire, so it is always 0. Both += 1 and -= 1 permanently move eventRevision off 0 on the first published event and it never returns to 0 (single mutation site); the magnitude is never read, so the stale-sample arbitration behaves identically.',
+    locations: exactLocations(90, 39, 90, 57),
+  },
+  {
+    file: 'src/lib/network-status.ts',
+    mutator: 'OptionalChaining',
+    originals: ['subscription?.remove();'],
+    replacements: ['subscription.remove'],
+    reason:
+      'subscription is undefined only when Network.addNetworkStateListener threw during registration; the teardown call sits inside a try/catch whose catch block makes the TypeError from `undefined.remove` a silent no-op — exactly what the optional chain produces. When subscription exists both spellings invoke the same method.',
+    locations: exactLocations(111, 7, 111, 27),
+  },
+  {
+    file: 'src/lib/network-status.ts',
+    mutator: 'ArrayDeclaration',
+    originals: ['useEffect(() => startNetworkStatusMonitoring(), []);'],
+    replacements: ['["Stryker was here"]'],
+    reason:
+      'The replacement deps array holds one compile-time-constant element; React compares deps elementwise with Object.is across renders, so the value is equal on every render, the effect still runs exactly once per mount, and its cleanup still runs on unmount — identical mount-once behavior to [].',
+    locations: exactLocations(124, 51, 124, 53),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["phase: pending.stage === 'feedback-pending' ? 'deferred' : 'ready',"],
+    replacements: ['""'],
+    reason:
+      "The false-branch 'ready' can be replaced by '' unobservably: phase is consumed only by the render branches ('checking'/'error'/'deferred'), the deferred-retry effect ('deferred'), and the router effect's `current.phase !== 'ready' || !current.target` — and every state this expression produces carries target:null (initialState never sets a target; both target-writing setStates pair the target with an explicit phase 'ready'), so '' renders children, mounts no banner, and replaces no route exactly like 'ready'.",
+    locations: exactLocations(214, 72, 214, 79),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["phase: shouldCheck ? 'checking' : 'ready',"],
+    replacements: ['""'],
+    reason:
+      "The only unoverridden consumer path seeds initialState with shouldCheck=false; a phase of '' is indistinguishable from 'ready' there because every consumer either tests other phase strings ('checking' render, 'error' render, 'deferred' banner/effect) or is the router effect gated by !current.target, and initialState always has target:null. Every other initialState call site overrides phase in the same object literal.",
+    locations: exactLocations(67, 39, 67, 46),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'LogicalOperator',
+    originals: ["const identity = `${sessionVersion}:${user?.id ?? 'anonymous'}`;"],
+    replacements: ["user?.id && 'anonymous'"],
+    reason:
+      "`user?.id && 'anonymous'` degrades every signed-in identity to `${sessionVersion}:anonymous` and a signed-out one to `${sessionVersion}:undefined`; both remain distinct per sessionVersion and constant within one session, and user cannot change without a sessionVersion rotation (Auth invariant). The string is otherwise an opaque key — see the empty-template pin for why only equality-change semantics are observable, and they are preserved exactly.",
+    locations: exactLocations(99, 41, 99, 64),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["const identity = `${sessionVersion}:${user?.id ?? 'anonymous'}`;"],
+    replacements: ['""'],
+    reason:
+      "The 'anonymous' fallback only re-spells an opaque internal key; identity is consumed solely by checkKey equality and the clear-guard, whose mismatch case is already unobservable (superseded-checkKey state is swapped out by the `current` fallback), and all identity transitions remain keyed by the embedded sessionVersion.",
+    locations: exactLocations(99, 53, 99, 64),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "const checkKey = `${identity}:${shouldCheck ? 'check' : 'skip'}:${retryVersion}:${pendingReplayRevision}`;",
+    ],
+    replacements: ['""'],
+    reason:
+      "checkKey is an opaque equality key consumed only by `state.checkKey === checkKey` and the effect dependency array; replacing 'check' with '' keeps check-keyed and skip-keyed runs distinct ('' vs 'skip') and no other segment combination can collide (identity embeds sessionVersion and a UUID, retryVersion and pendingReplayRevision are numbers).",
+    locations: exactLocations(107, 49, 107, 56),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "const checkKey = `${identity}:${shouldCheck ? 'check' : 'skip'}:${retryVersion}:${pendingReplayRevision}`;",
+    ],
+    replacements: ['""'],
+    reason:
+      "Same opaque-key argument as the 'check' pin: swapping 'skip' for '' keeps the two shouldCheck regimes distinct ('check' vs '') and every other segment is collision-free, so only equality — which is preserved — is observable.",
+    locations: exactLocations(107, 59, 107, 65),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['if (!shouldCheck || userId === undefined) return () => controller.abort();'],
+    replacements: ['false'],
+    reason:
+      'shouldCheck is `!!token && !!user && ...`, so userId = user?.id can only be undefined when user is null, which already makes !shouldCheck true — the mutant leaves the early-return decision entirely to !shouldCheck, which is true in exactly the same cases. User.id is a required string on the User type.',
+    locations: exactLocations(139, 25, 139, 45),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ArrowFunction',
+    originals: ['if (!shouldCheck || userId === undefined) return () => controller.abort();'],
+    replacements: ['() => undefined'],
+    reason:
+      'On this early-return path the controller was never passed to apiFetch and nothing reads its signal, so aborting on effect re-run or unmount is unobservable; the cleanup exists only to satisfy the effect contract.',
+    locations: exactLocations(139, 54, 139, 78),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['true'],
+    reason:
+      "initialState's third parameter only selects `phase: 'checking'` vs 'ready', and this call site overrides phase with 'ready' in the same object literal, so the seeded value never survives the spread.",
+    locations: exactLocations(169, 54, 169, 59),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['""'],
+    reason:
+      "A phase of '' behaves exactly like 'ready' in every consumer: render branches test only 'checking'/'error'/'deferred', and the router effect's 'ready' test is short-circuited by !current.target, which always holds here because initialState sets target:null.",
+    locations: exactLocations(169, 69, 169, 76),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['true'],
+    reason:
+      'The shouldCheck argument only influences the seeded phase, which this call site immediately overrides with an explicit phase property in the same object literal.',
+    locations: exactLocations(176, 58, 176, 63),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['""'],
+    reason:
+      "'' is indistinguishable from 'ready' for every consumer given target:null (see the line-169 pin).",
+    locations: exactLocations(176, 73, 176, 80),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['true'],
+    reason: 'Seeded phase is overridden by the explicit phase property in the same object literal.',
+    locations: exactLocations(184, 58, 184, 63),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['""'],
+    reason:
+      "'' is indistinguishable from 'ready' for every consumer given target:null (see the line-169 pin).",
+    locations: exactLocations(184, 73, 184, 80),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['...initialState(identity, checkKey, false),'],
+    replacements: ['true'],
+    reason:
+      "The shouldCheck argument only influences the seeded phase, which the very next line overrides with `phase: pending.stage === 'feedback-pending' ? 'deferred' : 'ready'` in the same object literal.",
+    locations: exactLocations(213, 49, 213, 54),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["throw new Error('The saved feedback pointer changed');"],
+    replacements: ['""'],
+    reason:
+      'The thrown Error is consumed only by the enclosing catch, which reads instanceof/status/code and never the message; no render, log, or observable reads it.',
+    locations: exactLocations(224, 27, 224, 63),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ArrowFunction',
+    originals: ['const pending = await loadPendingAssessment().catch(() => null);'],
+    replacements: ['() => undefined'],
+    reason:
+      "Inside the catch block, pending is consumed only via pending?.requestId/pending?.stage (identical for null and undefined under optional chaining) and via the classification's `pending !== null` operands — which are only evaluated after the mismatch guard proved a non-null pointer matching queriedPointer (a nullish pending always mismatches queriedPointer.requestId and re-runs the effect instead), so null vs undefined is indistinguishable.",
+    locations: exactLocations(254, 61, 254, 71),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'OptionalChaining',
+    originals: ['pending?.stage !== queriedPointer.stage)'],
+    replacements: ['pending.stage'],
+    reason:
+      'This operand sits in the second disjunct of `queriedPointer && (requestId-mismatch || stage-mismatch)` and is evaluated only when the first disjunct is false, i.e. when pending?.requestId === queriedPointer.requestId — impossible for a nullish pending (undefined never equals a UUID string) — so pending is provably non-null whenever the mutated property access executes. Empirically confirmed: all lane tests pass under this mutant.',
+    locations: exactLocations(259, 13, 259, 27),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['pending !== null &&'],
+    replacements: ['true'],
+    reason:
+      "When queriedPointer is null, branch 1 short-circuits on `queriedPointer?.stage === 'feedback-pending'` before this operand; when queriedPointer is set, a nullish catch-reload pending always mismatches queriedPointer.requestId and returns via the setRetryVersion re-run before classification — so `pending !== null` is only ever evaluated with pending non-null.",
+    locations: exactLocations(268, 11, 268, 27),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['pending !== null &&'],
+    replacements: ['true'],
+    reason:
+      "Same reachable-state argument as the branch-1 pin: branch 2 evaluates this operand only after its `queriedPointer !== null` prefix passed, and any nullish pending was already diverted by the mismatch guard's re-run.",
+    locations: exactLocations(273, 17, 273, 33),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'error' });"],
+    replacements: ['true'],
+    reason:
+      "Seeded phase is overridden by the explicit `phase: 'error'` property in the same object literal.",
+    locations: exactLocations(284, 62, 284, 67),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["queriedPointer.stage !== 'feedback-pending' &&"],
+    replacements: ['true'],
+    reason:
+      "The else-if is reached only after branch 1 rejected the same (stage, pending, instanceof, status) combination; the only stage value where the mutant differs ('feedback-pending') implies branch 1 failed on pending/instanceof/404, and those same operands fail the else-if's own remaining checks identically, routing to the same error branch. The leading `queriedPointer !== null` operand (a different mutant) stays intact here. Empirically confirmed: all lane tests pass.",
+    locations: exactLocations(289, 11, 289, 54),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["queriedPointer.stage !== 'feedback-pending' &&"],
+    replacements: ['""'],
+    reason:
+      "`queriedPointer.stage !== ''` differs from the original only when stage === 'feedback-pending'; a feedback-pending pointer reaching this else-if means branch 1 already failed on one of the shared operands (pending/instanceof/404), which fails the else-if identically, so both variants fall through to the error branch. Stage strings come from the parser and are never ''.",
+    locations: exactLocations(289, 36, 289, 54),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['true'],
+    reason:
+      "Seeded phase is overridden by the explicit `phase: 'ready'` property in the same object literal.",
+    locations: exactLocations(293, 58, 293, 63),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'ready' });"],
+    replacements: ['""'],
+    reason:
+      "'' is indistinguishable from 'ready' for every consumer given target:null (see the line-169 pin).",
+    locations: exactLocations(293, 73, 293, 80),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'error' });"],
+    replacements: ['true'],
+    reason:
+      "Seeded phase is overridden by the explicit `phase: 'error'` property in the same object literal.",
+    locations: exactLocations(295, 58, 295, 63),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ['active = false;'],
+    replacements: ['true'],
+    reason:
+      "The cleanup assigns active and then unconditionally calls controller.abort() in the same synchronous block; active is read only inside stillCurrent's `active && !controller.signal.aborted && ...`, so after any cleanup the aborted flag alone forces stillCurrent() false. Nothing can run between the two statements, so the mutated assignment can never flip a decision.",
+    locations: exactLocations(301, 16, 301, 21),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ["if (current.phase !== 'ready' || !current.target) return;"],
+    replacements: ['false'],
+    reason:
+      "current.target is only ever non-null in the two setStates that write `phase: 'ready'` and the target together, and the `current` fallback always substitutes an initialState with target null — so the guard reduces to `!current.target` for every reachable state and the phase operand is redundant.",
+    locations: exactLocations(321, 9, 321, 34),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: [
+      "const returnedToForeground = nextState === 'active' && previousAppState !== 'active';",
+    ],
+    replacements: ['true'],
+    reason:
+      "The mutant makes returnedToForeground equal `nextState === 'active'`, differing only for an 'active' event while previousAppState is already 'active'. AppState 'change' notifications report actual transitions, so a duplicate consecutive 'active' cannot arrive; previousAppState becomes 'active' only via an earlier 'active' transition, whose retryOnce either consumed the latch and replaced this effect instance (tearing down the listener at the next commit) or was suppressed by the onlineManager.isOnline() gate — which suppresses the mutant identically.",
+    locations: exactLocations(345, 62, 345, 91),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'StringLiteral',
+    originals: [
+      "const returnedToForeground = nextState === 'active' && previousAppState !== 'active';",
+    ],
+    replacements: ['""'],
+    reason:
+      "`previousAppState !== ''` is always true (AppState statuses are never the empty string), so the mutant reduces to `nextState === 'active' && true` — identical to the pinned second-operand mutant: the differing case requires a duplicate consecutive 'active' transition, which the OS never reports, and the isOnline() gate masks the offline remainder.",
+    locations: exactLocations(345, 83, 345, 91),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'ConditionalExpression',
+    originals: ['value.identity === identity && value.diagnosticReplay?.requestId === requestId'],
+    replacements: ['true'],
+    reason:
+      'The identity operand can only be false for state written under a superseded identity; such state always carries a stale checkKey, so `current` already substitutes a null-replay initialState and the stale card is unrendered — clearing it changes nothing observable, and checkKey can never return to a superseded value (retryVersion, sessionVersion, and pendingReplayRevision are monotonic; the check/skip segment differs across flips). The requestId guard the mutant retains still blocks every clear naming a foreign request.',
+    locations: exactLocations(365, 9, 365, 36),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'BooleanLiteral',
+    originals: ["setState({ ...initialState(identity, checkKey, false), phase: 'deferred' })"],
+    replacements: ['true'],
+    reason:
+      "Seeded phase is overridden by the explicit `phase: 'deferred'` property in the same object literal.",
+    locations: exactLocations(415, 62, 415, 67),
+  },
+  {
+    file: 'src/lib/assessment-replay.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["typeof questionId !== 'string' ||"],
+    replacements: ['false'],
+    reason:
+      "isUuid type-guards first (`typeof value === 'string' && regex.test(value)`), so it returns false for every non-string without throwing; any non-string questionId therefore already fails `!isUuid(questionId)` in the next disjunct and, being never strictly equal to the string pending.questionId, also the final disjunct — the typeof check is subsumed for every input.",
+    locations: exactLocations(67, 5, 67, 35),
+  },
+  {
+    file: 'src/lib/assessment-replay.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["(cycleId !== null && (typeof cycleId !== 'string' || !isUuid(cycleId))) ||"],
+    replacements: ['false'],
+    reason:
+      'expectedCycleId is null or a parser-validated UUID (parsePendingAssessment admits cycleId only when isUuid holds), so every candidate cycleId this group treats differently — any non-null value that is not exactly that well-formed UUID — already fails the trailing `cycleId !== expectedCycleId` disjunct and throws the same ContractError; the mutant only changes which disjunct catches a malformed value.',
+    locations: exactLocations(78, 6, 78, 75),
+  },
+  {
+    file: 'src/lib/assessment-replay.ts',
+    mutator: 'LogicalOperator',
+    originals: ["(cycleId !== null && (typeof cycleId !== 'string' || !isUuid(cycleId))) ||"],
+    replacements: ["typeof cycleId !== 'string' && !isUuid(cycleId)"],
+    reason:
+      'The ||-to-&& change only matters for a non-null cycleId that is a string non-UUID (inner conjunction then false); such a value differs from expectedCycleId (null or a valid UUID) and fails the trailing strict-equality disjunct identically. Non-strings keep `!isUuid(cycleId)` true (isUuid type-guards), so the conjunction stays true for them.',
+    locations: exactLocations(78, 27, 78, 74),
+  },
+  {
+    file: 'src/lib/assessment-replay.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["(cycleId !== null && (typeof cycleId !== 'string' || !isUuid(cycleId))) ||"],
+    replacements: ['false'],
+    reason:
+      'Reducing the inner check to `cycleId !== null && !isUuid(cycleId)` preserves the verdict for every input: non-null non-strings and non-UUID strings all fail !isUuid, and the only values that newly pass the inner check (none — isUuid is exact) would still need to equal expectedCycleId, which is null or a parser-validated UUID, so the trailing `cycleId !== expectedCycleId` disjunct catches everything the mutant lets through.',
+    locations: exactLocations(78, 27, 78, 54),
+  },
+  {
+    file: 'src/lib/assessment-replay.ts',
+    mutator: 'ConditionalExpression',
+    originals: ["if (!Object.hasOwn(candidate, 'response')) throw new ContractError();"],
+    replacements: ['false'],
+    reason:
+      'For a completed status without `response`, the mutant delegates to parseDiagnosticAnswerResult(undefined) / parseAttemptResult(undefined, …), whose isRecord entry guards throw the same ContractError (types.ts), so the hasOwn pre-check is defense-in-depth with no distinguishing observable — same error class either way.',
+    locations: exactLocations(90, 7, 90, 44),
+  },
+  {
+    file: 'src/lib/pending-assessment.ts',
+    mutator: 'ObjectLiteral',
+    originals: [
+      'const FORWARD_INCOMPATIBLE: ForwardIncompatiblePendingAssessment = { forwardIncompatible: true };',
+    ],
+    replacements: ['{}'],
+    reason:
+      'FORWARD_INCOMPATIBLE is a private module sentinel consumed exclusively by identity comparison in isForwardIncompatible (value === FORWARD_INCOMPATIBLE). The object never escapes the module: every public surface collapses it to null (parsePendingAssessment, loadPendingAssessment), a boolean (pendingAssessmentIsForwardIncompatible), or branches on its identity (ensurePendingAssessment, loadPendingUnsafe). No test can ever read the forwardIncompatible property value, so an empty object behaves identically.',
+    locations: exactLocations(125, 68, 125, 97),
+  },
+  {
+    file: 'src/lib/pending-assessment.ts',
+    mutator: 'BooleanLiteral',
+    originals: [
+      'const FORWARD_INCOMPATIBLE: ForwardIncompatiblePendingAssessment = { forwardIncompatible: true };',
+    ],
+    replacements: ['false'],
+    reason:
+      'Same identity-only sentinel: { forwardIncompatible: false } still satisfies every === comparison, and the property value is never read by any code path inside or outside the module (the exported type only describes the shape; the value is never exposed).',
+    locations: exactLocations(125, 91, 125, 95),
+  },
+  {
+    file: 'src/lib/pending-assessment.ts',
+    mutator: 'ConditionalExpression',
+    originals: ['const stageKnown = stageRaw !== undefined && STAGE_SET.has(stageRaw);'],
+    replacements: ['true'],
+    reason:
+      'Line 173 already returned null for any non-string stage, so stageRaw is a string or undefined when line 176 evaluates. STAGE_SET.has uses SameValueZero over a set of strings, so has(undefined) is false, and every member is !== undefined; therefore stageRaw !== undefined && STAGE_SET.has(stageRaw) is true for exactly the inputs where STAGE_SET.has(stageRaw) is true. Replacing the first conjunct with true is semantically identical for every reachable input.',
+    locations: exactLocations(176, 22, 176, 44),
+  },
+  {
+    file: 'src/lib/pending-assessment.ts',
+    mutator: 'ConditionalExpression',
+    originals: ['if (isForwardIncompatible(parsed)) {'],
+    replacements: ['false'],
+    reason:
+      'The FORWARD_INCOMPATIBLE sentinel is a truthy object. Skipping this branch falls straight into the immediately following "if (parsed) { memoryValue = parsed; return parsed; }" (lines 276-279), which performs the byte-identical memoryValue assignment and return; every downstream consumer behaves the same, and the delete path is skipped either way because parsed is truthy.',
+    locations: exactLocations(268, 9, 268, 38),
+  },
+  {
+    file: 'src/lib/pending-assessment.ts',
+    mutator: 'BlockStatement',
+    originals: [
+      'if (isForwardIncompatible(parsed)) {\n      // A structurally valid record with a newer-schema enum may point at an\n      // already-paid assessment result. Preserve it: this binary must never\n      // delete it, and a later load must not re-read the store to rediscover\n      // that same forward incompatibility.\n      memoryValue = parsed;\n      return parsed;\n    }',
+    ],
+    replacements: ['{}'],
+    reason:
+      'The block only contains comments plus "memoryValue = parsed; return parsed;" duplicated verbatim by the next branch (lines 276-279). The sentinel is truthy, so emptying this block routes forward-incompatible records through that identical branch: same cache write, same returned object, same no-delete outcome.',
+    locations: exactLocations(268, 40, 275, 6),
+  },
+  {
+    file: 'src/lib/assessment-replay-provider.tsx',
+    mutator: 'LogicalOperator',
+    originals: ['active && !controller.signal.aborted && isSessionLeaseCurrent(sessionLease);'],
+    replacements: ['active || !controller.signal.aborted'],
+    reason:
+      'The only code that ever aborts this controller is the effect cleanup at lines 300-303, which sets active = false in the same synchronous block before calling controller.abort(); the line-139 early return aborts a controller whose effect body (and therefore stillCurrent) never ran. So aborted implies active === false, and with active === true the mutated operand reduces to active exactly like the clean expression, while with active === false the cleanup has also aborted (making !controller.signal.aborted false) so both variants evaluate false. The lease conjunct is untouched, so stillCurrent is identical on every reachable state.',
+    locations: exactLocations(143, 7, 143, 43),
+  },
 ]);
 
 export const equivalentMutantSourceHashes = Object.freeze({
+  'src/lib/assessment-replay.ts':
+    '5396510cc1a135929e69ab13a8cba5005ce2c75448783abcd0117ae542d8e84c',
+  'src/lib/assessment-replay-provider.tsx':
+    '0751a95555c500801a71ab2d81ed9480241a21d0752b913cac1173cded3984c2',
+  'src/lib/network-status.ts': '76ca03f5e92ea253d11ef63501bed0827f83ebeb6adf4036a4c62c6733a936f0',
+  'src/components/NetworkStatusBanner.tsx':
+    '5c6c3f7225fb28ec02311265a8507c5cd3b42e5ac670ff9de1b8f3178ea0aad0',
+  'src/components/ClientUpgradeModal.tsx':
+    '5361252c79e471ee945ed74391da41ca13235604281ed2b898b404dadc4f69b2',
+  'src/lib/identity-validation.ts':
+    '3042554493dbd55c47f51ef84b79cf3304f682a73c0c02dc56c86ae10b0f4eb0',
+  'src/app/(auth)/welcome.tsx': '40864cb050ddff9465f51fe7fbb1ff2d9193e0df9aba036584ade986542bd7bd',
   'src/app/(auth)/forgot-password.tsx':
     'a0fddf6b1d65ebbed3f255cf5416440d0c0a967d22cc5502dfeb041f55e19754',
   'src/app/(auth)/login.tsx': '7a6e2418de6cc2204a937da5f5da0a7625d73fb0cbf59c441a4df6647fbe5b61',
